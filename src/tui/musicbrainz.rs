@@ -25,6 +25,10 @@ pub struct MbRelease {
     pub release_group_id: Option<String>,
     pub artist_id: Option<String>,
     pub title: String,
+    /// Ordered release-level artist credits. Joinphrases belong to `artist`
+    /// for presentation only; this list is the provider value source when
+    /// ARTIST is populated at album scope.
+    pub artist_values: Vec<String>,
     pub artist: String,
     pub year: Option<String>,
     /// First-release-date of the release-group (year only). Distinct
@@ -57,12 +61,13 @@ pub struct MbTrack {
     pub recording_id: Option<String>,
     pub artist_id: Option<String>,
     pub title: String,
-    pub artist: String,
-    /// Composer credit derived from recording -> work -> artist
-    /// relationships. Multiple credited composers are represented as one
-    /// deterministic scalar string; the metadata editor's true repeated-tag
-    /// model remains intentionally out of scope.
-    pub composer: Option<String>,
+    /// Ordered track artist credits. The list, not a joinphrase-rendered
+    /// scalar, is the provider source of truth for ARTIST population.
+    pub artist: Vec<String>,
+    /// Ordered composer credits derived from recording -> work -> artist
+    /// relationships. Multiplicity is preserved; the editor decides how the
+    /// target persistence backend can represent the list.
+    pub composer: Vec<String>,
     pub isrc: Option<String>,
     /// Track length in milliseconds, when MB exposes it. Required for
     /// generating an embedded CUESHEET tag on single-image rips.
@@ -379,8 +384,8 @@ pub fn align_release_tracks_to_source(
             recording_id: None,
             artist_id: None,
             title: String::new(),
-            artist: String::new(),
-            composer: None,
+            artist: Vec::new(),
+            composer: Vec::new(),
             isrc: None,
             length_ms: None,
         })
@@ -1061,6 +1066,7 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let artist_values = artist_credit_values(rel.get("artist-credit"));
     let artist = artist_credit_string(rel.get("artist-credit"));
     let artist_id = rel
         .get("artist-credit")
@@ -1201,6 +1207,7 @@ fn release_from_json(rel: &serde_json::Value, n_tracks: usize) -> MbRelease {
         release_group_id,
         artist_id,
         title,
+        artist_values,
         artist,
         year,
         original_date,
@@ -1221,9 +1228,9 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let track_artist = artist_credit_string(t.get("artist-credit"));
+    let track_artist = artist_credit_values(t.get("artist-credit"));
     let artist = if track_artist.is_empty() {
-        artist_credit_string(t.get("recording").and_then(|r| r.get("artist-credit")))
+        artist_credit_values(t.get("recording").and_then(|r| r.get("artist-credit")))
     } else {
         track_artist
     };
@@ -1265,7 +1272,8 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
         .map(|s| s.to_string());
     let composer = t
         .get("recording")
-        .and_then(composer_credit_from_recording);
+        .map(composer_credit_from_recording)
+        .unwrap_or_default();
     // Length in ms, preferring the track-level value (the disc-encoded
     // length); fall back to recording.length when the track doesn't
     // carry its own.
@@ -1292,7 +1300,7 @@ fn track_from_json(t: &serde_json::Value) -> Option<MbTrack> {
     })
 }
 
-fn composer_credit_from_recording(recording: &serde_json::Value) -> Option<String> {
+fn composer_credit_from_recording(recording: &serde_json::Value) -> Vec<String> {
     fn composer_name(relation: &serde_json::Value) -> Option<String> {
         if !relation
             .get("type")
@@ -1316,12 +1324,6 @@ fn composer_credit_from_recording(recording: &serde_json::Value) -> Option<Strin
     }
 
     let mut credits = Vec::<String>::new();
-    let mut push_unique = |name: String| {
-        if !credits.iter().any(|existing| existing == &name) {
-            credits.push(name);
-        }
-    };
-
     for relation in recording
         .get("relations")
         .and_then(|relations| relations.as_array())
@@ -1329,7 +1331,7 @@ fn composer_credit_from_recording(recording: &serde_json::Value) -> Option<Strin
         .flatten()
     {
         if let Some(name) = composer_name(relation) {
-            push_unique(name);
+            credits.push(name);
         }
         if let Some(work) = relation.get("work") {
             for work_relation in work
@@ -1339,13 +1341,12 @@ fn composer_credit_from_recording(recording: &serde_json::Value) -> Option<Strin
                 .flatten()
             {
                 if let Some(name) = composer_name(work_relation) {
-                    push_unique(name);
+                    credits.push(name);
                 }
             }
         }
     }
-
-    (!credits.is_empty()).then(|| credits.join("; "))
+    credits
 }
 
 /// Populate a metadata editor state with the MB-only fields that the
@@ -1424,8 +1425,8 @@ pub fn populate_editor_mb_supplemental_scoped(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![String::new(); dim],
-            per_file_originals: vec![String::new(); dim],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -1439,8 +1440,8 @@ pub fn populate_editor_mb_supplemental_scoped(
         value: String,
     ) {
         let values = &mut state.active_surface_mut().entries[idx].per_file_values;
-        if slot < values.len() {
-            values[slot] = value;
+        if let Some(values) = values.get_mut(slot) {
+            values.replace_scalar(value);
         }
     }
 
@@ -1892,6 +1893,8 @@ fn upsert_dvdv_duration_warning_entry(
     )
     .unwrap_or_default();
     let all_same = per_file_values.windows(2).all(|window| window[0] == window[1]);
+    let per_file_values =
+        crate::tui::probe::metadata_field_values_from_scalars(per_file_values);
 
     if let Some(idx) = state.active_surface()
         .entries
@@ -1904,7 +1907,7 @@ fn upsert_dvdv_duration_warning_entry(
         entry.is_binary = false;
         entry.is_mixed = !all_same && n > 1;
         entry.per_file_values = per_file_values;
-        entry.per_file_originals = vec![String::new(); n];
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     } else if !mismatches.is_empty() {
@@ -1919,7 +1922,7 @@ fn upsert_dvdv_duration_warning_entry(
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
             per_file_values,
-            per_file_originals: vec![String::new(); n],
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -2031,7 +2034,11 @@ fn recompute_and_stamp_mb_proposed(entry: &mut crate::tui::probe::TagEntry, _n: 
     entry.value = if entry.is_mixed {
         "<multiple values>".to_string()
     } else {
-        entry.per_file_values.first().cloned().unwrap_or_default()
+        entry
+            .per_file_values
+            .first()
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default()
     };
 
     if entry.value != entry.original || entry.per_file_values != entry.per_file_originals {
@@ -2128,8 +2135,8 @@ pub fn populate_editor_from_mb_scoped(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![String::new(); dim],
-            per_file_originals: vec![String::new(); dim],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -2156,11 +2163,9 @@ pub fn populate_editor_from_mb_scoped(
     // Per-track presence pre-pass: only create entries when at least
     // one track in the release has data for that field.
     let any_title = release.tracks.iter().any(|t| !t.title.is_empty());
-    let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty());
-    let any_composer = release
-        .tracks
-        .iter()
-        .any(|t| t.composer.as_deref().is_some_and(|value| !value.is_empty()));
+    let any_artist = release.tracks.iter().any(|t| !t.artist.is_empty())
+        || (single_image && !per_track_populate && !release.artist_values.is_empty());
+    let any_composer = release.tracks.iter().any(|t| !t.composer.is_empty());
 
     let title_idx = if any_title {
         Some(find_or_create(
@@ -2259,29 +2264,28 @@ pub fn populate_editor_from_mb_scoped(
             let mt = release.tracks.iter().find(|m| m.position == track_pos);
             if let Some(mt) = mt {
                 if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.title.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i].replace_scalar(mt.title.clone());
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = mt.artist.clone();
+                    state.active_surface_mut().entries[idx].per_file_values[i]
+                        .replace_stored_texts(mt.artist.clone());
                 }
-                if let (Some(idx), Some(composer)) = (
-                    composer_idx,
-                    mt.composer.as_deref().filter(|value| !value.is_empty()),
-                ) {
-                    state.active_surface_mut().entries[idx].per_file_values[i] = composer.to_string();
+                if let (Some(idx), false) = (composer_idx, mt.composer.is_empty()) {
+                    state.active_surface_mut().entries[idx].per_file_values[i]
+                        .replace_stored_texts(mt.composer.clone());
                 }
             }
         }
         if let Some(idx) = album_idx {
-            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(release.title.clone());
         }
         if let Some(idx) = tn_idx {
-            state.active_surface_mut().entries[idx].per_file_values[0] = "1".to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar("1".to_string());
         }
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
-            state.active_surface_mut().entries[idx].per_file_values[0] = year.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(year.to_string());
         }
     } else if single_image {
         // Single-image rip with a guard failure (multi-disc release,
@@ -2295,21 +2299,22 @@ pub fn populate_editor_from_mb_scoped(
         let title_dim_one = title_idx.filter(|&i| state.active_surface().entries[i].per_file_values.len() == 1);
         let artist_dim_one = artist_idx.filter(|&i| state.active_surface().entries[i].per_file_values.len() == 1);
         if let Some(idx) = title_dim_one {
-            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(release.title.clone());
         }
-        if let (Some(idx), false) = (artist_dim_one, release.artist.is_empty()) {
-            state.active_surface_mut().entries[idx].per_file_values[0] = release.artist.clone();
+        if let (Some(idx), false) = (artist_dim_one, release.artist_values.is_empty()) {
+            state.active_surface_mut().entries[idx].per_file_values[0]
+                .replace_stored_texts(release.artist_values.clone());
         }
         if let Some(idx) = album_idx {
-            state.active_surface_mut().entries[idx].per_file_values[0] = release.title.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(release.title.clone());
         }
         if let Some(idx) = tn_idx {
-            state.active_surface_mut().entries[idx].per_file_values[0] = "1".to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar("1".to_string());
         }
         if let (Some(idx), Some(year)) =
             (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
         {
-            state.active_surface_mut().entries[idx].per_file_values[0] = year.to_string();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(year.to_string());
         }
     } else {
         // Per-file populate: tag-per-file with track position == file
@@ -2318,43 +2323,56 @@ pub fn populate_editor_from_mb_scoped(
         // per-track fields but by FILE for album-level fields, so every
         // write is bounds-guarded: short (file-dimensioned) entries receive
         // their own slot count and per-track rows receive all N.
-        fn set_slot(
+        fn set_slot_scalar(
             state: &mut crate::tui::app::MetadataEditorState,
             idx: usize,
             slot: usize,
             value: String,
         ) {
             let values = &mut state.active_surface_mut().entries[idx].per_file_values;
-            if slot < values.len() {
-                values[slot] = value;
+            if let Some(values) = values.get_mut(slot) {
+                values.replace_scalar(value);
+            }
+        }
+
+        fn set_slot_values(
+            state: &mut crate::tui::app::MetadataEditorState,
+            idx: usize,
+            slot: usize,
+            values: &[String],
+        ) {
+            if let Some(target) = state
+                .active_surface_mut()
+                .entries
+                .get_mut(idx)
+                .and_then(|entry| entry.per_file_values.get_mut(slot))
+            {
+                target.replace_stored_texts(values.iter().cloned());
             }
         }
         for i in 0..n {
             let mt = release.tracks.iter().find(|m| m.position as usize == i + 1);
             if let Some(mt) = mt {
                 if let (Some(idx), false) = (title_idx, mt.title.is_empty()) {
-                    set_slot(state, idx, i, mt.title.clone());
+                    set_slot_scalar(state, idx, i, mt.title.clone());
                 }
                 if let (Some(idx), false) = (artist_idx, mt.artist.is_empty()) {
-                    set_slot(state, idx, i, mt.artist.clone());
+                    set_slot_values(state, idx, i, &mt.artist);
                 }
-                if let (Some(idx), Some(composer)) = (
-                    composer_idx,
-                    mt.composer.as_deref().filter(|value| !value.is_empty()),
-                ) {
-                    set_slot(state, idx, i, composer.to_string());
+                if let (Some(idx), false) = (composer_idx, mt.composer.is_empty()) {
+                    set_slot_values(state, idx, i, &mt.composer);
                 }
             }
             if let Some(idx) = album_idx {
-                set_slot(state, idx, i, release.title.clone());
+                set_slot_scalar(state, idx, i, release.title.clone());
             }
             if let Some(idx) = tn_idx {
-                set_slot(state, idx, i, (i + 1).to_string());
+                set_slot_scalar(state, idx, i, (i + 1).to_string());
             }
             if let (Some(idx), Some(year)) =
                 (date_idx, release.year.as_deref().filter(|s| !s.is_empty()))
             {
-                set_slot(state, idx, i, year.to_string());
+                set_slot_scalar(state, idx, i, year.to_string());
             }
         }
     }
@@ -2398,7 +2416,7 @@ pub fn populate_editor_from_mb_scoped(
                         ItemKey::Unknown("CUESHEET".to_string()),
                         n,
                     );
-                    state.active_surface_mut().entries[cue_idx].per_file_values[0] = cue.clone();
+                    state.active_surface_mut().entries[cue_idx].per_file_values[0].replace_scalar(cue.clone());
                     // is_binary keeps inline edit blocked; the value
                     // would be 1-2KB of multi-line content otherwise.
                     state.active_surface_mut().entries[cue_idx].is_binary = true;
@@ -2573,6 +2591,30 @@ fn verify_single_image_matches_release(
                 .to_string(),
         ),
     }
+}
+
+/// Project a MusicBrainz `artist-credit` array into ordered discrete
+/// performer values. Joinphrases are presentation punctuation and are never
+/// encoded into the authoritative ARTIST list.
+fn artist_credit_values(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    entry
+                        .get("artist")
+                        .and_then(|artist| artist.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Render a MusicBrainz `artist-credit` array into a single performer
@@ -2759,8 +2801,8 @@ mod tests {
                     recording_id: None,
                     artist_id: None,
                     title: "Gaslighting Abbie".into(),
-                    artist: "Steely Dan".into(),
-                    composer: None,
+                    artist: vec!["Steely Dan".into()],
+                    composer: Vec::new(),
                     isrc: None,
                     length_ms: Some(354_000),
                 },
@@ -2770,8 +2812,8 @@ mod tests {
                     recording_id: None,
                     artist_id: None,
                     title: "What a Shame About Me".into(),
-                    artist: "Steely Dan".into(),
-                    composer: None,
+                    artist: vec!["Steely Dan".into()],
+                    composer: Vec::new(),
                     isrc: None,
                     length_ms: Some(317_000),
                 },
@@ -2932,6 +2974,7 @@ mod tests {
             release_group_id: None,
             artist_id: None,
             title: id.into(),
+            artist_values: vec!["Artist".into()],
             artist: "Artist".into(),
             year: None,
             original_date: None,
@@ -2953,8 +2996,8 @@ mod tests {
             recording_id: None,
             artist_id: None,
             title: title.into(),
-            artist: artist.into(),
-            composer: None,
+            artist: vec![artist.into()],
+            composer: Vec::new(),
             isrc: isrc.map(String::from),
             length_ms: None,
         }
@@ -3030,7 +3073,7 @@ mod tests {
 
         let release = super::parse_mb_response(body, 1).unwrap().expect("release");
         assert!(!release.relationship_projection_complete);
-        assert!(release.tracks[0].composer.is_none());
+        assert!(release.tracks[0].composer.is_empty());
     }
 
     #[test]
@@ -3157,8 +3200,8 @@ mod tests {
 
         let release = parse_mb_response(body, 1).unwrap().expect("release");
         assert_eq!(
-            release.tracks[0].composer.as_deref(),
-            Some("John Luther Adams; J. L. Adams")
+            release.tracks[0].composer,
+            vec!["John Luther Adams".to_string(), "J. L. Adams".to_string()]
         );
     }
 
@@ -3586,8 +3629,8 @@ mod tests {
             is_mixed: true,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2, 1],
-            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
-            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -3640,7 +3683,12 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(lookup("ISRC"), vec!["USRC1", ""]);
@@ -3682,9 +3730,9 @@ mod tests {
             .position(|entry| entry.display_key == "COMPOSER")
             .expect("COMPOSER row");
         state.active_surface_mut().entries[composer_idx].per_file_values =
-            vec!["Old One".to_string(), "Old Two".to_string()];
+            crate::tui::probe::metadata_field_values_from_scalars(vec!["Old One".to_string(), "Old Two".to_string()]);
         state.active_surface_mut().entries[composer_idx].per_file_originals =
-            vec!["Old One".to_string(), "Old Two".to_string()];
+            crate::tui::probe::metadata_field_values_from_scalars(vec!["Old One".to_string(), "Old Two".to_string()]);
         crate::tui::keybindings::metadata_editor_recompute_entry_display(
             &mut state.active_surface_mut().entries[composer_idx],
         );
@@ -3693,7 +3741,7 @@ mod tests {
             "rid",
             vec![trk(1, "One", "Artist", None), trk(2, "Two", "Artist", None)],
         );
-        release.tracks[0].composer = Some("New Composer".to_string());
+        release.tracks[0].composer = vec!["New Composer".to_string()];
         populate_editor_from_mb(&mut state, &release);
 
         let composer = state
@@ -3703,6 +3751,71 @@ mod tests {
             .find(|entry| entry.display_key == "COMPOSER")
             .expect("COMPOSER row after MB populate");
         assert_eq!(composer.per_file_values, ["New Composer", "Old Two"]);
+    }
+
+    #[test]
+    fn populate_editor_from_mb_preserves_composer_lists_and_revert_toggle() {
+        let (mut state, _td) = empty_editor_state(2);
+        crate::tui::probe::ensure_standard_fields_present(&mut state.active_surface_mut().entries, 2);
+        let composer_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row");
+        state.active_surface_mut().entries[composer_idx].per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old A", "Old B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_text("Old C"),
+        ];
+        let original_composers =
+            state.active_surface().entries[composer_idx].per_file_values.clone();
+        state.active_surface_mut().entries[composer_idx].per_file_originals = original_composers;
+        crate::tui::keybindings::metadata_editor_recompute_entry_display(
+            &mut state.active_surface_mut().entries[composer_idx],
+        );
+
+        let mut release = rel(
+            "rid",
+            vec![trk(1, "One", "Artist", None), trk(2, "Two", "Artist", None)],
+        );
+        release.tracks[0].composer = vec!["New A".to_string(), "New B".to_string()];
+        release.tracks[1].composer = vec!["New C".to_string()];
+        populate_editor_from_mb(&mut state, &release);
+
+        let composer = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row after MB populate");
+        assert_eq!(composer.per_file_values[0].to_texts(), ["New A", "New B"]);
+        assert_eq!(composer.per_file_values[1].to_texts(), ["New C"]);
+        let proposed = composer
+            .mb_proposed_per_file
+            .as_ref()
+            .expect("list-shaped MB proposal");
+        assert_eq!(proposed[0].to_texts(), ["New A", "New B"]);
+
+        let composer_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "COMPOSER")
+            .expect("COMPOSER row index");
+        crate::tui::probe::toggle_mb_revert_field(
+            &mut state.active_surface_mut().entries[composer_idx],
+        );
+        assert_eq!(
+            state.active_surface().entries[composer_idx].per_file_values[0].to_texts(),
+            ["Old A", "Old B"],
+        );
+        crate::tui::probe::toggle_mb_revert_field(
+            &mut state.active_surface_mut().entries[composer_idx],
+        );
+        assert_eq!(
+            state.active_surface().entries[composer_idx].per_file_values[0].to_texts(),
+            ["New A", "New B"],
+        );
     }
 
     #[test]
@@ -3716,9 +3829,9 @@ mod tests {
             .position(|entry| entry.display_key == "COMPOSER")
             .expect("COMPOSER row");
         state.active_surface_mut().entries[composer_idx].per_file_values =
-            vec!["Existing A".to_string(), "Existing B".to_string()];
+            crate::tui::probe::metadata_field_values_from_scalars(vec!["Existing A".to_string(), "Existing B".to_string()]);
         state.active_surface_mut().entries[composer_idx].per_file_originals =
-            vec!["Existing A".to_string(), "Existing B".to_string()];
+            crate::tui::probe::metadata_field_values_from_scalars(vec!["Existing A".to_string(), "Existing B".to_string()]);
 
         let release = rel(
             "rid",
@@ -3756,7 +3869,12 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(lookup("TITLE"), vec!["Track 1", "Track 2"]);
@@ -3808,6 +3926,7 @@ mod tests {
         );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
+        release.artist_values = vec!["Album Artist".into()];
         release.year = Some("1970".into());
         populate_editor_from_mb(&mut state, &release);
 
@@ -3816,7 +3935,12 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(
@@ -4120,6 +4244,7 @@ mod tests {
         );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
+        release.artist_values = vec!["Album Artist".into()];
         populate_editor_from_mb(&mut state, &release);
 
         let lookup = |key: &str| -> Vec<String> {
@@ -4127,7 +4252,12 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(key))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(
@@ -4136,6 +4266,13 @@ mod tests {
             "non-eligible single-image: TITLE falls back to album title"
         );
         assert_eq!(lookup("ARTIST"), vec!["Album Artist"]);
+        let artist = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ARTIST")
+            .expect("single-artist fallback creates ARTIST");
+        assert_eq!(artist.per_file_values[0].to_texts(), ["Album Artist"]);
         assert_eq!(lookup("ALBUM"), vec!["Whole Album"]);
         // ISRC must NOT be created (no per-track CUESHEET home, and
         // album-level ISRC is meaningless).
@@ -4184,6 +4321,7 @@ mod tests {
         );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
+        release.artist_values = vec!["Album Artist".into()];
         populate_editor_from_mb(&mut state, &release);
 
         let cue_entry = state.active_surface()
@@ -4213,6 +4351,7 @@ mod tests {
         );
         release.title = "Whole Album".into();
         release.artist = "Album Artist".into();
+        release.artist_values = vec!["Album Artist".into()];
         populate_editor_from_mb(&mut state, &release);
 
         assert!(
@@ -4485,8 +4624,8 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![pre_existing.to_string()],
-            per_file_originals: vec![String::new()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![pre_existing.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -4566,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn artist_credit_joinphrase_preserved() {
+    fn artist_credit_scalar_rendering_preserves_joinphrase_but_list_projection_does_not_embed_it() {
         let v: serde_json::Value = serde_json::from_str(
             r#"[
             {"name": "Foo", "joinphrase": " & "},
@@ -4575,5 +4714,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(artist_credit_string(Some(&v)), "Foo & Bar");
+        assert_eq!(
+            artist_credit_values(Some(&v)),
+            vec!["Foo".to_string(), "Bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn release_parser_keeps_display_artist_and_discrete_release_artist_values() {
+        let v = serde_json::json!({
+            "id": "release-id",
+            "title": "Duet Album",
+            "artist-credit": [
+                {"name": "Artist A", "joinphrase": " & "},
+                {"name": "Artist B"}
+            ],
+            "media": []
+        });
+        let release = release_from_json(&v, 0);
+        assert_eq!(release.artist, "Artist A & Artist B");
+        assert_eq!(release.artist_values, ["Artist A", "Artist B"]);
+
+        let one_artist = serde_json::json!({
+            "id": "solo-release",
+            "title": "Solo Album",
+            "artist-credit": [{"name": "Solo Artist"}],
+            "media": []
+        });
+        let release = release_from_json(&one_artist, 0);
+        assert_eq!(release.artist, "Solo Artist");
+        assert_eq!(release.artist_values, ["Solo Artist"]);
+    }
+
+    #[test]
+    fn single_image_album_fallback_preserves_release_artist_list_and_mb_toggle() {
+        let (mut state, _td) = empty_editor_state(1);
+        crate::tui::probe::ensure_standard_fields_present(
+            &mut state.active_surface_mut().entries,
+            1,
+        );
+        let artist_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST row");
+        state.active_surface_mut().entries[artist_idx].per_file_values[0]
+            .replace_stored_texts(["Original A", "Original B"]);
+        let original_artist_values =
+            state.active_surface().entries[artist_idx].per_file_values.clone();
+        state.active_surface_mut().entries[artist_idx].per_file_originals =
+            original_artist_values;
+        crate::tui::keybindings::metadata_editor_recompute_entry_display(
+            &mut state.active_surface_mut().entries[artist_idx],
+        );
+
+        let mut release = rel(
+            "rid",
+            vec![
+                trk(1, "Track One", "Track Artist A", None),
+                trk(2, "Track Two", "Track Artist B", None),
+            ],
+        );
+        release.artist = "Artist A & Artist B".to_string();
+        release.artist_values = vec!["Artist A".to_string(), "Artist B".to_string()];
+
+        populate_editor_from_mb_with_per_track_decision(
+            &mut state,
+            &release,
+            &PerTrackDecision {
+                per_track_populate: false,
+                skip_reason: Some("test fallback".to_string()),
+            },
+        );
+
+        let artist_idx = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "ARTIST")
+            .expect("ARTIST row after fallback");
+        assert_eq!(
+            state.active_surface().entries[artist_idx].per_file_values[0].to_texts(),
+            ["Artist A", "Artist B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[artist_idx]
+                .mb_proposed_per_file
+                .as_ref()
+                .expect("MB list proposal")[0]
+                .to_texts(),
+            ["Artist A", "Artist B"]
+        );
+
+        crate::tui::probe::toggle_mb_revert_field(
+            &mut state.active_surface_mut().entries[artist_idx],
+        );
+        assert_eq!(
+            state.active_surface().entries[artist_idx].per_file_values[0].to_texts(),
+            ["Original A", "Original B"]
+        );
+
+        crate::tui::probe::toggle_mb_revert_field(
+            &mut state.active_surface_mut().entries[artist_idx],
+        );
+        assert_eq!(
+            state.active_surface().entries[artist_idx].per_file_values[0].to_texts(),
+            ["Artist A", "Artist B"]
+        );
     }
 }

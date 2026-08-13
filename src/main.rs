@@ -2814,7 +2814,7 @@ async fn run_tags_mb(
             }
         }
         PathKind::Audio(ref audio_paths) => {
-            let entries_snap: Vec<(lofty::tag::ItemKey, Vec<String>, Vec<String>)> = state
+            let entries_snap = state
                 .active_surface()
                 .entries
                 .iter()
@@ -2825,7 +2825,7 @@ async fn run_tags_mb(
                         e.per_file_originals.clone(),
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
             let deleted: Vec<usize> = state.active_surface().deleted.clone();
             let paths_owned = audio_paths.clone();
             let results = match tokio::task::spawn_blocking(move || {

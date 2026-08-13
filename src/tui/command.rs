@@ -5654,7 +5654,7 @@ Native helper failures, missing displays, denied clipboard access, and oversized
             let content = entry
                 .per_file_values
                 .first()
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .unwrap_or_else(|| entry.value.clone());
             let summary = format!(
                 "{} (read-only · {})",
@@ -10476,6 +10476,8 @@ fn dvdv_upsert_editor_entry(
     value: &str,
     per_file_values: Vec<String>,
 ) {
+    let per_file_values =
+        crate::tui::probe::metadata_field_values_from_scalars(per_file_values);
     let value = value.to_string();
     let is_mixed = value == "<multiple values>";
     if let Some(entry) = entries
@@ -11509,6 +11511,8 @@ fn bluray_upsert_editor_entry(
     value: &str,
     per_file_values: Vec<String>,
 ) {
+    let per_file_values =
+        crate::tui::probe::metadata_field_values_from_scalars(per_file_values);
     let value = value.to_string();
     let is_mixed = value == "<multiple values>";
     if let Some(entry) = entries.iter_mut().find(|entry| {
@@ -11690,7 +11694,7 @@ fn bluray_custom_field_values_are_track_specific(entry: &super::probe::TagEntry)
     if entry.per_file_values.len() <= 1 {
         return false;
     }
-    let first = entry.per_file_values.first().map(String::as_str).unwrap_or("");
+    let first = entry.per_file_values.first().map(crate::tui::probe::MetadataFieldValues::as_str).unwrap_or("");
     entry.per_file_values.iter().skip(1).any(|value| value.as_str() != first)
 }
 
@@ -14689,7 +14693,12 @@ fn build_cue_diff(
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(field))
-                .map(|e| e.per_file_values.get(i).cloned().unwrap_or_default())
+                .map(|e| {
+                    e.per_file_values
+                        .get(i)
+                        .map(|values| values.as_str().to_string())
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default();
 
             if old_value != new_value {
@@ -14740,8 +14749,8 @@ pub fn apply_cue_changes(
                     is_mixed: false,
                     has_multiple_stored_values: false,
                     per_file_stored_value_counts: Vec::new(),
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
+                    per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
+                    per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
                 });
@@ -14750,7 +14759,7 @@ pub fn apply_cue_changes(
         };
 
         if change.file_index < n {
-            state.active_surface_mut().entries[idx].per_file_values[change.file_index] = change.new_value.clone();
+            state.active_surface_mut().entries[idx].per_file_values[change.file_index].replace_scalar(change.new_value.clone());
         }
     }
 
@@ -14761,7 +14770,11 @@ pub fn apply_cue_changes(
         entry.value = if entry.is_mixed {
             "<multiple values>".to_string()
         } else {
-            entry.per_file_values.first().cloned().unwrap_or_default()
+            entry
+                .per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
     }
 
@@ -15193,7 +15206,7 @@ mod dvdv_sidecar_idempotency_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: per_file_values.into_iter().map(str::to_string).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.into_iter().map(str::to_string).collect()),
             per_file_originals: Vec::new(),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
@@ -16620,8 +16633,8 @@ MUSICBRAINZ_TRACKID = "recording-id"
             is_mixed: per_file_values.windows(2).any(|w| w[0] != w[1]),
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_originals: per_file_values.iter().map(|value| (*value).to_string()).collect(),
-            per_file_values: per_file_values.iter().map(|value| (*value).to_string()).collect(),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|value| (*value).to_string()).collect()),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|value| (*value).to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -16811,7 +16824,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
             .find(|entry| entry.display_key == "MOOD")
             .expect("custom album field should preload");
         mood.value = "Edited Mood".to_string();
-        mood.per_file_values = vec!["Edited Mood".to_string(), "Edited Mood".to_string()];
+        mood.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Edited Mood".to_string(), "Edited Mood".to_string()]);
         mood.is_mixed = false;
 
         let take_note = entries
@@ -16819,7 +16832,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
             .find(|entry| entry.display_key == "TAKE_NOTE")
             .expect("custom track field should preload");
         take_note.value = "<multiple values>".to_string();
-        take_note.per_file_values = vec!["Edited One".to_string(), "Edited Two".to_string()];
+        take_note.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Edited One".to_string(), "Edited Two".to_string()]);
         take_note.is_mixed = true;
 
         let state = bluray_editor_state_for_custom_fields(entries);
@@ -16853,7 +16866,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
             reloaded
                 .iter()
                 .find(|entry| entry.display_key == "TAKE_NOTE")
-                .map(|entry| entry.per_file_values.clone()),
+                .map(|entry| entry.per_file_values.iter().map(|v| v.as_str().to_string()).collect::<Vec<_>>()),
             Some(vec!["Edited One".to_string(), "Edited Two".to_string()])
         );
     }
@@ -17030,7 +17043,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
         let existing = sidecar_with_custom_fields();
         let mut entry = bluray_tag_entry("TAKE_NOTE", "One Note", vec!["One Note", "One Note"]);
         entry.original = "<multiple values>".to_string();
-        entry.per_file_originals = vec!["Old One".to_string(), "Old Two".to_string()];
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(vec!["Old One".to_string(), "Old Two".to_string()]);
         entry.is_mixed = false;
         let state = bluray_editor_state_for_custom_fields(vec![entry]);
 
@@ -17152,17 +17165,17 @@ CUT_NOTE = "Old Cut Two"
             match entry.display_key.as_str() {
                 "MOOD" | "VENUE" => {
                     entry.value.clear();
-                    entry.per_file_values = vec![String::new(), String::new()];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(), String::new()]);
                     entry.is_mixed = false;
                 }
                 "TAKE_NOTE" => {
                     entry.value = "<multiple values>".to_string();
-                    entry.per_file_values = vec![String::new(), String::new()];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(), String::new()]);
                     entry.is_mixed = true;
                 }
                 "CUT_NOTE" => {
                     entry.value = "<multiple values>".to_string();
-                    entry.per_file_values = vec!["Kept Cut One".to_string(), "Kept Cut Two".to_string()];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Kept Cut One".to_string(), "Kept Cut Two".to_string()]);
                     entry.is_mixed = true;
                 }
                 _ => {}
@@ -17536,8 +17549,8 @@ mod sacd_seed_tests {
                 is_mixed: mixed,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec![v.to_string()],
-                per_file_originals: vec![v.to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![v.to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![v.to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             })
@@ -20153,10 +20166,10 @@ mod mb_cardinality_command_tests {
             is_mixed: false,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2],
-            per_file_values: vec![current.to_string()],
-            per_file_originals: vec!["Alpha; Beta".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![current.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string()]),
             mb_proposed_value: Some(proposed.to_string()),
-            mb_proposed_per_file: Some(vec![proposed.to_string()]),
+            mb_proposed_per_file: Some(crate::tui::probe::metadata_field_values_from_scalars(vec![proposed.to_string()])),
         }
     }
 
@@ -20277,8 +20290,8 @@ mod metadata_autonumber_command_tests {
             has_multiple_stored_values: false,
             row_scope: RowScope::File,
             per_file_stored_value_counts: vec![1; values.len()],
-            per_file_values: values.clone(),
-            per_file_originals: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -20471,8 +20484,8 @@ mod round6_application_quit_lifecycle_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![original.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![original.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }

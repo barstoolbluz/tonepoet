@@ -4422,8 +4422,8 @@ mod metadata_auto_populate_alignment_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.iter().map(|v| v.to_string()).collect(),
-            per_file_originals: values.iter().map(|v| v.to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|v| v.to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|v| v.to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -4569,7 +4569,7 @@ mod metadata_auto_populate_alignment_tests {
             .iter_mut()
             .find(|entry| entry.display_key == "TITLE")
             .expect("TITLE row");
-        title.per_file_values[0] = "User edit".to_string();
+        title.per_file_values[0].replace_scalar("User edit".to_string());
         title.value = "User edit".to_string();
         state.active_surface_mut().dirty = true;
         assert!(state.any_presentation_dirty());
@@ -10980,9 +10980,10 @@ pub(super) fn metadata_editor_begin_cursor_value_edit(
     }
 
     let is_mixed = entry.is_mixed;
-    let value_count = entry.per_file_values.len();
+    let slot_count = entry.per_file_values.len();
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
     let value = entry.value.clone();
-    if is_mixed && value_count > 1 {
+    if set_valued || (is_mixed && slot_count > 1) {
         return metadata_editor_begin_detail_edit_for_entry(state, cursor, false);
     }
 
@@ -11332,7 +11333,8 @@ fn metadata_editor_dedicated_sidecar_structural_error(
         Some((_, entry)) => !entry
             .per_file_values
             .first()
-            .unwrap_or(&entry.value)
+            .map(|value| value.as_str())
+            .unwrap_or(entry.value.as_str())
             .trim()
             .is_empty(),
         None => surface
@@ -11571,6 +11573,7 @@ fn metadata_editor_entries_snapshot_for_save(
                 mapped_values.unwrap_or_else(|| entry.per_file_values.clone())
             };
             crate::tui::probe::MetadataEditorTagSnapshot {
+                display_key: crate::tui::probe::canonical_metadata_display_key(&entry.display_key),
                 item_key: entry.item_key.clone(),
                 row_scope,
                 tag_type: crate::tui::probe::editor_tag_origin(&entry.display_key),
@@ -12275,7 +12278,7 @@ fn cue_sidecar_writeback_plan_for_state(
         .iter()
         .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))?;
     let replacement_values = &cue_entry.per_file_values;
-    let replacement_cuesheet = replacement_values.first()?.clone();
+    let replacement_cuesheet = replacement_values.first()?.as_str().to_string();
     let dirty_cue_keys = metadata_editor_dirty_cue_representable_keys(state);
     if metadata_editor_dedicated_sidecar_authority(state)
         && !dirty_cue_keys.is_empty()
@@ -14921,15 +14924,262 @@ fn metadata_editor_commit_inline_edit(
     updated > 0
 }
 
+fn metadata_editor_detail_is_set_valued(
+    state: &super::app::MetadataEditorState,
+    field_idx: usize,
+) -> bool {
+    state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .map(|entry| super::probe::metadata_field_is_set_valued(&entry.display_key))
+        .unwrap_or(false)
+}
+
+fn metadata_editor_detail_target_slots(
+    state: &super::app::MetadataEditorState,
+    field_idx: usize,
+) -> Vec<usize> {
+    // Row-level persistability is an invariant for every detail mutation, not
+    // only scalar edits. Returning no targets makes add/edit/delete/reorder
+    // all flow through the same refusal path and prevents the set-valued UI
+    // from bypassing unified-CUE per-track guards.
+    if metadata_editor_unpersistable_per_track_reason(state, field_idx).is_some() {
+        return Vec::new();
+    }
+    let count = state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .map(|entry| entry.per_file_values.len())
+        .unwrap_or(0);
+    if state.detail_apply_shared {
+        (0..count)
+            .filter(|&slot| {
+                metadata_editor_entry_slot_edit_block_reason(state, field_idx, slot).is_none()
+            })
+            .collect()
+    } else if state.detail_cursor < count
+        && metadata_editor_entry_slot_edit_block_reason(state, field_idx, state.detail_cursor)
+            .is_none()
+    {
+        vec![state.detail_cursor]
+    } else {
+        Vec::new()
+    }
+}
+
+fn metadata_editor_clamp_detail_value_cursor(state: &mut super::app::MetadataEditorState) {
+    let count = state
+        .active_surface()
+        .entries
+        .get(state.detail_field_idx)
+        .and_then(|entry| entry.per_file_values.get(state.detail_cursor))
+        .map(super::probe::MetadataFieldValues::value_count)
+        .unwrap_or(0);
+    state.detail_value_cursor = state
+        .detail_value_cursor
+        .min(count.saturating_sub(1));
+}
+
+fn metadata_editor_refresh_detail_shared_mode(state: &mut super::app::MetadataEditorState) {
+    let field_idx = state.detail_field_idx;
+    let is_mixed = state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .map(|entry| entry.is_mixed)
+        .unwrap_or(false);
+    if is_mixed {
+        state.detail_apply_shared = false;
+    }
+    metadata_editor_clamp_detail_value_cursor(state);
+}
+
+fn metadata_editor_begin_set_value_edit(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    add: bool,
+) -> bool {
+    let field_idx = state.detail_field_idx;
+    if state.read_only {
+        app.set_status("read-only editor (SACD ISO)");
+        return false;
+    }
+    if !metadata_editor_detail_is_set_valued(state, field_idx) {
+        return false;
+    }
+    let targets = metadata_editor_detail_target_slots(state, field_idx);
+    if targets.is_empty() {
+        if let Some(reason) = metadata_editor_detail_value_edit_refusal(
+            state,
+            field_idx,
+            state.detail_cursor,
+        ) {
+            app.set_status(reason);
+        } else {
+            app.set_status("metadata editor: no writable slot for this field");
+        }
+        return false;
+    }
+
+    state.detail_edit_add = add;
+    let initial = if add {
+        String::new()
+    } else {
+        let Some(value) = state
+            .active_surface()
+            .entries
+            .get(field_idx)
+            .and_then(|entry| entry.per_file_values.get(state.detail_cursor))
+            .and_then(|values| values.value_text(state.detail_value_cursor))
+        else {
+            app.set_status("metadata editor: this field has no value to edit; press a to add one");
+            return false;
+        };
+        value.to_string()
+    };
+    state.detail_edit = Some(super::text_input::TextInputState::new_selected(initial));
+    true
+}
+
+fn metadata_editor_mutate_set_values<F>(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    mut mutation: F,
+) -> bool
+where
+    F: FnMut(&mut super::probe::MetadataFieldValues, usize) -> bool,
+{
+    let field_idx = state.detail_field_idx;
+    let value_idx = state.detail_value_cursor;
+    let targets = metadata_editor_detail_target_slots(state, field_idx);
+    if targets.is_empty() {
+        if let Some(reason) = metadata_editor_detail_value_edit_refusal(
+            state,
+            field_idx,
+            state.detail_cursor,
+        ) {
+            app.set_status(reason);
+        }
+        return false;
+    }
+
+    let before = state.active_surface().entries.get(field_idx).cloned();
+    let mut changed = false;
+    if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
+        for slot in targets.iter().copied() {
+            if let Some(values) = entry.per_file_values.get_mut(slot) {
+                changed |= mutation(values, value_idx);
+            }
+        }
+        if changed {
+            metadata_editor_recompute_entry_display(entry);
+        }
+    }
+    if !changed {
+        return false;
+    }
+
+    if let (Some(before), Some(after)) = (
+        before.as_ref(),
+        state.active_surface().entries.get(field_idx),
+    ) {
+        let collapsed = targets.iter().copied().any(|slot| {
+            after
+                .per_file_values
+                .get(slot)
+                .map(|replacement| {
+                    !before
+                        .stored_list_collapse_slots(std::iter::once((slot, replacement)))
+                        .is_empty()
+                })
+                .unwrap_or(false)
+        });
+        if collapsed {
+            if targets.len() == 1 {
+                app.set_status(format!(
+                    "metadata editor: editing {} for this file collapsed multiple stored values into one value",
+                    after.display_key
+                ));
+            } else {
+                app.set_status(format!(
+                    "metadata editor: {} now has fewer stored values for the edited slot",
+                    after.display_key
+                ));
+            }
+        }
+    }
+
+    metadata_editor_refresh_detail_shared_mode(state);
+    recalc_dirty(state);
+    true
+}
+
+fn metadata_editor_remove_selected_set_value(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) -> bool {
+    metadata_editor_mutate_set_values(app, state, |values, index| {
+        values.remove_value(index).is_some()
+    })
+}
+
+fn metadata_editor_move_selected_set_value(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    earlier: bool,
+) -> bool {
+    let current = state.detail_value_cursor;
+    let Some(target) = (if earlier {
+        current.checked_sub(1)
+    } else {
+        current.checked_add(1)
+    }) else {
+        return false;
+    };
+    let moved = metadata_editor_mutate_set_values(app, state, |values, index| {
+        values.move_value(index, target)
+    });
+    if moved {
+        state.detail_value_cursor = target;
+        metadata_editor_clamp_detail_value_cursor(state);
+    }
+    moved
+}
+
 fn metadata_editor_commit_detail_edit(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
 ) -> bool {
     let Some(input) = state.detail_edit.take() else {
+        state.detail_edit_add = false;
         return false;
     };
+    let add = std::mem::take(&mut state.detail_edit_add);
     let field_idx = state.detail_field_idx;
     let detail_cursor = state.detail_cursor;
+
+    if metadata_editor_detail_is_set_valued(state, field_idx) {
+        let text = input.text;
+        if add {
+            if text.trim().is_empty() {
+                app.set_status("metadata editor: empty value not added");
+                return false;
+            }
+            return metadata_editor_mutate_set_values(app, state, |values, _| {
+                values.push_value(text.clone());
+                true
+            });
+        }
+        if text.trim().is_empty() {
+            return metadata_editor_remove_selected_set_value(app, state);
+        }
+        return metadata_editor_mutate_set_values(app, state, |values, index| {
+            values.edit_value(index, text.clone())
+        });
+    }
+
     let n_values = state
         .active_surface()
         .entries
@@ -14959,7 +15209,8 @@ fn metadata_editor_commit_detail_edit(
                 .is_empty())
             .then(|| entry.display_key.clone())
         });
-    state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor] = new_value;
+    state.active_surface_mut().entries[field_idx].per_file_values[detail_cursor]
+        .replace_scalar(new_value);
     metadata_editor_recompute_entry_display(&mut state.active_surface_mut().entries[field_idx]);
     if let Some(key) = collapse_warning {
         app.set_status(format!(
@@ -15078,7 +15329,17 @@ fn metadata_editor_advance_detail_edit(
             continue;
         }
         state.detail_cursor = idx;
-        let value = state.active_surface().entries[field_idx].per_file_values[idx].clone();
+        metadata_editor_clamp_detail_value_cursor(state);
+        let entry = &state.active_surface().entries[field_idx];
+        let value = if super::probe::metadata_field_is_set_valued(&entry.display_key) {
+            entry.per_file_values[idx]
+                .value_text(state.detail_value_cursor)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            entry.per_file_values[idx].as_str().to_string()
+        };
+        state.detail_edit_add = false;
         state.detail_edit = Some(super::text_input::TextInputState::new_selected(value));
         ensure_detail_visible(state);
         return;
@@ -15843,8 +16104,8 @@ fn handle_metadata_editor_key(
                             is_mixed: false,
                             has_multiple_stored_values: false,
                             per_file_stored_value_counts: Vec::new(),
-                            per_file_values: vec![String::new(); n],
-                            per_file_originals: vec![String::new(); n],
+                            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
+                            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
                             mb_proposed_value: None,
                             mb_proposed_per_file: None,
                         });
@@ -15914,6 +16175,7 @@ fn handle_metadata_editor_key(
                 match key.code {
                     KeyCode::Esc => {
                         state.detail_edit = None;
+                        state.detail_edit_add = false;
                     }
                     KeyCode::Enter => {
                         metadata_editor_commit_detail_edit(app, state);
@@ -15946,35 +16208,82 @@ fn handle_metadata_editor_key(
                 return;
             }
 
-            // Detail overlay navigation.
+            // Detail overlay navigation. `j`/`k` move across the
+            // file/track axis. Set-valued fields add an orthogonal value
+            // cursor: `h`/`l` choose a value, `a` adds, `x` removes, and
+            // `[`/`]` reorder without ever parsing a delimiter-joined string.
+            let set_valued = metadata_editor_detail_is_set_valued(state, field_idx);
             match key.code {
                 KeyCode::Esc => {
-                    // Return to main field list.
                     state.phase = MetadataEditorPhase::Editing;
+                    state.detail_apply_shared = false;
+                    state.detail_edit_add = false;
+                    state.detail_value_cursor = 0;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.detail_cursor = state.detail_cursor.saturating_sub(1);
+                    metadata_editor_clamp_detail_value_cursor(state);
                     ensure_detail_visible(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if state.detail_cursor + 1 < n_files {
                         state.detail_cursor += 1;
                     }
+                    metadata_editor_clamp_detail_value_cursor(state);
                     ensure_detail_visible(state);
                 }
                 KeyCode::Tab | KeyCode::BackTab => {
                     let reverse = matches!(key.code, KeyCode::BackTab)
                         || key.modifiers.contains(KeyModifiers::SHIFT);
                     metadata_editor_advance_detail_cursor(state, reverse);
+                    metadata_editor_clamp_detail_value_cursor(state);
+                }
+                KeyCode::Left | KeyCode::Char('h') if set_valued => {
+                    state.detail_value_cursor = state.detail_value_cursor.saturating_sub(1);
+                }
+                KeyCode::Right | KeyCode::Char('l') if set_valued => {
+                    let count = state
+                        .active_surface()
+                        .entries
+                        .get(field_idx)
+                        .and_then(|entry| entry.per_file_values.get(state.detail_cursor))
+                        .map(super::probe::MetadataFieldValues::value_count)
+                        .unwrap_or(0);
+                    if state.detail_value_cursor + 1 < count {
+                        state.detail_value_cursor += 1;
+                    }
+                }
+                KeyCode::Char('a') if set_valued => {
+                    metadata_editor_begin_set_value_edit(app, state, true);
+                }
+                KeyCode::Char('x') if set_valued => {
+                    if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
+                    } else {
+                        metadata_editor_remove_selected_set_value(app, state);
+                    }
+                }
+                KeyCode::Char('[') if set_valued => {
+                    if !state.read_only {
+                        metadata_editor_move_selected_set_value(app, state, true);
+                    }
+                }
+                KeyCode::Char(']') if set_valued => {
+                    if !state.read_only {
+                        metadata_editor_move_selected_set_value(app, state, false);
+                    }
                 }
                 KeyCode::Enter => {
-                    if state.read_only {
+                    if set_valued {
+                        metadata_editor_begin_set_value_edit(app, state, false);
+                    } else if state.read_only {
                         app.set_status("read-only editor (SACD ISO)");
                     } else if let Some(reason) = metadata_editor_detail_value_edit_refusal(state, field_idx, state.detail_cursor) {
                         app.set_status(reason);
                     } else if field_idx < state.active_surface().entries.len() && state.detail_cursor < n_files {
-                        let val =
-                            state.active_surface().entries[field_idx].per_file_values[state.detail_cursor].clone();
+                        let val = state.active_surface().entries[field_idx].per_file_values[state.detail_cursor]
+                            .as_str()
+                            .to_string();
                         state.detail_edit = Some(super::text_input::TextInputState::new_selected(val));
                     }
                 }
@@ -16326,7 +16635,7 @@ pub fn regenerate_cuesheet_for_save(
             state.active_surface().entries[i]
                 .per_file_values
                 .first()
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .filter(|s| !s.is_empty()),
         )
     };
@@ -16397,7 +16706,12 @@ pub fn regenerate_cuesheet_for_save(
 
     let pt_get = |idx: Option<usize>, i: usize| -> Option<String> {
         idx.filter(|j| !deleted_entries.contains(j))
-            .and_then(|j| state.active_surface().entries[j].per_file_values.get(i).cloned())
+            .and_then(|j| {
+                state.active_surface().entries[j]
+                    .per_file_values
+                    .get(i)
+                    .map(|value| value.as_str().to_string())
+            })
             .filter(|s| !s.is_empty())
     };
     let overrides: Vec<super::cue_generate::TrackOverride> = (0..parsed.tracks.len())
@@ -16430,9 +16744,9 @@ pub fn regenerate_cuesheet_for_save(
     //    grid keeps showing the read-only summary.
     let entry = &mut state.active_surface_mut().entries[cue_idx];
     if entry.per_file_values.is_empty() {
-        entry.per_file_values.push(new_cue.clone());
+        entry.per_file_values.push(new_cue.clone().into());
     } else {
-        entry.per_file_values[0] = new_cue.clone();
+        entry.per_file_values[0].replace_scalar(new_cue.clone());
     }
     entry.value = new_cue;
 
@@ -16584,7 +16898,7 @@ fn embedded_cue_candidate_for_metadata_at(
     match validate_embedded_cue_sheet_for_metadata(&sheet) {
         Ok(()) => EmbeddedCueCandidate::Valid {
             audio_path: audio_path.to_path_buf(),
-            cue_text: text,
+            cue_text: text.to_string(),
             sheet,
             multi_file_read_only: false,
         },
@@ -16654,7 +16968,7 @@ fn embedded_cue_candidate_for_transfer_at(
     match validate_embedded_cue_sheet_for_transfer_source(&sheet) {
         Ok(multi_file_read_only) => EmbeddedCueCandidate::Valid {
             audio_path: audio_path.to_path_buf(),
-            cue_text: text,
+            cue_text: text.to_string(),
             sheet,
             multi_file_read_only,
         },
@@ -19842,8 +20156,8 @@ fn upsert_cuesheet_text_for_metadata_surface(
         is_mixed: false,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: vec![cue_text.to_string()],
-        per_file_originals: vec![cue_text.to_string()],
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![cue_text.to_string()]),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![cue_text.to_string()]),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
@@ -19861,9 +20175,9 @@ fn select_cuesheet_text_for_metadata_surface(
         let summary = super::probe::cue_summary_string(cue_text);
         entry.value = summary;
         if entry.per_file_values.is_empty() {
-            entry.per_file_values.push(cue_text.to_string());
+            entry.per_file_values.push(cue_text.to_string().into());
         } else {
-            entry.per_file_values[0] = cue_text.to_string();
+            entry.per_file_values[0].replace_scalar(cue_text.to_string());
         }
         return false;
     }
@@ -19920,10 +20234,18 @@ fn cue_album_entry_index(entries: &[super::probe::TagEntry], key: &str) -> Optio
     })
 }
 
-fn cue_album_entry_display(values: &[String]) -> (String, bool) {
-    let all_same = values.windows(2).all(|window| window[0] == window[1]);
+fn cue_album_entry_display<T: AsRef<str>>(values: &[T]) -> (String, bool) {
+    let all_same = values
+        .windows(2)
+        .all(|window| window[0].as_ref() == window[1].as_ref());
     if all_same {
-        (values.first().cloned().unwrap_or_default(), false)
+        (
+            values
+                .first()
+                .map(|value| value.as_ref().to_string())
+                .unwrap_or_default(),
+            false,
+        )
     } else {
         ("<multiple values>".to_string(), true)
     }
@@ -19935,12 +20257,15 @@ fn cue_album_recompute_entry_display(entry: &mut super::probe::TagEntry) {
     entry.is_mixed = mixed;
 }
 
-fn cue_album_merge_slot_values(dst: &mut Vec<String>, src: &[String]) {
+fn cue_album_merge_slot_values(
+    dst: &mut Vec<super::probe::MetadataFieldValues>,
+    src: &[super::probe::MetadataFieldValues],
+) {
     if dst.len() < src.len() {
-        dst.resize(src.len(), String::new());
+        dst.resize(src.len(), super::probe::MetadataFieldValues::default());
     }
     for (idx, value) in src.iter().enumerate() {
-        if dst[idx].trim().is_empty() && !value.trim().is_empty() {
+        if dst[idx].as_str().trim().is_empty() && !value.as_str().trim().is_empty() {
             dst[idx] = value.clone();
         }
     }
@@ -20053,8 +20378,8 @@ fn cue_album_upsert_album_entry(
         entry.original = value;
         entry.is_binary = false;
         entry.is_mixed = false;
-        entry.per_file_values = values.clone();
-        entry.per_file_originals = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values.clone());
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(values);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     } else {
@@ -20068,8 +20393,8 @@ fn cue_album_upsert_album_entry(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.clone(),
-            per_file_originals: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -20111,8 +20436,8 @@ fn cue_album_upsert_per_track_entry_with_empty_policy(
         entry.original = display;
         entry.is_binary = false;
         entry.is_mixed = mixed;
-        entry.per_file_values = values.clone();
-        entry.per_file_originals = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values.clone());
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(values);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     } else {
@@ -20126,8 +20451,8 @@ fn cue_album_upsert_per_track_entry_with_empty_policy(
             is_mixed: mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.clone(),
-            per_file_originals: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -20164,9 +20489,10 @@ fn cue_album_entry_value_at(entry: &super::probe::TagEntry, idx: usize) -> Optio
     entry
         .per_file_originals
         .get(idx)
-        .or_else(|| entry.per_file_values.get(idx))
-        .or_else(|| (idx == 0).then_some(&entry.original))
-        .or_else(|| (idx == 0).then_some(&entry.value))
+        .map(|value| value.as_str())
+        .or_else(|| entry.per_file_values.get(idx).map(|value| value.as_str()))
+        .or_else(|| (idx == 0).then_some(entry.original.as_str()))
+        .or_else(|| (idx == 0).then_some(entry.value.as_str()))
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
 }
@@ -20244,11 +20570,15 @@ fn cue_album_peek_cuesheet_originals(entries: &[super::probe::TagEntry]) -> Vec<
         .iter()
         .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
         .map(|entry| {
-            if entry.per_file_originals.is_empty() {
-                entry.per_file_values.clone()
+            let values = if entry.per_file_originals.is_empty() {
+                &entry.per_file_values
             } else {
-                entry.per_file_originals.clone()
-            }
+                &entry.per_file_originals
+            };
+            values
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -20265,8 +20595,9 @@ fn cue_album_loaded_album_value(
     entry
         .per_file_values
         .iter()
-        .chain(std::iter::once(&entry.value))
-        .map(|value| value.trim())
+        .map(|value| value.as_str())
+        .chain(std::iter::once(entry.value.as_str()))
+        .map(str::trim)
         .find(|value| !value.is_empty())
         .map(str::to_string)
 }
@@ -20307,7 +20638,7 @@ fn cue_album_loaded_track_field(
         values.push(
             index
                 .and_then(|index| entry.per_file_values.get(index))
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .unwrap_or_default(),
         );
         stored_value_counts.push(
@@ -20373,11 +20704,15 @@ fn cue_album_remove_replaced_keys(
     let mut retained = Vec::with_capacity(entries.len());
     for entry in entries.drain(..) {
         if entry.display_key.eq_ignore_ascii_case("CUESHEET") {
-            cuesheet_originals = if entry.per_file_originals.is_empty() {
-                entry.per_file_values.clone()
+            let source = if entry.per_file_originals.is_empty() {
+                &entry.per_file_values
             } else {
-                entry.per_file_originals.clone()
+                &entry.per_file_originals
             };
+            cuesheet_originals = source
+                .iter()
+                .map(|values| values.as_str().to_string())
+                .collect();
             continue;
         }
         if replaced
@@ -20496,7 +20831,7 @@ fn cue_album_generate_cuesheet_for_track_indices(
             entries[idx]
                 .per_file_values
                 .first()
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .filter(|value| !value.trim().is_empty()),
         )
     };
@@ -20515,7 +20850,7 @@ fn cue_album_generate_cuesheet_for_track_indices(
             entries[idx]
                 .per_file_values
                 .get(index)
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .filter(|value| !value.trim().is_empty()),
         )
     };
@@ -20663,13 +20998,13 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         })
         .collect::<Vec<_>>();
 
-    fn reshape_strings(
-        values: &[String],
+    fn reshape_values(
+        values: &[super::probe::MetadataFieldValues],
         source_scope: super::probe::RowScope,
         shape: super::probe::UnifiedCueRowShape,
         dimensions: super::probe::UnifiedCueDimensions,
         track_file_indices: &[Option<usize>],
-    ) -> Option<(Vec<String>, bool)> {
+    ) -> Option<(Vec<super::probe::MetadataFieldValues>, bool)> {
         let expected = shape.dimension(dimensions);
         let file_dim = dimensions.files;
         let track_dim = dimensions.tracks;
@@ -20680,7 +21015,7 @@ pub(crate) fn cue_album_reconcile_row_shapes(
             return None;
         }
         if values.is_empty() {
-            return Some((vec![String::new(); expected], false));
+            return Some((vec![super::probe::MetadataFieldValues::default(); expected], false));
         }
         if values.len() == 1 {
             return Some((vec![values[0].clone(); expected], false));
@@ -20699,7 +21034,8 @@ pub(crate) fn cue_album_reconcile_row_shapes(
                     && track_file_indices.len() == track_dim
                     && track_file_indices.iter().all(Option::is_some)
                 {
-                    let mut projected = vec![None::<String>; file_dim];
+                    let mut projected =
+                        vec![None::<super::probe::MetadataFieldValues>; file_dim];
                     let mut conflict = false;
                     for (track_index, value) in values.iter().enumerate() {
                         let file_index = track_file_indices[track_index]?;
@@ -20746,7 +21082,7 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         };
 
         let source_scope = entry.row_scope;
-        let Some((values, conflict)) = reshape_strings(
+        let Some((values, conflict)) = reshape_values(
             &entry.per_file_values,
             source_scope,
             shape,
@@ -20755,7 +21091,7 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         ) else {
             continue;
         };
-        let Some((originals, _)) = reshape_strings(
+        let Some((originals, _)) = reshape_values(
             &entry.per_file_originals,
             source_scope,
             shape,
@@ -20766,7 +21102,7 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         };
         let had_per_file_proposal = entry.mb_proposed_per_file.is_some();
         let proposed = entry.mb_proposed_per_file.as_ref().and_then(|proposed| {
-            reshape_strings(
+            reshape_values(
                 proposed,
                 source_scope,
                 shape,
@@ -20807,7 +21143,10 @@ pub(crate) fn cue_album_reconcile_row_shapes(
                     .windows(2)
                     .all(|pair| pair[0] == pair[1]);
                 entry.mb_proposed_value = Some(if proposed_all_same {
-                    proposed_values.first().cloned().unwrap_or_default()
+                    proposed_values
+                        .first()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default()
                 } else {
                     "<multiple values>".to_string()
                 });
@@ -20832,7 +21171,11 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         entry.value = if entry.is_mixed {
             "<multiple values>".to_string()
         } else {
-            entry.per_file_values.first().cloned().unwrap_or_default()
+            entry
+                .per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
         let originals_all_same = entry
             .per_file_originals
@@ -20841,7 +21184,11 @@ pub(crate) fn cue_album_reconcile_row_shapes(
         entry.original = if !originals_all_same && entry.per_file_originals.len() > 1 {
             "<multiple values>".to_string()
         } else {
-            entry.per_file_originals.first().cloned().unwrap_or_default()
+            entry
+                .per_file_originals
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
     }
     warnings
@@ -20986,7 +21333,13 @@ fn cue_album_update_cuesheet_entry_values(
             .entries
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
-            .map(|entry| entry.per_file_originals.clone())
+            .map(|entry| {
+                entry
+                    .per_file_originals
+                    .iter()
+                    .map(|values| values.as_str().to_string())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_else(|| vec![String::new(); n_paths])
     });
     let mut originals = originals;
@@ -21017,8 +21370,8 @@ fn cue_album_update_cuesheet_entry_values(
         entry.original = original_summary;
         entry.is_binary = true;
         entry.is_mixed = is_mixed;
-        entry.per_file_values = values;
-        entry.per_file_originals = originals;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values);
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(originals);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     } else {
@@ -21032,8 +21385,8 @@ fn cue_album_update_cuesheet_entry_values(
             is_mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values,
-            per_file_originals: originals,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(originals),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -21064,8 +21417,8 @@ fn cue_album_merge_warning_entry(warnings: Vec<String>) -> Option<super::probe::
         is_mixed: false,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: vec![value.clone()],
-        per_file_originals: vec![value],
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.clone()]),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value]),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     })
@@ -22114,8 +22467,8 @@ fn ensure_honest_metadata_empty_state(tab: &mut super::app::PresentationTab) {
         is_mixed: false,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: vec![reason.clone(); tab.paths.len()],
-        per_file_originals: vec![reason; tab.paths.len()],
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![reason.clone(); tab.paths.len()]),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![reason; tab.paths.len()]),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
@@ -22768,8 +23121,8 @@ pub fn inject_sidecar_cuesheet_if_present(
         is_mixed: false,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: vec![text],
-        per_file_originals: vec![String::new()],
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![text]),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new()]),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
@@ -22875,8 +23228,8 @@ mod aggregate_file_target_entry_tests {
             has_multiple_stored_values: false,
             row_scope: super::super::probe::RowScope::File,
             per_file_stored_value_counts: vec![1],
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![value.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -23195,8 +23548,8 @@ fn replace_cuesheet_row_with_sidecar_text(
     match cue_idx {
         Some(idx) if idx < surface.entries.len() => {
             let entry = &mut surface.entries[idx];
-            entry.per_file_values = vec![sidecar_text.to_string()];
-            entry.per_file_originals = vec![sidecar_text.to_string()];
+            entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![sidecar_text.to_string()]);
+            entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(vec![sidecar_text.to_string()]);
             entry.value = summary.clone();
             entry.original = summary;
             entry.is_binary = true;
@@ -23217,8 +23570,8 @@ fn replace_cuesheet_row_with_sidecar_text(
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec![sidecar_text.to_string()],
-                per_file_originals: vec![sidecar_text.to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![sidecar_text.to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![sidecar_text.to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -23324,7 +23677,7 @@ fn embedded_cuesheet_extract_source(
         .per_file_originals
         .iter()
         .find(|value| !value.is_empty())
-        .cloned()
+        .map(|value| value.as_str().to_string())
         .ok_or_else(|| {
             ":cuesheet-extract: exact on-disk embedded CUESHEET text is unavailable"
                 .to_string()
@@ -23703,9 +24056,10 @@ fn cue_album_stage_album_entry_from_cuesheet_edit(
         entry.value = value.clone();
         entry.is_binary = false;
         entry.is_mixed = false;
-        entry.per_file_values = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values);
         if entry.per_file_originals.len() != n_paths {
-            entry.per_file_originals.resize(n_paths, String::new());
+            entry.per_file_originals
+                .resize(n_paths, super::probe::MetadataFieldValues::default());
         }
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
@@ -23720,8 +24074,8 @@ fn cue_album_stage_album_entry_from_cuesheet_edit(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values,
-            per_file_originals: vec![String::new(); n_paths],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_paths]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -23743,11 +24097,14 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
         entry.value = display.clone();
         entry.is_binary = false;
         entry.is_mixed = mixed;
-        entry.per_file_values = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values);
         if entry.per_file_originals.len() != entry.per_file_values.len() {
             entry
                 .per_file_originals
-                .resize(entry.per_file_values.len(), String::new());
+                .resize(
+                    entry.per_file_values.len(),
+                    super::probe::MetadataFieldValues::default(),
+                );
         }
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
@@ -23762,8 +24119,8 @@ fn cue_album_stage_per_track_entry_from_cuesheet_edit(
             is_mixed: mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.clone(),
-            per_file_originals: vec![String::new(); values.len()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); values.len()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -24030,7 +24387,7 @@ fn metadata_editor_stage_embedded_cuesheet_edit(
             return Err("embedded CUESHEET row disappeared before staging".to_string());
         };
         let entry = &mut surface.entries[updated_cue_idx];
-        entry.per_file_values = vec![edited.to_string()];
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![edited.to_string()]);
         entry.value = super::probe::cue_summary_string(edited);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
@@ -24093,7 +24450,7 @@ pub(super) fn metadata_editor_edit_embedded_cuesheet_with_system_editor(
     if let Err(err) = validate_embedded_cuesheet_text(&edited) {
         return format!(":cuesheet-edit: {}; buffer kept at {}", err, tmp.display());
     }
-    if edited == current_text {
+    if edited.as_str() == current_text.as_str() {
         let _ = std::fs::remove_file(&tmp);
         return ":cuesheet-edit: embedded CUESHEET unchanged".to_string();
     }
@@ -24134,8 +24491,8 @@ fn grow_or_create_per_track(
         let entry = &mut entries[idx];
         entry.row_scope = crate::tui::probe::RowScope::Track;
         entry.clear_stored_value_provenance();
-        entry.per_file_values = values.clone();
-        entry.per_file_originals = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values.clone());
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(values);
         entry.is_mixed = is_mixed;
         entry.value = display_value.clone();
         entry.original = display_value;
@@ -24150,8 +24507,8 @@ fn grow_or_create_per_track(
             is_mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.clone(),
-            per_file_originals: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -24282,16 +24639,26 @@ pub(super) fn fix_caps_for_state(
             .per_file_values
             .iter()
             .enumerate()
-            .filter(|(_, value)| !value.is_empty())
-            .filter_map(|(slot, value)| {
-                let replacement = cap_fn(value);
-                (replacement.as_str() != value.as_str()).then_some((slot, replacement))
+            .filter_map(|(slot, values)| {
+                let mut replacement = values.clone();
+                let mut changed = 0usize;
+                for value_index in 0..values.value_count() {
+                    let Some(current) = values.value_text(value_index) else {
+                        continue;
+                    };
+                    let capitalized = cap_fn(current);
+                    if capitalized != current {
+                        replacement.edit_value(value_index, capitalized);
+                        changed += 1;
+                    }
+                }
+                (changed > 0).then_some((slot, replacement, changed))
             })
             .collect::<Vec<_>>();
-        let collapsed_slots = state.active_surface().entries[i].stored_value_collapse_slots(
+        let collapsed_slots = state.active_surface().entries[i].stored_list_collapse_slots(
             replacements
                 .iter()
-                .map(|(slot, replacement)| (*slot, replacement.as_str())),
+                .map(|(slot, replacement, _)| (*slot, replacement)),
         );
         if !collapsed_slots.is_empty() {
             result.collapsed_carriers.push(StoredValueCollapse {
@@ -24301,10 +24668,10 @@ pub(super) fn fix_caps_for_state(
         }
 
         let entry = &mut state.active_surface_mut().entries[i];
-        for (slot, replacement) in replacements {
+        for (slot, replacement, changed) in replacements {
             if let Some(value) = entry.per_file_values.get_mut(slot) {
                 *value = replacement;
-                result.changed_values += 1;
+                result.changed_values += changed;
             }
         }
         // Recompute is_mixed using the entry's OWN dim, not paths.len().
@@ -24314,7 +24681,11 @@ pub(super) fn fix_caps_for_state(
         entry.value = if entry.is_mixed {
             "<multiple values>".to_string()
         } else {
-            entry.per_file_values.first().cloned().unwrap_or_default()
+            entry
+                .per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
     }
 
@@ -24373,7 +24744,7 @@ fn overlay_per_track_values(
             .cloned()
             .unwrap_or_default();
         entry.per_file_originals.resize(dim, pad);
-        entry.per_file_values = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values);
         entry.is_mixed = is_mixed;
         entry.value = display_value;
     } else if !all_empty {
@@ -24390,8 +24761,8 @@ fn overlay_per_track_values(
             is_mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values,
-            per_file_originals: vec![String::new(); dim],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -24465,9 +24836,9 @@ pub(super) fn reload_from_sidecar_cue(
     {
         let entry = &mut state.active_surface_mut().entries[idx];
         if entry.per_file_values.is_empty() {
-            entry.per_file_values.push(text.clone());
+            entry.per_file_values.push(text.clone().into());
         } else {
-            entry.per_file_values[0] = text.clone();
+            entry.per_file_values[0].replace_scalar(text.clone());
         }
         entry.value = super::probe::cue_summary_string(&text);
     } else {
@@ -24481,8 +24852,8 @@ pub(super) fn reload_from_sidecar_cue(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![text.clone()],
-            per_file_originals: vec![String::new()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![text.clone()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -26728,8 +27099,8 @@ fn ensure_and_auto_populate_track_title_entries(
                     is_mixed: false,
                     has_multiple_stored_values: false,
                     per_file_stored_value_counts: Vec::new(),
-                    per_file_values: vec![String::new(); n],
-                    per_file_originals: vec![String::new(); n],
+                    per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
+                    per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n]),
                     mb_proposed_value: None,
                     mb_proposed_per_file: None,
                 });
@@ -26758,15 +27129,15 @@ fn ensure_and_auto_populate_track_title_entries(
         if tn_aligned && entries[tn_idx].per_file_values[i].is_empty() {
             if let Some(t) = parsed_track {
                 let value = t.to_string();
-                entries[tn_idx].per_file_values[i] = value.clone();
-                entries[tn_idx].per_file_originals[i] = value;
+                entries[tn_idx].per_file_values[i].replace_scalar(value.clone());
+                entries[tn_idx].per_file_originals[i] = value.into();
                 did_auto_populate = true;
             }
         }
         if title_aligned && entries[title_idx].per_file_values[i].is_empty() {
             if let Some(ref t) = parsed_title {
-                entries[title_idx].per_file_values[i] = t.clone();
-                entries[title_idx].per_file_originals[i] = t.clone();
+                entries[title_idx].per_file_values[i].replace_scalar(t.clone());
+                entries[title_idx].per_file_originals[i] = t.clone().into();
                 did_auto_populate = true;
             }
         }
@@ -26784,7 +27155,11 @@ fn ensure_and_auto_populate_track_title_entries(
         entries[idx].value = if !all_same {
             "<multiple values>".to_string()
         } else {
-            entries[idx].per_file_values.first().cloned().unwrap_or_default()
+            entries[idx]
+                .per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
 
         let originals_all_same = entries[idx]
@@ -26797,7 +27172,7 @@ fn ensure_and_auto_populate_track_title_entries(
             entries[idx]
                 .per_file_originals
                 .first()
-                .cloned()
+                .map(|values| values.as_str().to_string())
                 .unwrap_or_default()
         };
     }
@@ -27028,7 +27403,7 @@ fn editor_metadata_value(
         let value = entry
             .per_file_values
             .get(file_idx)
-            .map(String::as_str)
+            .map(crate::tui::probe::MetadataFieldValues::as_str)
             .unwrap_or(entry.value.as_str())
             .trim();
         return Some((!value.is_empty() && value != "<multiple values>").then(|| value.to_string()));
@@ -28260,8 +28635,8 @@ fn sort_disc_editor_entries(entries: &mut Vec<super::probe::TagEntry>, n_tracks:
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: vec![0; n_tracks],
-            per_file_values: vec![String::new(); n_tracks],
-            per_file_originals: vec![String::new(); n_tracks],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_tracks]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_tracks]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -28309,8 +28684,8 @@ pub fn build_dvda_editor_state(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vals.clone(),
-            per_file_originals: vals,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vals.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vals),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -28335,9 +28710,9 @@ pub fn build_dvda_editor_state(
             is_binary: false,
             is_mixed: !all_same,
             has_multiple_stored_values: false,
-            per_file_originals: values.clone(),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -28544,8 +28919,9 @@ pub(super) fn dvda_group_from_editor_state(state: &super::app::MetadataEditorSta
             entry
                 .per_file_values
                 .first()
+                .map(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| (!entry.value.trim().is_empty()).then_some(&entry.value))
+                .or_else(|| (!entry.value.trim().is_empty()).then_some(entry.value.as_str()))
         })
         .and_then(|value| value.trim().parse::<u8>().ok())
 }
@@ -29322,8 +29698,8 @@ fn push_dvdv_album_entry(
         is_mixed: false,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: vec![value.clone(); n_tracks],
-        per_file_originals: vec![value; n_tracks],
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.clone(); n_tracks]),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value; n_tracks]),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
@@ -29355,8 +29731,8 @@ fn push_dvdv_track_entry(
         is_mixed: !all_same && values.len() > 1,
         has_multiple_stored_values: false,
         per_file_stored_value_counts: Vec::new(),
-        per_file_values: values.clone(),
-        per_file_originals: values,
+        per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+        per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
         mb_proposed_value: None,
         mb_proposed_per_file: None,
     });
@@ -29718,7 +30094,11 @@ fn apply_dvda_entries_to_metabase(
                 let new_val = if entry_deleted {
                     String::new()
                 } else {
-                    entry.per_file_values.get(i).cloned().unwrap_or_default()
+                    entry
+                        .per_file_values
+                        .get(i)
+                        .map(|values| values.as_str().to_string())
+                        .unwrap_or_default()
                 };
                 if let Some(track) = super::dvda_metabase::track_mut(metabase, id) {
                     if new_val.is_empty() {
@@ -29933,8 +30313,8 @@ pub fn build_sacd_editor_state(
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vals.clone(),
-                per_file_originals: vals,
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vals.clone()),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vals),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -30026,9 +30406,9 @@ pub fn build_sacd_editor_state(
                 is_binary: false,
                 is_mixed: !all_same,
                 has_multiple_stored_values: false,
-                per_file_originals: values.clone(),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: values,
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -30692,7 +31072,11 @@ fn apply_sacd_entries_to_sidecar(
                 let new_val = if entry_deleted {
                     String::new()
                 } else {
-                    entry.per_file_values.get(i).cloned().unwrap_or_default()
+                    entry
+                        .per_file_values
+                        .get(i)
+                        .map(|values| values.as_str().to_string())
+                        .unwrap_or_default()
                 };
                 if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *tid) {
                     if new_val.is_empty() {
@@ -30884,7 +31268,7 @@ pub fn save_sacd_sidecar(
                         entry
                             .per_file_values
                             .get(editor_idx)
-                            .cloned()
+                            .map(|value| value.as_str().to_string())
                             .unwrap_or_default()
                     };
                     if let Some(track) = sidecar.tracks.iter_mut().find(|t| t.id == *sib_tid) {
@@ -35087,6 +35471,7 @@ fn handle_metadata_editor_mouse_in_area(
                     && state.detail_edit.is_none() =>
             {
                 state.detail_cursor = state.detail_cursor.saturating_sub(1);
+                metadata_editor_clamp_detail_value_cursor(&mut state);
                 ensure_detail_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
@@ -35102,6 +35487,7 @@ fn handle_metadata_editor_mouse_in_area(
                 if state.detail_cursor + 1 < n {
                     state.detail_cursor += 1;
                 }
+                metadata_editor_clamp_detail_value_cursor(&mut state);
                 ensure_detail_visible(&mut state);
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
@@ -35129,6 +35515,7 @@ fn handle_metadata_editor_mouse_in_area(
                         // context menu with field-level actions.
                         if state.detail_edit.is_some() {
                             state.detail_edit = None;
+                            state.detail_edit_add = false;
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         } else {
                             let detail_slot = in_content
@@ -35266,7 +35653,7 @@ fn handle_metadata_editor_mouse_in_area(
                                         let content = state.active_surface().entries[idx]
                                             .per_file_values
                                             .first()
-                                            .cloned()
+                                            .map(|values| values.as_str().to_string())
                                             .unwrap_or_else(|| state.active_surface().entries[idx].value.clone());
                                         let summary = format!(
                                             "{} (read-only · {})",
@@ -35336,12 +35723,19 @@ fn handle_metadata_editor_mouse_in_area(
                                     state.detail_cursor = file_idx;
                                     state.last_click = None;
                                 } else {
-                                    // Open inline edit for this file's value.
-                                    let val =
-                                        state.active_surface().entries[field_idx].per_file_values[file_idx].clone();
-                                    state.detail_edit =
-                                        Some(super::text_input::TextInputState::new_selected(val));
                                     state.detail_cursor = file_idx;
+                                    metadata_editor_clamp_detail_value_cursor(&mut state);
+                                    if metadata_editor_detail_is_set_valued(&state, field_idx) {
+                                        metadata_editor_begin_set_value_edit(app, &mut state, false);
+                                    } else {
+                                        let val = state.active_surface().entries[field_idx]
+                                            .per_file_values[file_idx]
+                                            .as_str()
+                                            .to_string();
+                                        state.detail_edit = Some(
+                                            super::text_input::TextInputState::new_selected(val),
+                                        );
+                                    }
                                     state.last_click = None;
                                 }
                             } else if is_double && state.read_only {
@@ -35350,6 +35744,7 @@ fn handle_metadata_editor_mouse_in_area(
                                 state.last_click = None;
                             } else {
                                 state.detail_cursor = file_idx;
+                                metadata_editor_clamp_detail_value_cursor(&mut state);
                                 state.last_click = Some((file_idx, now));
                             }
                             ensure_detail_visible(&mut state);
@@ -35969,30 +36364,50 @@ pub(super) fn metadata_editor_begin_detail_edit_for_entry(
     if entry.is_binary {
         return Some("metadata editor: cannot edit binary field".to_string());
     }
-    if entry.per_file_values.len() <= 1 {
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
+    if entry.per_file_values.len() <= 1 && !set_valued {
         return None;
     }
+    let apply_shared = set_valued && !entry.is_mixed;
 
     state.detail_field_idx = entry_idx;
     state.detail_cursor = 0;
+    state.detail_value_cursor = 0;
+    state.detail_apply_shared = apply_shared;
+    state.detail_edit_add = false;
     state.detail_scroll = 0;
     state.detail_edit = None;
     state.last_click = None;
     if edit_first_writable_slot {
-        let n = state.active_surface()
+        let n = state
+            .active_surface()
             .entries
             .get(entry_idx)
             .map(|entry| entry.per_file_values.len())
             .unwrap_or(0);
         if let Some(slot) = metadata_editor_first_writable_slot(state, entry_idx, n) {
             state.detail_cursor = slot;
-            if let Some(value) = state.active_surface()
+            if set_valued {
+                if let Some(value) = state
+                    .active_surface()
+                    .entries
+                    .get(entry_idx)
+                    .and_then(|entry| entry.per_file_values.get(slot))
+                    .and_then(|values| values.value_text(0))
+                {
+                    state.detail_edit = Some(super::text_input::TextInputState::new_selected(
+                        value.to_string(),
+                    ));
+                }
+            } else if let Some(value) = state
+                .active_surface()
                 .entries
                 .get(entry_idx)
                 .and_then(|entry| entry.per_file_values.get(slot))
-                .cloned()
             {
-                state.detail_edit = Some(super::text_input::TextInputState::new(value));
+                state.detail_edit = Some(super::text_input::TextInputState::new(
+                    value.as_str().to_string(),
+                ));
             }
         }
     }
@@ -36039,7 +36454,7 @@ fn metadata_editor_apply_inline_value_to_writable_slots(
     let mut updated = 0usize;
     for (idx, slot) in entry.per_file_values.iter_mut().enumerate() {
         if writable_slots.get(idx).copied().unwrap_or(true) {
-            *slot = new_value.clone();
+            slot.replace_scalar(new_value.clone());
             updated = updated.saturating_add(1);
         }
     }
@@ -36053,7 +36468,11 @@ pub(super) fn metadata_editor_recompute_entry_display(entry: &mut super::probe::
     entry.value = if entry.is_mixed {
         "<multiple values>".to_string()
     } else {
-        entry.per_file_values.first().cloned().unwrap_or_default()
+        entry
+            .per_file_values
+            .first()
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default()
     };
 }
 
@@ -36256,7 +36675,7 @@ fn metadata_editor_apply_detail_paste_with_mode(
     };
     for (slot, value) in &targets {
         if let Some(existing) = entry.per_file_values.get_mut(*slot) {
-            *existing = value.clone();
+            existing.replace_scalar(value.clone());
         }
     }
     metadata_editor_recompute_entry_display(entry);
@@ -54638,8 +55057,8 @@ mod phase4_tests {
             is_mixed: v.len() > 1 && !all_same,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: v,
-            per_file_originals: o,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(v),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(o),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -54655,6 +55074,80 @@ mod phase4_tests {
             vec!["01".to_string(), "02".to_string()],
             crate::tui::app::MetadataTechnicalDetails::default(),
         )
+    }
+
+    #[test]
+    fn set_valued_cursor_edit_always_enters_detail_mode() {
+        let mut composer = entry(
+            "COMPOSER",
+            ItemKey::Composer,
+            &["A; B", "A; B"],
+            &["A; B", "A; B"],
+        );
+        composer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+        ];
+        composer.per_file_originals = composer.per_file_values.clone();
+        composer.value = "A; B".to_string();
+        composer.original = composer.value.clone();
+        composer.is_mixed = false;
+
+        let mut state = two_file_editor(vec![composer]);
+        state.cursor = 0;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::DetailEdit);
+        assert!(state.edit_input.is_none());
+        assert!(state.detail_apply_shared);
+    }
+
+    #[test]
+    fn set_valued_detail_add_edit_reorder_remove_preserves_discrete_values() {
+        let mut composer = entry(
+            "COMPOSER",
+            ItemKey::Composer,
+            &["A; B", "A; B"],
+            &["A; B", "A; B"],
+        );
+        composer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+        ];
+        composer.per_file_originals = composer.per_file_values.clone();
+        composer.value = "A; B".to_string();
+        composer.original = composer.value.clone();
+        composer.is_mixed = false;
+
+        let mut state = two_file_editor(vec![composer]);
+        state.detail_field_idx = 0;
+        state.detail_cursor = 0;
+        state.detail_apply_shared = true;
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+
+        state.detail_edit_add = true;
+        state.detail_edit = Some(super::super::text_input::TextInputState::new("C".to_string()));
+        assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "B", "C"]);
+        }
+
+        state.detail_value_cursor = 1;
+        state.detail_edit = Some(super::super::text_input::TextInputState::new("B2".to_string()));
+        assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "B2", "C"]);
+        }
+
+        assert!(metadata_editor_move_selected_set_value(&mut app, &mut state, false));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "C", "B2"]);
+        }
+
+        assert!(metadata_editor_remove_selected_set_value(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "C"]);
+        }
     }
 
     #[test]
@@ -55061,7 +55554,7 @@ ignored".to_string()),
 
         let mut revert_app = AppState::new_for_test(TonepoetConfig::default());
         let mut revert_state = make_state();
-        revert_state.active_surface_mut().entries[0].per_file_values[0] = "Solo".to_string();
+        revert_state.active_surface_mut().entries[0].per_file_values[0].replace_scalar("Solo".to_string());
         metadata_editor_recompute_entry_display(&mut revert_state.active_surface_mut().entries[0]);
         revert_state.detail_cursor = 0;
         revert_state.detail_edit = Some(crate::tui::text_input::TextInputState::new(
@@ -55093,7 +55586,7 @@ ignored".to_string()),
         artist.has_multiple_stored_values = true;
         artist.per_file_stored_value_counts = vec![2];
         artist.mb_proposed_value = Some("New Artist".to_string());
-        artist.mb_proposed_per_file = Some(vec!["New Artist".to_string()]);
+        artist.mb_proposed_per_file = Some(crate::tui::probe::metadata_field_values_from_scalars(vec!["New Artist".to_string()]));
 
         let mut state = MetadataEditorState::for_files(
             vec![std::path::PathBuf::from("/tmp/a.flac")],
@@ -55153,10 +55646,10 @@ ignored".to_string()),
         artist.has_multiple_stored_values = true;
         artist.per_file_stored_value_counts = vec![2, 1];
         artist.mb_proposed_value = Some("<multiple values>".to_string());
-        artist.mb_proposed_per_file = Some(vec![
+        artist.mb_proposed_per_file = Some(crate::tui::probe::metadata_field_values_from_scalars(vec![
             "New Artist".to_string(),
             "New Scalar".to_string(),
-        ]);
+        ]));
 
         let mut state = MetadataEditorState::for_files(
             vec![
@@ -55221,10 +55714,10 @@ ignored".to_string()),
         artist.has_multiple_stored_values = true;
         artist.per_file_stored_value_counts = vec![2, 1];
         artist.mb_proposed_value = Some("<multiple values>".to_string());
-        artist.mb_proposed_per_file = Some(vec![
+        artist.mb_proposed_per_file = Some(crate::tui::probe::metadata_field_values_from_scalars(vec![
             "New Artist".to_string(),
             "New Scalar".to_string(),
-        ]);
+        ]));
 
         let mut state = MetadataEditorState::for_files(
             vec![
@@ -58371,8 +58864,7 @@ ignored".to_string()),
             state.active_surface().entries[composer_idx].row_scope,
             crate::tui::probe::RowScope::Track,
         );
-        state.active_surface_mut().entries[composer_idx].per_file_values[1] =
-            "Edited DVD-A Composer".to_string();
+        state.active_surface_mut().entries[composer_idx].per_file_values[1].replace_scalar("Edited DVD-A Composer".to_string());
 
         save_dvda_metabase_with_loaded_context(
             &state,
@@ -59805,11 +60297,11 @@ ignored".to_string()),
         assert!(state.active_surface().entries[album_artist_idx]
             .per_file_values
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert!(state.active_surface().entries[artist_idx]
             .per_file_values
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert_eq!(
             state.active_surface().entries[artist_idx].per_file_values.len(),
             4
@@ -60309,11 +60801,11 @@ ignored".to_string()),
         assert!(retained_state.active_surface().entries[retained_genre_idx]
             .per_file_values
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert!(retained_state.active_surface().entries[retained_artist_idx]
             .per_file_values
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert!(retained_state.active_surface().deleted.is_empty());
         assert_eq!(
             metadata_editor_apply_inline_value_to_writable_slots(
@@ -60368,11 +60860,11 @@ ignored".to_string()),
         assert!(retained_state.active_surface().entries[retained_isrc_idx]
             .per_file_values
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert!(retained_state.active_surface().entries[retained_isrc_idx]
             .per_file_originals
             .iter()
-            .all(String::is_empty));
+            .all(|values| values.is_empty()));
         assert!(retained_state.active_surface().deleted.is_empty());
         let second_text = std::fs::read_to_string(&cue_path).expect("second sidecar save");
         assert!(second_text.contains("REM GENRE \"Hard Rock\""));
@@ -60439,9 +60931,14 @@ ignored".to_string()),
                 .map(|entry| entry.per_file_values.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(row_values("ALBUM").first().map(String::as_str), Some("Corrected Album"));
-        assert!(row_values("ALBUMARTIST").iter().all(String::is_empty));
-        assert!(row_values("DATE").iter().all(String::is_empty));
+        assert_eq!(
+            row_values("ALBUM")
+                .first()
+                .map(crate::tui::probe::MetadataFieldValues::as_str),
+            Some("Corrected Album")
+        );
+        assert!(row_values("ALBUMARTIST").iter().all(|values| values.is_empty()));
+        assert!(row_values("DATE").iter().all(|values| values.is_empty()));
         assert!(row_values("GENRE").iter().all(|value| value == "Hard Rock"));
         assert_eq!(
             row_values("TITLE"),
@@ -60616,7 +61113,7 @@ ignored".to_string()),
             .expect("successful regen should create a sidecar write-back plan");
         assert_eq!(plan.audio_path.as_path(), audio.as_path());
         assert_eq!(plan.cue_path.as_path(), cue_path.as_path());
-        assert_eq!(plan.replacement_cuesheet, regenerated_cue);
+        assert_eq!(plan.replacement_cuesheet, regenerated_cue.as_str());
 
         let (session_id, generation) = state.begin_write();
         let image_result = crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
@@ -62065,15 +62562,30 @@ ignored".to_string()),
         let (state, _, _) = build_sacd_editor_state(&path, &md, Some(&sidecar)).expect("build");
         let by_key = |k: &str| state.active_surface().entries.iter().find(|e| e.display_key == k);
         assert_eq!(
-            by_key("MUSICBRAINZ_TRACKID").map(|e| e.per_file_values.clone()),
+            by_key("MUSICBRAINZ_TRACKID").map(|e| {
+                e.per_file_values
+                    .iter()
+                    .map(|values| values.as_str().to_string())
+                    .collect::<Vec<_>>()
+            }),
             Some(vec!["rec-1".to_string(), "rec-2".to_string()]),
         );
         assert_eq!(
-            by_key("MUSICBRAINZ_RELEASETRACKID").map(|e| e.per_file_values.clone()),
+            by_key("MUSICBRAINZ_RELEASETRACKID").map(|e| {
+                e.per_file_values
+                    .iter()
+                    .map(|values| values.as_str().to_string())
+                    .collect::<Vec<_>>()
+            }),
             Some(vec!["trk-1".to_string(), "trk-2".to_string()]),
         );
         assert_eq!(
-            by_key("MUSICBRAINZ_ARTISTID").map(|e| e.per_file_values.clone()),
+            by_key("MUSICBRAINZ_ARTISTID").map(|e| {
+                e.per_file_values
+                    .iter()
+                    .map(|values| values.as_str().to_string())
+                    .collect::<Vec<_>>()
+            }),
             Some(vec!["art-1".to_string(), "art-2".to_string()]),
         );
     }
@@ -62169,12 +62681,12 @@ ignored".to_string()),
             for entry in state.active_surface_mut().entries.iter_mut() {
                 match entry.display_key.as_str() {
                     "MUSICBRAINZ_ALBUMID" => {
-                        entry.per_file_values = vec!["alb-new".into(); 3];
+                        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["alb-new".into(); 3]);
                         entry.value = "alb-new".into();
                     }
                     "MUSICBRAINZ_TRACKID" => {
                         entry.per_file_values =
-                            vec!["rec-new-1".into(), "rec-new-2".into(), "rec-new-3".into()];
+                            crate::tui::probe::metadata_field_values_from_scalars(vec!["rec-new-1".into(), "rec-new-2".into(), "rec-new-3".into()]);
                         entry.value = "<multiple values>".into();
                         entry.is_mixed = true;
                     }
@@ -62257,7 +62769,7 @@ ignored".to_string()),
             // in the editor (built via push_per_track), so update each.
             for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "ARTIST" {
-                    entry.per_file_values = vec!["New".into(); 3];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["New".into(); 3]);
                     entry.value = "New".into();
                     entry.is_mixed = false;
                 }
@@ -62296,7 +62808,7 @@ ignored".to_string()),
         let (_td, reparsed) = round_trip_save(xml, |state| {
             for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "ALBUM" {
-                    entry.per_file_values = vec!["New Album".into(); 3];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["New Album".into(); 3]);
                     entry.value = "New Album".into();
                     entry.is_mixed = false;
                 }
@@ -62318,7 +62830,7 @@ ignored".to_string()),
         let (_td, reparsed) = round_trip_save(xml, |state| {
             for entry in state.active_surface_mut().entries.iter_mut() {
                 if entry.display_key == "TITLE" {
-                    entry.per_file_values = vec!["Alpha".into(), "Beta".into(), "Gamma".into()];
+                    entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha".into(), "Beta".into(), "Gamma".into()]);
                     entry.value = "<multiple values>".into();
                     entry.is_mixed = true;
                 }
@@ -62360,7 +62872,7 @@ ignored".to_string()),
                     "Composer 3".to_string(),
                 ],
             );
-            composer.per_file_values[1] = "Edited SACD Composer".to_string();
+            composer.per_file_values[1].replace_scalar("Edited SACD Composer".to_string());
             composer.value = "<multiple values>".to_string();
             composer.is_mixed = true;
         });
@@ -62398,7 +62910,7 @@ ignored".to_string()),
 
         for entry in state.active_surface_mut().entries.iter_mut() {
             if entry.display_key == "ARTIST" {
-                entry.per_file_values = vec!["".into()];
+                entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["".into()]);
                 entry.value = "".into();
                 entry.is_mixed = false;
             }
@@ -62990,7 +63502,7 @@ ignored".to_string()),
             .iter_mut()
             .find(|entry| entry.display_key == "TITLE")
             .expect("stereo TITLE");
-        title.per_file_values[0] = "Stereo New".into();
+        title.per_file_values[0].replace_scalar("Stereo New");
         title.value = "<multiple values>".into();
         title.is_mixed = true;
         stereo.dirty = true;
@@ -63005,7 +63517,7 @@ ignored".to_string()),
             .iter_mut()
             .find(|entry| entry.display_key == "TITLE")
             .expect("MCH TITLE");
-        title.per_file_values[0] = "MCH New".into();
+        title.per_file_values[0].replace_scalar("MCH New");
         title.value = "<multiple values>".into();
         title.is_mixed = true;
         mch.dirty = true;
@@ -63045,7 +63557,7 @@ ignored".to_string()),
                     .find(|e| e.display_key == "ALBUM")
                     .expect("ALBUM");
                 album.value = "NewAlbum".into();
-                album.per_file_values = vec!["NewAlbum".into(), "NewAlbum".into()];
+                album.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["NewAlbum".into(), "NewAlbum".into()]);
             },
         );
         assert!(outcome.mirror.sibling_present);
@@ -63077,7 +63589,7 @@ ignored".to_string()),
                     .find(|e| e.display_key == "TITLE")
                     .expect("TITLE");
                 // Edit track 1's title only.
-                title.per_file_values[0] = "NewTitle1".into();
+                title.per_file_values[0].replace_scalar("NewTitle1");
                 title.is_mixed = true;
                 title.value = "<multiple values>".into();
             },
@@ -63135,7 +63647,7 @@ ignored".to_string()),
                     .find(|e| e.display_key == "ALBUM")
                     .expect("ALBUM");
                 album.value = "New".into();
-                album.per_file_values = vec!["New".into(); 3];
+                album.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["New".into(); 3]);
             });
         assert!(outcome.mirror.sibling_present);
         assert_eq!(outcome.mirror.sibling_total, 2);
@@ -64014,8 +64526,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![original.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![original.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -64032,8 +64544,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: values.len() > 1,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: values.iter().map(|v| v.to_string()).collect(),
-            per_file_originals: values.iter().map(|v| v.to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|v| v.to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|v| v.to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -64176,7 +64688,7 @@ mod single_image_metadata_editor_regression_tests {
             .unwrap_or_else(|| panic!("missing {key} row"))
             .per_file_values
             .iter()
-            .map(String::as_str)
+            .map(crate::tui::probe::MetadataFieldValues::as_str)
             .collect()
     }
 
@@ -64266,8 +64778,8 @@ mod single_image_metadata_editor_regression_tests {
                 is_mixed: true,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["GBAYE0300334".to_string(), "".to_string()],
-                per_file_originals: vec!["GBAYE0300334".to_string(), "".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["GBAYE0300334".to_string(), "".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["GBAYE0300334".to_string(), "".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -64281,8 +64793,8 @@ mod single_image_metadata_editor_regression_tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["1".to_string(), "2".to_string()],
-                per_file_originals: vec!["1".to_string(), "2".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["1".to_string(), "2".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["1".to_string(), "2".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -64353,8 +64865,8 @@ mod single_image_metadata_editor_regression_tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
-                per_file_originals: vec!["album-artist-id".to_string(), "album-artist-id".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["album-artist-id".to_string(), "album-artist-id".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["album-artist-id".to_string(), "album-artist-id".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -64368,8 +64880,8 @@ mod single_image_metadata_editor_regression_tests {
                 is_mixed: true,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
-                per_file_originals: vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["FOREIGN000001".to_string(), "FOREIGN000002".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -65117,7 +65629,7 @@ mod single_image_metadata_editor_regression_tests {
         assert!(surface.pending_embedded_cuesheet_delete, "save path must retain an embedded-tag tombstone");
         assert!(!surface.embedded_cuesheet_present, "visible sidecar row must not masquerade as embedded");
         let cue = surface.entries.iter().find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET")).expect("sidecar CUESHEET row");
-        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(sidecar.as_str()));
+        assert_eq!(cue.per_file_values.first().map(|value| value.as_str()), Some(sidecar.as_str()));
         let title = surface.entries.iter().find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE")).expect("reshaped TITLE row");
         assert_eq!(title.per_file_values.len(), 3, "sidecar track count should reshape derived rows");
         assert!(title.per_file_values.iter().any(|title| title.contains("Sidecar Track 3")));
@@ -65269,8 +65781,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
-            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -65325,8 +65837,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
-            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -65379,8 +65891,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
-            per_file_originals: (1..=n_tracks).map(|idx| format!("Composer {idx}")).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars((1..=n_tracks).map(|idx| format!("Composer {idx}")).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -65702,7 +66214,7 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("embedded CUESHEET row");
-        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(stale_embedded.as_str()));
+        assert_eq!(cue.per_file_values.first().map(|value| value.as_str()), Some(stale_embedded.as_str()));
         assert_eq!(std::fs::read_to_string(&sidecar_path).expect("sidecar after cancel"), sidecar);
     }
 
@@ -65751,7 +66263,7 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("sidecar CUESHEET row after reshape");
-        assert_eq!(cue.per_file_values.first().map(String::as_str), Some(sidecar.as_str()));
+        assert_eq!(cue.per_file_values.first().map(|value| value.as_str()), Some(sidecar.as_str()));
         let title = surface
             .entries
             .iter()
@@ -66037,6 +66549,7 @@ mod single_image_metadata_editor_regression_tests {
             release_id: "mb-dsotm".to_string(),
             release_group_id: Some("rg-dsotm".to_string()),
             title: "The Dark Side Of The Moon".to_string(),
+            artist_values: vec!["Pink Floyd".to_string()],
             artist: "Pink Floyd".to_string(),
             artist_id: Some("artist-pink-floyd".to_string()),
             year: Some("1973".to_string()),
@@ -66052,8 +66565,8 @@ mod single_image_metadata_editor_regression_tests {
                     recording_id: Some(format!("recording-{position:02}")),
                     artist_id: Some(format!("track-artist-{position:02}")),
                     title: format!("MB Track {position}"),
-                    artist: "Pink Floyd".to_string(),
-                    composer: None,
+                    artist: vec!["Pink Floyd".to_string()],
+                    composer: Vec::new(),
                     isrc: Some(format!("GBAYE03003{position:02}")),
                     length_ms: Some(30_000),
                 })
@@ -66080,8 +66593,7 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
             .expect("TITLE row");
-        state.active_surface_mut().entries[title_idx].per_file_values[2] =
-            "Saved Embedded Authority Title".to_string();
+        state.active_surface_mut().entries[title_idx].per_file_values[2].replace_scalar("Saved Embedded Authority Title".to_string());
         state.active_surface_mut().dirty = true;
 
         assert!(
@@ -66101,7 +66613,7 @@ mod single_image_metadata_editor_regression_tests {
         for image in [&side_a, &side_b] {
             crate::tui::probe::write_all_tags(
                 image,
-                &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet.clone()))],
+                &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet.as_str().to_string()))],
             )
             .expect("write regenerated embedded CUESHEET through tag helper");
             assert_eq!(read_cuesheet_tag(image).as_deref(), Some(saved_sheet.trim()));
@@ -66165,7 +66677,7 @@ mod single_image_metadata_editor_regression_tests {
 
         crate::tui::probe::write_all_tags(
             &side_a,
-            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet))],
+            &[(lofty::tag::ItemKey::Unknown("CUESHEET".to_string()), Some(saved_sheet.as_str().to_string()))],
         )
         .expect("write side A embedded sheet");
         crate::tui::probe::write_all_tags(
@@ -66300,7 +66812,7 @@ mod single_image_metadata_editor_regression_tests {
             );
             if let Some(entry) = entry {
                 assert_ne!(
-                    entry.per_file_values.get(0).map(String::as_str),
+                    entry.per_file_values.get(0).map(|value| value.as_str()),
                     Some("recording-01"),
                     "track 1's recording id must never be written to member-image slot zero"
                 );
@@ -66309,7 +66821,7 @@ mod single_image_metadata_editor_regression_tests {
         assert!(
             surface.entries.iter().all(|entry| {
                 !entry.display_key.eq_ignore_ascii_case("MUSICBRAINZ_TRACKID")
-                    || entry.per_file_values.get(0).map(String::as_str) != Some("recording-01")
+                    || entry.per_file_values.get(0).map(|value| value.as_str()) != Some("recording-01")
             }),
             "no unified production-built row may preserve track 1's recording id as a member-image value"
         );
@@ -66495,8 +67007,8 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
             .expect("CUESHEET row after edit");
-        assert_eq!(cue_entry.per_file_values.first().map(String::as_str), Some(edited.as_str()));
-        assert_eq!(cue_entry.per_file_originals.first().map(String::as_str), Some(original.trim()));
+        assert_eq!(cue_entry.per_file_values.first().map(|value| value.as_str()), Some(edited.as_str()));
+        assert_eq!(cue_entry.per_file_originals.first().map(|value| value.as_str()), Some(original.trim()));
         assert!(state.active_surface().dirty, "edit must be staged, not directly written");
         let title = state
             .active_surface()
@@ -66600,7 +67112,7 @@ mod single_image_metadata_editor_regression_tests {
                 "B2".to_string(),
             ]
         );
-        title.per_file_values[2] = "Edited B1".to_string();
+        title.per_file_values[2].replace_scalar("Edited B1".to_string());
         title.value = "<multiple values>".to_string();
         title.is_mixed = true;
         state.active_surface_mut().dirty = true;
@@ -66778,19 +67290,20 @@ mod single_image_metadata_editor_regression_tests {
         let release = crate::tui::musicbrainz::MbRelease {
             release_id: "mb-two-sides".to_string(),
             title: "Two Sides".to_string(),
+            artist_values: vec!["Artist".to_string()],
             artist: "Artist".to_string(),
             disc_count: 1,
             tracks: vec![
                 crate::tui::musicbrainz::MbTrack {
                     position: 1,
                     title: "MB Side A".to_string(),
-                    artist: "Artist".to_string(),
+                    artist: vec!["Artist".to_string()],
                     ..Default::default()
                 },
                 crate::tui::musicbrainz::MbTrack {
                     position: 2,
                     title: "MB Side B".to_string(),
-                    artist: "Artist".to_string(),
+                    artist: vec!["Artist".to_string()],
                     ..Default::default()
                 },
             ],
@@ -66842,8 +67355,8 @@ mod single_image_metadata_editor_regression_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")],
-            per_file_originals: vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![base_sheet("side-a.flac"), base_sheet("side-b.flac")]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -66878,7 +67391,7 @@ mod single_image_metadata_editor_regression_tests {
                 .iter()
                 .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
                 .and_then(|entry| entry.per_file_values.first())
-                .map(String::as_str)
+                .map(crate::tui::probe::MetadataFieldValues::as_str)
                 .unwrap_or_default();
             assert_eq!(
                 whole_file_title,
@@ -66949,13 +67462,14 @@ mod single_image_metadata_editor_regression_tests {
         let release = crate::tui::musicbrainz::MbRelease {
             release_id: "mb-dsotm".to_string(),
             title: "The Dark Side Of The Moon".to_string(),
+            artist_values: vec!["Pink Floyd".to_string()],
             artist: "Pink Floyd".to_string(),
             disc_count: 1,
             tracks: (1..=10)
                 .map(|position| crate::tui::musicbrainz::MbTrack {
                     position,
                     title: format!("MB Track {position}"),
-                    artist: "Pink Floyd".to_string(),
+                    artist: vec!["Pink Floyd".to_string()],
                     ..Default::default()
                 })
                 .collect(),
@@ -66983,8 +67497,8 @@ mod single_image_metadata_editor_regression_tests {
             .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
             .expect("unified TITLE row");
         assert_eq!(title.per_file_values.len(), 10);
-        assert_eq!(title.per_file_values.first().map(String::as_str), Some("MB Track 1"));
-        assert_eq!(title.per_file_values.last().map(String::as_str), Some("MB Track 10"));
+        assert_eq!(title.per_file_values.first().map(|value| value.as_str()), Some("MB Track 1"));
+        assert_eq!(title.per_file_values.last().map(|value| value.as_str()), Some("MB Track 10"));
 
         assert!(regenerate_cuesheet_for_save(&mut state).expect("unified synthetic CUE regen"));
         let cue_row = state
@@ -66998,7 +67512,7 @@ mod single_image_metadata_editor_regression_tests {
         assert!(cue_row.per_file_values[0].contains("FILE"));
         assert!(cue_row.per_file_values[0].contains("TRACK 10 AUDIO"));
         assert!(cue_row.per_file_values[0].contains("TITLE \"MB Track 10\""));
-        assert_eq!(cue_row.per_file_originals.first().map(String::as_str), Some(stale_embedded_side_a.trim()));
+        assert_eq!(cue_row.per_file_originals.first().map(|value| value.as_str()), Some(stale_embedded_side_a.trim()));
     }
 
     #[test]
@@ -67839,8 +68353,8 @@ mod single_image_metadata_editor_regression_tests {
             .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
             .expect("TITLE row");
         assert_eq!(title.per_file_values.len(), 4, "one unified surface exposes all tracks");
-        assert_eq!(title.per_file_values.first().map(String::as_str), Some("side_a Track 1"));
-        assert_eq!(title.per_file_values.last().map(String::as_str), Some("side_b Track 2"));
+        assert_eq!(title.per_file_values.first().map(|value| value.as_str()), Some("side_a Track 1"));
+        assert_eq!(title.per_file_values.last().map(|value| value.as_str()), Some("side_b Track 2"));
     }
 
     #[test]
@@ -67940,7 +68454,7 @@ mod single_image_metadata_editor_regression_tests {
                 .iter()
                 .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
                 .and_then(|entry| entry.per_file_values.first())
-                .map(String::as_str);
+                .map(crate::tui::probe::MetadataFieldValues::as_str);
             assert_eq!(album_value, Some(expected_album));
             let date_values = surface
                 .entries
@@ -67949,7 +68463,7 @@ mod single_image_metadata_editor_regression_tests {
                 .map(|entry| entry.per_file_values.clone())
                 .unwrap_or_default();
             assert!(
-                date_values.iter().all(String::is_empty),
+                date_values.iter().all(|values| values.is_empty()),
                 "selected CUE authority must not inherit an absent DATE from image tags: {date_values:?}"
             );
             if expected_embedded {
@@ -68513,7 +69027,7 @@ mod single_image_metadata_editor_regression_tests {
         album_entry.value = "80's Movie Hits Corrected".to_string();
         album_entry.is_mixed = false;
         for value in &mut album_entry.per_file_values {
-            *value = "80's Movie Hits Corrected".to_string();
+            value.replace_scalar("80's Movie Hits Corrected");
         }
         state.active_surface_mut().dirty = true;
         state.close_after_successful_save = false;
@@ -68991,7 +69505,7 @@ mod single_image_metadata_editor_regression_tests {
             .expect("side A TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Edited Cue A1".to_string();
+            title.per_file_values[0].replace_scalar("Edited Cue A1".to_string());
             cue_album_recompute_entry_display(title);
         }
         recalc_dirty(&mut state);
@@ -69061,7 +69575,7 @@ mod single_image_metadata_editor_regression_tests {
             .expect("side B COMPOSER row");
         {
             let composer = &mut state.active_surface_mut().entries[composer_index];
-            composer.per_file_values[0] = "Edited Composer B1".to_string();
+            composer.per_file_values[0].replace_scalar("Edited Composer B1".to_string());
             cue_album_recompute_entry_display(composer);
         }
         recalc_dirty(&mut state);
@@ -69261,7 +69775,7 @@ mod single_image_metadata_editor_regression_tests {
             1,
             "{key} must be album-dimensioned for a single-image CUE"
         );
-        entry.per_file_values[0] = value.to_string();
+        entry.per_file_values[0].replace_scalar(value.to_string());
         entry.value = value.to_string();
     }
 
@@ -69824,7 +70338,7 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
             .and_then(|entry| entry.per_file_values.first())
-            .map(String::as_str);
+            .map(crate::tui::probe::MetadataFieldValues::as_str);
         assert_eq!(album_value, Some("Get Off Real WavPack Save"));
     }
 
@@ -70462,7 +70976,9 @@ mod metadata_cue_source_coverage_tests {
             .find(|entry| entry.display_key.eq_ignore_ascii_case(display_key))
             .unwrap_or_else(|| panic!("missing transfer row {display_key}"))
             .per_file_values
-            .clone()
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect()
     }
 
     #[test]
@@ -70668,14 +71184,14 @@ mod metadata_cue_source_coverage_tests {
         {
             let composer = &mut state.active_surface_mut().entries[composer_index];
             composer.row_scope = crate::tui::probe::RowScope::Track;
-            composer.per_file_values = vec![
+            composer.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![
                 "Composer Two".to_string(),
                 "Composer One".to_string(),
                 "Composer Three".to_string(),
-            ];
+            ]);
             composer.per_file_originals = composer.per_file_values.clone();
             composer.per_file_stored_value_counts = vec![1, 1, 1];
-            composer.per_file_values[0] = "Edited Composer Two".to_string();
+            composer.per_file_values[0].replace_scalar("Edited Composer Two".to_string());
             cue_album_recompute_entry_display(composer);
         }
         assert_eq!(
@@ -70845,7 +71361,7 @@ mod metadata_cue_source_coverage_tests {
             .expect("TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Edited Cue Two".to_string();
+            title.per_file_values[0].replace_scalar("Edited Cue Two".to_string());
             cue_album_recompute_entry_display(title);
         }
         recalc_dirty(&mut state);
@@ -72093,7 +72609,7 @@ FILE "a.flac" WAVE
             .expect("sidecar TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Sidecar Routed Title".to_string();
+            title.per_file_values[0].replace_scalar("Sidecar Routed Title".to_string());
             cue_album_recompute_entry_display(title);
         }
         recalc_dirty(&mut state);
@@ -72148,7 +72664,7 @@ FILE "a.flac" WAVE
             .expect("embedded TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Embedded Routed Title".to_string();
+            title.per_file_values[0].replace_scalar("Embedded Routed Title".to_string());
             cue_album_recompute_entry_display(title);
         }
         recalc_dirty(&mut state);
@@ -72227,7 +72743,7 @@ FILE "a.flac" WAVE
             .expect("ordinary TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Edited Bonus Only".to_string();
+            title.per_file_values[0].replace_scalar("Edited Bonus Only".to_string());
             title.value = "Edited Bonus Only".to_string();
         }
         recalc_dirty(&mut state);
@@ -72279,7 +72795,7 @@ FILE "a.flac" WAVE
                 .iter()
                 .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
                 .and_then(|entry| entry.per_file_values.first())
-                .map(String::as_str),
+                .map(crate::tui::probe::MetadataFieldValues::as_str),
             Some("Edited Bonus Only")
         );
     }
@@ -73049,7 +73565,7 @@ FILE "a.flac" WAVE
             .expect("Album A track TITLE row");
         {
             let title = &mut state.active_surface_mut().entries[title_index];
-            title.per_file_values[0] = "Album A Edited Track".to_string();
+            title.per_file_values[0].replace_scalar("Album A Edited Track".to_string());
             cue_album_recompute_entry_display(title);
         }
         recalc_dirty(&mut state);
@@ -73671,7 +74187,7 @@ FILE "a.flac" WAVE
             .iter_mut()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
             .expect("ALBUM row");
-        album_entry.per_file_values = vec!["Edited Album".to_string(); 2];
+        album_entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Edited Album".to_string(); 2]);
         album_entry.value = "Edited Album".to_string();
         let n_paths = state.active_surface().paths.len();
         let title_entry = state
@@ -73683,7 +74199,7 @@ FILE "a.flac" WAVE
                     && entry.is_track_scoped(n_paths)
             })
             .expect("track TITLE row");
-        title_entry.per_file_values[2] = "Disc Two Changed".to_string();
+        title_entry.per_file_values[2].replace_scalar("Disc Two Changed".to_string());
         state.active_surface_mut().dirty = true;
         assert!(regenerate_cuesheet_for_save(state).expect("regenerate member sheets"));
         let cue_entry = state
@@ -73932,7 +74448,7 @@ FILE "03.dff" WAVE
                 super::super::probe::canonical_metadata_display_key(&entry.display_key) == key
             })
             .and_then(|entry| entry.per_file_values.get(index))
-            .cloned()
+            .map(|values| values.as_str().to_string())
             .unwrap_or_default()
     }
 
@@ -73973,8 +74489,8 @@ FILE "03.dff" WAVE
             has_multiple_stored_values: false,
             row_scope: super::super::probe::RowScope::File,
             per_file_stored_value_counts: vec![1; values.len()],
-            per_file_originals: values.clone(),
-            per_file_values: values,
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -74606,8 +75122,8 @@ FILE "03.flac" WAVE
                 has_multiple_stored_values: false,
                 row_scope: super::super::probe::RowScope::File,
                 per_file_stored_value_counts: vec![1, 1],
-                per_file_values: vec!["New One".to_string(), "New Two".to_string()],
-                per_file_originals: vec!["New One".to_string(), "New Two".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["New One".to_string(), "New Two".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["New One".to_string(), "New Two".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             }];
@@ -75206,8 +75722,8 @@ mod untaggable_carrier_sidecar_regression_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: vec![0; n_files],
-            per_file_values: vec!["ripped 1984".to_string(); n_files],
-            per_file_originals: vec![String::new(); n_files],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["ripped 1984".to_string(); n_files]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_files]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -75730,8 +76246,8 @@ mod untaggable_carrier_sidecar_regression_tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: vec![1, 1],
-            per_file_values: vec!["Album A".to_string(), "Album B".to_string()],
-            per_file_originals: vec!["Album A".to_string(), "Album B".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Album A".to_string(), "Album B".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Album A".to_string(), "Album B".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };
@@ -75874,8 +76390,8 @@ mod metadata_cuesheet_pill_click_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()],
-            per_file_originals: vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["TITLE \"Album\"\nFILE \"a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -75947,8 +76463,8 @@ mod mb_picker_verification_lifecycle_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![value.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -76044,7 +76560,7 @@ mod mb_picker_verification_lifecycle_tests {
         {
             let surface = state.active_surface_mut();
             surface.entries[0].value = "Unsaved Album".to_string();
-            surface.entries[0].per_file_values = vec!["Unsaved Album".to_string()];
+            surface.entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Unsaved Album".to_string()]);
             surface.dirty = true;
         }
         let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
@@ -76121,7 +76637,7 @@ mod mb_picker_verification_lifecycle_tests {
         {
             let surface = state.active_surface_mut();
             surface.entries[0].value = "Unsaved Album".to_string();
-            surface.entries[0].per_file_values = vec!["Unsaved Album".to_string()];
+            surface.entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Unsaved Album".to_string()]);
             surface.dirty = true;
         }
         let (request_id, prepare_cancel) = state.begin_tag_transfer_preparation();
@@ -76292,8 +76808,8 @@ mod metadata_editor_inline_navigation_tests {
             is_mixed: mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_originals: per_file_values.clone(),
-            per_file_values,
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.clone()),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }

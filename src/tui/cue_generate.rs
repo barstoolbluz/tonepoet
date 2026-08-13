@@ -170,7 +170,7 @@ pub fn cue_from_mb_release(
             artist: if t.artist.is_empty() {
                 release.artist.clone()
             } else {
-                t.artist.clone()
+                t.artist.join("; ")
             },
             track_number: t.position,
             duration: Duration::from_millis(length_ms as u64),
@@ -760,7 +760,8 @@ pub fn fill_cue_with_mb(
             if fill_string(&mut t.title, &mt.title) {
                 stats.titles_filled += 1;
             }
-            if fill_string(&mut t.artist, &mt.artist) {
+            let artist = mt.artist.join("; ");
+            if fill_string(&mut t.artist, &artist) {
                 stats.artists_filled += 1;
             }
             if fill_opt(&mut t.isrc, mt.isrc.as_deref()) {
@@ -802,7 +803,8 @@ pub fn apply_mb_overrides(
     for t in tracks.iter_mut() {
         if let Some(mt) = mb.tracks.iter().find(|m| m.position == t.track_number) {
             replace_if_better(&mut t.title, &mt.title);
-            replace_if_better(&mut t.artist, &mt.artist);
+            let artist = mt.artist.join("; ");
+            replace_if_better(&mut t.artist, &artist);
             set_opt_if_better(&mut t.isrc, mt.isrc.as_deref());
         }
     }
@@ -1024,13 +1026,14 @@ mod tests {
         let mb = MbRelease {
             release_id: "x".to_string(),
             title: "MB Title".to_string(),
+            artist_values: vec!["MB Artist".to_string()],
             artist: "MB Artist".to_string(),
             year: Some("1971".to_string()),
             barcode: Some("MB-BARCODE".to_string()),
             tracks: vec![MbTrack {
                 position: 1,
                 title: "MB Track 1".to_string(),
-                artist: "MB Performer".to_string(),
+                artist: vec!["MB Performer".to_string()],
                 isrc: Some("USRC17607839".to_string()),
                 ..Default::default()
             }],
@@ -1074,6 +1077,7 @@ mod tests {
         let mb = MbRelease {
             release_id: "x".to_string(),
             title: "MB".to_string(),
+            artist_values: vec!["MB".to_string()],
             artist: "MB".to_string(),
             year: Some("1972".to_string()),
             barcode: Some("X".to_string()),
@@ -1103,6 +1107,7 @@ mod tests {
         let mb = MbRelease {
             release_id: "x".to_string(),
             title: "MB Title".to_string(),
+            artist_values: vec!["MB Artist".to_string()],
             artist: "MB Artist".to_string(),
             year: Some("1971".to_string()),
             barcode: Some("0044007735428".to_string()),
@@ -1110,7 +1115,7 @@ mod tests {
                 MbTrack {
                     position: 1,
                     title: "MB Track 1".to_string(),
-                    artist: "Track Artist 1".to_string(),
+                    artist: vec!["Track Artist 1".to_string()],
                     isrc: Some("USRC17607839".to_string()),
                     ..Default::default()
                 },
@@ -1149,8 +1154,8 @@ mod tests {
             recording_id: None,
             artist_id: None,
             title: title.into(),
-            artist: String::new(),
-            composer: None,
+            artist: Vec::new(),
+            composer: Vec::new(),
             isrc: isrc.map(String::from),
             length_ms,
         }
@@ -1163,6 +1168,7 @@ mod tests {
             release_group_id: None,
             artist_id: None,
             title: "Album".into(),
+            artist_values: vec!["Artist".into()],
             artist: "Artist".into(),
             year: Some("1970".into()),
             original_date: None,
@@ -1213,6 +1219,7 @@ mod tests {
             release_group_id: None,
             artist_id: None,
             title: "Album".into(),
+            artist_values: vec!["Artist".into()],
             artist: "Artist".into(),
             year: None,
             original_date: None,
@@ -1243,6 +1250,7 @@ mod tests {
             release_group_id: None,
             artist_id: None,
             title: "Album".into(),
+            artist_values: vec!["Artist".into()],
             artist: "Artist".into(),
             year: None,
             original_date: None,

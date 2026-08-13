@@ -7849,6 +7849,14 @@ pub struct MetadataEditorModel {
     pub phase: MetadataEditorPhase,
     pub detail_field_idx: usize,
     pub detail_cursor: usize,
+    /// Selected value within the current detail slot for set-valued fields.
+    pub detail_value_cursor: usize,
+    /// True when a set-valued field is shared across all slots and detail
+    /// mutations should fan out to every writable slot.
+    pub detail_apply_shared: bool,
+    /// True while the detail input is creating a new value rather than
+    /// replacing the selected value.
+    pub detail_edit_add: bool,
     pub detail_scroll: usize,
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
     pub mb_back: Option<MbBackCache>,
@@ -7905,6 +7913,9 @@ impl Default for MetadataEditorModel {
             phase: MetadataEditorPhase::Editing,
             detail_field_idx: 0,
             detail_cursor: 0,
+            detail_value_cursor: 0,
+            detail_apply_shared: false,
+            detail_edit_add: false,
             detail_scroll: 0,
             detail_edit: None,
             mb_back: None,
@@ -8730,6 +8741,9 @@ impl MetadataEditorState {
         self.edit_input = None;
         self.add_key_input = None;
         self.detail_edit = None;
+        self.detail_edit_add = false;
+        self.detail_apply_shared = false;
+        self.detail_value_cursor = 0;
         self.file_picker = None;
         self.pending_artwork_type = None;
         self.phase = MetadataEditorPhase::Editing;
@@ -8922,6 +8936,9 @@ impl MetadataEditorState {
         self.add_key_input = None;
         self.detail_field_idx = 0;
         self.detail_cursor = 0;
+        self.detail_value_cursor = 0;
+        self.detail_apply_shared = false;
+        self.detail_edit_add = false;
         self.detail_scroll = 0;
         self.detail_edit = None;
         self.phase = MetadataEditorPhase::Editing;
@@ -9229,14 +9246,6 @@ fn mark_presentation_tab_saved(tab: &mut PresentationTab) {
     tab.deleted.clear();
 }
 
-fn scalar_stored_value_count(value: &str) -> usize {
-    if value.trim().is_empty() {
-        0
-    } else {
-        1
-    }
-}
-
 fn refresh_stored_value_summary(entry: &mut crate::tui::probe::TagEntry) {
     if !entry.per_file_stored_value_counts.is_empty() {
         entry.has_multiple_stored_values = entry
@@ -9253,7 +9262,7 @@ fn mark_tag_entry_saved(entry: &mut crate::tui::probe::TagEntry) {
         for idx in 0..entry.per_file_values.len() {
             if entry.per_file_values[idx] != entry.per_file_originals[idx] {
                 entry.per_file_stored_value_counts[idx] =
-                    scalar_stored_value_count(&entry.per_file_values[idx]);
+                    entry.per_file_values[idx].value_count();
             }
         }
         refresh_stored_value_summary(entry);
@@ -9658,7 +9667,7 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
                     entry.per_file_originals[idx] = entry.per_file_values[idx].clone();
                     if changed && entry.per_file_stored_value_counts.len() == path_count {
                         entry.per_file_stored_value_counts[idx] =
-                            scalar_stored_value_count(&entry.per_file_values[idx]);
+                            entry.per_file_values[idx].value_count();
                     }
                 }
             }
@@ -9762,7 +9771,11 @@ fn recompute_tag_entry_display(entry: &mut crate::tui::probe::TagEntry) {
     entry.value = if entry.is_mixed {
         "<multiple values>".to_string()
     } else {
-        entry.per_file_values.first().cloned().unwrap_or_default()
+        entry
+            .per_file_values
+            .first()
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default()
     };
 }
 
@@ -9795,7 +9808,10 @@ fn copy_musicbrainz_entries_preserving_originals(
                 dst.mb_proposed_value = Some(src.value.clone());
                 dst.mb_proposed_per_file = Some(dst.per_file_values.clone());
                 if dst.per_file_originals.len() != dst.per_file_values.len() {
-                    dst.per_file_originals.resize(dst.per_file_values.len(), String::new());
+                    dst.per_file_originals.resize(
+                        dst.per_file_values.len(),
+                        crate::tui::probe::MetadataFieldValues::default(),
+                    );
                 }
             }
             None => {
@@ -9807,7 +9823,8 @@ fn copy_musicbrainz_entries_preserving_originals(
                 // for this field.
                 entry.clear_stored_value_provenance();
                 entry.per_file_values = values.clone();
-                entry.per_file_originals = vec![String::new(); values.len()];
+                entry.per_file_originals =
+                    vec![crate::tui::probe::MetadataFieldValues::default(); values.len()];
                 entry.value = src.value.clone();
                 entry.original = String::new();
                 entry.mb_proposed_value = Some(src.value.clone());
@@ -9827,7 +9844,7 @@ fn entry_was_populated_from_musicbrainz(entry: &crate::tui::probe::TagEntry) -> 
 fn normalize_entry_values_for_track_count(
     src: &crate::tui::probe::TagEntry,
     track_count: usize,
-) -> Vec<String> {
+) -> Vec<crate::tui::probe::MetadataFieldValues> {
     if src.per_file_values.len() == track_count {
         src.per_file_values.clone()
     } else if src.per_file_values.len() == 1 {
@@ -16604,8 +16621,8 @@ mod metadata_presentation_tab_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
-            per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|v| (*v).to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|v| (*v).to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -16645,7 +16662,7 @@ mod metadata_presentation_tab_tests {
         changed.is_mixed = true;
         changed.has_multiple_stored_values = true;
         changed.per_file_stored_value_counts = vec![2, 1];
-        changed.per_file_values[0] = "Solo".to_string();
+        changed.per_file_values[0].replace_scalar("Solo".to_string());
         mark_tag_entry_saved(&mut changed);
         assert_eq!(changed.per_file_stored_value_counts, vec![1, 1]);
         assert!(!changed.has_multiple_stored_values);
@@ -16677,7 +16694,7 @@ mod metadata_presentation_tab_tests {
         ];
         let mut state = state_with_tabs(tabs, 0);
         state.active_surface_mut().entries[0].value = "edited mch".to_string();
-        state.active_surface_mut().entries[0].per_file_values = vec!["edited mch".to_string()];
+        state.active_surface_mut().entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["edited mch".to_string()]);
         state.active_surface_mut().dirty = true;
 
         assert!(state.switch_presentation_tab(1));
@@ -16813,7 +16830,7 @@ mod metadata_presentation_tab_tests {
         );
         dirty_active.dirty = true;
         dirty_active.entries[0].value = "edited active".to_string();
-        dirty_active.entries[0].per_file_values = vec!["edited active".to_string()];
+        dirty_active.entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["edited active".to_string()]);
 
         let mut dirty_sibling = tab(
             PresentationId::DvdAudioGroup(3),
@@ -16823,11 +16840,11 @@ mod metadata_presentation_tab_tests {
         );
         dirty_sibling.dirty = true;
         dirty_sibling.entries[0].value = "edited sibling".to_string();
-        dirty_sibling.entries[0].per_file_values = vec!["edited sibling".to_string()];
+        dirty_sibling.entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["edited sibling".to_string()]);
 
         let mut state = state_with_tabs(vec![dirty_active, dirty_sibling], 0);
         state.active_surface_mut().entries[0].value = "edited active".to_string();
-        state.active_surface_mut().entries[0].per_file_values = vec!["edited active".to_string()];
+        state.active_surface_mut().entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["edited active".to_string()]);
         state.active_surface_mut().dirty = true;
 
         state.mark_active_presentation_saved();
@@ -17237,7 +17254,7 @@ mod metadata_presentation_tab_tests {
     fn stale_save_completion_wrong_session_is_ignored() {
         let mut state = write_state();
         let (session_id, generation) = state.begin_write();
-        state.active_surface_mut().entries[0].per_file_values[0] = "new one".to_string();
+        state.active_surface_mut().entries[0].per_file_values[0].replace_scalar("new one".to_string());
 
         let ignored = state.apply_write_results(
             session_id.saturating_add(10_000),
@@ -17254,7 +17271,7 @@ mod metadata_presentation_tab_tests {
     fn stale_save_completion_wrong_generation_is_ignored() {
         let mut state = write_state();
         let (session_id, generation) = state.begin_write();
-        state.active_surface_mut().entries[0].per_file_values[0] = "new one".to_string();
+        state.active_surface_mut().entries[0].per_file_values[0].replace_scalar("new one".to_string());
 
         let ignored = state.apply_write_results(
             session_id,
@@ -17308,7 +17325,7 @@ mod metadata_presentation_tab_tests {
     #[test]
     fn partial_save_updates_originals_for_successful_files_only() {
         let mut state = write_state();
-        state.active_surface_mut().entries[0].per_file_values = vec!["new one".to_string(), "new two".to_string()];
+        state.active_surface_mut().entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["new one".to_string(), "new two".to_string()]);
         state.active_surface_mut().dirty = true;
         let (session_id, generation) = state.begin_write();
 
@@ -17357,7 +17374,7 @@ mod metadata_presentation_tab_tests {
             .entries
             .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
         let row_idx = state.active_surface().entries.len() - 1;
-        state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
+        state.active_surface_mut().entries[row_idx].per_file_values[2].replace_scalar("Edited".to_string());
         state.active_surface_mut().dirty = true;
         let (session_id, generation) = state.begin_write();
 
@@ -17411,14 +17428,14 @@ mod metadata_presentation_tab_tests {
             // already persisted.
             let cue_idx = state.active_surface().entries.len() - 1;
             let entry = &mut state.active_surface_mut().entries[cue_idx];
-            entry.per_file_values = vec!["SHEET-NEW-A".to_string(), "SHEET-NEW-B".to_string()];
+            entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["SHEET-NEW-A".to_string(), "SHEET-NEW-B".to_string()]);
         }
         state
             .active_surface_mut()
             .entries
             .push(tag("TITLE", "<multiple values>", vec!["T1", "T2", "T3", "T4"]));
         let row_idx = state.active_surface().entries.len() - 1;
-        state.active_surface_mut().entries[row_idx].per_file_values[2] = "Edited".to_string();
+        state.active_surface_mut().entries[row_idx].per_file_values[2].replace_scalar("Edited".to_string());
         state.active_surface_mut().dirty = true;
         let (session_id, generation) = state.begin_write();
 
@@ -17472,14 +17489,14 @@ mod metadata_presentation_tab_tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
-                per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
             tag("TITLE", "<multiple values>", vec!["A1", "A2", "B1", "B2"]),
         ];
-        state.active_surface_mut().entries[1].per_file_values[2] = "B1 edited".to_string();
+        state.active_surface_mut().entries[1].per_file_values[2].replace_scalar("B1 edited".to_string());
         state.active_surface_mut().dirty = true;
 
         let (session_id, generation) = state.begin_write();
@@ -17566,14 +17583,14 @@ mod metadata_presentation_tab_tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()],
-                per_file_originals: vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["new synthetic sheet".to_string(), "new synthetic sheet".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["old synthetic sheet".to_string(), "old synthetic sheet".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
             tag("TITLE", "<multiple values>", vec!["A1", "A2", "B1", "B2"]),
         ];
-        state.active_surface_mut().entries[1].per_file_values[2] = "B1 edited".to_string();
+        state.active_surface_mut().entries[1].per_file_values[2].replace_scalar("B1 edited".to_string());
         state.active_surface_mut().dirty = true;
 
         let (session_id, generation) = state.begin_write();
@@ -17639,7 +17656,7 @@ mod metadata_presentation_tab_tests {
             vec!["01", "02", "03", "04"],
         ));
         let row_idx = state.active_surface().entries.len() - 1;
-        state.active_surface_mut().entries[row_idx].per_file_values[2] = "99".to_string();
+        state.active_surface_mut().entries[row_idx].per_file_values[2].replace_scalar("99".to_string());
         state.active_surface_mut().dirty = true;
         let (session_id, generation) = state.begin_write();
 
@@ -17854,7 +17871,7 @@ mod metadata_presentation_tab_tests {
     #[test]
     fn failed_and_skipped_writes_become_durable_file_issues() {
         let mut state = write_state();
-        state.active_surface_mut().entries[0].per_file_values = vec!["new one".to_string(), "new two".to_string()];
+        state.active_surface_mut().entries[0].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["new one".to_string(), "new two".to_string()]);
         let (session_id, generation) = state.begin_write();
 
         let summary = state
@@ -17912,7 +17929,7 @@ mod metadata_presentation_tab_tests {
     fn partial_save_preserves_non_file_aligned_deleted_rows() {
         let mut state = write_state();
         let mut synthetic = tag("CUESHEET", "cue", vec!["cue row one"]);
-        synthetic.per_file_values = vec!["cue row one".to_string(), "cue row two".to_string(), "cue row three".to_string()];
+        synthetic.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["cue row one".to_string(), "cue row two".to_string(), "cue row three".to_string()]);
         synthetic.per_file_originals = synthetic.per_file_values.clone();
         state.active_surface_mut().entries.push(synthetic);
         state.active_surface_mut().deleted.push(1);
@@ -17942,11 +17959,11 @@ mod metadata_presentation_tab_tests {
     fn successful_path_keyed_save_with_retained_dirty_state_is_not_all_saved() {
         let mut state = write_state();
         let mut synthetic = tag("CUESHEET", "cue", vec!["cue row one"]);
-        synthetic.per_file_values = vec![
+        synthetic.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![
             "cue row one".to_string(),
             "cue row two".to_string(),
             "cue row three".to_string(),
-        ];
+        ]);
         synthetic.per_file_originals = synthetic.per_file_values.clone();
         state.active_surface_mut().entries.push(synthetic);
         state.active_surface_mut().deleted.push(1);

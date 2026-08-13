@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use super::probe::TagEntry;
+use super::probe::{MetadataStoredValueCollapse, TagEntry};
 
 /// Picker-local filter for tag transfer. Keeping this separate from the global
 /// Audio filter prevents `.cue` visibility from changing unrelated pickers.
@@ -312,7 +312,9 @@ impl FirstTrackCollapseEligibility {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldBlock {
     pub key: String,
-    pub values: Vec<String>,
+    /// One ordered list per source position. Scalar tag-block lines decode to
+    /// zero-or-one-value lists; the v1 list marker preserves repeated values.
+    pub values: Vec<super::probe::MetadataFieldValues>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +441,27 @@ fn decode_value(line: &str) -> String {
     line.to_string()
 }
 
+
+const MULTI_VALUE_LINE_PREFIX: &str = "@tonepoet-mv1:";
+
+fn encode_field_position(values: &super::probe::MetadataFieldValues) -> String {
+    if values.value_count() <= 1 && !values.as_str().starts_with(MULTI_VALUE_LINE_PREFIX) {
+        return encode_value(values.as_str());
+    }
+    let encoded = serde_json::to_string(&values.to_texts())
+        .expect("serializing a vector of strings to JSON cannot fail");
+    format!("{MULTI_VALUE_LINE_PREFIX}{encoded}")
+}
+
+fn decode_field_position(line: &str) -> super::probe::MetadataFieldValues {
+    if let Some(encoded) = line.strip_prefix(MULTI_VALUE_LINE_PREFIX) {
+        if let Ok(values) = serde_json::from_str::<Vec<String>>(encoded) {
+            return super::probe::MetadataFieldValues::from_stored_texts(values);
+        }
+    }
+    super::probe::MetadataFieldValues::from_scalar(decode_value(line))
+}
+
 pub fn serialize_tag_entries<'a>(
     entries: impl IntoIterator<Item = &'a TagEntry>,
 ) -> FieldBlockSerialization {
@@ -462,7 +485,12 @@ pub fn serialize_tag_entries<'a>(
         if entry
             .per_file_values
             .iter()
-            .any(|value| value.contains('\n') || value.contains('\r'))
+            .any(|values| {
+                values
+                    .values()
+                    .iter()
+                    .any(|value| value.text.contains('\n') || value.text.contains('\r'))
+            })
         {
             skipped.push(SkippedField {
                 key,
@@ -475,7 +503,7 @@ pub fn serialize_tag_entries<'a>(
         block.push_str(&key);
         for value in &entry.per_file_values {
             block.push('\n');
-            block.push_str(&encode_value(value));
+            block.push_str(&encode_field_position(value));
         }
         // Synthetic rows with no positional values cannot form a valid block.
         if entry.per_file_values.is_empty() {
@@ -537,7 +565,7 @@ pub fn parse_field_blocks(input: &str) -> Result<Vec<FieldBlock>, FieldBlockPars
                 key: key.to_string(),
             });
         }
-        let values = lines.map(decode_value).collect::<Vec<_>>();
+        let values = lines.map(decode_field_position).collect::<Vec<_>>();
         if values.is_empty() {
             return Err(FieldBlockParseError::MissingValues {
                 block: block_index,
@@ -574,14 +602,14 @@ pub fn validate_block_count(
     })
 }
 
-pub fn value_for_target<'a>(
-    block: &'a FieldBlock,
+pub fn value_for_target(
+    block: &FieldBlock,
     mode: FieldBlockValueMode,
     target_index: usize,
-) -> Option<&'a str> {
+) -> Option<&super::probe::MetadataFieldValues> {
     match mode {
-        FieldBlockValueMode::Broadcast => block.values.first().map(String::as_str),
-        FieldBlockValueMode::Positional => block.values.get(target_index).map(String::as_str),
+        FieldBlockValueMode::Broadcast => block.values.first(),
+        FieldBlockValueMode::Positional => block.values.get(target_index),
     }
 }
 
@@ -646,8 +674,8 @@ mod tests {
             has_multiple_stored_values: false,
             row_scope: RowScope::File,
             per_file_stored_value_counts: vec![1; values.len()],
-            per_file_values: values.iter().map(|value| (*value).to_string()).collect(),
-            per_file_originals: values.iter().map(|value| (*value).to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|value| (*value).to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|value| (*value).to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -670,17 +698,44 @@ mod tests {
             vec![
                 FieldBlock {
                     key: "TITLE".to_string(),
-                    values: vec!["", "~", "~~", "  "]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
+                    values: crate::tui::probe::metadata_field_values_from_scalars(vec!["".to_string(), "~".to_string(), "~~".to_string(), "  ".to_string()]),
                 },
                 FieldBlock {
                     key: "ARTIST".to_string(),
-                    values: vec!["Genesis".to_string(); 4],
+                    values: crate::tui::probe::metadata_field_values_from_scalars(
+                        vec!["Genesis".to_string(); 4],
+                    ),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn field_blocks_preserve_repeated_values_order_duplicates_and_prefix_collisions() {
+        let mut repeated = entry("COMPOSER", &["placeholder"]);
+        repeated.per_file_values[0] = super::super::probe::MetadataFieldValues::from_stored_texts([
+            "Alice",
+            "Alice",
+            "Bob; Carol",
+            "@tonepoet-mv1:literal",
+        ]);
+        repeated.per_file_originals = repeated.per_file_values.clone();
+        repeated.value = repeated.per_file_values[0].as_str().to_string();
+        repeated.original = repeated.value.clone();
+
+        let serialized = serialize_tag_entries(std::iter::once(&repeated));
+        assert!(serialized.text.starts_with("COMPOSER\n@tonepoet-mv1:["));
+        let parsed = parse_field_blocks(&serialized.text).expect("parse repeated-value field block");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].values, repeated.per_file_values);
+        assert_eq!(
+            parsed[0].values[0].to_texts(),
+            vec!["Alice", "Alice", "Bob; Carol", "@tonepoet-mv1:literal"],
+        );
+
+        let legacy = parse_field_blocks("COMPOSER\nAlice; Bob")
+            .expect("legacy scalar field block stays readable");
+        assert_eq!(legacy[0].values[0].to_texts(), vec!["Alice; Bob"]);
     }
 
     #[test]
@@ -772,8 +827,8 @@ mod tests {
                 has_multiple_stored_values: false,
                 row_scope: RowScope::File,
                 per_file_stored_value_counts: vec![1; values.len()],
-                per_file_values: values.clone(),
-                per_file_originals: values.clone(),
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             };
@@ -781,7 +836,7 @@ mod tests {
             let parsed = parse_field_blocks(&serialized.text).expect("generated round trip");
             assert_eq!(parsed, vec![FieldBlock {
                 key: "CUSTOM_1".to_string(),
-                values,
+                values: crate::tui::probe::metadata_field_values_from_scalars(values),
             }]);
         }
     }
@@ -803,11 +858,13 @@ mod tests {
         let blocks = vec![
             FieldBlock {
                 key: "TITLE".to_string(),
-                values: vec!["Duke".to_string()],
+                values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Duke".to_string()]),
             },
             FieldBlock {
                 key: "TRACKNUMBER".to_string(),
-                values: (1..=12).map(|value| value.to_string()).collect(),
+                values: crate::tui::probe::metadata_field_values_from_scalars(
+                    (1..=12).map(|value| value.to_string()).collect::<Vec<String>>(),
+                ),
             },
         ];
         let report = apply_field_blocks_to_editor(&mut state, &blocks).expect("valid blocks");
@@ -838,11 +895,11 @@ mod tests {
         let invalid = vec![
             FieldBlock {
                 key: "ARTIST".to_string(),
-                values: vec!["Genesis".to_string()],
+                values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Genesis".to_string()]),
             },
             FieldBlock {
                 key: "DISCNUMBER".to_string(),
-                values: vec!["1".to_string(), "2".to_string()],
+                values: crate::tui::probe::metadata_field_values_from_scalars(vec!["1".to_string(), "2".to_string()]),
             },
         ];
         assert_eq!(
@@ -863,6 +920,138 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(after, before, "count failure must apply nothing");
+    }
+
+    fn stored_list_entry(key: &str, slots: &[&[&str]]) -> TagEntry {
+        let mut entry = entry(key, &vec!["placeholder"; slots.len()]);
+        entry.per_file_values = slots
+            .iter()
+            .map(|values| {
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(values.iter().copied())
+            })
+            .collect();
+        entry.per_file_originals = entry.per_file_values.clone();
+        entry.per_file_stored_value_counts = entry
+            .per_file_values
+            .iter()
+            .map(crate::tui::probe::MetadataFieldValues::value_count)
+            .collect();
+        entry.has_multiple_stored_values = entry
+            .per_file_stored_value_counts
+            .iter()
+            .any(|count| *count > 1);
+        entry.value = entry
+            .per_file_values
+            .first()
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default();
+        entry.original = entry.value.clone();
+        entry
+    }
+
+    #[test]
+    fn block_apply_reports_stored_list_cardinality_reduction_and_keeps_provenance() {
+        let mut state = editor_with_files(
+            1,
+            vec![stored_list_entry("COMPOSER", &[&["Alice", "Bob"]])],
+        );
+        let blocks = vec![FieldBlock {
+            key: "COMPOSER".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_stored_texts([
+                "Carol",
+            ])],
+        }];
+
+        let report = apply_field_blocks_to_editor(&mut state, &blocks).expect("apply COMPOSER");
+        assert_eq!(
+            report.collapsed_fields,
+            vec![MetadataStoredValueCollapse {
+                display_key: "COMPOSER".to_string(),
+                slots: vec![0],
+            }]
+        );
+        assert_eq!(
+            report.success_status(1),
+            "applied COMPOSER (broadcast to 1 file), warning: COMPOSER stored-value count reduced on carrier 1 — review before save"
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_stored_value_counts,
+            vec![2],
+            "tag-block application must preserve original stored-cardinality provenance"
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            vec!["Carol"]
+        );
+    }
+
+    #[test]
+    fn block_apply_does_not_warn_for_equal_or_greater_list_cardinality_or_exact_revert() {
+        let original = stored_list_entry("COMPOSER", &[&["Alice", "Bob"]]);
+
+        for replacement in [
+            vec!["Bob", "Alice"],
+            vec!["Alice", "Bob", "Carol"],
+            vec!["Alice", "Bob"],
+        ] {
+            let mut state = editor_with_files(1, vec![original.clone()]);
+            let blocks = vec![FieldBlock {
+                key: "COMPOSER".to_string(),
+                values: vec![crate::tui::probe::MetadataFieldValues::from_stored_texts(
+                    replacement,
+                )],
+            }];
+            let report = apply_field_blocks_to_editor(&mut state, &blocks)
+                .expect("apply non-reducing COMPOSER block");
+            assert!(
+                report.collapsed_fields.is_empty(),
+                "equal-cardinality edits, growth, and exact reverts must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn block_apply_new_field_never_reports_stored_list_collapse() {
+        let mut state = editor_with_files(2, Vec::new());
+        let blocks = vec![FieldBlock {
+            key: "COMPOSER".to_string(),
+            values: vec![
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["Alice"]),
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["Bob", "Carol"]),
+            ],
+        }];
+
+        let report = apply_field_blocks_to_editor(&mut state, &blocks).expect("create COMPOSER");
+        assert!(report.collapsed_fields.is_empty());
+    }
+
+    #[test]
+    fn block_apply_reports_only_slots_below_their_original_stored_count() {
+        let mut state = editor_with_files(
+            3,
+            vec![stored_list_entry(
+                "COMPOSER",
+                &[
+                    &["Alice", "Bob"],
+                    &["Carol", "Dave"],
+                    &["Eve", "Frank", "Grace"],
+                ],
+            )],
+        );
+        let blocks = vec![FieldBlock {
+            key: "COMPOSER".to_string(),
+            values: vec![
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["Solo"]),
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["Carol", "Delta"]),
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["Grace", "Eve"]),
+            ],
+        }];
+
+        let report = apply_field_blocks_to_editor(&mut state, &blocks).expect("apply COMPOSER");
+        assert_eq!(report.collapsed_fields.len(), 1);
+        assert_eq!(report.collapsed_fields[0].display_key, "COMPOSER");
+        assert_eq!(report.collapsed_fields[0].slots, vec![0, 2]);
+        assert!(report.success_status(3).contains("carriers 1, 3"));
     }
 
     #[test]
@@ -886,7 +1075,7 @@ mod tests {
             .collect::<Vec<_>>();
         let blocks = vec![FieldBlock {
             key: "TITLE".to_string(),
-            values: vec!["Replacement".to_string()],
+            values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Replacement".to_string()]),
         }];
 
         assert_eq!(
@@ -1274,7 +1463,7 @@ mod tests {
             assert_eq!(observed[0].3, verification);
             assert_eq!(
                 observed[0].1,
-                vec![(lofty::tag::ItemKey::TrackTitle, Some("Duke".to_string()))]
+                vec![(lofty::tag::ItemKey::TrackTitle, Some(crate::tui::probe::MetadataFieldValues::from_scalar("Duke")), false)]
             );
         }
     }
@@ -2654,7 +2843,7 @@ fn cue_target_key(key: &str) -> Option<&'static str> {
 struct PlannedTransferField {
     canonical_key: String,
     item_key: lofty::tag::ItemKey,
-    values: Vec<String>,
+    values: Vec<super::probe::MetadataFieldValues>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2804,17 +2993,12 @@ fn plan_transfer_values_for_unified_cue_editor(
             }
         };
 
-        let mut warned_stored_sources = std::collections::BTreeSet::new();
-        for source_index in 0..source_count {
-            let stored_count = entry.stored_value_count_for_slot(source_index);
-            if stored_count > 1 && warned_stored_sources.insert(source_index) {
-                plan.cardinality_warnings.push(format!(
-                    "{} source {} collapsed {} stored values to its display value",
-                    canonical_key,
-                    source_index + 1,
-                    stored_count
-                ));
-            }
+        if values.iter().any(|values| values.value_count() > 1) {
+            plan.skipped_fields.push(format!(
+                "{} skipped: CUE cannot represent repeated values without loss",
+                canonical_key
+            ));
+            continue;
         }
 
         plan.fields.push(PlannedTransferField {
@@ -2966,15 +3150,27 @@ fn plan_transfer_values_for_dimensions_with_collapse(
                 )
             })?;
             let stored_count = entry.stored_value_count_for_slot(source_index);
-            if stored_count > 1 && warned_stored_sources.insert(source_index) {
+            if stored_count > value.value_count()
+                && warned_stored_sources.insert(source_index)
+            {
                 plan.cardinality_warnings.push(format!(
-                    "{} source {} collapsed {} stored values to its display value",
+                    "{} source {} exposes {} list values for {} stored instances",
                     canonical_key,
                     source_index + 1,
+                    value.value_count(),
                     stored_count
                 ));
             }
             values.push(value.clone());
+        }
+        if target_dimension.is_tracks()
+            && values.iter().any(|values| values.value_count() > 1)
+        {
+            plan.skipped_fields.push(format!(
+                "{} skipped: CUE cannot represent repeated values without loss",
+                canonical_key
+            ));
+            continue;
         }
         if target_dimension.is_tracks()
             && !is_cue_per_track_field(&canonical_key)
@@ -3019,20 +3215,31 @@ fn plan_transfer_values(
 }
 
 
-fn cue_transfer_entry(
+fn cue_transfer_entry<V>(
     display_key: &str,
     item_key: lofty::tag::ItemKey,
-    values: Vec<String>,
-) -> Option<TagEntry> {
-    if values.is_empty() || values.iter().all(String::is_empty) {
+    values: Vec<V>,
+) -> Option<TagEntry>
+where
+    V: Into<super::probe::MetadataFieldValues>,
+{
+    let values: Vec<super::probe::MetadataFieldValues> = values.into_iter().map(Into::into).collect();
+    if values.is_empty() || values.iter().all(|value| value.as_str().is_empty()) {
         return None;
     }
     let is_mixed = values.windows(2).any(|pair| pair[0] != pair[1]);
     let value = if is_mixed {
         "<multiple values>".to_string()
     } else {
-        values.first().cloned().unwrap_or_default()
+        values
+            .first()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default()
     };
+    let stored_value_counts = values
+        .iter()
+        .map(super::probe::MetadataFieldValues::value_count)
+        .collect();
     Some(TagEntry {
         display_key: display_key.to_string(),
         item_key,
@@ -3040,9 +3247,9 @@ fn cue_transfer_entry(
         original: value,
         is_binary: false,
         is_mixed,
-        has_multiple_stored_values: false,
+        has_multiple_stored_values: values.iter().any(|value| value.value_count() > 1),
         row_scope: super::probe::RowScope::Track,
-        per_file_stored_value_counts: vec![1; values.len()],
+        per_file_stored_value_counts: stored_value_counts,
         per_file_originals: values.clone(),
         per_file_values: values,
         mb_proposed_value: None,
@@ -3130,7 +3337,10 @@ fn embedded_cue_set_transfer_entries(carriers: &[EmbeddedCueCarrier]) -> Vec<Tag
                 {
                     values.extend(entry.per_file_values.iter().cloned());
                 } else {
-                    values.extend(std::iter::repeat(String::new()).take(track_count));
+                    values.extend(
+                        std::iter::repeat(super::probe::MetadataFieldValues::default())
+                            .take(track_count),
+                    );
                 }
             }
             cue_transfer_entry(display_key, item_key, values)
@@ -3139,12 +3349,15 @@ fn embedded_cue_set_transfer_entries(carriers: &[EmbeddedCueCarrier]) -> Vec<Tag
 }
 
 
-fn transfer_value_summary(values: &[String]) -> (String, bool) {
+fn transfer_value_summary(values: &[super::probe::MetadataFieldValues]) -> (String, bool) {
     let is_mixed = values.windows(2).any(|pair| pair[0] != pair[1]);
     let value = if is_mixed {
         "<multiple values>".to_string()
     } else {
-        values.first().cloned().unwrap_or_default()
+        values
+            .first()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default()
     };
     (value, is_mixed)
 }
@@ -3244,10 +3457,10 @@ fn merge_transfer_entry_segments(
             } else {
                 entry
                     .per_file_values
-                    .extend(std::iter::repeat(String::new()).take(*count));
+                    .extend(std::iter::repeat_with(crate::tui::probe::MetadataFieldValues::default).take(*count));
                 entry
                     .per_file_originals
-                    .extend(std::iter::repeat(String::new()).take(*count));
+                    .extend(std::iter::repeat_with(crate::tui::probe::MetadataFieldValues::default).take(*count));
                 entry
                     .per_file_stored_value_counts
                     .extend(std::iter::repeat(0).take(*count));
@@ -3755,7 +3968,7 @@ fn corroborate_file_track_order(
         .map(|(index, path)| {
             let tagged = tracknumber
                 .and_then(|entry| entry.per_file_values.get(index))
-                .map(String::as_str)
+                .map(super::probe::MetadataFieldValues::as_str)
                 .filter(|value| !value.trim().is_empty());
             match tagged {
                 // A present TRACKNUMBER is authoritative, including an
@@ -3826,7 +4039,7 @@ pub(crate) fn execute_tag_transfer_from_entries(
         cancel,
         progress,
         |path, changes, cancel, verification| {
-            super::probe::write_all_tags_for_transfer_at_verification(
+            super::probe::write_tag_value_lists_for_transfer_at_verification(
                 path,
                 changes,
                 cancel,
@@ -3850,7 +4063,7 @@ fn execute_tag_transfer_from_entries_with_writer<F>(
 where
     F: FnMut(
         &std::path::Path,
-        &[(lofty::tag::ItemKey, Option<String>)],
+        &[(lofty::tag::ItemKey, Option<super::probe::MetadataFieldValues>, bool)],
         Option<&super::probe::MetadataWriteCancelFlag>,
         tui_file_picker::VerificationMode,
     ) -> Result<super::probe::MetadataWriteCommitReport, String>,
@@ -3882,7 +4095,7 @@ fn execute_tag_transfer_to_files_with_writer<F>(
 where
     F: FnMut(
         &std::path::Path,
-        &[(lofty::tag::ItemKey, Option<String>)],
+        &[(lofty::tag::ItemKey, Option<super::probe::MetadataFieldValues>, bool)],
         Option<&super::probe::MetadataWriteCancelFlag>,
         tui_file_picker::VerificationMode,
     ) -> Result<super::probe::MetadataWriteCommitReport, String>,
@@ -3978,18 +4191,37 @@ where
             continue;
         }
 
+        let backend = crate::metadata_persistence::metadata_backend_for_path(target_path)?;
         let mut changes = Vec::new();
         for field in &value_plan.fields {
             let source_value = &field.values[target_index];
-            let target_value = target_by_key
-                .get(&field.canonical_key)
+            let target_entry = target_by_key.get(&field.canonical_key);
+            let target_value = target_entry
                 .and_then(|entry| entry.per_file_values.get(target_index))
-                .map(String::as_str)
-                .unwrap_or("");
-            if source_value == target_value {
+                .cloned()
+                .unwrap_or_default();
+            let target_existed = target_entry
+                .is_some_and(|entry| entry.stored_value_count_for_slot(target_index) > 0);
+            if source_value == &target_value {
                 continue;
             }
-            changes.push((field.item_key.clone(), Some(source_value.clone())));
+            if super::probe::metadata_field_is_set_valued(&field.canonical_key)
+                && source_value.value_count() > 1
+                && !backend.supports_repeated_instances()
+            {
+                report.cardinality_warnings.push(format!(
+                    "{}: {} has {} values but {} cannot round-trip repeated instances; the legacy scalar projection will be written",
+                    target_path.display(),
+                    field.canonical_key,
+                    source_value.value_count(),
+                    backend.label(),
+                ));
+            }
+            changes.push((
+                field.item_key.clone(),
+                Some(source_value.clone()),
+                target_existed,
+            ));
         }
         if changes.is_empty() {
             report.unchanged += 1;
@@ -4090,7 +4322,7 @@ fn overlay_projected_transfer_plan_on_cue_sheet(
             // complete current value is empty. Treat that as an all-empty full
             // sheet so a projected write can introduce a representable
             // per-track field without manufacturing values for other tracks.
-            vec![String::new(); target_count]
+            vec![super::probe::MetadataFieldValues::default(); target_count]
         };
         for (projected_index, target_index) in
             selected_track_indices.iter().copied().enumerate()
@@ -4143,7 +4375,7 @@ fn cue_metadata_replacement_text(
         lines.push(format!(
             "{} \"{}\"",
             cue_key,
-            cue_replacement_value(value, key)?
+            cue_replacement_value(value.as_str(), key)?
         ));
         Ok(())
     };
@@ -4154,7 +4386,7 @@ fn cue_metadata_replacement_text(
         if !value.is_empty() {
             lines.push(format!(
                 "REM DATE \"{}\"",
-                cue_replacement_value(value, "DATE")?
+                cue_replacement_value(value.as_str(), "DATE")?
             ));
         }
     }
@@ -4162,7 +4394,7 @@ fn cue_metadata_replacement_text(
         if !value.is_empty() {
             lines.push(format!(
                 "REM GENRE \"{}\"",
-                cue_replacement_value(value, "GENRE")?
+                cue_replacement_value(value.as_str(), "GENRE")?
             ));
         }
     }
@@ -4170,7 +4402,7 @@ fn cue_metadata_replacement_text(
         if !value.is_empty() {
             lines.push(format!(
                 "CATALOG {}",
-                cue_replacement_value(value, "CATALOGNUMBER")?
+                cue_replacement_value(value.as_str(), "CATALOGNUMBER")?
             ));
         }
     }
@@ -4189,7 +4421,7 @@ fn cue_metadata_replacement_text(
             lines.push(format!(
                 "    {} \"{}\"",
                 cue_key,
-                cue_replacement_value(value, key)?
+                cue_replacement_value(value.as_str(), key)?
             ));
         }
     }
@@ -4318,7 +4550,7 @@ fn revalidate_embedded_transfer_target(
         .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
         .and_then(|entry| entry.per_file_values.first())
         .filter(|text| !text.trim().is_empty())
-        .cloned()
+        .map(|text| text.as_str().to_string())
         .ok_or_else(|| {
             format!(
                 "embedded CUE target '{}' no longer carries a CUESHEET; left unchanged",
@@ -4952,7 +5184,7 @@ fn execute_tag_transfer_to_cue(
             cancel,
             Some(&mapped_progress),
             |path, changes, cancel, verification| {
-                super::probe::write_all_tags_for_transfer_at_verification(
+                super::probe::write_tag_value_lists_for_transfer_at_verification(
                     path,
                     changes,
                     cancel,
@@ -5110,7 +5342,7 @@ pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
             cancel,
             progress,
             |path, changes, cancel, verification| {
-                super::probe::write_all_tags_for_transfer_at_verification(
+                super::probe::write_tag_value_lists_for_transfer_at_verification(
                     path,
                     changes,
                     cancel,
@@ -5294,6 +5526,7 @@ pub(crate) fn execute_tag_transfer_from_paths(
 pub struct FieldBlockApplyReport {
     pub applied: Vec<(String, FieldBlockValueMode)>,
     pub skipped_track_scoped: Vec<String>,
+    pub collapsed_fields: Vec<MetadataStoredValueCollapse>,
 }
 
 impl FieldBlockApplyReport {
@@ -5315,6 +5548,19 @@ impl FieldBlockApplyReport {
             parts.push(format!(
                 "skipped track-scoped {}",
                 self.skipped_track_scoped.join(", ")
+            ));
+        }
+        for collapsed in &self.collapsed_fields {
+            let carriers = collapsed
+                .slots
+                .iter()
+                .map(|slot| (slot + 1).to_string())
+                .collect::<Vec<_>>();
+            parts.push(format!(
+                "warning: {} stored-value count reduced on carrier{} {}",
+                collapsed.display_key,
+                if carriers.len() == 1 { "" } else { "s" },
+                carriers.join(", ")
             ));
         }
         format!("applied {} — review before save", parts.join(", "))
@@ -5365,18 +5611,29 @@ pub(crate) fn apply_field_blocks_to_editor(
         let values = (0..file_count)
             .map(|index| {
                 value_for_target(block, mode, index)
+                    .cloned()
                     .unwrap_or_default()
-                    .to_string()
             })
             .collect::<Vec<_>>();
         let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);
         let display = if all_same {
-            values.first().cloned().unwrap_or_default()
+            values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         } else {
             "<multiple values>".to_string()
         };
 
         if let Some(row) = existing_row {
+            let collapse_slots = state.active_surface().entries[row]
+                .stored_list_collapse_slots(values.iter().enumerate());
+            if !collapse_slots.is_empty() {
+                report.collapsed_fields.push(MetadataStoredValueCollapse {
+                    display_key: block.key.clone(),
+                    slots: collapse_slots,
+                });
+            }
             let surface = state.active_surface_mut();
             let entry = &mut surface.entries[row];
             entry.value = display;
@@ -5397,7 +5654,7 @@ pub(crate) fn apply_field_blocks_to_editor(
                 row_scope: super::probe::RowScope::File,
                 per_file_stored_value_counts: vec![0; file_count],
                 per_file_values: values,
-                per_file_originals: vec![String::new(); file_count],
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); file_count]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -5496,7 +5753,7 @@ fn metadata_editor_first_track_collapse_eligibility(
             && !entry
                 .per_file_values
                 .first()
-                .map(String::as_str)
+                .map(super::probe::MetadataFieldValues::as_str)
                 .unwrap_or(entry.value.as_str())
                 .trim()
                 .is_empty()
@@ -5537,8 +5794,9 @@ pub(crate) fn editor_snapshot_authored_track_numbers(
             entry
                 .per_file_values
                 .first()
+                .map(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| (!entry.value.trim().is_empty()).then_some(&entry.value))
+                .or_else(|| (!entry.value.trim().is_empty()).then_some(entry.value.as_str()))
         })?;
     let sheet = crate::convert::cue_parser::parse_cue(cue_text);
     let mut numbers = sheet
@@ -5669,7 +5927,10 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
         };
         let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);
         let display = if all_same {
-            values.first().cloned().unwrap_or_default()
+            values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         } else {
             "<multiple values>".to_string()
         };
@@ -5696,7 +5957,7 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
                 row_scope,
                 per_file_stored_value_counts: Vec::new(),
                 per_file_values: values,
-                per_file_originals: vec![String::new(); field_target_count],
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); field_target_count]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });

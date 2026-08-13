@@ -1235,12 +1235,37 @@ mod flac_metadata_writer {
         )
     }
 
+    fn scalar_vorbis_changes(
+        changes: &[(lofty::tag::ItemKey, Option<String>)],
+    ) -> Vec<(lofty::tag::ItemKey, Option<Vec<String>>)> {
+        changes
+            .iter()
+            .map(|(key, value)| {
+                let values = value
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| vec![value.to_string()]);
+                (key.clone(), values)
+            })
+            .collect()
+    }
+
     pub(super) fn write_vorbis_comment_changes(
         path: &Path,
         changes: &[(lofty::tag::ItemKey, Option<String>)],
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<FlacWriteReport, String> {
-        write_vorbis_comment_changes_conditionally(path, changes, None, cancel)
+        let changes = scalar_vorbis_changes(changes);
+        write_vorbis_comment_value_changes_conditionally(path, &changes, None, cancel)
+    }
+
+    pub(super) fn write_vorbis_comment_value_changes(
+        path: &Path,
+        changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<FlacWriteReport, String> {
+        write_vorbis_comment_value_changes_conditionally(path, changes, None, cancel)
     }
 
     pub(super) fn write_vorbis_comment_changes_if_current_value_matches(
@@ -1250,17 +1275,18 @@ mod flac_metadata_writer {
         expected_value: &str,
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<FlacWriteReport, String> {
-        write_vorbis_comment_changes_conditionally(
+        let changes = scalar_vorbis_changes(changes);
+        write_vorbis_comment_value_changes_conditionally(
             path,
-            changes,
+            &changes,
             Some((expected_key, expected_value)),
             cancel,
         )
     }
 
-    fn write_vorbis_comment_changes_conditionally(
+    fn write_vorbis_comment_value_changes_conditionally(
         path: &Path,
-        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
         expected_current: Option<(&str, &str)>,
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<FlacWriteReport, String> {
@@ -1802,7 +1828,7 @@ mod flac_metadata_writer {
 
     fn build_vorbis_comment_replacement(
         metadata: &FlacMetadata,
-        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
     ) -> Result<Option<Vec<FlacBlock>>, String> {
         let old_vorbis = metadata
             .blocks
@@ -1997,41 +2023,39 @@ mod flac_metadata_writer {
 
     fn apply_comment_changes(
         vorbis: &mut VorbisComments,
-        changes: &[(lofty::tag::ItemKey, Option<String>)],
+        changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
     ) -> Result<bool, String> {
         use std::collections::BTreeMap;
 
-        // Resolve logical alias groups before mutating the comment list. The
-        // metadata editor emits one canonical row per group, but callers may
-        // still submit legacy + canonical keys together. Equal requests
-        // coalesce; conflicting requests fail closed instead of making the
-        // result depend on slice order.
-        let mut resolved = BTreeMap::<String, Option<String>>::new();
-        for (key, new_value) in changes {
+        // Resolve logical alias groups before mutating the comment list. Equal
+        // requests coalesce; conflicting requests fail closed instead of making
+        // the result depend on slice order. Values remain ordered and duplicates
+        // remain distinct.
+        let mut resolved = BTreeMap::<String, Option<Vec<String>>>::new();
+        for (key, new_values) in changes {
             let raw_key = vorbis_comment_key(key)?;
             let aliases = vorbis_key_aliases(&raw_key);
             let comment_key = aliases.first().copied().unwrap_or(raw_key.as_str()).to_string();
-            let normalized_value = new_value
+            let normalized_values = new_values
                 .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
+                .filter(|values| !values.is_empty())
+                .cloned();
             if let Some(previous) = resolved.get(&comment_key) {
-                if previous != &normalized_value {
+                if previous != &normalized_values {
                     return Err(format!(
-                        "conflicting metadata changes target the same Vorbis alias group {comment_key}: {previous:?} versus {normalized_value:?}"
+                        "conflicting metadata changes target the same Vorbis alias group {comment_key}: {previous:?} versus {normalized_values:?}"
                     ));
                 }
                 continue;
             }
-            resolved.insert(comment_key, normalized_value);
+            resolved.insert(comment_key, normalized_values);
         }
 
         let mut changed = false;
-        for (comment_key, new_value) in resolved {
+        for (comment_key, new_values) in resolved {
             let aliases = vorbis_key_aliases(&comment_key);
-            let mut matching_count = 0usize;
-            let mut matching_value = None;
-            let mut matching_key_is_canonical = false;
+            let mut matching_values = Vec::<&str>::new();
+            let mut all_keys_canonical = true;
             for comment in &vorbis.comments {
                 let VorbisComment::Parsed { name, value } = comment else {
                     continue;
@@ -2039,20 +2063,20 @@ mod flac_metadata_writer {
                 if name.eq_ignore_ascii_case(&comment_key)
                     || aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
                 {
-                    matching_count += 1;
-                    if matching_count == 1 {
-                        matching_value = Some(value.as_str());
-                        matching_key_is_canonical = name.eq_ignore_ascii_case(&comment_key);
-                    }
+                    matching_values.push(value.as_str());
+                    all_keys_canonical &= name.eq_ignore_ascii_case(&comment_key);
                 }
             }
-            let already_satisfied = match new_value.as_deref() {
+            let already_satisfied = match new_values.as_ref() {
                 Some(expected) => {
-                    matching_count == 1
-                        && matching_key_is_canonical
-                        && matching_value == Some(expected)
+                    all_keys_canonical
+                        && matching_values.len() == expected.len()
+                        && matching_values
+                            .iter()
+                            .zip(expected.iter())
+                            .all(|(actual, expected)| *actual == expected.as_str())
                 }
-                None => matching_count == 0,
+                None => matching_values.is_empty(),
             };
             if already_satisfied {
                 continue;
@@ -2066,12 +2090,14 @@ mod flac_metadata_writer {
                 }
                 VorbisComment::Raw(_) => true,
             });
-            if let Some(value) = new_value {
+            if let Some(values) = new_values {
                 validate_vorbis_field_name(&comment_key)?;
-                vorbis.comments.push(VorbisComment::Parsed {
-                    name: comment_key,
-                    value,
-                });
+                for value in values {
+                    vorbis.comments.push(VorbisComment::Parsed {
+                        name: comment_key.clone(),
+                        value,
+                    });
+                }
             }
         }
         Ok(changed)
@@ -5385,7 +5411,8 @@ mod flac_metadata_writer {
         recover_metadata_journal(path)?;
         recover_artwork_rollback_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let replacement = build_vorbis_comment_replacement(&metadata, changes)?
+        let value_changes = scalar_vorbis_changes(changes);
+        let replacement = build_vorbis_comment_replacement(&metadata, &value_changes)?
             .ok_or_else(|| "test kill-point change set was already satisfied".to_string())?;
         let mut padded_replacement = replacement;
         let old_metadata_len = metadata.raw_metadata_region.len();
@@ -5435,7 +5462,8 @@ mod flac_metadata_writer {
     ) -> Result<(), String> {
         recover_metadata_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?
+        let value_changes = scalar_vorbis_changes(changes);
+        let mut replacement = build_vorbis_comment_replacement(&metadata, &value_changes)?
             .ok_or_else(|| "test wrong-offset change set was already satisfied".to_string())?;
         let old_metadata_len = metadata.raw_metadata_region.len();
         let new_len_without_padding = encoded_blocks_len(&replacement)?;
@@ -5503,7 +5531,8 @@ mod flac_metadata_writer {
     ) -> Result<(), String> {
         recover_metadata_journal(path)?;
         let metadata = read_flac_metadata(path)?;
-        let mut replacement = build_vorbis_comment_replacement(&metadata, changes)?
+        let value_changes = scalar_vorbis_changes(changes);
+        let mut replacement = build_vorbis_comment_replacement(&metadata, &value_changes)?
             .ok_or_else(|| "test forced-rewrite change set was already satisfied".to_string())?;
         append_padding(&mut replacement, REWRITE_PADDING_BYTES)?;
         stream_rewrite(path, metadata.stream_offset, metadata.audio_start, &replacement, None).map(|_| ())
@@ -6111,6 +6140,249 @@ fn unified_cue_row_shape_contract_is_semantic_when_dimensions_are_equal() {
     }
 }
 
+/// One discrete value of a logical metadata field.
+///
+/// The wrapper is intentionally small today, but gives future phases an
+/// additive home for structured attributes such as PERFORMER roles or stable
+/// external identifiers without changing the editor's cardinality model.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MetadataFieldValue {
+    pub text: String,
+}
+
+impl MetadataFieldValue {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+impl From<String> for MetadataFieldValue {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for MetadataFieldValue {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+/// Ordered values for one field in one positional editor slot.
+///
+/// `values` is authoritative. `display` is an encapsulated projection used to
+/// preserve the existing scalar-facing UI and call sites without allowing a
+/// second mutable representation to drift from the list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MetadataFieldValues {
+    values: Vec<MetadataFieldValue>,
+    display: String,
+}
+
+impl MetadataFieldValues {
+    pub fn from_stored_text(text: impl Into<String>) -> Self {
+        Self::from_stored_texts(std::iter::once(text))
+    }
+
+    pub fn from_stored_texts<I, S>(texts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let values = texts
+            .into_iter()
+            .map(|text| MetadataFieldValue::new(text.into()))
+            .collect::<Vec<_>>();
+        Self::from_values(values)
+    }
+
+    /// Convert the editor's historical scalar convention into a real list.
+    /// An empty scalar means the field is absent, so it becomes an empty list.
+    pub fn from_scalar(text: impl Into<String>) -> Self {
+        let text = text.into();
+        if text.is_empty() {
+            Self::default()
+        } else {
+            Self::from_stored_text(text)
+        }
+    }
+
+    pub fn from_values(values: Vec<MetadataFieldValue>) -> Self {
+        let display = values
+            .iter()
+            .map(|value| value.text.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Self { values, display }
+    }
+
+    pub fn value_count(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn values(&self) -> &[MetadataFieldValue] {
+        &self.values
+    }
+
+    pub fn texts(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.values.iter().map(|value| value.text.as_str())
+    }
+
+    pub fn to_texts(&self) -> Vec<String> {
+        self.values.iter().map(|value| value.text.clone()).collect()
+    }
+
+    pub fn value_text(&self, index: usize) -> Option<&str> {
+        self.values.get(index).map(|value| value.text.as_str())
+    }
+
+    pub fn replace_scalar(&mut self, text: impl Into<String>) {
+        *self = Self::from_scalar(text);
+    }
+
+    pub fn replace_stored_texts<I, S>(&mut self, texts: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        *self = Self::from_stored_texts(texts);
+    }
+
+    pub fn push_value(&mut self, text: impl Into<String>) {
+        self.values.push(MetadataFieldValue::new(text));
+        self.rebuild_display();
+    }
+
+    pub fn insert_value(&mut self, index: usize, text: impl Into<String>) {
+        let index = index.min(self.values.len());
+        self.values.insert(index, MetadataFieldValue::new(text));
+        self.rebuild_display();
+    }
+
+    pub fn edit_value(&mut self, index: usize, text: impl Into<String>) -> bool {
+        let Some(value) = self.values.get_mut(index) else {
+            return false;
+        };
+        value.text = text.into();
+        self.rebuild_display();
+        true
+    }
+
+    pub fn remove_value(&mut self, index: usize) -> Option<MetadataFieldValue> {
+        if index >= self.values.len() {
+            return None;
+        }
+        let removed = self.values.remove(index);
+        self.rebuild_display();
+        Some(removed)
+    }
+
+    pub fn move_value(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.values.len() || to >= self.values.len() || from == to {
+            return false;
+        }
+        let value = self.values.remove(from);
+        self.values.insert(to, value);
+        self.rebuild_display();
+        true
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.display
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.display.clear();
+    }
+
+    fn rebuild_display(&mut self) {
+        self.display.clear();
+        for (index, value) in self.values.iter().enumerate() {
+            if index > 0 {
+                self.display.push_str("; ");
+            }
+            self.display.push_str(&value.text);
+        }
+    }
+}
+
+impl std::ops::Deref for MetadataFieldValues {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for MetadataFieldValues {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for MetadataFieldValues {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<String> for MetadataFieldValues {
+    fn from(text: String) -> Self {
+        Self::from_scalar(text)
+    }
+}
+
+impl From<&str> for MetadataFieldValues {
+    fn from(text: &str) -> Self {
+        Self::from_scalar(text)
+    }
+}
+
+impl From<&MetadataFieldValues> for MetadataFieldValues {
+    fn from(values: &MetadataFieldValues) -> Self {
+        values.clone()
+    }
+}
+
+impl PartialEq<str> for MetadataFieldValues {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for MetadataFieldValues {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for MetadataFieldValues {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+pub fn metadata_field_values_from_scalars(values: Vec<String>) -> Vec<MetadataFieldValues> {
+    values.into_iter().map(MetadataFieldValues::from).collect()
+}
+
+/// Canonical editor fields whose values are intentionally user-editable as
+/// ordered lists. Adding a field in a later phase is a data-only change here.
+pub const SET_VALUED_FIELDS: &[&str] = &[
+    "ARTIST",
+    "COMPOSER",
+    "PERFORMER",
+    "GENRE",
+    "LYRICIST",
+    "ARRANGER",
+];
+
+pub fn metadata_field_is_set_valued(display_key: &str) -> bool {
+    let canonical = canonical_metadata_display_key(display_key);
+    SET_VALUED_FIELDS.iter().any(|field| *field == canonical.as_str())
+}
+
 /// A single tag entry read from an audio file (or merged across files).
 #[derive(Debug, Clone)]
 pub struct TagEntry {
@@ -6134,21 +6406,21 @@ pub struct TagEntry {
     /// The semantic dimension of the positional value vectors.
     pub row_scope: RowScope,
     /// Stored item/frame cardinality for each position in `per_file_values`.
-    /// A value greater than one means replacing that scalar display value
-    /// collapses multiple source items into one. Empty is allowed for
-    /// synthetic/derived rows that have no source-carrier provenance.
+    /// The count is carrier provenance used to detect genuine cardinality loss
+    /// after an edit. Empty is allowed for synthetic/derived rows that have no
+    /// source-carrier provenance.
     pub per_file_stored_value_counts: Vec<usize>,
     /// Current values in the row's declared positional dimension.
-    pub per_file_values: Vec<String>,
+    pub per_file_values: Vec<MetadataFieldValues>,
     /// Per-file original values at read time (for per-file write diff).
-    pub per_file_originals: Vec<String>,
+    pub per_file_originals: Vec<MetadataFieldValues>,
     /// MB-proposed displayed value, when the entry was touched by a
     /// MusicBrainz populate. Lets the editor show a `[revert]` /
     /// `[use MB]` toggle pill that swaps `value` between the file's
     /// pre-populate `original` and the MB suggestion.
     pub mb_proposed_value: Option<String>,
     /// Per-file MB-proposed values, paired with `mb_proposed_value`.
-    pub mb_proposed_per_file: Option<Vec<String>>,
+    pub mb_proposed_per_file: Option<Vec<MetadataFieldValues>>,
 }
 
 /// Whether a metadata row has a lossless representation in a CUE sidecar.
@@ -6253,6 +6525,29 @@ impl TagEntry {
         slots
     }
 
+    /// List-aware collapse detector. Reordering, editing in place, or replacing
+    /// N stored values with N new values is not a cardinality collapse; only an
+    /// actual reduction below the original stored count is reported.
+    pub fn stored_list_collapse_slots<'a, I>(&self, replacements: I) -> Vec<usize>
+    where
+        I: IntoIterator<Item = (usize, &'a MetadataFieldValues)>,
+    {
+        let mut slots = replacements
+            .into_iter()
+            .filter_map(|(slot, replacement)| {
+                let current = self.per_file_values.get(slot)?;
+                let original = self.per_file_originals.get(slot)?;
+                (current != replacement
+                    && original != replacement
+                    && replacement.value_count() < self.stored_value_count_for_slot(slot))
+                    .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     /// Return source carriers whose current scalar projection already differs
     /// from the original multi-item representation. This is the snapshot-free
     /// form of `stored_value_collapse_slots`, used only when provider
@@ -6265,7 +6560,8 @@ impl TagEntry {
             .zip(self.per_file_originals.iter())
             .enumerate()
             .filter_map(|(slot, (current, original))| {
-                (self.slot_has_multiple_stored_values(slot) && current != original)
+                (current != original
+                    && current.value_count() < self.stored_value_count_for_slot(slot))
                     .then_some(slot)
             })
             .collect::<Vec<_>>();
@@ -6329,12 +6625,11 @@ impl MetadataMutationReport {
             let Some(before_entry) = before_entry else {
                 continue;
             };
-            let mut slots = before_entry.stored_value_collapse_slots(
+            let mut slots = before_entry.stored_list_collapse_slots(
                 after_entry
                     .per_file_values
                     .iter()
-                    .enumerate()
-                    .map(|(slot, replacement)| (slot, replacement.as_str())),
+                    .enumerate(),
             );
 
             // A provider may intentionally repurpose a file-scoped row as a
@@ -6600,9 +6895,9 @@ pub fn mb_pill_state_field(entry: &TagEntry) -> MbRevertPill {
     let Some(ref proposed) = entry.mb_proposed_value else {
         return MbRevertPill::None;
     };
-    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+    let proposed_per_file: Vec<MetadataFieldValues> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
-        None => vec![proposed.clone(); entry.per_file_values.len()],
+        None => vec![MetadataFieldValues::from_scalar(proposed.clone()); entry.per_file_values.len()],
     };
     if entry.per_file_values == proposed_per_file {
         MbRevertPill::Revert
@@ -6622,9 +6917,9 @@ pub fn toggle_mb_revert_field(entry: &mut TagEntry) -> MetadataMutationReport {
     let Some(ref proposed) = entry.mb_proposed_value else {
         return MetadataMutationReport::default();
     };
-    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+    let proposed_per_file: Vec<MetadataFieldValues> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
-        None => vec![proposed.clone(); entry.per_file_values.len()],
+        None => vec![MetadataFieldValues::from_scalar(proposed.clone()); entry.per_file_values.len()],
     };
 
     if entry.per_file_values == proposed_per_file {
@@ -6648,9 +6943,9 @@ pub fn restore_mb_proposed(entry: &mut TagEntry) -> MetadataMutationReport {
     let Some(ref proposed) = entry.mb_proposed_value else {
         return MetadataMutationReport::default();
     };
-    let proposed_per_file: Vec<String> = match &entry.mb_proposed_per_file {
+    let proposed_per_file: Vec<MetadataFieldValues> = match &entry.mb_proposed_per_file {
         Some(v) => v.clone(),
-        None => vec![proposed.clone(); entry.per_file_values.len()],
+        None => vec![MetadataFieldValues::from_scalar(proposed.clone()); entry.per_file_values.len()],
     };
     entry.per_file_values = proposed_per_file;
     recompute_aggregate_value(entry);
@@ -6672,7 +6967,11 @@ fn recompute_aggregate_value(entry: &mut TagEntry) {
     entry.value = if entry.is_mixed {
         "<multiple values>".to_string()
     } else {
-        entry.per_file_values.first().cloned().unwrap_or_default()
+        entry
+            .per_file_values
+            .first()
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default()
     };
 }
 
@@ -7093,7 +7392,7 @@ pub(crate) fn item_key_for_new_editor_row(canonical_display_key: &str) -> lofty:
 struct CanonicalEditorTagField {
     display_key: String,
     item_key: lofty::tag::ItemKey,
-    value: String,
+    values: MetadataFieldValues,
     is_binary: bool,
     stored_value_count: usize,
 }
@@ -7110,21 +7409,6 @@ fn canonical_editor_item_key(
         "COMMENT" => lofty::tag::ItemKey::Comment,
         _ => fallback.clone(),
     }
-}
-
-fn append_distinct_editor_value(current: &mut String, next: &str) {
-    if next.is_empty() {
-        return;
-    }
-    if current.is_empty() {
-        current.push_str(next);
-        return;
-    }
-    if current.split("; ").any(|value| value == next) {
-        return;
-    }
-    current.push_str("; ");
-    current.push_str(next);
 }
 
 /// Format-independent canonical editor key for a Lofty tag item.
@@ -7206,8 +7490,27 @@ fn ape_combined_disc_editor_rows(
     Some(rows)
 }
 
-/// Insert or merge one editor row, collapsing duplicate canonical keys the same
-/// way multiple stored carriers for one logical field are collapsed elsewhere.
+fn append_distinct_scalar_editor_value(current: &mut String, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(next);
+        return;
+    }
+    if current.split("; ").any(|value| value == next) {
+        return;
+    }
+    current.push_str("; ");
+    current.push_str(next);
+}
+
+/// Insert or merge one canonical editor row.
+///
+/// Registered set-valued fields retain every carrier as an ordered list,
+/// including duplicate values. Other fields keep the editor's pre-existing
+/// scalar presentation semantics, while `stored_value_count` still records the
+/// number of physical carriers for loss detection.
 fn merge_editor_field(
     fields: &mut Vec<CanonicalEditorTagField>,
     indexes: &mut std::collections::HashMap<String, usize>,
@@ -7218,12 +7521,14 @@ fn merge_editor_field(
 ) {
     if let Some(index) = indexes.get(&display_key).copied() {
         let field: &mut CanonicalEditorTagField = &mut fields[index];
-        // A second stored carrier is cardinality information even when
-        // its text duplicates the first value. Keep display de-duplicated,
-        // but retain the fact that an explicit scalar edit will collapse
-        // more than one stored item.
         field.stored_value_count += 1;
-        append_distinct_editor_value(&mut field.value, &value);
+        if metadata_field_is_set_valued(&display_key) {
+            field.values.push_value(value);
+        } else {
+            let mut scalar = field.values.as_str().to_string();
+            append_distinct_scalar_editor_value(&mut scalar, &value);
+            field.values.replace_scalar(scalar);
+        }
         field.is_binary |= is_binary;
         return;
     }
@@ -7231,7 +7536,7 @@ fn merge_editor_field(
     fields.push(CanonicalEditorTagField {
         item_key,
         display_key,
-        value,
+        values: MetadataFieldValues::from_stored_text(value),
         is_binary,
         stored_value_count: 1,
     });
@@ -7241,11 +7546,10 @@ fn merge_editor_field(
 /// collapsed before placeholder synthesis, so COMMENT/DESCRIPTION and total
 /// spellings cannot produce competing rows or order-dependent writes.
 ///
-/// The editor is intentionally scalar: when a key has multiple stored values,
-/// it renders a joined summary. This is lossy only if that row is explicitly
-/// edited. The save planner emits changes solely for rows whose value changed,
-/// so unrelated edits leave the carrier's original multi-value frames/items
-/// untouched and in their original cardinality.
+/// Repeated stored carriers for registered set-valued fields become an ordered
+/// list on the canonical row. The existing joined string is only a display
+/// projection of that list; dirty detection and persistence compare the lists
+/// themselves. Fields outside the registry retain scalar editor semantics.
 fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEditorTagField> {
     use lofty::tag::ItemValue;
     use std::collections::HashMap;
@@ -7282,7 +7586,26 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
 
         let display_key = canonical_editor_display_key(item.key(), tag.tag_type());
         let item_key = canonical_editor_item_key(&display_key, item.key());
-        merge_editor_field(&mut fields, &mut indexes, display_key, item_key, value, is_binary);
+        // Lofty 0.21.x represents an APEv2 multi-value text item as one
+        // generic `TagItem` whose text contains the format's NUL separators.
+        // The native APE fallback already expands the same physical payload
+        // into one logical row per value. Mirror that representation here so
+        // a healthy WavPack read and a native-fallback Monkey's Audio read
+        // have identical editor semantics and preserve order + duplicates.
+        if tag.tag_type() == lofty::tag::TagType::Ape && !is_binary && value.contains('\0') {
+            for physical_value in value.split('\0') {
+                merge_editor_field(
+                    &mut fields,
+                    &mut indexes,
+                    display_key.clone(),
+                    item_key.clone(),
+                    physical_value.to_string(),
+                    false,
+                );
+            }
+        } else {
+            merge_editor_field(&mut fields, &mut indexes, display_key, item_key, value, is_binary);
+        }
     }
 
     // Structured carriers such as MP4 may expose `trkn`/`disk` only through
@@ -7305,7 +7628,7 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
         fields.push(CanonicalEditorTagField {
             item_key,
             display_key: display_key.to_string(),
-            value: value.to_string(),
+            values: MetadataFieldValues::from_stored_text(value.to_string()),
             is_binary: false,
             stored_value_count: 1,
         });
@@ -7330,13 +7653,22 @@ fn canonical_editor_fields_from_dsf(
             // values/counts have already been discarded.
             let stored_value_count = snapshot.stored_value_count(display_key);
             let display_key = display_key.clone();
+            let editor_values = if metadata_field_is_set_valued(&display_key) {
+                MetadataFieldValues::from_stored_texts(values.iter().cloned())
+            } else {
+                let mut scalar = String::new();
+                for value in values {
+                    append_distinct_scalar_editor_value(&mut scalar, value);
+                }
+                MetadataFieldValues::from_scalar(scalar)
+            };
             CanonicalEditorTagField {
                 item_key: canonical_editor_item_key(
                     &display_key,
                     &lofty::tag::ItemKey::Unknown(display_key.clone()),
                 ),
                 display_key,
-                value: values.join("; "),
+                values: editor_values,
                 is_binary: false,
                 stored_value_count,
             }
@@ -7375,14 +7707,14 @@ fn tag_entries_from_dsf_snapshot(snapshot: &crate::dsf_tags::DsfTagSnapshot) -> 
             row_scope: RowScope::File,
             display_key: field.display_key,
             item_key: field.item_key,
-            value: field.value.clone(),
-            original: field.value.clone(),
+            value: field.values.as_str().to_string(),
+            original: field.values.as_str().to_string(),
             is_binary: false,
             is_mixed: false,
             has_multiple_stored_values: field.stored_value_count > 1,
             per_file_stored_value_counts: vec![field.stored_value_count],
-            per_file_values: vec![field.value.clone()],
-            per_file_originals: vec![field.value],
+            per_file_values: vec![field.values.clone()],
+            per_file_originals: vec![field.values],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         })
@@ -7471,8 +7803,8 @@ pub fn ensure_standard_fields_present(entries: &mut Vec<TagEntry>, n_files: usiz
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: vec![0; n_files],
-                per_file_values: vec![String::new(); n_files],
-                per_file_originals: vec![String::new(); n_files],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_files]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); n_files]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -7775,7 +8107,7 @@ fn source_metadata_from_canonical_fields(
         fields
             .iter()
             .find(|field| field.display_key == key && !field.is_binary)
-            .map(|field| field.value.clone())
+            .map(|field| field.values.as_str().to_string())
     };
     let embedded_cue_availability = value("CUESHEET")
         .filter(|value| !value.trim().is_empty())
@@ -7953,14 +8285,14 @@ fn tag_entries_from_canonical_fields(
             row_scope: crate::tui::probe::RowScope::File,
             display_key: field.display_key,
             item_key: field.item_key,
-            value: field.value.clone(),
-            original: field.value.clone(),
+            value: field.values.as_str().to_string(),
+            original: field.values.as_str().to_string(),
             is_binary: field.is_binary,
             is_mixed: false,
             has_multiple_stored_values: field.stored_value_count > 1,
             per_file_stored_value_counts: vec![field.stored_value_count],
-            per_file_values: vec![field.value.clone()],
-            per_file_originals: vec![field.value],
+            per_file_values: vec![field.values.clone()],
+            per_file_originals: vec![field.values],
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         })
@@ -8095,19 +8427,20 @@ pub struct MergedTagsAndMetadata {
 /// normal primary container.
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataEditorTagSnapshot {
+    pub(crate) display_key: String,
     pub(crate) item_key: lofty::tag::ItemKey,
     pub(crate) row_scope: RowScope,
     pub(crate) tag_type: Option<lofty::tag::TagType>,
     pub(crate) existed: Vec<bool>,
-    pub(crate) values: Vec<String>,
-    pub(crate) originals: Vec<String>,
+    pub(crate) values: Vec<MetadataFieldValues>,
+    pub(crate) originals: Vec<MetadataFieldValues>,
 }
 
 /// Read and merge tags from multiple audio files.
 ///
 /// For each `ItemKey` present in any file, collects per-file values.
 /// If all files agree → shared value. If they differ → `<mixed>`.
-/// Duplicate keys within a single file are joined with "; ".
+/// Duplicate keys within a single file remain discrete ordered values.
 pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry>, String> {
     use std::collections::HashMap;
 
@@ -8122,7 +8455,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         item_key: lofty::tag::ItemKey,
         is_binary: bool,
         stored_value_counts: Vec<usize>,
-        values: Vec<String>,
+        values: Vec<MetadataFieldValues>,
     }
 
     let n = paths.len();
@@ -8145,12 +8478,12 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
                             item_key: field.item_key.clone(),
                             is_binary: false,
                             stored_value_counts: vec![0; n],
-                            values: vec![String::new(); n],
+                            values: vec![MetadataFieldValues::default(); n],
                         },
                     );
                 }
                 if let Some(data) = key_map.get_mut(&key) {
-                    data.values[file_idx] = field.value;
+                    data.values[file_idx] = field.values;
                     data.stored_value_counts[file_idx] = field.stored_value_count;
                 }
             }
@@ -8173,12 +8506,12 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
                         item_key: field.item_key.clone(),
                         is_binary: field.is_binary,
                         stored_value_counts: vec![0; n],
-                        values: vec![String::new(); n],
+                        values: vec![MetadataFieldValues::default(); n],
                     },
                 );
             }
             if let Some(data) = key_map.get_mut(&key) {
-                data.values[file_idx] = field.value;
+                data.values[file_idx] = field.values;
                 data.is_binary |= field.is_binary;
                 data.stored_value_counts[file_idx] = field.stored_value_count;
             }
@@ -8195,7 +8528,10 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
         let display_value = if is_mixed {
             "<multiple values>".to_string()
         } else {
-            data.values.first().cloned().unwrap_or_default()
+            data.values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
         entries.push(TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
@@ -8340,7 +8676,7 @@ where
         item_key: lofty::tag::ItemKey,
         is_binary: bool,
         stored_value_counts: Vec<usize>,
-        values: Vec<String>,
+        values: Vec<MetadataFieldValues>,
     }
 
     let mut metadata = vec![SourceMetadata::default(); n];
@@ -8371,12 +8707,12 @@ where
                                     item_key: field.item_key.clone(),
                                     is_binary: false,
                                     stored_value_counts: vec![0; n],
-                                    values: vec![String::new(); n],
+                                    values: vec![MetadataFieldValues::default(); n],
                                 },
                             );
                         }
                         if let Some(data) = key_map.get_mut(&key) {
-                            data.values[file_idx] = field.value;
+                            data.values[file_idx] = field.values;
                             data.stored_value_counts[file_idx] = field.stored_value_count;
                         }
                     }
@@ -8422,12 +8758,12 @@ where
                         item_key: field.item_key.clone(),
                         is_binary: field.is_binary,
                         stored_value_counts: vec![0; n],
-                        values: vec![String::new(); n],
+                        values: vec![MetadataFieldValues::default(); n],
                     },
                 );
             }
             if let Some(data) = key_map.get_mut(&key) {
-                data.values[file_idx] = field.value;
+                data.values[file_idx] = field.values;
                 data.is_binary |= field.is_binary;
                 data.stored_value_counts[file_idx] = field.stored_value_count;
             }
@@ -8444,7 +8780,10 @@ where
         let display_value = if is_mixed {
             "<multiple values>".to_string()
         } else {
-            data.values.first().cloned().unwrap_or_default()
+            data.values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
         entries.push(TagEntry {
             row_scope: crate::tui::probe::RowScope::File,
@@ -8500,11 +8839,14 @@ where
 /// through the CUESHEET tag via `regenerate_cuesheet_for_save`, not
 /// through individual file writes. `deleted` is the editor's
 /// `state.active_surface().deleted` (indices of entries the user removed).
-pub fn apply_audio_tag_changes(
+pub fn apply_audio_tag_changes<V>(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<V>, Vec<V>)],
     deleted: &[usize],
-) -> Vec<(std::path::PathBuf, Result<(), String>)> {
+) -> Vec<(std::path::PathBuf, Result<(), String>)>
+where
+    V: Clone + Into<MetadataFieldValues>,
+{
     apply_audio_tag_changes_with_save_blocks(paths, entries_snap, deleted, &[])
         .into_iter()
         .map(crate::tui::app::MetadataEditorWriteResult::into_legacy_result)
@@ -8635,12 +8977,15 @@ impl MetadataWriteFailure {
     }
 }
 
-pub fn apply_audio_tag_changes_with_save_blocks(
+pub fn apply_audio_tag_changes_with_save_blocks<V>(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<V>, Vec<V>)],
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
-) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+) -> Vec<crate::tui::app::MetadataEditorWriteResult>
+where
+    V: Clone + Into<MetadataFieldValues>,
+{
     apply_audio_tag_changes_with_save_blocks_and_progress(
         paths,
         entries_snap,
@@ -8660,14 +9005,17 @@ pub fn apply_audio_tag_changes_with_save_blocks(
 /// Planning remains deterministic and single-threaded; only independent file
 /// writes are piped. Results are returned in path order so save-result reduction
 /// and sidecar gating remain stable even when workers complete out of order.
-pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
+pub fn apply_audio_tag_changes_with_save_blocks_and_progress<V>(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, Vec<String>, Vec<String>)],
+    entries_snap: &[(lofty::tag::ItemKey, Vec<V>, Vec<V>)],
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
     progress: Option<MetadataWriteProgressCallback>,
     cancel: Option<MetadataWriteCancelFlag>,
-) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
+) -> Vec<crate::tui::app::MetadataEditorWriteResult>
+where
+    V: Clone + Into<MetadataFieldValues>,
+{
     // Rows whose value vectors don't align to the path count cannot be
     // whole-file writes. Route them as Track scope — which the underlying
     // writer SKIPS (track-dimension data round-trips through the regenerated
@@ -8686,7 +9034,12 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
             } else {
                 RowScope::File
             };
-            (key.clone(), scope, values.clone(), originals.clone())
+            (
+                key.clone(),
+                scope,
+                values.iter().cloned().map(Into::into).collect(),
+                originals.iter().cloned().map(Into::into).collect(),
+            )
         })
         .collect();
     if !misaligned_rows.is_empty() {
@@ -8717,7 +9070,14 @@ pub fn apply_audio_tag_changes_with_save_blocks_and_progress(
 /// treated as the tag to delete.
 pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, RowScope, Vec<String>, Vec<String>)],
+    entries_snap: &[
+        (
+            lofty::tag::ItemKey,
+            RowScope,
+            Vec<MetadataFieldValues>,
+            Vec<MetadataFieldValues>,
+        )
+    ],
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
     progress: Option<MetadataWriteProgressCallback>,
@@ -8740,7 +9100,14 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes(
 
 pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
     paths: &[std::path::PathBuf],
-    entries_snap: &[(lofty::tag::ItemKey, RowScope, Vec<String>, Vec<String>)],
+    entries_snap: &[
+        (
+            lofty::tag::ItemKey,
+            RowScope,
+            Vec<MetadataFieldValues>,
+            Vec<MetadataFieldValues>,
+        )
+    ],
     deleted: &[usize],
     save_block_reasons: &[Option<String>],
     progress: Option<MetadataWriteProgressCallback>,
@@ -8752,6 +9119,10 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_v
     let normalized = entries_snap
         .iter()
         .map(|(item_key, row_scope, values, originals)| MetadataEditorTagSnapshot {
+            display_key: canonical_editor_display_key(
+                item_key,
+                lofty::tag::TagType::VorbisComments,
+            ),
             item_key: item_key.clone(),
             row_scope: *row_scope,
             tag_type: None,
@@ -8831,8 +9202,100 @@ pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_fo
 struct EditorTagChange {
     tag_type: Option<lofty::tag::TagType>,
     existed: bool,
+    display_key: String,
     item_key: lofty::tag::ItemKey,
-    value: Option<String>,
+    values: Option<MetadataFieldValues>,
+}
+
+fn editor_change_values_for_backend(
+    change: &EditorTagChange,
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+) -> Option<Vec<String>> {
+    let values = change.values.as_ref()?;
+    if metadata_field_is_set_valued(&change.display_key) && backend.supports_repeated_instances() {
+        let values = values.to_texts();
+        (!values.is_empty()).then_some(values)
+    } else {
+        (!values.as_str().is_empty()).then(|| vec![values.as_str().to_string()])
+    }
+}
+
+fn editor_changes_for_backend(
+    changes: &[EditorTagChange],
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+) -> Vec<(lofty::tag::ItemKey, Option<Vec<String>>)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.item_key.clone(),
+                editor_change_values_for_backend(change, backend),
+            )
+        })
+        .collect()
+}
+
+fn repeated_instance_loss_warnings(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+) -> Vec<String> {
+    let candidates = changes
+        .iter()
+        .filter(|change| {
+            metadata_field_is_set_valued(&change.display_key)
+                && change
+                    .values
+                    .as_ref()
+                    .is_some_and(|values| values.value_count() > 1)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let fallback_backend = candidates
+        .iter()
+        .any(|change| change.tag_type.is_none())
+        .then(|| crate::metadata_persistence::metadata_backend_for_path(path))
+        .transpose()
+        .ok()
+        .flatten();
+
+    candidates
+        .into_iter()
+        .filter_map(|change| {
+            let backend = change
+                .tag_type
+                .map(crate::metadata_persistence::metadata_backend_for_lofty_tag_type)
+                .or(fallback_backend)?;
+            (!backend.supports_repeated_instances()).then(|| {
+                let count = change.values.as_ref().map_or(0, MetadataFieldValues::value_count);
+                format!(
+                    "{} has {count} values, but {} stores one value for this field; save used the legacy joined representation",
+                    change.display_key,
+                    backend.label(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn editor_changes_scalar_projection(
+    changes: &[EditorTagChange],
+) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.item_key.clone(),
+                change
+                    .values
+                    .as_ref()
+                    .filter(|values| !values.as_str().is_empty())
+                    .map(|values| values.as_str().to_string()),
+            )
+        })
+        .collect()
 }
 
 fn apply_metadata_editor_tag_changes_internal(
@@ -8871,8 +9334,9 @@ fn apply_metadata_editor_tag_changes_internal(
                 changes.push(EditorTagChange {
                     tag_type: entry.tag_type,
                     existed: entry.existed.get(file_idx).copied().unwrap_or(false),
+                    display_key: entry.display_key.clone(),
                     item_key: entry.item_key.clone(),
-                    value: None,
+                    values: None,
                 });
             } else if file_idx < entry.values.len()
                 && file_idx < entry.originals.len()
@@ -8881,8 +9345,9 @@ fn apply_metadata_editor_tag_changes_internal(
                 changes.push(EditorTagChange {
                     tag_type: entry.tag_type,
                     existed: entry.existed.get(file_idx).copied().unwrap_or(false),
+                    display_key: entry.display_key.clone(),
                     item_key: entry.item_key.clone(),
-                    value: Some(entry.values[file_idx].clone()),
+                    values: Some(entry.values[file_idx].clone()),
                 });
             }
         }
@@ -8891,8 +9356,12 @@ fn apply_metadata_editor_tag_changes_internal(
                 changes.push(EditorTagChange {
                     tag_type: None,
                     existed: false,
+                    display_key: canonical_editor_display_key(
+                        key,
+                        lofty::tag::TagType::VorbisComments,
+                    ),
                     item_key: key.clone(),
-                    value: None,
+                    values: None,
                 });
             }
         }
@@ -8976,10 +9445,17 @@ fn apply_metadata_editor_tag_changes_internal(
                         Some(&report_byte_progress),
                         verification,
                     ) {
-                        Ok(report) => crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
-                            write.path.clone(),
-                            report.durability_warnings,
-                        ),
+                        Ok(report) => {
+                            let mut warnings = report.durability_warnings;
+                            warnings.extend(repeated_instance_loss_warnings(
+                                &write.path,
+                                &write.changes,
+                            ));
+                            crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
+                                write.path.clone(),
+                                warnings,
+                            )
+                        }
                         Err(MetadataWriteFailure::Cancelled(reason)) => {
                             crate::tui::app::MetadataEditorWriteResult::skipped(write.path.clone(), reason)
                         }
@@ -9212,17 +9688,72 @@ fn write_editor_tag_changes_with_cancel_report_at_verification(
                 route
             ));
         }
-        let primary_changes = changes
-            .iter()
-            .map(|change| (change.item_key.clone(), change.value.clone()))
-            .collect::<Vec<_>>();
-        return write_all_tags_with_cancel_report_at_verification(
-            path,
-            &primary_changes,
-            cancel,
-            byte_progress,
-            verification,
-        );
+        match route {
+            crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
+                let backend = crate::metadata_persistence::MetadataPersistenceBackend::NativeFlacVorbis;
+                let value_changes = editor_changes_for_backend(changes, backend);
+                normalized_vorbis_lofty_value_changes(&value_changes)?;
+                let numbering_changes = metadata_value_changes_scalar_projection(&value_changes);
+                crate::metadata_persistence::validate_numbering_changes_for_backend(
+                    backend,
+                    &numbering_changes,
+                )?;
+                let observation_before =
+                    cancel.map_or(0, MetadataWriteCancelFlag::observation_count);
+                return match flac_metadata_writer::write_vorbis_comment_value_changes(
+                    path,
+                    &value_changes,
+                    cancel,
+                ) {
+                    Ok(report) => Ok(MetadataWriteCommitReport::from_warnings(
+                        report.durability_warnings,
+                    )),
+                    Err(native_err)
+                        if cancel.is_some_and(|flag| {
+                            flag.observation_count() > observation_before
+                        }) =>
+                    {
+                        Err(native_err)
+                    }
+                    Err(native_err) => Err(native_flac_write_refused_error(
+                        path,
+                        "tag write",
+                        &native_err,
+                    )),
+                };
+            }
+            crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
+                let backend = crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe;
+                let value_changes = editor_changes_for_backend(changes, backend);
+                recover_ape_tail_before_read(path)?;
+                if is_wavpack_path(path) && wavpack_requires_native_ape_writer(path)? {
+                    return write_all_tags_native_wavpack_ape_atomic_with_policy_values(
+                        path,
+                        &value_changes,
+                        cancel,
+                        false,
+                    );
+                }
+                return write_all_tags_native_ape_tail_values(
+                    path,
+                    &value_changes,
+                    cancel,
+                    byte_progress,
+                    false,
+                    false,
+                );
+            }
+            _ => {
+                let primary_changes = editor_changes_scalar_projection(changes);
+                return write_all_tags_with_cancel_report_at_verification(
+                    path,
+                    &primary_changes,
+                    cancel,
+                    byte_progress,
+                    verification,
+                );
+            }
+        }
     }
 
     check_metadata_write_cancel(cancel, "before starting origin-aware metadata rewrite")?;
@@ -9275,6 +9806,41 @@ pub(crate) fn write_all_tags_for_transfer_at_verification(
     write_all_tags_with_cancel_report_classified_at_verification(
         path,
         changes,
+        cancel,
+        None,
+        verification,
+    )
+    .map_err(MetadataWriteFailure::into_message)
+}
+
+
+/// Transfer-only list-preserving write boundary. The caller supplies whether
+/// the logical field already exists on the target so Lofty can keep its normal
+/// primary-vs-existing-container placement semantics. Native-capable backends
+/// receive the ordered list; other backends receive the legacy scalar display
+/// projection through the same editor-aware routing used by ordinary saves.
+pub(crate) fn write_tag_value_lists_for_transfer_at_verification(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<MetadataFieldValues>, bool)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
+    let changes = changes
+        .iter()
+        .map(|(item_key, values, existed)| EditorTagChange {
+            tag_type: None,
+            existed: *existed,
+            display_key: canonical_editor_display_key(
+                item_key,
+                lofty::tag::TagType::VorbisComments,
+            ),
+            item_key: item_key.clone(),
+            values: values.clone(),
+        })
+        .collect::<Vec<_>>();
+    write_editor_tag_changes_with_cancel_report_classified_at_verification(
+        path,
+        &changes,
         cancel,
         None,
         verification,
@@ -9728,10 +10294,27 @@ fn write_all_tags_with_cancel_report(
     )
 }
 
+fn metadata_value_changes_scalar_projection(
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
+) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
+    changes
+        .iter()
+        .map(|(key, values)| {
+            (
+                key.clone(),
+                values
+                    .as_ref()
+                    .filter(|values| !values.is_empty())
+                    .map(|values| values.join("; ")),
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct NativeApeRequestedChange {
     physical_key: String,
-    value: Option<String>,
+    values: Option<Vec<String>>,
 }
 
 fn native_ape_change_identity_and_key(
@@ -9766,23 +10349,19 @@ fn native_ape_change_identity_and_key(
     Ok((native_ape_canonical_key(&physical_key), physical_key))
 }
 
-fn collect_native_ape_requested_changes(
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
+fn collect_native_ape_requested_value_changes(
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
 ) -> Result<std::collections::BTreeMap<String, NativeApeRequestedChange>, String> {
     let mut requested =
         std::collections::BTreeMap::<String, NativeApeRequestedChange>::new();
-    for (key, value) in changes {
+    for (key, values) in changes {
         let (identity, physical_key) = native_ape_change_identity_and_key(key)?;
-        // The public metadata-write contract treats both `None` and an
-        // empty string as deletion. Normalize at the native boundary so every
-        // downstream path, including combined Track/Disc serialization, sees
-        // one unambiguous delete representation.
         let candidate = NativeApeRequestedChange {
             physical_key,
-            value: value.as_ref().filter(|value| !value.is_empty()).cloned(),
+            values: values.as_ref().filter(|values| !values.is_empty()).cloned(),
         };
         if let Some(existing) = requested.get(&identity) {
-            if existing.value != candidate.value {
+            if existing.values != candidate.values {
                 return Err(format!(
                     "conflicting metadata changes target the same native WavPack/APEv2 field {identity}"
                 ));
@@ -9794,6 +10373,21 @@ fn collect_native_ape_requested_changes(
     Ok(requested)
 }
 
+fn scalar_native_ape_changes(
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Vec<(lofty::tag::ItemKey, Option<Vec<String>>)> {
+    changes
+        .iter()
+        .map(|(key, value)| {
+            let values = value
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .map(|value| vec![value.clone()]);
+            (key.clone(), values)
+        })
+        .collect()
+}
+
 fn canonical_field_value(
     fields: &[CanonicalEditorTagField],
     key: &str,
@@ -9801,13 +10395,27 @@ fn canonical_field_value(
     fields
         .iter()
         .find(|field| field.display_key == key && !field.is_binary)
-        .map(|field| field.value.clone())
+        .map(|field| field.values.as_str().to_string())
         .filter(|value| !value.is_empty())
 }
 
 fn native_ape_numbering_fraction(value: &str) -> Option<(&str, &str)> {
     let (number, total) = value.split_once('/')?;
     (!number.is_empty() && !total.is_empty() && !total.contains('/')).then_some((number, total))
+}
+
+fn native_ape_single_requested_value(
+    identity: &str,
+    change: NativeApeRequestedChange,
+) -> Result<Option<String>, String> {
+    match change.values {
+        None => Ok(None),
+        Some(mut values) if values.len() == 1 => Ok(values.pop()),
+        Some(values) => Err(format!(
+            "native WavPack/APEv2 numbering field {identity} requires one value, got {}",
+            values.len()
+        )),
+    }
 }
 
 fn combine_native_ape_numbering_change(
@@ -9826,7 +10434,7 @@ fn combine_native_ape_numbering_change(
     let existing_number = canonical_field_value(fields, number_identity);
     let existing_total = canonical_field_value(fields, total_identity);
     let value = match (number_change, total_change) {
-        (Some(number), Some(total)) => match (number.value, total.value) {
+        (Some(number), Some(total)) => match (native_ape_single_requested_value(number_identity, number)?, native_ape_single_requested_value(total_identity, total)?) {
             (None, None) => None,
             (None, Some(_)) => {
                 return Err(format!(
@@ -9847,7 +10455,7 @@ fn combine_native_ape_numbering_change(
                 }
             },
         },
-        (Some(number), None) => match number.value {
+        (Some(number), None) => match native_ape_single_requested_value(number_identity, number)? {
             // Track/Disc number owns the combined physical item. Deleting the
             // number therefore deletes the whole item and its inseparable
             // total, exactly as the logical tag-delete contract requires.
@@ -9861,7 +10469,7 @@ fn combine_native_ape_numbering_change(
                 }
             }),
         },
-        (None, Some(total)) => match total.value {
+        (None, Some(total)) => match native_ape_single_requested_value(total_identity, total)? {
             // Deleting only the total preserves the existing number as a
             // non-fractional physical value.
             None => existing_number,
@@ -9879,25 +10487,47 @@ fn combine_native_ape_numbering_change(
         number_identity.to_string(),
         NativeApeRequestedChange {
             physical_key: physical_key.to_string(),
-            value,
+            values: value.map(|value| vec![value]),
         },
     );
     Ok(())
 }
 
-fn encode_native_ape_text_item(key: &str, value: &str) -> Result<Vec<u8>, String> {
+fn encode_native_ape_text_values_item(key: &str, values: &[String]) -> Result<Vec<u8>, String> {
     if !ape_key_is_valid(key.as_bytes()) {
         return Err(format!("refusing to encode invalid APEv2 key {key:?}"));
     }
-    let value_len = u32::try_from(value.len())
+    if values.iter().any(|value| value.contains('\0')) {
+        return Err(format!(
+            "refusing APEv2 value for {key:?} containing an embedded NUL delimiter"
+        ));
+    }
+    let text_bytes = values.iter().try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.len())
+            .ok_or_else(|| format!("APEv2 value length overflow for {key:?}"))
+    })?;
+    let payload_len = text_bytes
+        .checked_add(values.len().saturating_sub(1))
+        .ok_or_else(|| format!("APEv2 value length overflow for {key:?}"))?;
+    let value_len = u32::try_from(payload_len)
         .map_err(|_| format!("APEv2 value for {key:?} exceeds 4 GiB"))?;
-    let mut raw = Vec::with_capacity(8 + key.len() + 1 + value.len());
+    let mut raw = Vec::with_capacity(8 + key.len() + 1 + payload_len);
     raw.extend_from_slice(&value_len.to_le_bytes());
     raw.extend_from_slice(&APE_ITEM_TYPE_TEXT.to_le_bytes());
     raw.extend_from_slice(key.as_bytes());
     raw.push(0);
-    raw.extend_from_slice(value.as_bytes());
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            raw.push(0);
+        }
+        raw.extend_from_slice(value.as_bytes());
+    }
     Ok(raw)
+}
+
+fn encode_native_ape_text_item(key: &str, value: &str) -> Result<Vec<u8>, String> {
+    encode_native_ape_text_values_item(key, &[value.to_string()])
 }
 
 fn native_ape_descriptor(size: u32, item_count: u32, flags: u32) -> [u8; APE_DESCRIPTOR_LEN] {
@@ -9992,9 +10622,9 @@ pub(crate) fn inject_invalid_ape_key_item_for_test(
     Ok(raw)
 }
 
-fn prepare_native_ape_replacement(
+fn prepare_native_ape_value_replacement(
     path: &std::path::Path,
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
     drop_invalid_items: bool,
     clear_all_items: bool,
 ) -> Result<(u64, u64, Vec<u8>, bool), String> {
@@ -10013,7 +10643,7 @@ fn prepare_native_ape_replacement(
         Some(tag) => native_ape_fields(tag, path)?,
         None => Vec::new(),
     };
-    let mut requested = collect_native_ape_requested_changes(changes)?;
+    let mut requested = collect_native_ape_requested_value_changes(changes)?;
     combine_native_ape_numbering_change(
         &mut requested,
         &fields,
@@ -10051,9 +10681,15 @@ fn prepare_native_ape_replacement(
                 continue;
             };
             if item.is_read_only() {
-                if change.value.as_deref().is_some_and(|expected| {
+                if change.values.as_ref().is_some_and(|expected| {
                     matches!(item.item_type(), APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR)
-                        && item.value == expected.as_bytes()
+                        && encode_native_ape_text_values_item(&change.physical_key, expected)
+                            .ok()
+                            .and_then(|raw| {
+                                let key_end = 8 + change.physical_key.len() + 1;
+                                raw.get(key_end..).map(|payload| item.value == payload)
+                            })
+                            .unwrap_or(false)
                 }) && emitted.insert(identity.clone())
                 {
                     output_items.push(item.raw.clone());
@@ -10066,8 +10702,8 @@ fn prepare_native_ape_replacement(
                 ));
             }
             if emitted.insert(identity.clone()) {
-                if let Some(value) = change.value.as_deref() {
-                    output_items.push(encode_native_ape_text_item(&change.physical_key, value)?);
+                if let Some(values) = change.values.as_deref() {
+                    output_items.push(encode_native_ape_text_values_item(&change.physical_key, values)?);
                 }
             }
         }
@@ -10076,8 +10712,8 @@ fn prepare_native_ape_replacement(
         if emitted.contains(identity) {
             continue;
         }
-        if let Some(value) = change.value.as_deref() {
-            output_items.push(encode_native_ape_text_item(&change.physical_key, value)?);
+        if let Some(values) = change.values.as_deref() {
+            output_items.push(encode_native_ape_text_values_item(&change.physical_key, values)?);
         }
     }
 
@@ -10104,6 +10740,16 @@ fn prepare_native_ape_replacement(
         false
     };
     Ok((replace_start, footer_end, replacement, unchanged))
+}
+
+fn prepare_native_ape_replacement(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    drop_invalid_items: bool,
+    clear_all_items: bool,
+) -> Result<(u64, u64, Vec<u8>, bool), String> {
+    let changes = scalar_native_ape_changes(changes);
+    prepare_native_ape_value_replacement(path, &changes, drop_invalid_items, clear_all_items)
 }
 
 const APE_TAIL_JOURNAL_MAGIC: &[u8; 8] = b"TPAPEJ01";
@@ -10635,6 +11281,27 @@ fn write_all_tags_native_ape_tail(
     drop_invalid_items: bool,
     clear_all_items: bool,
 ) -> Result<MetadataWriteCommitReport, String> {
+    let changes = scalar_native_ape_changes(changes);
+    write_all_tags_native_ape_tail_values(
+        path,
+        &changes,
+        cancel,
+        byte_progress,
+        drop_invalid_items,
+        clear_all_items,
+    )
+}
+
+fn write_all_tags_native_ape_tail_values(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    drop_invalid_items: bool,
+    clear_all_items: bool,
+) -> Result<MetadataWriteCommitReport, String> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let report_progress = |update| {
@@ -10654,9 +11321,10 @@ fn write_all_tags_native_ape_tail(
         log::warn!("{warning}");
     }
     validate_native_ape_carrier_magic(path)?;
+    let numbering_changes = metadata_value_changes_scalar_projection(changes);
     crate::metadata_persistence::validate_numbering_changes_for_backend(
         crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
-        changes,
+        &numbering_changes,
     )?;
     check_metadata_write_cancel(cancel, "before checking APEv2 metadata recovery authority")?;
     {
@@ -10669,7 +11337,7 @@ fn write_all_tags_native_ape_tail(
     let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
     check_metadata_write_cancel(cancel, "before parsing native APEv2 metadata")?;
     let (replace_start, footer_end, replacement, unchanged) =
-        prepare_native_ape_replacement(path, changes, drop_invalid_items, clear_all_items)?;
+        prepare_native_ape_value_replacement(path, changes, drop_invalid_items, clear_all_items)?;
     if unchanged {
         return Ok(MetadataWriteCommitReport::clean());
     }
@@ -11218,6 +11886,21 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy(
     cancel: Option<&MetadataWriteCancelFlag>,
     drop_invalid_items: bool,
 ) -> Result<MetadataWriteCommitReport, String> {
+    let changes = scalar_native_ape_changes(changes);
+    write_all_tags_native_wavpack_ape_atomic_with_policy_values(
+        path,
+        &changes,
+        cancel,
+        drop_invalid_items,
+    )
+}
+
+fn write_all_tags_native_wavpack_ape_atomic_with_policy_values(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    drop_invalid_items: bool,
+) -> Result<MetadataWriteCommitReport, String> {
     write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
         path,
         changes,
@@ -11246,7 +11929,7 @@ fn clear_all_tags_native_wavpack_ape_atomic(
 
 fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
     path: &std::path::Path,
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
     cancel: Option<&MetadataWriteCancelFlag>,
     drop_invalid_items: bool,
     clear_all_items: bool,
@@ -11254,9 +11937,10 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
 ) -> Result<MetadataWriteCommitReport, NativeApeWriteFailure> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
+    let numbering_changes = metadata_value_changes_scalar_projection(changes);
     crate::metadata_persistence::validate_numbering_changes_for_backend(
         crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
-        changes,
+        &numbering_changes,
     )?;
     let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
     {
@@ -11287,7 +11971,7 @@ fn write_all_tags_native_wavpack_ape_atomic_with_policy_classified(
 
     check_metadata_write_cancel(cancel, "before parsing native WavPack/APEv2 metadata")?;
     let (replace_start, footer_end, replacement, unchanged) =
-        prepare_native_ape_replacement(path, changes, drop_invalid_items, clear_all_items)?;
+        prepare_native_ape_value_replacement(path, changes, drop_invalid_items, clear_all_items)?;
     if unchanged {
         return Ok(MetadataWriteCommitReport::clean());
     }
@@ -11636,28 +12320,25 @@ fn canonical_vorbis_alias_group<'a>(
     }
 }
 
-fn normalized_vorbis_lofty_changes(
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
+fn normalized_vorbis_lofty_value_changes(
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
 ) -> Result<
     Vec<(
         String,
         lofty::tag::ItemKey,
-        Option<String>,
+        Option<Vec<String>>,
         Vec<lofty::tag::ItemKey>,
     )>,
     String,
 > {
     use std::collections::BTreeMap;
 
-    let mut resolved = BTreeMap::<String, Option<String>>::new();
-    for (key, value) in changes {
+    let mut resolved = BTreeMap::<String, Option<Vec<String>>>::new();
+    for (key, values) in changes {
         let raw = lofty_vorbis_comment_key(key)
             .ok_or_else(|| format!("cannot map {:?} to a Vorbis comment key", key))?;
         let (canonical, _) = canonical_vorbis_alias_group(&raw);
-        let normalized = value
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let normalized = values.as_ref().filter(|values| !values.is_empty()).cloned();
         if let Some(previous) = resolved.get(canonical) {
             if previous != &normalized {
                 return Err(format!(
@@ -11671,7 +12352,7 @@ fn normalized_vorbis_lofty_changes(
 
     Ok(resolved
         .into_iter()
-        .map(|(canonical, value)| {
+        .map(|(canonical, values)| {
             let (_, aliases) = canonical_vorbis_alias_group(&canonical);
             let removal_keys = aliases
                 .iter()
@@ -11682,29 +12363,57 @@ fn normalized_vorbis_lofty_changes(
                 "COMMENT" => lofty::tag::ItemKey::Comment,
                 _ => lofty::tag::ItemKey::Unknown(canonical.clone()),
             };
-            (canonical, insert_key, value, removal_keys)
+            (canonical, insert_key, values, removal_keys)
         })
         .collect())
 }
 
-
-fn apply_vorbis_lofty_changes(
-    tag: &mut lofty::tag::Tag,
+fn scalar_vorbis_lofty_changes(
     changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Vec<(lofty::tag::ItemKey, Option<Vec<String>>)> {
+    changes
+        .iter()
+        .map(|(key, value)| {
+            let values = value
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| vec![value.to_string()]);
+            (key.clone(), values)
+        })
+        .collect()
+}
+
+fn normalized_vorbis_lofty_changes(
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<
+    Vec<(
+        String,
+        lofty::tag::ItemKey,
+        Option<Vec<String>>,
+        Vec<lofty::tag::ItemKey>,
+    )>,
+    String,
+> {
+    normalized_vorbis_lofty_value_changes(&scalar_vorbis_lofty_changes(changes))
+}
+
+fn apply_vorbis_lofty_value_changes(
+    tag: &mut lofty::tag::Tag,
+    changes: &[(lofty::tag::ItemKey, Option<Vec<String>>)],
 ) -> Result<bool, String> {
     use lofty::tag::{ItemValue, TagItem};
 
     let mut changed = false;
-    for (canonical, insert_key, new_value, removal_keys) in
-        normalized_vorbis_lofty_changes(changes)?
+    for (canonical, insert_key, new_values, removal_keys) in
+        normalized_vorbis_lofty_value_changes(changes)?
     {
         // Remove the actual ItemKey instances Lofty parsed, not only guessed
-        // Unknown aliases. Some Vorbis spellings map to typed ItemKey variants,
-        // while others remain Unknown; canonicalizing each existing item before
-        // collecting its key covers both.
-        let mut matching_count = 0usize;
-        let mut matching_text = None;
-        let mut matching_key_is_canonical = false;
+        // Unknown aliases. Canonicalizing each existing item covers typed and
+        // unknown representations while preserving carrier order for the
+        // idempotency comparison.
+        let mut matching_values = Vec::<String>::new();
+        let mut all_keys_canonical = true;
         let parsed_alias_keys = tag
             .items()
             .filter_map(|item| {
@@ -11713,24 +12422,17 @@ fn apply_vorbis_lofty_changes(
                 if existing_canonical != canonical {
                     return None;
                 }
-                matching_count += 1;
-                if matching_count == 1 {
-                    matching_text = match item.value() {
-                        ItemValue::Text(value) => Some(value.clone()),
-                        _ => None,
-                    };
-                    matching_key_is_canonical = raw.eq_ignore_ascii_case(&canonical);
+                match item.value() {
+                    ItemValue::Text(value) => matching_values.push(value.clone()),
+                    _ => matching_values.push(String::new()),
                 }
+                all_keys_canonical &= raw.eq_ignore_ascii_case(&canonical);
                 Some(item.key().clone())
             })
             .collect::<Vec<_>>();
-        let already_satisfied = match new_value.as_deref() {
-            Some(expected) => {
-                matching_count == 1
-                    && matching_key_is_canonical
-                    && matching_text.as_deref() == Some(expected)
-            }
-            None => matching_count == 0,
+        let already_satisfied = match new_values.as_ref() {
+            Some(expected) => all_keys_canonical && matching_values == *expected,
+            None => matching_values.is_empty(),
         };
         if already_satisfied {
             continue;
@@ -11740,11 +12442,37 @@ fn apply_vorbis_lofty_changes(
             tag.remove_key(removal_key);
         }
         tag.remove_key(&insert_key);
-        if let Some(value) = new_value {
-            tag.insert_unchecked(TagItem::new(insert_key, ItemValue::Text(value)));
+        if let Some(values) = new_values {
+            for value in values {
+                let item = TagItem::new(insert_key.clone(), ItemValue::Text(value));
+                if matches!(&insert_key, lofty::tag::ItemKey::Unknown(_)) {
+                    // Canonical Vorbis field spellings intentionally use
+                    // `Unknown` so we control the physical comment key.
+                    // Lofty's checked `push` rejects such keys when they do
+                    // not map through ItemKey's built-in table, silently
+                    // dropping otherwise valid custom/canonical comments.
+                    // `push_unchecked` is the API Lofty provides for this
+                    // case; the Vorbis writer still validates the physical
+                    // key when serializing the tag.
+                    tag.push_unchecked(item);
+                } else if !tag.push(item) {
+                    return Err(format!(
+                        "cannot map canonical Vorbis comment key {canonical:?} into Lofty tag type {:?}",
+                        tag.tag_type()
+                    ));
+                }
+            }
         }
     }
     Ok(changed)
+}
+
+fn apply_vorbis_lofty_changes(
+    tag: &mut lofty::tag::Tag,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Result<bool, String> {
+    let changes = scalar_vorbis_lofty_changes(changes);
+    apply_vorbis_lofty_value_changes(tag, &changes)
 }
 
 fn typed_numbering_accessor_value(
@@ -12121,6 +12849,56 @@ fn prepare_all_tags_lofty_from_tagged(
     Ok(Some(tagged))
 }
 
+fn editor_changes_for_lofty_ape(
+    changes: &[EditorTagChange],
+) -> Result<Vec<(lofty::tag::ItemKey, Option<String>)>, String> {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe;
+    changes
+        .iter()
+        .map(|change| {
+            let value = match change.values.as_ref() {
+                None => None,
+                Some(values) if metadata_field_is_set_valued(&change.display_key)
+                    && backend.supports_repeated_instances() =>
+                {
+                    if values.values().iter().any(|value| value.text.contains('\0')) {
+                        return Err(format!(
+                            "refusing APEv2 field {} containing an embedded NUL delimiter",
+                            change.display_key
+                        ));
+                    }
+                    (!values.values().is_empty()).then(|| values.texts().collect::<Vec<_>>().join("\0"))
+                }
+                Some(values) => (!values.as_str().is_empty())
+                    .then(|| values.as_str().to_string()),
+            };
+            Ok((change.item_key.clone(), value))
+        })
+        .collect()
+}
+
+fn apply_editor_changes_to_lofty_tag(
+    tag: &mut lofty::tag::Tag,
+    changes: &[EditorTagChange],
+) -> Result<bool, String> {
+    let backend = crate::metadata_persistence::metadata_backend_for_lofty_tag_type(tag.tag_type());
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyVorbisComments {
+        let value_changes = editor_changes_for_backend(changes, backend);
+        let numbering_changes = metadata_value_changes_scalar_projection(&value_changes);
+        crate::metadata_persistence::validate_numbering_changes_for_backend(
+            backend,
+            &numbering_changes,
+        )?;
+        return apply_vorbis_lofty_value_changes(tag, &value_changes);
+    }
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe {
+        let scalar_changes = editor_changes_for_lofty_ape(changes)?;
+        return apply_changes_to_lofty_tag(tag, &scalar_changes);
+    }
+    let scalar_changes = editor_changes_scalar_projection(changes);
+    apply_changes_to_lofty_tag(tag, &scalar_changes)
+}
+
 fn prepare_editor_tags_lofty_from_tagged(
     mut tagged: lofty::file::TaggedFile,
     changes: &[EditorTagChange],
@@ -12132,10 +12910,7 @@ fn prepare_editor_tags_lofty_from_tagged(
         .or_else(|| tagged.first_tag())
         .map(|tag| tag.tag_type());
     let normal_primary_type = tagged.primary_tag_type();
-    let mut groups = Vec::<(
-        lofty::tag::TagType,
-        Vec<(lofty::tag::ItemKey, Option<String>)>,
-    )>::new();
+    let mut groups = Vec::<(lofty::tag::TagType, Vec<EditorTagChange>)>::new();
     for change in changes {
         let target_type = change.tag_type.unwrap_or_else(|| {
             if change.existed {
@@ -12148,19 +12923,16 @@ fn prepare_editor_tags_lofty_from_tagged(
             .iter_mut()
             .find(|(tag_type, _)| *tag_type == target_type)
         {
-            grouped.push((change.item_key.clone(), change.value.clone()));
+            grouped.push(change.clone());
         } else {
-            groups.push((
-                target_type,
-                vec![(change.item_key.clone(), change.value.clone())],
-            ));
+            groups.push((target_type, vec![change.clone()]));
         }
     }
 
     let mut changed = false;
     for (tag_type, grouped) in groups {
         if tagged.tag(tag_type).is_none() {
-            if grouped.iter().all(|(_, value)| value.is_none()) {
+            if grouped.iter().all(|change| change.values.is_none()) {
                 continue;
             }
             tagged.insert_tag(lofty::tag::Tag::new(tag_type));
@@ -12171,7 +12943,7 @@ fn prepare_editor_tags_lofty_from_tagged(
                 editor_tag_type_label(tag_type)
             )
         })?;
-        changed |= apply_changes_to_lofty_tag(tag, &grouped)?;
+        changed |= apply_editor_changes_to_lofty_tag(tag, &grouped)?;
     }
 
     if !changed {
@@ -14157,6 +14929,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/metadata_persistence/vorbis.ogg"
     ));
+    const OPUS_MULTIVALUE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/metadata_persistence/opus.opus"
+    ));
     const NATIVE_FLAC_NUMBERING_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/silence.flac"
@@ -14266,6 +15042,7 @@ mod tests {
         entries
             .iter()
             .map(|entry| MetadataEditorTagSnapshot {
+                display_key: canonical_metadata_display_key(&entry.display_key),
                 item_key: entry.item_key.clone(),
                 row_scope: entry.row_scope,
                 tag_type: editor_tag_origin(&entry.display_key),
@@ -14278,9 +15055,332 @@ mod tests {
             .collect()
     }
 
+    fn editor_list_snapshot(
+        display_key: &str,
+        values: &[&str],
+        originals: &[&str],
+    ) -> MetadataEditorTagSnapshot {
+        MetadataEditorTagSnapshot {
+            display_key: display_key.to_string(),
+            item_key: item_key_for_new_editor_row(display_key),
+            row_scope: RowScope::File,
+            tag_type: None,
+            existed: vec![!originals.is_empty()],
+            values: vec![MetadataFieldValues::from_stored_texts(values.iter().copied())],
+            originals: vec![MetadataFieldValues::from_stored_texts(originals.iter().copied())],
+        }
+    }
+
+    fn apply_editor_list_change(
+        path: &std::path::Path,
+        display_key: &str,
+        values: &[&str],
+        originals: &[&str],
+    ) -> crate::tui::app::MetadataEditorWriteResult {
+        let snapshot = editor_list_snapshot(display_key, values, originals);
+        let mut results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path.to_path_buf()),
+            &[snapshot],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1, "one changed carrier must yield one result");
+        results.pop().expect("single metadata write result")
+    }
+
+    fn editor_slot_values(path: &std::path::Path, display_key: &str) -> Vec<String> {
+        let entries = read_all_tags(path).expect("read carrier through metadata editor");
+        entries
+            .iter()
+            .find(|entry| entry.display_key == display_key)
+            .and_then(|entry| entry.per_file_values.first())
+            .map(MetadataFieldValues::to_texts)
+            .unwrap_or_default()
+    }
+
+    fn assert_saved_without_warnings(result: &crate::tui::app::MetadataEditorWriteResult) {
+        assert!(
+            matches!(&result.outcome, crate::tui::app::MetadataEditorWriteOutcome::Saved),
+            "unexpected metadata write result: {result:?}"
+        );
+    }
+
+    fn owned_test_values(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn isolated_metadata_journal_home(
+        prefix: &str,
+    ) -> crate::tui::test_support::XdgConfigHomeGuard {
+        let guard = crate::tui::test_support::XdgConfigHomeGuard::new(prefix);
+        assert_eq!(
+            crate::db::db_path(),
+            guard.path().join("data").join("tonepoet").join("tonepoet.db"),
+            "metadata editor test must resolve its journal inside the per-test XDG data home",
+        );
+        guard
+    }
+
+    fn native_ape_physical_text_values(
+        path: &std::path::Path,
+        display_key: &str,
+    ) -> Vec<String> {
+        let tag = read_native_ape_tag(path)
+            .expect("read native APEv2 tag")
+            .expect("carrier has native APEv2 tag");
+        let items = tag
+            .items
+            .iter()
+            .filter(|item| {
+                item.key
+                    .as_deref()
+                    .is_some_and(|key| native_ape_canonical_key(key) == display_key)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items.len(),
+            1,
+            "{display_key} must persist as exactly one APEv2 multi-value item",
+        );
+        let item = items[0];
+        assert_eq!(
+            item.item_type(),
+            APE_ITEM_TYPE_TEXT,
+            "{display_key} must persist as an APEv2 text item",
+        );
+        let text = std::str::from_utf8(&item.value).expect("APEv2 text item is UTF-8");
+        text.split('\0').map(str::to_string).collect()
+    }
+
+    fn assert_vorbis_multivalue_editor_round_trip(
+        file_name: &str,
+        fixture: &[u8],
+        expected_backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    ) {
+        let _xdg = isolated_metadata_journal_home("tonepoet-vorbis-multivalue-round-trip");
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        assert_eq!(
+            crate::metadata_persistence::metadata_backend_for_path(&path)
+                .expect("classify Vorbis-family carrier"),
+            expected_backend,
+        );
+
+        let initial = ["Alice", "Alice", "Bob"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &initial, &[],
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&initial));
+        assert_eq!(lofty_vorbis_physical_values(&path, "COMPOSER"), owned_test_values(&initial));
+
+        // Unrelated editor write must leave repeated COMPOSER carriers intact.
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "TITLE", &["Unrelated edit"], &[],
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&initial));
+        assert_eq!(lofty_vorbis_physical_values(&path, "COMPOSER"), owned_test_values(&initial));
+
+        // Exercise edit, deletion, reordering, duplicate retention, and append
+        // in one persisted target list.
+        let edited = ["Bob (edited)", "Alice", "Alice", "Carol"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &edited, &initial,
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&edited));
+        assert_eq!(lofty_vorbis_physical_values(&path, "COMPOSER"), owned_test_values(&edited));
+
+        let bytes = std::fs::read(&path).expect("snapshot accepted repeated-value write");
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &edited, &initial,
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated no-op save"),
+            bytes,
+            "repeating an already-satisfied multi-value edit must be byte-identical",
+        );
+    }
+
     fn append_invalid_key_ape_item(path: &std::path::Path) -> Vec<u8> {
         inject_invalid_ape_key_item_for_test(path, "&год".as_bytes(), b"1977")
             .expect("write invalid-key APEv2 fixture")
+    }
+
+    #[test]
+    fn native_flac_multivalue_editor_round_trip_preserves_order_and_duplicates() {
+        assert_vorbis_multivalue_editor_round_trip(
+            "multivalue.flac",
+            NATIVE_FLAC_NUMBERING_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeFlacVorbis,
+        );
+    }
+
+    #[test]
+    fn opus_multivalue_editor_round_trip_preserves_order_and_duplicates() {
+        assert_vorbis_multivalue_editor_round_trip(
+            "multivalue.opus",
+            OPUS_MULTIVALUE_FIXTURE,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyVorbisComments,
+        );
+    }
+
+    #[test]
+    fn wavpack_multivalue_editor_round_trip_preserves_order_and_duplicates() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-wavpack-multivalue-round-trip");
+        let (_temp, path) = copy_numbering_fixture("multivalue.wv", APE_NUMBERING_FIXTURE);
+        assert_eq!(
+            crate::metadata_persistence::metadata_backend_for_path(&path)
+                .expect("classify WavPack carrier"),
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+        );
+
+        let initial = ["Alice", "Alice", "Bob"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &initial, &[],
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&initial));
+        assert_eq!(
+            native_ape_physical_text_values(&path, "COMPOSER"),
+            owned_test_values(&initial),
+            "WavPack must store the ordered duplicate-preserving APEv2 value list physically",
+        );
+
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "TITLE", &["Unrelated edit"], &[],
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&initial));
+        assert_eq!(
+            native_ape_physical_text_values(&path, "COMPOSER"),
+            owned_test_values(&initial),
+            "an unrelated WavPack edit must preserve the physical APEv2 value list",
+        );
+
+        let edited = ["Bob (edited)", "Alice", "Alice", "Carol"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &edited, &initial,
+        ));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&edited));
+        assert_eq!(
+            native_ape_physical_text_values(&path, "COMPOSER"),
+            owned_test_values(&edited),
+            "WavPack must persist list edits as one ordered NUL-delimited APEv2 text item",
+        );
+
+        let bytes = std::fs::read(&path).expect("snapshot accepted APEv2 repeated-value write");
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &edited, &initial,
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated WavPack no-op save"),
+            bytes,
+            "repeating an already-satisfied APEv2 multi-value edit must be byte-identical",
+        );
+    }
+
+    #[test]
+    fn monkeys_audio_multivalue_editor_round_trip_preserves_order_duplicates_and_reduction() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-monkeys-audio-multivalue-round-trip");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("multivalue.ape");
+        synthetic_monkeys_audio_with_ape_tag(&path, "Original title");
+        assert_eq!(
+            crate::metadata_persistence::metadata_backend_for_path(&path)
+                .expect("classify Monkey's Audio carrier"),
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe,
+        );
+
+        let initial = ["Alice", "Alice", "Bob"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &initial, &[],
+        ));
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&initial),
+        );
+
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path,
+            "TITLE",
+            &["Unrelated edit"],
+            &["Original title"],
+        ));
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&initial),
+        );
+
+        let edited = ["Bob", "Alice (edited)", "Alice"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &edited, &initial,
+        ));
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&edited),
+        );
+
+        let reduced = ["Bob", "Alice"];
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path, "COMPOSER", &reduced, &edited,
+        ));
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&reduced),
+        );
+    }
+
+    #[test]
+    fn every_default_set_valued_field_round_trips_on_phase_one_native_backends() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-set-valued-registry-round-trip");
+        for (file_name, fixture) in [
+            ("registry.flac", NATIVE_FLAC_NUMBERING_FIXTURE),
+            ("registry.opus", OPUS_MULTIVALUE_FIXTURE),
+            ("registry.wv", APE_NUMBERING_FIXTURE),
+        ] {
+            let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+            for display_key in SET_VALUED_FIELDS {
+                let values = ["First", "Second", "Second"];
+                assert_saved_without_warnings(&apply_editor_list_change(
+                    &path, display_key, &values, &[],
+                ));
+                assert_eq!(
+                    editor_slot_values(&path, display_key),
+                    owned_test_values(&values),
+                    "{display_key} did not preserve repeated values on {file_name}",
+                );
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("registry.ape");
+        synthetic_monkeys_audio_with_ape_tag(&path, "Original title");
+        for display_key in SET_VALUED_FIELDS {
+            let values = ["First", "Second", "Second"];
+            assert_saved_without_warnings(&apply_editor_list_change(
+                &path, display_key, &values, &[],
+            ));
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                owned_test_values(&values),
+                "{display_key} did not preserve repeated values on registry.ape",
+            );
+        }
+    }
+
+    #[test]
+    fn noncapable_backend_reports_cardinality_loss_and_keeps_legacy_projection() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-noncapable-multivalue-projection");
+        let (_temp, path) = copy_numbering_fixture("multivalue.mp3", ID3V2_NUMBERING_FIXTURE);
+        let result = apply_editor_list_change(&path, "COMPOSER", &["Alice", "Bob"], &[]);
+        let warnings = match &result.outcome {
+            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => warnings,
+            other => panic!("non-capable multi-value save must warn, got {other:?}"),
+        };
+        assert!(warnings.iter().any(|warning| warning.contains("COMPOSER")));
+        assert!(warnings.iter().any(|warning| warning.contains("Lofty ID3v2")));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), vec!["Alice; Bob"]);
     }
 
     #[test]
@@ -14328,7 +15428,7 @@ mod tests {
         assert!(editor.metadata_entry_is_visible(legacy_idx));
 
         entries[legacy_idx].value = "Updated legacy title".to_string();
-        entries[legacy_idx].per_file_values[0] = "Updated legacy title".to_string();
+        entries[legacy_idx].per_file_values[0].replace_scalar("Updated legacy title".to_string());
         let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
             std::slice::from_ref(&path),
             &editor_snapshots(&entries),
@@ -14417,7 +15517,7 @@ mod tests {
             .expect("preferred fallback TITLE row remains unsuffixed");
         assert_eq!(entries[title_idx].per_file_stored_value_counts, vec![1]);
         entries[title_idx].value = "Updated legacy title".to_string();
-        entries[title_idx].per_file_values[0] = "Updated legacy title".to_string();
+        entries[title_idx].per_file_values[0].replace_scalar("Updated legacy title".to_string());
 
         let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
             std::slice::from_ref(&path),
@@ -14519,7 +15619,7 @@ mod tests {
             .expect("synthetic empty GENRE row");
         assert_eq!(entries[genre_idx].per_file_stored_value_counts, vec![0]);
         entries[genre_idx].value = "Progressive Rock".to_string();
-        entries[genre_idx].per_file_values[0] = "Progressive Rock".to_string();
+        entries[genre_idx].per_file_values[0].replace_scalar("Progressive Rock".to_string());
 
         let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
             std::slice::from_ref(&path),
@@ -14576,7 +15676,7 @@ mod tests {
             .expect("shared unsuffixed preferred TITLE row");
         assert_eq!(entries[title_idx].per_file_stored_value_counts, vec![1, 1]);
         entries[title_idx].value = "Unified title".to_string();
-        entries[title_idx].per_file_values = vec!["Unified title".to_string(); 2];
+        entries[title_idx].per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Unified title".to_string(); 2]);
 
         let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
             &[path_a.clone(), path_b.clone()],
@@ -14650,7 +15750,7 @@ mod tests {
         assert!(editor.metadata_entry_is_visible(custom_idx));
 
         entries[custom_idx].value = "Restless".to_string();
-        entries[custom_idx].per_file_values[0] = "Restless".to_string();
+        entries[custom_idx].per_file_values[0].replace_scalar("Restless".to_string());
 
         let results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
             std::slice::from_ref(&path),
@@ -14747,7 +15847,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry.display_key == "TITLE")
                 .and_then(|entry| entry.per_file_values.first())
-                .map(String::as_str),
+                .map(MetadataFieldValues::as_str),
             Some("Even in the Quietest Moments")
         );
         assert_eq!(
@@ -15396,7 +16496,7 @@ mod tests {
         assert!(read.metadata_errors[0].is_none());
         assert!(read.entries.iter().any(|entry| {
             entry.display_key.eq_ignore_ascii_case("CUESHEET")
-                && entry.per_file_values.first().map(String::as_str) == Some(cue)
+                && entry.per_file_values.first().map(crate::tui::probe::MetadataFieldValues::as_str) == Some(cue)
         }));
         // The embedded CUESHEET is readable (asserted above), but
         // `embedded_cue_availability` reports whether the cue is *editable* on
@@ -15536,7 +16636,7 @@ mod tests {
             .iter()
             .find(|entry| entry.display_key == display_key)
             .and_then(|entry| entry.per_file_values.first())
-            .cloned()
+            .map(|values| values.as_str().to_string())
             .unwrap_or_else(|| panic!("missing {display_key} after persistence round trip"))
     }
 
@@ -15628,7 +16728,7 @@ mod tests {
             .iter()
             .find(|entry| entry.display_key == display_key)
             .and_then(|entry| entry.per_file_values.first())
-            .cloned()
+            .map(|values| values.as_str().to_string())
     }
 
     fn seed_lofty_vorbis_comments(
@@ -17582,7 +18682,7 @@ mod tests {
             .find(|field| field.display_key == "TRACKNUMBER")
             .expect("canonical track-number field");
         assert_eq!(field.item_key, ItemKey::TrackNumber);
-        assert_eq!(field.value, "7");
+        assert_eq!(field.values.as_str(), "7");
     }
 
     #[test]
@@ -17601,7 +18701,7 @@ mod tests {
         let fields = canonical_editor_fields_from_dsf(&snapshot);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].display_key, "MUSICBRAINZ_ALBUMID");
-        assert_eq!(fields[0].value, "canonical-id; picard-id");
+        assert_eq!(fields[0].values.as_str(), "canonical-id; picard-id");
         assert_eq!(fields[0].stored_value_count, 3);
     }
 
@@ -17617,8 +18717,8 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec!["legacy comment".to_string()],
-            per_file_originals: vec!["legacy comment".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["legacy comment".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["legacy comment".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }];
@@ -17657,7 +18757,26 @@ mod tests {
             .into_iter()
             .find(|field| field.display_key == "ARTIST")
             .expect("canonical artist field");
-        assert_eq!(field.value, "Alpha; Beta");
+        assert_eq!(field.values.as_str(), "Alpha; Alpha; Beta");
+        assert_eq!(field.values.to_texts(), vec!["Alpha", "Alpha", "Beta"]);
+        assert_eq!(field.stored_value_count, 3);
+    }
+
+    #[test]
+    fn canonical_editor_fields_split_apev2_nul_delimited_text_values() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::Ape);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Composer,
+            ItemValue::Text("Alice\0Alice\0Bob".to_string()),
+        ));
+
+        let field = canonical_editor_fields_from_tag(&tag)
+            .into_iter()
+            .find(|field| field.display_key == "COMPOSER")
+            .expect("canonical composer field");
+        assert_eq!(field.values.to_texts(), vec!["Alice", "Alice", "Bob"]);
         assert_eq!(field.stored_value_count, 3);
     }
 
@@ -17806,12 +18925,12 @@ mod tests {
         let comments = fields
             .iter()
             .filter(|field| field.display_key == "COMMENT")
-            .map(|field| field.value.as_str())
+            .map(|field| field.values.as_str())
             .collect::<Vec<_>>();
         let totals = fields
             .iter()
             .filter(|field| field.display_key == "TRACKTOTAL")
-            .map(|field| field.value.as_str())
+            .map(|field| field.values.as_str())
             .collect::<Vec<_>>();
         assert_eq!(comments, vec!["new comment"]);
         assert_eq!(totals, vec!["12"]);
@@ -17829,8 +18948,8 @@ mod tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            per_file_originals: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["A".to_string(), "B".to_string(), "C".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["A".to_string(), "B".to_string(), "C".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };
@@ -21537,8 +22656,8 @@ mod tests {
             is_mixed: true,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2, 1],
-            per_file_values: vec!["2".to_string(), "1".to_string()],
-            per_file_originals: vec!["2".to_string(), "1".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["2".to_string(), "1".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["2".to_string(), "1".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }];
@@ -21574,10 +22693,10 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![proposed.to_string(); per_file_count],
-            per_file_originals: vec![original.to_string(); per_file_count],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![proposed.to_string(); per_file_count]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![original.to_string(); per_file_count]),
             mb_proposed_value: Some(proposed.to_string()),
-            mb_proposed_per_file: Some(vec![proposed.to_string(); per_file_count]),
+            mb_proposed_per_file: Some(crate::tui::probe::metadata_field_values_from_scalars(vec![proposed.to_string(); per_file_count])),
         }
     }
 
@@ -21599,7 +22718,7 @@ mod tests {
     fn pill_state_none_for_manual_edit() {
         let mut e = entry_with_mb_proposed("File Title", "MB Title", 1);
         e.value = "User Hand-Edit".to_string();
-        e.per_file_values = vec!["User Hand-Edit".to_string()];
+        e.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["User Hand-Edit".to_string()]);
         assert_eq!(mb_pill_state(&e), MbRevertPill::None);
     }
 
@@ -21615,8 +22734,8 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec!["x".into()],
-            per_file_originals: vec!["x".into()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };
@@ -21638,7 +22757,7 @@ mod tests {
     fn toggle_no_op_on_manual_edit() {
         let mut e = entry_with_mb_proposed("File", "MB", 1);
         e.value = "Hand-Edit".into();
-        e.per_file_values = vec!["Hand-Edit".into()];
+        e.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Hand-Edit".into()]);
         toggle_mb_revert(&mut e);
         assert_eq!(e.value, "Hand-Edit"); // unchanged
     }
@@ -21675,10 +22794,10 @@ mod tests {
             is_mixed: mixed,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2, 1],
-            per_file_values: current_values.clone(),
-            per_file_originals: current_values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(current_values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(current_values),
             mb_proposed_value: Some("<multiple values>".to_string()),
-            mb_proposed_per_file: Some(proposed_values),
+            mb_proposed_per_file: Some(crate::tui::probe::metadata_field_values_from_scalars(proposed_values)),
         }
     }
 
@@ -21688,7 +22807,7 @@ mod tests {
             &["New Artist", "New Scalar"],
             &["New Artist", "New Scalar"],
         );
-        entry.per_file_originals = vec!["Alpha; Beta".to_string(), "Gamma".to_string()];
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]);
 
         let report = MetadataMutationReport::from_musicbrainz_entries(&[entry]);
 
@@ -21782,7 +22901,7 @@ mod tests {
             &["Alpha; Beta", "Gamma"],
             &["New Artist", "New Scalar"],
         );
-        entry.per_file_values = vec!["New Artist".to_string(), "New Scalar".to_string()];
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["New Artist".to_string(), "New Scalar".to_string()]);
         recompute_aggregate_value(&mut entry);
 
         let report = toggle_mb_revert_field(&mut entry);
@@ -21798,7 +22917,7 @@ mod tests {
             &["Alpha; Beta", "Gamma"],
             &["New Artist", "New Scalar"],
         );
-        entry.per_file_values = vec!["Manual Artist".to_string(), "Gamma".to_string()];
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Manual Artist".to_string(), "Gamma".to_string()]);
         recompute_aggregate_value(&mut entry);
 
         let report = restore_mb_proposed(&mut entry);
@@ -21824,8 +22943,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["x".into()],
-                per_file_originals: vec!["x".into()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             }],
@@ -21961,8 +23080,8 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec!["x".into()],
-            per_file_originals: vec!["y".into()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["y".into()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };

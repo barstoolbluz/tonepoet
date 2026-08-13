@@ -881,7 +881,7 @@ fn metadata_editor_existing_entry_value(
             entry
                 .per_file_values
                 .get(idx)
-                .cloned()
+                .map(|values| values.as_str().to_string())
                 .or_else(|| (!entry.value.trim().is_empty()).then(|| entry.value.clone()))
         })
 }
@@ -929,8 +929,8 @@ fn metadata_editor_upsert_per_file_entry(
             is_mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: stored_value_counts,
-            per_file_values: values.clone(),
-            per_file_originals: values,
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.clone()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -941,8 +941,8 @@ fn metadata_editor_upsert_per_file_entry(
         entry.is_mixed = is_mixed;
         entry.has_multiple_stored_values = false;
         entry.per_file_stored_value_counts = stored_value_counts;
-        entry.per_file_values = values.clone();
-        entry.per_file_originals = values;
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(values.clone());
+        entry.per_file_originals = crate::tui::probe::metadata_field_values_from_scalars(values);
         entry.mb_proposed_value = None;
         entry.mb_proposed_per_file = None;
     }
@@ -8097,8 +8097,8 @@ mod metadata_detail_paste_tests {
             is_mixed: values.windows(2).any(|pair| pair[0] != pair[1]),
             has_multiple_stored_values: false,
             per_file_stored_value_counts: vec![1; values.len()],
-            per_file_values: values.iter().map(|value| (*value).to_string()).collect(),
-            per_file_originals: values.iter().map(|value| (*value).to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|value| (*value).to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(values.iter().map(|value| (*value).to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -8160,8 +8160,8 @@ mod metadata_detail_paste_tests {
             is_mixed: true,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2, 1],
-            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
-            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };
@@ -12440,8 +12440,8 @@ mod musicbrainz_completion_dispatch_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![value.to_string(); n_paths],
-            per_file_originals: vec![value.to_string(); n_paths],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string(); n_paths]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string(); n_paths]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -12515,13 +12515,14 @@ mod musicbrainz_completion_dispatch_tests {
         crate::tui::musicbrainz::MbRelease {
             release_id: "mb-dsotm".to_string(),
             title: "The Dark Side Of The Moon".to_string(),
+            artist_values: vec!["Pink Floyd".to_string()],
             artist: "Pink Floyd".to_string(),
             disc_count: 1,
             tracks: (1..=10)
                 .map(|position| crate::tui::musicbrainz::MbTrack {
                     position,
                     title: format!("MB Track {position}"),
-                    artist: "Pink Floyd".to_string(),
+                    artist: vec!["Pink Floyd".to_string()],
                     ..Default::default()
                 })
                 .collect(),
@@ -12757,7 +12758,7 @@ mod musicbrainz_completion_dispatch_tests {
         artist.is_mixed = true;
         artist.has_multiple_stored_values = true;
         artist.per_file_stored_value_counts = vec![2, 1];
-        artist.per_file_values = vec!["Alpha; Beta".to_string(), "Gamma".to_string()];
+        artist.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]);
         artist.per_file_originals = artist.per_file_values.clone();
 
         let editor = Box::new(MetadataEditorState::for_files(
@@ -12773,18 +12774,19 @@ mod musicbrainz_completion_dispatch_tests {
         let release = crate::tui::musicbrainz::MbRelease {
             release_id: "provider-cardinality".to_string(),
             title: "Replacement Album".to_string(),
+            artist_values: vec!["Replacement Artist".to_string()],
             artist: "Replacement Artist".to_string(),
             tracks: vec![
                 crate::tui::musicbrainz::MbTrack {
                     position: 1,
                     title: "Track 01".to_string(),
-                    artist: "New Artist".to_string(),
+                    artist: vec!["New Artist".to_string()],
                     ..Default::default()
                 },
                 crate::tui::musicbrainz::MbTrack {
                     position: 2,
                     title: "Track 02".to_string(),
-                    artist: "New Scalar".to_string(),
+                    artist: vec!["New Scalar".to_string()],
                     ..Default::default()
                 },
             ],
@@ -13447,7 +13449,7 @@ mod musicbrainz_completion_dispatch_tests {
         detail.tracks = vec![crate::tui::musicbrainz::MbTrack {
             position: 1,
             title: "Movement I".to_string(),
-            composer: Some("Picker Composer".to_string()),
+            composer: vec!["Picker Composer".to_string()],
             ..Default::default()
         }];
 
@@ -13467,8 +13469,8 @@ mod musicbrainz_completion_dispatch_tests {
         assert_eq!(pending.releases[0].title, detail.title);
         assert!(pending.releases[0].relationship_projection_complete);
         assert_eq!(
-            pending.releases[0].tracks[0].composer.as_deref(),
-            Some("Picker Composer")
+            pending.releases[0].tracks[0].composer,
+            ["Picker Composer"]
         );
         let ActiveOverlay::MbSelect(state) = &app.active_overlay else {
             panic!("accepted picker should remain visible while verification runs");
@@ -14533,8 +14535,8 @@ mod musicbrainz_completion_dispatch_tests {
             is_mixed: false,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2],
-            per_file_values: vec!["-9.00 dB".to_string()],
-            per_file_originals: vec!["-9.00 dB".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["-9.00 dB".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["-9.00 dB".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -15319,8 +15321,8 @@ mod tag_clipboard_completion_tests {
             has_multiple_stored_values: false,
             row_scope: RowScope::File,
             per_file_stored_value_counts: vec![1],
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![value.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -15356,7 +15358,7 @@ mod tag_clipboard_completion_tests {
         copied.row_scope = RowScope::Track;
         copied.is_mixed = true;
         copied.per_file_stored_value_counts = vec![2, 1];
-        copied.per_file_values = vec!["12".to_string(), "13".to_string()];
+        copied.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["12".to_string(), "13".to_string()]);
         copied.per_file_originals = copied.per_file_values.clone();
         handle_message(
             &mut app,
@@ -15412,8 +15414,8 @@ mod editor_tag_transfer_preparation_tests {
             has_multiple_stored_values: false,
             row_scope: RowScope::File,
             per_file_stored_value_counts: vec![1],
-            per_file_values: vec![value.to_string()],
-            per_file_originals: vec![value.to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -15611,7 +15613,7 @@ mod editor_tag_transfer_preparation_tests {
                 path: PathBuf::from("/tmp/older.txt"),
                 result: Ok(vec![super::super::tag_interchange::FieldBlock {
                     key: "TITLE".to_string(),
-                    values: vec!["Older".to_string()],
+                    values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Older".to_string()]),
                 }]),
             },
             &tx(),
@@ -15639,7 +15641,7 @@ mod editor_tag_transfer_preparation_tests {
                 path: PathBuf::from("/tmp/newer.txt"),
                 result: Ok(vec![super::super::tag_interchange::FieldBlock {
                     key: "TITLE".to_string(),
-                    values: vec!["Newer".to_string()],
+                    values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Newer".to_string()]),
                 }]),
             },
             &tx(),

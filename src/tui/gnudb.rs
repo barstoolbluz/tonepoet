@@ -471,8 +471,8 @@ pub fn populate_editor_from_review(
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![String::new(); dim],
-            per_file_originals: vec![String::new(); dim],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); dim]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });
@@ -523,16 +523,16 @@ pub fn populate_editor_from_review(
         // values for both TITLE and ARTIST (compilation-friendly).
         let page = &review.pages[0];
         for (i, track) in page.tracks.iter().enumerate() {
-            state.active_surface_mut().entries[title_idx].per_file_values[i] = track.title.clone();
-            state.active_surface_mut().entries[artist_idx].per_file_values[i] = track.artist.clone();
+            state.active_surface_mut().entries[title_idx].per_file_values[i].replace_scalar(track.title.clone());
+            state.active_surface_mut().entries[artist_idx].per_file_values[i].replace_scalar(track.artist.clone());
         }
-        state.active_surface_mut().entries[album_idx].per_file_values[0] = page.album.clone();
-        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[album_idx].per_file_values[0].replace_scalar(page.album.clone());
+        state.active_surface_mut().entries[tn_idx].per_file_values[0].replace_scalar("1".to_string());
         if !page.year.is_empty() {
-            state.active_surface_mut().entries[year_idx].per_file_values[0] = page.year.clone();
+            state.active_surface_mut().entries[year_idx].per_file_values[0].replace_scalar(page.year.clone());
         }
         if !page.genre.is_empty() {
-            state.active_surface_mut().entries[genre_idx].per_file_values[0] = page.genre.clone();
+            state.active_surface_mut().entries[genre_idx].per_file_values[0].replace_scalar(page.genre.clone());
         }
     } else if single_image {
         // Album-level fallback (no CUESHEET anchor available).
@@ -542,7 +542,7 @@ pub fn populate_editor_from_review(
         let artist_dim_one =
             (state.active_surface().entries[artist_idx].per_file_values.len() == 1).then_some(artist_idx);
         if let Some(idx) = title_dim_one {
-            state.active_surface_mut().entries[idx].per_file_values[0] = page.album.clone();
+            state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(page.album.clone());
         }
         if let Some(idx) = artist_dim_one {
             // Use the first track's artist as a representative when
@@ -550,16 +550,16 @@ pub fn populate_editor_from_review(
             // (compilation rips); falls back gracefully to whatever
             // tracks[0] has.
             if let Some(track) = page.tracks.first() {
-                state.active_surface_mut().entries[idx].per_file_values[0] = track.artist.clone();
+                state.active_surface_mut().entries[idx].per_file_values[0].replace_scalar(track.artist.clone());
             }
         }
-        state.active_surface_mut().entries[album_idx].per_file_values[0] = page.album.clone();
-        state.active_surface_mut().entries[tn_idx].per_file_values[0] = "1".to_string();
+        state.active_surface_mut().entries[album_idx].per_file_values[0].replace_scalar(page.album.clone());
+        state.active_surface_mut().entries[tn_idx].per_file_values[0].replace_scalar("1".to_string());
         if !page.year.is_empty() {
-            state.active_surface_mut().entries[year_idx].per_file_values[0] = page.year.clone();
+            state.active_surface_mut().entries[year_idx].per_file_values[0].replace_scalar(page.year.clone());
         }
         if !page.genre.is_empty() {
-            state.active_surface_mut().entries[genre_idx].per_file_values[0] = page.genre.clone();
+            state.active_surface_mut().entries[genre_idx].per_file_values[0].replace_scalar(page.genre.clone());
         }
     } else {
         // Per-file populate (multi-disc / multi-file): index by
@@ -570,15 +570,15 @@ pub fn populate_editor_from_review(
                 if i >= n {
                     continue;
                 }
-                state.active_surface_mut().entries[title_idx].per_file_values[i] = track.title.clone();
-                state.active_surface_mut().entries[artist_idx].per_file_values[i] = track.artist.clone();
-                state.active_surface_mut().entries[album_idx].per_file_values[i] = page.album.clone();
-                state.active_surface_mut().entries[tn_idx].per_file_values[i] = track.track_number.to_string();
+                state.active_surface_mut().entries[title_idx].per_file_values[i].replace_scalar(track.title.clone());
+                state.active_surface_mut().entries[artist_idx].per_file_values[i].replace_scalar(track.artist.clone());
+                state.active_surface_mut().entries[album_idx].per_file_values[i].replace_scalar(page.album.clone());
+                state.active_surface_mut().entries[tn_idx].per_file_values[i].replace_scalar(track.track_number.to_string());
                 if !page.year.is_empty() {
-                    state.active_surface_mut().entries[year_idx].per_file_values[i] = page.year.clone();
+                    state.active_surface_mut().entries[year_idx].per_file_values[i].replace_scalar(page.year.clone());
                 }
                 if !page.genre.is_empty() {
-                    state.active_surface_mut().entries[genre_idx].per_file_values[i] = page.genre.clone();
+                    state.active_surface_mut().entries[genre_idx].per_file_values[i].replace_scalar(page.genre.clone());
                 }
             }
         }
@@ -594,7 +594,10 @@ pub fn populate_editor_from_review(
         e.value = if e.is_mixed {
             "<multiple values>".to_string()
         } else {
-            e.per_file_values.first().cloned().unwrap_or_default()
+            e.per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
         };
     }
 
@@ -880,8 +883,8 @@ mod gnudb_per_track_tests {
             is_mixed: false,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![text.to_string()],
-            per_file_originals: vec![String::new()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![text.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -976,7 +979,12 @@ mod gnudb_per_track_tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(k))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(lookup("TITLE"), vec!["T1", "T2", "T3"]);
@@ -1009,7 +1017,12 @@ mod gnudb_per_track_tests {
                 .entries
                 .iter()
                 .find(|e| e.display_key.eq_ignore_ascii_case(k))
-                .map(|e| e.per_file_values.clone())
+                .map(|e| {
+                    e.per_file_values
+                        .iter()
+                        .map(|values| values.as_str().to_string())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         assert_eq!(lookup("TITLE"), vec!["Disc Album"]);
@@ -1072,8 +1085,8 @@ mod gnudb_per_track_tests {
             is_mixed: true,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2, 1],
-            per_file_values: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
-            per_file_originals: vec!["Alpha; Beta".to_string(), "Gamma".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });

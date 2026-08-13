@@ -847,10 +847,10 @@ fn apply_values(
             let Some(current) = entry.per_file_values.get_mut(slot) else {
                 continue;
             };
-            if *current == replacement {
+            if current.as_str() == replacement {
                 unchanged += 1;
             } else {
-                *current = replacement;
+                current.replace_scalar(replacement);
                 changed += 1;
             }
         }
@@ -1217,9 +1217,10 @@ fn disc_number_offer_has_evidence(state: &MetadataEditorState, entry_idx: usize)
     entry
         .per_file_values
         .iter()
-        .chain(entry.per_file_originals.iter())
-        .chain(std::iter::once(&entry.value))
-        .chain(std::iter::once(&entry.original))
+        .map(|value| value.as_str())
+        .chain(entry.per_file_originals.iter().map(|value| value.as_str()))
+        .chain(std::iter::once(entry.value.as_str()))
+        .chain(std::iter::once(entry.original.as_str()))
         .any(|value| parse_positive_component(value).is_some())
 }
 
@@ -1352,7 +1353,11 @@ impl AutoNumberOverlayState {
             selected: BTreeSet::new(),
             selection_anchor: None,
             assignments,
-            current_values: entry.per_file_values.clone(),
+            current_values: entry
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect(),
             labels,
             prefix_input: None,
         })
@@ -1515,19 +1520,25 @@ mod tests {
             value: if is_mixed {
                 "<multiple values>".to_string()
             } else {
-                per_file_values.first().cloned().unwrap_or_default()
+                per_file_values
+                    .first()
+                    .map(|values| values.as_str().to_string())
+                    .unwrap_or_default()
             },
             original: if is_mixed {
                 "<multiple values>".to_string()
             } else {
-                per_file_values.first().cloned().unwrap_or_default()
+                per_file_values
+                    .first()
+                    .map(|values| values.as_str().to_string())
+                    .unwrap_or_default()
             },
             is_binary: false,
             is_mixed,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: vec![1; values.len()],
-            per_file_originals: per_file_values.clone(),
-            per_file_values,
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.clone()),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }

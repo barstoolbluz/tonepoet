@@ -1795,8 +1795,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: vec![1],
-                per_file_values: vec![value.to_string()],
-                per_file_originals: vec![value.to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![value.to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
@@ -1959,7 +1959,7 @@ mod tests {
         );
         push_file_tag(&mut state, "PRE_EMPHASIS", "1");
         state.active_surface_mut().entries[0].per_file_values =
-            vec!["1".to_string(), "0".to_string()];
+            crate::tui::probe::metadata_field_values_from_scalars(vec!["1".to_string(), "0".to_string()]);
 
         assert!(explicit_preemphasis_tag_for_file(&state, &first_path));
         assert!(!explicit_preemphasis_tag_for_file(&state, &second_path));
@@ -2034,16 +2034,16 @@ mod tests {
             is_mixed: true,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: vec![
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![
                 "-1.0 dB".to_string(),
                 "-2.0 dB".to_string(),
                 "-3.0 dB".to_string(),
-            ],
-            per_file_originals: vec![
+            ]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![
                 "-1.0 dB".to_string(),
                 "-2.0 dB".to_string(),
                 "-3.0 dB".to_string(),
-            ],
+            ]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         });

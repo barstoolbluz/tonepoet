@@ -1739,7 +1739,7 @@ fn open_browse_metadata_cue_action(
             let content = entry
                 .per_file_values
                 .first()
-                .cloned()
+                .map(|value| value.as_str().to_string())
                 .unwrap_or_else(|| entry.value.clone());
             let summary = format!(
                 "{} (read-only · {})",
@@ -3396,7 +3396,7 @@ pub fn execute_context_action(
                 let content = entry
                     .per_file_values
                     .first()
-                    .cloned()
+                    .map(|value| value.as_str().to_string())
                     .unwrap_or_else(|| entry.value.clone());
                 let summary = format!(
                     "{} (read-only · {})",
@@ -4616,8 +4616,8 @@ mod tests {
             has_multiple_stored_values: false,
             row_scope: crate::tui::probe::RowScope::File,
             per_file_stored_value_counts: vec![1, 1],
-            per_file_values: vec!["Behind the Lines".to_string(), "Duchess".to_string()],
-            per_file_originals: vec!["Behind the Lines".to_string(), "Duchess".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Behind the Lines".to_string(), "Duchess".to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Behind the Lines".to_string(), "Duchess".to_string()]),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         };
@@ -5007,8 +5007,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: vec![1],
-                per_file_values: vec!["value".to_string()],
-                per_file_originals: vec!["value".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["value".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["value".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             }
@@ -5082,8 +5082,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: vec![1],
-                per_file_values: vec!["value".to_string()],
-                per_file_originals: vec!["value".to_string()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["value".to_string()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["value".to_string()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             })
@@ -5790,8 +5790,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["x".into()],
-                per_file_originals: vec!["x".into()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["x".into()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -5805,8 +5805,8 @@ mod tests {
                 is_mixed: false,
                 has_multiple_stored_values: false,
                 per_file_stored_value_counts: Vec::new(),
-                per_file_values: vec!["FILE \"a.flac\" FLAC\n".into()],
-                per_file_originals: vec!["".into()],
+                per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["FILE \"a.flac\" FLAC\n".into()]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["".into()]),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             },
@@ -5866,10 +5866,10 @@ mod tests {
             is_mixed: false,
             has_multiple_stored_values: true,
             per_file_stored_value_counts: vec![2],
-            per_file_values: vec![current.to_string()],
-            per_file_originals: vec!["Alpha; Beta".to_string()],
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec![current.to_string()]),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string()]),
             mb_proposed_value: Some(proposed.to_string()),
-            mb_proposed_per_file: Some(vec![proposed.to_string()]),
+            mb_proposed_per_file: Some(crate::tui::probe::metadata_field_values_from_scalars(vec![proposed.to_string()])),
         }
     }
 

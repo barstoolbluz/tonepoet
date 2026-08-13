@@ -455,7 +455,7 @@ pub(crate) fn native_ape_rows(
     let mut rows = Vec::new();
     for item in tag.items.iter().filter(|item| item.key.is_some()) {
         let raw_key = item.key.as_deref().expect("filtered valid APE key");
-        let (value, is_binary) = match item.item_type() {
+        match item.item_type() {
             APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR => {
                 let value = std::str::from_utf8(&item.value).map_err(|_| {
                     format!(
@@ -464,9 +464,51 @@ pub(crate) fn native_ape_rows(
                         path.display()
                     )
                 })?;
-                (value.split('\0').collect::<Vec<_>>().join("; "), false)
+
+                // Numbering fields are physically scalar and may encode a
+                // number/total pair with '/'. Do not reinterpret a NUL-valued
+                // item as numbering; preserve its physical values instead.
+                if !value.contains('\0') {
+                    if let Some(numbering_rows) = native_ape_numbering_rows(raw_key, value) {
+                        rows.extend(numbering_rows.into_iter().map(
+                            |(canonical_key, item_key, value)| NeutralApeRow {
+                                raw_key: raw_key.to_string(),
+                                canonical_key,
+                                item_key,
+                                value,
+                                is_binary: false,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+
+                let canonical_key = native_ape_canonical_key(raw_key);
+                let item_key = item_key_for_neutral_ape_row(&canonical_key);
+                // APEv2 represents multiple text values as NUL-separated
+                // strings inside one item. Emit one neutral row per physical
+                // value so the editor merge layer can preserve order and
+                // multiplicity without a join/split round-trip.
+                for value in value.split('\0') {
+                    rows.push(NeutralApeRow {
+                        raw_key: raw_key.to_string(),
+                        item_key: item_key.clone(),
+                        canonical_key: canonical_key.clone(),
+                        value: value.to_string(),
+                        is_binary: false,
+                    });
+                }
             }
-            APE_ITEM_TYPE_BINARY => (format!("<binary, {} bytes>", item.value.len()), true),
+            APE_ITEM_TYPE_BINARY => {
+                let canonical_key = native_ape_canonical_key(raw_key);
+                rows.push(NeutralApeRow {
+                    raw_key: raw_key.to_string(),
+                    item_key: item_key_for_neutral_ape_row(&canonical_key),
+                    canonical_key,
+                    value: format!("<binary, {} bytes>", item.value.len()),
+                    is_binary: true,
+                });
+            }
             _ => {
                 return Err(format!(
                     "APEv2 item '{}' has reserved value type in '{}'",
@@ -474,29 +516,7 @@ pub(crate) fn native_ape_rows(
                     path.display()
                 ));
             }
-        };
-        if !is_binary {
-            if let Some(numbering_rows) = native_ape_numbering_rows(raw_key, &value) {
-                rows.extend(numbering_rows.into_iter().map(
-                    |(canonical_key, item_key, value)| NeutralApeRow {
-                        raw_key: raw_key.to_string(),
-                        canonical_key,
-                        item_key,
-                        value,
-                        is_binary: false,
-                    },
-                ));
-                continue;
-            }
         }
-        let canonical_key = native_ape_canonical_key(raw_key);
-        rows.push(NeutralApeRow {
-            raw_key: raw_key.to_string(),
-            item_key: item_key_for_neutral_ape_row(&canonical_key),
-            canonical_key,
-            value,
-            is_binary,
-        });
     }
     Ok(rows)
 }
@@ -733,6 +753,24 @@ impl MetadataPersistenceBackend {
             Self::ReadOnlyApeFamily | Self::UnsupportedDff | Self::UnclassifiedLofty => {
                 MetadataNumberingCapabilities::NONE
             }
+        }
+    }
+
+    /// Whether this backend can faithfully persist more than one value for
+    /// the same logical metadata field. Keep this exhaustive so every new
+    /// backend makes an explicit cardinality decision at compile time.
+    pub const fn supports_repeated_instances(self) -> bool {
+        match self {
+            Self::NativeFlacVorbis
+            | Self::NativeWavPackApe
+            | Self::LoftyVorbisComments
+            | Self::LoftyApe => true,
+            Self::NativeDsfId3
+            | Self::LoftyId3v2
+            | Self::LoftyMp4Ilst
+            | Self::ReadOnlyApeFamily
+            | Self::UnsupportedDff
+            | Self::UnclassifiedLofty => false,
         }
     }
 
@@ -1963,6 +2001,28 @@ mod tests {
             metadata_backend_for_lofty_tag_type(TagType::RiffInfo),
             MetadataPersistenceBackend::UnclassifiedLofty
         );
+    }
+
+    #[test]
+    fn repeated_instance_capabilities_are_exhaustive_and_phase_one_scoped() {
+        for backend in [
+            MetadataPersistenceBackend::NativeFlacVorbis,
+            MetadataPersistenceBackend::NativeWavPackApe,
+            MetadataPersistenceBackend::LoftyVorbisComments,
+            MetadataPersistenceBackend::LoftyApe,
+        ] {
+            assert!(backend.supports_repeated_instances(), "{backend:?}");
+        }
+        for backend in [
+            MetadataPersistenceBackend::NativeDsfId3,
+            MetadataPersistenceBackend::LoftyId3v2,
+            MetadataPersistenceBackend::LoftyMp4Ilst,
+            MetadataPersistenceBackend::ReadOnlyApeFamily,
+            MetadataPersistenceBackend::UnsupportedDff,
+            MetadataPersistenceBackend::UnclassifiedLofty,
+        ] {
+            assert!(!backend.supports_repeated_instances(), "{backend:?}");
+        }
     }
 
     #[test]

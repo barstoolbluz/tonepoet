@@ -5301,7 +5301,7 @@ fn draw_metadata_editor(
                 entry
                     .per_file_values
                     .first()
-                    .map(String::as_str)
+                    .map(super::probe::MetadataFieldValues::as_str)
                     .unwrap_or(entry.value.as_str()),
             )
         } else if entry.is_binary {
@@ -5309,6 +5309,19 @@ fn draw_metadata_editor(
         } else {
             entry.value.replace('\n', "↵").replace('\r', "")
         };
+
+        let max_discrete_values = entry
+            .per_file_values
+            .iter()
+            .map(super::probe::MetadataFieldValues::value_count)
+            .max()
+            .unwrap_or(0);
+        let set_value_badge = if max_discrete_values > 1 {
+            format!(" [×{} values]", max_discrete_values)
+        } else {
+            String::new()
+        };
+        let set_value_badge_w = super::display_width::width(&set_value_badge);
 
         let mut val_style = if is_deleted {
             Style::default()
@@ -5359,7 +5372,7 @@ fn draw_metadata_editor(
             0
         };
         let cue_actions_w = super::display_width::width(&cue_actions_text);
-        let combined_pill_w = cue_actions_w + pill_w;
+        let combined_pill_w = cue_actions_w + set_value_badge_w + pill_w;
         let val_for_pill = val_max.saturating_sub(combined_pill_w);
         let val_truncated = truncate_to_chars(&value_display, val_for_pill);
 
@@ -5392,6 +5405,14 @@ fn draw_metadata_editor(
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            if set_value_badge_w > 0 {
+                spans.push(Span::styled(
+                    set_value_badge.clone(),
+                    Style::default()
+                        .fg(theme.cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if pill_w > 0 {
                 spans.push(Span::styled(pill_text.to_string(), pill_style));
             }
@@ -5412,7 +5433,7 @@ fn draw_metadata_editor(
                     button_map.record_button(
                         super::button_map::TuiButton::MetadataEntryRevert(i),
                         Rect::new(
-                            view_screen_x + cue_actions_w as u16,
+                            view_screen_x + cue_actions_w as u16 + set_value_badge_w as u16,
                             content_area.y + visible_row,
                             pill_w as u16,
                             1,
@@ -6433,6 +6454,7 @@ fn draw_metadata_detail(
         Some(e) => e,
         None => return,
     };
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
 
     // Per-track entries (e.g. TITLE on a single-image rip with embedded
     // CUESHEET) carry more values than `state.active_surface().file_labels` has labels
@@ -6469,19 +6491,52 @@ fn draw_metadata_detail(
     };
     let label_col_w = (max_label + 4).min(inner_w / 3).max(10);
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("  {}", entry.display_key),
-        Style::default()
-            .fg(theme.cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
+    let header_suffix = if set_valued {
+        let selected_count = entry
+            .per_file_values
+            .get(state.detail_cursor)
+            .map(super::probe::MetadataFieldValues::value_count)
+            .unwrap_or(0);
+        if state.detail_apply_shared {
+            format!("  [shared · {selected_count} values]")
+        } else if entry.is_mixed {
+            format!("  [differs across slots · {selected_count} values here]")
+        } else {
+            format!("  [{selected_count} values]")
+        }
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {}", entry.display_key),
+            Style::default()
+                .fg(theme.cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(header_suffix, Style::default().fg(theme.text_dim)),
+    ]));
     lines.push(Line::from(""));
 
     // Per-file rows.
     for (i, val) in entry.per_file_values.iter().enumerate() {
         let is_cursor = i == state.detail_cursor;
         let label = label_for(i);
-        let label_display = format!("  {:<width$}  ", label, width = label_col_w - 4);
+        let label_display = if set_valued && is_cursor {
+            let value_count = val.value_count();
+            let value_position = if value_count == 0 {
+                "0/0".to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    state.detail_value_cursor.min(value_count - 1) + 1,
+                    value_count
+                )
+            };
+            format!("  {:<width$} {value_position} ", label, width = label_col_w.saturating_sub(8))
+        } else {
+            format!("  {:<width$}  ", label, width = label_col_w - 4)
+        };
 
         let label_style = if is_cursor {
             Style::default()
@@ -6521,7 +6576,27 @@ fn draw_metadata_detail(
             Style::default().fg(theme.text_bright)
         };
 
-        let val_sanitized = val.replace('\n', "↵").replace('\r', "");
+        let val_sanitized = if set_valued {
+            if val.value_count() == 0 {
+                "<no values>".to_string()
+            } else {
+                val.values()
+                    .iter()
+                    .enumerate()
+                    .map(|(value_idx, value)| {
+                        let text = value.text.replace('\n', "↵").replace('\r', "");
+                        if is_cursor && value_idx == state.detail_value_cursor {
+                            format!("‹{text}›")
+                        } else {
+                            format!("[{text}]")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            }
+        } else {
+            val.as_str().replace('\n', "↵").replace('\r', "")
+        };
         let block_reason = metadata_editor_detail_slot_block_reason(state, field_idx, i);
         let val_display = if let Some(reason) = block_reason.as_deref() {
             let suffix = format!("  <{}>", reason);
@@ -6573,7 +6648,15 @@ fn draw_metadata_detail(
         // running it from inside the editor would destroy unsaved edits
         // (the command itself also refuses while the editor is open).
         Line::from(vec![
-            footer_pill("Enter confirm", theme.green, theme),
+            footer_pill(
+                if set_valued && state.detail_edit_add {
+                    "Enter add"
+                } else {
+                    "Enter confirm"
+                },
+                theme.green,
+                theme,
+            ),
             pill_gap(),
             footer_pill("Esc cancel", theme.purple, theme),
         ])
@@ -6591,11 +6674,29 @@ fn draw_metadata_detail(
                 pills.push(pill_gap());
             }
         }
-        pills.extend_from_slice(&[
-            footer_pill("Enter edit", theme.green, theme),
-            pill_gap(),
-            footer_pill("Esc back", theme.purple, theme),
-        ]);
+        if set_valued {
+            pills.extend_from_slice(&[
+                footer_pill("h/l value", theme.cyan, theme),
+                pill_gap(),
+                footer_pill("Enter edit", theme.green, theme),
+                pill_gap(),
+                footer_pill("a add", theme.green, theme),
+                pill_gap(),
+                footer_pill("x delete", theme.destructive, theme),
+                pill_gap(),
+                footer_pill("[/] reorder", theme.blue, theme),
+                pill_gap(),
+                footer_pill("j/k slot", theme.amber, theme),
+                pill_gap(),
+                footer_pill("Esc back", theme.purple, theme),
+            ]);
+        } else {
+            pills.extend_from_slice(&[
+                footer_pill("Enter edit", theme.green, theme),
+                pill_gap(),
+                footer_pill("Esc back", theme.purple, theme),
+            ]);
+        }
         let mut revert_offset: Option<u16> = None;
         let mut revert_w_chars: u16 = 0;
         let mut restore_offset: Option<u16> = None;
@@ -8732,8 +8833,8 @@ mod tests {
             is_mixed: per_file_values.len() > 1,
             has_multiple_stored_values: false,
             per_file_stored_value_counts: Vec::new(),
-            per_file_values: per_file_values.iter().map(|v| (*v).to_string()).collect(),
-            per_file_originals: per_file_values.iter().map(|v| (*v).to_string()).collect(),
+            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|v| (*v).to_string()).collect()),
+            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(per_file_values.iter().map(|v| (*v).to_string()).collect()),
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
@@ -8853,7 +8954,7 @@ mod tests {
             title.value = "<multiple values>".to_string();
             title.original = "<multiple values>".to_string();
             title.is_mixed = true;
-            title.per_file_values = vec!["Cue One".to_string(), "Cue Two".to_string()];
+            title.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec!["Cue One".to_string(), "Cue Two".to_string()]);
             title.per_file_originals = title.per_file_values.clone();
 
             let sheet = surface

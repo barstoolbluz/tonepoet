@@ -156,6 +156,18 @@ enum DatabasePragmaProfile {
     InMemory,
 }
 
+const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DB_OPEN_INIT_LOCK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+const DB_OPEN_INIT_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+struct DatabaseOpenInitFileLock(std::fs::File);
+
+impl Drop for DatabaseOpenInitFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Return the database file path.
 pub fn db_path() -> PathBuf {
     dirs::data_dir()
@@ -230,22 +242,160 @@ impl Database {
                 .map_err(|e| format!("failed to create DB directory {}: {e}", parent.display()))?;
         }
 
-        // Serialize connection creation + WAL initialization process-wide.
-        // Switching a freshly created database into WAL mode requires that no
-        // other connection is open; concurrent opens (e.g. writing metadata to
-        // several files in quick succession, each opening its own connection)
-        // would otherwise race and fail with "database is locked". This lock
-        // only gates the brief open+pragma window — once WAL is established the
-        // journal_mode pragma is a no-op, so overlapping connections thereafter
-        // are fine.
+        // Routine opens take shared initialization authority. Multiple
+        // processes may probe/open an established database concurrently, while
+        // an exclusive first-open or migration window blocks those probes until
+        // persistent WAL/schema state is ready.
+        let shared_init = Self::acquire_open_init_file_lock(path, false)?;
+        let existing_nonempty_file = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.is_file() && metadata.len() > 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect database path {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if existing_nonempty_file {
+            let conn = Connection::open(path)
+                .map_err(|e| format!("failed to open database {}: {e}", path.display()))?;
+            conn.busy_timeout(DB_BUSY_TIMEOUT)
+                .map_err(|e| format!("busy_timeout pragma failed: {}", e))?;
+            if Self::file_backed_database_is_initialized(&conn)? {
+                Self::configure_file_backed_connection(&conn)?;
+                return Ok(Self { conn });
+            }
+        }
+        drop(shared_init);
+
+        // Slow-path initialization upgrades by releasing shared authority and
+        // reacquiring exclusive authority. Recheck all persistent state after
+        // the exclusive lock because another process may win the upgrade race.
+        // The process mutex avoids platform-specific same-process lock quirks
+        // while the file lock extends authority across tonepoet processes.
         static DB_OPEN_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _init = DB_OPEN_INIT_LOCK
+        let _process_init = DB_OPEN_INIT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+        let _exclusive_init = Self::acquire_open_init_file_lock(path, true)?;
         let conn = Connection::open(path)
             .map_err(|e| format!("failed to open database {}: {e}", path.display()))?;
         Self::from_connection(conn, DatabasePragmaProfile::FileBacked)
+    }
+
+    fn open_init_lock_path(path: &Path) -> PathBuf {
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".open-init.lock");
+        PathBuf::from(lock_name)
+    }
+
+    fn acquire_open_init_file_lock(
+        path: &Path,
+        exclusive: bool,
+    ) -> Result<DatabaseOpenInitFileLock, String> {
+        let lock_path = Self::open_init_lock_path(path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open database initialization lock {}: {error}",
+                    lock_path.display()
+                )
+            })?;
+        let started = std::time::Instant::now();
+        loop {
+            let result = if exclusive {
+                fs2::FileExt::try_lock_exclusive(&file)
+            } else {
+                fs2::FileExt::try_lock_shared(&file)
+            };
+            match result {
+                Ok(()) => return Ok(DatabaseOpenInitFileLock(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if Self::is_file_lock_contention(&error) => {
+                    if started.elapsed() >= DB_OPEN_INIT_LOCK_WAIT_LIMIT {
+                        let mode = if exclusive { "exclusive" } else { "shared" };
+                        return Err(format!(
+                            "timed out after {} ms waiting for {mode} database initialization lock {}",
+                            DB_OPEN_INIT_LOCK_WAIT_LIMIT.as_millis(),
+                            lock_path.display()
+                        ));
+                    }
+                    std::thread::sleep(DB_OPEN_INIT_LOCK_RETRY_DELAY);
+                }
+                Err(error) => {
+                    let mode = if exclusive { "exclusive" } else { "shared" };
+                    return Err(format!(
+                        "failed to take {mode} database initialization lock {}: {error}",
+                        lock_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    fn is_file_lock_contention(error: &std::io::Error) -> bool {
+        error.kind() == fs2::lock_contended_error().kind()
+    }
+
+    fn file_backed_database_is_initialized(conn: &Connection) -> Result<bool, String> {
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|error| format!("read journal_mode during database open: {error}"))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Ok(false);
+        }
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| format!("read user_version during database open: {error}"))?;
+        Ok(version == CURRENT_VERSION)
+    }
+
+    fn configure_file_backed_connection(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| format!("foreign_keys pragma failed: {}", e))?;
+        // Browse performs many small cache reads during navigation. A larger
+        // page cache and mmap window reduce syscall churn without changing
+        // schema or transaction semantics; unsupported platforms clamp
+        // mmap_size to SQLite's accepted value.
+        conn.execute_batch("PRAGMA cache_size = -65536; PRAGMA mmap_size = 268435456;")
+            .map_err(|e| format!("performance pragmas failed: {}", e))?;
+        Ok(())
+    }
+
+    fn enable_wal_mode(conn: &Connection) -> Result<(), String> {
+        let current_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|error| format!("read journal_mode before WAL initialization: {error}"))?;
+        if current_mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => Ok(()),
+            Ok(mode) => Err(format!(
+                "WAL pragma did not activate WAL mode; SQLite reported journal_mode={mode:?}"
+            )),
+            Err(error) => {
+                // A process from an older tonepoet build may race this build and
+                // finish the same persistent mode switch after our statement
+                // reports contention. Accept only a verified WAL result; retain
+                // every other I/O/locking failure so storage faults stay visible.
+                match conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0)) {
+                    Ok(mode) if mode.eq_ignore_ascii_case("wal") => Ok(()),
+                    Ok(mode) => Err(format!(
+                        "WAL pragma failed: {error}; journal_mode remained {mode:?}"
+                    )),
+                    Err(recheck_error) => Err(format!(
+                        "WAL pragma failed: {error}; journal_mode recheck also failed: {recheck_error}"
+                    )),
+                }
+            }
+        }
     }
 
     /// Open an in-memory database (for explicit lightweight tests and fallback).
@@ -270,21 +420,14 @@ impl Database {
                 // with rapid successive opens (e.g. multi-file metadata writes)
                 // that lock can momentarily collide. Without a busy timeout the
                 // default is zero and the very first write fails.
-                conn.busy_timeout(std::time::Duration::from_secs(5))
+                conn.busy_timeout(DB_BUSY_TIMEOUT)
                     .map_err(|e| format!("busy_timeout pragma failed: {}", e))?;
-                // WAL mode for crash safety + concurrent reads. This is part of
-                // the production behavior and must be exercised by temp-file DB
-                // tests too.
-                conn.execute_batch("PRAGMA journal_mode = WAL;")
-                    .map_err(|e| format!("WAL pragma failed: {}", e))?;
-                conn.execute_batch("PRAGMA foreign_keys = ON;")
-                    .map_err(|e| format!("foreign_keys pragma failed: {}", e))?;
-                // Browse performs many small cache reads during navigation. A
-                // larger page cache and mmap window reduce syscall churn without
-                // changing schema or transaction semantics; unsupported platforms
-                // simply clamp mmap_size to SQLite's accepted value.
-                conn.execute_batch("PRAGMA cache_size = -65536; PRAGMA mmap_size = 268435456;")
-                    .map_err(|e| format!("performance pragmas failed: {}", e))?;
+                // WAL is persistent for a file-backed database. Read the mode on
+                // ordinary opens and mutate it only when initialization actually
+                // needs a mode switch. This avoids taking a journal-mode lock on
+                // every metadata write while still validating the required mode.
+                Self::enable_wal_mode(&conn)?;
+                Self::configure_file_backed_connection(&conn)?;
             }
             DatabasePragmaProfile::InMemory => {
                 conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA cache_size = -32768;")
@@ -4571,6 +4714,142 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    const CROSS_PROCESS_DB_PATH_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_PATH";
+    const CROSS_PROCESS_DB_GATE_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_GATE";
+    const CROSS_PROCESS_DB_CHILD_ID_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_CHILD_ID";
+    const CROSS_PROCESS_DB_SUCCESS_DIR_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_SUCCESS_DIR";
+
+    #[test]
+    fn cross_process_database_open_child() {
+        let Some(db_path) = std::env::var_os(CROSS_PROCESS_DB_PATH_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let gate = PathBuf::from(
+            std::env::var_os(CROSS_PROCESS_DB_GATE_ENV)
+                .expect("cross-process DB child gate path"),
+        );
+        let child_id = std::env::var(CROSS_PROCESS_DB_CHILD_ID_ENV)
+            .expect("cross-process DB child id");
+        let success_dir = PathBuf::from(
+            std::env::var_os(CROSS_PROCESS_DB_SUCCESS_DIR_ENV)
+                .expect("cross-process DB child success directory"),
+        );
+
+        let gate_wait_started = std::time::Instant::now();
+        while !gate.exists() {
+            assert!(
+                gate_wait_started.elapsed() < std::time::Duration::from_secs(10),
+                "timed out waiting for parent start gate {}",
+                gate.display(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        for round in 0..16 {
+            let db = Database::open_path(&db_path).unwrap_or_else(|error| {
+                panic!("child {child_id} round {round} could not open shared database: {error}")
+            });
+            let journal_mode: String = db
+                .conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("read child journal mode");
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+            // Hold SQLite's writer reservation briefly. Other child processes
+            // continue opening the already-WAL database during this window;
+            // an open path must not attempt another journal-mode transition.
+            db.conn
+                .execute_batch("BEGIN IMMEDIATE;")
+                .expect("acquire child SQLite writer reservation");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            db.conn
+                .execute_batch("COMMIT;")
+                .expect("release child SQLite writer reservation");
+
+            let file_path = format!("/cross-process/{child_id}/{round}.wv");
+            let backup_path = format!("{file_path}.tonepoet-bak");
+            db.begin_metadata_write(&file_path, &backup_path)
+                .unwrap_or_else(|error| {
+                    panic!("child {child_id} round {round} journal insert failed: {error}")
+                });
+            db.complete_metadata_write(&file_path)
+                .unwrap_or_else(|error| {
+                    panic!("child {child_id} round {round} journal delete failed: {error}")
+                });
+        }
+
+        std::fs::write(success_dir.join(format!("child-{child_id}.ok")), b"ok")
+            .expect("publish cross-process DB child success marker");
+    }
+
+    #[test]
+    fn concurrent_processes_open_and_write_one_wal_database() {
+        const CHILD_COUNT: usize = 6;
+        let temp = tempfile::tempdir().expect("cross-process database tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let gate = temp.path().join("start");
+        let success_dir = temp.path().join("success");
+        std::fs::create_dir(&success_dir).expect("create child success directory");
+        let current_exe = std::env::current_exe().expect("resolve current test executable");
+
+        let mut children = Vec::with_capacity(CHILD_COUNT);
+        for child_id in 0..CHILD_COUNT {
+            let child = std::process::Command::new(&current_exe)
+                .arg("--exact")
+                .arg("db::tests::cross_process_database_open_child")
+                .arg("--nocapture")
+                .env(CROSS_PROCESS_DB_PATH_ENV, &db_path)
+                .env(CROSS_PROCESS_DB_GATE_ENV, &gate)
+                .env(CROSS_PROCESS_DB_CHILD_ID_ENV, child_id.to_string())
+                .env(CROSS_PROCESS_DB_SUCCESS_DIR_ENV, &success_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn DB child {child_id}: {error}"));
+            children.push((child_id, child));
+        }
+
+        std::fs::write(&gate, b"go").expect("release DB child start gate");
+        for (child_id, child) in children {
+            let output = child
+                .wait_with_output()
+                .unwrap_or_else(|error| panic!("wait for DB child {child_id}: {error}"));
+            assert!(
+                output.status.success(),
+                "DB child {child_id} failed with {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                success_dir.join(format!("child-{child_id}.ok")).is_file(),
+                "DB child {child_id} exited without running the filtered helper test",
+            );
+        }
+
+        let db = Database::open_path(&db_path).expect("open database after process contention");
+        let journal_mode: String = db
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read final journal mode");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read final schema version");
+        let pending_journal_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM metadata_journal", [], |row| row.get(0))
+            .expect("count final metadata journal rows");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(version, CURRENT_VERSION);
+        assert_eq!(pending_journal_rows, 0);
+        assert!(
+            Database::open_init_lock_path(&db_path).is_file(),
+            "persistent DB initialization lock marker must remain adjacent to the database",
+        );
     }
 
     #[test]
