@@ -1578,6 +1578,7 @@ struct RealizedProbe {
     exact: bool,
     codec_name: Option<String>,
     sample_fmt: Option<String>,
+    channels: Option<u32>,
     bits_per_raw_sample: Option<u32>,
     bits_per_sample: Option<u32>,
 }
@@ -1606,7 +1607,7 @@ async fn probe_realized_segment_with_tool_limits(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=sample_rate,duration_ts,time_base,duration,codec_name,sample_fmt,bits_per_raw_sample,bits_per_sample".into(),
+            "stream=sample_rate,channels,duration_ts,time_base,duration,codec_name,sample_fmt,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -1654,6 +1655,7 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
             exact: true,
             codec_name: json_string(stream, "codec_name"),
             sample_fmt: json_string(stream, "sample_fmt"),
+            channels: json_u32_field(stream, "channels"),
             bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
             bits_per_sample: json_u32_field(stream, "bits_per_sample"),
         });
@@ -1676,6 +1678,7 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
         exact: false,
         codec_name: json_string(stream, "codec_name"),
         sample_fmt: json_string(stream, "sample_fmt"),
+        channels: json_u32_field(stream, "channels"),
         bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
         bits_per_sample: json_u32_field(stream, "bits_per_sample"),
     })
@@ -1686,11 +1689,13 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
 /// Lossless PCM-preserving targets (FLAC, WAV, AIFF, WavPack, ALAC) must
 /// preserve the staged segment's duration after final encode. Same-rate
 /// encodes validate against the source-rate sample count exactly when ffprobe
-/// reports exact `duration_ts`. Resampled encodes validate against the
-/// target-rate sample count with a one-sample endpoint tolerance. Duration-only
-/// probes get a narrow one-millisecond sample tolerance to cover
-/// container/probe rounding. Lossy formats and DSD are skipped because codec
-/// padding or a different sample model makes strict comparison invalid.
+/// reports exact `duration_ts`, except for the precisely computed terminal
+/// alignment padding exposed by FFmpeg's W64 integer-PCM demuxer. Resampled
+/// encodes validate against the target-rate sample count with a one-sample
+/// endpoint tolerance. Duration-only probes get a narrow one-millisecond
+/// sample tolerance to cover container/probe rounding. Lossy formats and DSD
+/// are skipped because codec padding or a different sample model makes strict
+/// comparison invalid.
 ///
 /// Returns the actual probed sample count on success, the original expected
 /// sample count when validation is intentionally skipped for a non-lossless
@@ -1835,7 +1840,14 @@ async fn validate_encoded_output_with_tool_limits(
         }
 
         let delta = actual.abs_diff(expected.samples);
-        let allowed = encoded_output_sample_tolerance(&probe, &expected);
+        let mut allowed = encoded_output_sample_tolerance(&probe, &expected);
+        if actual >= expected.samples {
+            allowed = allowed.max(w64_integer_pcm_padding_sample_tolerance(
+                out_path,
+                &probe,
+                &expected,
+            ));
+        }
 
         if delta > allowed {
             return Err(ConvertError::TrackValidation(format!(
@@ -1895,7 +1907,10 @@ fn requires_lossless_post_encode_sample_validation(target_format: &tonepoet_pipe
     ) && target_format.is_pcm_lossless()
 }
 
-fn encoded_output_sample_tolerance(probe: &RealizedProbe, expected: &PostEncodeSampleExpectation) -> u64 {
+fn encoded_output_sample_tolerance(
+    probe: &RealizedProbe,
+    expected: &PostEncodeSampleExpectation,
+) -> u64 {
     let probe_tolerance = if probe.exact {
         0
     } else {
@@ -1916,6 +1931,79 @@ fn encoded_output_sample_tolerance(probe: &RealizedProbe, expected: &PostEncodeS
     };
 
     probe_tolerance.max(resampler_tolerance)
+}
+
+/// FFmpeg pads Wave64 chunks to an 8-byte boundary. For integer PCM, its W64
+/// demuxer can expose the terminal zero padding through `duration_ts` as one or
+/// more extra sample frames. Compute only the frames that the required
+/// alignment can explain for this exact sample count and PCM layout; every
+/// other W64 drift remains a validation error.
+fn w64_integer_pcm_padding_sample_tolerance(
+    out_path: &Path,
+    probe: &RealizedProbe,
+    expected: &PostEncodeSampleExpectation,
+) -> u64 {
+    if !has_path_extension(out_path, "w64") {
+        return 0;
+    }
+
+    let Some(codec) = probe.codec_name.as_deref() else {
+        return 0;
+    };
+    if !(codec.starts_with("pcm_s") || codec.starts_with("pcm_u")) {
+        return 0;
+    }
+
+    let Some(channels) = probe.channels.map(u64::from).filter(|channels| *channels > 0) else {
+        return 0;
+    };
+    let Some(bytes_per_sample) = integer_pcm_storage_bytes_per_sample(codec, probe) else {
+        return 0;
+    };
+    let Some(frame_bytes) = channels.checked_mul(bytes_per_sample) else {
+        return 0;
+    };
+    if frame_bytes == 0 {
+        return 0;
+    }
+
+    // The W64 data-chunk header is itself 8-byte aligned, so only the PCM
+    // payload length determines the terminal zero padding. Work modulo eight
+    // to avoid overflow even for very long sources.
+    let payload_mod_8 = (expected.samples % 8).saturating_mul(frame_bytes % 8) % 8;
+    let padding_bytes = (8 - payload_mod_8) % 8;
+    if padding_bytes == 0 {
+        return 0;
+    }
+
+    // FFmpeg derives integer-PCM W64 duration_ts by rounding the aligned data
+    // extent to the nearest sample frame. Reproduce that bounded artifact from
+    // the padding alone, rather than granting a fixed W64 drift budget.
+    padding_bytes
+        .saturating_add(frame_bytes / 2)
+        .checked_div(frame_bytes)
+        .unwrap_or(0)
+}
+
+fn integer_pcm_storage_bytes_per_sample(codec: &str, probe: &RealizedProbe) -> Option<u64> {
+    let bytes = if codec.starts_with("pcm_s8") || codec.starts_with("pcm_u8") {
+        1
+    } else if codec.starts_with("pcm_s16") || codec.starts_with("pcm_u16") {
+        2
+    } else if codec.starts_with("pcm_s24") || codec.starts_with("pcm_u24") {
+        3
+    } else if codec.starts_with("pcm_s32") || codec.starts_with("pcm_u32") {
+        4
+    } else if codec.starts_with("pcm_s64") || codec.starts_with("pcm_u64") {
+        8
+    } else {
+        let bits = probe.bits_per_sample?;
+        if bits == 0 || bits % 8 != 0 {
+            return None;
+        }
+        u64::from(bits / 8)
+    };
+    Some(bytes)
 }
 
 fn samples_from_stream_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Option<u64> {
@@ -6821,8 +6909,8 @@ mod metadata_writer_command_tests {
             assert!(warnings.iter().any(|warning| warning.contains("ALBUMARTIST")));
             assert!(warnings.iter().any(|warning| warning.contains("PERFORMER")));
             assert!(warnings.iter().any(|warning| warning.contains("GENRE")));
-            assert!(!warnings.iter().any(|warning| warning.contains("ARTIST has")));
-            assert!(!warnings.iter().any(|warning| warning.contains("COMPOSER")));
+            assert!(!warnings.iter().any(|warning| warning.contains(": ARTIST has ")));
+            assert!(!warnings.iter().any(|warning| warning.contains(": COMPOSER has ")));
         }
         assert!(fixed_vocab_scalar_collapse_warnings(Path::new("track.wv"), "wv", &tags).is_empty());
     }
@@ -9969,7 +10057,7 @@ FILE "album.flac" WAVE
             let tags = format_tag_map(&probe);
             assert_eq!(tags.get("TITLE").map(String::as_str), Some("Planner spelling title"));
             assert_eq!(tags.get("ARTIST").map(String::as_str), Some("Planner spelling artist"));
-            assert_eq!(tags.get("TRACK").map(String::as_str), Some("4"));
+            assert_eq!(tags.get("TRACK").map(String::as_str), Some("4/1"));
             if case.extension == "rf64" {
                 assert_eq!(
                     &std::fs::read(output_path).expect("read RF64 output")[..4],
@@ -54828,6 +54916,19 @@ mod validate_encoded_output_tests {
         )
     }
 
+    fn ffprobe_exact_integer_pcm_json(
+        sample_rate: u32,
+        total_samples: u64,
+        channels: u32,
+        codec_name: &str,
+        sample_fmt: &str,
+        bits_per_sample: u32,
+    ) -> String {
+        format!(
+            r#"{{"streams":[{{"sample_rate":"{sample_rate}","channels":{channels},"duration_ts":{total_samples},"time_base":"1/{sample_rate}","codec_name":"{codec_name}","sample_fmt":"{sample_fmt}","bits_per_sample":{bits_per_sample}}}],"format":{{}}}}"#
+        )
+    }
+
     fn ffprobe_approx_json(sample_rate: u32, duration_secs: f64) -> String {
         format!(
             r#"{{"streams":[{{"sample_rate":"{sample_rate}","duration":"{duration_secs}"}}],"format":{{"duration":"{duration_secs}"}}}}"#
@@ -55550,6 +55651,152 @@ mod validate_encoded_output_tests {
             Err(ConvertError::TrackValidation(message))
                 if message.contains("post-encode sample drift") && message.contains("allowed 0")
         ));
+    }
+
+    #[tokio::test]
+    async fn w64_integer_pcm_exact_probe_accepts_only_computed_alignment_padding() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.w64");
+        std::fs::write(&out, b"fake-w64").expect("write");
+        let cancel = CancellationToken::new();
+        let expected = PostEncodeSampleExpectation::same_rate(66_150, Some(44_100));
+
+        let runner = stub_with_probe(&ffprobe_exact_integer_pcm_json(
+            44_100,
+            66_152,
+            1,
+            "pcm_s16le",
+            "s16",
+            16,
+        ));
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(expected),
+            None,
+            &tonepoet_pipeline::AudioFormat::Wav,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("two W64 alignment samples should be accepted");
+        assert_eq!(validation.samples, Some(66_152));
+
+        let runner = stub_with_probe(&ffprobe_exact_integer_pcm_json(
+            44_100,
+            66_153,
+            1,
+            "pcm_s16le",
+            "s16",
+            16,
+        ));
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(expected),
+            None,
+            &tonepoet_pipeline::AudioFormat::Wav,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample drift") && message.contains("allowed 2")
+        ));
+
+        let runner = stub_with_probe(&ffprobe_exact_integer_pcm_json(
+            44_100,
+            66_148,
+            1,
+            "pcm_s16le",
+            "s16",
+            16,
+        ));
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(expected),
+            None,
+            &tonepoet_pipeline::AudioFormat::Wav,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample drift") && message.contains("allowed 0")
+        ));
+
+        let wav = temp.path().join("track.wav");
+        std::fs::write(&wav, b"fake-wav").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_integer_pcm_json(
+            44_100,
+            66_152,
+            1,
+            "pcm_s16le",
+            "s16",
+            16,
+        ));
+        let result = validate_encoded_output_with_tool_limits(
+            &wav,
+            Some(expected),
+            None,
+            &tonepoet_pipeline::AudioFormat::Wav,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample drift") && message.contains("allowed 0")
+        ));
+    }
+
+    #[test]
+    fn w64_padding_tolerance_handles_24_bit_partial_frame_without_covering_float_pcm() {
+        let expected = PostEncodeSampleExpectation::same_rate(66_150, Some(44_100));
+        let integer_probe = RealizedProbe {
+            sample_rate: 44_100,
+            samples: Some(66_151),
+            exact: true,
+            codec_name: Some("pcm_s24le".to_string()),
+            sample_fmt: Some("s32".to_string()),
+            channels: Some(2),
+            bits_per_raw_sample: Some(24),
+            bits_per_sample: Some(24),
+        };
+        assert_eq!(
+            w64_integer_pcm_padding_sample_tolerance(
+                Path::new("track.w64"),
+                &integer_probe,
+                &expected,
+            ),
+            1,
+        );
+
+        let float_probe = RealizedProbe {
+            sample_rate: 44_100,
+            samples: Some(66_151),
+            exact: true,
+            codec_name: Some("pcm_f32le".to_string()),
+            sample_fmt: Some("flt".to_string()),
+            channels: Some(1),
+            bits_per_raw_sample: Some(32),
+            bits_per_sample: Some(32),
+        };
+        assert_eq!(
+            w64_integer_pcm_padding_sample_tolerance(
+                Path::new("track.w64"),
+                &float_probe,
+                &expected,
+            ),
+            0,
+        );
     }
 
     #[tokio::test]
