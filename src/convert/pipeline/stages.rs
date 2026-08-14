@@ -4125,6 +4125,7 @@ fn planner_metadata_already_satisfied(
                         .authoritative_tags_applied
                         || dvd_audio_artifact_has_authoritative_metadata(track, source)
                         || sidecar_cue_artifact_has_authoritative_metadata(track, source, req)
+                        || prepared_artifact_requires_post_encode_metadata(track, source, req)
                         || m4a_artifact_has_freeform_metadata(track, source);
                     let required = track.metadata_required.merge(PlannedMetadataSatisfaction {
                         authoritative_tags_applied: authoritative_tags_required,
@@ -4181,6 +4182,74 @@ fn dvd_audio_artifact_has_authoritative_metadata(
         .is_some_and(|track| {
             !authoritative_metadata_tags(&track.metadata, &source.album_metadata).is_empty()
         })
+}
+
+fn prepared_artifact_requires_post_encode_metadata(
+    artifact: &TrackArtifact,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> bool {
+    // Request/archive edits live only in the prepared model; planner source-tag
+    // transfer reads the realized input file and cannot observe them. One such
+    // edit is enough to keep the authoritative stage for the artifact set.
+    if !req.metadata_overrides.album_artist.is_keep()
+        || (matches!(source.kind, SourceKind::Archive)
+            && req
+                .archive_metadata_overrides
+                .iter()
+                .any(ArchiveTrackMetadataOverride::has_changes))
+    {
+        return true;
+    }
+
+    let Some(track) = source.tracks.iter().find(|track| track.id == artifact.track_id) else {
+        return false;
+    };
+    let tags = authoritative_metadata_tags(&track.metadata, &source.album_metadata);
+    let ext = artifact
+        .staged_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        // FFmpeg source-tag transfer can scalarize repeated values. Native
+        // post writers must restore the complete prepared list. Custom APE
+        // source provenance with embedded NUL separators likewise needs the
+        // authoritative boundary to project every logical value into one
+        // legal scalar carrier instead of trusting FFmpeg's first-value view.
+        "flac" | "opus" | "ogg" | "wv" => {
+            !pipeline_multivalue_write_changes(&tags).is_empty()
+                || source_provenance_requires_scalar_projection(
+                    &track.metadata,
+                    &source.album_metadata,
+                    &tags,
+                )
+        }
+        // MP3 needs the post stage for its repeat-capable standard fields and
+        // for NUL-separated custom APE provenance. M4A/MP4 custom/freeform
+        // provenance is already covered by m4a_artifact_has_freeform_metadata.
+        "mp3" => {
+            !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
+                || source_provenance_requires_scalar_projection(
+                    &track.metadata,
+                    &source.album_metadata,
+                    &tags,
+                )
+        }
+        "m4a" | "mp4" => {
+            !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
+        }
+        // W64 metadata mutation is intentionally fail-closed. Never let a
+        // planner-transfer satisfaction bit bypass that safety boundary.
+        "w64" => authoritative_metadata_mutation_required(
+            &track.metadata,
+            &source.album_metadata,
+            &tags,
+        ),
+        _ => false,
+    }
 }
 
 fn m4a_artifact_has_freeform_metadata(
@@ -4479,15 +4548,69 @@ pub async fn apply_metadata_with_tool_limits(
     })
 }
 
+fn pipeline_set_valued_tag_key(key: &str) -> bool {
+    matches!(
+        normalize_metadata_key(key).as_str(),
+        "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+    )
+}
+
+fn push_scalar_tag_value(tags: &mut Vec<(String, String)>, key: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() || tags.iter().any(|(existing, _)| existing == key) {
+        return;
+    }
+    tags.push((key.to_string(), value.to_string()));
+}
+
 fn push_tag_value(tags: &mut Vec<(String, String)>, key: &str, value: &str) {
     let value = value.trim();
     if value.is_empty() {
         return;
     }
-    if tags.iter().any(|(existing, _)| existing == key) {
+    if !pipeline_set_valued_tag_key(key)
+        && tags.iter().any(|(existing, _)| existing == key)
+    {
         return;
     }
     tags.push((key.to_string(), value.to_string()));
+}
+
+fn push_metadata_value_list(
+    tags: &mut Vec<(String, String)>,
+    key: &str,
+    values: &MetadataValueList,
+) {
+    for value in values.values() {
+        push_tag_value(tags, key, value);
+    }
+}
+
+fn push_authoritative_metadata_value_list(
+    tags: &mut Vec<(String, String)>,
+    fallback_recovered: bool,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    key: &str,
+    values: &MetadataValueList,
+) {
+    if !fallback_recovered {
+        push_metadata_value_list(tags, key, values);
+        return;
+    }
+
+    let Some(source_first) = fallback_authoritative_source_value(meta, album, key) else {
+        return;
+    };
+    // Native APE recovery stores the first value in the immutable scalar
+    // provenance namespace while the typed field retains the complete ordered
+    // list. Only trust the full list when its first value still matches that
+    // source proof; later enrichment must not acquire tag authority.
+    if values.as_deref() == Some(source_first) {
+        push_metadata_value_list(tags, key, values);
+    } else {
+        push_tag_value(tags, key, source_first);
+    }
 }
 
 fn cue_extra_tag_key(scope: &str, key: &str) -> String {
@@ -4653,6 +4776,48 @@ fn explicit_album_artist_clear_requested(
             .contains_key(EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY)
 }
 
+fn source_provenance_scalar_value(value: &str) -> Option<String> {
+    if !value.contains('\0') {
+        return (!value.trim().is_empty()).then(|| value.to_string());
+    }
+
+    let components = value
+        .split('\0')
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    (!components.is_empty()).then(|| components.join("; "))
+}
+
+fn source_provenance_requires_scalar_projection(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    authoritative_tags: &[(String, String)],
+) -> bool {
+    let album_artist_authoritative = tag_value(authoritative_tags, "ALBUMARTIST").is_some()
+        || explicit_album_artist_clear_requested(meta, album);
+
+    [&meta.extra, &album.extra].into_iter().any(|extra| {
+        extra.iter().any(|(marker_key, marker_value)| {
+            let Some(source_key) =
+                source_text_tag_key_from_extra(extra, marker_key, marker_value)
+            else {
+                return false;
+            };
+            if source_text_tag_is_writer_owned(
+                source_key,
+                meta.pre_emphasis,
+                album_artist_authoritative,
+            ) {
+                return false;
+            }
+            source_text_tag_output_key(source_key).is_some()
+                && marker_value.contains('\0')
+                && source_provenance_scalar_value(marker_value).is_some()
+        })
+    })
+}
+
 pub(crate) fn authoritative_metadata_tags(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
@@ -4673,15 +4838,14 @@ pub(crate) fn authoritative_metadata_tags(
     ) {
         push_tag_value(&mut tags, "TITLE", v);
     }
-    if let Some(v) = authoritative_canonical_value(
+    push_authoritative_metadata_value_list(
+        &mut tags,
         fallback_recovered,
         meta,
         album,
         "ARTIST",
-        meta.artist.as_deref(),
-    ) {
-        push_tag_value(&mut tags, "ARTIST", v);
-    }
+        &meta.artist,
+    );
 
     // Batch identity and label enrichment are organizational facts, not source
     // tag authority. For a fallback-recovered source, ALBUMARTIST therefore
@@ -4695,27 +4859,36 @@ pub(crate) fn authoritative_metadata_tags(
         .get(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY)
         .or_else(|| album.extra.get(EXPLICIT_ALBUM_ARTIST_OVERRIDE_EXTRA_KEY))
         .map(String::as_str);
-    let album_artist_tag = if fallback_recovered {
-        if explicit_album_artist_clear {
-            None
-        } else {
-            explicit_album_artist.or_else(|| {
-                fallback_authoritative_source_value(meta, album, "ALBUMARTIST")
-            })
+    if fallback_recovered {
+        if !explicit_album_artist_clear {
+            if let Some(value) = explicit_album_artist {
+                push_tag_value(&mut tags, "ALBUMARTIST", value);
+            } else {
+                let values = if meta.album_artist.is_some() {
+                    &meta.album_artist
+                } else {
+                    &album.album_artist
+                };
+                push_authoritative_metadata_value_list(
+                    &mut tags,
+                    true,
+                    meta,
+                    album,
+                    "ALBUMARTIST",
+                    values,
+                );
+            }
         }
+    } else if meta.album_artist.is_some() {
+        push_metadata_value_list(&mut tags, "ALBUMARTIST", &meta.album_artist);
+    } else if let Some(value) = album
+        .extra
+        .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
+        .map(String::as_str)
+    {
+        push_tag_value(&mut tags, "ALBUMARTIST", value);
     } else {
-        meta.album_artist
-            .as_deref()
-            .or_else(|| {
-                album
-                    .extra
-                    .get(PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY)
-                    .map(String::as_str)
-            })
-            .or(album.album_artist.as_deref())
-    };
-    if let Some(v) = album_artist_tag {
-        push_tag_value(&mut tags, "ALBUMARTIST", v);
+        push_metadata_value_list(&mut tags, "ALBUMARTIST", &album.album_artist);
     }
 
     // ALBUM is source-gated for fallback recovery. In particular, preserved
@@ -4736,16 +4909,15 @@ pub(crate) fn authoritative_metadata_tags(
         push_tag_value(&mut tags, "ALBUM", v);
     }
 
-    let ordinary_genre = meta.genre.as_deref().or(album.genre.as_deref());
-    if let Some(v) = authoritative_canonical_value(
+    let genre_values = if meta.genre.is_some() { &meta.genre } else { &album.genre };
+    push_authoritative_metadata_value_list(
+        &mut tags,
         fallback_recovered,
         meta,
         album,
         "GENRE",
-        ordinary_genre,
-    ) {
-        push_tag_value(&mut tags, "GENRE", v);
-    }
+        genre_values,
+    );
     let ordinary_date = meta.date.as_deref().or(album.date.as_deref());
     if let Some(v) = authoritative_canonical_value(
         fallback_recovered,
@@ -4794,24 +4966,22 @@ pub(crate) fn authoritative_metadata_tags(
     ) {
         push_tag_value(&mut tags, "COMMENT", v);
     }
-    if let Some(v) = authoritative_canonical_value(
+    push_authoritative_metadata_value_list(
+        &mut tags,
         fallback_recovered,
         meta,
         album,
         "COMPOSER",
-        meta.composer.as_deref(),
-    ) {
-        push_tag_value(&mut tags, "COMPOSER", v);
-    }
-    if let Some(v) = authoritative_canonical_value(
+        &meta.composer,
+    );
+    push_authoritative_metadata_value_list(
+        &mut tags,
         fallback_recovered,
         meta,
         album,
         "PERFORMER",
-        meta.performer.as_deref(),
-    ) {
-        push_tag_value(&mut tags, "PERFORMER", v);
-    }
+        &meta.performer,
+    );
     if let Some(v) = authoritative_canonical_value(
         fallback_recovered,
         meta,
@@ -4893,8 +5063,11 @@ pub(crate) fn authoritative_metadata_tags(
                 ) {
                     continue;
                 }
-                if let Some(tag_key) = source_text_tag_output_key(source_key) {
-                    push_tag_value(&mut tags, &tag_key, value);
+                if let (Some(tag_key), Some(value)) = (
+                    source_text_tag_output_key(source_key),
+                    source_provenance_scalar_value(value),
+                ) {
+                    push_tag_value(&mut tags, &tag_key, &value);
                 }
             }
         }
@@ -4910,8 +5083,11 @@ pub(crate) fn authoritative_metadata_tags(
             ) {
                 continue;
             }
-            if let Some(tag_key) = source_text_tag_output_key(source_key) {
-                push_tag_value(&mut tags, &tag_key, value);
+            if let (Some(tag_key), Some(value)) = (
+                source_text_tag_output_key(source_key),
+                source_provenance_scalar_value(value),
+            ) {
+                push_tag_value(&mut tags, &tag_key, &value);
             }
         }
         for (key, value) in &album.extra {
@@ -4925,8 +5101,11 @@ pub(crate) fn authoritative_metadata_tags(
             ) {
                 continue;
             }
-            if let Some(tag_key) = source_text_tag_output_key(source_key) {
-                push_tag_value(&mut tags, &tag_key, value);
+            if let (Some(tag_key), Some(value)) = (
+                source_text_tag_output_key(source_key),
+                source_provenance_scalar_value(value),
+            ) {
+                push_tag_value(&mut tags, &tag_key, &value);
             }
         }
     }
@@ -4988,26 +5167,45 @@ fn ffmpeg_metadata_value_for_number(
     }
 }
 
+fn collapsed_metadata_tag_value(tags: &[(String, String)], key: &str) -> Option<String> {
+    let values = tags
+        .iter()
+        .filter(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    let first = values.first()?;
+    if pipeline_set_valued_tag_key(key) && values.len() > 1 {
+        Some(values.join("; "))
+    } else {
+        Some((*first).to_string())
+    }
+}
+
 fn ffmpeg_authoritative_metadata_tags(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (key, value) in tags {
+    for (key, _) in tags {
         match key.as_str() {
             "TRACKNUMBER" => {
                 if let Some(track) = ffmpeg_metadata_value_for_number(tags, "TRACKNUMBER", "TRACKTOTAL") {
-                    push_tag_value(&mut out, "track", &track);
+                    push_scalar_tag_value(&mut out, "track", &track);
                 }
             }
             "DISCNUMBER" => {
                 if let Some(disc) = ffmpeg_metadata_value_for_number(tags, "DISCNUMBER", "DISCTOTAL") {
-                    push_tag_value(&mut out, "disc", &disc);
+                    push_scalar_tag_value(&mut out, "disc", &disc);
                 }
             }
             "TRACKTOTAL" | "DISCTOTAL" | "TOTALTRACKS" | "TOTALDISCS" => {}
-            _ => push_tag_value(&mut out, &ffmpeg_metadata_key(key), value),
+            _ => {
+                if let Some(value) = collapsed_metadata_tag_value(tags, key) {
+                    push_scalar_tag_value(&mut out, &ffmpeg_metadata_key(key), &value);
+                }
+            }
         }
     }
     out
 }
+
 
 const AUTHORITATIVE_CUE_MANAGED_TAG_KEYS: &[&str] = &[
     "TITLE",
@@ -5205,8 +5403,9 @@ fn opustags_tag_args(
         args.push("--delete".into());
         args.push(key);
     }
+    let mut seen = BTreeSet::new();
     for (k, v) in tags {
-        args.push("-s".into());
+        args.push(if seen.insert(k.clone()) { "-s" } else { "-a" }.into());
         args.push(format!("{}={}", k, v));
     }
     args.push("--in-place".into());
@@ -5224,19 +5423,50 @@ fn wvtag_tag_args(
         args.push("-d".into());
         args.push(key);
     }
-    for (k, v) in tags {
+    let mut seen = BTreeSet::new();
+    for (k, _) in tags {
+        if !seen.insert(k.clone()) {
+            continue;
+        }
+        let Some(value) = collapsed_metadata_tag_value(tags, k) else {
+            continue;
+        };
         args.push("-w".into());
-        args.push(format!("{}={}", k, v));
+        args.push(format!("{}={}", k, value));
     }
     args.push(path.display().to_string());
     args
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegMetadataCarrier {
+    Auto,
+    Rf64,
+}
+
+fn ffmpeg_raw_pcm_muxer_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "s8" => Some("s8"),
+        "u8" => Some("u8"),
+        "s16le" => Some("s16le"),
+        "s16be" => Some("s16be"),
+        "s24le" => Some("s24le"),
+        "s24be" => Some("s24be"),
+        "s32le" => Some("s32le"),
+        "s32be" => Some("s32be"),
+        "f32le" => Some("f32le"),
+        "f32be" => Some("f32be"),
+        "f64le" => Some("f64le"),
+        "f64be" => Some("f64be"),
+        _ => None,
+    }
 }
 
 fn ffmpeg_metadata_rewrite_args(
     path: &Path,
     tmp: &Path,
     tags: &[(String, String)],
-    preserve_rf64: bool,
+    carrier: FfmpegMetadataCarrier,
 ) -> Vec<String> {
     let mut args = vec![
         "-y".into(),
@@ -5244,25 +5474,32 @@ fn ffmpeg_metadata_rewrite_args(
         "-nostdin".into(),
         "-loglevel".into(),
         "error".into(),
+    ];
+    args.extend([
         "-i".into(),
         path.display().to_string(),
         "-map".into(),
         "0".into(),
         "-map_metadata".into(),
         "-1".into(),
-    ];
+    ]);
     for (k, v) in ffmpeg_authoritative_metadata_tags(tags) {
         args.push("-metadata".into());
         args.push(format!("{}={}", k, v));
     }
     args.push("-c".into());
     args.push("copy".into());
-    if preserve_rf64 {
-        // A same-extension rewrite of a small RF64 file otherwise defaults back
-        // to ordinary RIFF. Container identity is part of the production
-        // metadata contract, so preserve the source RF64 dialect explicitly.
-        args.push("-rf64".into());
-        args.push("always".into());
+    match carrier {
+        FfmpegMetadataCarrier::Auto => {}
+        FfmpegMetadataCarrier::Rf64 => {
+            // `.rf64` is not an ffmpeg filename alias for the WAV muxer, and a
+            // same-extension rewrite of a small RF64 file otherwise defaults
+            // back to ordinary RIFF. Pin both the muxer and RF64 dialect.
+            args.push("-rf64".into());
+            args.push("always".into());
+            args.push("-f".into());
+            args.push("wav".into());
+        }
     }
     // NOTE: no `-movflags +use_metadata_tags` here. On ffmpeg 7.1 that flag
     // and an attached picture are mutually exclusive in ONE mov/ipod mux
@@ -5320,8 +5557,10 @@ fn m4a_freeform_tag_pairs_for_file(
 /// Write the non-native authoritative keys as iTunes freeform atoms
 /// (`----:com.apple.iTunes:<KEY>`). Runs AFTER the ffmpeg rewrite AND after
 /// any artwork embed: every mov re-mux strips freeform atoms (allowlist), so
-/// this must be the final container rewrite. Later in-place tag editors are
-/// permitted only when their preservation behavior is pinned (the real-tools
+/// this must be the final *remux-style* container rewrite. The Phase-4 shared
+/// in-process metadata writer may follow it; that path uses the editor's
+/// format-aware preservation logic. Later unrelated tag editors are permitted
+/// only when their preservation behavior is pinned (the real-tools
 /// ReplayGain test covers loudgain/taglib). Convergence holds because the next
 /// metadata run's rewrite (`-map_metadata -1`) wipes all prior freeform atoms
 /// before this re-adds the current set.
@@ -5387,18 +5626,29 @@ fn metadata_tag_command(
         "flac" => (ToolBinary::Metaflac, metaflac_tag_args(path, tags, existing_keys), None),
         "opus" | "ogg" => (ToolBinary::Opustags, opustags_tag_args(path, tags, existing_keys), None),
         "wv" => (ToolBinary::Wvtag, wvtag_tag_args(path, tags, existing_keys), None),
-        "mp3" | "m4a" | "wav" | "aiff" | "aif" => {
-            let tmp = metadata_rewrite_temp_path(path)?;
-            let preserve_rf64 = ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?;
-            let args = ffmpeg_metadata_rewrite_args(path, tmp.path(), tags, preserve_rf64);
-            (ToolBinary::Ffmpeg, args, Some(tmp))
-        }
         "w64" => {
+            // FFmpeg 7.1.x W64 stream-copy remuxing can append a phantom PCM
+            // sample for valid 24-bit alignments, and its W64 muxer does not
+            // persist the authoritative text metadata this stage promises.
+            // Reject before mutation rather than report a destructive no-op as
+            // successful metadata application.
             return Err(MetadataError::PolicyRejected(
                 tonepoet_pipeline::reference_error_text(
                     tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified,
                 ),
             ));
+        }
+        "mp3" | "m4a" | "mp4" | "wav" | "rf64" | "aiff" | "aif" => {
+            let tmp = metadata_rewrite_temp_path(path)?;
+            let carrier = if ext == "rf64"
+                || (ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?)
+            {
+                FfmpegMetadataCarrier::Rf64
+            } else {
+                FfmpegMetadataCarrier::Auto
+            };
+            let args = ffmpeg_metadata_rewrite_args(path, tmp.path(), tags, carrier);
+            (ToolBinary::Ffmpeg, args, Some(tmp))
         }
         _ => return Err(MetadataError::UnsupportedTagFormat(ext.to_string())),
     };
@@ -5582,6 +5832,280 @@ pub struct ProductionMetadataMutationOutcome {
     pub m4a_freeform_mutator_applied: bool,
 }
 
+fn pipeline_multivalue_write_changes(
+    tags: &[(String, String)],
+) -> Vec<(lofty::tag::ItemKey, Vec<String>)> {
+    use lofty::tag::ItemKey;
+
+    [
+        ("ARTIST", ItemKey::TrackArtist),
+        ("ALBUMARTIST", ItemKey::AlbumArtist),
+        ("COMPOSER", ItemKey::Composer),
+        ("PERFORMER", ItemKey::Performer),
+        ("GENRE", ItemKey::Genre),
+    ]
+    .into_iter()
+    .filter_map(|(key, item_key)| {
+        let values = tags
+            .iter()
+            .filter(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        (values.len() > 1).then_some((item_key, values))
+    })
+    .collect()
+}
+
+fn pipeline_multivalue_field_name(item_key: &lofty::tag::ItemKey) -> &'static str {
+    match item_key {
+        lofty::tag::ItemKey::TrackArtist => "ARTIST",
+        lofty::tag::ItemKey::AlbumArtist => "ALBUMARTIST",
+        lofty::tag::ItemKey::Composer => "COMPOSER",
+        lofty::tag::ItemKey::Performer => "PERFORMER",
+        lofty::tag::ItemKey::Genre => "GENRE",
+        _ => "metadata field",
+    }
+}
+
+fn external_scalar_collapse_warnings(
+    path: &Path,
+    ext: &str,
+    tags: &[(String, String)],
+) -> Vec<String> {
+    if !matches!(ext, "wav" | "rf64" | "aiff" | "aif") {
+        return Vec::new();
+    }
+    pipeline_multivalue_write_changes(tags)
+        .into_iter()
+        .map(|(item_key, values)| {
+            let key = pipeline_multivalue_field_name(&item_key);
+            format!(
+                "Metadata warning for '{}': {key} has {} ordered values, but {ext} conversion metadata uses a scalar carrier; writing one joined scalar value",
+                path.display(),
+                values.len()
+            )
+        })
+        .collect()
+}
+
+fn fixed_vocab_scalar_collapse_warnings(
+    path: &Path,
+    ext: &str,
+    tags: &[(String, String)],
+) -> Vec<String> {
+    use lofty::tag::ItemKey;
+
+    if !matches!(ext, "mp3" | "m4a" | "mp4") {
+        return Vec::new();
+    }
+    pipeline_multivalue_write_changes(tags)
+        .into_iter()
+        .filter(|(item_key, _)| {
+            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+        })
+        .map(|(item_key, values)| {
+            let key = pipeline_multivalue_field_name(&item_key);
+            format!(
+                "Metadata warning for '{}': {key} has {} ordered values, but {ext} supports one value for this field; keeping the primary pass's joined scalar value",
+                path.display(),
+                values.len()
+            )
+        })
+        .collect()
+}
+
+fn pipeline_multivalue_overlay_changes_for_extension(
+    tags: &[(String, String)],
+    ext: &str,
+) -> Vec<(lofty::tag::ItemKey, Vec<String>)> {
+    use lofty::tag::ItemKey;
+
+    pipeline_multivalue_write_changes(tags)
+        .into_iter()
+        .filter(|(item_key, _)| match ext {
+            "wv" => true,
+            "mp3" | "m4a" | "mp4" => matches!(item_key, ItemKey::TrackArtist | ItemKey::Composer),
+            _ => false,
+        })
+        .collect()
+}
+
+fn raw_pcm_metadata_omission_warning(path: &Path, ext: &str) -> String {
+    format!(
+        "Metadata warning for '{}': {ext} is headerless PCM and has no metadata carrier; skipping the requested metadata mutation and leaving audio bytes untouched",
+        path.display()
+    )
+}
+
+fn dsf_authoritative_metadata_key(key: &str) -> String {
+    match key {
+        // The pipeline names the release-label field PUBLISHER while the DSF
+        // backend's audited ID3 mapping owns TPUB as LABEL. Likewise the
+        // pipeline's album catalog carrier maps to the backend's established
+        // CATALOGNUMBER TXXX convention.
+        "PUBLISHER" => "LABEL".to_string(),
+        "CATALOG" => "CATALOGNUMBER".to_string(),
+        _ => key.to_string(),
+    }
+}
+
+fn dsf_authoritative_value_changes(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    tags: &[(String, String)],
+) -> Vec<crate::dsf_tags::DsfTagValueChange> {
+    let explicit_album_artist_clear = explicit_album_artist_clear_requested(meta, album);
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+
+    for (key, value) in tags {
+        let key = dsf_authoritative_metadata_key(key);
+        // An explicit ALBUMARTIST clear is a convergence instruction, not an
+        // omission. Do not allow any carried/source value to repopulate it.
+        if explicit_album_artist_clear && key == "ALBUMARTIST" {
+            continue;
+        }
+        grouped.entry(key).or_default().push(value.clone());
+    }
+
+    if explicit_album_artist_clear {
+        grouped.insert("ALBUMARTIST".to_string(), Vec::new());
+    }
+
+    grouped
+        .into_iter()
+        .map(|(canonical_key, values)| {
+            let values = if values.is_empty() {
+                None
+            } else if matches!(canonical_key.as_str(), "ARTIST" | "COMPOSER") {
+                // The audited DSF writer persists these two as ordered ID3v2.4
+                // text-value lists, including duplicates.
+                Some(values)
+            } else if matches!(
+                canonical_key.as_str(),
+                "ALBUMARTIST" | "PERFORMER" | "GENRE"
+            ) && values.len() > 1
+            {
+                // DSF's current write contract intentionally remains scalar
+                // for these fields. Match the pipeline's established scalar
+                // projection rather than expanding backend capability here.
+                Some(vec![values.join("; ")])
+            } else {
+                // Every other pipeline/custom field is scalar. Mapped aliases
+                // such as PUBLISHER/LABEL deliberately retain first-wins
+                // canonical ownership if both spellings are present.
+                values.into_iter().next().map(|value| vec![value])
+            };
+            crate::dsf_tags::DsfTagValueChange {
+                canonical_key,
+                values,
+            }
+        })
+        .collect()
+}
+
+fn dsf_scalar_collapse_warnings(
+    path: &Path,
+    tags: &[(String, String)],
+) -> Vec<String> {
+    use lofty::tag::ItemKey;
+
+    pipeline_multivalue_write_changes(tags)
+        .into_iter()
+        .filter(|(item_key, _)| {
+            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+        })
+        .map(|(item_key, values)| {
+            let key = pipeline_multivalue_field_name(&item_key);
+            format!(
+                "Metadata warning for '{}': {key} has {} ordered values, but DSF supports one value for this field; writing one joined scalar value",
+                path.display(),
+                values.len()
+            )
+        })
+        .collect()
+}
+
+async fn apply_dsf_authoritative_metadata(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    tags: &[(String, String)],
+    cancel: &CancellationToken,
+) -> Result<(), MetadataError> {
+    let changes = dsf_authoritative_value_changes(meta, album, tags);
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    for warning in dsf_scalar_collapse_warnings(path, tags) {
+        log::warn!("{warning}");
+    }
+
+    let write_path = path.to_path_buf();
+    let write_cancel = cancel.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        crate::dsf_tags::write_values_with_control_report(
+            &write_path,
+            &changes,
+            &|| write_cancel.is_cancelled(),
+            &|_| {},
+        )
+    })
+    .await
+    .map_err(|error| {
+        MetadataError::InProcessWrite(format!(
+            "DSF metadata writer worker for '{}' did not complete: {error}",
+            path.display()
+        ))
+    })?
+    .map_err(MetadataError::InProcessWrite)?;
+
+    if let Some(warning) = report.durability_warning {
+        log::warn!("Metadata warning for '{}': {warning}", path.display());
+    }
+    Ok(())
+}
+
+async fn apply_pipeline_multivalue_overlay(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> Result<(), MetadataError> {
+    let ext = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "wv" | "mp3" | "m4a" | "mp4") {
+        return Ok(());
+    }
+
+    let tags = authoritative_metadata_tags(meta, album);
+    let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, &ext);
+    if changes.is_empty() {
+        // Critical scalar-compatibility invariant: do not invoke an in-process
+        // tag writer at all when every logical field is scalar.
+        return Ok(());
+    }
+
+    let overlay_path = path.to_path_buf();
+    let report = tokio::task::spawn_blocking(move || {
+        crate::tui::probe::write_all_tag_value_lists(&overlay_path, &changes)
+    })
+    .await
+    .map_err(|error| {
+        MetadataError::InProcessWrite(format!(
+            "metadata writer worker for '{}' did not complete: {error}",
+            path.display()
+        ))
+    })?
+    .map_err(MetadataError::InProcessWrite)?;
+    for warning in report.durability_warnings {
+        log::warn!("Metadata warning for '{}': {warning}", path.display());
+    }
+    Ok(())
+}
+
 fn authoritative_metadata_mutation_required(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
@@ -5607,6 +6131,37 @@ async fn tag_audio_file(
     let tags = authoritative_metadata_tags(meta, album);
     if !authoritative_metadata_mutation_required(meta, album, &tags) {
         return Ok(None);
+    }
+
+    if ffmpeg_raw_pcm_muxer_for_extension(&ext).is_some() {
+        // Headerless PCM cannot persist text metadata. The previous FFmpeg
+        // stream-copy pass copied the entire file while silently discarding
+        // every `-metadata` argument, so skip that no-op I/O entirely.
+        log::warn!("{}", raw_pcm_metadata_omission_warning(path, &ext));
+        return Ok(None);
+    }
+    if ext == "w64" {
+        // Keep ordinary conversion on the same fail-closed safety boundary as
+        // Reference: the known FFmpeg W64 remux defect can alter decoded PCM,
+        // and the muxer does not persist the requested text metadata anyway.
+        return Err(MetadataError::PolicyRejected(
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified,
+            ),
+        ));
+    }
+    if ext == "dsf" {
+        // DSF is an in-process, journaled ID3v2.4 mutation. Never route it
+        // through FFmpeg or the external tag-command table.
+        apply_dsf_authoritative_metadata(path, meta, album, &tags, cancel).await?;
+        return Ok(None);
+    }
+
+    for warning in external_scalar_collapse_warnings(path, &ext, &tags) {
+        log::warn!("{warning}");
+    }
+    for warning in fixed_vocab_scalar_collapse_warnings(path, &ext, &tags) {
+        log::warn!("{warning}");
     }
 
     let existing_keys = native_existing_tag_keys(
@@ -5678,17 +6233,25 @@ async fn apply_production_metadata_to_file(
     )
     .await?;
 
+    // Artwork remuxes and the M4A freeform pass run first. The audited editor
+    // writer is the final metadata mutation for formats whose command-line
+    // writer cannot represent repeated values (WavPack/ID3v2.4/MP4).
+    apply_pipeline_multivalue_overlay(path, meta, album).await?;
+
     Ok(ProductionMetadataMutationOutcome {
         primary_mutator,
         m4a_freeform_mutator_applied,
     })
 }
 
-/// Execute the same authoritative per-file metadata mutation path used by
-/// `apply_metadata`, without an artwork sidecar. The commissioned Reference
-/// qualification uses this seam so its evidence covers the exact production
-/// command builders, existing-tag discovery, atomic replacement, and M4A
-/// freeform follow-up rather than a surrogate remux.
+/// Execute the authoritative per-file metadata mutation path used by
+/// `apply_metadata`, without an artwork sidecar, for the commissioned Reference
+/// qualification. W64 is fail-closed here and in ordinary conversion because
+/// the characterized FFmpeg remux both violates sample identity for valid
+/// 24-bit alignments and fails to persist the requested text metadata. All
+/// admitted carriers then exercise the exact production command builders,
+/// existing-tag discovery, atomic replacement, and M4A freeform follow-up
+/// rather than a surrogate remux.
 #[doc(hidden)]
 pub async fn qualify_production_metadata_mutation(
     path: &Path,
@@ -5697,6 +6260,17 @@ pub async fn qualify_production_metadata_mutation(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<ProductionMetadataMutationOutcome, MetadataError> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("w64"))
+    {
+        return Err(MetadataError::PolicyRejected(
+            tonepoet_pipeline::reference_error_text(
+                tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified,
+            ),
+        ));
+    }
     apply_production_metadata_to_file(path, meta, album, None, runner, cancel, None).await
 }
 
@@ -5746,10 +6320,10 @@ mod metadata_writer_command_tests {
         (
             TrackMetadata {
                 title: Some("Cue Track".to_string()),
-                artist: Some("Cue Performer".to_string()),
-                performer: Some("Cue Performer".to_string()),
-                composer: Some("Cue Composer".to_string()),
-                genre: Some("Fusion".to_string()),
+                artist: Some("Cue Performer".to_string()).into(),
+                performer: Some("Cue Performer".to_string()).into(),
+                composer: Some("Cue Composer".to_string()).into(),
+                genre: Some("Fusion".to_string()).into(),
                 date: Some("2026".to_string()),
                 track_number: Some(3),
                 isrc: Some("USRC17607839".to_string()),
@@ -5760,7 +6334,7 @@ mod metadata_writer_command_tests {
             },
             AlbumMetadata {
                 album: Some("Cue Album".to_string()),
-                album_artist: Some("Cue Album Artist".to_string()),
+                album_artist: Some("Cue Album Artist".to_string()).into(),
                 total_tracks: 12,
                 total_discs: Some(2),
                 disc_number: Some(2),
@@ -5820,8 +6394,8 @@ mod metadata_writer_command_tests {
     fn fallback_recovered_untagged_track_uses_ordinal_filename_without_fabricating_tag() {
         let mut track = TrackMetadata {
             title: Some("Give a Little Bit".to_string()),
-            artist: Some("Supertramp".to_string()),
-            genre: Some("Rock".to_string()),
+            artist: Some("Supertramp".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("2001".to_string()),
             disc_number: Some(2),
             comment: Some("US A&M SP-4634".to_string()),
@@ -5845,7 +6419,7 @@ mod metadata_writer_command_tests {
         }
         let mut album = AlbumMetadata {
             album: Some("Batch-Resolved Album".to_string()),
-            album_artist: Some("Batch-Resolved Artist".to_string()),
+            album_artist: Some("Batch-Resolved Artist".to_string()).into(),
             date: Some("2001".to_string()),
             total_tracks: 99,
             total_discs: Some(2),
@@ -5955,7 +6529,7 @@ mod metadata_writer_command_tests {
     #[test]
     fn fallback_authority_rejects_unproven_organizational_metadata() {
         let mut track = TrackMetadata {
-            artist: Some("Solo Artist".to_string()),
+            artist: Some("Solo Artist".to_string()).into(),
             date: Some("1999".to_string()),
             disc_number: Some(3),
             extra: BTreeMap::from([(
@@ -5967,7 +6541,7 @@ mod metadata_writer_command_tests {
         insert_fallback_source_tag(&mut track.extra, "ARTIST", "Solo Artist");
         let album = AlbumMetadata {
             album: Some("Resolved Batch Album".to_string()),
-            album_artist: Some("Resolved Batch Artist".to_string()),
+            album_artist: Some("Resolved Batch Artist".to_string()).into(),
             date: Some("1999".to_string()),
             total_tracks: 1,
             total_discs: Some(3),
@@ -6105,6 +6679,187 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
+    fn multivalue_flatten_repeats_only_named_set_fields_and_preserves_order_duplicates() {
+        let (mut track, mut album) = sample_metadata();
+        track.artist = vec!["A".to_string(), "B".to_string(), "A".to_string()].into();
+        track.composer = vec!["C1".to_string(), "C2".to_string()].into();
+        track.performer = vec!["P1".to_string(), "P2".to_string()].into();
+        track.genre = vec!["G1".to_string(), "G2".to_string()].into();
+        track.album_artist = vec!["AA1".to_string(), "AA2".to_string()].into();
+        album.total_tracks = 12;
+        album.total_discs = Some(2);
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        let values = |key: &str| {
+            tags.iter()
+                .filter(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(values("ARTIST"), vec!["A", "B", "A"]);
+        assert_eq!(values("ALBUMARTIST"), vec!["AA1", "AA2"]);
+        assert_eq!(values("COMPOSER"), vec!["C1", "C2"]);
+        assert_eq!(values("PERFORMER"), vec!["P1", "P2"]);
+        assert_eq!(values("GENRE"), vec!["G1", "G2"]);
+        assert_eq!(values("TRACKNUMBER").len(), 1, "TRACKNUMBER stays scalar");
+        assert_eq!(values("DISCNUMBER").len(), 1, "DISCNUMBER stays scalar");
+        assert_eq!(values("TRACKTOTAL").len(), 1, "TRACKTOTAL stays scalar");
+        assert_eq!(values("DISCTOTAL").len(), 1, "DISCTOTAL stays scalar");
+    }
+
+    #[test]
+    fn external_writer_projections_preserve_native_repeats_or_collapse_once() {
+        let path = Path::new("track.opus");
+        let tags = vec![
+            ("ARTIST".to_string(), "A".to_string()),
+            ("ARTIST".to_string(), "B".to_string()),
+            ("ARTIST".to_string(), "A".to_string()),
+            ("TRACKNUMBER".to_string(), "3".to_string()),
+        ];
+
+        let flac = metaflac_tag_args(Path::new("track.flac"), &tags, &BTreeSet::new());
+        assert_eq!(
+            flac.iter().filter(|arg| arg.starts_with("--set-tag=ARTIST=")).count(),
+            3
+        );
+
+        let opus = opustags_tag_args(path, &tags, &BTreeSet::new());
+        assert_pair(&opus, "-s", "ARTIST=A");
+        assert_eq!(pair_count(&opus, "-a", "ARTIST=B"), 1);
+        assert_eq!(pair_count(&opus, "-a", "ARTIST=A"), 1);
+        assert_eq!(pair_count(&opus, "-s", "TRACKNUMBER=3"), 1);
+
+        let wavpack = wvtag_tag_args(Path::new("track.wv"), &tags, &BTreeSet::new());
+        assert_eq!(pair_count(&wavpack, "-w", "ARTIST=A; B; A"), 1);
+        assert_eq!(pair_count(&wavpack, "-w", "TRACKNUMBER=3"), 1);
+
+        let ffmpeg = ffmpeg_authoritative_metadata_tags(&tags);
+        assert_eq!(
+            ffmpeg
+                .iter()
+                .filter(|(key, _)| key == "artist")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A; B; A"]
+        );
+        assert_eq!(
+            ffmpeg.iter().filter(|(key, _)| key == "track").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn in_process_overlay_receives_only_actual_multivalue_pipeline_fields() {
+        let tags = vec![
+            ("ARTIST".to_string(), "A".to_string()),
+            ("ARTIST".to_string(), "B".to_string()),
+            ("GENRE".to_string(), "Rock".to_string()),
+            ("TRACKNUMBER".to_string(), "1".to_string()),
+        ];
+        let changes = pipeline_multivalue_write_changes(&tags);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, lofty::tag::ItemKey::TrackArtist);
+        assert_eq!(changes[0].1, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn scalar_carrier_warning_is_emitted_only_for_persisting_scalar_carriers() {
+        let tags = vec![
+            ("ARTIST".to_string(), "A".to_string()),
+            ("ARTIST".to_string(), "B".to_string()),
+            ("TITLE".to_string(), "Song".to_string()),
+        ];
+        assert_eq!(
+            external_scalar_collapse_warnings(Path::new("track.wav"), "wav", &tags).len(),
+            1
+        );
+        assert_eq!(
+            external_scalar_collapse_warnings(Path::new("track.rf64"), "rf64", &tags).len(),
+            1
+        );
+        assert_eq!(
+            external_scalar_collapse_warnings(Path::new("track.aiff"), "aiff", &tags).len(),
+            1
+        );
+        assert!(external_scalar_collapse_warnings(Path::new("track.w64"), "w64", &tags).is_empty());
+        for ext in [
+            "s8", "u8", "s16le", "s16be", "s24le", "s24be", "s32le", "s32be",
+            "f32le", "f32be", "f64le", "f64be",
+        ] {
+            assert!(
+                external_scalar_collapse_warnings(Path::new(&format!("track.{ext}")), ext, &tags)
+                    .is_empty(),
+                "headerless {ext} cannot persist a scalar metadata carrier",
+            );
+        }
+        assert!(external_scalar_collapse_warnings(Path::new("track.flac"), "flac", &tags).is_empty());
+        assert!(external_scalar_collapse_warnings(Path::new("track.aac"), "aac", &tags).is_empty());
+    }
+
+    #[test]
+    fn fixed_vocab_collapse_warning_covers_only_non_repeatable_mp3_mp4_fields() {
+        let tags = vec![
+            ("ARTIST".to_string(), "A1".to_string()),
+            ("ARTIST".to_string(), "A2".to_string()),
+            ("ALBUMARTIST".to_string(), "AA1".to_string()),
+            ("ALBUMARTIST".to_string(), "AA2".to_string()),
+            ("COMPOSER".to_string(), "C1".to_string()),
+            ("COMPOSER".to_string(), "C2".to_string()),
+            ("PERFORMER".to_string(), "P1".to_string()),
+            ("PERFORMER".to_string(), "P2".to_string()),
+            ("GENRE".to_string(), "G1".to_string()),
+            ("GENRE".to_string(), "G2".to_string()),
+        ];
+        for ext in ["mp3", "m4a", "mp4"] {
+            let warnings = fixed_vocab_scalar_collapse_warnings(
+                Path::new(&format!("track.{ext}")),
+                ext,
+                &tags,
+            );
+            assert_eq!(warnings.len(), 3, "{ext}");
+            assert!(warnings.iter().any(|warning| warning.contains("ALBUMARTIST")));
+            assert!(warnings.iter().any(|warning| warning.contains("PERFORMER")));
+            assert!(warnings.iter().any(|warning| warning.contains("GENRE")));
+            assert!(!warnings.iter().any(|warning| warning.contains("ARTIST has")));
+            assert!(!warnings.iter().any(|warning| warning.contains("COMPOSER")));
+        }
+        assert!(fixed_vocab_scalar_collapse_warnings(Path::new("track.wv"), "wv", &tags).is_empty());
+    }
+
+    #[test]
+    fn overlay_projection_skips_non_repeatable_mp3_mp4_fields() {
+        use lofty::tag::ItemKey;
+
+        let tags = vec![
+            ("ARTIST".to_string(), "A1".to_string()),
+            ("ARTIST".to_string(), "A2".to_string()),
+            ("ALBUMARTIST".to_string(), "AA1".to_string()),
+            ("ALBUMARTIST".to_string(), "AA2".to_string()),
+            ("COMPOSER".to_string(), "C1".to_string()),
+            ("COMPOSER".to_string(), "C2".to_string()),
+            ("PERFORMER".to_string(), "P1".to_string()),
+            ("PERFORMER".to_string(), "P2".to_string()),
+            ("GENRE".to_string(), "G1".to_string()),
+            ("GENRE".to_string(), "G2".to_string()),
+        ];
+        for ext in ["mp3", "m4a", "mp4"] {
+            let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, ext);
+            assert_eq!(changes.len(), 2, "{ext}");
+            assert!(changes.iter().any(|(key, _)| *key == ItemKey::TrackArtist));
+            assert!(changes.iter().any(|(key, _)| *key == ItemKey::Composer));
+            assert!(!changes.iter().any(|(key, _)| {
+                matches!(key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+            }));
+        }
+        assert_eq!(
+            pipeline_multivalue_overlay_changes_for_extension(&tags, "wv").len(),
+            5,
+            "WavPack still overlays every repeat-capable pipeline field",
+        );
+    }
+
+    #[test]
     fn raw_aac_metadata_writes_fail_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("unsupported.aac");
@@ -6119,28 +6874,66 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
-    fn w64_metadata_mutation_fails_closed_before_tempfile_or_tool_selection() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("reference.w64");
+    fn w64_metadata_mutation_is_rejected_before_command_construction() {
+        let path = Path::new("ordinary.w64");
         let error = metadata_tag_command(
-            &path,
+            path,
             "w64",
-            &[("TITLE".to_string(), "Reference qualification".to_string())],
+            &[("TITLE".to_string(), "must not remux".to_string())],
             &BTreeSet::new(),
         )
-        .expect_err("W64 metadata mutation has no qualified route");
-        assert!(matches!(
-            error,
-            MetadataError::PolicyRejected(reason)
-                if reason == tonepoet_pipeline::reference_error_text(
-                    tonepoet_pipeline::ReferenceErrorCode::W64MetadataMutationUnqualified
-                )
-        ));
-        assert_eq!(
-            fs::read_dir(temp.path()).expect("read tempdir").count(),
-            0,
-            "policy rejection must not create a rewrite tempfile"
-        );
+        .expect_err("W64 metadata mutation must fail closed");
+        assert!(matches!(error, MetadataError::PolicyRejected(_)));
+    }
+
+    #[test]
+    fn concrete_raw_pcm_has_no_metadata_command() {
+        for ext in [
+            "s8", "u8", "s16le", "s16be", "s24le", "s24be", "s32le", "s32be",
+            "f32le", "f32be", "f64le", "f64be",
+        ] {
+            assert!(ffmpeg_raw_pcm_muxer_for_extension(ext).is_some(), "{ext}");
+            let error = metadata_tag_command(
+                Path::new(&format!("track.{ext}")),
+                ext,
+                &[("TITLE".to_string(), "cannot persist".to_string())],
+                &BTreeSet::new(),
+            )
+            .expect_err("headerless PCM must not trigger a full-file metadata copy");
+            assert!(matches!(error, MetadataError::UnsupportedTagFormat(ref rejected) if rejected == ext));
+        }
+    }
+
+    #[test]
+    fn mp4_and_rf64_supported_output_spellings_route_to_ffmpeg() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tags = vec![("TITLE".to_string(), "metadata".to_string())];
+
+        let mp4 = temp.path().join("track.mp4");
+        fs::write(&mp4, b"mp4 placeholder").expect("seed mp4 rewrite source");
+        let (mp4_command, mp4_temporary) = metadata_tag_command(
+            &mp4,
+            "mp4",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("planner-supported .mp4 must reach the metadata writer");
+        assert_eq!(mp4_command.binary, ToolBinary::Ffmpeg);
+        assert!(mp4_temporary.is_some());
+
+        let rf64 = temp.path().join("track.rf64");
+        fs::write(&rf64, b"RF64\0\0\0\0WAVE").expect("seed RF64 rewrite source");
+        let (rf64_command, rf64_temporary) = metadata_tag_command(
+            &rf64,
+            "rf64",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("planner-supported .rf64 must reach the metadata writer");
+        assert_eq!(rf64_command.binary, ToolBinary::Ffmpeg);
+        assert_pair(&rf64_command.args, "-rf64", "always");
+        assert_pair(&rf64_command.args, "-f", "wav");
+        assert!(rf64_temporary.is_some());
     }
 
     #[test]
@@ -6236,7 +7029,7 @@ mod metadata_writer_command_tests {
     #[test]
     fn preserved_source_album_artist_is_written_without_emitting_internal_keys() {
         let (mut track, mut album) = sample_metadata();
-        track.album_artist = None;
+        track.album_artist = None.into();
         track.extra.insert(
             LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY.to_string(),
             "Track Internal Sentinel".to_string(),
@@ -6245,7 +7038,7 @@ mod metadata_writer_command_tests {
             PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
             "Track Preserved Sentinel".to_string(),
         );
-        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        album.album_artist = Some("Resolved Organizational Artist".to_string()).into();
         album.extra.insert(
             PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
             "Original Album Artist".to_string(),
@@ -6267,8 +7060,8 @@ mod metadata_writer_command_tests {
     #[test]
     fn legacy_album_artist_internal_key_does_not_override_real_metadata() {
         let (mut track, mut album) = sample_metadata();
-        track.album_artist = None;
-        album.album_artist = Some("Real Source Album Artist".to_string());
+        track.album_artist = None.into();
+        album.album_artist = Some("Real Source Album Artist".to_string()).into();
         album.extra.insert(
             LEGACY_ALBUM_ARTIST_TAG_OVERRIDE_EXTRA_KEY.to_string(),
             "Legacy Internal Sentinel".to_string(),
@@ -6290,10 +7083,10 @@ mod metadata_writer_command_tests {
     #[test]
     fn batch_resolved_identity_does_not_rewrite_written_album_or_album_artist() {
         let (mut track, mut album) = sample_metadata();
-        track.album_artist = None;
+        track.album_artist = None.into();
         track.extra.remove("album");
         album.album = Some("Resolved Organizational Album".to_string());
-        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        album.album_artist = Some("Resolved Organizational Artist".to_string()).into();
         album.extra.insert(
             PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY.to_string(),
             "Source Album (Disc 1)".to_string(),
@@ -6332,8 +7125,8 @@ mod metadata_writer_command_tests {
     #[test]
     fn explicit_album_artist_override_rewrites_native_and_ffmpeg_metadata() {
         let (mut track, mut album) = sample_metadata();
-        track.album_artist = Some("Explicit Conversion Override".to_string());
-        album.album_artist = Some("Resolved Organizational Artist".to_string());
+        track.album_artist = Some("Explicit Conversion Override".to_string()).into();
+        album.album_artist = Some("Resolved Organizational Artist".to_string()).into();
         album.extra.insert(
             PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
             "Source Album Artist".to_string(),
@@ -6394,7 +7187,7 @@ mod metadata_writer_command_tests {
             Path::new("track.m4a"),
             Path::new(".track.m4a.tmp.m4a"),
             &tags,
-            false,
+            FfmpegMetadataCarrier::Auto,
         );
 
         assert_pair(&args, "-map", "0");
@@ -6415,6 +7208,102 @@ mod metadata_writer_command_tests {
         assert_eq!(command.env[0].key, "LC_ALL");
         assert_eq!(command.env[0].value.expose(), locale);
         assert!(!command.env[0].secret);
+    }
+
+    #[test]
+    fn source_provenance_with_ape_nul_values_is_scalarized_only_at_output_boundary() {
+        let mut track = TrackMetadata {
+            artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+        insert_source_text_tag(&mut track.extra, "MY_NOTE", "one\0two\0one");
+        assert_eq!(
+            track.extra.get("my_note").map(String::as_str),
+            Some("one\0two\0one"),
+            "ingestion keeps immutable source provenance intact",
+        );
+
+        let tags = authoritative_metadata_tags(&track, &AlbumMetadata::default());
+        let values = |key: &str| {
+            tags.iter()
+                .filter(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("ARTIST"), vec!["A", "B", "A"]);
+        assert_eq!(values("MY_NOTE"), vec!["one; two; one"]);
+        assert!(tags.iter().all(|(_, value)| !value.contains('\0')));
+
+        let (command, _) = metadata_tag_command(
+            Path::new("track.flac"),
+            "flac",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("sanitized source provenance must produce a legal native command");
+        assert!(command.args.iter().all(|arg| !arg.contains('\0')));
+        assert_eq!(
+            command
+                .args
+                .iter()
+                .filter(|arg| arg.starts_with("--set-tag=ARTIST="))
+                .count(),
+            3,
+            "typed list values remain independent native entries",
+        );
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "--set-tag=MY_NOTE=one; two; one"));
+        assert!(source_provenance_requires_scalar_projection(
+            &track,
+            &AlbumMetadata::default(),
+            &tags,
+        ));
+
+        let mut writer_owned = TrackMetadata {
+            title: Some("Canonical title".to_string()),
+            ..TrackMetadata::default()
+        };
+        insert_source_text_tag(&mut writer_owned.extra, "TITLE", "one\0two");
+        let writer_owned_tags =
+            authoritative_metadata_tags(&writer_owned, &AlbumMetadata::default());
+        assert!(
+            !source_provenance_requires_scalar_projection(
+                &writer_owned,
+                &AlbumMetadata::default(),
+                &writer_owned_tags,
+            ),
+            "writer-owned source provenance must not create a second obligation",
+        );
+
+        let mut invalid_key = TrackMetadata::default();
+        insert_source_text_tag(&mut invalid_key.extra, "BAD=KEY", "one\0two");
+        let invalid_key_tags = authoritative_metadata_tags(&invalid_key, &AlbumMetadata::default());
+        assert!(
+            !source_provenance_requires_scalar_projection(
+                &invalid_key,
+                &AlbumMetadata::default(),
+                &invalid_key_tags,
+            ),
+            "provenance that cannot become a legal output key must not force a pass",
+        );
+
+        let mut fallback_track = TrackMetadata::default();
+        insert_fallback_source_tag(&mut fallback_track.extra, "MY_NOTE", "one\0two\0one");
+        let fallback_album = AlbumMetadata {
+            extra: BTreeMap::from([(
+                FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+                "native-apev2".to_string(),
+            )]),
+            ..AlbumMetadata::default()
+        };
+        let fallback_tags = authoritative_metadata_tags(&fallback_track, &fallback_album);
+        assert!(fallback_tags.contains(&(
+            "MY_NOTE".to_string(),
+            "one; two; one".to_string(),
+        )));
+        assert!(fallback_tags.iter().all(|(_, value)| !value.contains('\0')));
     }
 
     #[test]
@@ -6506,7 +7395,7 @@ mod metadata_writer_command_tests {
     #[test]
     fn authoritative_tags_canonicalize_managed_source_aliases_without_reemission() {
         let mut track = TrackMetadata {
-            album_artist: Some("Album Artist".to_string()),
+            album_artist: Some("Album Artist".to_string()).into(),
             date: Some("1977".to_string()),
             comment: Some("Comment".to_string()),
             track_number: Some(3),
@@ -6820,6 +7709,33 @@ mod metadata_writer_command_tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn run_bytes(tool: &str, args: &[String]) -> Vec<u8> {
+        let output = ProcessCommand::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {tool}: {err}"));
+        assert!(
+            output.status.success(),
+            "{tool} failed with status {:?}\nstdout bytes={}\nstderr:\n{}\nargs: {:?}",
+            output.status.code(),
+            output.stdout.len(),
+            String::from_utf8_lossy(&output.stderr),
+            args
+        );
+        output.stdout
+    }
+
+    fn deterministic_int24_mono_bytes(sample_count: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(sample_count * 3);
+        for index in 0..sample_count {
+            let unsigned = ((index as u32).wrapping_mul(7_919).wrapping_add(1_337)) & 0x00ff_ffff;
+            let value = unsigned as i32 - 0x0080_0000;
+            let encoded = value.to_le_bytes();
+            bytes.extend_from_slice(&encoded[..3]);
+        }
+        bytes
+    }
+
     fn tag_line_key_counts(text: &str) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
         for line in text.lines() {
@@ -6894,6 +7810,484 @@ mod metadata_writer_command_tests {
         args.extend(codec_args.iter().map(|arg| (*arg).to_string()));
         args.push(path.display().to_string());
         run_checked("ffmpeg", &args);
+    }
+
+    fn native_round_trip_multivalue_metadata() -> (TrackMetadata, AlbumMetadata) {
+        (
+            TrackMetadata {
+                title: Some("Multi-value track".to_string()),
+                artist: vec!["Artist A".to_string(), "Artist B".to_string(), "Artist A".to_string()].into(),
+                album_artist: vec!["Album Artist A".to_string(), "Album Artist B".to_string()].into(),
+                composer: vec!["Composer A".to_string(), "Composer B".to_string(), "Composer A".to_string()].into(),
+                performer: vec!["Performer A".to_string(), "Performer B".to_string()].into(),
+                genre: vec!["Genre A".to_string(), "Genre B".to_string(), "Genre A".to_string()].into(),
+                track_number: Some(1),
+                disc_number: Some(1),
+                ..TrackMetadata::default()
+            },
+            AlbumMetadata {
+                album: Some("Multi-value album".to_string()),
+                total_tracks: 1,
+                total_discs: Some(1),
+                ..AlbumMetadata::default()
+            },
+        )
+    }
+
+    fn assert_native_round_trip_multivalue_metadata(metadata: &TrackMetadata) {
+        assert_eq!(
+            metadata.artist.values(),
+            &["Artist A".to_string(), "Artist B".to_string(), "Artist A".to_string()]
+        );
+        assert_eq!(
+            metadata.album_artist.values(),
+            &["Album Artist A".to_string(), "Album Artist B".to_string()]
+        );
+        assert_eq!(
+            metadata.composer.values(),
+            &["Composer A".to_string(), "Composer B".to_string(), "Composer A".to_string()]
+        );
+        assert_eq!(
+            metadata.performer.values(),
+            &["Performer A".to_string(), "Performer B".to_string()]
+        );
+        assert_eq!(
+            metadata.genre.values(),
+            &["Genre A".to_string(), "Genre B".to_string(), "Genre A".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn production_w64_metadata_rejects_int24_alignment_witness_before_mutation_when_tools_are_available() {
+        if !executable_on_path("ffmpeg") || !executable_on_path("sox") {
+            eprintln!("skipping W64 fail-closed witness; ffmpeg and sox are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-w64-metadata-fail-closed");
+        let raw_path = dir.join("witness.raw");
+        let w64_path = dir.join("witness.w64");
+        let expected = deterministic_int24_mono_bytes(8_820);
+        assert_eq!(expected.len(), 26_460);
+        fs::write(&raw_path, &expected).expect("write 24-bit W64 alignment witness");
+        run_checked(
+            "sox",
+            &[
+                "-S".to_string(),
+                "-D".to_string(),
+                "-t".to_string(),
+                "raw".to_string(),
+                "-e".to_string(),
+                "signed-integer".to_string(),
+                "-b".to_string(),
+                "24".to_string(),
+                "-L".to_string(),
+                "-r".to_string(),
+                "88200".to_string(),
+                "-c".to_string(),
+                "1".to_string(),
+                raw_path.display().to_string(),
+                "-t".to_string(),
+                "w64".to_string(),
+                "-e".to_string(),
+                "signed-integer".to_string(),
+                "-b".to_string(),
+                "24".to_string(),
+                w64_path.display().to_string(),
+            ],
+        );
+
+        let file_before = fs::read(&w64_path).expect("read W64 before rejected metadata stage");
+        let decode_args = vec![
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            w64_path.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-f".to_string(),
+            "s24le".to_string(),
+            "-c:a".to_string(),
+            "pcm_s24le".to_string(),
+            "pipe:1".to_string(),
+        ];
+        assert_eq!(run_bytes("ffmpeg", &decode_args), expected);
+
+        let track = TrackMetadata {
+            title: Some("must not mutate W64".to_string()),
+            artist: MetadataValueList::from_scalar("Artist"),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        let runner = RealToolRunner::new(HashMap::new());
+        let error = apply_production_metadata_to_file(
+            &w64_path,
+            &track,
+            &AlbumMetadata::default(),
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("ordinary W64 metadata mutation must fail before FFmpeg remux");
+        assert!(matches!(error, MetadataError::PolicyRejected(_)));
+        assert_eq!(
+            fs::read(&w64_path).expect("read W64 after rejected metadata stage"),
+            file_before,
+            "fail-closed W64 metadata rejection must leave the file byte-identical",
+        );
+        assert_eq!(
+            run_bytes("ffmpeg", &decode_args),
+            expected,
+            "fail-closed W64 metadata rejection must leave decoded PCM sample-identical",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn production_raw_pcm_metadata_stage_skips_noop_copy_and_preserves_bytes_when_ffmpeg_is_available() {
+        if !executable_on_path("ffmpeg") {
+            eprintln!("skipping raw PCM metadata omission test; ffmpeg is required to create the fixture");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-raw-pcm-metadata-omission");
+        let path = dir.join("track.s16le");
+        create_sine_audio(&path, &["-c:a", "pcm_s16le", "-f", "s16le"]);
+        let before = fs::read(&path).expect("read raw PCM before metadata stage");
+        let track = TrackMetadata {
+            title: Some("cannot persist in raw PCM".to_string()),
+            artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
+            track_number: Some(5),
+            ..TrackMetadata::default()
+        };
+        let runner = RealToolRunner::new(HashMap::new());
+        let outcome = apply_production_metadata_to_file(
+            &path,
+            &track,
+            &AlbumMetadata::default(),
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("headerless PCM metadata limitation should be a surfaced no-op, not a full-file copy");
+        assert_eq!(outcome.primary_mutator, None);
+        assert!(!outcome.m4a_freeform_mutator_applied);
+        assert_eq!(
+            fs::read(&path).expect("read raw PCM after metadata stage"),
+            before,
+            "metadata omission must leave headerless PCM byte-identical",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn production_dsf_metadata_uses_audited_writer_and_preserves_supported_value_lists() {
+        let dir = temp_test_dir("tonepoet-production-dsf-metadata");
+        let path = dir.join("track.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write untagged DSF fixture");
+
+        let mut track_extra = BTreeMap::new();
+        insert_source_text_tag(&mut track_extra, "MY_NOTE", "custom value");
+        let track = TrackMetadata {
+            title: Some("DSF production title".to_string()),
+            artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
+            album_artist: vec!["AA1".to_string(), "AA2".to_string(), "AA1".to_string()].into(),
+            composer: vec!["C1".to_string(), "C2".to_string(), "C1".to_string()].into(),
+            performer: vec!["P1".to_string(), "P2".to_string(), "P1".to_string()].into(),
+            genre: vec!["G1".to_string(), "G2".to_string(), "G1".to_string()].into(),
+            date: Some("2026".to_string()),
+            track_number: Some(3),
+            disc_number: Some(1),
+            publisher: Some("Example Label".to_string()),
+            comment: Some("DSF production comment".to_string()),
+            extra: track_extra,
+            ..TrackMetadata::default()
+        };
+        let mut album_extra = BTreeMap::new();
+        album_extra.insert("catalog".to_string(), "DSF-CAT-001".to_string());
+        let album = AlbumMetadata {
+            album: Some("DSF production album".to_string()),
+            total_tracks: 9,
+            total_discs: Some(2),
+            extra: album_extra,
+            ..AlbumMetadata::default()
+        };
+        let runner = crate::convert::pipeline::tool::StubToolRunner::new();
+        let outcome = apply_production_metadata_to_file(
+            &path,
+            &track,
+            &album,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("production DSF metadata mutation");
+        assert_eq!(outcome.primary_mutator, None, "DSF mutation is in-process");
+        assert!(!outcome.m4a_freeform_mutator_applied);
+        assert!(
+            runner.transcript().is_empty(),
+            "DSF production metadata must not invoke an external tag command"
+        );
+
+        let snapshot = crate::dsf_tags::read(&path).expect("read production-tagged DSF");
+        assert_eq!(snapshot.first("TITLE"), Some("DSF production title"));
+        assert_eq!(snapshot.first("ALBUM"), Some("DSF production album"));
+        assert_eq!(snapshot.first("TRACKNUMBER"), Some("3"));
+        assert_eq!(snapshot.first("TRACKTOTAL"), Some("9"));
+        assert_eq!(snapshot.first("DISCNUMBER"), Some("1"));
+        assert_eq!(snapshot.first("DISCTOTAL"), Some("2"));
+        assert_eq!(snapshot.first("LABEL"), Some("Example Label"));
+        assert_eq!(snapshot.first("CATALOGNUMBER"), Some("DSF-CAT-001"));
+        assert_eq!(snapshot.first("COMMENT"), Some("DSF production comment"));
+        assert_eq!(snapshot.first("MY_NOTE"), Some("custom value"));
+        assert_eq!(
+            snapshot.fields.get("ARTIST"),
+            Some(&vec!["A".to_string(), "B".to_string(), "A".to_string()])
+        );
+        assert_eq!(
+            snapshot.fields.get("COMPOSER"),
+            Some(&vec!["C1".to_string(), "C2".to_string(), "C1".to_string()])
+        );
+        assert_eq!(
+            snapshot.fields.get("ALBUMARTIST"),
+            Some(&vec!["AA1; AA2; AA1".to_string()]),
+            "DSF ALBUMARTIST write capability remains scalar"
+        );
+        assert_eq!(
+            snapshot.fields.get("PERFORMER"),
+            Some(&vec!["P1; P2; P1".to_string()]),
+            "DSF PERFORMER write capability remains scalar"
+        );
+        assert_eq!(
+            snapshot.fields.get("GENRE"),
+            Some(&vec!["G1; G2; G1".to_string()]),
+            "DSF GENRE write capability remains scalar"
+        );
+        let (artist_frames, artist_values) =
+            crate::dsf_tags::test_text_frame_values(&path, "TPE1").expect("read ARTIST frame");
+        assert_eq!(artist_frames, 1);
+        assert_eq!(artist_values, vec!["A", "B", "A"]);
+        let (composer_frames, composer_values) =
+            crate::dsf_tags::test_text_frame_values(&path, "TCOM").expect("read COMPOSER frame");
+        assert_eq!(composer_frames, 1);
+        assert_eq!(composer_values, vec!["C1", "C2", "C1"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn production_dsf_explicit_albumartist_clear_removes_existing_value() {
+        let dir = temp_test_dir("tonepoet-production-dsf-clear");
+        let path = dir.join("track.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write untagged DSF fixture");
+        crate::dsf_tags::write_values_with_control(
+            &path,
+            &[crate::dsf_tags::DsfTagValueChange {
+                canonical_key: "ALBUMARTIST".to_string(),
+                values: Some(vec!["Stale Album Artist".to_string()]),
+            }],
+            &|| false,
+            &|_| {},
+        )
+        .expect("seed DSF ALBUMARTIST");
+        assert_eq!(
+            crate::dsf_tags::read(&path)
+                .expect("read seeded DSF")
+                .first("ALBUMARTIST"),
+            Some("Stale Album Artist")
+        );
+
+        let mut track = TrackMetadata::default();
+        track.extra.insert(
+            EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY.to_string(),
+            "1".to_string(),
+        );
+        let runner = crate::convert::pipeline::tool::StubToolRunner::new();
+        apply_production_metadata_to_file(
+            &path,
+            &track,
+            &AlbumMetadata::default(),
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("explicit DSF ALBUMARTIST clear");
+        assert!(
+            crate::dsf_tags::read(&path)
+                .expect("read cleared DSF")
+                .first("ALBUMARTIST")
+                .is_none(),
+            "explicit ALBUMARTIST clear must converge on DSF"
+        );
+        assert!(runner.transcript().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn planner_supported_mp4_and_rf64_survive_production_metadata_stage_when_ffmpeg_is_available() {
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            eprintln!("skipping .mp4/.rf64 metadata integration test; ffmpeg/ffprobe are required");
+            return;
+        }
+        if !ffmpeg_encoder_available("aac") {
+            eprintln!("skipping .mp4 metadata integration case; ffmpeg AAC encoder is unavailable");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-planner-metadata-spellings");
+        let track = TrackMetadata {
+            title: Some("Planner metadata title".to_string()),
+            artist: MetadataValueList::from_scalar("Planner metadata artist"),
+            track_number: Some(4),
+            ..TrackMetadata::default()
+        };
+        let album = AlbumMetadata::default();
+        let runner = RealToolRunner::new(HashMap::new());
+        let cancel = CancellationToken::new();
+
+        validate_final_container_extension(&PlannerAudioFormat::Aac, Some("mp4"))
+            .expect("planner accepts AAC .mp4");
+        let mut mp4_path = dir.join("aac-track");
+        append_default_extension(&mut mp4_path, &PlannerAudioFormat::Aac, Some("mp4"));
+        assert_eq!(mp4_path.extension().and_then(|value| value.to_str()), Some("mp4"));
+        create_sine_audio(&mp4_path, &["-c:a", "aac", "-f", "mp4"]);
+        let mp4_outcome = apply_production_metadata_to_file(
+            &mp4_path,
+            &track,
+            &album,
+            None,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("planner-accepted .mp4 must survive metadata application");
+        assert_eq!(mp4_outcome.primary_mutator, Some(ToolBinary::Ffmpeg));
+        assert!(!mp4_outcome.m4a_freeform_mutator_applied);
+        let mp4_tags = run_stdout(
+            "ffprobe",
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-show_entries".to_string(),
+                "format_tags=title,artist,track".to_string(),
+                "-of".to_string(),
+                "default=nw=1".to_string(),
+                mp4_path.display().to_string(),
+            ],
+        );
+        assert!(mp4_tags.contains("TAG:title=Planner metadata title"), "{mp4_tags:?}");
+        assert!(mp4_tags.contains("TAG:artist=Planner metadata artist"), "{mp4_tags:?}");
+        assert!(mp4_tags.contains("TAG:track=4"), "{mp4_tags:?}");
+
+        let mut rf64_path = dir.join("pcm-track");
+        append_default_extension(&mut rf64_path, &PlannerAudioFormat::Wav, Some("rf64"));
+        assert_eq!(rf64_path.extension().and_then(|value| value.to_str()), Some("rf64"));
+        create_sine_audio(
+            &rf64_path,
+            &["-c:a", "pcm_s16le", "-rf64", "always", "-f", "wav"],
+        );
+        let rf64_outcome = apply_production_metadata_to_file(
+            &rf64_path,
+            &track,
+            &album,
+            None,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("planner-preserved .rf64 must survive metadata application");
+        assert_eq!(rf64_outcome.primary_mutator, Some(ToolBinary::Ffmpeg));
+        assert!(!rf64_outcome.m4a_freeform_mutator_applied);
+        assert_eq!(
+            &fs::read(&rf64_path).expect("read RF64 marker")[..4],
+            b"RF64",
+            "metadata rewrite must preserve RF64 container identity",
+        );
+        let rf64_tags = run_stdout(
+            "ffprobe",
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-show_entries".to_string(),
+                "format_tags=title,artist,track".to_string(),
+                "-of".to_string(),
+                "default=nw=1".to_string(),
+                rf64_path.display().to_string(),
+            ],
+        );
+        assert!(rf64_tags.contains("TAG:title=Planner metadata title"), "{rf64_tags:?}");
+        assert!(rf64_tags.contains("TAG:artist=Planner metadata artist"), "{rf64_tags:?}");
+        assert!(rf64_tags.contains("TAG:track=4"), "{rf64_tags:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_flac_pipeline_multivalue_round_trips_through_tonepoet_reader_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("metaflac")
+            || !ffmpeg_encoder_available("flac")
+        {
+            eprintln!("skipping real-file FLAC multi-value test; ffmpeg with flac encoder and metaflac are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-metaflac-multivalue");
+        let flac_path = dir.join("track.flac");
+        create_sine_audio(&flac_path, &["-c:a", "flac"]);
+        let (track, album) = native_round_trip_multivalue_metadata();
+        let tags = authoritative_metadata_tags(&track, &album);
+        let args = metaflac_tag_args(&flac_path, &tags, &BTreeSet::new());
+        run_checked("metaflac", &args);
+        run_checked("metaflac", &args);
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&flac_path)
+                .expect("read tagged FLAC through pipeline reader");
+        assert!(!recovered, "normal FLAC metadata should not use native APE recovery");
+        assert!(warnings.is_empty(), "unexpected FLAC metadata warnings: {warnings:?}");
+        assert_native_round_trip_multivalue_metadata(&metadata);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_opus_pipeline_multivalue_round_trips_through_tonepoet_reader_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("opustags")
+            || !ffmpeg_encoder_available("libopus")
+        {
+            eprintln!("skipping real-file Opus multi-value test; ffmpeg with libopus and opustags are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-opustags-multivalue");
+        let opus_path = dir.join("track.opus");
+        create_sine_audio(&opus_path, &["-c:a", "libopus", "-b:a", "64k"]);
+        let (track, album) = native_round_trip_multivalue_metadata();
+        let tags = authoritative_metadata_tags(&track, &album);
+        let args = opustags_tag_args(&opus_path, &tags, &BTreeSet::new());
+        run_checked("opustags", &args);
+        run_checked("opustags", &args);
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&opus_path)
+                .expect("read tagged Opus through pipeline reader");
+        assert!(!recovered, "normal Opus metadata should not use native APE recovery");
+        assert!(warnings.is_empty(), "unexpected Opus metadata warnings: {warnings:?}");
+        assert_native_round_trip_multivalue_metadata(&metadata);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8248,7 +9642,8 @@ FILE "album.flac" WAVE
                 case.name
             );
 
-            let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            let converted =
+                convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
             assert!(
                 matches!(converted.record.outcome, StageOutcome::Ok),
                 "{} conversion stage failed: {:?}",
@@ -8308,6 +9703,281 @@ FILE "album.flac" WAVE
             );
         }
         eprintln!("exercised real CUE matrix cases: {exercised:?}");
+    }
+
+    #[tokio::test]
+    async fn cue_conversion_w64_metadata_fails_closed_and_raw_pcm_metadata_is_omitted_without_rewrite_when_ffmpeg_is_available(
+    ) {
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            eprintln!(
+                "skipping W64/raw PCM conversion metadata integration; ffmpeg/ffprobe are required"
+            );
+            return;
+        }
+        if !ffmpeg_encoder_available("pcm_s16le") {
+            eprintln!(
+                "skipping W64/raw PCM conversion metadata integration; pcm_s16le encoder is required"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (image, _cue) = create_fixture_image_and_cue(temp.path());
+        for (name, extension) in [
+            ("cue_to_w64_multivalue", "w64"),
+            ("cue_to_s16le_multivalue", "s16le"),
+        ] {
+            let case = MatrixCase {
+                name,
+                format: tonepoet_pipeline::AudioFormat::Wav,
+                extension,
+                container_contains: &[],
+                codec: "pcm_s16le",
+                required_encoder: Some("pcm_s16le"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: false,
+            };
+            let case_root = temp.path().join(name);
+            std::fs::create_dir_all(case_root.join("out")).expect("case output root");
+            std::fs::create_dir_all(case_root.join("logs")).expect("case log root");
+            let mut req = request_for_case(&case_root, &image, &case);
+            req.container_extension = Some(extension.to_string());
+            if extension == "s16le" {
+                req.container_ffmpeg_flags = vec!["-f".to_string(), "s16le".to_string()];
+            }
+            req.settings.preferred_tool = PreferredTool::Ffmpeg;
+            req.settings.metadata.preserve_artwork = false;
+            let staging = StagingDir::new(case_root.join("staging"), req.job_id.clone());
+            let runner = RealToolRunner::new(HashMap::new());
+            let cancel = CancellationToken::new();
+
+            let mut source = CueImageMaterializer
+                .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+                .await
+                .unwrap_or_else(|error| panic!("{name} CUE materialization failed: {error}"));
+            let track = source
+                .tracks
+                .first_mut()
+                .expect("focused W64/raw conversion source should contain one track");
+            track.metadata.artist =
+                vec!["A".to_string(), "B".to_string(), "A".to_string()].into();
+            track.metadata.album_artist = vec![
+                "Album A".to_string(),
+                "Album B".to_string(),
+                "Album A".to_string(),
+            ]
+            .into();
+            track.metadata.composer = vec![
+                "Composer A".to_string(),
+                "Composer B".to_string(),
+                "Composer A".to_string(),
+            ]
+            .into();
+            track.metadata.performer = vec![
+                "Performer A".to_string(),
+                "Performer B".to_string(),
+                "Performer A".to_string(),
+            ]
+            .into();
+            track.metadata.genre = vec![
+                "Genre A".to_string(),
+                "Genre B".to_string(),
+                "Genre A".to_string(),
+            ]
+            .into();
+
+            let tags = authoritative_metadata_tags(&track.metadata, &source.album_metadata);
+            assert!(
+                external_scalar_collapse_warnings(
+                    Path::new(&format!("track.{extension}")),
+                    extension,
+                    &tags,
+                )
+                .is_empty(),
+                "{name} must not claim a scalar metadata carrier that cannot persist tags",
+            );
+
+            let plan = plan_outputs(&source, &req)
+                .unwrap_or_else(|error| panic!("{name} output planning failed: {error}"));
+            assert_eq!(
+                plan.entries[0]
+                    .final_path
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some(extension),
+                "{name} planned extension mismatch",
+            );
+            let converted =
+                convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            assert!(
+                matches!(converted.record.outcome, StageOutcome::Ok),
+                "{name} conversion stage failed: {:?}",
+                converted.tracks,
+            );
+            let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+                panic!("{name} should produce per-track artifacts");
+            };
+            assert_eq!(track_artifacts.len(), 1, "{name}");
+            let output_path = track_artifacts[0].staged_path.clone();
+            let bytes_before =
+                std::fs::read(&output_path).expect("read encoded output before metadata stage");
+
+            if extension == "w64" {
+                let error = apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                    .await
+                    .expect_err("ordinary W64 metadata mutation must fail closed");
+                assert!(
+                    matches!(error, MetadataError::PolicyRejected(_)),
+                    "W64 metadata mutation must reject by policy, got {error:?}",
+                );
+                assert_eq!(
+                    std::fs::read(&output_path).expect("read W64 after rejected metadata stage"),
+                    bytes_before,
+                    "W64 rejection must occur before any mutation",
+                );
+            } else {
+                assert!(
+                    raw_pcm_metadata_omission_warning(&output_path, extension)
+                        .contains("has no metadata carrier"),
+                    "raw PCM omission warning must explain why metadata is skipped",
+                );
+                let record =
+                    apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                        .await
+                        .unwrap_or_else(|error| panic!("{name} metadata stage failed: {error}"));
+                assert!(matches!(record.outcome, StageOutcome::Ok), "{name}");
+                assert_eq!(
+                    std::fs::read(&output_path).expect("read raw PCM after metadata stage"),
+                    bytes_before,
+                    "raw PCM metadata stage must not rewrite headerless PCM",
+                );
+            }
+        }
+    }
+
+
+    #[tokio::test]
+    async fn cue_planner_mp4_and_rf64_outputs_survive_metadata_stage_when_tools_are_available() {
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            eprintln!("skipping CUE .mp4/.rf64 planner-to-metadata integration; ffmpeg/ffprobe are required");
+            return;
+        }
+        if !ffmpeg_encoder_available("alac") || !ffmpeg_encoder_available("pcm_s16le") {
+            eprintln!("skipping CUE .mp4/.rf64 planner-to-metadata integration; alac and pcm_s16le encoders are required");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (image, _cue) = create_fixture_image_and_cue(temp.path());
+        for case in [
+            MatrixCase {
+                name: "cue_to_alac_mp4_spelling",
+                format: tonepoet_pipeline::AudioFormat::Alac,
+                extension: "mp4",
+                container_contains: &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+                codec: "alac",
+                required_encoder: Some("alac"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_rf64_spelling",
+                format: tonepoet_pipeline::AudioFormat::Wav,
+                extension: "rf64",
+                container_contains: &["wav"],
+                codec: "pcm_s16le",
+                required_encoder: Some("pcm_s16le"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: false,
+            },
+        ] {
+            let root = temp.path().join(case.name);
+            std::fs::create_dir_all(root.join("out")).expect("case output root");
+            std::fs::create_dir_all(root.join("logs")).expect("case log root");
+            let mut req = request_for_case(&root, &image, &case);
+            req.container_extension = Some(case.extension.to_string());
+            req.settings.preferred_tool = PreferredTool::Ffmpeg;
+            req.settings.metadata.preserve_artwork = false;
+            if case.extension == "rf64" {
+                // The selected RF64 container contract is WAV muxing with the
+                // dialect pinned to RF64. The extension is independently
+                // preserved by output planning and metadata dispatch.
+                req.container_ffmpeg_flags = vec![
+                    "-rf64".to_string(),
+                    "always".to_string(),
+                    "-f".to_string(),
+                    "wav".to_string(),
+                ];
+            }
+
+            let staging = StagingDir::new(root.join("staging"), req.job_id.clone());
+            let runner = RealToolRunner::new(HashMap::new());
+            let cancel = CancellationToken::new();
+            let mut source = CueImageMaterializer
+                .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+                .await
+                .unwrap_or_else(|error| panic!("{} CUE materialization failed: {error}", case.name));
+
+            // Keep this focused on container spelling -> encode -> metadata.
+            // Remove custom/freeform fields so the MP4 case does not depend on
+            // AtomicParsley and can prove the first metadata mutation itself.
+            source.album_metadata.extra.clear();
+            let track = source.tracks.first_mut().expect("one CUE track");
+            track.metadata.title = Some("Planner spelling title".to_string());
+            track.metadata.artist = MetadataValueList::from_scalar("Planner spelling artist");
+            track.metadata.track_number = Some(4);
+            track.metadata.isrc = None;
+            track.metadata.publisher = None;
+            track.metadata.copyright = None;
+            track.metadata.comment = None;
+            track.metadata.extra.clear();
+
+            let plan = plan_outputs(&source, &req)
+                .unwrap_or_else(|error| panic!("{} output planning failed: {error}", case.name));
+            assert_eq!(
+                plan.entries[0].final_path.extension().and_then(|value| value.to_str()),
+                Some(case.extension),
+                "{} planner must preserve the explicit container spelling",
+                case.name,
+            );
+            let converted = convert_tracks(&source, &plan, &req, &staging, &runner, &cancel).await;
+            assert!(
+                matches!(converted.record.outcome, StageOutcome::Ok),
+                "{} conversion failed: {:?}",
+                case.name,
+                converted.tracks,
+            );
+            let AudioArtifacts::Tracks(track_artifacts) = &converted.artifacts.audio else {
+                panic!("{} should produce track artifacts", case.name);
+            };
+            let output_path = &track_artifacts[0].staged_path;
+            assert_eq!(
+                output_path.extension().and_then(|value| value.to_str()),
+                Some(case.extension),
+                "{} staged path must preserve the planner spelling",
+                case.name,
+            );
+
+            apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
+                .await
+                .unwrap_or_else(|error| panic!("{} metadata stage failed: {error}", case.name));
+
+            let probe = ffprobe_json(output_path);
+            let tags = format_tag_map(&probe);
+            assert_eq!(tags.get("TITLE").map(String::as_str), Some("Planner spelling title"));
+            assert_eq!(tags.get("ARTIST").map(String::as_str), Some("Planner spelling artist"));
+            assert_eq!(tags.get("TRACK").map(String::as_str), Some("4"));
+            if case.extension == "rf64" {
+                assert_eq!(
+                    &std::fs::read(output_path).expect("read RF64 output")[..4],
+                    b"RF64",
+                    "RF64 metadata rewrite must preserve the explicit RF64 dialect",
+                );
+            }
+        }
     }
 
     fn create_single_flac_with_custom_tags(dir: &Path) -> PathBuf {
@@ -11235,10 +12905,10 @@ fn build_pre_materialization_conversion_log_common_fragment(
     ConversionLogCommonFragment {
         representative_job_id: req.job_id.clone(),
         representative_item_id: req.item_id.clone(),
-        album_artist: None,
+        album_artist: None.into(),
         album: None,
         year: None,
-        genre: None,
+        genre: None.into(),
         catalog_number: None,
         source_blocking_lines: String::new(),
         provenance_section: String::new(),
@@ -11403,10 +13073,10 @@ fn build_conversion_log_at_with_runner(
         container_path: path_log_value(&req.container),
         source_kind: source_kind_label(source.kind).to_string(),
         track_count: source.tracks.len(),
-        album_artist: source.album_metadata.album_artist.clone(),
+        album_artist: source.album_metadata.album_artist.as_deref().map(str::to_string),
         album: source.album_metadata.album.clone(),
         year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
-        genre: source.album_metadata.genre.clone(),
+        genre: source.album_metadata.genre.as_deref().map(str::to_string),
         catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
         source_blocking_lines,
         provenance_section,
@@ -12108,10 +13778,10 @@ fn build_conversion_log_common_fragment_with_runner(
     ConversionLogCommonFragment {
         representative_job_id: req.job_id.clone(),
         representative_item_id: req.item_id.clone(),
-        album_artist: source.album_metadata.album_artist.clone(),
+        album_artist: source.album_metadata.album_artist.as_deref().map(str::to_string),
         album: source.album_metadata.album.clone(),
         year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
-        genre: source.album_metadata.genre.clone(),
+        genre: source.album_metadata.genre.as_deref().map(str::to_string),
         catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
         source_blocking_lines,
         provenance_section,
@@ -20444,7 +22114,7 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
             cue.push_str("REM TONEPOET OMITTED invalid CATALOG\n");
         }
     }
-    if let Some(ref artist) = source.album_metadata.album_artist {
+    if let Some(artist) = source.album_metadata.album_artist.as_deref() {
         push_cue_quoted_line(&mut cue, "PERFORMER ", artist, "PERFORMER");
     }
     if let Some(ref album) = source.album_metadata.album {
@@ -20459,7 +22129,7 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
             }
         }
     }
-    if let Some(ref genre) = source.album_metadata.genre {
+    if let Some(genre) = source.album_metadata.genre.as_deref() {
         push_cue_quoted_line(&mut cue, "REM GENRE ", genre, "GENRE");
     }
     let push_track_body = |cue: &mut String, st: &PreparedTrack| {
@@ -20473,7 +22143,7 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
         if let Some(ref title) = st.metadata.title {
             push_cue_quoted_line(cue, "    TITLE ", title, "TITLE");
         }
-        if let Some(ref artist) = st.metadata.artist {
+        if let Some(artist) = st.metadata.artist.as_deref() {
             push_cue_quoted_line(cue, "    PERFORMER ", artist, "PERFORMER");
         }
     };
@@ -24391,7 +26061,7 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
             source.album_metadata.album = Some(album.clone());
         }
         if let Some(album_artist) = identity.album_artist.as_ref() {
-            source.album_metadata.album_artist = Some(album_artist.clone());
+            source.album_metadata.album_artist = Some(album_artist.clone()).into();
         }
         if let Some(date) = identity.date.as_ref() {
             source.album_metadata.date = Some(date.clone());
@@ -24417,7 +26087,7 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
     match &req.metadata_overrides.album_artist {
         MetadataTextOverride::Keep => {}
         MetadataTextOverride::Clear => {
-            source.album_metadata.album_artist = None;
+            source.album_metadata.album_artist = None.into();
             remove_preserved_source_album_artist_tag(&mut source.album_metadata);
             source
                 .album_metadata
@@ -24428,7 +26098,7 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
                 "1".to_string(),
             );
             for track in &mut source.tracks {
-                track.metadata.album_artist = None;
+                track.metadata.album_artist = None.into();
                 track
                     .metadata
                     .extra
@@ -24442,7 +26112,7 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
         MetadataTextOverride::Set(value) => {
             let value = value.trim();
             if !value.is_empty() {
-                source.album_metadata.album_artist = Some(value.to_string());
+                source.album_metadata.album_artist = Some(value.to_string()).into();
                 remove_preserved_source_album_artist_tag(&mut source.album_metadata);
                 source
                     .album_metadata
@@ -24453,7 +26123,7 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
                     value.to_string(),
                 );
                 for track in &mut source.tracks {
-                    track.metadata.album_artist = Some(value.to_string());
+                    track.metadata.album_artist = Some(value.to_string()).into();
                     track
                         .metadata
                         .extra
@@ -31392,7 +33062,7 @@ mod companion_copy_hardening_tests {
         let make_source = || {
             let mut metadata = TrackMetadata {
                 title: Some("Source Title".to_string()),
-                artist: Some("Source Artist".to_string()),
+                artist: Some("Source Artist".to_string()).into(),
                 ..TrackMetadata::default()
             };
             insert_fallback_source_tag(&mut metadata.extra, "TITLE", "Source Title");
@@ -31423,7 +33093,7 @@ mod companion_copy_hardening_tests {
                 // before batch identity was applied. None is source authority.
                 album_metadata: AlbumMetadata {
                     album: Some("Label-Inferred Album".to_string()),
-                    album_artist: Some("Label-Inferred Artist".to_string()),
+                    album_artist: Some("Label-Inferred Artist".to_string()).into(),
                     date: Some("1988".to_string()),
                     total_tracks: 1,
                     total_discs: Some(2),
@@ -31450,7 +33120,7 @@ mod companion_copy_hardening_tests {
         let mut request = test_request(temp.path(), source_path.clone());
         request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
             album: Some("Batch Album".to_string()),
-            album_artist: Some("Batch Artist".to_string()),
+            album_artist: Some("Batch Artist".to_string()).into(),
             date: Some("2001".to_string()),
             total_discs: Some(2),
             source_disc_numbers: BTreeMap::from([(identity_key.clone(), 2)]),
@@ -31505,7 +33175,7 @@ mod companion_copy_hardening_tests {
         cleared_request.metadata_overrides.album_artist = MetadataTextOverride::Clear;
         let mut cleared_source = make_source();
         cleared_source.tracks[0].metadata.album_artist =
-            Some("Source Album Artist".to_string());
+            Some("Source Album Artist".to_string()).into();
         insert_fallback_source_tag(
             &mut cleared_source.tracks[0].metadata.extra,
             "ALBUMARTIST",
@@ -32193,8 +33863,8 @@ mod companion_copy_hardening_tests {
         request.companion.extensions = vec![".jpg".to_string()];
         let mut metadata = TrackMetadata {
             title: Some("Track".to_string()),
-            artist: Some("Artist".to_string()),
-            album_artist: Some("Artist".to_string()),
+            artist: Some("Artist".to_string()).into(),
+            album_artist: Some("Artist".to_string()).into(),
             track_number: Some(1),
             ..TrackMetadata::default()
         };
@@ -33665,7 +35335,7 @@ mod companion_copy_hardening_tests {
     pub(super) fn resolved_companion_test_identity(total_discs: u32) -> BatchResolvedAlbumIdentity {
         BatchResolvedAlbumIdentity {
             album: Some("Resolved Album".to_string()),
-            album_artist: Some("Resolved Artist".to_string()),
+            album_artist: Some("Resolved Artist".to_string()).into(),
             date: Some("1972".to_string()),
             total_discs: Some(total_discs),
             source_disc_numbers: BTreeMap::new(),
@@ -40900,8 +42570,8 @@ mod pipeline_test_helpers {
                     source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav")),
                     metadata: TrackMetadata {
                         title: Some("One".to_string()),
-                        artist: Some("Artist One".to_string()),
-                        composer: Some("Composer One".to_string()),
+                        artist: Some("Artist One".to_string()).into(),
+                        composer: Some("Composer One".to_string()).into(),
                         track_number: Some(1),
                         disc_number: Some(1),
                         ..TrackMetadata::default()
@@ -40942,8 +42612,8 @@ mod pipeline_test_helpers {
             ],
             album_metadata: AlbumMetadata {
                 album: Some("Test Album".to_string()),
-                album_artist: Some("Test Artist".to_string()),
-                genre: Some("Jazz".to_string()),
+                album_artist: Some("Test Artist".to_string()).into(),
+                genre: Some("Jazz".to_string()).into(),
                 date: Some("2025-12-31".to_string()),
                 total_tracks: 2,
                 extra: album_extra,
@@ -41359,7 +43029,7 @@ mod build_cue_sheet_tests {
                     source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav")),
                     metadata: TrackMetadata {
                         title: Some("One".to_string()),
-                        artist: Some("Artist".to_string()),
+                        artist: Some("Artist".to_string()).into(),
                         track_number: Some(1),
                         ..TrackMetadata::default()
                     },
@@ -41419,9 +43089,9 @@ mod build_cue_sheet_tests {
     fn generated_cue_carries_album_metadata_and_isrc() {
         let mut source = cue_source();
         source.album_metadata.album = Some("Album".to_string());
-        source.album_metadata.album_artist = Some("Artist".to_string());
+        source.album_metadata.album_artist = Some("Artist".to_string()).into();
         source.album_metadata.date = Some("1973".to_string());
-        source.album_metadata.genre = Some("Rock".to_string());
+        source.album_metadata.genre = Some("Rock".to_string()).into();
         source
             .album_metadata
             .extra
@@ -41447,7 +43117,7 @@ mod build_cue_sheet_tests {
     fn generated_cue_sanitizes_quoted_fields_and_omits_invalid_unquoted_identifiers() {
         let mut source = cue_source();
         source.album_metadata.album = Some("Album \"Name\"\nCATALOG 123".to_string());
-        source.album_metadata.genre = Some("Rock\r\nPop".to_string());
+        source.album_metadata.genre = Some("Rock\r\nPop".to_string()).into();
         source
             .album_metadata
             .extra
@@ -42983,9 +44653,9 @@ mod naming_template_tests {
                 source_ref: TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac")),
                 metadata: TrackMetadata {
                     title: Some("Right Off".to_string()),
-                    artist: Some("Miles/Davis".to_string()),
-                    genre: Some("Jazz".to_string()),
-                    composer: Some("Miles Davis".to_string()),
+                    artist: Some("Miles/Davis".to_string()).into(),
+                    genre: Some("Jazz".to_string()).into(),
+                    composer: Some("Miles Davis".to_string()).into(),
                     track_number: Some(1),
                     disc_number: Some(1),
                     isrc: Some("USSM17100001".to_string()),
@@ -43004,8 +44674,8 @@ mod naming_template_tests {
             }],
             album_metadata: AlbumMetadata {
                 album: Some("A Tribute to Jack Johnson".to_string()),
-                album_artist: Some("Miles Davis".to_string()),
-                genre: Some("Fusion".to_string()),
+                album_artist: Some("Miles Davis".to_string()).into(),
+                genre: Some("Fusion".to_string()).into(),
                 date: Some("March 1971".to_string()),
                 total_tracks: 1,
                 extra: album_extra,
@@ -44494,7 +46164,7 @@ mod naming_template_tests {
     #[test]
     fn folder_template_sanitizes_value_slashes_but_preserves_template_slashes() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("Miles/Davis".to_string());
+        source.album_metadata.album_artist = Some("Miles/Davis".to_string()).into();
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
@@ -44517,7 +46187,7 @@ mod naming_template_tests {
         let mut source = template_source();
         source.album_metadata.album =
             Some("Dark Side of the Moon (MFSL LP / 24-96)".to_string());
-        source.album_metadata.album_artist = Some("AC/DC".to_string());
+        source.album_metadata.album_artist = Some("AC/DC".to_string()).into();
         // The designator reaches %TITLE_EXTRA% with a two-space gap (template
         // has no %BITDEPTH%/%SAMPLERATE%, so the resolution stays in place).
         assert_eq!(
@@ -44594,9 +46264,9 @@ mod naming_template_tests {
     #[test]
     fn real_naming_paths_prefer_preserved_source_artist_over_batch_identity() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("Blue Öyster Cult".to_string());
+        source.album_metadata.album_artist = Some("Blue Öyster Cult".to_string()).into();
         source.album_metadata.album = Some("Fire of Unknown Origin".to_string());
-        source.tracks[0].metadata.artist = None;
+        source.tracks[0].metadata.artist = None.into();
         source.tracks[0].metadata.title = Some("Burnin' for You".to_string());
 
         // Reproduce through the real mutation entry point. Batch identity is
@@ -44607,7 +46277,7 @@ mod naming_template_tests {
         ));
         identity_request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
             album: Some("Fire of Unknown Origin".to_string()),
-            album_artist: Some("Blue Oyster Cult".to_string()),
+            album_artist: Some("Blue Oyster Cult".to_string()).into(),
             date: None,
             total_discs: None,
             source_disc_numbers: BTreeMap::new(),
@@ -44666,17 +46336,17 @@ mod naming_template_tests {
     #[test]
     fn track_artist_only_source_survives_batch_identity_in_folder_and_file_paths() {
         let mut source = template_source();
-        source.album_metadata.album_artist = None;
+        source.album_metadata.album_artist = None.into();
         source.album_metadata.album = Some("Fire of Unknown Origin".to_string());
-        source.tracks[0].metadata.artist = Some("Blue Öyster Cult".to_string());
-        source.tracks[0].metadata.album_artist = None;
+        source.tracks[0].metadata.artist = Some("Blue Öyster Cult".to_string()).into();
+        source.tracks[0].metadata.album_artist = None.into();
         source.tracks[0].metadata.title = Some("Burnin' for You".to_string());
 
         let mut request = template_request(Some("%ARTIST%/%ALBUM%".to_string()));
         request.naming.template = "%ALBUM_ARTIST% - %TITLE%".to_string();
         request.batch_resolved_identity = Some(BatchResolvedAlbumIdentity {
             album: Some("Fire of Unknown Origin".to_string()),
-            album_artist: Some("Blue Oyster Cult".to_string()),
+            album_artist: Some("Blue Oyster Cult".to_string()).into(),
             date: None,
             total_discs: None,
             source_disc_numbers: BTreeMap::new(),
@@ -44723,12 +46393,12 @@ mod naming_template_tests {
     fn preserved_source_artist_keeps_combining_marks_symbols_and_cjk() {
         for value in ["Beyoncé", "München", "宇多田ヒカル", "Ångström № 1"] {
             let mut source = template_source();
-            source.album_metadata.album_artist = Some("Resolved ASCII Identity".to_string());
+            source.album_metadata.album_artist = Some("Resolved ASCII Identity".to_string()).into();
             source.album_metadata.extra.insert(
                 PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
                 value.to_string(),
             );
-            source.tracks[0].metadata.artist = None;
+            source.tracks[0].metadata.artist = None.into();
             assert_eq!(
                 folder_template_token_map(
                     "%ALBUM_ARTIST%",
@@ -44746,12 +46416,12 @@ mod naming_template_tests {
     #[test]
     fn flat_single_file_and_album_batch_plans_keep_preserved_unicode_artist() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("Blue Oyster Cult".to_string());
+        source.album_metadata.album_artist = Some("Blue Oyster Cult".to_string()).into();
         source.album_metadata.extra.insert(
             PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY.to_string(),
             "Blue Öyster Cult".to_string(),
         );
-        source.tracks[0].metadata.artist = None;
+        source.tracks[0].metadata.artist = None.into();
 
         let mut flat = template_request(None);
         flat.naming.per_album_subdir = false;
@@ -44787,7 +46457,7 @@ mod naming_template_tests {
     #[test]
     fn folder_template_canonicalizes_artist_casing() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("miles davis".to_string());
+        source.album_metadata.album_artist = Some("miles davis".to_string()).into();
         assert_eq!(
             render_folder_template("%ARTIST%/%ALBUM%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("Miles Davis/A Tribute to Jack Johnson")
@@ -44797,7 +46467,7 @@ mod naming_template_tests {
     #[test]
     fn folder_template_uses_corrected_kool_and_the_gang_canonical_identity() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("Kool & the Gang".to_string());
+        source.album_metadata.album_artist = Some("Kool & the Gang".to_string()).into();
         source.album_metadata.album = Some("Emergency".to_string());
         assert_eq!(
             render_folder_template(
@@ -44812,8 +46482,8 @@ mod naming_template_tests {
     #[test]
     fn track_template_canonicalizes_track_artist_casing() {
         let mut source = template_source();
-        source.album_metadata.album_artist = None;
-        source.tracks[0].metadata.artist = Some("bill evans trio".to_string());
+        source.album_metadata.album_artist = None.into();
+        source.tracks[0].metadata.artist = Some("bill evans trio".to_string()).into();
         let path = render_track_template(
             "%ARTIST% - %TITLE%",
             &source,
@@ -44827,7 +46497,7 @@ mod naming_template_tests {
     #[test]
     fn track_template_canonicalizes_album_artist_casing() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("miles davis".to_string());
+        source.album_metadata.album_artist = Some("miles davis".to_string()).into();
         let path = render_track_template(
             "%ALBUM_ARTIST% - %TITLE%",
             &source,
@@ -44841,7 +46511,7 @@ mod naming_template_tests {
     #[test]
     fn pipeline_enrichment_before_output_planning_produces_folder_name() {
         let mut source = template_source();
-        source.album_metadata.album_artist = Some("miles davis".to_string());
+        source.album_metadata.album_artist = Some("miles davis".to_string()).into();
         source.album_metadata.extra.clear();
         source
             .album_metadata
@@ -45582,7 +47252,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     use crate::convert::pipeline::tool::blocking_test_runner::{
         tool_gate, BlockingToolRunner, ToolBehavior,
     };
-    use crate::convert::pipeline::tool::{CommandRecord, ProcessExit, StubToolRunner, ToolBinary, ToolCommand, ToolOutput, ToolRunner};
+    use crate::convert::pipeline::tool::{
+        CommandRecord, ProcessExit, RealToolRunner, StubToolRunner, ToolBinary, ToolCommand,
+        ToolOutput, ToolRunner,
+    };
     use crate::convert::pipeline::errors::ToolRunnerError;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -45958,8 +47631,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.source.provenance.source_kind = SourceKind::SacdIso;
         fixture.album.source.album_metadata = AlbumMetadata {
             album: Some("Rollins Plays for Bird (Analogue Productions SACD ISO)".to_string()),
-            album_artist: Some("Sonny Rollins".to_string()),
-            genre: Some("Jazz".to_string()),
+            album_artist: Some("Sonny Rollins".to_string()).into(),
+            genre: Some("Jazz".to_string()).into(),
             date: Some("1957".to_string()),
             total_tracks: 3,
             ..AlbumMetadata::default()
@@ -45971,11 +47644,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         };
         fixture.album.source.tracks[0].metadata = TrackMetadata {
             title: Some("Medley: I Remember You...".to_string()),
-            artist: Some("Sonny Rollins".to_string()),
-            genre: Some("Jazz".to_string()),
+            artist: Some("Sonny Rollins".to_string()).into(),
+            genre: Some("Jazz".to_string()).into(),
             date: Some("1957".to_string()),
             track_number: Some(1),
-            performer: Some("Sonny Rollins".to_string()),
+            performer: Some("Sonny Rollins".to_string()).into(),
             ..TrackMetadata::default()
         };
 
@@ -46051,6 +47724,83 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+    #[tokio::test]
+    async fn sacd_dsf_authoritative_metadata_stage_uses_in_process_writer() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.target_format = PlannerAudioFormat::Dsf;
+        fixture.album.source.kind = SourceKind::SacdIso;
+        fixture.album.source.provenance.source_kind = SourceKind::SacdIso;
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("SACD sidecar album".to_string()),
+            total_tracks: 1,
+            ..AlbumMetadata::default()
+        };
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: fixture.album.req.container.clone(),
+            track_index: 1,
+            area: SacdArea::Stereo,
+        };
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("SACD DSF track".to_string()),
+            artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
+            composer: vec!["C1".to_string(), "C2".to_string(), "C1".to_string()].into(),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+
+        let dsf_path = fixture._temp.path().join("sacd-track.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&dsf_path, None)
+            .expect("write realized SACD DSF artifact fixture");
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.staged_path = dsf_path.clone();
+        artifact.final_path.set_extension("dsf");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "SACD materializer metadata must reach the authoritative DSF stage"
+        );
+        let runner = StubToolRunner::new();
+        let record = apply_metadata(
+            &artifacts,
+            &fixture.album.source,
+            &fixture.album.req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("SACD -> DSF authoritative metadata stage");
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+        assert!(
+            runner.transcript().is_empty(),
+            "SACD -> DSF metadata must use the in-process DSF writer"
+        );
+        let snapshot = crate::dsf_tags::read(&dsf_path).expect("read tagged SACD DSF fixture");
+        assert_eq!(snapshot.first("TITLE"), Some("SACD DSF track"));
+        assert_eq!(snapshot.first("ALBUM"), Some("SACD sidecar album"));
+        assert_eq!(snapshot.first("TRACKNUMBER"), Some("1"));
+        assert_eq!(
+            snapshot.fields.get("ARTIST"),
+            Some(&vec!["A".to_string(), "B".to_string(), "A".to_string()])
+        );
+        assert_eq!(
+            snapshot.fields.get("COMPOSER"),
+            Some(&vec!["C1".to_string(), "C2".to_string(), "C1".to_string()])
+        );
+    }
+
+
 
     #[test]
     fn dvd_audio_authoritative_metadata_prevents_empty_obligation_planner_skip() {
@@ -46067,16 +47817,16 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.source.provenance.source_kind = SourceKind::DvdAudio;
         fixture.album.source.album_metadata = AlbumMetadata {
             album: Some("Brothers in Arms (DVD-A) [ISO]".to_string()),
-            album_artist: Some("Dire Straits".to_string()),
-            genre: Some("Rock".to_string()),
+            album_artist: Some("Dire Straits".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("1985".to_string()),
             total_tracks: 9,
             ..AlbumMetadata::default()
         };
         fixture.album.source.tracks[0].metadata = TrackMetadata {
             title: Some("So Far Away".to_string()),
-            artist: Some("Dire Straits".to_string()),
-            genre: Some("Rock".to_string()),
+            artist: Some("Dire Straits".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("1985".to_string()),
             track_number: Some(1),
             ..TrackMetadata::default()
@@ -46168,16 +47918,16 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.source.provenance.source_kind = SourceKind::DvdAudio;
         fixture.album.source.album_metadata = AlbumMetadata {
             album: Some("Brothers in Arms (DVD-A) [ISO]".to_string()),
-            album_artist: Some("Dire Straits".to_string()),
-            genre: Some("Rock".to_string()),
+            album_artist: Some("Dire Straits".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("1985".to_string()),
             total_tracks: 9,
             ..AlbumMetadata::default()
         };
         fixture.album.source.tracks[0].metadata = TrackMetadata {
             title: Some("So Far Away".to_string()),
-            artist: Some("Dire Straits".to_string()),
-            genre: Some("Rock".to_string()),
+            artist: Some("Dire Straits".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("1985".to_string()),
             track_number: Some(1),
             extra: BTreeMap::from([(
@@ -46261,6 +48011,523 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
     }
 
+
+    fn planner_source_tag_satisfaction() -> PlannedMetadataSatisfaction {
+        PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            ..PlannedMetadataSatisfaction::none()
+        }
+    }
+
+    #[test]
+    fn prepared_multivalue_semantics_force_post_metadata_without_disabling_scalar_fast_path() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata.artist =
+            vec!["A".to_string(), "B".to_string(), "A".to_string()].into();
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "planner transfer cannot satisfy repeated native FLAC semantics",
+        );
+
+        fixture.album.source.tracks[0].metadata.artist = Some("A".to_string()).into();
+        assert!(
+            planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "scalar SingleFile metadata keeps the existing planner fast path",
+        );
+    }
+
+    #[test]
+    fn embedded_nul_custom_source_provenance_forces_only_the_needed_post_stage() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata = TrackMetadata::default();
+        insert_source_text_tag(
+            &mut fixture.album.source.tracks[0].metadata.extra,
+            "MY_NOTE",
+            "one\0two\0one",
+        );
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+
+        for ext in ["flac", "opus", "ogg", "wv", "mp3"] {
+            artifact.staged_path.set_extension(ext);
+            let artifacts = ArtifactSet {
+                audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                sidecars: Vec::new(),
+            };
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &artifacts,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "embedded-NUL custom source provenance must defeat {ext} planner satisfaction",
+            );
+        }
+
+        fixture.album.source.tracks[0].metadata = TrackMetadata::default();
+        insert_source_text_tag(
+            &mut fixture.album.source.tracks[0].metadata.extra,
+            "MY_NOTE",
+            "one",
+        );
+        for ext in ["flac", "opus", "ogg", "wv", "mp3"] {
+            artifact.staged_path.set_extension(ext);
+            let artifacts = ArtifactSet {
+                audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                sidecars: Vec::new(),
+            };
+            assert!(
+                planner_metadata_already_satisfied(
+                    &artifacts,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "ordinary scalar custom provenance must keep the {ext} planner fast path",
+            );
+        }
+
+        fixture.album.source.tracks[0].metadata = TrackMetadata::default();
+        insert_source_text_tag(
+            &mut fixture.album.source.album_metadata.extra,
+            "ALBUM_NOTE",
+            "left\0right\0left",
+        );
+        artifact.staged_path.set_extension("flac");
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "album-level embedded-NUL source provenance must also force scalar repair",
+        );
+    }
+
+    #[tokio::test]
+    async fn wavpack_ape_provenance_repair_writes_complete_scalar_to_flac() {
+        let tool_exists = |name: &str| {
+            std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
+            })
+        };
+        if !tool_exists("metaflac") {
+            eprintln!("skipping APE-provenance FLAC integration; metaflac required");
+            return;
+        }
+
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.container = fixture._temp.path().join("source.wv");
+        fixture.album.source.tracks[0].source_ref =
+            TrackSourceRef::StagedFile(fixture.album.source.container.clone());
+        fixture.album.source.tracks[0].metadata = TrackMetadata::default();
+        insert_source_text_tag(
+            &mut fixture.album.source.tracks[0].metadata.extra,
+            "MY_NOTE",
+            "one\0two\0one",
+        );
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.staged_path.set_extension("flac");
+        fs::write(
+            &artifact.staged_path,
+            include_bytes!("../../../tests/fixtures/silence.flac"),
+        )
+        .expect("seed FLAC output fixture");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "WavPack APE NUL provenance must reach the authoritative FLAC writer",
+        );
+
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &artifact.staged_path,
+            &fixture.album.source.tracks[0].metadata,
+            &fixture.album.source.album_metadata,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("authoritative FLAC provenance repair");
+
+        let (read_back, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &artifact.staged_path,
+            )
+            .expect("read FLAC after provenance repair");
+        assert!(!recovered);
+        assert!(warnings.is_empty(), "unexpected FLAC read warnings: {warnings:?}");
+        assert_eq!(
+            read_back.extra.get("my_note").map(String::as_str),
+            Some("one; two; one"),
+            "the final native FLAC tag must retain every logical APE value in order",
+        );
+        assert_eq!(
+            read_back
+                .extra
+                .get(&format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}my_note"))
+                .map(String::as_str),
+            Some("one; two; one"),
+            "readback provenance must describe the persisted legal scalar carrier",
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_satisfied_flac_transfer_still_restores_prepared_repeated_values_on_disk() {
+        let tool_exists = |name: &str| {
+            std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
+            })
+        };
+        if !tool_exists("ffmpeg") || !tool_exists("metaflac") {
+            eprintln!("skipping planner/post-metadata FLAC integration; ffmpeg and metaflac required");
+            return;
+        }
+
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Prepared multi-value".to_string()),
+            artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        let ffmpeg = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=44100:duration=0.1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(&artifact.staged_path)
+            .output()
+            .expect("run ffmpeg FLAC fixture encoder");
+        if !ffmpeg.status.success() {
+            eprintln!(
+                "skipping planner/post-metadata FLAC integration; ffmpeg FLAC encode unavailable: {}",
+                String::from_utf8_lossy(&ffmpeg.stderr)
+            );
+            return;
+        }
+
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "prepared A/B/A must defeat planner source-tag satisfaction",
+        );
+
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &artifact.staged_path,
+            &fixture.album.source.tracks[0].metadata,
+            &fixture.album.source.album_metadata,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("authoritative FLAC post stage");
+
+        let (read_back, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &artifact.staged_path,
+            )
+            .expect("read FLAC after post stage");
+        assert!(!recovered);
+        assert!(warnings.is_empty(), "unexpected FLAC read warnings: {warnings:?}");
+        assert_eq!(read_back.artist.values(), &["A".to_string(), "B".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn fixed_vocab_skip_gate_matches_repeat_capability_and_w64_safety_boundary() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+
+        for ext in ["mp3", "m4a", "mp4"] {
+            artifact.staged_path.set_extension(ext);
+            fixture.album.source.tracks[0].metadata = TrackMetadata {
+                artist: vec!["A1".to_string(), "A2".to_string()].into(),
+                ..TrackMetadata::default()
+            };
+            assert!(
+                prepared_artifact_requires_post_encode_metadata(
+                    &artifact,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "repeated ARTIST requires the {ext} post stage",
+            );
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &ArtifactSet {
+                        audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                        sidecars: Vec::new(),
+                    },
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "repeated ARTIST must defeat {ext} planner satisfaction",
+            );
+            fixture.album.source.tracks[0].metadata = TrackMetadata {
+                composer: vec!["C1".to_string(), "C2".to_string()].into(),
+                ..TrackMetadata::default()
+            };
+            assert!(
+                prepared_artifact_requires_post_encode_metadata(
+                    &artifact,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "repeated COMPOSER requires the {ext} post stage",
+            );
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &ArtifactSet {
+                        audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                        sidecars: Vec::new(),
+                    },
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "repeated COMPOSER must defeat {ext} planner satisfaction",
+            );
+            fixture.album.source.tracks[0].metadata = TrackMetadata {
+                album_artist: vec!["AA1".to_string(), "AA2".to_string()].into(),
+                genre: vec!["G1".to_string(), "G2".to_string()].into(),
+                ..TrackMetadata::default()
+            };
+            assert!(
+                !prepared_artifact_requires_post_encode_metadata(
+                    &artifact,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "non-repeatable fields alone retain the scalar {ext} planner path",
+            );
+            assert!(
+                planner_metadata_already_satisfied(
+                    &ArtifactSet {
+                        audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                        sidecars: Vec::new(),
+                    },
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "repeated ALBUMARTIST/GENRE alone must keep the {ext} planner fast path",
+            );
+        }
+
+        artifact.staged_path.set_extension("w64");
+        fixture.album.source.tracks[0].metadata.title = Some("must reject".to_string());
+        assert!(prepared_artifact_requires_post_encode_metadata(
+            &artifact,
+            &fixture.album.source,
+            &fixture.album.req,
+        ));
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "planner source transfer must not bypass W64 fail-closed metadata policy",
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_skip_gate_reaches_w64_rejection_before_mutation() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata.title = Some("Prepared Title".to_string());
+
+        let w64_path = fixture._temp.path().join("ordinary.w64");
+        let original = b"unchanged-before-policy-rejection".to_vec();
+        fs::write(&w64_path, &original).expect("seed W64 policy fixture");
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.staged_path = w64_path.clone();
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "planner transfer must hand W64 authoritative metadata to the policy gate",
+        );
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let error = tag_audio_file(
+            &w64_path,
+            &fixture.album.source.tracks[0].metadata,
+            &fixture.album.source.album_metadata,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect_err("ordinary W64 metadata must fail closed");
+        assert!(matches!(error, MetadataError::PolicyRejected(_)));
+        assert_eq!(fs::read(&w64_path).expect("read unchanged W64 fixture"), original);
+        assert!(runner.transcript().is_empty(), "rejection must occur before spawning a tool");
+    }
+
+    #[test]
+    fn prepared_request_and_archive_overrides_force_post_metadata_stage() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+
+        for override_value in [
+            MetadataTextOverride::Set("Requested Album Artist".to_string()),
+            MetadataTextOverride::Clear,
+        ] {
+            fixture.album.req.metadata_overrides.album_artist = override_value;
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &artifacts,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "request-level ALBUMARTIST edits exist only in PreparedSource",
+            );
+        }
+
+        fixture.album.req.metadata_overrides.album_artist = MetadataTextOverride::Keep;
+        fixture.album.source.kind = SourceKind::Archive;
+        fixture.album.source.provenance.source_kind = SourceKind::Archive;
+        fixture.album.req.archive_metadata_overrides = vec![ArchiveTrackMetadataOverride {
+            source_ordinal: 1,
+            relative_path: PathBuf::from("01.flac"),
+            title: MetadataTextOverride::Set("Archive Edit".to_string()),
+            ..ArchiveTrackMetadataOverride::default()
+        }];
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "archive preview edits cannot be credited to source-file transfer",
+        );
+    }
+
+    #[test]
+    fn bluray_materializer_metadata_prevents_planner_skip() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.kind = SourceKind::BluRay;
+        fixture.album.source.provenance.source_kind = SourceKind::BluRay;
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Chapter 1".to_string()),
+            artist: Some("Sidecar Artist".to_string()).into(),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+        assert!(super::super::plan_bridge::source_needs_authoritative_metadata(
+            &fixture.album.source,
+        ));
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "generated WAV source-tag transfer cannot satisfy Blu-ray materializer metadata",
+        );
+    }
 
     #[test]
     fn no_real_metadata_obligations_skip_metadata_stage() {
@@ -47776,7 +50043,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             }],
         );
         source.container = req.container.clone();
-        source.album_metadata.album_artist = Some("Real Artist".to_string());
+        source.album_metadata.album_artist = Some("Real Artist".to_string()).into();
         source.album_metadata.album = Some("Real Album".to_string());
 
         let plan = plan_outputs(&source, &req).expect("planner uses metadata folder template");
@@ -47860,7 +50127,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         disc_one.container = source_root.join("Disc 1").join("01.wav");
         disc_one.album_metadata.album = Some("Album".to_string());
-        disc_one.album_metadata.album_artist = Some("Artist".to_string());
+        disc_one.album_metadata.album_artist = Some("Artist".to_string()).into();
         disc_one.album_metadata.total_discs = Some(2);
         disc_one.album_metadata.disc_number = Some(1);
         disc_one.album_metadata.total_tracks = 2;
@@ -47876,7 +50143,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         disc_two.container = source_root.join("Disc 2").join("01.wav");
         disc_two.album_metadata.album = Some("Album".to_string());
-        disc_two.album_metadata.album_artist = Some("Artist".to_string());
+        disc_two.album_metadata.album_artist = Some("Artist".to_string()).into();
         disc_two.album_metadata.total_discs = Some(2);
         disc_two.album_metadata.disc_number = Some(2);
         disc_two.album_metadata.total_tracks = 2;
@@ -47911,10 +50178,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         ConversionLogCommonFragment {
             representative_job_id: format!("job-{batch_id}"),
             representative_item_id: format!("{batch_id}-item"),
-            album_artist: Some("Artist".to_string()),
+            album_artist: Some("Artist".to_string()).into(),
             album: Some("Album".to_string()),
             year: Some("2026".to_string()),
-            genre: Some("Rock".to_string()),
+            genre: Some("Rock".to_string()).into(),
             catalog_number: None,
             source_blocking_lines: String::new(),
             provenance_section: "Provenance\n----------\nNo provenance details were recorded.\n\n".to_string(),
@@ -48483,7 +50750,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         source.tracks[0].metadata.track_number = Some(track_number);
         source.tracks[0].metadata.disc_number = disc_number;
         source.album_metadata.album = Some("Test Album".to_string());
-        source.album_metadata.album_artist = Some("Test Artist".to_string());
+        source.album_metadata.album_artist = Some("Test Artist".to_string()).into();
         source.album_metadata.total_tracks = total_tracks_tag;
         source.album_metadata.disc_number = disc_number;
         source.provenance.source_kind = SourceKind::SingleFile;
@@ -48719,7 +50986,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source.tracks[0].metadata.track_number = Some(1);
             source.tracks[0].metadata.disc_number = Some(disc);
             source.album_metadata.album = Some("WarGames".to_string());
-            source.album_metadata.album_artist = Some("Arthur B. Rubinstein".to_string());
+            source.album_metadata.album_artist = Some("Arthur B. Rubinstein".to_string()).into();
             source.album_metadata.total_tracks = 2;
             source.album_metadata.total_discs = Some(2);
             source.album_metadata.disc_number = Some(disc);
@@ -49946,10 +52213,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         failed_first.common.representative_job_id = "failed-first-job".to_string();
         failed_first.common.representative_item_id = "failed-first-item".to_string();
-        failed_first.common.album_artist = None;
+        failed_first.common.album_artist = None.into();
         failed_first.common.album = None;
         failed_first.common.year = None;
-        failed_first.common.genre = None;
+        failed_first.common.genre = None.into();
         failed_first.common.catalog_number = None;
         failed_first.common.source_blocking_lines.clear();
         failed_first.common.provenance_section.clear();
@@ -49972,10 +52239,10 @@ Request-only setting: yes
         );
         successful_later.common.representative_job_id = "successful-later-job".to_string();
         successful_later.common.representative_item_id = "successful-later-item".to_string();
-        successful_later.common.album_artist = Some("Recovered Artist".to_string());
+        successful_later.common.album_artist = Some("Recovered Artist".to_string()).into();
         successful_later.common.album = Some("Recovered Album".to_string());
         successful_later.common.year = Some("2026".to_string());
-        successful_later.common.genre = Some("Recovered Genre".to_string());
+        successful_later.common.genre = Some("Recovered Genre".to_string()).into();
         successful_later.common.catalog_number = Some("CAT-32".to_string());
         successful_later.common.provenance_section = "Provenance
 ----------
@@ -53705,10 +55972,10 @@ mod publish_lock_soundness_tests {
             common: ConversionLogCommonFragment {
                 representative_job_id: "job".to_string(),
                 representative_item_id: "item".to_string(),
-                album_artist: Some("Artist".to_string()),
+                album_artist: Some("Artist".to_string()).into(),
                 album: Some("WarGames".to_string()),
                 year: Some("2026".to_string()),
-                genre: None,
+                genre: None.into(),
                 catalog_number: None,
                 source_blocking_lines: String::new(),
                 provenance_section: String::new(),

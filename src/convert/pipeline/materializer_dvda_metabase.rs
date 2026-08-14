@@ -74,11 +74,11 @@ pub fn track_metadata(
 
     TrackMetadata {
         title: resolved.title,
-        artist: resolved.artist.clone(),
-        album_artist: resolved.album_artist,
-        composer: resolved.composer,
-        performer: resolved.performer.or(resolved.artist),
-        genre: resolved.genre,
+        artist: resolved.artist.clone().into(),
+        album_artist: resolved.album_artist.into(),
+        composer: resolved.composer.into(),
+        performer: resolved.performer.or(resolved.artist).into(),
+        genre: resolved.genre.into(),
         date: resolved.date,
         track_number: resolved.track_number.or(Some(keys.track_number)),
         disc_number: resolved.disc_number,
@@ -117,19 +117,19 @@ pub fn overlay_track_metadata(
         base.title = Some(value);
     }
     if let Some(value) = resolved.artist.clone() {
-        base.artist = Some(value);
+        base.artist = Some(value).into();
     }
     if let Some(value) = resolved.album_artist {
-        base.album_artist = Some(value);
+        base.album_artist = Some(value).into();
     }
     if let Some(value) = resolved.composer {
-        base.composer = Some(value);
+        base.composer = Some(value).into();
     }
     if let Some(value) = resolved.performer.or(resolved.artist) {
-        base.performer = Some(value);
+        base.performer = Some(value).into();
     }
     if let Some(value) = resolved.genre {
-        base.genre = Some(value);
+        base.genre = Some(value).into();
     }
     if let Some(value) = resolved.date {
         base.date = Some(value);
@@ -176,10 +176,10 @@ pub fn overlay_album_metadata(
         metabase,
         &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"],
     ) {
-        base.album_artist = Some(value);
+        base.album_artist = Some(value).into();
     }
     if let Some(value) = dvda_metabase::album_value(metabase, &["GENRE"]) {
-        base.genre = Some(value);
+        base.genre = Some(value).into();
     }
     if let Some(value) = dvda_metabase::album_value(metabase, &["DATE", "YEAR"]) {
         base.date = Some(value);
@@ -247,8 +247,9 @@ pub fn album_metadata(
         album_artist: dvda_metabase::album_value(
             metabase,
             &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"],
-        ),
-        genre: dvda_metabase::album_value(metabase, &["GENRE"]),
+        )
+        .into(),
+        genre: dvda_metabase::album_value(metabase, &["GENRE"]).into(),
         date: dvda_metabase::album_value(metabase, &["DATE", "YEAR"]),
         total_tracks,
         total_discs: None,

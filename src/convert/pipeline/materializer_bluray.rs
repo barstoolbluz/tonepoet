@@ -1027,8 +1027,8 @@ fn base_album_metadata(
             .file_stem()
             .and_then(|value| value.to_str())
             .map(str::to_string),
-        album_artist: None,
-        genre: None,
+        album_artist: None.into(),
+        genre: None.into(),
         date: None,
         total_tracks: bluray_album_total_tracks(authored_chapter_count),
         total_discs: None,
@@ -1063,11 +1063,11 @@ fn track_metadata(
 
     TrackMetadata {
         title: Some(format!("Chapter {chapter_number}")),
-        artist: None,
-        album_artist: None,
-        composer: None,
-        performer: None,
-        genre: None,
+        artist: None.into(),
+        album_artist: None.into(),
+        composer: None.into(),
+        performer: None.into(),
+        genre: None.into(),
         date: None,
         track_number: Some(output_track_number),
         disc_number: None,
@@ -1166,10 +1166,10 @@ fn overlay_bluray_sidecar_album_metadata(
         metadata.album = Some(value);
     }
     if let Some(value) = overlay.album_artist {
-        metadata.album_artist = Some(value);
+        metadata.album_artist = Some(value).into();
     }
     if let Some(value) = overlay.genre {
-        metadata.genre = Some(value);
+        metadata.genre = Some(value).into();
     }
     if let Some(value) = overlay.year {
         metadata.date = Some(value);
@@ -1197,10 +1197,10 @@ fn overlay_bluray_sidecar_track_metadata(
         metadata.title = Some(value);
     }
     if let Some(value) = overlay.artist {
-        metadata.artist = Some(value);
+        metadata.artist = Some(value).into();
     }
     if let Some(value) = overlay.performer {
-        metadata.performer = Some(value);
+        metadata.performer = Some(value).into();
     }
     metadata
 }

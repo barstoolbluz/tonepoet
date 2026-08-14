@@ -274,8 +274,10 @@ fn album_metadata(
         album: sc("ALBUM")
             .or_else(|| metadata.album_title().map(str::to_string))
             .or_else(|| area.header.description.clone()),
-        album_artist: sc("ARTIST").or_else(|| metadata.album_artist().map(str::to_string)),
-        genre: sc("GENRE").or_else(|| first_genre(metadata)),
+        album_artist: sc("ARTIST")
+            .or_else(|| metadata.album_artist().map(str::to_string))
+            .into(),
+        genre: sc("GENRE").or_else(|| first_genre(metadata)).into(),
         date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         total_tracks,
         total_discs: if metadata.master_toc.album_set_size > 1 {
@@ -356,13 +358,17 @@ fn track_metadata(
         title: sc("TITLE").or_else(|| entry.text.title.clone()),
         artist: sc("ARTIST")
             .or_else(|| entry.text.performer.clone())
-            .or_else(|| metadata.album_artist().map(str::to_string)),
-        album_artist: sc("ARTIST").or_else(|| metadata.album_artist().map(str::to_string)),
-        composer: entry.text.composer.clone(),
-        performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()),
+            .or_else(|| metadata.album_artist().map(str::to_string))
+            .into(),
+        album_artist: sc("ARTIST")
+            .or_else(|| metadata.album_artist().map(str::to_string))
+            .into(),
+        composer: entry.text.composer.clone().into(),
+        performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()).into(),
         genre: sc("GENRE")
             .or_else(|| entry.genre.map(genre_to_string))
-            .or_else(|| first_genre(metadata)),
+            .or_else(|| first_genre(metadata))
+            .into(),
         date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         track_number: Some(track_number),
         disc_number: disc_number(metadata),

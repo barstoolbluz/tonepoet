@@ -138,11 +138,11 @@ fn qualification_metadata() -> (TrackMetadata, AlbumMetadata) {
     track_extra.insert("MY_NOTE".to_string(), "Reference production mutator".to_string());
     let track = TrackMetadata {
         title: Some("Reference qualification track".to_string()),
-        artist: Some("Reference qualification artist".to_string()),
-        album_artist: Some("Reference qualification album artist".to_string()),
-        composer: Some("Reference qualification composer".to_string()),
-        performer: Some("Reference qualification performer".to_string()),
-        genre: Some("Reference qualification genre".to_string()),
+        artist: Some("Reference qualification artist".to_string()).into(),
+        album_artist: Some("Reference qualification album artist".to_string()).into(),
+        composer: Some("Reference qualification composer".to_string()).into(),
+        performer: Some("Reference qualification performer".to_string()).into(),
+        genre: Some("Reference qualification genre".to_string()).into(),
         date: Some("2026".to_string()),
         track_number: Some(1),
         disc_number: Some(1),
@@ -157,8 +157,8 @@ fn qualification_metadata() -> (TrackMetadata, AlbumMetadata) {
     album_extra.insert("CATALOG".to_string(), "1234567890123".to_string());
     let album = AlbumMetadata {
         album: Some("Reference qualification album".to_string()),
-        album_artist: Some("Reference qualification album artist".to_string()),
-        genre: Some("Reference qualification genre".to_string()),
+        album_artist: Some("Reference qualification album artist".to_string()).into(),
+        genre: Some("Reference qualification genre".to_string()).into(),
         date: Some("2026".to_string()),
         total_tracks: 1,
         total_discs: Some(1),

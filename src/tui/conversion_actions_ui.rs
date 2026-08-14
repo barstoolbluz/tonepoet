@@ -645,9 +645,9 @@ fn wizard_preview_track_metadata(
 ) -> Vec<crate::convert::pipeline::TrackMetadata> {
     let mut base = crate::convert::pipeline::TrackMetadata {
         title: app.convert.metadata.title.clone(),
-        artist: app.convert.metadata.artist.clone(),
-        album_artist: app.convert.metadata.album_artist_for_conversion.clone(),
-        genre: app.convert.metadata.genre.clone(),
+        artist: app.convert.metadata.artist.clone().into(),
+        album_artist: app.convert.metadata.album_artist_for_conversion.clone().into(),
+        genre: app.convert.metadata.genre.clone().into(),
         date: app.convert.metadata.year.clone(),
         ..crate::convert::pipeline::TrackMetadata::default()
     };
@@ -669,8 +669,12 @@ fn wizard_preview_track_metadata(
                 let mut metadata = base.clone();
                 metadata.track_number = Some(track.number);
                 metadata.title = track.title.clone().or(metadata.title);
-                metadata.artist = track.performer.clone().or(metadata.artist);
-                metadata.album_artist = album_artist.clone().or(metadata.album_artist);
+                if let Some(performer) = track.performer.clone() {
+                    metadata.artist = Some(performer).into();
+                }
+                if let Some(album_artist) = album_artist.clone() {
+                    metadata.album_artist = Some(album_artist).into();
+                }
                 if let Some(album) = album_title.clone() {
                     metadata.extra.insert("album".to_string(), album);
                 }

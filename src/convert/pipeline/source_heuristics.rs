@@ -261,14 +261,14 @@ fn apply_title_casing(source: &mut PreparedSource) {
     if let Some(ref mut album) = source.album_metadata.album {
         *album = crate::convert::renaming::capitalize_title(album);
     }
-    if let Some(ref mut artist) = source.album_metadata.album_artist {
+    for artist in source.album_metadata.album_artist.values_mut() {
         *artist = crate::convert::renaming::capitalize_title(artist);
     }
     for track in &mut source.tracks {
         if let Some(ref mut title) = track.metadata.title {
             *title = crate::convert::renaming::capitalize_title(title);
         }
-        if let Some(ref mut artist) = track.metadata.artist {
+        for artist in track.metadata.artist.values_mut() {
             *artist = crate::convert::renaming::capitalize_title(artist);
         }
     }
@@ -428,7 +428,7 @@ mod tests {
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Bloody Tourists (UK)".into()),
-                album_artist: Some("10cc".into()),
+                album_artist: Some("10cc".into()).into(),
                 date: Some("1978".into()),
                 ..AlbumMetadata::default()
             },
@@ -527,7 +527,7 @@ mod tests {
             }],
             album_metadata: AlbumMetadata {
                 album: Some("Album (UK)".into()),
-                album_artist: Some("Artist".into()),
+                album_artist: Some("Artist".into()).into(),
                 date: Some("2000".into()),
                 ..AlbumMetadata::default()
             },

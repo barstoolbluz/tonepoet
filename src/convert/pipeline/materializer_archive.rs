@@ -303,8 +303,8 @@ fn apply_archive_metadata_override(
     override_set: &ArchiveTrackMetadataOverride,
 ) {
     override_set.title.apply_to(&mut metadata.title);
-    override_set.artist.apply_to(&mut metadata.artist);
-    override_set.genre.apply_to(&mut metadata.genre);
+    override_set.artist.apply_to_value_list(&mut metadata.artist);
+    override_set.genre.apply_to_value_list(&mut metadata.genre);
     override_set.date.apply_to(&mut metadata.date);
     override_set
         .album
@@ -1856,20 +1856,33 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
         return AlbumMetadata::default();
     }
 
-    // Helper: if all tracks agree on a field, return it.
-    fn common<F>(tracks: &[PreparedTrack], f: F) -> Option<String>
+    // Helpers: album-scope promotion requires every track to agree exactly.
+    // List-valued fields compare the complete ordered list, including duplicate
+    // values; scalar fields retain their legacy Option semantics.
+    fn common_values<F>(tracks: &[PreparedTrack], f: F) -> MetadataValueList
+    where
+        F: Fn(&TrackMetadata) -> &MetadataValueList,
+    {
+        let first = f(&tracks[0].metadata);
+        if first.is_empty() {
+            return MetadataValueList::default();
+        }
+        if tracks.iter().all(|track| f(&track.metadata) == first) {
+            first.clone()
+        } else {
+            MetadataValueList::default()
+        }
+    }
+
+    fn common_scalar<F>(tracks: &[PreparedTrack], f: F) -> Option<String>
     where
         F: Fn(&TrackMetadata) -> &Option<String>,
     {
         let first = f(&tracks[0].metadata).as_ref()?;
-        if tracks
+        tracks
             .iter()
-            .all(|t| f(&t.metadata).as_deref() == Some(first))
-        {
-            Some(first.clone())
-        } else {
-            None
-        }
+            .all(|track| f(&track.metadata).as_deref() == Some(first.as_str()))
+            .then(|| first.clone())
     }
 
     let total_tracks = tracks.len() as u32;
@@ -1917,9 +1930,10 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 
     AlbumMetadata {
         album,
-        album_artist: common(tracks, |m| &m.album_artist).or_else(|| common(tracks, |m| &m.artist)),
-        genre: common(tracks, |m| &m.genre),
-        date: common(tracks, |m| &m.date),
+        album_artist: common_values(tracks, |m| &m.album_artist)
+            .or_else(|| common_values(tracks, |m| &m.artist)),
+        genre: common_values(tracks, |m| &m.genre),
+        date: common_scalar(tracks, |m| &m.date),
         total_tracks,
         total_discs,
         disc_number: if total_discs.is_some() {
@@ -2338,8 +2352,8 @@ mod tests {
     fn archive_metadata_override_applies_compact_edits_and_explicit_clears() {
         let mut metadata = TrackMetadata {
             title: Some("Original Title".to_string()),
-            artist: Some("Original Artist".to_string()),
-            genre: Some("Rock".to_string()),
+            artist: Some("Original Artist".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
             date: Some("1984".to_string()),
             extra: BTreeMap::from([("album".to_string(), "Original Album".to_string())]),
             ..TrackMetadata::default()
@@ -2357,7 +2371,7 @@ mod tests {
         apply_archive_metadata_override(&mut metadata, &override_set);
 
         assert_eq!(metadata.title.as_deref(), Some("Edited Title"));
-        assert_eq!(metadata.artist, None);
+        assert!(metadata.artist.is_empty());
         assert_eq!(metadata.extra.get("album").map(String::as_str), Some("Edited Album"));
         assert_eq!(metadata.genre.as_deref(), Some("Rock"));
         assert_eq!(metadata.date.as_deref(), Some("2026"));
@@ -3373,9 +3387,9 @@ mod tests {
             ))),
             metadata: TrackMetadata {
                 title: Some(format!("Track {ordinal}")),
-                artist: Some("Miles Davis".to_string()),
-                album_artist: Some("Miles Davis".to_string()),
-                genre: Some("Jazz".to_string()),
+                artist: Some("Miles Davis".to_string()).into(),
+                album_artist: Some("Miles Davis".to_string()).into(),
+                genre: Some("Jazz".to_string()).into(),
                 date: Some("1971".to_string()),
                 track_number: Some(ordinal),
                 disc_number: Some(1),
@@ -3427,8 +3441,8 @@ mod tests {
             ))),
             metadata: TrackMetadata {
                 title: Some(format!("Track {ordinal}")),
-                artist: Some("Miles Davis".to_string()),
-                album_artist: Some("Miles Davis".to_string()),
+                artist: Some("Miles Davis".to_string()).into(),
+                album_artist: Some("Miles Davis".to_string()).into(),
                 extra: BTreeMap::from([
                     ("album".to_string(), "A Tribute to Jack Johnson".to_string()),
                     ("isrc".to_string(), isrc.to_string()),

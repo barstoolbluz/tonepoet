@@ -418,6 +418,18 @@ impl MetadataTextOverride {
         }
     }
 
+    /// Apply a legacy scalar override to a list-valued pipeline field.
+    /// Explicit overrides remain scalar by contract: `Set` replaces the full
+    /// source list with one value, `Clear` removes every value, and `Keep`
+    /// preserves the ordered source list unchanged.
+    pub fn apply_to_value_list(&self, target: &mut MetadataValueList) {
+        match self {
+            Self::Keep => {}
+            Self::Clear => *target = MetadataValueList::default(),
+            Self::Set(value) => *target = MetadataValueList::from_scalar(value.clone()),
+        }
+    }
+
     pub fn apply_to_extra_key(&self, extra: &mut BTreeMap<String, String>, key: &str) {
         match self {
             Self::Keep => {}
@@ -1648,14 +1660,162 @@ pub enum SourceKind {
     BluRay,
 }
 
+/// Ordered values for a pipeline metadata field that can carry repeated values.
+///
+/// The conversion queue historically serialized these fields as `string | null`.
+/// New queue items serialize them as JSON arrays. Deserialization intentionally
+/// accepts all three representations (`null`, scalar string, array) so an
+/// interrupted pre-Phase-4 queue remains loadable after upgrade. Values are
+/// never trimmed, sorted, or deduplicated: order and duplicates are metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct MetadataValueList(Vec<String>);
+
+impl MetadataValueList {
+    #[must_use]
+    pub fn from_scalar(value: impl Into<String>) -> Self {
+        Self(vec![value.into()])
+    }
+
+    #[must_use]
+    pub fn from_optional(value: Option<String>) -> Self {
+        value.map_or_else(Self::default, Self::from_scalar)
+    }
+
+    #[must_use]
+    pub fn from_values(values: Vec<String>) -> Self {
+        Self(values)
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[String] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn values_mut(&mut self) -> &mut [String] {
+        &mut self.0
+    }
+
+    #[must_use]
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.first().map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn as_ref(&self) -> Option<&String> {
+        self.0.first()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_some(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn first(&self) -> Option<&String> {
+        self.0.first()
+    }
+
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<String> {
+        self.0.clone()
+    }
+
+    #[must_use]
+    pub fn into_values(self) -> Vec<String> {
+        self.0
+    }
+
+    #[must_use]
+    pub fn or_else<F>(self, fallback: F) -> Self
+    where
+        F: FnOnce() -> Self,
+    {
+        if self.0.is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
+impl From<String> for MetadataValueList {
+    fn from(value: String) -> Self {
+        Self::from_scalar(value)
+    }
+}
+
+impl From<Option<String>> for MetadataValueList {
+    fn from(value: Option<String>) -> Self {
+        Self::from_optional(value)
+    }
+}
+
+impl From<Vec<String>> for MetadataValueList {
+    fn from(values: Vec<String>) -> Self {
+        Self::from_values(values)
+    }
+}
+
+impl<'a> IntoIterator for &'a MetadataValueList {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for MetadataValueList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Scalar(String),
+            List(Vec<String>),
+        }
+
+        let value = Option::<Representation>::deserialize(deserializer)?;
+        Ok(match value {
+            None => Self::default(),
+            Some(Representation::Scalar(value)) => Self::from_scalar(value),
+            Some(Representation::List(values)) => Self::from_values(values),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackMetadata {
     pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album_artist: Option<String>,
-    pub composer: Option<String>,
-    pub performer: Option<String>,
-    pub genre: Option<String>,
+    #[serde(default)]
+    pub artist: MetadataValueList,
+    #[serde(default)]
+    pub album_artist: MetadataValueList,
+    #[serde(default)]
+    pub composer: MetadataValueList,
+    #[serde(default)]
+    pub performer: MetadataValueList,
+    #[serde(default)]
+    pub genre: MetadataValueList,
     pub date: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
@@ -1670,8 +1830,10 @@ pub struct TrackMetadata {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AlbumMetadata {
     pub album: Option<String>,
-    pub album_artist: Option<String>,
-    pub genre: Option<String>,
+    #[serde(default)]
+    pub album_artist: MetadataValueList,
+    #[serde(default)]
+    pub genre: MetadataValueList,
     pub date: Option<String>,
     pub total_tracks: u32,
     pub total_discs: Option<u32>,
@@ -2863,6 +3025,54 @@ mod chunk_2_1_3_staging_cleanup_tests {
     }
 }
 
+
+#[cfg(test)]
+mod metadata_value_list_serde_contract {
+    use super::*;
+
+    #[test]
+    fn track_metadata_accepts_legacy_scalar_null_and_new_ordered_lists() {
+        let mut value = serde_json::to_value(TrackMetadata::default()).expect("serialize default");
+        let object = value.as_object_mut().expect("track metadata object");
+        object.insert("artist".to_string(), serde_json::json!("Alice"));
+        object.insert("album_artist".to_string(), serde_json::Value::Null);
+        object.insert(
+            "composer".to_string(),
+            serde_json::json!(["One", "Two", "One"]),
+        );
+
+        let metadata: TrackMetadata = serde_json::from_value(value).expect("compat deserialize");
+        assert_eq!(metadata.artist.values(), &["Alice".to_string()]);
+        assert!(metadata.album_artist.is_empty());
+        assert_eq!(
+            metadata.composer.values(),
+            &["One".to_string(), "Two".to_string(), "One".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_fields_serialize_as_arrays_without_reordering_or_deduplication() {
+        let metadata = TrackMetadata {
+            artist: vec!["B".to_string(), "A".to_string(), "B".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+        let value = serde_json::to_value(metadata).expect("serialize metadata");
+        assert_eq!(value["artist"], serde_json::json!(["B", "A", "B"]));
+    }
+
+    #[test]
+    fn album_metadata_accepts_legacy_scalar_and_null_shapes() {
+        let mut value = serde_json::to_value(AlbumMetadata::default()).expect("serialize default");
+        let object = value.as_object_mut().expect("album metadata object");
+        object.insert("album_artist".to_string(), serde_json::json!("Quartet"));
+        object.insert("genre".to_string(), serde_json::Value::Null);
+
+        let metadata: AlbumMetadata = serde_json::from_value(value).expect("compat deserialize");
+        assert_eq!(metadata.album_artist.as_deref(), Some("Quartet"));
+        assert!(metadata.genre.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod prepared_track_sample_rate_contract {
     use super::*;
@@ -2884,6 +3094,28 @@ mod prepared_track_sample_rate_contract {
                 "bit_depth": null
             }}"#
         )
+    }
+
+    #[test]
+    fn prepared_track_deserializes_legacy_scalar_metadata_fields() {
+        let json = track_json("44100", r#"{"primary_sample_rate":44100}"#)
+            .replacen("\"artist\": null", "\"artist\": \"Legacy Artist\"", 1)
+            .replacen(
+                "\"composer\": null",
+                "\"composer\": [\"Composer A\", \"Composer B\", \"Composer A\"]",
+                1,
+            );
+        let track: PreparedTrack =
+            serde_json::from_str(&json).expect("legacy scalar metadata should deserialize");
+        assert_eq!(track.metadata.artist.as_deref(), Some("Legacy Artist"));
+        assert_eq!(
+            track.metadata.composer.values(),
+            &[
+                "Composer A".to_string(),
+                "Composer B".to_string(),
+                "Composer A".to_string(),
+            ]
+        );
     }
 
     #[test]

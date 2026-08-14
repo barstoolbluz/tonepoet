@@ -910,8 +910,9 @@ fn dispatch_track_metadata_for_output_planning(
                 title: first.and_then(|track| track.title.clone()),
                 artist: first
                     .and_then(|track| track.performer.clone())
-                    .or_else(|| cue.performer.clone()),
-                album_artist: cue.performer.clone(),
+                    .or_else(|| cue.performer.clone())
+                    .into(),
+                album_artist: cue.performer.clone().into(),
                 date: cue.date.clone(),
                 track_number: first.map(|track| track.number),
                 disc_number: req
@@ -975,8 +976,8 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
     let probe = BatchIdentityProbe {
         path_key: String::new(),
         album,
-        album_artist: metadata.album_artist.clone(),
-        artist: metadata.artist.clone(),
+        album_artist: metadata.album_artist.first().cloned(),
+        artist: metadata.artist.first().cloned(),
         date: metadata.date.clone(),
         disc_number: metadata.disc_number,
         total_discs,
@@ -6119,8 +6120,8 @@ FILE "track.flac" WAVE
     #[test]
     fn batch_identity_probe_uses_materializer_metadata_shape_for_single_files() {
         let mut metadata = TrackMetadata::default();
-        metadata.artist = Some("The Allman Brothers Band".to_string());
-        metadata.album_artist = Some("The Allman Brothers Band".to_string());
+        metadata.artist = Some("The Allman Brothers Band".to_string()).into();
+        metadata.album_artist = Some("The Allman Brothers Band".to_string()).into();
         metadata.date = Some("1972".to_string());
         metadata.disc_number = Some(1);
         metadata.track_number = Some(1);

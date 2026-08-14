@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DsfTagSnapshot {
-    /// Canonical editor display key -> ordered, distinct values.
+    /// Canonical editor display key -> ordered values. The five pipeline
+    /// set-valued fields preserve duplicates; scalar/editor-only fields may
+    /// still be canonicalized to distinct presentation values.
     pub fields: BTreeMap<String, Vec<String>>,
     /// Canonical editor display key -> number of stored source frames/items.
     /// This can exceed `fields[key].len()` when duplicate frames carry the
@@ -183,11 +185,26 @@ pub fn to_track_metadata(snapshot: &DsfTagSnapshot) -> crate::convert::pipeline:
         crate::convert::pipeline::source_text_tags_indicate_pre_emphasis(&extra);
     crate::convert::pipeline::TrackMetadata {
         title: snapshot.first("TITLE").map(ToOwned::to_owned),
-        artist: snapshot.first("ARTIST").map(ToOwned::to_owned),
-        album_artist: snapshot.first("ALBUMARTIST").map(ToOwned::to_owned),
-        composer: snapshot.first("COMPOSER").map(ToOwned::to_owned),
-        performer: snapshot.first("PERFORMER").map(ToOwned::to_owned),
-        genre: snapshot.first("GENRE").map(ToOwned::to_owned),
+        artist: snapshot.fields.get("ARTIST").cloned().unwrap_or_default().into(),
+        album_artist: snapshot
+            .fields
+            .get("ALBUMARTIST")
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        composer: snapshot
+            .fields
+            .get("COMPOSER")
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        performer: snapshot
+            .fields
+            .get("PERFORMER")
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        genre: snapshot.fields.get("GENRE").cloned().unwrap_or_default().into(),
         date: snapshot.first("DATE").map(ToOwned::to_owned),
         track_number: snapshot.parsed_u32("TRACKNUMBER"),
         disc_number: snapshot.parsed_u32("DISCNUMBER"),
@@ -3197,8 +3214,10 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             if (normalized_key == canonical_key) != canonical_pass {
                 continue;
             }
-            let preserve_repeated_values =
-                matches!(canonical_key.as_str(), "ARTIST" | "COMPOSER");
+            let preserve_repeated_values = matches!(
+                canonical_key.as_str(),
+                "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+            );
             let target = fields.entry(canonical_key).or_default();
             for value in values {
                 if preserve_repeated_values {
@@ -3538,8 +3557,14 @@ mod backend {
         push(&mut fields, "TITLE", tag.title());
         push_text_frame_values(&mut fields, tag, "TPE1", "ARTIST");
         push(&mut fields, "ALBUM", tag.album());
-        push(&mut fields, "ALBUMARTIST", tag.album_artist());
-        push(&mut fields, "GENRE", tag.genre());
+        push_text_frame_values(&mut fields, tag, "TPE2", "ALBUMARTIST");
+        if !fields.contains_key("ALBUMARTIST") {
+            push(&mut fields, "ALBUMARTIST", tag.album_artist());
+        }
+        push_text_frame_values(&mut fields, tag, "TCON", "GENRE");
+        if !fields.contains_key("GENRE") {
+            push(&mut fields, "GENRE", tag.genre());
+        }
         if let Some(date) = tag
             .frames()
             .find(|frame| frame.id() == "TDRC")
@@ -3917,6 +3942,81 @@ mod tests {
                 .map(String::as_str),
             Some("keep me")
         );
+    }
+
+    #[test]
+    fn dsf_read_preserves_all_five_pipeline_value_lists_without_widening_write_capability() {
+        use id3::frame::ExtendedText;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("five-field-multivalue.dsf");
+        let mut tag = id3::Tag::new();
+        tag.set_text_values(
+            "TPE1",
+            ["A1", "A2", "A1"].into_iter().map(str::to_string),
+        );
+        tag.set_text_values(
+            "TPE2",
+            ["AA1", "AA2", "AA1"].into_iter().map(str::to_string),
+        );
+        tag.set_text_values(
+            "TCOM",
+            ["C1", "C2", "C1"].into_iter().map(str::to_string),
+        );
+        tag.set_text_values(
+            "TCON",
+            ["G1", "G2", "G1"].into_iter().map(str::to_string),
+        );
+        // Distinct TXXX descriptions canonicalize to the same PERFORMER key,
+        // exercising duplicate preservation without using the production
+        // writer (which intentionally does not support repeated PERFORMER).
+        for (description, value) in [
+            ("PERFORMER", "P1"),
+            ("performer", "P2"),
+            (" PERFORMER ", "P1"),
+        ] {
+            tag.add_frame(ExtendedText {
+                description: description.to_string(),
+                value: value.to_string(),
+            });
+        }
+
+        let mut metadata = Vec::new();
+        tag.write_to(&mut metadata, id3::Version::Id3v24)
+            .expect("serialize DSF multi-value fixture");
+        write_test_dsf_fixture(&path, Some(&metadata)).expect("write DSF fixture");
+
+        let outcome = read_with_warnings(&path).expect("read DSF fixture");
+        assert!(outcome.warnings.is_empty(), "unexpected warnings: {:?}", outcome.warnings);
+        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "GENRE"] {
+            assert_eq!(
+                outcome.snapshot.stored_value_count(key),
+                3,
+                "fixture must retain all three physical/logical values for {key}",
+            );
+        }
+        let track = to_track_metadata(&outcome.snapshot);
+        assert_eq!(track.artist.values(), &["A1".to_string(), "A2".to_string(), "A1".to_string()]);
+        assert_eq!(track.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
+        assert_eq!(track.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
+        assert_eq!(track.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(track.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
+
+        for key in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+            let error = resolve_value_changes(&[DsfTagValueChange {
+                canonical_key: key.to_string(),
+                values: Some(vec!["one".to_string(), "two".to_string()]),
+            }])
+            .expect_err("DSF output capability must remain ARTIST/COMPOSER-only");
+            assert!(error.contains("does not support repeated values"), "{error}");
+        }
+        for key in ["ARTIST", "COMPOSER"] {
+            resolve_value_changes(&[DsfTagValueChange {
+                canonical_key: key.to_string(),
+                values: Some(vec!["one".to_string(), "two".to_string()]),
+            }])
+            .expect("DSF writer still supports repeated ARTIST/COMPOSER");
+        }
     }
 
     #[test]

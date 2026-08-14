@@ -3508,8 +3508,8 @@ fn album_metadata(
 
     let base = AlbumMetadata {
         album: None,
-        album_artist: None,
-        genre: None,
+        album_artist: None.into(),
+        genre: None.into(),
         date: None,
         total_tracks,
         total_discs: None,
@@ -3546,11 +3546,11 @@ fn overlay_selected_track_album_values(
         &track_ids,
         &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"],
     ) {
-        album.album_artist = Some(value);
+        album.album_artist = Some(value).into();
     }
     if let Some(value) = dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["GENRE"])
     {
-        album.genre = Some(value);
+        album.genre = Some(value).into();
     }
     if let Some(value) =
         dvda_metabase::album_value_for_track_ids(metabase, &track_ids, &["DATE", "YEAR"])
@@ -3698,11 +3698,11 @@ fn track_metadata(
 
     let base = TrackMetadata {
         title: None,
-        artist: None,
-        album_artist: None,
-        composer: None,
-        performer: None,
-        genre: None,
+        artist: None.into(),
+        album_artist: None.into(),
+        composer: None.into(),
+        performer: None.into(),
+        genre: None.into(),
         date: None,
         track_number: Some(source_ordinal),
         disc_number: None,
@@ -3817,11 +3817,11 @@ fn samg_track_metadata(
 
     TrackMetadata {
         title: None,
-        artist: None,
-        album_artist: None,
-        composer: None,
-        performer: None,
-        genre: None,
+        artist: None.into(),
+        album_artist: None.into(),
+        composer: None.into(),
+        performer: None.into(),
+        genre: None.into(),
         date: None,
         track_number: Some(source_ordinal),
         disc_number: None,

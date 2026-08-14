@@ -227,8 +227,8 @@ impl Materializer for DvdVideoMaterializer {
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .map(str::to_string),
-                album_artist: None,
-                genre: None,
+                album_artist: None.into(),
+                genre: None.into(),
                 date: None,
                 total_tracks: dvdv_album_total_tracks(tracks.len()),
                 total_discs: None,
@@ -1284,10 +1284,10 @@ fn overlay_dvdv_album_metadata(
         base.album = Some(value);
     }
     if let Some(value) = dvdv_album_value(sidecar, &["ALBUMARTIST", "ARTIST"]) {
-        base.album_artist = Some(value);
+        base.album_artist = Some(value).into();
     }
     if let Some(value) = dvdv_album_value(sidecar, &["GENRE"]) {
-        base.genre = Some(value);
+        base.genre = Some(value).into();
     }
     if let Some(value) = dvdv_album_value(sidecar, &["DATE", "YEAR"]) {
         base.date = Some(value);
@@ -1347,11 +1347,11 @@ fn track_metadata(
     let performer = dvdv_track_value(sidecar_track, &["PERFORMER"]).or_else(|| artist.clone());
     TrackMetadata {
         title: dvdv_track_value(sidecar_track, &["TITLE"]).or(Some(synthetic_title)),
-        artist: artist.clone(),
-        album_artist: dvdv_track_value(sidecar_track, &["ALBUMARTIST"]),
-        composer: dvdv_track_value(sidecar_track, &["COMPOSER"]),
-        performer,
-        genre: dvdv_track_value(sidecar_track, &["GENRE"]),
+        artist: artist.clone().into(),
+        album_artist: dvdv_track_value(sidecar_track, &["ALBUMARTIST"]).into(),
+        composer: dvdv_track_value(sidecar_track, &["COMPOSER"]).into(),
+        performer: performer.into(),
+        genre: dvdv_track_value(sidecar_track, &["GENRE"]).into(),
         date: dvdv_track_value(sidecar_track, &["DATE", "YEAR"]),
         track_number: Some(output_track_number),
         disc_number: dvdv_track_value(sidecar_track, &["DISCNUMBER"])

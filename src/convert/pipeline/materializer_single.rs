@@ -583,7 +583,8 @@ pub(crate) fn read_track_metadata_with_warnings_and_viability(
                     true,
                 ));
             };
-            Ok((track_metadata_from_lofty_tag(tag), Vec::new(), false, true))
+            let (metadata, warnings) = track_metadata_from_lofty_tag(path, tag);
+            Ok((metadata, warnings, false, true))
         }
         Err(lofty_error)
             if crate::metadata_persistence::native_ape_error_is_eligible(&lofty_error) =>
@@ -623,7 +624,10 @@ pub(crate) fn read_track_metadata_with_warnings_and_viability(
     }
 }
 
-fn track_metadata_from_lofty_tag(tag: &lofty::tag::Tag) -> TrackMetadata {
+fn track_metadata_from_lofty_tag(
+    path: &Path,
+    tag: &lofty::tag::Tag,
+) -> (TrackMetadata, Vec<String>) {
     use lofty::prelude::*;
 
     let mut extra = BTreeMap::new();
@@ -641,6 +645,8 @@ fn track_metadata_from_lofty_tag(tag: &lofty::tag::Tag) -> TrackMetadata {
     // lowercased entry remains available to naming templates; the reserved
     // marker lets the metadata writer distinguish user tags from derived
     // pipeline extras and reproduce arbitrary custom keys without renaming.
+    // This map intentionally remains first-wins/scalar even when a standard
+    // field above carries multiple values.
     let tag_type = tag.tag_type();
     for item in tag.items() {
         if let lofty::tag::ItemValue::Text(text) = item.value() {
@@ -650,35 +656,43 @@ fn track_metadata_from_lofty_tag(tag: &lofty::tag::Tag) -> TrackMetadata {
     }
     let pre_emphasis = source_text_tags_indicate_pre_emphasis(&extra);
 
-    TrackMetadata {
-        title: tag.title().map(|value| value.to_string()),
-        artist: tag.artist().map(|value| value.to_string()),
-        album_artist: tag
-            .get_string(&lofty::tag::ItemKey::AlbumArtist)
-            .map(|value| value.to_string()),
-        composer: tag
-            .get_string(&lofty::tag::ItemKey::Composer)
-            .map(|value| value.to_string()),
-        performer: tag
-            .get_string(&lofty::tag::ItemKey::Performer)
-            .map(|value| value.to_string()),
-        genre: tag.genre().map(|value| value.to_string()),
-        date: tag.year().map(|value| value.to_string()),
-        track_number: tag.track().map(|value| value as u32),
-        disc_number: tag.disk().map(|value| value as u32),
-        isrc: tag
-            .get_string(&lofty::tag::ItemKey::Isrc)
-            .map(|value| value.to_string()),
-        publisher: tag
-            .get_string(&lofty::tag::ItemKey::Publisher)
-            .map(|value| value.to_string()),
-        copyright: tag
-            .get_string(&lofty::tag::ItemKey::CopyrightMessage)
-            .map(|value| value.to_string()),
-        comment: tag.comment().map(|value| value.to_string()),
-        pre_emphasis,
-        extra,
-    }
+    let (mut set_values, warnings) =
+        crate::tui::probe::read_pipeline_set_valued_text_fields(path, tag);
+    let take_values = |fields: &mut BTreeMap<String, Vec<String>>, key: &str| {
+        MetadataValueList::from_values(fields.remove(key).unwrap_or_default())
+    };
+    let artist = take_values(&mut set_values, "ARTIST");
+    let album_artist = take_values(&mut set_values, "ALBUMARTIST");
+    let composer = take_values(&mut set_values, "COMPOSER");
+    let performer = take_values(&mut set_values, "PERFORMER");
+    let genre = take_values(&mut set_values, "GENRE");
+
+    (
+        TrackMetadata {
+            title: tag.title().map(|value| value.to_string()),
+            artist,
+            album_artist,
+            composer,
+            performer,
+            genre,
+            date: tag.year().map(|value| value.to_string()),
+            track_number: tag.track().map(|value| value as u32),
+            disc_number: tag.disk().map(|value| value as u32),
+            isrc: tag
+                .get_string(&lofty::tag::ItemKey::Isrc)
+                .map(|value| value.to_string()),
+            publisher: tag
+                .get_string(&lofty::tag::ItemKey::Publisher)
+                .map(|value| value.to_string()),
+            copyright: tag
+                .get_string(&lofty::tag::ItemKey::CopyrightMessage)
+                .map(|value| value.to_string()),
+            comment: tag.comment().map(|value| value.to_string()),
+            pre_emphasis,
+            extra,
+        },
+        warnings,
+    )
 }
 
 fn track_metadata_from_neutral_ape_rows(
@@ -688,6 +702,14 @@ fn track_metadata_from_neutral_ape_rows(
         rows.iter()
             .find(|row| row.canonical_key == canonical_key && !row.is_binary)
             .map(|row| row.value.clone())
+    };
+    let texts = |canonical_key: &str| {
+        MetadataValueList::from_values(
+            rows.iter()
+                .filter(|row| row.canonical_key == canonical_key && !row.is_binary)
+                .map(|row| row.value.clone())
+                .collect(),
+        )
     };
     let number = |canonical_key: &str| {
         text(canonical_key).and_then(|value| value.trim().parse::<u32>().ok())
@@ -721,11 +743,11 @@ fn track_metadata_from_neutral_ape_rows(
 
     TrackMetadata {
         title: text("TITLE"),
-        artist: text("ARTIST"),
-        album_artist: text("ALBUMARTIST"),
-        composer: text("COMPOSER"),
-        performer: text("PERFORMER"),
-        genre: text("GENRE"),
+        artist: texts("ARTIST"),
+        album_artist: texts("ALBUMARTIST"),
+        composer: texts("COMPOSER"),
+        performer: texts("PERFORMER"),
+        genre: texts("GENRE"),
         date: year(),
         track_number: number("TRACKNUMBER"),
         disc_number: number("DISCNUMBER"),
@@ -791,19 +813,80 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn list_values(values: &MetadataValueList) -> Vec<&str> {
+        values.values().iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn source_reader_preserves_all_ordered_vorbis_values_including_duplicates() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::VorbisComments);
+        for (key, value) in [
+            (ItemKey::TrackArtist, "Artist A"),
+            (ItemKey::TrackArtist, "Artist B"),
+            (ItemKey::TrackArtist, "Artist A"),
+            (ItemKey::AlbumArtist, "Album A"),
+            (ItemKey::AlbumArtist, "Album B"),
+            (ItemKey::Composer, "Composer A"),
+            (ItemKey::Composer, "Composer B"),
+            (ItemKey::Performer, "Performer A"),
+            (ItemKey::Performer, "Performer B"),
+            (ItemKey::Genre, "Genre A"),
+            (ItemKey::Genre, "Genre B"),
+        ] {
+            tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+
+        let (metadata, warnings) = track_metadata_from_lofty_tag(Path::new("source.flac"), &tag);
+        assert!(warnings.is_empty());
+        assert_eq!(list_values(&metadata.artist), vec!["Artist A", "Artist B", "Artist A"]);
+        assert_eq!(list_values(&metadata.album_artist), vec!["Album A", "Album B"]);
+        assert_eq!(list_values(&metadata.composer), vec!["Composer A", "Composer B"]);
+        assert_eq!(list_values(&metadata.performer), vec!["Performer A", "Performer B"]);
+        assert_eq!(list_values(&metadata.genre), vec!["Genre A", "Genre B"]);
+    }
+
+    #[test]
+    fn source_reader_expands_ape_nul_lists_without_widening_extra_map() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::Ape);
+        tag.push_unchecked(TagItem::new(
+            ItemKey::TrackArtist,
+            ItemValue::Text("A\0B\0A".to_string()),
+        ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::AlbumArtist,
+            ItemValue::Text("AA1\0AA2".to_string()),
+        ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Composer,
+            ItemValue::Text("C1\0C2".to_string()),
+        ));
+
+        let (metadata, warnings) = track_metadata_from_lofty_tag(Path::new("source.wv"), &tag);
+        assert!(warnings.is_empty());
+        assert_eq!(list_values(&metadata.artist), vec!["A", "B", "A"]);
+        assert_eq!(list_values(&metadata.album_artist), vec!["AA1", "AA2"]);
+        assert_eq!(list_values(&metadata.composer), vec!["C1", "C2"]);
+        assert!(metadata.extra.values().all(|value| !value.contains("; ")),
+            "custom/provenance extras remain scalar rather than list-projected");
+    }
+
     #[test]
     fn sidecar_cue_merge_overrides_cue_fields_but_preserves_non_cue_enrichment() {
         let mut base = TrackMetadata::default();
         base.title = Some("Embedded Title".to_string());
-        base.artist = Some("Embedded Artist".to_string());
-        base.composer = Some("Quincy Jones".to_string());
+        base.artist = Some("Embedded Artist".to_string()).into();
+        base.composer = Some("Quincy Jones".to_string()).into();
         base.comment = Some("source note".to_string());
         base.extra.insert("custom".to_string(), "keep".to_string());
 
         let mut cue = TrackMetadata::default();
         cue.title = Some("Cue Title".to_string());
-        cue.artist = Some("Cue Artist".to_string());
-        cue.album_artist = Some("Cue Album Artist".to_string());
+        cue.artist = Some("Cue Artist".to_string()).into();
+        cue.album_artist = Some("Cue Album Artist".to_string()).into();
         cue.track_number = Some(7);
         cue.isrc = Some("USAAA2600007".to_string());
         cue.extra.insert("album".to_string(), "Cue Album".to_string());
@@ -823,7 +906,7 @@ mod tests {
     #[test]
     fn sidecar_album_fallback_does_not_promote_track_artist_to_album_artist() {
         let mut metadata = TrackMetadata::default();
-        metadata.artist = Some("Track Performer".to_string());
+        metadata.artist = Some("Track Performer".to_string()).into();
 
         let album = derive_sidecar_album_fallback_metadata(&metadata, false);
         assert!(album.album_artist.is_none());
@@ -1042,7 +1125,7 @@ mod tests {
             },
             source_ref: TrackSourceRef::StagedFile(PathBuf::from("untagged.wv")),
             metadata: TrackMetadata {
-                artist: Some("Solo Artist".to_string()),
+                artist: Some("Solo Artist".to_string()).into(),
                 disc_number: Some(1),
                 extra: BTreeMap::from([("album".to_string(), "Source Album".to_string())]),
                 ..TrackMetadata::default()

@@ -21,9 +21,9 @@ use tonepoet_pipeline::{
 
 use super::errors::ConvertError;
 use super::types::{
-    AlbumMetadata, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource, PreparedTrack,
-    CueSegmentCarrier, SourceAudioCoding, SourceKind, StageRequirement, TrackMetadata,
-    TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
+    AlbumMetadata, MetadataValueList, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource,
+    PreparedTrack, CueSegmentCarrier, SourceAudioCoding, SourceKind, StageRequirement,
+    TrackMetadata, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
 };
 
 fn planned_riff_non_audio_upper_bound(
@@ -695,7 +695,10 @@ pub fn orchestrator_metadata_stage_required(
 
 #[must_use]
 pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
-    (matches!(source.kind, SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo)
+    (matches!(
+        source.kind,
+        SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo | SourceKind::BluRay
+    )
         || (matches!(source.kind, SourceKind::SingleFile)
             && source
                 .album_metadata
@@ -713,10 +716,14 @@ fn has_non_empty_text(value: &Option<String>) -> bool {
     value.as_deref().map_or(false, |value| !value.trim().is_empty())
 }
 
+fn has_non_empty_values(value: &MetadataValueList) -> bool {
+    value.values().iter().any(|value| !value.trim().is_empty())
+}
+
 fn album_metadata_has_tags(album: &AlbumMetadata) -> bool {
     has_non_empty_text(&album.album)
-        || has_non_empty_text(&album.album_artist)
-        || has_non_empty_text(&album.genre)
+        || has_non_empty_values(&album.album_artist)
+        || has_non_empty_values(&album.genre)
         || has_non_empty_text(&album.date)
         || (album.total_tracks > 0
             && !album
@@ -732,11 +739,11 @@ fn album_metadata_has_tags(album: &AlbumMetadata) -> bool {
 
 fn track_metadata_has_tags(track: &TrackMetadata) -> bool {
     has_non_empty_text(&track.title)
-        || has_non_empty_text(&track.artist)
-        || has_non_empty_text(&track.album_artist)
-        || has_non_empty_text(&track.composer)
-        || has_non_empty_text(&track.performer)
-        || has_non_empty_text(&track.genre)
+        || has_non_empty_values(&track.artist)
+        || has_non_empty_values(&track.album_artist)
+        || has_non_empty_values(&track.composer)
+        || has_non_empty_values(&track.performer)
+        || has_non_empty_values(&track.genre)
         || has_non_empty_text(&track.date)
         || track.track_number.is_some()
         || track.disc_number.is_some()
@@ -1114,7 +1121,7 @@ mod tests {
         orchestrator_metadata_stage_required, plan_request_for_track,
         planner_metadata_obligations_for_track, source_audio_md5_policy_downgrade_message,
         source_info_for_realized_track, source_needs_authoritative_metadata,
-        DsdPlannerSourceKind,
+        source_supports_source_tag_transfer, DsdPlannerSourceKind,
     };
     use crate::disc::bluray_backend::BluRayAudioCoding;
     use crate::convert::pipeline::types::{
@@ -1253,7 +1260,7 @@ mod tests {
             tracks: vec![track],
             album_metadata: AlbumMetadata {
                 album: Some("Album".to_string()),
-                album_artist: Some("Artist".to_string()),
+                album_artist: Some("Artist".to_string()).into(),
                 total_tracks: 1,
                 ..AlbumMetadata::default()
             },
@@ -2312,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn only_fallback_recovered_single_files_require_authoritative_metadata() {
+    fn single_file_authoritative_metadata_requires_fallback_recovery() {
         let temp = TempDir::new().expect("temp dir");
         let req = request(temp.path());
         let mut recovered = source(
@@ -2345,7 +2352,7 @@ mod tests {
         let mut marker_only = recovered;
         marker_only.tracks[0].metadata = TrackMetadata::default();
         marker_only.album_metadata.album = None;
-        marker_only.album_metadata.album_artist = None;
+        marker_only.album_metadata.album_artist = None.into();
         assert_eq!(
             marker_only.album_metadata.total_tracks, 1,
             "single-file planning still carries its organizational count"
@@ -2354,6 +2361,34 @@ mod tests {
             !source_needs_authoritative_metadata(&marker_only),
             "the recovery marker must not bypass the existing metadata-present conjunct"
         );
+    }
+
+    #[test]
+    fn bluray_materializer_metadata_requires_authoritative_stage_even_with_source_transfer() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.metadata.transfer_tags = true;
+        let mut prepared_track = track(TrackSourceRef::StagedFile(temp.path().join("chapter.wav")));
+        prepared_track.metadata.title = Some("Chapter 1".to_string());
+        prepared_track.metadata.artist = Some("Sidecar Artist".to_string()).into();
+        let src = source(SourceKind::BluRay, prepared_track, temp.path());
+
+        assert!(
+            source_supports_source_tag_transfer(&req, &src),
+            "planner source transfer may still run for the realized Blu-ray carrier",
+        );
+        assert!(source_needs_authoritative_metadata(&src));
+        let obligations = metadata_obligations_for_request(&req, &src);
+        assert!(obligations.source_tags_transferred);
+        assert!(obligations.authoritative_tags_applied);
+        assert!(orchestrator_metadata_stage_required(
+            PlannedMetadataSatisfaction {
+                source_tags_transferred: true,
+                ..PlannedMetadataSatisfaction::none()
+            },
+            req.stages.metadata,
+            obligations,
+        ));
     }
 
     #[test]

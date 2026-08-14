@@ -8277,6 +8277,17 @@ const MP4_ARTIST_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
     lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART");
 const MP4_COMPOSER_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
     lofty::mp4::AtomIdent::Fourcc(*b"\xa9wrt");
+const MP4_ALBUM_ARTIST_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
+    lofty::mp4::AtomIdent::Fourcc(*b"aART");
+const MP4_GENRE_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
+    lofty::mp4::AtomIdent::Fourcc(*b"\xa9gen");
+
+fn mp4_performer_atom_ident() -> lofty::mp4::AtomIdent<'static> {
+    lofty::mp4::AtomIdent::Freeform {
+        mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+        name: std::borrow::Cow::Borrowed("PERFORMER"),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Mp4NativeMultiValueState {
@@ -8340,6 +8351,118 @@ fn read_mp4_native_multivalue_state(
         )
     })?;
     Ok(mp4_native_multivalue_state_from_mp4(&mp4))
+}
+
+/// Conversion-only concrete MP4 recovery for the five Phase-4 list fields.
+///
+/// Keep this separate from `Mp4NativeMultiValueState`: that state is part of
+/// the editor's write-preservation machinery and intentionally covers only the
+/// two fields that the MP4 backend may write repeatedly. Source recovery has a
+/// broader job: it must retain every physical value found in the input even
+/// when a later MP3/M4A output will collapse that field by capability policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Mp4PipelineSetValuedTextState {
+    artist: Vec<String>,
+    album_artist: Vec<String>,
+    composer: Vec<String>,
+    performer: Vec<String>,
+    genre: Vec<String>,
+}
+
+fn mp4_pipeline_set_valued_text_state_from_mp4(
+    mp4: &lofty::mp4::Mp4File,
+) -> Mp4PipelineSetValuedTextState {
+    let Some(ilst) = mp4.ilst() else {
+        return Mp4PipelineSetValuedTextState::default();
+    };
+    let performer_ident = mp4_performer_atom_ident();
+    Mp4PipelineSetValuedTextState {
+        artist: mp4_native_text_values_for_ident(ilst, &MP4_ARTIST_ATOM_IDENT),
+        album_artist: mp4_native_text_values_for_ident(ilst, &MP4_ALBUM_ARTIST_ATOM_IDENT),
+        composer: mp4_native_text_values_for_ident(ilst, &MP4_COMPOSER_ATOM_IDENT),
+        performer: mp4_native_text_values_for_ident(ilst, &performer_ident),
+        genre: mp4_native_text_values_for_ident(ilst, &MP4_GENRE_ATOM_IDENT),
+    }
+}
+
+fn read_mp4_pipeline_set_valued_text_state(
+    path: &std::path::Path,
+) -> Result<Mp4PipelineSetValuedTextState, String> {
+    use lofty::file::AudioFile;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open MP4 metadata carrier '{}': {error}", path.display()))?;
+    let mp4 = lofty::mp4::Mp4File::read_from(
+        &mut file,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| {
+        format!(
+            "read concrete MP4 ilst metadata from '{}': {error}",
+            path.display()
+        )
+    })?;
+    Ok(mp4_pipeline_set_valued_text_state_from_mp4(&mp4))
+}
+
+/// Read the conversion pipeline's five ordered-list fields through the same
+/// canonical format mapping used by the editor. This deliberately has its own
+/// field set: the shipped editor registry excludes ALBUMARTIST, while Phase 4
+/// pipeline metadata must carry it losslessly for native repeating carriers.
+/// The editor registry itself remains unchanged.
+pub(crate) fn read_pipeline_set_valued_text_fields(
+    path: &std::path::Path,
+    tag: &lofty::tag::Tag,
+) -> (std::collections::BTreeMap<String, Vec<String>>, Vec<String>) {
+    use lofty::tag::{ItemValue, TagType};
+
+    let mut fields = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for item in tag.items() {
+        let display_key = canonical_editor_display_key(item.key(), tag.tag_type());
+        if !matches!(
+            display_key.as_str(),
+            "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+        ) {
+            continue;
+        }
+        let ItemValue::Text(value) = item.value() else {
+            continue;
+        };
+        let values = fields.entry(display_key).or_default();
+        if matches!(tag.tag_type(), TagType::Ape | TagType::Id3v2) && value.contains('\0') {
+            values.extend(value.split('\0').map(str::to_string));
+        } else {
+            values.push(value.clone());
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if tag.tag_type() == TagType::Mp4Ilst {
+        match read_mp4_pipeline_set_valued_text_state(path) {
+            Ok(state) => {
+                for (display_key, values) in [
+                    ("ARTIST", state.artist),
+                    ("ALBUMARTIST", state.album_artist),
+                    ("COMPOSER", state.composer),
+                    ("PERFORMER", state.performer),
+                    ("GENRE", state.genre),
+                ] {
+                    if !values.is_empty() {
+                        // Concrete ilst data is authoritative when present:
+                        // Lofty's generic Tag bridge can retain only a subset
+                        // of these physical values for some MP4 fields.
+                        fields.insert(display_key.to_string(), values);
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "Tag read: MP4 concrete multi-value recovery failed for '{}': {error}; generic metadata was retained",
+                path.display()
+            )),
+        }
+    }
+
+    (fields, warnings)
 }
 
 fn overlay_mp4_native_multivalue_editor_fields(
@@ -9336,6 +9459,12 @@ struct EditorTagChange {
     display_key: String,
     item_key: lofty::tag::ItemKey,
     values: Option<MetadataFieldValues>,
+    /// Whether this caller treats the logical field as an ordered value list.
+    /// Editor callers derive this from the shipped set-valued registry; the
+    /// conversion pipeline has its own five-field contract, which additionally
+    /// includes ALBUMARTIST. Keeping the bit on the change preserves the editor
+    /// registry exactly while still reusing every audited backend serializer.
+    list_semantics: bool,
 }
 
 fn editor_change_values_for_backend(
@@ -9343,7 +9472,7 @@ fn editor_change_values_for_backend(
     backend: crate::metadata_persistence::MetadataPersistenceBackend,
 ) -> Option<Vec<String>> {
     let values = change.values.as_ref()?;
-    if metadata_field_is_set_valued(&change.display_key)
+    if change.list_semantics
         && backend.supports_repeated_field(&change.display_key) {
         let values = values.to_texts();
         (!values.is_empty()).then_some(values)
@@ -9374,7 +9503,7 @@ fn repeated_instance_loss_warnings(
     let candidates = changes
         .iter()
         .filter(|change| {
-            metadata_field_is_set_valued(&change.display_key)
+            change.list_semantics
                 && change
                     .values
                     .as_ref()
@@ -9748,6 +9877,7 @@ fn apply_metadata_editor_tag_changes_internal(
                     display_key: entry.display_key.clone(),
                     item_key: entry.item_key.clone(),
                     values: None,
+                    list_semantics: metadata_field_is_set_valued(&entry.display_key),
                 });
             } else if file_idx < entry.values.len()
                 && file_idx < entry.originals.len()
@@ -9759,6 +9889,7 @@ fn apply_metadata_editor_tag_changes_internal(
                     display_key: entry.display_key.clone(),
                     item_key: entry.item_key.clone(),
                     values: Some(entry.values[file_idx].clone()),
+                    list_semantics: metadata_field_is_set_valued(&entry.display_key),
                 });
             }
         }
@@ -9773,6 +9904,12 @@ fn apply_metadata_editor_tag_changes_internal(
                     ),
                     item_key: key.clone(),
                     values: None,
+                    list_semantics: metadata_field_is_set_valued(
+                        &canonical_editor_display_key(
+                            key,
+                            lofty::tag::TagType::VorbisComments,
+                        ),
+                    ),
                 });
             }
         }
@@ -10000,6 +10137,99 @@ pub fn write_all_tags(
     write_all_tags_with_cancel(path, changes, None)
 }
 
+/// Public list-aware metadata write boundary for non-editor callers.
+///
+/// This is the multi-value analogue of [`write_all_tags`]. Callers provide
+/// ordered value lists, while this function owns conversion into the editor
+/// change model and therefore reuses the same backend capability gate, native
+/// APEv2/ID3v2.4/MP4 serializers, metadata journal, atomicity policy,
+/// post-write verification, and interoperability/collapse warnings as an
+/// interactive editor save. Empty lists delete the field.
+///
+/// The returned report is intentionally not discarded: conversion callers must
+/// surface `durability_warnings` so a backend's scalar projection can never be
+/// silent.
+fn public_list_writer_field_has_list_semantics(display_key: &str) -> bool {
+    metadata_field_is_set_valued(display_key)
+        || canonical_metadata_display_key(display_key) == "ALBUMARTIST"
+}
+
+pub fn write_all_tag_value_lists(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Vec<String>)],
+) -> Result<MetadataWriteCommitReport, String> {
+    if changes.is_empty() {
+        return Ok(MetadataWriteCommitReport::default());
+    }
+
+    let mut seen_fields = std::collections::BTreeSet::new();
+    let mut normalized = Vec::with_capacity(changes.len());
+    for (item_key, values) in changes {
+        let display_key = canonical_editor_display_key(
+            item_key,
+            lofty::tag::TagType::VorbisComments,
+        );
+        if !seen_fields.insert(display_key.clone()) {
+            return Err(format!(
+                "duplicate metadata field {display_key} in list-aware write request for '{}'",
+                path.display()
+            ));
+        }
+
+        let list_semantics = public_list_writer_field_has_list_semantics(&display_key);
+        if values.len() > 1 && !list_semantics {
+            return Err(format!(
+                "metadata field {display_key} is scalar and cannot accept {} values in one write request",
+                values.len()
+            ));
+        }
+        normalized.push((item_key, values, display_key, list_semantics));
+    }
+
+    let existing = read_all_tags(path)?;
+    let mut editor_changes = Vec::with_capacity(normalized.len());
+    for (item_key, values, display_key, list_semantics) in normalized {
+        let existed = existing.iter().any(|entry| {
+            canonical_metadata_display_key(&entry.display_key) == display_key
+        });
+        editor_changes.push(EditorTagChange {
+            tag_type: None,
+            existed,
+            display_key,
+            item_key: item_key.clone(),
+            values: (!values.is_empty()).then(|| {
+                MetadataFieldValues::from_stored_texts(values.iter().cloned())
+            }),
+            list_semantics,
+        });
+    }
+
+    let mut report = write_editor_tag_changes_with_cancel_report_classified(
+        path,
+        &editor_changes,
+        None,
+        None,
+    )
+    .map_err(MetadataWriteFailure::into_message)?;
+
+    // The interactive editor's established warning text remains unchanged.
+    // Phase 4 fixes the conversion reader, so only this conversion-facing
+    // boundary removes the now-stale claim that tonepoet itself sees one
+    // value. External interoperability cautions remain intact.
+    for warning in &mut report.durability_warnings {
+        *warning = warning
+            .replace(
+                "while common tools including ffmpeg and VLC and tonepoet conversion reads may expose only the first value",
+                "while common tools including ffmpeg and VLC may expose only the first value; tonepoet conversion preserves all values",
+            )
+            .replace(
+                "while ffmpeg, VLC, and tonepoet conversion reads see only the first value",
+                "while ffmpeg and VLC may expose only the first value; tonepoet conversion preserves all values",
+            );
+    }
+    Ok(report)
+}
+
 pub fn write_all_tags_with_cancel(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
@@ -10019,6 +10249,23 @@ fn write_all_tags_with_cancel_report_classified(
     >,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
     write_all_tags_with_cancel_report_classified_at_verification(
+        path,
+        changes,
+        cancel,
+        byte_progress,
+        tui_file_picker::VerificationMode::Strong,
+    )
+}
+
+fn write_editor_tag_changes_with_cancel_report_classified(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
+    write_editor_tag_changes_with_cancel_report_classified_at_verification(
         path,
         changes,
         cancel,
@@ -10275,15 +10522,20 @@ pub(crate) fn write_tag_value_lists_for_transfer_at_verification(
 ) -> Result<MetadataWriteCommitReport, String> {
     let changes = changes
         .iter()
-        .map(|(item_key, values, existed)| EditorTagChange {
-            tag_type: None,
-            existed: *existed,
-            display_key: canonical_editor_display_key(
+        .map(|(item_key, values, existed)| {
+            let display_key = canonical_editor_display_key(
                 item_key,
                 lofty::tag::TagType::VorbisComments,
-            ),
-            item_key: item_key.clone(),
-            values: values.clone(),
+            );
+            let list_semantics = metadata_field_is_set_valued(&display_key);
+            EditorTagChange {
+                tag_type: None,
+                existed: *existed,
+                display_key,
+                item_key: item_key.clone(),
+                values: values.clone(),
+                list_semantics,
+            }
         })
         .collect::<Vec<_>>();
     write_editor_tag_changes_with_cancel_report_classified_at_verification(
@@ -13408,7 +13660,7 @@ fn editor_changes_for_lofty_ape(
         .map(|change| {
             let value = match change.values.as_ref() {
                 None => None,
-                Some(values) if metadata_field_is_set_valued(&change.display_key)
+                Some(values) if change.list_semantics
                     && backend.supports_repeated_field(&change.display_key) =>
                 {
                     if values.values().iter().any(|value| value.text.contains('\0')) {
@@ -13859,7 +14111,7 @@ fn normalized_fixed_vocabulary_editor_changes(
                         change.display_key,
                     ));
                 }
-                if metadata_field_is_set_valued(&change.display_key)
+                if change.list_semantics
                     && backend.supports_repeated_field(&change.display_key)
                 {
                     let texts = values.texts().collect::<Vec<_>>();
@@ -13964,6 +14216,7 @@ fn normalize_existing_lofty_id3_serializer_sensitive_items(
                 display_key: display_key.clone(),
                 item_key: source_key.clone(),
                 values: Some(field.values.clone()),
+                list_semantics: metadata_field_is_set_valued(&display_key),
             };
             (fixed_vocabulary_persistence_key(backend, &source_change) != source_key.clone())
                 .then(|| source_key.clone())
@@ -13982,12 +14235,14 @@ fn normalize_existing_lofty_id3_serializer_sensitive_items(
         } else {
             serializer_unsafe_source_key.expect("serializer-sensitive source key")
         };
+        let list_semantics = metadata_field_is_set_valued(&display_key);
         let change = EditorTagChange {
             tag_type: Some(lofty::tag::TagType::Id3v2),
             existed: true,
             display_key,
             item_key,
             values: Some(field.values),
+            list_semantics,
         };
 
         let mut normalized = normalized_fixed_vocabulary_editor_changes(
@@ -17059,6 +17314,87 @@ mod tests {
         );
     }
 
+    fn pipeline_metadata_values(values: &crate::convert::pipeline::MetadataValueList) -> Vec<String> {
+        values.values().to_vec()
+    }
+
+    #[test]
+    fn pipeline_public_value_list_writer_round_trips_all_five_fields_on_wavpack() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-public-wavpack-multivalue");
+        let (_temp, path) = copy_numbering_fixture("pipeline-multi.wv", APE_NUMBERING_FIXTURE);
+        let changes = vec![
+            (ItemKey::TrackArtist, owned_test_values(&["A", "B", "A"])),
+            (ItemKey::AlbumArtist, owned_test_values(&["AA1", "AA2"])),
+            (ItemKey::Composer, owned_test_values(&["C1", "C2", "C1"])),
+            (ItemKey::Performer, owned_test_values(&["P1", "P2"])),
+            (ItemKey::Genre, owned_test_values(&["G1", "G2"])),
+        ];
+
+        let report = write_all_tag_value_lists(&path, &changes).expect("pipeline list write");
+        assert!(
+            !report
+                .durability_warnings
+                .iter()
+                .any(|warning| warning.contains("stores one value")),
+            "native WavPack fields must not collapse: {:?}",
+            report.durability_warnings
+        );
+
+        let (metadata, warnings, _fallback) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&path)
+                .expect("pipeline source read");
+        assert!(warnings.is_empty(), "unexpected source warnings: {warnings:?}");
+        assert_eq!(pipeline_metadata_values(&metadata.artist), owned_test_values(&["A", "B", "A"]));
+        assert_eq!(pipeline_metadata_values(&metadata.album_artist), owned_test_values(&["AA1", "AA2"]));
+        assert_eq!(pipeline_metadata_values(&metadata.composer), owned_test_values(&["C1", "C2", "C1"]));
+        assert_eq!(pipeline_metadata_values(&metadata.performer), owned_test_values(&["P1", "P2"]));
+        assert_eq!(pipeline_metadata_values(&metadata.genre), owned_test_values(&["G1", "G2"]));
+    }
+
+    #[test]
+    fn pipeline_albumartist_list_semantics_do_not_change_the_editor_registry() {
+        assert!(!metadata_field_is_set_valued("ALBUMARTIST"));
+        assert!(public_list_writer_field_has_list_semantics("ALBUMARTIST"));
+        assert!(
+            crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe
+                .supports_repeated_field("ALBUMARTIST")
+        );
+        assert!(
+            !crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+                .supports_repeated_field("ALBUMARTIST")
+        );
+        assert!(
+            !crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+                .supports_repeated_field("ALBUMARTIST")
+        );
+    }
+
+    #[test]
+    fn pipeline_public_value_list_writer_rejects_invalid_requests_before_io() {
+        use lofty::tag::ItemKey;
+
+        let missing = std::path::Path::new("/definitely/missing/tonepoet-phase4-validation.flac");
+        let scalar_error = write_all_tag_value_lists(
+            missing,
+            &[(ItemKey::TrackTitle, owned_test_values(&["One", "Two"]))],
+        )
+        .expect_err("scalar fields must reject repeated values before reading the file");
+        assert!(scalar_error.contains("TITLE"));
+        assert!(scalar_error.contains("scalar"));
+
+        let duplicate_error = write_all_tag_value_lists(
+            missing,
+            &[
+                (ItemKey::TrackArtist, owned_test_values(&["One"])),
+                (ItemKey::TrackArtist, owned_test_values(&["Two"])),
+            ],
+        )
+        .expect_err("duplicate logical fields must fail before reading the file");
+        assert!(duplicate_error.contains("duplicate metadata field ARTIST"));
+    }
+
     #[test]
     fn wavpack_multivalue_editor_round_trip_preserves_order_and_duplicates() {
         let _xdg = isolated_metadata_journal_home("tonepoet-wavpack-multivalue-round-trip");
@@ -17857,6 +18193,76 @@ mod tests {
         );
     }
 
+    fn assert_pipeline_fixed_vocabulary_public_writer(
+        file_name: &str,
+        fixture: &[u8],
+        expected_interop_fragment: &str,
+    ) {
+        use lofty::tag::ItemKey;
+
+        let (_temp, path) = copy_numbering_fixture(file_name, fixture);
+        let changes = vec![
+            (ItemKey::TrackArtist, owned_test_values(&["A", "B", "A"])),
+            (ItemKey::AlbumArtist, owned_test_values(&["AA1", "AA2"])),
+            (ItemKey::Composer, owned_test_values(&["C1", "C2", "C1"])),
+            (ItemKey::Performer, owned_test_values(&["P1", "P2"])),
+            (ItemKey::Genre, owned_test_values(&["G1", "G2"])),
+        ];
+
+        let report = write_all_tag_value_lists(&path, &changes).expect("pipeline fixed-vocabulary list write");
+        for supported in ["ARTIST", "COMPOSER"] {
+            assert!(
+                report.durability_warnings.iter().any(|warning| {
+                    warning.contains(supported) && warning.contains(expected_interop_fragment)
+                }),
+                "missing interoperability warning for {supported}: {:?}",
+                report.durability_warnings
+            );
+        }
+        for collapsed in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+            assert!(
+                report.durability_warnings.iter().any(|warning| {
+                    warning.contains(collapsed) && warning.contains("stores one value")
+                }),
+                "missing collapse warning for {collapsed}: {:?}",
+                report.durability_warnings
+            );
+        }
+
+        let (metadata, source_warnings, _fallback) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&path)
+                .expect("pipeline read-back");
+        assert!(source_warnings.is_empty(), "unexpected source warnings: {source_warnings:?}");
+        assert_eq!(pipeline_metadata_values(&metadata.artist), owned_test_values(&["A", "B", "A"]));
+        assert_eq!(pipeline_metadata_values(&metadata.composer), owned_test_values(&["C1", "C2", "C1"]));
+        assert_eq!(metadata.album_artist.len(), 1);
+        assert_eq!(metadata.performer.len(), 1);
+        assert_eq!(metadata.genre.len(), 1);
+        assert_eq!(metadata.album_artist.as_deref(), Some("AA1; AA2"));
+        assert_eq!(metadata.performer.as_deref(), Some("P1; P2"));
+        assert_eq!(metadata.genre.as_deref(), Some("G1; G2"));
+    }
+
+    #[test]
+    fn pipeline_public_value_list_writer_round_trips_mp3_matrix() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-public-mp3-multivalue");
+        assert_pipeline_fixed_vocabulary_public_writer(
+            "pipeline-multi.mp3",
+            ID3V2_NUMBERING_FIXTURE,
+            "ID3v2.4 multi-value",
+        );
+    }
+
+    #[test]
+    fn pipeline_public_value_list_writer_round_trips_m4a_matrix() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-public-m4a-multivalue");
+        assert_pipeline_fixed_vocabulary_public_writer(
+            "pipeline-multi.m4a",
+            MP4_NUMBERING_FIXTURE,
+            "MP4 ilst metadata atom",
+        );
+    }
+
     #[test]
     fn mp4_artist_and_composer_round_trip_as_canonical_multi_data_atoms() {
         let _xdg = isolated_metadata_journal_home("tonepoet-mp4-native-multivalue-roundtrip");
@@ -17993,6 +18399,128 @@ mod tests {
             mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
             vec![owned_test_values(&composer_values)],
         );
+    }
+
+    #[test]
+    fn pipeline_mp4_foreign_multi_data_reads_all_five_ordered_list_fields() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-mp4-five-field-source-read");
+        let (_temp, path) = copy_numbering_fixture(
+            "pipeline-foreign-five-field.m4a",
+            MP4_NUMBERING_FIXTURE,
+        );
+        let artist = ["Artist A", "Artist B", "Artist A"];
+        let album_artist = ["Album Artist A", "Album Artist B", "Album Artist A"];
+        let composer = ["Composer A", "Composer B", "Composer A"];
+        let performer = ["Performer A", "Performer B", "Performer A"];
+        let genre = ["Genre A", "Genre B", "Genre A"];
+
+        for (ident, values) in [
+            (MP4_ARTIST_ATOM_IDENT.clone(), &artist),
+            (MP4_ALBUM_ARTIST_ATOM_IDENT.clone(), &album_artist),
+            (MP4_COMPOSER_ATOM_IDENT.clone(), &composer),
+            (mp4_performer_atom_ident(), &performer),
+            (MP4_GENRE_ATOM_IDENT.clone(), &genre),
+        ] {
+            seed_mp4_native_multi_data_atom(&path, ident, values);
+        }
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&path)
+                .expect("pipeline MP4 source read");
+        assert!(!recovered, "ordinary MP4 source read must not use the APE fallback");
+        assert!(warnings.is_empty(), "unexpected MP4 source warnings: {warnings:?}");
+        assert_eq!(metadata.artist.values(), &owned_test_values(&artist));
+        assert_eq!(metadata.album_artist.values(), &owned_test_values(&album_artist));
+        assert_eq!(metadata.composer.values(), &owned_test_values(&composer));
+        assert_eq!(metadata.performer.values(), &owned_test_values(&performer));
+        assert_eq!(metadata.genre.values(), &owned_test_values(&genre));
+
+        // The editor's MP4 write-preservation state remains intentionally
+        // two-field. This test is conversion-read coverage, not a capability
+        // expansion for Phase 1-3 editor writes.
+        let editor_state = read_mp4_native_multivalue_state(&path)
+            .expect("read editor MP4 native multi-value state");
+        assert_eq!(editor_state.artist, owned_test_values(&artist));
+        assert_eq!(editor_state.composer, owned_test_values(&composer));
+        assert!(editor_state.values_for_display_key("ALBUMARTIST").is_none());
+        assert!(editor_state.values_for_display_key("PERFORMER").is_none());
+        assert!(editor_state.values_for_display_key("GENRE").is_none());
+
+        let recovered_changes = vec![
+            (ItemKey::TrackArtist, metadata.artist.values().to_vec()),
+            (ItemKey::AlbumArtist, metadata.album_artist.values().to_vec()),
+            (ItemKey::Composer, metadata.composer.values().to_vec()),
+            (ItemKey::Performer, metadata.performer.values().to_vec()),
+            (ItemKey::Genre, metadata.genre.values().to_vec()),
+        ];
+
+        let (_wavpack_temp, wavpack_path) =
+            copy_numbering_fixture("pipeline-recovered-five-field.wv", APE_NUMBERING_FIXTURE);
+        let wavpack_report = write_all_tag_value_lists(&wavpack_path, &recovered_changes)
+            .expect("persist recovered MP4 lists to WavPack");
+        assert!(
+            !wavpack_report
+                .durability_warnings
+                .iter()
+                .any(|warning| warning.contains("stores one value")),
+            "WavPack must retain all five recovered lists: {:?}",
+            wavpack_report.durability_warnings,
+        );
+        let (wavpack_metadata, wavpack_warnings, _) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &wavpack_path,
+            )
+            .expect("read recovered-list WavPack output");
+        assert!(wavpack_warnings.is_empty(), "{wavpack_warnings:?}");
+        assert_eq!(wavpack_metadata.artist.values(), metadata.artist.values());
+        assert_eq!(
+            wavpack_metadata.album_artist.values(),
+            metadata.album_artist.values()
+        );
+        assert_eq!(wavpack_metadata.composer.values(), metadata.composer.values());
+        assert_eq!(wavpack_metadata.performer.values(), metadata.performer.values());
+        assert_eq!(wavpack_metadata.genre.values(), metadata.genre.values());
+
+        let (_m4a_temp, m4a_path) =
+            copy_numbering_fixture("pipeline-recovered-five-field.m4a", MP4_NUMBERING_FIXTURE);
+        let m4a_report = write_all_tag_value_lists(&m4a_path, &recovered_changes)
+            .expect("persist recovered MP4 lists to M4A");
+        for supported in ["ARTIST", "COMPOSER"] {
+            assert!(
+                m4a_report
+                    .durability_warnings
+                    .iter()
+                    .any(|warning| warning.contains(supported) && warning.contains("MP4 ilst")),
+                "missing MP4 interoperability warning for {supported}: {:?}",
+                m4a_report.durability_warnings,
+            );
+        }
+        for collapsed in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+            assert!(
+                m4a_report
+                    .durability_warnings
+                    .iter()
+                    .any(|warning| warning.contains(collapsed) && warning.contains("stores one value")),
+                "missing M4A collapse warning for {collapsed}: {:?}",
+                m4a_report.durability_warnings,
+            );
+        }
+        let (m4a_metadata, m4a_warnings, _) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &m4a_path,
+            )
+            .expect("read recovered-list M4A output");
+        assert!(m4a_warnings.is_empty(), "{m4a_warnings:?}");
+        assert_eq!(m4a_metadata.artist.values(), metadata.artist.values());
+        assert_eq!(m4a_metadata.composer.values(), metadata.composer.values());
+        assert_eq!(m4a_metadata.album_artist.len(), 1);
+        assert_eq!(m4a_metadata.performer.len(), 1);
+        assert_eq!(m4a_metadata.genre.len(), 1);
+        assert_eq!(m4a_metadata.album_artist.as_deref(), Some("Album Artist A; Album Artist B; Album Artist A"));
+        assert_eq!(m4a_metadata.performer.as_deref(), Some("Performer A; Performer B; Performer A"));
+        assert_eq!(m4a_metadata.genre.as_deref(), Some("Genre A; Genre B; Genre A"));
     }
 
     #[test]

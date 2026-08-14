@@ -2685,12 +2685,12 @@ fn cue_segment_atrim_filter(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ImageAlbumMetadata {
     album: Option<String>,
-    album_artist: Option<String>,
-    artist: Option<String>,
-    genre: Option<String>,
+    album_artist: MetadataValueList,
+    artist: MetadataValueList,
+    genre: MetadataValueList,
     date: Option<String>,
-    composer: Option<String>,
-    performer: Option<String>,
+    composer: MetadataValueList,
+    performer: MetadataValueList,
     isrc: Option<String>,
     publisher: Option<String>,
     copyright: Option<String>,
@@ -2831,6 +2831,20 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
 
     let mut metadata = ImageAlbumMetadata::default();
     let tag_type = tag.tag_type();
+    let (mut set_values, set_value_warnings) =
+        crate::tui::probe::read_pipeline_set_valued_text_fields(path, tag);
+    for warning in set_value_warnings {
+        log::warn!("{warning}");
+    }
+    metadata.album_artist =
+        MetadataValueList::from_values(set_values.remove("ALBUMARTIST").unwrap_or_default());
+    metadata.artist = MetadataValueList::from_values(set_values.remove("ARTIST").unwrap_or_default());
+    metadata.genre = MetadataValueList::from_values(set_values.remove("GENRE").unwrap_or_default());
+    metadata.composer =
+        MetadataValueList::from_values(set_values.remove("COMPOSER").unwrap_or_default());
+    metadata.performer =
+        MetadataValueList::from_values(set_values.remove("PERFORMER").unwrap_or_default());
+
     for item in tag.items() {
         let key = normalized_lofty_item_key(item.key());
         let Some(value) = item.value().text().map(str::trim).filter(|value| !value.is_empty()) else {
@@ -2847,15 +2861,36 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
 
         match cue_image_tag_field(&key) {
             Some(ImageTagField::Album) => set_if_empty(&mut metadata.album, value),
-            Some(ImageTagField::AlbumArtist) => set_if_empty(&mut metadata.album_artist, value),
-            Some(ImageTagField::Artist) => set_if_empty(&mut metadata.artist, value),
-            Some(ImageTagField::Genre) => set_if_empty(&mut metadata.genre, value),
-            Some(ImageTagField::Date) => set_if_empty(&mut metadata.date, value),
-            Some(ImageTagField::Composer) => set_if_empty(&mut metadata.composer, value),
-            Some(ImageTagField::Performer) => {
-                set_if_empty(&mut metadata.performer, value);
-                set_if_empty(&mut metadata.artist, value);
+            Some(ImageTagField::AlbumArtist) => {
+                // The shared format-aware reader is authoritative for the five
+                // ordered-list fields. Preserve the old first-value fallback
+                // only for legacy aliases that its canonical mapping does not
+                // classify (for example an album-artist-sort carrier).
+                if metadata.album_artist.is_empty() {
+                    metadata.album_artist = MetadataValueList::from_scalar(value);
+                }
             }
+            Some(ImageTagField::Artist) => {
+                if metadata.artist.is_empty() {
+                    metadata.artist = MetadataValueList::from_scalar(value);
+                }
+            }
+            Some(ImageTagField::Genre) => {
+                if metadata.genre.is_empty() {
+                    metadata.genre = MetadataValueList::from_scalar(value);
+                }
+            }
+            Some(ImageTagField::Composer) => {
+                if metadata.composer.is_empty() {
+                    metadata.composer = MetadataValueList::from_scalar(value);
+                }
+            }
+            Some(ImageTagField::Performer) => {
+                if metadata.performer.is_empty() {
+                    metadata.performer = MetadataValueList::from_scalar(value);
+                }
+            }
+            Some(ImageTagField::Date) => set_if_empty(&mut metadata.date, value),
             Some(ImageTagField::Isrc) => set_if_empty(&mut metadata.isrc, value),
             Some(ImageTagField::Publisher) => set_if_empty(&mut metadata.publisher, value),
             Some(ImageTagField::Copyright) => set_if_empty(&mut metadata.copyright, value),
@@ -2876,6 +2911,12 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
                 }
             }
         }
+    }
+
+    if metadata.artist.is_empty() && !metadata.performer.is_empty() {
+        // Preserve the historical image PERFORMER -> ARTIST fallback, but copy
+        // the complete ordered list rather than only its first physical value.
+        metadata.artist = metadata.performer.clone();
     }
 
     if metadata.album.is_some()
@@ -3049,18 +3090,31 @@ fn cue_track_metadata(
         );
     }
 
-    let performer = cue_track
+    let performer = if let Some(value) = cue_track
         .performer
         .clone()
         .or_else(|| sheet.performer.clone())
-        .or_else(|| image.performer.clone())
-        .or_else(|| image.artist.clone())
-        .or_else(|| image.album_artist.clone());
-    let album_artist = sheet
-        .performer
-        .clone()
-        .or_else(|| image.album_artist.clone())
-        .or_else(|| image.artist.clone());
+    {
+        MetadataValueList::from_scalar(value)
+    } else if !image.performer.is_empty() {
+        image.performer.clone()
+    } else if !image.artist.is_empty() {
+        image.artist.clone()
+    } else {
+        image.album_artist.clone()
+    };
+    let album_artist = if let Some(value) = sheet.performer.clone() {
+        MetadataValueList::from_scalar(value)
+    } else if !image.album_artist.is_empty() {
+        image.album_artist.clone()
+    } else {
+        image.artist.clone()
+    };
+    let genre = if let Some(value) = sheet.genre.clone() {
+        MetadataValueList::from_scalar(value)
+    } else {
+        image.genre.clone()
+    };
 
     TrackMetadata {
         title: cue_track.title.clone(),
@@ -3068,7 +3122,7 @@ fn cue_track_metadata(
         album_artist,
         composer: image.composer.clone(),
         performer,
-        genre: sheet.genre.clone().or_else(|| image.genre.clone()),
+        genre,
         date: sheet.date.clone().or_else(|| image.date.clone()),
         track_number: Some(numbering.output_number),
         disc_number: None,
@@ -3123,14 +3177,23 @@ fn cue_album_metadata(
         extra.insert("image_metadata_source".to_string(), source.clone());
     }
 
+    let album_artist = if let Some(value) = sheet.performer.clone() {
+        MetadataValueList::from_scalar(value)
+    } else if !image.album_artist.is_empty() {
+        image.album_artist.clone()
+    } else {
+        image.artist.clone()
+    };
+    let genre = if let Some(value) = sheet.genre.clone() {
+        MetadataValueList::from_scalar(value)
+    } else {
+        image.genre.clone()
+    };
+
     AlbumMetadata {
         album: sheet.title.clone().or_else(|| image.album.clone()),
-        album_artist: sheet
-            .performer
-            .clone()
-            .or_else(|| image.album_artist.clone())
-            .or_else(|| image.artist.clone()),
-        genre: sheet.genre.clone().or_else(|| image.genre.clone()),
+        album_artist,
+        genre,
         date: sheet.date.clone().or_else(|| image.date.clone()),
         total_tracks,
         total_discs: image.total_discs,
@@ -5382,9 +5445,9 @@ FILE "side-b.flac" WAVE
     fn cue_metadata_uses_image_tags_only_for_cue_gaps() {
         let mut image = ImageAlbumMetadata::default();
         image.album = Some("Image Album".to_string());
-        image.album_artist = Some("Image Album Artist".to_string());
-        image.artist = Some("Image Artist".to_string());
-        image.genre = Some("Image Genre".to_string());
+        image.album_artist = MetadataValueList::from_scalar("Image Album Artist");
+        image.artist = MetadataValueList::from_scalar("Image Artist");
+        image.genre = MetadataValueList::from_scalar("Image Genre");
         image.date = Some("1984".to_string());
         image.disc_number = Some(1);
         image.total_discs = Some(2);
@@ -5998,6 +6061,172 @@ FILE "lofty-image.flac" WAVE
         assert!(embedded.contains("Embedded Cue Track One"));
     }
 
+
+    #[tokio::test]
+    async fn cue_image_materializer_preserves_complete_repeated_flac_lists_when_tools_are_available() {
+        let metaflac_available = std::process::Command::new("metaflac")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !fixture_tool_available("ffmpeg")
+            || !fixture_tool_available("ffprobe")
+            || !metaflac_available
+        {
+            eprintln!(
+                "skipping repeated CUE-image FLAC metadata fixture: ffmpeg/ffprobe/metaflac are required"
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue_path = temp.path().join("album.cue");
+        run_fixture_command(
+            std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("sine=frequency=440:sample_rate=44100:duration=1")
+                .arg("-c:a")
+                .arg("flac")
+                .arg(&image),
+        );
+        std::fs::write(
+            &cue_path,
+            br#"FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track"
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write minimal CUE sidecar");
+
+        let mut metaflac = std::process::Command::new("metaflac");
+        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "GENRE"] {
+            metaflac.arg(format!("--remove-tag={key}"));
+        }
+        for (key, value) in [
+            ("ARTIST", "A"),
+            ("ARTIST", "B"),
+            ("ARTIST", "A"),
+            ("ALBUMARTIST", "AA1"),
+            ("ALBUMARTIST", "AA2"),
+            ("ALBUMARTIST", "AA1"),
+            ("COMPOSER", "C1"),
+            ("COMPOSER", "C2"),
+            ("COMPOSER", "C1"),
+            ("PERFORMER", "P1"),
+            ("PERFORMER", "P2"),
+            ("PERFORMER", "P1"),
+            ("GENRE", "G1"),
+            ("GENRE", "G2"),
+            ("GENRE", "G1"),
+        ] {
+            metaflac.arg(format!("--set-tag={key}={value}"));
+        }
+        metaflac.arg(&image);
+        run_fixture_command(&mut metaflac);
+
+        let image_metadata = read_image_album_metadata(&image);
+        assert_eq!(image_metadata.artist.values(), &["A".to_string(), "B".to_string(), "A".to_string()]);
+        assert_eq!(image_metadata.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
+        assert_eq!(image_metadata.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
+        assert_eq!(image_metadata.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(image_metadata.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
+
+        let mut req = test_request(&image);
+        req.settings.metadata.preserve_artwork = false;
+        let mut staging = test_staging(&temp);
+        let runner = RealProcessToolRunner;
+        let prepared = CueImageMaterializer
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &HashMap::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("real CUE image materialization with repeated metadata");
+        staging.disarm();
+
+        assert_eq!(prepared.tracks.len(), 1);
+        let track = &prepared.tracks[0].metadata;
+        // Existing CUE-image precedence treats image PERFORMER as the first
+        // fallback for both track ARTIST and PERFORMER; preserve that rule but
+        // retain the complete list.
+        assert_eq!(track.artist.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(track.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(track.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
+        assert_eq!(track.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
+        assert_eq!(track.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
+        assert_eq!(prepared.album_metadata.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
+        assert_eq!(prepared.album_metadata.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
+    }
+
+    #[test]
+    fn cue_performer_and_genre_scalar_overrides_replace_image_lists() {
+        let image = ImageAlbumMetadata {
+            album_artist: vec!["AA1".to_string(), "AA2".to_string()].into(),
+            artist: vec!["A1".to_string(), "A2".to_string()].into(),
+            genre: vec!["G1".to_string(), "G2".to_string()].into(),
+            composer: vec!["C1".to_string(), "C2".to_string()].into(),
+            performer: vec!["P1".to_string(), "P2".to_string()].into(),
+            ..ImageAlbumMetadata::default()
+        };
+        let sheet = parse_cue(
+            "PERFORMER \"Cue Performer\"\nREM GENRE \"Cue Genre\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track\"\n    INDEX 01 00:00:00\n",
+        );
+        let numbering = cue_track_number_plan(&sheet);
+        let track = cue_track_metadata(&sheet.tracks[0], &sheet, &image, true, false, numbering[0]);
+        let album = cue_album_metadata(&sheet, &image, 1);
+
+        assert_eq!(track.artist.values(), &["Cue Performer".to_string()]);
+        assert_eq!(track.performer.values(), &["Cue Performer".to_string()]);
+        assert_eq!(track.album_artist.values(), &["Cue Performer".to_string()]);
+        assert_eq!(track.genre.values(), &["Cue Genre".to_string()]);
+        assert_eq!(track.composer.values(), &["C1".to_string(), "C2".to_string()]);
+        assert_eq!(album.album_artist.values(), &["Cue Performer".to_string()]);
+        assert_eq!(album.genre.values(), &["Cue Genre".to_string()]);
+    }
+
+    #[test]
+    fn image_album_metadata_merge_keeps_complete_first_non_empty_lists() {
+        let first = PathBuf::from("/album/side_a.flac");
+        let second = PathBuf::from("/album/side_b.flac");
+        let first_metadata = ImageAlbumMetadata {
+            artist: vec!["A", "B", "A"].into_iter().map(str::to_string).collect::<Vec<_>>().into(),
+            composer: vec!["C1", "C2", "C1"].into_iter().map(str::to_string).collect::<Vec<_>>().into(),
+            ..ImageAlbumMetadata::default()
+        };
+        let second_metadata = ImageAlbumMetadata {
+            artist: vec!["X".to_string(), "Y".to_string()].into(),
+            composer: vec!["Z".to_string()].into(),
+            genre: vec!["Second only".to_string(), "Second duplicate".to_string()].into(),
+            ..ImageAlbumMetadata::default()
+        };
+        let mut by_image = HashMap::new();
+        by_image.insert(path_identity(&first), first_metadata);
+        by_image.insert(path_identity(&second), second_metadata);
+
+        let merged = merge_image_album_metadata(&[first, second], &by_image);
+        assert_eq!(merged.artist.values(), &["A".to_string(), "B".to_string(), "A".to_string()]);
+        assert_eq!(merged.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
+        assert_eq!(
+            merged.genre.values(),
+            &["Second only".to_string(), "Second duplicate".to_string()],
+            "a later image may fill an empty field but must never combine lists across images",
+        );
+    }
 
     #[test]
     fn image_album_metadata_extra_merge_is_first_non_empty_and_conflict_safe() {
