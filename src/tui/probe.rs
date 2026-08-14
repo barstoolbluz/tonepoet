@@ -8273,6 +8273,106 @@ fn editor_fields_from_tagged_file(
     fields
 }
 
+const MP4_ARTIST_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
+    lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART");
+const MP4_COMPOSER_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
+    lofty::mp4::AtomIdent::Fourcc(*b"\xa9wrt");
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Mp4NativeMultiValueState {
+    artist: Vec<String>,
+    composer: Vec<String>,
+}
+
+impl Mp4NativeMultiValueState {
+    fn values_for_display_key(&self, display_key: &str) -> Option<&[String]> {
+        match canonical_metadata_display_key(display_key).as_str() {
+            "ARTIST" => Some(&self.artist),
+            "COMPOSER" => Some(&self.composer),
+            _ => None,
+        }
+    }
+}
+
+fn mp4_native_text_values_for_ident(
+    ilst: &lofty::mp4::Ilst,
+    ident: &lofty::mp4::AtomIdent<'_>,
+) -> Vec<String> {
+    ilst.into_iter()
+        .filter(|atom| atom.ident() == ident)
+        .flat_map(|atom| atom.data())
+        .filter_map(|data| match data {
+            lofty::mp4::AtomData::UTF8(value) | lofty::mp4::AtomData::UTF16(value) => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn mp4_native_multivalue_state_from_mp4(
+    mp4: &lofty::mp4::Mp4File,
+) -> Mp4NativeMultiValueState {
+    let Some(ilst) = mp4.ilst() else {
+        return Mp4NativeMultiValueState::default();
+    };
+    Mp4NativeMultiValueState {
+        artist: mp4_native_text_values_for_ident(ilst, &MP4_ARTIST_ATOM_IDENT),
+        composer: mp4_native_text_values_for_ident(ilst, &MP4_COMPOSER_ATOM_IDENT),
+    }
+}
+
+fn read_mp4_native_multivalue_state(
+    path: &std::path::Path,
+) -> Result<Mp4NativeMultiValueState, String> {
+    use lofty::file::AudioFile;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open MP4 metadata carrier '{}': {error}", path.display()))?;
+    let mp4 = lofty::mp4::Mp4File::read_from(
+        &mut file,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| {
+        format!(
+            "read native MP4 ilst metadata from '{}': {error}",
+            path.display()
+        )
+    })?;
+    Ok(mp4_native_multivalue_state_from_mp4(&mp4))
+}
+
+fn overlay_mp4_native_multivalue_editor_fields(
+    fields: &mut Vec<CanonicalEditorTagField>,
+    state: &Mp4NativeMultiValueState,
+) {
+    for (display_key, item_key, values) in [
+        ("ARTIST", lofty::tag::ItemKey::TrackArtist, &state.artist),
+        ("COMPOSER", lofty::tag::ItemKey::Composer, &state.composer),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        if let Some(field) = fields
+            .iter_mut()
+            .find(|field| field.display_key == display_key)
+        {
+            field.item_key = item_key;
+            field.values = MetadataFieldValues::from_stored_texts(values.iter().cloned());
+            field.is_binary = false;
+            field.stored_value_count = values.len();
+        } else {
+            fields.push(CanonicalEditorTagField {
+                item_key,
+                display_key: display_key.to_string(),
+                values: MetadataFieldValues::from_stored_texts(values.iter().cloned()),
+                is_binary: false,
+                stored_value_count: values.len(),
+            });
+        }
+    }
+}
+
 fn read_editor_metadata_file(
     path: &std::path::Path,
 ) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
@@ -8281,7 +8381,16 @@ fn read_editor_metadata_file(
     match lofty::read_from_path(path) {
         Ok(tagged) => {
             let metadata = source_metadata_from_tags(path, tagged.tags(), false);
-            let fields = editor_fields_from_tagged_file(path, &tagged);
+            let mut fields = editor_fields_from_tagged_file(path, &tagged);
+            if tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some() {
+                let state = read_mp4_native_multivalue_state(path).map_err(|reason| {
+                    MetadataReadIssue {
+                        kind: MetadataReadIssueKind::TagRead,
+                        reason,
+                    }
+                })?;
+                overlay_mp4_native_multivalue_editor_fields(&mut fields, &state);
+            }
             Ok((fields, metadata, None))
         }
         Err(err) if native_ape_error_is_eligible(&err) => match read_native_ape_fallback(path) {
@@ -9313,6 +9422,21 @@ fn id3_multivalue_interop_warning(display_key: &str, count: usize) -> String {
     )
 }
 
+fn mp4_multivalue_interop_warning(display_key: &str, count: usize) -> String {
+    format!(
+        "{display_key} has {count} values and was written as one MP4 ilst metadata atom with multiple data atoms; MP4-aware readers can see all values, while ffmpeg, VLC, and tonepoet conversion reads see only the first value",
+    )
+}
+
+fn mp4_native_multivalue_fields(state: &Mp4NativeMultiValueState) -> Vec<(String, usize)> {
+    [("ARTIST", state.artist.len()), ("COMPOSER", state.composer.len())]
+        .into_iter()
+        .filter_map(|(display_key, count)| {
+            (count > 1).then_some((display_key.to_string(), count))
+        })
+        .collect()
+}
+
 fn metadata_commit_report_from_dsf_value_write(
     report: crate::dsf_tags::DsfValueWriteReport,
 ) -> MetadataWriteCommitReport {
@@ -9400,9 +9524,24 @@ fn unrepresentable_container_warnings(
         .map(|tag| tag.tag_type());
     let normal_primary_type = tagged.primary_tag_type();
     let mut warnings = Vec::new();
+    let mp4_native_state = if tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some() {
+        match read_mp4_native_multivalue_state(path) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                warnings.push(format!(
+                    "saved metadata, but native MP4 multi-value verification failed for '{}': {error}",
+                    path.display(),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // O3 is about what the successful serializer actually wrote, not merely
-    // which fields were present in the edit request. Any Lofty ID3 save
+    // Interoperability warnings describe what the successful serializer
+    // actually wrote, not merely which fields appeared in the edit request.
+    // Any Lofty ID3 save
     // serializes the complete prepared ID3 tag, including multi-value fields
     // preserved during an unrelated edit. Re-use this post-commit read to
     // surface interoperability warnings for every supported multi-value frame
@@ -9410,6 +9549,11 @@ fn unrepresentable_container_warnings(
     if let Some(id3v2) = tagged.tag(lofty::tag::TagType::Id3v2) {
         for (display_key, count) in lofty_id3_multivalue_fields(id3v2) {
             warnings.push(id3_multivalue_interop_warning(&display_key, count));
+        }
+    }
+    if let Some(state) = mp4_native_state.as_ref() {
+        for (display_key, count) in mp4_native_multivalue_fields(state) {
+            warnings.push(mp4_multivalue_interop_warning(&display_key, count));
         }
     }
 
@@ -9430,16 +9574,27 @@ fn unrepresentable_container_warnings(
         ) {
             let canonical_key = canonical_metadata_display_key(&change.display_key);
             let expected = editor_change_values_for_backend(change, backend).unwrap_or_default();
-            let actual = tagged
-                .tag(target_type)
-                .map(canonical_editor_fields_from_tag)
-                .and_then(|fields| {
-                    fields
-                        .into_iter()
-                        .find(|field| field.display_key == canonical_key)
-                })
-                .map(|field| field.values.to_texts())
-                .unwrap_or_default();
+            let actual = if backend
+                == crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+                && backend.supports_repeated_field(&canonical_key)
+            {
+                mp4_native_state
+                    .as_ref()
+                    .and_then(|state| state.values_for_display_key(&canonical_key))
+                    .map(|values| values.to_vec())
+                    .unwrap_or_default()
+            } else {
+                tagged
+                    .tag(target_type)
+                    .map(canonical_editor_fields_from_tag)
+                    .and_then(|fields| {
+                        fields
+                            .into_iter()
+                            .find(|field| field.display_key == canonical_key)
+                    })
+                    .map(|field| field.values.to_texts())
+                    .unwrap_or_default()
+            };
             if actual != expected {
                 warnings.push(format!(
                     "{} did not round-trip through {} in '{}': requested {:?}, read back {:?}; save completed with a fidelity warning instead of silently accepting the mismatch",
@@ -9456,7 +9611,9 @@ fn unrepresentable_container_warnings(
     let is_wav = path
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("wave")
+        });
     if !is_wav {
         warnings.sort();
         warnings.dedup();
@@ -13193,19 +13350,12 @@ fn sanitize_id3v1_for_lofty_save(tagged: &mut lofty::file::TaggedFile) -> bool {
     !replacements.is_empty()
 }
 
-fn prepare_all_tags_lofty(
-    path: &std::path::Path,
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
-) -> Result<Option<lofty::file::TaggedFile>, String> {
-    let tagged = lofty::read_from_path(path)
-        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-    prepare_all_tags_lofty_from_tagged(tagged, changes, false)
-}
-
 fn prepare_all_tags_lofty_from_tagged(
+    path: &std::path::Path,
     mut tagged: lofty::file::TaggedFile,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
     clear_all: bool,
+    force_write: bool,
 ) -> Result<Option<lofty::file::TaggedFile>, String> {
     use lofty::file::TaggedFileExt;
 
@@ -13219,11 +13369,30 @@ fn prepare_all_tags_lofty_from_tagged(
         let tag_type = tagged.primary_tag_type();
         tagged.insert_tag(lofty::tag::Tag::new(tag_type));
     }
-    let tag = tagged
-        .primary_tag_mut()
-        .ok_or_else(|| "failed to create primary tag".to_string())?;
-    let changed = apply_changes_to_lofty_tag(tag, changes)?;
-    if !changed {
+    let primary_tag_type = tagged.primary_tag_type();
+    let mut changed = {
+        let tag = tagged
+            .primary_tag_mut()
+            .ok_or_else(|| "failed to create primary tag".to_string())?;
+        apply_changes_to_lofty_tag(tag, changes)?
+    };
+    if primary_tag_type == lofty::tag::TagType::Id3v2 {
+        let reconciliation_values = changes
+            .iter()
+            .filter_map(|(key, value)| {
+                let value = value
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())?;
+                Some((
+                    canonical_editor_display_key(key, lofty::tag::TagType::Id3v2),
+                    vec![value.to_string()],
+                ))
+            })
+            .collect::<Vec<_>>();
+        changed |= reconcile_wav_riff_info_shadow(path, &mut tagged, &reconciliation_values);
+    }
+    if !changed && !force_write {
         return Ok(None);
     }
     sanitize_id3v1_for_lofty_save(&mut tagged);
@@ -13374,6 +13543,302 @@ fn fixed_vocabulary_editor_persistence_key(
     persistence_key
 }
 
+fn resolved_editor_change_target_type(
+    tagged: &lofty::file::TaggedFile,
+    change: &EditorTagChange,
+) -> lofty::tag::TagType {
+    use lofty::file::TaggedFileExt;
+
+    let existing_preferred_type = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .map(|tag| tag.tag_type());
+    let normal_primary_type = tagged.primary_tag_type();
+    change.tag_type.unwrap_or_else(|| {
+        if change.existed {
+            existing_preferred_type.unwrap_or(normal_primary_type)
+        } else {
+            normal_primary_type
+        }
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct Mp4NativeMultiValueOverlay {
+    artist: Option<Vec<String>>,
+    composer: Option<Vec<String>>,
+    force_write: bool,
+}
+
+impl Mp4NativeMultiValueOverlay {
+    fn is_empty(&self) -> bool {
+        self.artist.is_none() && self.composer.is_none()
+    }
+}
+
+fn prepare_mp4_native_multivalue_overlay(
+    tagged: &lofty::file::TaggedFile,
+    state: &Mp4NativeMultiValueState,
+    changes: &[EditorTagChange],
+) -> (Vec<EditorTagChange>, Mp4NativeMultiValueOverlay) {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst;
+    let mut generic_changes = changes.to_vec();
+    let mut overlay = Mp4NativeMultiValueOverlay {
+        // Any generic MP4 rewrite would otherwise collapse a concrete
+        // multi-data atom to the first value. Preserve pre-existing lists even
+        // when the user edits an unrelated field. Separate same-fourcc atoms
+        // are intentionally canonicalized to one atom on the next real write.
+        artist: (state.artist.len() > 1).then(|| state.artist.clone()),
+        composer: (state.composer.len() > 1).then(|| state.composer.clone()),
+        force_write: false,
+    };
+
+    for change in &mut generic_changes {
+        if resolved_editor_change_target_type(tagged, change) != lofty::tag::TagType::Mp4Ilst {
+            continue;
+        }
+        let canonical_key = canonical_metadata_display_key(&change.display_key);
+        if !backend.supports_repeated_field(&canonical_key) {
+            continue;
+        }
+        let desired = editor_change_values_for_backend(change, backend).unwrap_or_default();
+        let current = state
+            .values_for_display_key(&canonical_key)
+            .unwrap_or_default();
+        overlay.force_write |= current != desired.as_slice();
+        match canonical_key.as_str() {
+            "ARTIST" => overlay.artist = Some(desired.clone()),
+            "COMPOSER" => overlay.composer = Some(desired.clone()),
+            _ => unreachable!("MP4 repeated-field capability must stay field-scoped"),
+        }
+
+        // Keep the established generic Tag path authoritative for every
+        // single-value MP4 field. For the two native list fields, feed that
+        // bridge only the first value, then apply the complete ordered list via
+        // concrete Ilst after serialization. This prevents the ID3 NUL-frame
+        // representation from leaking into MP4.
+        change.values = desired
+            .first()
+            .cloned()
+            .map(MetadataFieldValues::from_stored_text);
+    }
+
+    (generic_changes, overlay)
+}
+
+fn prepare_mp4_native_multivalue_overlay_for_primary_changes(
+    state: &Mp4NativeMultiValueState,
+    changes: &[(lofty::tag::ItemKey, Option<String>)],
+) -> Mp4NativeMultiValueOverlay {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst;
+    let mut overlay = Mp4NativeMultiValueOverlay {
+        artist: (state.artist.len() > 1).then(|| state.artist.clone()),
+        composer: (state.composer.len() > 1).then(|| state.composer.clone()),
+        force_write: false,
+    };
+
+    for (item_key, value) in changes {
+        let canonical_key = canonical_editor_display_key(item_key, lofty::tag::TagType::Mp4Ilst);
+        if !backend.supports_repeated_field(&canonical_key) {
+            continue;
+        }
+        let desired = value
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default();
+        let current = state
+            .values_for_display_key(&canonical_key)
+            .unwrap_or_default();
+        overlay.force_write |= current != desired.as_slice();
+        match canonical_key.as_str() {
+            "ARTIST" => overlay.artist = Some(desired),
+            "COMPOSER" => overlay.composer = Some(desired),
+            _ => unreachable!("MP4 repeated-field capability must stay field-scoped"),
+        }
+    }
+    overlay
+}
+
+fn mp4_ident_has_canonical_data_layout(
+    mp4: &lofty::mp4::Mp4File,
+    ident: &lofty::mp4::AtomIdent<'_>,
+    desired: &[String],
+) -> bool {
+    let Some(ilst) = mp4.ilst() else {
+        return desired.is_empty();
+    };
+    let mut matching = ilst.into_iter().filter(|atom| atom.ident() == ident);
+    if desired.is_empty() {
+        return matching.next().is_none();
+    }
+    let Some(atom) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    let data = atom.data().collect::<Vec<_>>();
+    if data.len() != desired.len() {
+        return false;
+    }
+    data.into_iter().zip(desired).all(|(data, desired)| match data {
+        lofty::mp4::AtomData::UTF8(value) | lofty::mp4::AtomData::UTF16(value) => value == desired,
+        _ => false,
+    })
+}
+
+fn apply_mp4_native_multivalue_overlay_to_mp4(
+    mp4: &mut lofty::mp4::Mp4File,
+    overlay: &Mp4NativeMultiValueOverlay,
+) -> bool {
+    let artist_changed = overlay.artist.as_ref().is_some_and(|values| {
+        !mp4_ident_has_canonical_data_layout(mp4, &MP4_ARTIST_ATOM_IDENT, values)
+    });
+    let composer_changed = overlay.composer.as_ref().is_some_and(|values| {
+        !mp4_ident_has_canonical_data_layout(mp4, &MP4_COMPOSER_ATOM_IDENT, values)
+    });
+    if !artist_changed && !composer_changed {
+        return false;
+    }
+
+    if mp4.ilst().is_none() {
+        mp4.set_ilst(lofty::mp4::Ilst::new());
+    }
+    let ilst = mp4
+        .ilst_mut()
+        .expect("MP4 ilst was created immediately before mutation");
+
+    for (ident, desired, changed) in [
+        (&MP4_ARTIST_ATOM_IDENT, overlay.artist.as_ref(), artist_changed),
+        (
+            &MP4_COMPOSER_ATOM_IDENT,
+            overlay.composer.as_ref(),
+            composer_changed,
+        ),
+    ] {
+        if !changed {
+            continue;
+        }
+        let desired = desired.expect("changed MP4 overlay entry must be present");
+        if desired.is_empty() {
+            ilst.retain(|atom| atom.ident() != ident);
+            continue;
+        }
+        let data = desired
+            .iter()
+            .cloned()
+            .map(lofty::mp4::AtomData::UTF8)
+            .collect::<Vec<_>>();
+        let atom = lofty::mp4::Atom::from_collection((*ident).clone(), data)
+            .expect("non-empty MP4 metadata collection must produce an atom");
+        ilst.retain(|existing| existing.ident() != ident);
+        ilst.insert(atom);
+    }
+    true
+}
+
+fn apply_mp4_native_multivalue_overlay_to_cursor(
+    carrier: &mut std::io::Cursor<Vec<u8>>,
+    overlay: &Mp4NativeMultiValueOverlay,
+) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::AudioFile;
+
+    if overlay.is_empty() {
+        return Ok(());
+    }
+    carrier.set_position(0);
+    let mut mp4 = lofty::mp4::Mp4File::read_from(
+        carrier,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| format!("re-read serialized MP4 metadata before native overlay: {error}"))?;
+    if !apply_mp4_native_multivalue_overlay_to_mp4(&mut mp4, overlay) {
+        return Ok(());
+    }
+    carrier.set_position(0);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mp4.save_to(carrier, WriteOptions::default())
+    }))
+    .map_err(|_| {
+        "write native MP4 multi-value ilst overlay: metadata dependency panicked".to_string()
+    })?
+    .map_err(|error| format!("write native MP4 multi-value ilst overlay: {error}"))
+}
+
+fn apply_mp4_native_multivalue_overlay_to_file(
+    file: &mut std::fs::File,
+    display_path: &std::path::Path,
+    overlay: &Mp4NativeMultiValueOverlay,
+) -> Result<u64, String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::AudioFile;
+    use std::io::Seek;
+
+    if overlay.is_empty() {
+        return Ok(0);
+    }
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "rewind MP4 metadata carrier '{}': {error}",
+            display_path.display()
+        )
+    })?;
+    let mut io = MetadataReplacementWriteCounter::new(file);
+    let mut mp4 = lofty::mp4::Mp4File::read_from(
+        &mut io,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| {
+        format!(
+            "re-read serialized MP4 metadata before native overlay in '{}': {error}",
+            display_path.display()
+        )
+    })?;
+    if !apply_mp4_native_multivalue_overlay_to_mp4(&mut mp4, overlay) {
+        return Ok(0);
+    }
+    io.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "rewind MP4 metadata carrier '{}': {error}",
+            display_path.display()
+        )
+    })?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mp4.save_to(&mut io, WriteOptions::default())
+    }))
+    .map_err(|_| {
+        format!(
+            "write native MP4 multi-value ilst overlay to '{}': metadata dependency panicked",
+            display_path.display()
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "write native MP4 multi-value ilst overlay to '{}': {error}",
+            display_path.display()
+        )
+    })?;
+    Ok(io.bytes_written())
+}
+
+fn apply_mp4_native_multivalue_overlay_to_path(
+    path: &std::path::Path,
+    overlay: &Mp4NativeMultiValueOverlay,
+) -> Result<u64, String> {
+    if overlay.is_empty() {
+        return Ok(0);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open MP4 metadata carrier '{}': {error}", path.display()))?;
+    apply_mp4_native_multivalue_overlay_to_file(&mut file, path, overlay)
+}
+
 fn normalized_fixed_vocabulary_editor_changes(
     backend: crate::metadata_persistence::MetadataPersistenceBackend,
     changes: &[EditorTagChange],
@@ -13398,6 +13863,15 @@ fn normalized_fixed_vocabulary_editor_changes(
                     && backend.supports_repeated_field(&change.display_key)
                 {
                     let texts = values.texts().collect::<Vec<_>>();
+                    if backend
+                        == crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+                        && texts.len() > 1
+                    {
+                        return Err(format!(
+                            "internal metadata invariant violated: MP4 {} multi-value must use the native ilst overlay path",
+                            change.display_key,
+                        ));
+                    }
                     (!texts.is_empty()).then(|| texts.join("\0"))
                 } else {
                     (!values.as_str().is_empty()).then(|| values.as_str().to_string())
@@ -13574,26 +14048,70 @@ fn apply_editor_changes_to_lofty_tag(
     apply_changes_to_lofty_tag(tag, &scalar_changes)
 }
 
+fn reconcile_wav_riff_info_shadow(
+    path: &std::path::Path,
+    tagged: &mut lofty::file::TaggedFile,
+    authoritative_id3_values: &[(String, Vec<String>)],
+) -> bool {
+    use lofty::file::TaggedFileExt;
+
+    if authoritative_id3_values.is_empty()
+        || !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("wave")
+            })
+    {
+        return false;
+    }
+    let Some(riff) = tagged.tag_mut(lofty::tag::TagType::RiffInfo) else {
+        return false;
+    };
+
+    // RIFF-INFO is semantically scalar. Keep an existing INFO field only when
+    // it is exactly the same single logical value as the authoritative ID3
+    // write. A multi-value ID3 field can never be equivalent to RIFF-INFO, and
+    // any differing scalar is a stale shadow, so remove every physical INFO
+    // item that canonicalizes to that field.
+    let riff_fields = canonical_editor_fields_from_tag(riff);
+    let conflicting_keys = authoritative_id3_values
+        .iter()
+        .filter_map(|(canonical_key, desired)| {
+            let existing = riff_fields
+                .iter()
+                .find(|field| field.display_key == *canonical_key)?
+                .values
+                .to_texts();
+            let identical_scalar = desired.len() == 1
+                && existing.len() == 1
+                && existing.first() == desired.first();
+            (!identical_scalar).then(|| canonical_key.clone())
+        })
+        .collect::<Vec<_>>();
+    if conflicting_keys.is_empty() {
+        return false;
+    }
+
+    let before = riff.items().count();
+    riff.retain(|item| {
+        let canonical = canonical_editor_display_key(item.key(), lofty::tag::TagType::RiffInfo);
+        !conflicting_keys.iter().any(|key| key == &canonical)
+    });
+    riff.items().count() != before
+}
+
 fn prepare_editor_tags_lofty_from_tagged(
+    path: &std::path::Path,
     mut tagged: lofty::file::TaggedFile,
     changes: &[EditorTagChange],
+    force_write: bool,
 ) -> Result<Option<lofty::file::TaggedFile>, String> {
     use lofty::file::TaggedFileExt;
 
-    let existing_preferred_type = tagged
-        .primary_tag()
-        .or_else(|| tagged.first_tag())
-        .map(|tag| tag.tag_type());
-    let normal_primary_type = tagged.primary_tag_type();
     let mut groups = Vec::<(lofty::tag::TagType, Vec<EditorTagChange>)>::new();
     for change in changes {
-        let target_type = change.tag_type.unwrap_or_else(|| {
-            if change.existed {
-                existing_preferred_type.unwrap_or(normal_primary_type)
-            } else {
-                normal_primary_type
-            }
-        });
+        let target_type = resolved_editor_change_target_type(&tagged, change);
         if let Some((_, grouped)) = groups
             .iter_mut()
             .find(|(tag_type, _)| *tag_type == target_type)
@@ -13610,7 +14128,29 @@ fn prepare_editor_tags_lofty_from_tagged(
             changed |= normalize_existing_lofty_id3_serializer_sensitive_items(id3v2)?;
         }
     }
+
+    let mut wav_id3_reconciliation_values = Vec::<(String, Vec<String>)>::new();
     for (tag_type, grouped) in groups {
+        if tag_type == lofty::tag::TagType::Id3v2 {
+            let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+            for change in &grouped {
+                let Some(values) = editor_change_values_for_backend(change, backend) else {
+                    // O3 reconciles an INFO shadow when tonepoet writes an ID3
+                    // value. Deletion retains the established Phase-2 warning
+                    // semantics rather than silently defining a new policy.
+                    continue;
+                };
+                let canonical_key = canonical_metadata_display_key(&change.display_key);
+                if let Some((_, existing_values)) = wav_id3_reconciliation_values
+                    .iter_mut()
+                    .find(|(existing_key, _)| existing_key == &canonical_key)
+                {
+                    *existing_values = values;
+                } else {
+                    wav_id3_reconciliation_values.push((canonical_key, values));
+                }
+            }
+        }
         if tagged.tag(tag_type).is_none() {
             if grouped.iter().all(|change| change.values.is_none()) {
                 continue;
@@ -13626,7 +14166,18 @@ fn prepare_editor_tags_lofty_from_tagged(
         changed |= apply_editor_changes_to_lofty_tag(tag, &grouped)?;
     }
 
-    if !changed {
+    // WAV can carry both ID3v2 and RIFF-INFO. For a non-empty ID3v2 value
+    // write, the ID3 list is authoritative; strip every contradictory INFO
+    // item that canonicalizes to that field. Deletions intentionally stay on
+    // the established warning-only path. The helper is extension-scoped and
+    // therefore cannot affect AIFF's independent AiffText carrier.
+    changed |= reconcile_wav_riff_info_shadow(
+        path,
+        &mut tagged,
+        &wav_id3_reconciliation_values,
+    );
+
+    if !changed && !force_write {
         return Ok(None);
     }
     sanitize_id3v1_for_lofty_save(&mut tagged);
@@ -13656,10 +14207,15 @@ fn write_all_tags_lofty_in_place(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Option<String>)],
 ) -> Result<bool, String> {
-    let Some(tagged) = prepare_all_tags_lofty(path, changes)? else {
+    let tagged = lofty::read_from_path(path)
+        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+    let Some(prepared) = prepare_lofty_write(path, tagged, LoftyWriteMode::Primary(changes))? else {
         return Ok(false);
     };
-    save_prepared_lofty_tags(path, &tagged)?;
+    save_prepared_lofty_tags(path, &prepared.tagged)?;
+    if let Some(overlay) = prepared.mp4_overlay.as_ref() {
+        let _ = apply_mp4_native_multivalue_overlay_to_path(path, overlay)?;
+    }
     Ok(true)
 }
 
@@ -14650,18 +15206,90 @@ enum LoftyWriteMode<'a> {
     ClearAll,
 }
 
+struct PreparedLoftyWrite {
+    tagged: lofty::file::TaggedFile,
+    mp4_overlay: Option<Mp4NativeMultiValueOverlay>,
+}
+
 fn prepare_lofty_write(
+    path: &std::path::Path,
     tagged: lofty::file::TaggedFile,
     mode: LoftyWriteMode<'_>,
-) -> Result<Option<lofty::file::TaggedFile>, String> {
+) -> Result<Option<PreparedLoftyWrite>, String> {
+    use lofty::file::TaggedFileExt;
+
     match mode {
         LoftyWriteMode::Primary(changes) => {
-            prepare_all_tags_lofty_from_tagged(tagged, changes, false)
+            let is_mp4_carrier = tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some()
+                || tagged.primary_tag_type() == lofty::tag::TagType::Mp4Ilst;
+            if !is_mp4_carrier {
+                return prepare_all_tags_lofty_from_tagged(
+                    path, tagged, changes, false, false,
+                )
+                .map(|prepared| {
+                    prepared.map(|tagged| PreparedLoftyWrite {
+                        tagged,
+                        mp4_overlay: None,
+                    })
+                });
+            }
+
+            let state = read_mp4_native_multivalue_state(path)?;
+            let overlay =
+                prepare_mp4_native_multivalue_overlay_for_primary_changes(&state, changes);
+            let force_write = overlay.force_write;
+            prepare_all_tags_lofty_from_tagged(path, tagged, changes, false, force_write).map(
+                |prepared| {
+                    prepared.map(|tagged| PreparedLoftyWrite {
+                        tagged,
+                        mp4_overlay: (!overlay.is_empty()).then_some(overlay),
+                    })
+                },
+            )
         }
         LoftyWriteMode::Editor(changes) => {
-            prepare_editor_tags_lofty_from_tagged(tagged, changes)
+            let is_mp4_carrier = tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some()
+                || tagged.primary_tag_type() == lofty::tag::TagType::Mp4Ilst;
+            if !is_mp4_carrier {
+                return prepare_editor_tags_lofty_from_tagged(path, tagged, changes, false).map(
+                    |prepared| {
+                        prepared.map(|tagged| PreparedLoftyWrite {
+                            tagged,
+                            mp4_overlay: None,
+                        })
+                    },
+                );
+            }
+
+            // The generic MP4 bridge cannot represent AtomDataStorage::Multiple
+            // and truncates it while reading. Snapshot the concrete ilst before
+            // generic preparation so every actual rewrite can restore untouched
+            // lists and explicit ARTIST/COMPOSER changes can be emitted natively.
+            let state = read_mp4_native_multivalue_state(path)?;
+            let (generic_changes, overlay) =
+                prepare_mp4_native_multivalue_overlay(&tagged, &state, changes);
+            let force_write = overlay.force_write;
+            prepare_editor_tags_lofty_from_tagged(
+                path,
+                tagged,
+                &generic_changes,
+                force_write,
+            )
+            .map(|prepared| {
+                prepared.map(|tagged| PreparedLoftyWrite {
+                    tagged,
+                    mp4_overlay: (!overlay.is_empty()).then_some(overlay),
+                })
+            })
         }
-        LoftyWriteMode::ClearAll => prepare_all_tags_lofty_from_tagged(tagged, &[], true),
+        LoftyWriteMode::ClearAll => {
+            prepare_all_tags_lofty_from_tagged(path, tagged, &[], true, false).map(|prepared| {
+                prepared.map(|tagged| PreparedLoftyWrite {
+                    tagged,
+                    mp4_overlay: None,
+                })
+            })
+        }
     }
 }
 
@@ -14711,7 +15339,7 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
 
     enum PreparedReplacement {
         InMemory(Vec<u8>),
-        Large(lofty::file::TaggedFile),
+        Large(lofty::file::TaggedFile, Option<Mp4NativeMultiValueOverlay>),
     }
 
     let snapshot = GenericMetadataReplacementSnapshot::capture(path)?;
@@ -14740,12 +15368,12 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
         let tagged = probe
             .read()
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
+        let Some(prepared) = prepare_lofty_write(path, tagged, mode)? else {
             return Ok(MetadataWriteCommitReport::clean());
         };
         let mut carrier = std::io::Cursor::new(bytes);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tagged.save_to(&mut carrier, WriteOptions::default())
+            prepared.tagged.save_to(&mut carrier, WriteOptions::default())
         }))
         .map_err(|_| {
             format!(
@@ -14756,6 +15384,9 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
         .map_err(|error| {
             format!("failed to serialize metadata for '{}': {error}", path.display())
         })?;
+        if let Some(overlay) = prepared.mp4_overlay.as_ref() {
+            apply_mp4_native_multivalue_overlay_to_cursor(&mut carrier, overlay)?;
+        }
         record_standard_metadata_write_strategy(strategy);
         PreparedReplacement::InMemory(carrier.into_inner())
     } else {
@@ -14769,11 +15400,11 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
             .read()
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
         record_metadata_source_parse(source.bytes_read());
-        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
+        let Some(prepared) = prepare_lofty_write(path, tagged, mode)? else {
             return Ok(MetadataWriteCommitReport::clean());
         };
         record_standard_metadata_write_strategy(strategy);
-        PreparedReplacement::Large(tagged)
+        PreparedReplacement::Large(prepared.tagged, prepared.mp4_overlay)
     };
 
     check_metadata_write_cancel(cancel, "before arming generic metadata replacement")?;
@@ -14789,7 +15420,7 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
                 .map_err(|error| format!("write metadata temp for '{}': {error}", path.display()))?;
             record_metadata_replacement_rewrite(bytes.len() as u64);
         }
-        PreparedReplacement::Large(tagged) => {
+        PreparedReplacement::Large(tagged, mp4_overlay) => {
             // Above the RAM guard, preserve bounded memory at the accepted ~2xS
             // floor: parse once, copy once, then rewrite the temp in place.
             check_metadata_write_cancel(cancel, "before copying large metadata carrier")?;
@@ -14821,6 +15452,21 @@ fn write_all_tags_lofty_standard_atomic_with_mode(
             // carrier, not its final length. This remains correct if a format
             // performs multiple writes, seeks, or in-place shifts internally.
             record_metadata_replacement_rewrite(rewritten_bytes);
+            if let Some(overlay) = mp4_overlay.as_ref() {
+                temp.as_file_mut().flush().map_err(|error| {
+                    format!(
+                        "flush metadata temp before MP4 ilst overlay for '{}': {error}",
+                        path.display()
+                    )
+                })?;
+                let temp_path = temp.path().to_path_buf();
+                let overlay_bytes = apply_mp4_native_multivalue_overlay_to_file(
+                    temp.as_file_mut(),
+                    &temp_path,
+                    overlay,
+                )?;
+                record_metadata_replacement_rewrite(overlay_bytes);
+            }
         }
     }
 
@@ -14891,7 +15537,7 @@ fn write_all_tags_lofty_with_backup_mode(
     // transient or residual backup artifact.
     let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-    let prepared = prepare_lofty_write(tagged, mode)?;
+    let prepared = prepare_lofty_write(path, tagged, mode)?;
     if prepared.is_none() {
         return Ok(None);
     }
@@ -14909,10 +15555,14 @@ fn write_all_tags_lofty_with_backup_mode(
     let write_result = (|| {
         let tagged = lofty::read_from_path(path)
             .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
-        let Some(tagged) = prepare_lofty_write(tagged, mode)? else {
+        let Some(prepared) = prepare_lofty_write(path, tagged, mode)? else {
             return Ok(());
         };
-        save_prepared_lofty_tags(path, &tagged)
+        save_prepared_lofty_tags(path, &prepared.tagged)?;
+        if let Some(overlay) = prepared.mp4_overlay.as_ref() {
+            let _ = apply_mp4_native_multivalue_overlay_to_path(path, overlay)?;
+        }
+        Ok(())
     })();
     match write_result {
         Ok(_) => match std::fs::remove_file(&backup) {
@@ -15888,7 +16538,6 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
-
     fn saved_warnings(
         result: &crate::tui::app::MetadataEditorWriteResult,
     ) -> &[String] {
@@ -15910,6 +16559,124 @@ mod tests {
                 && warning.contains("VLC")
                 && warning.contains("tonepoet conversion")
         }), "missing ID3 interoperability warning for {display_key}: {warnings:?}");
+    }
+
+    fn write_result_warnings(
+        result: &crate::tui::app::MetadataEditorWriteResult,
+    ) -> &[String] {
+        match &result.outcome {
+            crate::tui::app::MetadataEditorWriteOutcome::Saved => &[],
+            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => warnings,
+            other => panic!("expected successful metadata write, got {other:?}"),
+        }
+    }
+
+    fn assert_mp4_multivalue_interop_warning(
+        result: &crate::tui::app::MetadataEditorWriteResult,
+        display_key: &str,
+    ) {
+        let warnings = write_result_warnings(result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains(display_key)
+                && warning.contains("MP4 ilst")
+                && warning.contains("multiple data atoms")
+                && warning.contains("ffmpeg")
+                && warning.contains("VLC")
+                && warning.contains("tonepoet conversion")
+        }), "missing MP4 interoperability warning for {display_key}: {warnings:?}");
+        assert!(
+            !warnings.iter().any(|warning| {
+                warning.contains(display_key)
+                    && warning.contains("legacy joined representation")
+            }),
+            "native MP4 multi-value persistence must not report a legacy-join downgrade for {display_key}: {warnings:?}",
+        );
+    }
+
+    fn mp4_text_atom_groups(
+        path: &std::path::Path,
+        ident: &lofty::mp4::AtomIdent<'_>,
+    ) -> Vec<Vec<String>> {
+        use lofty::file::AudioFile;
+
+        let mut file = std::fs::File::open(path).expect("open MP4 fixture for physical assertion");
+        let mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse MP4 fixture for physical assertion");
+        let Some(ilst) = mp4.ilst() else {
+            return Vec::new();
+        };
+        ilst.into_iter()
+            .filter(|atom| atom.ident() == ident)
+            .map(|atom| {
+                atom.data()
+                    .filter_map(|data| match data {
+                        lofty::mp4::AtomData::UTF8(value)
+                        | lofty::mp4::AtomData::UTF16(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn seed_mp4_native_multi_data_atom(
+        path: &std::path::Path,
+        ident: lofty::mp4::AtomIdent<'static>,
+        values: &[&str],
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+
+        assert!(!values.is_empty());
+        let mut file = std::fs::File::open(path).expect("open MP4 fixture for native seed");
+        let mut mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse MP4 fixture for native seed");
+        drop(file);
+        if mp4.ilst().is_none() {
+            mp4.set_ilst(lofty::mp4::Ilst::new());
+        }
+        let data = values
+            .iter()
+            .map(|value| lofty::mp4::AtomData::UTF8((*value).to_string()))
+            .collect::<Vec<_>>();
+        let atom = lofty::mp4::Atom::from_collection(ident.clone(), data)
+            .expect("non-empty MP4 native seed atom");
+        let ilst = mp4.ilst_mut().expect("seeded MP4 ilst");
+        let _ = ilst.remove(&ident).count();
+        ilst.insert(atom);
+        mp4.save_to_path(path, WriteOptions::default())
+            .expect("save native MP4 multi-data seed");
+    }
+
+    fn seed_mp4_separate_same_fourcc_atoms(
+        path: &std::path::Path,
+        item_key: lofty::tag::ItemKey,
+        values: &[&str],
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemValue, Tag, TagItem, TagType};
+
+        let mut tagged = lofty::read_from_path(path).expect("read MP4 fixture for generic seed");
+        if tagged.tag(TagType::Mp4Ilst).is_none() {
+            tagged.insert_tag(Tag::new(TagType::Mp4Ilst));
+        }
+        let tag = tagged.tag_mut(TagType::Mp4Ilst).expect("seeded generic MP4 tag");
+        tag.remove_key(&item_key);
+        for value in values {
+            assert!(tag.push(TagItem::new(
+                item_key.clone(),
+                ItemValue::Text((*value).to_string()),
+            )));
+        }
+        tagged.save_to_path(path, WriteOptions::default())
+            .expect("save separate-same-fourcc MP4 seed");
     }
 
     fn embedded_id3v2_bytes(path: &std::path::Path) -> Vec<u8> {
@@ -16097,6 +16864,26 @@ mod tests {
         canonical_editor_fields_from_tag(tag)
             .into_iter()
             .find(|field| field.display_key == display_key)
+            .map(|field| field.values.to_texts())
+            .unwrap_or_default()
+    }
+
+    fn editor_values_in_optional_lofty_tag(
+        path: &std::path::Path,
+        tag_type: lofty::tag::TagType,
+        display_key: &str,
+    ) -> Vec<String> {
+        use lofty::file::TaggedFileExt;
+
+        let tagged = lofty::read_from_path(path).expect("read tagged file for optional container assertion");
+        tagged
+            .tag(tag_type)
+            .map(canonical_editor_fields_from_tag)
+            .and_then(|fields| {
+                fields
+                    .into_iter()
+                    .find(|field| field.display_key == display_key)
+            })
             .map(|field| field.values.to_texts())
             .unwrap_or_default()
     }
@@ -17071,20 +17858,279 @@ mod tests {
     }
 
     #[test]
-    fn mp4_multivalue_remains_scalar_and_surfaces_cardinality_warning() {
-        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-multivalue-remains-scalar");
+    fn mp4_artist_and_composer_round_trip_as_canonical_multi_data_atoms() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-native-multivalue-roundtrip");
+        let (_temp, path) = copy_numbering_fixture("native-multi.m4a", MP4_NUMBERING_FIXTURE);
+        let artist_values = ["Alice", "Alice", "Bob"];
+        let composer_values = ["Carol", "Dave", "Dave"];
+
+        let result = apply_editor_list_change(&path, "ARTIST", &artist_values, &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
+        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&artist_values)],
+            "tonepoet MP4 ARTIST must be one atom containing all data atoms",
+        );
+
+        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
+        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            vec![owned_test_values(&composer_values)],
+            "tonepoet MP4 COMPOSER must be one atom containing all data atoms",
+        );
+
+        let before = std::fs::read(&path).expect("snapshot MP4 multi-value carrier");
+        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
+        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated MP4 multi-value save"),
+            before,
+            "repeating an already-satisfied MP4 multi-value edit must be byte-identical",
+        );
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Unrelated edit"], &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
+        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&artist_values)],
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            vec![owned_test_values(&composer_values)],
+        );
+    }
+
+    #[test]
+    fn scalar_mp4_artist_and_composer_do_not_emit_multivalue_interop_warning() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-scalar-no-multivalue-warning");
         let (_temp, path) = copy_numbering_fixture("scalar.m4a", MP4_NUMBERING_FIXTURE);
-        let result = apply_editor_list_change(&path, "ARTIST", &["Alice", "Bob"], &[]);
-        let warnings = saved_warnings(&result);
-        assert!(warnings.iter().any(|warning| {
-            warning.contains("ARTIST")
-                && warning.contains("Lofty MP4 ilst")
-                && warning.contains("legacy joined representation")
-        }), "missing MP4 scalar-projection warning: {warnings:?}");
+
+        for (display_key, value) in [("ARTIST", "Solo Artist"), ("COMPOSER", "Solo Composer")] {
+            let result = apply_editor_list_change(&path, display_key, &[value], &[]);
+            let warnings = write_result_warnings(&result);
+            assert!(
+                !warnings.iter().any(|warning| {
+                    warning.contains(display_key)
+                        && warning.contains("MP4 ilst")
+                        && warning.contains("first value")
+                }),
+                "scalar MP4 {display_key} must not emit the multi-value interoperability warning: {warnings:?}",
+            );
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                vec![value.to_string()],
+            );
+        }
+    }
+
+    #[test]
+    fn mp4_foreign_multi_data_atoms_read_all_values_and_survive_edit() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-foreign-multidata-read");
+        let (_temp, path) = copy_numbering_fixture("foreign-multidata.m4a", MP4_NUMBERING_FIXTURE);
+        let artist_values = ["Foreign Artist A", "Foreign Artist A", "Foreign Artist B"];
+        let composer_values = [
+            "Foreign Composer A",
+            "Foreign Composer B",
+            "Foreign Composer A",
+        ];
+        seed_mp4_native_multi_data_atom(
+            &path,
+            MP4_ARTIST_ATOM_IDENT.clone(),
+            &artist_values,
+        );
+        seed_mp4_native_multi_data_atom(
+            &path,
+            MP4_COMPOSER_ATOM_IDENT.clone(),
+            &composer_values,
+        );
+
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&artist_values)],
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            vec![owned_test_values(&composer_values)],
+        );
         assert_eq!(
             editor_slot_values(&path, "ARTIST"),
-            vec!["Alice; Bob".to_string()],
+            owned_test_values(&artist_values),
         );
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Edited title"], &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
+        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            editor_slot_values(&path, "ARTIST"),
+            owned_test_values(&artist_values),
+        );
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&artist_values)],
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            vec![owned_test_values(&composer_values)],
+        );
+    }
+
+    #[test]
+    fn mp4_foreign_separate_same_fourcc_atoms_read_all_values_and_canonicalize_on_edit() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-foreign-separate-read");
+        let (_temp, path) = copy_numbering_fixture("foreign-separate.m4a", MP4_NUMBERING_FIXTURE);
+        let artist_values = ["Separate Artist A", "Separate Artist A", "Separate Artist B"];
+        let composer_values = [
+            "Separate Composer A",
+            "Separate Composer B",
+            "Separate Composer A",
+        ];
+        seed_mp4_separate_same_fourcc_atoms(&path, ItemKey::TrackArtist, &artist_values);
+        seed_mp4_separate_same_fourcc_atoms(&path, ItemKey::Composer, &composer_values);
+
+        let expected_artist_groups = artist_values
+            .iter()
+            .map(|value| vec![(*value).to_string()])
+            .collect::<Vec<_>>();
+        let expected_composer_groups = composer_values
+            .iter()
+            .map(|value| vec![(*value).to_string()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            expected_artist_groups,
+            "fixture must prove the foreign ARTIST N-separate-atoms layout",
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            expected_composer_groups,
+            "fixture must prove the foreign COMPOSER N-separate-atoms layout",
+        );
+        assert_eq!(
+            editor_slot_values(&path, "ARTIST"),
+            owned_test_values(&artist_values),
+        );
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Edited title"], &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
+        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            editor_slot_values(&path, "ARTIST"),
+            owned_test_values(&artist_values),
+        );
+        assert_eq!(
+            editor_slot_values(&path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&artist_values)],
+            "any real tonepoet rewrite should normalize preserved ARTIST to one canonical atom",
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
+            vec![owned_test_values(&composer_values)],
+            "any real tonepoet rewrite should normalize preserved COMPOSER to one canonical atom",
+        );
+    }
+
+    #[test]
+    fn primary_mp4_scalar_write_preserves_unrelated_native_multivalue_and_replaces_explicit_artist() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-primary-preservation");
+        let (_temp, path) = copy_numbering_fixture("primary-preserve.m4a", MP4_NUMBERING_FIXTURE);
+        let values = ["Native A", "Native A", "Native B"];
+        seed_mp4_native_multi_data_atom(&path, MP4_ARTIST_ATOM_IDENT.clone(), &values);
+
+        write_all_tags(
+            &path,
+            &[(ItemKey::TrackTitle, Some("Primary title edit".to_string()))],
+        )
+        .expect("primary MP4 title write");
+        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&values));
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&values)],
+        );
+
+        write_all_tags(
+            &path,
+            &[(ItemKey::TrackArtist, Some("Scalar replacement".to_string()))],
+        )
+        .expect("primary MP4 scalar artist write");
+        assert_eq!(
+            editor_slot_values(&path, "ARTIST"),
+            vec!["Scalar replacement".to_string()],
+        );
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![vec!["Scalar replacement".to_string()]],
+        );
+    }
+
+    #[test]
+    fn mp4_database_backed_scalar_write_preserves_native_multivalue() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-database-scalar-preservation");
+        let (_temp, path) = copy_numbering_fixture("database-preserve.m4a", MP4_NUMBERING_FIXTURE);
+        let values = ["Database A", "Database A", "Database B"];
+        seed_mp4_native_multi_data_atom(&path, MP4_ARTIST_ATOM_IDENT.clone(), &values);
+
+        write_all_tags_without_full_file_backup(
+            &path,
+            &[(ItemKey::TrackTitle, Some("Database-backed title edit".to_string()))],
+        )
+        .expect("database-backed MP4 scalar write");
+
+        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&values));
+        assert_eq!(
+            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
+            vec![owned_test_values(&values)],
+            "database-backed scalar metadata writes must not collapse native MP4 lists",
+        );
+    }
+
+    #[test]
+    fn performer_arranger_genre_and_lyricist_remain_single_value_on_mp4_this_phase() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-deferred-set-valued-fields");
+        let (_temp, path) = copy_numbering_fixture("deferred.m4a", MP4_NUMBERING_FIXTURE);
+        for display_key in ["PERFORMER", "ARRANGER", "GENRE", "LYRICIST"] {
+            let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
+            let warnings = saved_warnings(&result);
+            assert!(warnings.iter().any(|warning| warning.contains(display_key)));
+            assert!(warnings
+                .iter()
+                .any(|warning| warning.contains("legacy joined representation")));
+            assert_eq!(editor_slot_values(&path, display_key), vec!["One; Two".to_string()]);
+        }
     }
 
     #[test]
@@ -17129,12 +18175,12 @@ mod tests {
     }
 
     #[test]
-    fn wav_riff_info_shadowing_of_saved_id3_value_is_surfaced() {
+    fn wav_riff_info_artist_shadow_is_reconciled_when_scalar_id3_value_is_saved() {
         use lofty::tag::{ItemKey, TagType};
 
-        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-shadow-warning");
-        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV tempdir");
-        let path = temp.path().join("shadow.wav");
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-artist-shadow-reconcile");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV ARTIST tempdir");
+        let path = temp.path().join("artist-shadow.wav");
         write_minimal_pcm_wav(&path);
         seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackArtist, "Old RIFF Artist");
         seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
@@ -17147,24 +18193,96 @@ mod tests {
             &["New ID3 Artist"],
             &["Old ID3 Artist"],
         );
-        let warnings = saved_warnings(&result);
-        assert!(warnings.iter().any(|warning| {
-            warning.contains("RIFF INFO ARTIST")
-                && warning.contains("Old RIFF Artist")
-                && warning.contains("RIFF-preferring")
-        }), "missing RIFF/ID3 shadow warning: {warnings:?}");
+        let warnings = write_result_warnings(&result);
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("RIFF INFO ARTIST")),
+            "reconciled RIFF ARTIST must not survive to trigger a shadow warning: {warnings:?}",
+        );
         assert_eq!(
             editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST"),
             vec!["New ID3 Artist".to_string()],
         );
-        assert_eq!(
-            editor_values_in_lofty_tag(&path, TagType::RiffInfo, "ARTIST"),
-            vec!["Old RIFF Artist".to_string()],
+        assert!(
+            editor_values_in_optional_lofty_tag(&path, TagType::RiffInfo, "ARTIST").is_empty(),
+            "stale RIFF ARTIST must be stripped after the authoritative scalar ID3 write",
         );
     }
 
     #[test]
-    fn wav_riff_info_shadowing_after_id3_deletion_is_surfaced() {
+    fn wav_riff_info_composer_shadow_is_reconciled_when_scalar_id3_value_is_saved() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-composer-shadow-reconcile");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV COMPOSER tempdir");
+        let path = temp.path().join("composer-shadow.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::Composer, "Old RIFF Composer");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::Composer, "Old ID3 Composer");
+
+        let result = apply_editor_typed_list_change_in_tag(
+            &path,
+            TagType::Id3v2,
+            "COMPOSER",
+            ItemKey::Composer,
+            &["New ID3 Composer"],
+            &["Old ID3 Composer"],
+        );
+        let warnings = write_result_warnings(&result);
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("RIFF INFO COMPOSER")),
+            "reconciled RIFF COMPOSER must not survive to trigger a shadow warning: {warnings:?}",
+        );
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "COMPOSER"),
+            vec!["New ID3 Composer".to_string()],
+        );
+        assert!(
+            editor_values_in_optional_lofty_tag(&path, TagType::RiffInfo, "COMPOSER").is_empty(),
+            "stale RIFF COMPOSER must be stripped after the authoritative scalar ID3 write",
+        );
+    }
+
+    #[test]
+    fn wav_riff_info_artist_shadow_is_reconciled_when_multivalue_id3_is_saved() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-multivalue-shadow-reconcile");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV multi-value tempdir");
+        let path = temp.path().join("multi-shadow.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackArtist, "Old RIFF Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
+
+        let result = apply_editor_typed_list_change_in_tag(
+            &path,
+            TagType::Id3v2,
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["New ID3 Artist", "Second ID3 Artist", "New ID3 Artist"],
+            &["Old ID3 Artist"],
+        );
+        assert_id3_multivalue_interop_warning(&result, "ARTIST");
+        let warnings = write_result_warnings(&result);
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("RIFF INFO ARTIST")),
+            "reconciled RIFF ARTIST must not survive to trigger a shadow warning: {warnings:?}",
+        );
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST"),
+            vec![
+                "New ID3 Artist".to_string(),
+                "Second ID3 Artist".to_string(),
+                "New ID3 Artist".to_string(),
+            ],
+        );
+        assert!(
+            editor_values_in_optional_lofty_tag(&path, TagType::RiffInfo, "ARTIST").is_empty(),
+            "stale RIFF ARTIST must be stripped after the authoritative multi-value ID3 write",
+        );
+    }
+
+    #[test]
+    fn wav_riff_info_shadow_after_id3_deletion_is_surfaced_and_preserved() {
         use lofty::tag::{ItemKey, TagType};
 
         let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-delete-shadow-warning");
@@ -17182,13 +18300,14 @@ mod tests {
             ItemKey::TrackArtist,
             "Old ID3 Artist",
         );
-        let warnings = saved_warnings(&result);
-        assert!(warnings.iter().any(|warning| {
-            warning.contains("RIFF INFO ARTIST")
-                && warning.contains("Old RIFF Artist")
-                && warning.contains("deleting the ID3v2 value")
-                && warning.contains("RIFF-preferring")
-        }), "missing RIFF/ID3 deletion shadow warning: {warnings:?}");
+        let warnings = write_result_warnings(&result);
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains("RIFF INFO ARTIST")
+                    && warning.contains("after deleting the ID3v2 value")
+            }),
+            "ID3 deletion must retain the established RIFF shadow warning: {warnings:?}",
+        );
         assert!(
             editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST").is_empty(),
             "deleted ID3 ARTIST must remain absent",
@@ -17198,8 +18317,36 @@ mod tests {
             vec!["Keep ID3 title".to_string()],
         );
         assert_eq!(
-            editor_values_in_lofty_tag(&path, TagType::RiffInfo, "ARTIST"),
+            editor_values_in_optional_lofty_tag(&path, TagType::RiffInfo, "ARTIST"),
             vec!["Old RIFF Artist".to_string()],
+            "ID3 deletion is out of O3 reconciliation scope; the RIFF shadow remains and is surfaced",
+        );
+    }
+
+    #[test]
+    fn wav_primary_id3_write_also_reconciles_riff_info_shadow() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-primary-id3-shadow-reconcile");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 primary-write WAV tempdir");
+        let path = temp.path().join("primary-shadow.wave");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackArtist, "Old RIFF Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
+
+        write_all_tags(
+            &path,
+            &[(ItemKey::TrackArtist, Some("New primary ID3 Artist".to_string()))],
+        )
+        .expect("primary WAV ID3 write");
+
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST"),
+            vec!["New primary ID3 Artist".to_string()],
+        );
+        assert!(
+            editor_values_in_optional_lofty_tag(&path, TagType::RiffInfo, "ARTIST").is_empty(),
+            "shared primary ID3 write path must strip the stale RIFF shadow too",
         );
     }
 

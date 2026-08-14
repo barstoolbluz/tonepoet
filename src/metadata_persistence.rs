@@ -767,9 +767,9 @@ impl MetadataPersistenceBackend {
             | Self::NativeWavPackApe
             | Self::LoftyVorbisComments
             | Self::LoftyId3v2
+            | Self::LoftyMp4Ilst
             | Self::LoftyApe => true,
-            Self::LoftyMp4Ilst
-            | Self::ReadOnlyApeFamily
+            Self::ReadOnlyApeFamily
             | Self::UnsupportedDff
             | Self::UnclassifiedLofty => false,
         }
@@ -779,22 +779,22 @@ impl MetadataPersistenceBackend {
     /// the specific canonical editor field.
     ///
     /// Vorbis comments and APEv2 are natively list-capable for arbitrary keys.
-    /// This phase deliberately scopes ID3v2.4 multi-value serialization to
+    /// ID3v2.4 and MP4 ilst deliberately scope multi-value serialization to
     /// ARTIST and COMPOSER. GENRE remains scalar because a bare numeric TCON
-    /// value is interpreted through ID3v1 genre numbering on read; LYRICIST is
-    /// kept scalar with the Writer/Lyricist ownership split; PERFORMER and
-    /// ARRANGER remain single-value until their role-aware value model lands.
+    /// value is interpreted through ID3v1 genre numbering on ID3 read and has
+    /// corresponding fixed-vocabulary hazards on MP4; LYRICIST is kept scalar
+    /// with the Writer/Lyricist ownership split; PERFORMER and ARRANGER remain
+    /// single-value until their role-aware value model lands.
     pub fn supports_repeated_field(self, canonical_display_key: &str) -> bool {
         match self {
             Self::NativeFlacVorbis
             | Self::NativeWavPackApe
             | Self::LoftyVorbisComments
             | Self::LoftyApe => true,
-            Self::NativeDsfId3 | Self::LoftyId3v2 => {
+            Self::NativeDsfId3 | Self::LoftyId3v2 | Self::LoftyMp4Ilst => {
                 matches!(canonical_display_key, "ARTIST" | "COMPOSER")
             }
-            Self::LoftyMp4Ilst
-            | Self::ReadOnlyApeFamily
+            Self::ReadOnlyApeFamily
             | Self::UnsupportedDff
             | Self::UnclassifiedLofty => false,
         }
@@ -2037,12 +2037,12 @@ mod tests {
             MetadataPersistenceBackend::NativeWavPackApe,
             MetadataPersistenceBackend::LoftyVorbisComments,
             MetadataPersistenceBackend::LoftyId3v2,
+            MetadataPersistenceBackend::LoftyMp4Ilst,
             MetadataPersistenceBackend::LoftyApe,
         ] {
             assert!(backend.supports_repeated_instances(), "{backend:?}");
         }
         for backend in [
-            MetadataPersistenceBackend::LoftyMp4Ilst,
             MetadataPersistenceBackend::ReadOnlyApeFamily,
             MetadataPersistenceBackend::UnsupportedDff,
             MetadataPersistenceBackend::UnclassifiedLofty,
@@ -2060,7 +2060,12 @@ mod tests {
         assert!(MetadataPersistenceBackend::NativeDsfId3.supports_repeated_field("ARTIST"));
         assert!(MetadataPersistenceBackend::NativeDsfId3.supports_repeated_field("COMPOSER"));
         assert!(!MetadataPersistenceBackend::NativeDsfId3.supports_repeated_field("LYRICIST"));
-        assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("ARTIST"));
+        assert!(MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("ARTIST"));
+        assert!(MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("COMPOSER"));
+        assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("LYRICIST"));
+        assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("GENRE"));
+        assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("PERFORMER"));
+        assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("ARRANGER"));
     }
 
     #[test]
