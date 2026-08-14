@@ -69,6 +69,33 @@ pub struct DsfTagChange {
     pub value: Option<String>,
 }
 
+/// Ordered logical values for one DSF/ID3 metadata field.
+///
+/// The scalar writer remains the compatibility boundary for callers that own
+/// only one value. The metadata editor uses this value-list boundary for the
+/// ID3v2.4 fields whose physical representation is one NUL-delimited text
+/// frame. Keeping the list explicit prevents display joining from becoming
+/// persistence semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsfTagValueChange {
+    pub canonical_key: String,
+    pub values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DsfValueWriteReport {
+    pub durability_warning: Option<String>,
+    /// Supported ID3v2.4 multi-value text fields present in the complete tag
+    /// that was actually serialized by this write. Empty for semantic no-ops.
+    pub id3_multivalue_fields_written: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedDsfValueWrite {
+    encoded: Vec<u8>,
+    id3_multivalue_fields: Vec<(String, usize)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsfWriteProgressPhase {
     Preparing,
@@ -688,8 +715,18 @@ pub fn write_with_control(
     is_cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(DsfWriteProgress),
 ) -> Result<Option<String>, String> {
+    write_with_control_report(path, changes, is_cancelled, progress)
+        .map(|report| report.durability_warning)
+}
+
+pub(crate) fn write_with_control_report(
+    path: &Path,
+    changes: &[DsfTagChange],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<DsfValueWriteReport, String> {
     if changes.is_empty() {
-        return Ok(None);
+        return Ok(DsfValueWriteReport::default());
     }
     progress(DsfWriteProgress {
         phase: DsfWriteProgressPhase::Preparing,
@@ -704,12 +741,77 @@ pub fn write_with_control(
     let path = target_path.as_path();
     preflight_dsf_write_artifacts(path)?;
     let resolved = validate_and_resolve_write(path, changes)?;
-    let (location, encoded) = backend::prepare(path, &resolved)
+    let value_changes = resolved
+        .into_iter()
+        .map(|change| DsfTagValueChange {
+            canonical_key: change.canonical_key,
+            values: change.value.map(|value| vec![value]),
+        })
+        .collect::<Vec<_>>();
+    let (location, prepared) = backend::prepare_values(path, &value_changes)
         .map_err(|error| format!("failed to save DSF ID3 tags to '{}': {error}", path.display()))?;
-    let Some(encoded) = encoded else {
-        return Ok(None);
+    let Some(prepared) = prepared else {
+        return Ok(DsfValueWriteReport::default());
     };
-    write_prepared(path, location, &encoded, is_cancelled, progress)
+    let durability_warning =
+        write_prepared(path, location, &prepared.encoded, is_cancelled, progress)?;
+    Ok(DsfValueWriteReport {
+        durability_warning,
+        id3_multivalue_fields_written: prepared.id3_multivalue_fields,
+    })
+}
+
+/// Save ordered DSF/ID3 logical values without first projecting them through
+/// the editor's scalar display form. ARTIST and COMPOSER are persisted as one
+/// ID3v2.4 text frame whose NUL-separated payload preserves order and
+/// duplicates. Other fields remain scalar and fail closed if a caller attempts
+/// to pass more than one physical value.
+pub fn write_values_with_control(
+    path: &Path,
+    changes: &[DsfTagValueChange],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<Option<String>, String> {
+    write_values_with_control_report(path, changes, is_cancelled, progress)
+        .map(|report| report.durability_warning)
+}
+
+pub(crate) fn write_values_with_control_report(
+    path: &Path,
+    changes: &[DsfTagValueChange],
+    is_cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(DsfWriteProgress),
+) -> Result<DsfValueWriteReport, String> {
+    if changes.is_empty() {
+        return Ok(DsfValueWriteReport::default());
+    }
+    progress(DsfWriteProgress {
+        phase: DsfWriteProgressPhase::Preparing,
+        bytes_done: 0,
+        bytes_total: 0,
+    });
+    if is_cancelled() {
+        return Err("metadata save cancelled before preparing DSF metadata".to_string());
+    }
+    reject_symlinked_write_path(path)?;
+    let (_write_lock, target_path) = acquire_dsf_write_lock(path)?;
+    let path = target_path.as_path();
+    preflight_dsf_write_artifacts(path)?;
+    if !is_dsf(path) {
+        return Err(format!("'{}' is not a DSF file", path.display()));
+    }
+    let resolved = resolve_value_changes(changes)?;
+    let (location, prepared) = backend::prepare_values(path, &resolved)
+        .map_err(|error| format!("failed to save DSF ID3 tags to '{}': {error}", path.display()))?;
+    let Some(prepared) = prepared else {
+        return Ok(DsfValueWriteReport::default());
+    };
+    let durability_warning =
+        write_prepared(path, location, &prepared.encoded, is_cancelled, progress)?;
+    Ok(DsfValueWriteReport {
+        durability_warning,
+        id3_multivalue_fields_written: prepared.id3_multivalue_fields,
+    })
 }
 
 fn validate_and_resolve_write(
@@ -3095,9 +3197,17 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             if (normalized_key == canonical_key) != canonical_pass {
                 continue;
             }
+            let preserve_repeated_values =
+                matches!(canonical_key.as_str(), "ARTIST" | "COMPOSER");
             let target = fields.entry(canonical_key).or_default();
             for value in values {
-                append_distinct(target, value.clone());
+                if preserve_repeated_values {
+                    if !value.trim().is_empty() {
+                        target.push(value.clone());
+                    }
+                } else {
+                    append_distinct(target, value.clone());
+                }
             }
         }
     }
@@ -3111,6 +3221,16 @@ fn resolve_changes(changes: &[DsfTagChange]) -> Result<Vec<DsfTagChange>, String
     let mut resolved = BTreeMap::<String, Option<String>>::new();
     for change in changes {
         let key = canonical_metadata_key(&change.canonical_key);
+        if change
+            .value
+            .as_ref()
+            .is_some_and(|value| value.contains('\0'))
+        {
+            return Err(format!(
+                "refusing DSF metadata field {} containing an embedded NUL delimiter",
+                change.canonical_key
+            ));
+        }
         let value = change
             .value
             .as_ref()
@@ -3153,9 +3273,92 @@ fn resolve_changes(changes: &[DsfTagChange]) -> Result<Vec<DsfTagChange>, String
         .collect())
 }
 
+fn resolve_value_changes(
+    changes: &[DsfTagValueChange],
+) -> Result<Vec<DsfTagValueChange>, String> {
+    let mut resolved = BTreeMap::<String, Option<Vec<String>>>::new();
+    for change in changes {
+        let key = canonical_metadata_key(&change.canonical_key);
+        let values = match change.values.as_ref() {
+            None => None,
+            Some(values) => {
+                let mut normalized = Vec::with_capacity(values.len());
+                for value in values {
+                    if value.contains('\0') {
+                        return Err(format!(
+                            "refusing DSF metadata field {key} containing an embedded NUL delimiter"
+                        ));
+                    }
+                    let value = value.trim().to_string();
+                    if !value.is_empty() {
+                        normalized.push(value);
+                    }
+                }
+                (!normalized.is_empty()).then_some(normalized)
+            }
+        };
+
+        if matches!(
+            key.as_str(),
+            "TRACKNUMBER" | "TRACKTOTAL" | "DISCNUMBER" | "DISCTOTAL" | "BPM"
+        ) {
+            if values.as_ref().is_some_and(|values| values.len() > 1) {
+                return Err(format!(
+                    "invalid DSF metadata value for {key}: numeric fields accept exactly one value"
+                ));
+            }
+            if let Some(raw) = values
+                .as_ref()
+                .and_then(|values| values.first())
+                .map(String::as_str)
+            {
+                let parsed = raw.parse::<u32>().map_err(|_| {
+                    format!("invalid DSF metadata value for {key}: expected an unsigned integer, got {raw:?}")
+                })?;
+                if matches!(key.as_str(), "TRACKTOTAL" | "DISCTOTAL") && parsed == 0 {
+                    return Err(format!(
+                        "invalid DSF metadata value for {key}: totals must be greater than zero"
+                    ));
+                }
+                if key == "BPM" && parsed == 0 {
+                    return Err(
+                        "invalid DSF metadata value for BPM: tempo must be greater than zero"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        if !matches!(key.as_str(), "ARTIST" | "COMPOSER")
+            && values.as_ref().is_some_and(|values| values.len() > 1)
+        {
+            return Err(format!(
+                "DSF metadata field {key} does not support repeated values on this write path"
+            ));
+        }
+
+        if let Some(previous) = resolved.get(&key) {
+            if previous != &values {
+                return Err(format!(
+                    "conflicting DSF metadata changes target canonical key {key}: {previous:?} versus {values:?}"
+                ));
+            }
+        } else {
+            resolved.insert(key, values);
+        }
+    }
+    Ok(resolved
+        .into_iter()
+        .map(|(canonical_key, values)| DsfTagValueChange {
+            canonical_key,
+            values,
+        })
+        .collect())
+}
+
 /// Direct dependency seam. Keep every crate-specific type and method here.
 mod backend {
-    use super::{DsfMetadataLocation, DsfTagChange, DsfTagSnapshot};
+    use super::{DsfMetadataLocation, DsfTagChange, DsfTagSnapshot, DsfTagValueChange};
     use id3::frame::{Comment, Content, ExtendedText, Picture, PictureType};
     use id3::{Tag, TagLike, Version};
     use std::collections::BTreeMap;
@@ -3170,17 +3373,19 @@ mod backend {
         Ok(snapshot_from_tag(&tag))
     }
 
-    pub(super) fn prepare(
+    pub(super) fn prepare_values(
         path: &Path,
-        changes: &[DsfTagChange],
-    ) -> Result<(DsfMetadataLocation, Option<Vec<u8>>), String> {
+        changes: &[DsfTagValueChange],
+    ) -> Result<(DsfMetadataLocation, Option<super::PreparedDsfValueWrite>), String> {
         let location = super::inspect_dsf_metadata_location(path)?;
         let mut tag = read_tag(path, location)?;
         let before = snapshot_from_tag(&tag);
-        apply_changes_to_tag(&mut tag, changes);
+        apply_value_changes_to_tag(&mut tag, changes)?;
         if snapshot_from_tag(&tag) == before {
             return Ok((location, None));
         }
+
+        let id3_multivalue_fields = supported_multivalue_text_fields(&tag);
 
         let mut encoded = Vec::new();
         tag.write_to(&mut encoded, Version::Id3v24)
@@ -3188,7 +3393,27 @@ mod backend {
         if !encoded.starts_with(b"ID3") {
             return Err("ID3 backend produced bytes without an ID3 marker".to_string());
         }
-        Ok((location, Some(encoded)))
+        Ok((
+            location,
+            Some(super::PreparedDsfValueWrite {
+                encoded,
+                id3_multivalue_fields,
+            }),
+        ))
+    }
+
+    fn supported_multivalue_text_fields(tag: &Tag) -> Vec<(String, usize)> {
+        [("ARTIST", "TPE1"), ("COMPOSER", "TCOM")]
+            .into_iter()
+            .filter_map(|(display_key, frame_id)| {
+                let count = tag
+                    .get(frame_id)
+                    .and_then(|frame| frame.content().text_values())
+                    .map(|values| values.count())
+                    .unwrap_or(0);
+                (count > 1).then(|| (display_key.to_string(), count))
+            })
+            .collect()
     }
 
     pub(super) fn prepare_artwork_replace(
@@ -3311,7 +3536,7 @@ mod backend {
         let mut fields = BTreeMap::<String, Vec<String>>::new();
 
         push(&mut fields, "TITLE", tag.title());
-        push(&mut fields, "ARTIST", tag.artist());
+        push_text_frame_values(&mut fields, tag, "TPE1", "ARTIST");
         push(&mut fields, "ALBUM", tag.album());
         push(&mut fields, "ALBUMARTIST", tag.album_artist());
         push(&mut fields, "GENRE", tag.genre());
@@ -3347,9 +3572,10 @@ mod backend {
                 extended.value.clone(),
             );
         }
+        push_text_frame_values(&mut fields, tag, "TCOM", "COMPOSER");
         for frame in tag.frames() {
             let key = match frame.id() {
-                "TCOM" => Some("COMPOSER"),
+                "TCOM" => None,
                 "TPE3" => Some("CONDUCTOR"),
                 "TSRC" => Some("ISRC"),
                 "TPUB" => Some("LABEL"),
@@ -3377,6 +3603,61 @@ mod backend {
         for change in changes {
             apply_one(tag, change);
         }
+    }
+
+    fn apply_value_changes_to_tag(
+        tag: &mut Tag,
+        changes: &[DsfTagValueChange],
+    ) -> Result<(), String> {
+        for change in changes {
+            match (change.canonical_key.as_str(), change.values.as_deref()) {
+                ("ARTIST", Some(values)) | ("COMPOSER", Some(values)) if values.len() > 1 => {
+                    remove_extended_text_aliases(tag, &change.canonical_key);
+                    let frame_id = if change.canonical_key == "ARTIST" {
+                        "TPE1"
+                    } else {
+                        "TCOM"
+                    };
+                    set_text_values(tag, frame_id, values, &change.canonical_key)?;
+                }
+                (_, Some(values)) if values.len() > 1 => {
+                    return Err(format!(
+                        "DSF metadata field {} does not support repeated values on this write path",
+                        change.canonical_key
+                    ));
+                }
+                _ => {
+                    let scalar = DsfTagChange {
+                        canonical_key: change.canonical_key.clone(),
+                        value: change
+                            .values
+                            .as_ref()
+                            .and_then(|values| values.first().cloned()),
+                    };
+                    apply_one(tag, &scalar);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_text_frame_values(
+        path: &Path,
+        frame_id: &str,
+    ) -> Result<(usize, Vec<String>), String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let tag = read_tag(path, location)?;
+        let matching = tag
+            .frames()
+            .filter(|frame| frame.id() == frame_id)
+            .collect::<Vec<_>>();
+        let values = matching
+            .first()
+            .and_then(|frame| frame.content().text_values())
+            .map(|values| values.map(str::to_string).collect())
+            .unwrap_or_default();
+        Ok((matching.len(), values))
     }
 
     #[cfg(test)]
@@ -3487,6 +3768,24 @@ mod backend {
         }
     }
 
+    fn set_text_values(
+        tag: &mut Tag,
+        frame_id: &str,
+        values: &[String],
+        canonical_key: &str,
+    ) -> Result<(), String> {
+        if values.iter().any(|value| value.contains('\0')) {
+            return Err(format!(
+                "refusing DSF metadata field {canonical_key} containing an embedded NUL delimiter"
+            ));
+        }
+        tag.remove(frame_id);
+        if !values.is_empty() {
+            tag.set_text_values(frame_id, values.iter().cloned());
+        }
+        Ok(())
+    }
+
     fn set_number_pair(tag: &mut Tag, track_pair: bool, change: &DsfTagChange) {
         let (number, total) = if track_pair {
             (tag.track(), tag.total_tracks())
@@ -3511,6 +3810,23 @@ mod backend {
         }
     }
 
+    fn push_text_frame_values(
+        fields: &mut BTreeMap<String, Vec<String>>,
+        tag: &Tag,
+        frame_id: &str,
+        key: &str,
+    ) {
+        let Some(values) = tag
+            .get(frame_id)
+            .and_then(|frame| frame.content().text_values())
+        else {
+            return;
+        };
+        for value in values {
+            push_owned(fields, key, value.to_string());
+        }
+    }
+
     fn push(fields: &mut BTreeMap<String, Vec<String>>, key: &str, value: Option<&str>) {
         if let Some(value) = value {
             push_owned(fields, key, value.to_string());
@@ -3522,6 +3838,14 @@ mod backend {
             fields.entry(key.into()).or_default().push(value);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_text_frame_values(
+    path: &Path,
+    frame_id: &str,
+) -> Result<(usize, Vec<String>), String> {
+    backend::test_text_frame_values(path, frame_id)
 }
 
 #[cfg(test)]

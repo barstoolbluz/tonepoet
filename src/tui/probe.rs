@@ -7418,10 +7418,27 @@ fn canonical_editor_item_key(
 /// (`TIT2`, `TPE1`, `TSSE`, …) and other format-native names collapse onto the
 /// same canonical editor rows that Vorbis/FLAC already use instead of surfacing
 /// raw frame identifiers. Genuinely custom keys fall back to their raw name.
+const ID3_CUSTOM_TXXX_ESCAPE_PREFIX: &str = "TXXX:TONEPOET_CUSTOM:";
+
 fn canonical_editor_display_key(
     key: &lofty::tag::ItemKey,
     tag_type: lofty::tag::TagType,
 ) -> String {
+    if tag_type == lofty::tag::TagType::Id3v2 {
+        if let lofty::tag::ItemKey::Unknown(name) = key {
+            if let Some(display_key) = name.strip_prefix(ID3_CUSTOM_TXXX_ESCAPE_PREFIX) {
+                return canonical_metadata_display_key(display_key);
+            }
+        }
+    }
+    if tag_type == lofty::tag::TagType::Mp4Ilst {
+        if let lofty::tag::ItemKey::Unknown(name) = key {
+            const ITUNES_FREEFORM_PREFIX: &str = "----:com.apple.iTunes:";
+            if let Some(display_key) = name.strip_prefix(ITUNES_FREEFORM_PREFIX) {
+                return canonical_metadata_display_key(display_key);
+            }
+        }
+    }
     if let Some(canonical) =
         crate::metadata_persistence::canonical_numbering_display_key_for_tag_item(key, tag_type)
     {
@@ -7592,7 +7609,11 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
         // into one logical row per value. Mirror that representation here so
         // a healthy WavPack read and a native-fallback Monkey's Audio read
         // have identical editor semantics and preserve order + duplicates.
-        if tag.tag_type() == lofty::tag::TagType::Ape && !is_binary && value.contains('\0') {
+        if matches!(tag.tag_type(), lofty::tag::TagType::Ape | lofty::tag::TagType::Id3v2)
+            && !is_binary
+            && metadata_field_is_set_valued(&display_key)
+            && value.contains('\0')
+        {
             for physical_value in value.split('\0') {
                 merge_editor_field(
                     &mut fields,
@@ -7636,10 +7657,9 @@ fn canonical_editor_fields_from_tag(tag: &lofty::tag::Tag) -> Vec<CanonicalEdito
     fields
 }
 
-/// DSF uses the same scalar presentation policy as other carriers. Joined
-/// values are display-only until the row itself is edited; an unrelated edit
-/// emits no change for this key, so the ID3 backend preserves all original
-/// frames rather than collapsing them into the joined display string.
+/// DSF exposes only the ID3v2.4 fields enabled for repeated persistence in
+/// this phase as logical value lists. Every other field retains the editor's
+/// established scalar presentation and stored-value count semantics.
 fn canonical_editor_fields_from_dsf(
     snapshot: &crate::dsf_tags::DsfTagSnapshot,
 ) -> Vec<CanonicalEditorTagField> {
@@ -7653,7 +7673,9 @@ fn canonical_editor_fields_from_dsf(
             // values/counts have already been discarded.
             let stored_value_count = snapshot.stored_value_count(display_key);
             let display_key = display_key.clone();
-            let editor_values = if metadata_field_is_set_valued(&display_key) {
+            let editor_values = if crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3
+                .supports_repeated_field(&display_key)
+            {
                 MetadataFieldValues::from_stored_texts(values.iter().cloned())
             } else {
                 let mut scalar = String::new();
@@ -9212,7 +9234,8 @@ fn editor_change_values_for_backend(
     backend: crate::metadata_persistence::MetadataPersistenceBackend,
 ) -> Option<Vec<String>> {
     let values = change.values.as_ref()?;
-    if metadata_field_is_set_valued(&change.display_key) && backend.supports_repeated_instances() {
+    if metadata_field_is_set_valued(&change.display_key)
+        && backend.supports_repeated_field(&change.display_key) {
         let values = values.to_texts();
         (!values.is_empty()).then_some(values)
     } else {
@@ -9268,16 +9291,247 @@ fn repeated_instance_loss_warnings(
                 .tag_type
                 .map(crate::metadata_persistence::metadata_backend_for_lofty_tag_type)
                 .or(fallback_backend)?;
-            (!backend.supports_repeated_instances()).then(|| {
-                let count = change.values.as_ref().map_or(0, MetadataFieldValues::value_count);
-                format!(
-                    "{} has {count} values, but {} stores one value for this field; save used the legacy joined representation",
-                    change.display_key,
-                    backend.label(),
-                )
-            })
+            let count = change
+                .values
+                .as_ref()
+                .map_or(0, MetadataFieldValues::value_count);
+            if backend.supports_repeated_field(&change.display_key) {
+                return None;
+            }
+            Some(format!(
+                "{} has {count} values, but {} stores one value for this field; save used the legacy joined representation",
+                change.display_key,
+                backend.label(),
+            ))
         })
         .collect()
+}
+
+fn id3_multivalue_interop_warning(display_key: &str, count: usize) -> String {
+    format!(
+        "{display_key} has {count} values and was written as one ID3v2.4 multi-value text frame; ID3v2.4-aware readers can see all values, while common tools including ffmpeg and VLC and tonepoet conversion reads may expose only the first value",
+    )
+}
+
+fn metadata_commit_report_from_dsf_value_write(
+    report: crate::dsf_tags::DsfValueWriteReport,
+) -> MetadataWriteCommitReport {
+    let mut warnings = report.durability_warning.into_iter().collect::<Vec<_>>();
+    warnings.extend(
+        report
+            .id3_multivalue_fields_written
+            .into_iter()
+            .map(|(display_key, count)| id3_multivalue_interop_warning(&display_key, count)),
+    );
+    MetadataWriteCommitReport::from_warnings(warnings)
+}
+
+fn lofty_id3_multivalue_fields(tag: &lofty::tag::Tag) -> Vec<(String, usize)> {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+    if tag.tag_type() != lofty::tag::TagType::Id3v2 {
+        return Vec::new();
+    }
+    canonical_editor_fields_from_tag(tag)
+        .into_iter()
+        .filter_map(|field| {
+            let display_key = canonical_metadata_display_key(&field.display_key);
+            let count = field.values.value_count();
+            (count > 1 && backend.supports_repeated_field(&display_key))
+                .then_some((display_key, count))
+        })
+        .collect()
+}
+
+fn unrepresentable_container_warnings(
+    path: &std::path::Path,
+    changes: &[EditorTagChange],
+) -> Vec<String> {
+    use lofty::file::TaggedFileExt;
+
+    if changes.is_empty()
+        || crate::metadata_persistence::metadata_persistence_route_for_path(path)
+            != crate::metadata_persistence::MetadataPersistenceRoute::Lofty
+    {
+        return Vec::new();
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let fixed_vocabulary_extension = matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "mp3" | "wav" | "wave" | "aif" | "aiff" | "m4a" | "m4b" | "m4p"
+            | "mp4" | "aac" | "alac"
+    );
+    let explicit_fixed_vocabulary_target = changes.iter().any(|change| {
+        change.tag_type.is_some_and(|tag_type| {
+            matches!(
+                crate::metadata_persistence::metadata_backend_for_lofty_tag_type(tag_type),
+                crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+                    | crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+            )
+        })
+    });
+    if !fixed_vocabulary_extension && !explicit_fixed_vocabulary_target {
+        // Keep Phase-1 Vorbis/APE save behavior byte-for-byte on its existing
+        // path; this additional verification read is only for the fixed-
+        // vocabulary carriers in scope here.
+        return Vec::new();
+    }
+
+    // Re-read after commit and compare the logical editor values for every
+    // fixed-vocabulary field we touched. This is intentionally a write-time
+    // fidelity guard rather than a test-only assumption: if Lofty's serializer
+    // behavior changes or a carrier cannot represent the chosen physical key,
+    // the save is surfaced as SavedWithWarnings instead of silently losing or
+    // relabeling the user's value.
+    let tagged = match lofty::read_from_path(path) {
+        Ok(tagged) => tagged,
+        Err(error) => {
+            return vec![format!(
+                "saved metadata, but post-save fidelity verification could not re-read '{}': {error}; no-silent-loss status could not be verified",
+                path.display(),
+            )];
+        }
+    };
+    let preferred_type = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .map(|tag| tag.tag_type());
+    let normal_primary_type = tagged.primary_tag_type();
+    let mut warnings = Vec::new();
+
+    // O3 is about what the successful serializer actually wrote, not merely
+    // which fields were present in the edit request. Any Lofty ID3 save
+    // serializes the complete prepared ID3 tag, including multi-value fields
+    // preserved during an unrelated edit. Re-use this post-commit read to
+    // surface interoperability warnings for every supported multi-value frame
+    // present in the committed ID3v2 tag.
+    if let Some(id3v2) = tagged.tag(lofty::tag::TagType::Id3v2) {
+        for (display_key, count) in lofty_id3_multivalue_fields(id3v2) {
+            warnings.push(id3_multivalue_interop_warning(&display_key, count));
+        }
+    }
+
+    for change in changes {
+        let target_type = change.tag_type.unwrap_or_else(|| {
+            if change.existed {
+                preferred_type.unwrap_or(normal_primary_type)
+            } else {
+                normal_primary_type
+            }
+        });
+        let backend =
+            crate::metadata_persistence::metadata_backend_for_lofty_tag_type(target_type);
+        if matches!(
+            backend,
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+                | crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+        ) {
+            let canonical_key = canonical_metadata_display_key(&change.display_key);
+            let expected = editor_change_values_for_backend(change, backend).unwrap_or_default();
+            let actual = tagged
+                .tag(target_type)
+                .map(canonical_editor_fields_from_tag)
+                .and_then(|fields| {
+                    fields
+                        .into_iter()
+                        .find(|field| field.display_key == canonical_key)
+                })
+                .map(|field| field.values.to_texts())
+                .unwrap_or_default();
+            if actual != expected {
+                warnings.push(format!(
+                    "{} did not round-trip through {} in '{}': requested {:?}, read back {:?}; save completed with a fidelity warning instead of silently accepting the mismatch",
+                    canonical_key,
+                    backend.label(),
+                    path.display(),
+                    expected,
+                    actual,
+                ));
+            }
+        }
+    }
+
+    let is_wav = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+    if !is_wav {
+        warnings.sort();
+        warnings.dedup();
+        return warnings;
+    }
+
+    // WAV has a second, state-dependent failure mode: pristine RIFF-INFO can
+    // reject fields outside its vocabulary, and surviving RIFF values can
+    // shadow a correctly-written ID3 value for RIFF-preferring readers.
+    for change in changes.iter().filter(|change| change.values.is_some()) {
+        let target_type = change.tag_type.unwrap_or_else(|| {
+            if change.existed {
+                preferred_type.unwrap_or(normal_primary_type)
+            } else {
+                normal_primary_type
+            }
+        });
+        let backend =
+            crate::metadata_persistence::metadata_backend_for_lofty_tag_type(target_type);
+        if backend == crate::metadata_persistence::MetadataPersistenceBackend::UnclassifiedLofty
+            && change.item_key.map_key(target_type, false).is_none()
+        {
+            warnings.push(format!(
+                "{} cannot be represented by the current {} tag in '{}'; the save path cannot guarantee that field persisted in this container",
+                change.display_key,
+                editor_tag_type_label(target_type),
+                path.display(),
+            ));
+        }
+    }
+
+    if let Some(riff) = tagged.tag(lofty::tag::TagType::RiffInfo) {
+        let riff_fields = canonical_editor_fields_from_tag(riff);
+        for change in changes.iter().filter(|change| {
+            let target_type = change.tag_type.unwrap_or_else(|| {
+                if change.existed {
+                    preferred_type.unwrap_or(normal_primary_type)
+                } else {
+                    normal_primary_type
+                }
+            });
+            target_type == lofty::tag::TagType::Id3v2
+        }) {
+            let canonical_key = canonical_metadata_display_key(&change.display_key);
+            let Some(riff_value) = riff_fields
+                .iter()
+                .find(|field| field.display_key == canonical_key)
+                .map(|field| field.values.as_str())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let desired = change
+                .values
+                .as_ref()
+                .map(MetadataFieldValues::as_str)
+                .unwrap_or_default();
+            if riff_value == desired {
+                continue;
+            }
+            if change.values.is_none() {
+                warnings.push(format!(
+                    "WAV still contains a RIFF INFO {canonical_key} value ({riff_value:?}) after deleting the ID3v2 value; RIFF-preferring readers may continue to show the RIFF INFO value",
+                ));
+            } else {
+                warnings.push(format!(
+                    "WAV also contains a RIFF INFO {canonical_key} value ({riff_value:?}) that differs from the saved ID3v2 value; RIFF-preferring readers may show the older RIFF INFO value",
+                ));
+            }
+        }
+    }
+
+    warnings.sort();
+    warnings.dedup();
+    warnings
 }
 
 fn editor_changes_scalar_projection(
@@ -9446,14 +9700,9 @@ fn apply_metadata_editor_tag_changes_internal(
                         verification,
                     ) {
                         Ok(report) => {
-                            let mut warnings = report.durability_warnings;
-                            warnings.extend(repeated_instance_loss_warnings(
-                                &write.path,
-                                &write.changes,
-                            ));
                             crate::tui::app::MetadataEditorWriteResult::saved_with_warnings(
                                 write.path.clone(),
-                                warnings,
+                                report.durability_warnings,
                             )
                         }
                         Err(MetadataWriteFailure::Cancelled(reason)) => {
@@ -9638,6 +9887,17 @@ fn write_editor_tag_changes_with_cancel_report_classified_at_verification(
         byte_progress,
         verification,
     )
+    .map(|mut report| {
+        report
+            .durability_warnings
+            .extend(repeated_instance_loss_warnings(path, changes));
+        report
+            .durability_warnings
+            .extend(unrepresentable_container_warnings(path, changes));
+        report.durability_warnings.sort();
+        report.durability_warnings.dedup();
+        report
+    })
     .map_err(|message| {
         if operation_cancel
             .as_ref()
@@ -9721,6 +9981,37 @@ fn write_editor_tag_changes_with_cancel_report_at_verification(
                         &native_err,
                     )),
                 };
+            }
+            crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3 => {
+                let backend = crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3;
+                let value_changes = changes
+                    .iter()
+                    .map(|change| crate::dsf_tags::DsfTagValueChange {
+                        canonical_key: canonical_metadata_display_key(&change.display_key),
+                        values: editor_change_values_for_backend(change, backend),
+                    })
+                    .collect::<Vec<_>>();
+                let is_cancelled = || {
+                    cancel.is_some_and(|flag| {
+                        let cancelled = flag.is_cancelled();
+                        if cancelled {
+                            flag.record_observation();
+                        }
+                        cancelled
+                    })
+                };
+                let progress = |update: crate::dsf_tags::DsfWriteProgress| {
+                    if let Some(byte_progress) = byte_progress {
+                        byte_progress(path, update);
+                    }
+                };
+                return crate::dsf_tags::write_values_with_control_report(
+                    path,
+                    &value_changes,
+                    &is_cancelled,
+                    &progress,
+                )
+                .map(metadata_commit_report_from_dsf_value_write);
             }
             crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch => {
                 let backend = crate::metadata_persistence::MetadataPersistenceBackend::NativeWavPackApe;
@@ -12158,15 +12449,13 @@ fn write_all_tags_with_cancel_report_at_verification(
                     progress(path, update);
                 }
             };
-            let warning = crate::dsf_tags::write_with_control(
+            let report = crate::dsf_tags::write_with_control_report(
                 path,
                 &dsf_changes,
                 &is_cancelled,
                 &report_progress,
             )?;
-            return Ok(MetadataWriteCommitReport::from_warnings(
-                warning.into_iter().collect(),
-            ));
+            return Ok(metadata_commit_report_from_dsf_value_write(report));
         }
         crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis => {
             let observation_before =
@@ -12581,6 +12870,8 @@ fn typed_lofty_change_already_satisfied(
 
     let mut matching_count = 0usize;
     let mut matching_text = None;
+    let mut all_matching_items_are_text = true;
+    let mut all_matching_items_use_persistence_key = true;
     for item in tag.items() {
         if !change
             .removal_keys
@@ -12590,17 +12881,75 @@ fn typed_lofty_change_already_satisfied(
             continue;
         }
         matching_count += 1;
-        if matching_count == 1 {
-            matching_text = match item.value() {
-                ItemValue::Text(value) => Some(value.clone()),
-                _ => None,
-            };
+        all_matching_items_use_persistence_key &= item.key() == &change.persistence_key;
+        match item.value() {
+            ItemValue::Text(value) => {
+                if matching_count == 1 {
+                    matching_text = Some(value.clone());
+                }
+            }
+            _ => all_matching_items_are_text = false,
         }
     }
     match change.value.as_deref() {
-        Some(expected) => matching_count == 1 && matching_text.as_deref() == Some(expected),
+        Some(expected)
+            if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+                && expected.contains('\0') =>
+        {
+            // ID3v2.4 multi-value is serializer-sensitive on tonepoet's
+            // per-item path: repeated same-key logical items are not a safe
+            // physical representation even when joining them would yield the
+            // requested logical list. Treat only one actual NUL-delimited
+            // item as satisfied so a loaded Lofty tag is coalesced before the
+            // whole TaggedFile is serialized again.
+            matching_count == 1
+                && all_matching_items_are_text
+                && all_matching_items_use_persistence_key
+                && matching_text.as_deref() == Some(expected)
+        }
+        Some(expected) => {
+            matching_count == 1
+                && all_matching_items_are_text
+                && all_matching_items_use_persistence_key
+                && matching_text.as_deref() == Some(expected)
+        }
         None => matching_count == 0,
     }
+}
+
+fn replace_same_key_lofty_items_at_first_position(
+    tag: &mut lofty::tag::Tag,
+    replacement: lofty::tag::TagItem,
+) -> bool {
+    let key = replacement.key().clone();
+    let original = tag.items().cloned().collect::<Vec<_>>();
+
+    // Lofty 0.21.1 exposes no indexed insertion API for generic TagItems.
+    // Rebuild only the generic item vector so a same-key coalesce can replace
+    // the first occurrence in place while leaving pictures and the preserved
+    // format-specific companion tag untouched. Cloning TagItem retains its
+    // language/description/value metadata exactly for every unaffected item.
+    let mut rebuilt = Vec::with_capacity(original.len());
+    let mut replacement = Some(replacement);
+    for item in original {
+        if item.key() == &key {
+            if let Some(replacement) = replacement.take() {
+                rebuilt.push(replacement);
+            }
+            continue;
+        }
+        rebuilt.push(item);
+    }
+
+    if replacement.is_some() {
+        return false;
+    }
+
+    tag.retain(|_| false);
+    for item in rebuilt {
+        tag.push_unchecked(item);
+    }
+    true
 }
 
 fn apply_typed_lofty_changes(
@@ -12637,6 +12986,38 @@ fn apply_typed_lofty_changes(
             })
             .map(|item| item.key().clone())
             .collect::<Vec<_>>();
+
+        // Preserve physical ID3 frame position only for the serializer-sensitive
+        // same-key multi-value coalesce. Re-keying migrations (for example
+        // TIPL/UFID-derived typed items to TXXX fallbacks) must retain the
+        // established remove-then-append behavior because their destination
+        // key is intentionally different from the source carrier.
+        let position_stable_same_key_multivalue = backend
+            == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+            && change.value.as_deref().is_some_and(|value| value.contains('\0'))
+            && !parsed_removal_keys.is_empty()
+            && parsed_removal_keys
+                .iter()
+                .all(|key| key == &change.persistence_key)
+            && change
+                .removal_keys
+                .iter()
+                .all(|key| key == &change.persistence_key);
+
+        if position_stable_same_key_multivalue {
+            if let Some(value) = change.value.as_ref() {
+                if replace_same_key_lofty_items_at_first_position(
+                    tag,
+                    TagItem::new(
+                        change.persistence_key.clone(),
+                        ItemValue::Text(value.clone()),
+                    ),
+                ) {
+                    continue;
+                }
+            }
+        }
+
         for removal_key in parsed_removal_keys.iter().chain(change.removal_keys.iter()) {
             tag.remove_key(removal_key);
         }
@@ -12859,7 +13240,7 @@ fn editor_changes_for_lofty_ape(
             let value = match change.values.as_ref() {
                 None => None,
                 Some(values) if metadata_field_is_set_valued(&change.display_key)
-                    && backend.supports_repeated_instances() =>
+                    && backend.supports_repeated_field(&change.display_key) =>
                 {
                     if values.values().iter().any(|value| value.text.contains('\0')) {
                         return Err(format!(
@@ -12867,7 +13248,8 @@ fn editor_changes_for_lofty_ape(
                             change.display_key
                         ));
                     }
-                    (!values.values().is_empty()).then(|| values.texts().collect::<Vec<_>>().join("\0"))
+                    (!values.values().is_empty())
+                        .then(|| values.texts().collect::<Vec<_>>().join("\0"))
                 }
                 Some(values) => (!values.as_str().is_empty())
                     .then(|| values.as_str().to_string()),
@@ -12875,6 +13257,292 @@ fn editor_changes_for_lofty_ape(
             Ok((change.item_key.clone(), value))
         })
         .collect()
+}
+
+const MP4_ITUNES_FREEFORM_PREFIX: &str = "----:com.apple.iTunes:";
+
+fn fixed_vocabulary_persistence_key(
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    change: &EditorTagChange,
+) -> lofty::tag::ItemKey {
+    use lofty::tag::ItemKey;
+
+    let canonical_key = canonical_metadata_display_key(&change.display_key);
+    if canonical_key == "DATE" {
+        return ItemKey::RecordingDate;
+    }
+
+    let tag_type = match backend {
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2 => {
+            lofty::tag::TagType::Id3v2
+        }
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst => {
+            lofty::tag::TagType::Mp4Ilst
+        }
+        _ => return change.item_key.clone(),
+    };
+
+    // Shared native carriers have one canonical owner. Keep LABEL on TPUB and
+    // LYRICIST on TEXT; PUBLISHER/WRITER use private fallbacks so the display
+    // name selected by the user cannot silently collapse into its sibling.
+    let requires_distinct_owner = matches!(canonical_key.as_str(), "PUBLISHER" | "WRITER");
+    let is_preformatted_freeform = matches!(
+        &change.item_key,
+        ItemKey::Unknown(name) if name.starts_with("----:")
+    );
+    let native_mapping_missing = !matches!(&change.item_key, ItemKey::Unknown(_))
+        && change.item_key.map_key(tag_type, false).is_none();
+
+    // `ItemKey::map_key` answers whether Lofty has a vocabulary mapping, not
+    // whether the generic per-item serializer used by tonepoet can emit that
+    // mapping. Some ID3 concepts (notably involved-people roles) only become
+    // representable in Lofty's whole-tag merge path, which this write path
+    // deliberately does not use. Keep the empirically lossy per-item cases
+    // explicit, then use `map_key` as the future-proof catch-all for other
+    // named keys that have no native carrier at all.
+    let known_per_item_drop = match backend {
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2 => matches!(
+            &change.item_key,
+            ItemKey::Performer
+                | ItemKey::Arranger
+                | ItemKey::Producer
+                | ItemKey::Engineer
+                | ItemKey::Bpm
+                | ItemKey::MusicBrainzRecordingId
+                | ItemKey::Publisher
+                | ItemKey::Writer
+        ),
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst => matches!(
+            &change.item_key,
+            ItemKey::Performer | ItemKey::Arranger | ItemKey::Publisher | ItemKey::Writer
+        ),
+        _ => false,
+    };
+
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2 {
+        if requires_distinct_owner || known_per_item_drop || native_mapping_missing {
+            return ItemKey::Unknown(canonical_key);
+        }
+        return change.item_key.clone();
+    }
+
+    if is_preformatted_freeform {
+        return change.item_key.clone();
+    }
+    if requires_distinct_owner
+        || known_per_item_drop
+        || native_mapping_missing
+        || matches!(&change.item_key, ItemKey::Unknown(_))
+    {
+        return ItemKey::Unknown(format!("{MP4_ITUNES_FREEFORM_PREFIX}{canonical_key}"));
+    }
+    change.item_key.clone()
+}
+
+fn id3_custom_key_requires_txxx_escape(key: &lofty::tag::ItemKey) -> bool {
+    matches!(key, lofty::tag::ItemKey::Unknown(name) if name.as_bytes().len() == 4)
+}
+
+/// Persistence key for an explicit editor mutation.
+///
+/// Four-byte ID3 custom `Unknown` names are ambiguous on both sides of Lofty's
+/// generic conversion boundary. Frame-ID-shaped names can be serialized as raw
+/// ID3 frames instead of TXXX, while other four-byte TXXX descriptions are not
+/// promoted back into generic `TagItem`s on read. An arbitrary editor custom
+/// key must remain text and retain its logical name on readback, so every
+/// explicit four-byte custom-field write gets a reserved, non-four-byte TXXX
+/// description. Existing unknown raw ID3 frames are deliberately not migrated
+/// merely because another field is edited; the serializer-sensitive pre-save
+/// pass continues to classify those with `fixed_vocabulary_persistence_key`
+/// directly.
+fn fixed_vocabulary_editor_persistence_key(
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    change: &EditorTagChange,
+) -> lofty::tag::ItemKey {
+    use lofty::tag::ItemKey;
+
+    let persistence_key = fixed_vocabulary_persistence_key(backend, change);
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+        && persistence_key == change.item_key
+        && id3_custom_key_requires_txxx_escape(&change.item_key)
+    {
+        let canonical_key = canonical_metadata_display_key(&change.display_key);
+        return ItemKey::Unknown(format!(
+            "{ID3_CUSTOM_TXXX_ESCAPE_PREFIX}{canonical_key}"
+        ));
+    }
+    persistence_key
+}
+
+fn normalized_fixed_vocabulary_editor_changes(
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+    changes: &[EditorTagChange],
+) -> Result<Vec<crate::metadata_persistence::NormalizedTypedLoftyChange>, String> {
+    let mut physical = Vec::<(lofty::tag::ItemKey, Option<String>)>::with_capacity(changes.len());
+    let mut source_keys =
+        Vec::<(lofty::tag::ItemKey, lofty::tag::ItemKey)>::with_capacity(changes.len());
+
+    for change in changes {
+        let persistence_key = fixed_vocabulary_editor_persistence_key(backend, change);
+        let value = match change.values.as_ref() {
+            None => None,
+            Some(values) => {
+                if values.values().iter().any(|value| value.text.contains('\0')) {
+                    return Err(format!(
+                        "refusing {} field {} containing an embedded NUL delimiter",
+                        backend.label(),
+                        change.display_key,
+                    ));
+                }
+                if metadata_field_is_set_valued(&change.display_key)
+                    && backend.supports_repeated_field(&change.display_key)
+                {
+                    let texts = values.texts().collect::<Vec<_>>();
+                    (!texts.is_empty()).then(|| texts.join("\0"))
+                } else {
+                    (!values.as_str().is_empty()).then(|| values.as_str().to_string())
+                }
+            }
+        };
+        source_keys.push((persistence_key.clone(), change.item_key.clone()));
+        physical.push((persistence_key, value));
+    }
+
+    crate::metadata_persistence::validate_numbering_changes_for_backend(backend, &physical)?;
+    let mut normalized =
+        crate::metadata_persistence::normalized_typed_lofty_changes(backend, &physical)?;
+    for change in &mut normalized {
+        for (physical_key, source_key) in &source_keys {
+            let normalized_physical =
+                crate::metadata_persistence::normalize_numbering_item_key_for_backend(
+                    backend,
+                    physical_key,
+                );
+            if normalized_physical == change.persistence_key
+                && !change.removal_keys.iter().any(|key| key == source_key)
+            {
+                change.removal_keys.push(source_key.clone());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn id3_source_item_keys_for_display_key(
+    tag: &lofty::tag::Tag,
+    display_key: &str,
+) -> Vec<lofty::tag::ItemKey> {
+    let canonical_key = canonical_metadata_display_key(display_key);
+    let mut keys = Vec::new();
+    for item in tag.items() {
+        if canonical_editor_display_key(item.key(), tag.tag_type()) != canonical_key {
+            continue;
+        }
+        if !keys.iter().any(|key| key == item.key()) {
+            keys.push(item.key().clone());
+        }
+    }
+    keys
+}
+
+fn normalize_existing_lofty_id3_serializer_sensitive_items(
+    tag: &mut lofty::tag::Tag,
+) -> Result<bool, String> {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+    if tag.tag_type() != lofty::tag::TagType::Id3v2 {
+        return Ok(false);
+    }
+
+    // Lofty exposes one on-disk ID3v2.4 NUL-delimited text frame as repeated
+    // logical same-key TagItems when reading, and it also consumes some
+    // format-specific carriers (for example recognized TIPL roles and the
+    // MusicBrainz UFID) into typed generic TagItems. tonepoet later saves the
+    // complete TaggedFile through Lofty's generic per-item serializer. That
+    // serializer cannot losslessly emit either representation: repeated
+    // ARTIST/COMPOSER items need one NUL-delimited text item, while typed keys
+    // for which `fixed_vocabulary_persistence_key` selects a different key
+    // need the same stable TXXX fallback used by direct editor changes.
+    //
+    // A canonical editor row can be assembled from more than one physical
+    // source key. Do not let the first contributor decide whether the row is
+    // safe: inspect every actual source key and, when normalization is needed,
+    // remove every contributing alias before inserting the merged logical
+    // value once. This makes a safe TXXX + later TIPL-derived typed item just
+    // as lossless as the inverse physical order. The current user edit is
+    // still applied after this pass, so an explicit replacement/deletion wins.
+    let fields = canonical_editor_fields_from_tag(tag);
+    let mut changed = false;
+    for field in fields {
+        let display_key = canonical_metadata_display_key(&field.display_key);
+        let source_keys = id3_source_item_keys_for_display_key(tag, &display_key);
+        if source_keys.is_empty() {
+            continue;
+        }
+
+        let requires_multivalue_coalescing = metadata_field_is_set_valued(&display_key)
+            && backend.supports_repeated_field(&display_key)
+            && field.values.value_count() > 1;
+
+        let serializer_unsafe_source_key = source_keys.iter().find_map(|source_key| {
+            let source_change = EditorTagChange {
+                tag_type: Some(lofty::tag::TagType::Id3v2),
+                existed: true,
+                display_key: display_key.clone(),
+                item_key: source_key.clone(),
+                values: Some(field.values.clone()),
+            };
+            (fixed_vocabulary_persistence_key(backend, &source_change) != source_key.clone())
+                .then(|| source_key.clone())
+        });
+
+        if !requires_multivalue_coalescing && serializer_unsafe_source_key.is_none() {
+            continue;
+        }
+
+        // ARTIST/COMPOSER always normalize to their canonical native typed key
+        // when physical coalescing is required. Other fields use an unsafe
+        // contributor as the source identity so the existing persistence-key
+        // policy selects its already-approved stable fallback.
+        let item_key = if requires_multivalue_coalescing {
+            item_key_for_new_editor_row(&display_key)
+        } else {
+            serializer_unsafe_source_key.expect("serializer-sensitive source key")
+        };
+        let change = EditorTagChange {
+            tag_type: Some(lofty::tag::TagType::Id3v2),
+            existed: true,
+            display_key,
+            item_key,
+            values: Some(field.values),
+        };
+
+        let mut normalized = normalized_fixed_vocabulary_editor_changes(
+            backend,
+            std::slice::from_ref(&change),
+        )?;
+        for normalized_change in &mut normalized {
+            for source_key in &source_keys {
+                if !normalized_change
+                    .removal_keys
+                    .iter()
+                    .any(|key| key == source_key)
+                {
+                    normalized_change.removal_keys.push(source_key.clone());
+                }
+            }
+        }
+        changed |= apply_typed_lofty_changes(tag, backend, normalized);
+    }
+    Ok(changed)
+}
+
+fn apply_fixed_vocabulary_editor_changes(
+    tag: &mut lofty::tag::Tag,
+    changes: &[EditorTagChange],
+    backend: crate::metadata_persistence::MetadataPersistenceBackend,
+) -> Result<bool, String> {
+    let normalized = normalized_fixed_vocabulary_editor_changes(backend, changes)?;
+    Ok(apply_typed_lofty_changes(tag, backend, normalized))
 }
 
 fn apply_editor_changes_to_lofty_tag(
@@ -12894,6 +13562,13 @@ fn apply_editor_changes_to_lofty_tag(
     if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyApe {
         let scalar_changes = editor_changes_for_lofty_ape(changes)?;
         return apply_changes_to_lofty_tag(tag, &scalar_changes);
+    }
+    if matches!(
+        backend,
+        crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
+            | crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
+    ) {
+        return apply_fixed_vocabulary_editor_changes(tag, changes, backend);
     }
     let scalar_changes = editor_changes_scalar_projection(changes);
     apply_changes_to_lofty_tag(tag, &scalar_changes)
@@ -12930,6 +13605,11 @@ fn prepare_editor_tags_lofty_from_tagged(
     }
 
     let mut changed = false;
+    if !changes.is_empty() {
+        if let Some(id3v2) = tagged.tag_mut(lofty::tag::TagType::Id3v2) {
+            changed |= normalize_existing_lofty_id3_serializer_sensitive_items(id3v2)?;
+        }
+    }
     for (tag_type, grouped) in groups {
         if tagged.tag(tag_type).is_none() {
             if grouped.iter().all(|change| change.values.is_none()) {
@@ -15093,6 +15773,100 @@ mod tests {
         results.pop().expect("single metadata write result")
     }
 
+    fn apply_editor_typed_list_change(
+        path: &std::path::Path,
+        display_key: &str,
+        item_key: lofty::tag::ItemKey,
+        values: &[&str],
+        originals: &[&str],
+    ) -> crate::tui::app::MetadataEditorWriteResult {
+        let snapshot = MetadataEditorTagSnapshot {
+            display_key: display_key.to_string(),
+            item_key,
+            row_scope: RowScope::File,
+            tag_type: None,
+            existed: vec![!originals.is_empty()],
+            values: vec![MetadataFieldValues::from_stored_texts(values.iter().copied())],
+            originals: vec![MetadataFieldValues::from_stored_texts(originals.iter().copied())],
+        };
+        let mut results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path.to_path_buf()),
+            &[snapshot],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1, "one changed carrier must yield one result");
+        results.pop().expect("single metadata write result")
+    }
+
+    fn apply_editor_typed_list_change_in_tag(
+        path: &std::path::Path,
+        tag_type: lofty::tag::TagType,
+        display_key: &str,
+        item_key: lofty::tag::ItemKey,
+        values: &[&str],
+        originals: &[&str],
+    ) -> crate::tui::app::MetadataEditorWriteResult {
+        let snapshot = MetadataEditorTagSnapshot {
+            display_key: display_key.to_string(),
+            item_key,
+            row_scope: RowScope::File,
+            tag_type: Some(tag_type),
+            existed: vec![!originals.is_empty()],
+            values: vec![MetadataFieldValues::from_stored_texts(values.iter().copied())],
+            originals: vec![MetadataFieldValues::from_stored_texts(originals.iter().copied())],
+        };
+        let mut results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path.to_path_buf()),
+            &[snapshot],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1, "one changed carrier must yield one result");
+        results.pop().expect("single metadata write result")
+    }
+
+    fn apply_editor_typed_delete_in_tag(
+        path: &std::path::Path,
+        tag_type: lofty::tag::TagType,
+        display_key: &str,
+        item_key: lofty::tag::ItemKey,
+        original: &str,
+    ) -> crate::tui::app::MetadataEditorWriteResult {
+        let snapshot = MetadataEditorTagSnapshot {
+            display_key: display_key.to_string(),
+            item_key,
+            row_scope: RowScope::File,
+            tag_type: Some(tag_type),
+            existed: vec![true],
+            values: vec![MetadataFieldValues::from_stored_text(original)],
+            originals: vec![MetadataFieldValues::from_stored_text(original)],
+        };
+        let mut results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path.to_path_buf()),
+            &[snapshot],
+            &[0],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
+        assert_eq!(results.len(), 1, "one deleted carrier must yield one result");
+        results.pop().expect("single metadata delete result")
+    }
+
     fn editor_slot_values(path: &std::path::Path, display_key: &str) -> Vec<String> {
         let entries = read_all_tags(path).expect("read carrier through metadata editor");
         entries
@@ -15112,6 +15886,277 @@ mod tests {
 
     fn owned_test_values(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+
+    fn saved_warnings(
+        result: &crate::tui::app::MetadataEditorWriteResult,
+    ) -> &[String] {
+        match &result.outcome {
+            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => warnings,
+            other => panic!("expected saved-with-warnings outcome, got {other:?}"),
+        }
+    }
+
+    fn assert_id3_multivalue_interop_warning(
+        result: &crate::tui::app::MetadataEditorWriteResult,
+        display_key: &str,
+    ) {
+        let warnings = saved_warnings(result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains(display_key)
+                && warning.contains("ID3v2.4")
+                && warning.contains("ffmpeg")
+                && warning.contains("VLC")
+                && warning.contains("tonepoet conversion")
+        }), "missing ID3 interoperability warning for {display_key}: {warnings:?}");
+    }
+
+    fn embedded_id3v2_bytes(path: &std::path::Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).expect("read carrier for physical ID3 assertion");
+        if bytes.starts_with(b"ID3") {
+            return bytes;
+        }
+
+        let (mut offset, big_endian) = if bytes.starts_with(b"RIFF")
+            && bytes.get(8..12) == Some(&b"WAVE"[..])
+        {
+            (12usize, false)
+        } else if bytes.starts_with(b"FORM")
+            && bytes.get(8..12) == Some(&b"AIFF"[..])
+        {
+            (12usize, true)
+        } else {
+            panic!("unsupported physical ID3 carrier for {}", path.display());
+        };
+
+        while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+            let chunk_id = &bytes[offset..offset + 4];
+            let size_bytes: [u8; 4] = bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("four-byte RIFF/AIFF chunk size");
+            let chunk_len = if big_endian {
+                u32::from_be_bytes(size_bytes)
+            } else {
+                u32::from_le_bytes(size_bytes)
+            } as usize;
+            let payload_start = offset + 8;
+            let payload_end = payload_start
+                .checked_add(chunk_len)
+                .unwrap_or_else(|| panic!("chunk length overflow in {}", path.display()));
+            assert!(
+                payload_end <= bytes.len(),
+                "truncated RIFF/AIFF chunk in {}",
+                path.display(),
+            );
+            if chunk_id.eq_ignore_ascii_case(b"ID3 ") {
+                let payload = bytes[payload_start..payload_end].to_vec();
+                assert!(
+                    payload.starts_with(b"ID3"),
+                    "ID3 chunk in {} lacks an ID3 header",
+                    path.display(),
+                );
+                return payload;
+            }
+            offset = payload_end
+                .checked_add(chunk_len & 1)
+                .unwrap_or_else(|| panic!("chunk padding overflow in {}", path.display()));
+        }
+        panic!("missing ID3 chunk in {}", path.display());
+    }
+
+    fn id3_physical_text_values(path: &std::path::Path, frame_id: &str) -> Vec<String> {
+        let bytes = embedded_id3v2_bytes(path);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let tag = id3::Tag::read_from2(&mut cursor).expect("parse embedded ID3v2 payload");
+        let matching = tag
+            .frames()
+            .filter(|frame| frame.id() == frame_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{frame_id} must persist as exactly one physical ID3 text frame",
+        );
+        matching[0]
+            .content()
+            .text_values()
+            .expect("ID3 frame is textual")
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn id3_physical_extended_text_value(
+        path: &std::path::Path,
+        description: &str,
+    ) -> String {
+        let bytes = embedded_id3v2_bytes(path);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let tag = id3::Tag::read_from2(&mut cursor).expect("parse embedded ID3v2 payload");
+        let matching = tag
+            .extended_texts()
+            .filter(|frame| frame.description.eq_ignore_ascii_case(description))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{description} must persist as exactly one physical ID3 TXXX frame",
+        );
+        matching[0].value.clone()
+    }
+
+    fn write_minimal_pcm_wav(path: &std::path::Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&38u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&88_200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        std::fs::write(path, bytes).expect("write minimal PCM WAV fixture");
+    }
+
+    fn write_minimal_pcm_aiff(path: &std::path::Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FORM");
+        bytes.extend_from_slice(&48u32.to_be_bytes());
+        bytes.extend_from_slice(b"AIFF");
+        bytes.extend_from_slice(b"COMM");
+        bytes.extend_from_slice(&18u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&16u16.to_be_bytes());
+        // 44100.0 as an IEEE 754 80-bit extended precision value.
+        bytes.extend_from_slice(&[0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(b"SSND");
+        bytes.extend_from_slice(&10u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0i16.to_be_bytes());
+        std::fs::write(path, bytes).expect("write minimal PCM AIFF fixture");
+    }
+
+    fn seed_id3v24_carrier(path: &std::path::Path) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tagged = lofty::read_from_path(path).expect("read carrier before ID3 seed");
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::TrackTitle,
+            ItemValue::Text("ID3 seed".to_string()),
+        ));
+        tagged.insert_tag(tag);
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .expect("seed ID3v2.4 carrier through Lofty");
+    }
+
+    fn seed_lofty_text_tag(
+        path: &std::path::Path,
+        tag_type: lofty::tag::TagType,
+        item_key: lofty::tag::ItemKey,
+        value: &str,
+    ) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::tag::{ItemValue, Tag, TagItem};
+
+        let mut tagged = lofty::read_from_path(path).expect("read carrier before tag seed");
+        if tagged.tag(tag_type).is_none() {
+            tagged.insert_tag(Tag::new(tag_type));
+        }
+        let tag = tagged.tag_mut(tag_type).expect("seeded tag container is present");
+        tag.insert_unchecked(TagItem::new(
+            item_key,
+            ItemValue::Text(value.to_string()),
+        ));
+        tagged
+            .save_to_path(path, WriteOptions::default())
+            .expect("seed tag carrier through Lofty");
+    }
+
+    fn editor_values_in_lofty_tag(
+        path: &std::path::Path,
+        tag_type: lofty::tag::TagType,
+        display_key: &str,
+    ) -> Vec<String> {
+        use lofty::file::TaggedFileExt;
+
+        let tagged = lofty::read_from_path(path).expect("read tagged file for container assertion");
+        let tag = tagged.tag(tag_type).expect("expected tag container");
+        canonical_editor_fields_from_tag(tag)
+            .into_iter()
+            .find(|field| field.display_key == display_key)
+            .map(|field| field.values.to_texts())
+            .unwrap_or_default()
+    }
+
+    fn assert_lofty_id3_multivalue_round_trip(path: &std::path::Path) {
+        assert_eq!(
+            crate::metadata_persistence::metadata_backend_for_path(path)
+                .expect("classify ID3 fixture"),
+            crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2,
+        );
+
+        let artist_values = ["Alice", "Alice", "Bob"];
+        let composer_values = ["Carol", "Dave", "Dave"];
+
+        let result = apply_editor_list_change(path, "ARTIST", &artist_values, &[]);
+        assert_id3_multivalue_interop_warning(&result, "ARTIST");
+        assert_eq!(editor_slot_values(path, "ARTIST"), owned_test_values(&artist_values));
+        assert_eq!(
+            id3_physical_text_values(path, "TPE1"),
+            owned_test_values(&artist_values),
+        );
+
+        let result = apply_editor_list_change(path, "COMPOSER", &composer_values, &[]);
+        assert_id3_multivalue_interop_warning(&result, "ARTIST");
+        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            editor_slot_values(path, "COMPOSER"),
+            owned_test_values(&composer_values),
+        );
+        assert_eq!(
+            id3_physical_text_values(path, "TCOM"),
+            owned_test_values(&composer_values),
+        );
+        // Writing COMPOSER serializes the whole loaded ID3 tag. ARTIST must
+        // already have been re-coalesced before that serializer boundary.
+        assert_eq!(editor_slot_values(path, "ARTIST"), owned_test_values(&artist_values));
+        assert_eq!(
+            id3_physical_text_values(path, "TPE1"),
+            owned_test_values(&artist_values),
+        );
+
+        let result = apply_editor_list_change(path, "TITLE", &["Unrelated edit"], &[]);
+        assert_id3_multivalue_interop_warning(&result, "ARTIST");
+        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
+        for (display_key, frame_id, values) in [
+            ("ARTIST", "TPE1", artist_values),
+            ("COMPOSER", "TCOM", composer_values),
+        ] {
+            assert_eq!(editor_slot_values(path, display_key), owned_test_values(&values));
+            assert_eq!(id3_physical_text_values(path, frame_id), owned_test_values(&values));
+        }
+
+        let before = std::fs::read(path).expect("snapshot ID3 multi-value carrier");
+        let result = apply_editor_list_change(path, "COMPOSER", &composer_values, &[]);
+        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(
+            std::fs::read(path).expect("read repeated ID3 multi-value save"),
+            before,
+            "repeating an already-satisfied ID3 multi-value edit must be byte-identical",
+        );
     }
 
     fn isolated_metadata_journal_home(
@@ -15370,17 +16415,830 @@ mod tests {
     }
 
     #[test]
-    fn noncapable_backend_reports_cardinality_loss_and_keeps_legacy_projection() {
-        let _xdg = isolated_metadata_journal_home("tonepoet-noncapable-multivalue-projection");
+    fn mp3_id3v24_multivalue_round_trip_preserves_order_duplicates_and_physical_frame() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3v24-mp3-multivalue");
         let (_temp, path) = copy_numbering_fixture("multivalue.mp3", ID3V2_NUMBERING_FIXTURE);
-        let result = apply_editor_list_change(&path, "COMPOSER", &["Alice", "Bob"], &[]);
-        let warnings = match &result.outcome {
-            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => warnings,
-            other => panic!("non-capable multi-value save must warn, got {other:?}"),
+        assert_lofty_id3_multivalue_round_trip(&path);
+    }
+
+    #[test]
+    fn wav_id3v24_multivalue_round_trip_preserves_order_duplicates_and_physical_frame() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3v24-wav-multivalue");
+        let temp = tempfile::tempdir().expect("WAV multi-value tempdir");
+        let path = temp.path().join("multivalue.wav");
+        write_minimal_pcm_wav(&path);
+        seed_id3v24_carrier(&path);
+        assert_lofty_id3_multivalue_round_trip(&path);
+    }
+
+    #[test]
+    fn aiff_id3v24_multivalue_round_trip_preserves_order_duplicates_and_physical_frame() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3v24-aiff-multivalue");
+        let temp = tempfile::tempdir().expect("AIFF multi-value tempdir");
+        let path = temp.path().join("multivalue.aiff");
+        write_minimal_pcm_aiff(&path);
+        seed_id3v24_carrier(&path);
+        assert_lofty_id3_multivalue_round_trip(&path);
+    }
+
+    #[test]
+    fn dsf_id3v24_multivalue_round_trip_preserves_order_duplicates_and_physical_frame() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3v24-dsf-multivalue");
+        let temp = tempfile::tempdir().expect("DSF multi-value tempdir");
+        let path = temp.path().join("multivalue.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write DSF fixture");
+
+        for (display_key, frame_id, values) in [
+            ("ARTIST", "TPE1", ["Alice", "Alice", "Bob"]),
+            ("COMPOSER", "TCOM", ["Carol", "Dave", "Dave"]),
+        ] {
+            let result = apply_editor_list_change(&path, display_key, &values, &[]);
+            assert_id3_multivalue_interop_warning(&result, display_key);
+            if display_key == "COMPOSER" {
+                assert_id3_multivalue_interop_warning(&result, "ARTIST");
+            }
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+            let (frame_count, physical_values) =
+                crate::dsf_tags::test_text_frame_values(&path, frame_id)
+                    .expect("inspect DSF ID3 text frame");
+            assert_eq!(frame_count, 1, "DSF {frame_id} must be exactly one frame");
+            assert_eq!(physical_values, owned_test_values(&values));
+        }
+
+        let artist_values = ["Alice", "Alice", "Bob"];
+        let composer_values = ["Carol", "Dave", "Dave"];
+        let before = std::fs::read(&path).expect("snapshot DSF multi-value carrier");
+        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
+        assert_saved_without_warnings(&result);
+        assert_eq!(
+            std::fs::read(&path).expect("read repeated DSF multi-value save"),
+            before,
+            "repeating an already-satisfied DSF multi-value edit must be byte-identical",
+        );
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Unrelated edit"], &[]);
+        assert_id3_multivalue_interop_warning(&result, "ARTIST");
+        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
+        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
+        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&composer_values));
+        for (frame_id, values) in [("TPE1", artist_values), ("TCOM", composer_values)] {
+            let (frame_count, physical_values) =
+                crate::dsf_tags::test_text_frame_values(&path, frame_id)
+                    .expect("inspect DSF frame after unrelated edit");
+            assert_eq!(frame_count, 1);
+            assert_eq!(physical_values, owned_test_values(&values));
+        }
+    }
+
+    #[test]
+    fn dsf_embedded_nul_is_rejected_before_id3_crate_mutation() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-dsf-embedded-nul-guard");
+        let temp = tempfile::tempdir().expect("DSF NUL guard tempdir");
+        let path = temp.path().join("nul-guard.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write DSF fixture");
+        let before = std::fs::read(&path).expect("snapshot DSF fixture");
+        let result = crate::dsf_tags::write_values_with_control(
+            &path,
+            &[crate::dsf_tags::DsfTagValueChange {
+                canonical_key: "ARTIST".to_string(),
+                values: Some(vec!["Alice".to_string(), "Bob\0Eve".to_string()]),
+            }],
+            &|| false,
+            &|_| {},
+        );
+        let error = result.expect_err("embedded NUL must fail closed");
+        assert!(error.contains("embedded NUL"), "unexpected error: {error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read DSF after rejected write"),
+            before,
+            "NUL validation failure must not mutate the DSF carrier",
+        );
+    }
+
+    #[test]
+    fn id3_fixed_vocabulary_drop_set_round_trips_under_stable_editor_names() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-fixed-vocabulary-fallbacks");
+        let (_temp, path) = copy_numbering_fixture("fallbacks.mp3", ID3V2_NUMBERING_FIXTURE);
+        let cases = [
+            ("PERFORMER", ItemKey::Performer, "Performer One"),
+            ("ARRANGER", ItemKey::Arranger, "Arranger One"),
+            ("DATE", ItemKey::Year, "2026-08-13"),
+            ("PRODUCER", ItemKey::Producer, "Producer One"),
+            ("ENGINEER", ItemKey::Engineer, "Engineer One"),
+            ("BPM", ItemKey::Bpm, "127.5"),
+            (
+                "MUSICBRAINZ_TRACKID",
+                ItemKey::MusicBrainzRecordingId,
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            ("WRITER", ItemKey::Writer, "Writer One"),
+            ("PUBLISHER", ItemKey::Publisher, "Publisher One"),
+            (
+                "MYCUSTOM",
+                ItemKey::Unknown("MYCUSTOM".to_string()),
+                "Custom One",
+            ),
+        ];
+        for (display_key, item_key, value) in cases {
+            let result =
+                apply_editor_typed_list_change(&path, display_key, item_key, &[value], &[]);
+            assert!(
+                matches!(
+                    &result.outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::Saved
+                        | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                ),
+                "{display_key} failed to save: {result:?}",
+            );
+            assert_eq!(editor_slot_values(&path, display_key), vec![value.to_string()]);
+        }
+
+        for (key, value) in [
+            ("PERFORMER", "Performer One"),
+            ("ARRANGER", "Arranger One"),
+            ("PRODUCER", "Producer One"),
+            ("ENGINEER", "Engineer One"),
+            ("BPM", "127.5"),
+            (
+                "MUSICBRAINZ_TRACKID",
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            ("WRITER", "Writer One"),
+            ("PUBLISHER", "Publisher One"),
+            ("MYCUSTOM", "Custom One"),
+        ] {
+            assert_eq!(
+                id3_physical_extended_text_value(&path, key),
+                value,
+                "{key} must use an independent TXXX fallback carrier",
+            );
+        }
+
+        apply_editor_typed_list_change(&path, "LABEL", ItemKey::Label, &["Label One"], &[]);
+        assert_eq!(editor_slot_values(&path, "LABEL"), vec!["Label One".to_string()]);
+        assert_eq!(
+            editor_slot_values(&path, "PUBLISHER"),
+            vec!["Publisher One".to_string()],
+            "PUBLISHER must not collapse into LABEL",
+        );
+        apply_editor_typed_list_change(
+            &path,
+            "LYRICIST",
+            ItemKey::Lyricist,
+            &["Lyricist One"],
+            &[],
+        );
+        assert_eq!(
+            editor_slot_values(&path, "WRITER"),
+            vec!["Writer One".to_string()],
+            "WRITER must not collapse into LYRICIST",
+        );
+        assert_eq!(
+            editor_slot_values(&path, "LYRICIST"),
+            vec!["Lyricist One".to_string()],
+        );
+    }
+
+    #[test]
+    fn id3_same_key_multivalue_coalesce_preserves_first_item_position() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+        let mut tag = Tag::new(TagType::Id3v2);
+        for (key, value) in [
+            (ItemKey::AlbumTitle, "Album"),
+            (ItemKey::TrackArtist, "Alice"),
+            (ItemKey::TrackArtist, "Alice"),
+            (ItemKey::TrackArtist, "Bob"),
+            (ItemKey::Composer, "Carol"),
+            (ItemKey::Composer, "Dave"),
+            (ItemKey::Composer, "Dave"),
+            (ItemKey::TrackTitle, "Unrelated edit"),
+        ] {
+            tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+
+        let normalized = crate::metadata_persistence::normalized_typed_lofty_changes(
+            backend,
+            &[
+                (
+                    ItemKey::TrackArtist,
+                    Some("Alice\0Alice\0Bob".to_string()),
+                ),
+                (
+                    ItemKey::Composer,
+                    Some("Carol\0Dave\0Dave".to_string()),
+                ),
+            ],
+        )
+        .expect("normalize ID3 multi-value coalesce");
+
+        assert!(apply_typed_lofty_changes(&mut tag, backend, normalized));
+        let expected_keys = vec![
+            ItemKey::AlbumTitle,
+            ItemKey::TrackArtist,
+            ItemKey::Composer,
+            ItemKey::TrackTitle,
+        ];
+        assert_eq!(
+            tag.items()
+                .map(|item| item.key().clone())
+                .collect::<Vec<_>>(),
+            expected_keys,
+            "coalescing same-key ID3 multi-values must retain each field's first physical position",
+        );
+        assert_eq!(
+            tag.get_string(&ItemKey::TrackArtist),
+            Some("Alice\0Alice\0Bob"),
+        );
+        assert_eq!(
+            tag.get_string(&ItemKey::Composer),
+            Some("Carol\0Dave\0Dave"),
+        );
+        assert_eq!(tag.get_string(&ItemKey::AlbumTitle), Some("Album"));
+        assert_eq!(
+            tag.get_string(&ItemKey::TrackTitle),
+            Some("Unrelated edit"),
+        );
+
+        let normalized_again = crate::metadata_persistence::normalized_typed_lofty_changes(
+            backend,
+            &[
+                (
+                    ItemKey::TrackArtist,
+                    Some("Alice\0Alice\0Bob".to_string()),
+                ),
+                (
+                    ItemKey::Composer,
+                    Some("Carol\0Dave\0Dave".to_string()),
+                ),
+            ],
+        )
+        .expect("normalize already-satisfied ID3 multi-value coalesce");
+        assert!(
+            !apply_typed_lofty_changes(&mut tag, backend, normalized_again),
+            "an already-satisfied same-key ID3 multi-value edit must be a no-op",
+        );
+        assert_eq!(
+            tag.items()
+                .map(|item| item.key().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ItemKey::AlbumTitle,
+                ItemKey::TrackArtist,
+                ItemKey::Composer,
+                ItemKey::TrackTitle,
+            ],
+            "an already-satisfied multi-value edit must not perturb item order",
+        );
+    }
+
+    #[test]
+    fn id3_position_stable_multivalue_path_excludes_rekeying_migrations() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+        let mut tag = Tag::new(TagType::Id3v2);
+        for (key, value) in [
+            (ItemKey::AlbumTitle, "Album"),
+            (ItemKey::Producer, "George Martin"),
+            (ItemKey::TrackTitle, "Title"),
+        ] {
+            tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+
+        let normalized = vec![crate::metadata_persistence::NormalizedTypedLoftyChange {
+            persistence_key: ItemKey::Unknown("PRODUCER".to_string()),
+            value: Some("George Martin\0Giles Martin".to_string()),
+            removal_keys: vec![ItemKey::Producer],
+        }];
+
+        assert!(apply_typed_lofty_changes(&mut tag, backend, normalized));
+        assert_eq!(
+            tag.items()
+                .map(|item| item.key().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ItemKey::AlbumTitle,
+                ItemKey::TrackTitle,
+                ItemKey::Unknown("PRODUCER".to_string()),
+            ],
+            "a multi-value re-key migration must keep remove-then-append semantics",
+        );
+        assert_eq!(
+            tag.get_string(&ItemKey::Unknown("PRODUCER".to_string())),
+            Some("George Martin\0Giles Martin"),
+        );
+    }
+
+    #[test]
+    fn id3_serializer_sensitive_normalizer_requires_the_safe_physical_key() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.push_unchecked(TagItem::new(
+            ItemKey::AlbumTitle,
+            ItemValue::Text("Album".to_string()),
+        ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Producer,
+            ItemValue::Text("George Martin".to_string()),
+        ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::TrackTitle,
+            ItemValue::Text("Title".to_string()),
+        ));
+
+        assert!(
+            normalize_existing_lofty_id3_serializer_sensitive_items(&mut tag)
+                .expect("normalize serializer-sensitive typed ID3 item"),
+            "a typed per-item-drop key must not be mistaken for an already-satisfied fallback",
+        );
+        assert!(!tag.items().any(|item| item.key() == &ItemKey::Producer));
+        assert!(tag.items().any(|item| {
+            item.key() == &ItemKey::Unknown("PRODUCER".to_string())
+                && item.value().text() == Some("George Martin")
+        }));
+        assert_eq!(
+            tag.items()
+                .map(|item| item.key().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ItemKey::AlbumTitle,
+                ItemKey::TrackTitle,
+                ItemKey::Unknown("PRODUCER".to_string()),
+            ],
+            "serializer-unsafe re-keying must retain remove-then-append migration semantics",
+        );
+    }
+
+    #[test]
+    fn unrelated_id3_edit_migrates_consumed_tipl_and_musicbrainz_ufid_to_safe_fallbacks() {
+        use id3::frame::{
+            Content, InvolvedPeopleList, InvolvedPeopleListItem, UniqueFileIdentifier,
         };
-        assert!(warnings.iter().any(|warning| warning.contains("COMPOSER")));
-        assert!(warnings.iter().any(|warning| warning.contains("Lofty ID3v2")));
-        assert_eq!(editor_slot_values(&path, "COMPOSER"), vec!["Alice; Bob"]);
+        use id3::{Frame, TagLike, Version};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-consumed-carrier-preservation");
+        let (_temp, path) = copy_numbering_fixture("consumed-carriers.mp3", ID3V2_NUMBERING_FIXTURE);
+        let recording_id = "11111111-2222-3333-4444-555555555555";
+
+        let mut physical = id3::Tag::read_from_path(&path).unwrap_or_else(|_| id3::Tag::new());
+        physical.add_frame(Frame::with_content(
+            "TIPL",
+            Content::InvolvedPeopleList(InvolvedPeopleList {
+                items: vec![
+                    InvolvedPeopleListItem {
+                        involvement: "producer".to_string(),
+                        involvee: "George Martin".to_string(),
+                    },
+                    InvolvedPeopleListItem {
+                        involvement: "arranger".to_string(),
+                        involvee: "Arranger One".to_string(),
+                    },
+                    InvolvedPeopleListItem {
+                        involvement: "engineer".to_string(),
+                        involvee: "Engineer One".to_string(),
+                    },
+                ],
+            }),
+        ));
+        physical.add_frame(UniqueFileIdentifier {
+            owner_identifier: "http://musicbrainz.org".to_string(),
+            identifier: recording_id.as_bytes().to_vec(),
+        });
+        physical
+            .write_to_path(&path, Version::Id3v24)
+            .expect("seed physical TIPL and MusicBrainz UFID");
+
+        let seeded = id3::Tag::read_from_path(&path).expect("re-read seeded physical ID3 tag");
+        assert!(seeded.involved_people_lists().any(|list| {
+            list.items.iter().any(|item| {
+                item.involvement.eq_ignore_ascii_case("producer")
+                    && item.involvee == "George Martin"
+            })
+        }));
+        assert!(seeded.unique_file_identifiers().any(|ufid| {
+            ufid.owner_identifier.eq_ignore_ascii_case("http://musicbrainz.org")
+                && ufid.identifier.as_slice() == recording_id.as_bytes()
+        }));
+
+        for (display_key, expected) in [
+            ("PRODUCER", "George Martin"),
+            ("ARRANGER", "Arranger One"),
+            ("ENGINEER", "Engineer One"),
+            ("MUSICBRAINZ_TRACKID", recording_id),
+        ] {
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                vec![expected.to_string()],
+                "Lofty must expose the seeded physical carrier as the canonical editor field before the unrelated edit",
+            );
+        }
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Unrelated title edit"], &[]);
+        assert!(matches!(
+            &result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+
+        for (display_key, expected) in [
+            ("PRODUCER", "George Martin"),
+            ("ARRANGER", "Arranger One"),
+            ("ENGINEER", "Engineer One"),
+            ("MUSICBRAINZ_TRACKID", recording_id),
+        ] {
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                vec![expected.to_string()],
+                "unrelated ID3 save must preserve {display_key}",
+            );
+            assert_eq!(
+                id3_physical_extended_text_value(&path, display_key),
+                expected,
+                "{display_key} must migrate to the serializer-safe TXXX fallback before whole-tag save",
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_id3_edit_normalizes_mixed_safe_txxx_and_tipl_producer_without_order_loss() {
+        use id3::frame::{
+            Content, ExtendedText, InvolvedPeopleList, InvolvedPeopleListItem,
+        };
+        use id3::{Frame, TagLike, Version};
+        use lofty::file::TaggedFileExt as _;
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-mixed-producer-carriers");
+        let (_temp, path) = copy_numbering_fixture("mixed-producer.mp3", ID3V2_NUMBERING_FIXTURE);
+
+        let mut physical = id3::Tag::new();
+        physical.add_frame(ExtendedText {
+            description: "PRODUCER".to_string(),
+            value: "Producer A".to_string(),
+        });
+        physical.add_frame(Frame::with_content(
+            "TIPL",
+            Content::InvolvedPeopleList(InvolvedPeopleList {
+                items: vec![InvolvedPeopleListItem {
+                    involvement: "producer".to_string(),
+                    involvee: "Producer B".to_string(),
+                }],
+            }),
+        ));
+        physical
+            .write_to_path(&path, Version::Id3v24)
+            .expect("seed TXXX producer before TIPL producer");
+
+        // Prove this fixture exercises the safe-first ordering that exposed the
+        // v2 bug rather than relying on the physical writer's ordering by
+        // assumption.
+        let tagged = lofty::read_from_path(&path).expect("read mixed producer fixture");
+        let id3v2 = tagged
+            .tag(lofty::tag::TagType::Id3v2)
+            .expect("mixed producer fixture has ID3v2");
+        let producer = canonical_editor_fields_from_tag(id3v2)
+            .into_iter()
+            .find(|field| field.display_key == "PRODUCER")
+            .expect("canonical producer row");
+        assert_eq!(
+            producer.item_key,
+            ItemKey::Unknown("PRODUCER".to_string()),
+            "fixture must expose the already-safe TXXX contributor first",
+        );
+        assert_eq!(
+            producer.values.to_texts(),
+            vec!["Producer A; Producer B".to_string()],
+            "canonical scalar row must retain both source values before the unrelated edit",
+        );
+
+        let result = apply_editor_list_change(&path, "TITLE", &["Unrelated title edit"], &[]);
+        assert!(matches!(
+            &result.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+        assert_eq!(
+            editor_slot_values(&path, "PRODUCER"),
+            vec!["Producer A; Producer B".to_string()],
+            "TITLE-only save must preserve both safe and TIPL-derived producer values",
+        );
+        assert_eq!(
+            id3_physical_extended_text_value(&path, "PRODUCER"),
+            "Producer A; Producer B",
+            "mixed producer carriers must collapse to one serializer-safe TXXX value",
+        );
+    }
+
+    #[test]
+    fn id3_four_byte_custom_keys_use_escaped_txxx_and_survive_unrelated_edit() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-four-byte-custom-keys");
+        let (_temp, path) = copy_numbering_fixture("four-byte-custom.mp3", ID3V2_NUMBERING_FIXTURE);
+        let cases = [("ABCD", "hello"), ("A-BC", "world")];
+
+        for (display_key, value) in cases {
+            let escaped_description = format!("{ID3_CUSTOM_TXXX_ESCAPE_PREFIX}{display_key}");
+            let result = apply_editor_typed_list_change(
+                &path,
+                display_key,
+                ItemKey::Unknown(display_key.to_string()),
+                &[value],
+                &[],
+            );
+            assert!(matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            ));
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                vec![value.to_string()],
+                "four-byte custom field must round-trip under its logical editor key",
+            );
+            assert_eq!(
+                id3_physical_extended_text_value(&path, &escaped_description),
+                value,
+                "four-byte custom field must use an unambiguous reserved TXXX carrier",
+            );
+        }
+
+        let bytes = embedded_id3v2_bytes(&path);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let physical = id3::Tag::read_from2(&mut cursor).expect("parse escaped custom ID3 tag");
+        assert!(
+            physical.frames().all(|frame| frame.id() != "ABCD"),
+            "custom ABCD must never be serialized as a raw ABCD frame",
+        );
+
+        let second = apply_editor_list_change(&path, "TITLE", &["Later title edit"], &[]);
+        assert!(matches!(
+            &second.outcome,
+            crate::tui::app::MetadataEditorWriteOutcome::Saved
+                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+        ));
+        for (display_key, value) in cases {
+            let escaped_description = format!("{ID3_CUSTOM_TXXX_ESCAPE_PREFIX}{display_key}");
+            assert_eq!(
+                editor_slot_values(&path, display_key),
+                vec![value.to_string()],
+                "escaped four-byte custom field must survive an unrelated whole-tag save",
+            );
+            assert_eq!(
+                id3_physical_extended_text_value(&path, &escaped_description),
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn mp4_fixed_vocabulary_drop_set_and_custom_keys_round_trip_under_stable_editor_names() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-fixed-vocabulary-fallbacks");
+        let (_temp, path) = copy_numbering_fixture("fallbacks.m4a", MP4_NUMBERING_FIXTURE);
+        let cases = [
+            ("PERFORMER", ItemKey::Performer, "Performer One"),
+            ("ARRANGER", ItemKey::Arranger, "Arranger One"),
+            ("DATE", ItemKey::Year, "2026-08-13"),
+            ("WRITER", ItemKey::Writer, "Writer One"),
+            ("PUBLISHER", ItemKey::Publisher, "Publisher One"),
+            (
+                "MYCUSTOM",
+                ItemKey::Unknown("MYCUSTOM".to_string()),
+                "Custom One",
+            ),
+        ];
+        for (display_key, item_key, value) in cases {
+            let result =
+                apply_editor_typed_list_change(&path, display_key, item_key, &[value], &[]);
+            assert!(
+                matches!(
+                    &result.outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::Saved
+                        | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                ),
+                "{display_key} failed to save: {result:?}",
+            );
+            assert_eq!(editor_slot_values(&path, display_key), vec![value.to_string()]);
+        }
+
+        assert!(
+            file_contains_ascii_case_insensitive(&path, "com.apple.iTunes"),
+            "MP4 fallbacks must use the iTunes freeform namespace",
+        );
+        for (key, value) in [
+            ("PERFORMER", "Performer One"),
+            ("ARRANGER", "Arranger One"),
+            ("WRITER", "Writer One"),
+            ("PUBLISHER", "Publisher One"),
+            ("MYCUSTOM", "Custom One"),
+        ] {
+            assert!(
+                file_contains_ascii_case_insensitive(&path, key),
+                "MP4 freeform carrier is missing canonical name {key}",
+            );
+            assert!(
+                file_contains_ascii_case_insensitive(&path, value),
+                "MP4 freeform carrier is missing value for {key}",
+            );
+        }
+
+        apply_editor_typed_list_change(&path, "LABEL", ItemKey::Label, &["Label One"], &[]);
+        assert_eq!(editor_slot_values(&path, "LABEL"), vec!["Label One".to_string()]);
+        assert_eq!(
+            editor_slot_values(&path, "PUBLISHER"),
+            vec!["Publisher One".to_string()],
+            "MP4 PUBLISHER must not collapse into LABEL",
+        );
+        apply_editor_typed_list_change(
+            &path,
+            "LYRICIST",
+            ItemKey::Lyricist,
+            &["Lyricist One"],
+            &[],
+        );
+        assert_eq!(editor_slot_values(&path, "WRITER"), vec!["Writer One".to_string()]);
+        assert_eq!(
+            editor_slot_values(&path, "LYRICIST"),
+            vec!["Lyricist One".to_string()],
+        );
+    }
+
+    #[test]
+    fn mp4_multivalue_remains_scalar_and_surfaces_cardinality_warning() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-multivalue-remains-scalar");
+        let (_temp, path) = copy_numbering_fixture("scalar.m4a", MP4_NUMBERING_FIXTURE);
+        let result = apply_editor_list_change(&path, "ARTIST", &["Alice", "Bob"], &[]);
+        let warnings = saved_warnings(&result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("ARTIST")
+                && warning.contains("Lofty MP4 ilst")
+                && warning.contains("legacy joined representation")
+        }), "missing MP4 scalar-projection warning: {warnings:?}");
+        assert_eq!(
+            editor_slot_values(&path, "ARTIST"),
+            vec!["Alice; Bob".to_string()],
+        );
+    }
+
+    #[test]
+    fn performer_arranger_genre_and_lyricist_remain_single_value_on_id3_this_phase() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-deferred-set-valued-fields");
+        let (_temp, path) = copy_numbering_fixture("deferred.mp3", ID3V2_NUMBERING_FIXTURE);
+        for display_key in ["PERFORMER", "ARRANGER", "GENRE", "LYRICIST"] {
+            let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
+            let warnings = saved_warnings(&result);
+            assert!(warnings.iter().any(|warning| warning.contains(display_key)));
+            assert!(warnings
+                .iter()
+                .any(|warning| warning.contains("legacy joined representation")));
+            assert_eq!(editor_slot_values(&path, display_key), vec!["One; Two".to_string()]);
+        }
+    }
+
+    #[test]
+    fn wav_riff_info_unrepresentable_field_surfaces_warning_instead_of_silent_loss() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-unrepresentable-warning");
+        let temp = tempfile::tempdir().expect("RIFF-INFO WAV tempdir");
+        let path = temp.path().join("riff-info.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackTitle, "RIFF seed");
+
+        let result = apply_editor_typed_list_change_in_tag(
+            &path,
+            TagType::RiffInfo,
+            "PERFORMER",
+            ItemKey::Performer,
+            &["Performer One"],
+            &[],
+        );
+        let warnings = saved_warnings(&result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("PERFORMER")
+                && warning.contains("RIFF INFO")
+                && warning.contains("cannot be represented")
+        }), "missing RIFF-INFO no-silent-loss warning: {warnings:?}");
+    }
+
+    #[test]
+    fn wav_riff_info_shadowing_of_saved_id3_value_is_surfaced() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-shadow-warning");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV tempdir");
+        let path = temp.path().join("shadow.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackArtist, "Old RIFF Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
+
+        let result = apply_editor_typed_list_change_in_tag(
+            &path,
+            TagType::Id3v2,
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["New ID3 Artist"],
+            &["Old ID3 Artist"],
+        );
+        let warnings = saved_warnings(&result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("RIFF INFO ARTIST")
+                && warning.contains("Old RIFF Artist")
+                && warning.contains("RIFF-preferring")
+        }), "missing RIFF/ID3 shadow warning: {warnings:?}");
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST"),
+            vec!["New ID3 Artist".to_string()],
+        );
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::RiffInfo, "ARTIST"),
+            vec!["Old RIFF Artist".to_string()],
+        );
+    }
+
+    #[test]
+    fn wav_riff_info_shadowing_after_id3_deletion_is_surfaced() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-riff-id3-delete-shadow-warning");
+        let temp = tempfile::tempdir().expect("RIFF/ID3 WAV deletion tempdir");
+        let path = temp.path().join("delete-shadow.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackArtist, "Old RIFF Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackTitle, "Keep ID3 title");
+
+        let result = apply_editor_typed_delete_in_tag(
+            &path,
+            TagType::Id3v2,
+            "ARTIST",
+            ItemKey::TrackArtist,
+            "Old ID3 Artist",
+        );
+        let warnings = saved_warnings(&result);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("RIFF INFO ARTIST")
+                && warning.contains("Old RIFF Artist")
+                && warning.contains("deleting the ID3v2 value")
+                && warning.contains("RIFF-preferring")
+        }), "missing RIFF/ID3 deletion shadow warning: {warnings:?}");
+        assert!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST").is_empty(),
+            "deleted ID3 ARTIST must remain absent",
+        );
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "TITLE"),
+            vec!["Keep ID3 title".to_string()],
+        );
+        assert_eq!(
+            editor_values_in_lofty_tag(&path, TagType::RiffInfo, "ARTIST"),
+            vec!["Old RIFF Artist".to_string()],
+        );
+    }
+
+    #[test]
+    fn wav_id3_deletion_without_matching_riff_field_does_not_invent_shadow_warning() {
+        use lofty::tag::{ItemKey, TagType};
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-wav-id3-delete-no-riff-shadow");
+        let temp = tempfile::tempdir().expect("ID3-only WAV deletion tempdir");
+        let path = temp.path().join("delete-no-shadow.wav");
+        write_minimal_pcm_wav(&path);
+        seed_lofty_text_tag(&path, TagType::RiffInfo, ItemKey::TrackTitle, "RIFF title only");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackArtist, "Old ID3 Artist");
+        seed_lofty_text_tag(&path, TagType::Id3v2, ItemKey::TrackTitle, "Keep ID3 title");
+
+        let result = apply_editor_typed_delete_in_tag(
+            &path,
+            TagType::Id3v2,
+            "ARTIST",
+            ItemKey::TrackArtist,
+            "Old ID3 Artist",
+        );
+        let warnings = match &result.outcome {
+            crate::tui::app::MetadataEditorWriteOutcome::Saved => &[][..],
+            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings } => {
+                warnings.as_slice()
+            }
+            other => panic!("unexpected metadata delete result: {other:?}"),
+        };
+        assert!(
+            !warnings.iter().any(|warning| {
+                warning.contains("RIFF INFO ARTIST") && warning.contains("RIFF-preferring")
+            }),
+            "deleting ID3 ARTIST must not invent a RIFF shadow warning when RIFF has no ARTIST: {warnings:?}",
+        );
+        assert!(
+            editor_values_in_lofty_tag(&path, TagType::Id3v2, "ARTIST").is_empty(),
+            "deleted ID3 ARTIST must remain absent",
+        );
     }
 
     #[test]

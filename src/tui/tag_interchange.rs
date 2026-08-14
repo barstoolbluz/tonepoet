@@ -4207,7 +4207,7 @@ where
             }
             if super::probe::metadata_field_is_set_valued(&field.canonical_key)
                 && source_value.value_count() > 1
-                && !backend.supports_repeated_instances()
+                && !backend.supports_repeated_field(&field.canonical_key)
             {
                 report.cardinality_warnings.push(format!(
                     "{}: {} has {} values but {} cannot round-trip repeated instances; the legacy scalar projection will be written",
