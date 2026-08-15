@@ -1695,12 +1695,14 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
 /// endpoint tolerance. Duration-only probes get a narrow one-millisecond
 /// sample tolerance to cover container/probe rounding. Lossy formats and DSD
 /// are skipped because codec padding or a different sample model makes strict
-/// comparison invalid.
+/// comparison invalid. Headerless raw PCM outputs are also skipped because
+/// ffprobe cannot infer their format, sample rate, or channels from the bytes
+/// alone.
 ///
 /// Returns the actual probed sample count on success, the original expected
-/// sample count when validation is intentionally skipped for a non-lossless
-/// target, or a track-validation error when a lossless final output drifts
-/// or lands at the wrong sample rate.
+/// sample count when validation is intentionally skipped, or a track-validation
+/// error when a probeable lossless final output drifts or lands at the wrong
+/// sample rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PostEncodeSampleExpectation {
     samples: u64,
@@ -1792,7 +1794,9 @@ async fn validate_encoded_output_with_tool_limits(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<PostEncodeValidation, ConvertError> {
-    if !requires_lossless_post_encode_sample_validation(target_format) {
+    if !requires_lossless_post_encode_sample_validation(target_format)
+        || ffmpeg_raw_pcm_muxer_for_path(out_path).is_some()
+    {
         return Ok(PostEncodeValidation {
             samples: expected_samples.map(|expected| expected.samples),
             measured_depth: None,
@@ -5530,6 +5534,17 @@ fn wvtag_tag_args(
 enum FfmpegMetadataCarrier {
     Auto,
     Rf64,
+}
+
+fn ffmpeg_raw_pcm_muxer_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    if let Some(muxer) = ffmpeg_raw_pcm_muxer_for_extension(ext) {
+        return Some(muxer);
+    }
+    if ext.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return ffmpeg_raw_pcm_muxer_for_extension(&ext.to_ascii_lowercase());
+    }
+    None
 }
 
 fn ffmpeg_raw_pcm_muxer_for_extension(ext: &str) -> Option<&'static str> {
@@ -55868,6 +55883,51 @@ mod validate_encoded_output_tests {
         .await;
 
         assert!(matches!(result, Err(ConvertError::TrackValidation(message)) if message.contains("post-encode sample drift")));
+    }
+
+    #[tokio::test]
+    async fn headerless_raw_pcm_output_skips_lossless_validation_without_probing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let expected_samples = PostEncodeSampleExpectation::same_rate(1_000_000, Some(44_100));
+        let expected_depth = PostEncodeDepthExpectation {
+            depth: tonepoet_pipeline::PcmBitDepth::Int16,
+            class_strict: true,
+        };
+
+        for extension in ["s16le", "F32BE"] {
+            let out = temp.path().join(format!("track.{extension}"));
+            std::fs::write(&out, b"headerless-pcm-placeholder")
+                .expect("write raw PCM placeholder");
+
+            let validation = validate_encoded_output_with_tool_limits(
+                &out,
+                Some(expected_samples),
+                Some(expected_depth),
+                &tonepoet_pipeline::AudioFormat::Wav,
+                &runner,
+                &cancel,
+                None,
+            )
+            .await
+            .expect("headerless raw PCM validation should be intentionally skipped");
+
+            assert_eq!(
+                validation,
+                PostEncodeValidation {
+                    samples: Some(expected_samples.samples),
+                    measured_depth: None,
+                },
+                "{extension}",
+            );
+        }
+
+        assert_eq!(
+            runner.transcript().len(),
+            0,
+            "headerless raw PCM must never invoke ffprobe during post-encode validation",
+        );
     }
 
     #[tokio::test]
