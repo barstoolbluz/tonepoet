@@ -267,3 +267,41 @@ chance to veto before the filesystem work begins.
    overrides — so the replay list is the minimal correct set, not "every journal ever left pending."
 3. Reconcile the `recoveries.last()`-as-clipboard special-case (`app.rs:12367`) with whatever the
    prompt presents, so the newest op isn't both "the clipboard" and "just another queued replay."
+4. **Journal garbage-collection (compounding factor, field-confirmed 2026-08-14).** The journal
+   directory `file_task_journal_dir()` (`file_task_runtime.rs:1309`) =
+   `~/.config/tonepoet/file-operation-journal/` — one append-only `.jsonl` per file-task job — is
+   **never pruned**: terminal (Completed/Reconciled/Cancelled) journals accumulate indefinitely.
+   Field state had **101** journals (plus `.abandoned` markers) built up since 2026-08-06, so the
+   startup `startup_file_task_recovery_inventory()` scan (`file_task_runtime.rs:1212`) re-chews a
+   large stale set every launch and surfaces the recovery prompt for any left non-terminal. Manual
+   workaround: with tonepoet closed, delete/rename that directory (it is recreated empty). Real fix:
+   GC terminal journals after their reconciliation completes (and cap/retire abandoned ones), so the
+   scan set stays bounded and the prompt only reflects genuinely-pending work.
+
+---
+
+## 7. Containerless / untaggable outputs (raw PCM, DFF, W64, raw AAC) handle metadata THREE inconsistent ways — need a unified policy
+
+**Raised:** 2026-08-14 (reasoning-model observations during Phase-4 pipeline work — raw PCM, then DFF).
+
+**Symptom.** Several conversion *output* formats have **no (usable) tag container**, yet the pipeline handles their metadata **three different, surprising ways** — and none of them tells the user "this output is metadata-free":
+
+| Output | Today's behavior | Surprise |
+|---|---|---|
+| **raw PCM** (`pcm`/`raw`/`s8`/`u8`/`s16le`…`f64be`, headerless LPCM) | metadata stage reports **SUCCESS** (silently drops tags) | over-reports success; metadata silently lost |
+| **DFF** (DSDIFF `.dff`), with materializer-authoritative metadata | **fails LATE** via `UnsupportedTagFormat` at the metadata stage — *after* the expensive DSD encode | wastes the encode, then hard-errors |
+| **raw AAC** | **fails** via `UnsupportedTagFormat` | hard-error |
+| **W64** | **fails** via `PolicyRejected` (`W64MetadataMutationUnqualified`) | hard-error (but at least reasoned) |
+
+So the same underlying situation — an output with nowhere to put tags plus metadata that wants writing — produces silent-success in one case and late hard-failure in others.
+
+**Root cause / context.** The metadata tool dispatcher `metadata_tag_command` (`src/convert/pipeline/stages.rs:5386`) maps flac/opus/wv/mp3/m4a/wav/aiff to real writers, `w64` → `MetadataError::PolicyRejected`, and **everything else (incl. DFF and raw AAC) → `MetadataError::UnsupportedTagFormat`** — a *late* write-stage error. Raw PCM is short-circuited upstream to a clean metadata-stage success instead. There is **no qualified DFF tag writer** (the editor backend is literally `MetadataPersistenceBackend::UnsupportedDff`, `metadata_persistence.rs:645`; "DFF tag writing" is a documented non-goal — DFF *can* technically hold DIIN/COMT chunks but tonepoet writes none), and building one is out of scope. tonepoet already has the honesty vocabulary — `StageOutcome::NotRequested` / `SkippedWithReason(String)` (`types.rs:2563`, surfaced by `reporter.rs:483/501`) — it just isn't used consistently for containerless outputs.
+
+**No data loss** (source untouched), but the behavior is inconsistent: some outputs silently drop-with-success, others hard-fail late (DFF after wasting the encode).
+
+**Fix direction — one unified policy for the whole containerless/untaggable family (raw PCM, DFF, W64, raw AAC, and any future one):**
+1. **Default = skip-and-label-metadata-free, honestly.** Report the metadata stage as `StageOutcome::NotRequested` / `SkippedWithReason("<FORMAT> output has no tag container")`, **produce the output**, and label it **"metadata-free"** in the UI/log. This replaces raw PCM's silent success AND DFF/AAC's late hard-error with one predictable outcome. Do **not** invent DFF/PCM tagging machinery. (Mostly wiring — the outcome variants and reporter handling exist.)
+2. **Strict / must-tag mode = reject EARLY (opt-in).** For users who require tags to be written, gate at *planning* time so a containerless-output-with-metadata conversion is refused **before** the encode (a clear "DFF/raw PCM can't hold tags" message), not late after wasting the DSD/PCM encode. This preserves fail-closed for those who want it, moved up-front. (Replaces DFF's current late error as the default.)
+3. **Optional metadata sidecar = keep the tags alongside (opt-in, off by default).** Since these formats can't embed tags, write a **companion sidecar**: a **CUE sidecar** is the natural carrier (standard for headerless/raw audio; tonepoet already *generates* CUE sheets via `crates/tonepoet-features/src/cue_generator.rs` **and** already reads sidecar CUEs as conversion sources, so it round-trips), **or** a lighter `.json`/`.txt` sidecar, **or** lean on the conversion log (already captures per-track metadata). Gate behind a config toggle / CLI flag (e.g. `--metadata-sidecar`).
+
+The key is a **single, predictable rule** across the family instead of today's grab-bag (raw PCM silently succeeds, DFF late-errors, W64 policy-rejects).
