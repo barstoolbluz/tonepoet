@@ -78,6 +78,7 @@ pub fn track_metadata(
         album_artist: resolved.album_artist.into(),
         composer: resolved.composer.into(),
         performer: resolved.performer.or(resolved.artist).into(),
+        arranger: resolved.arranger.into(),
         genre: resolved.genre.into(),
         date: resolved.date,
         track_number: resolved.track_number.or(Some(keys.track_number)),
@@ -127,6 +128,9 @@ pub fn overlay_track_metadata(
     }
     if let Some(value) = resolved.performer.or(resolved.artist) {
         base.performer = Some(value).into();
+    }
+    if let Some(value) = resolved.arranger {
+        base.arranger = Some(value).into();
     }
     if let Some(value) = resolved.genre {
         base.genre = Some(value).into();

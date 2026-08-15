@@ -1815,6 +1815,8 @@ pub struct TrackMetadata {
     #[serde(default)]
     pub performer: MetadataValueList,
     #[serde(default)]
+    pub arranger: MetadataValueList,
+    #[serde(default)]
     pub genre: MetadataValueList,
     pub date: Option<String>,
     pub track_number: Option<u32>,
@@ -3108,6 +3110,7 @@ mod prepared_track_sample_rate_contract {
         let track: PreparedTrack =
             serde_json::from_str(&json).expect("legacy scalar metadata should deserialize");
         assert_eq!(track.metadata.artist.as_deref(), Some("Legacy Artist"));
+        assert!(track.metadata.arranger.is_empty(), "missing legacy arranger field must default empty");
         assert_eq!(
             track.metadata.composer.values(),
             &[

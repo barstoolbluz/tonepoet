@@ -142,6 +142,7 @@ fn qualification_metadata() -> (TrackMetadata, AlbumMetadata) {
         album_artist: Some("Reference qualification album artist".to_string()).into(),
         composer: Some("Reference qualification composer".to_string()).into(),
         performer: Some("Reference qualification performer".to_string()).into(),
+        arranger: Some("Reference qualification arranger".to_string()).into(),
         genre: Some("Reference qualification genre".to_string()).into(),
         date: Some("2026".to_string()),
         track_number: Some(1),

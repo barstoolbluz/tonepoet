@@ -1067,6 +1067,7 @@ fn track_metadata(
         album_artist: None.into(),
         composer: None.into(),
         performer: None.into(),
+        arranger: None.into(),
         genre: None.into(),
         date: None,
         track_number: Some(output_track_number),
@@ -1201,6 +1202,9 @@ fn overlay_bluray_sidecar_track_metadata(
     }
     if let Some(value) = overlay.performer {
         metadata.performer = Some(value).into();
+    }
+    if let Some(value) = overlay.arranger {
+        metadata.arranger = Some(value).into();
     }
     metadata
 }
@@ -1788,6 +1792,7 @@ mod tests {
         assert_eq!(&left.album_artist, &right.album_artist);
         assert_eq!(&left.composer, &right.composer);
         assert_eq!(&left.performer, &right.performer);
+        assert_eq!(&left.arranger, &right.arranger);
         assert_eq!(&left.genre, &right.genre);
         assert_eq!(&left.date, &right.date);
         assert_eq!(&left.track_number, &right.track_number);
@@ -2539,6 +2544,7 @@ label = "Authored Chapter Three"
 [presentations.tracks.tags]
 TITLE = "Authored Chapter Three"
 PERFORMER = "Chapter Three Performer"
+ARRANGER = "Chapter Three Arranger"
 "#,
                 source.display(),
                 fingerprint,
@@ -2572,6 +2578,7 @@ PERFORMER = "Chapter Three Performer"
         assert_eq!(prepared.tracks[1].id.track_number, 2);
         assert_eq!(prepared.tracks[1].metadata.title.as_deref(), Some("Authored Chapter Three"));
         assert_eq!(prepared.tracks[1].metadata.performer.as_deref(), Some("Chapter Three Performer"));
+        assert_eq!(prepared.tracks[1].metadata.arranger.as_deref(), Some("Chapter Three Arranger"));
         let _ = std::fs::remove_dir_all(root);
     }
 

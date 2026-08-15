@@ -2691,6 +2691,7 @@ struct ImageAlbumMetadata {
     date: Option<String>,
     composer: MetadataValueList,
     performer: MetadataValueList,
+    arranger: MetadataValueList,
     isrc: Option<String>,
     publisher: Option<String>,
     copyright: Option<String>,
@@ -2738,6 +2739,9 @@ fn merge_image_album_metadata(
         }
         if merged.performer.is_none() {
             merged.performer = metadata.performer.clone();
+        }
+        if merged.arranger.is_none() {
+            merged.arranger = metadata.arranger.clone();
         }
         if merged.isrc.is_none() {
             merged.isrc = metadata.isrc.clone();
@@ -2844,6 +2848,8 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
         MetadataValueList::from_values(set_values.remove("COMPOSER").unwrap_or_default());
     metadata.performer =
         MetadataValueList::from_values(set_values.remove("PERFORMER").unwrap_or_default());
+    metadata.arranger =
+        MetadataValueList::from_values(set_values.remove("ARRANGER").unwrap_or_default());
 
     for item in tag.items() {
         let key = normalized_lofty_item_key(item.key());
@@ -2862,7 +2868,7 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
         match cue_image_tag_field(&key) {
             Some(ImageTagField::Album) => set_if_empty(&mut metadata.album, value),
             Some(ImageTagField::AlbumArtist) => {
-                // The shared format-aware reader is authoritative for the five
+                // The shared format-aware reader is authoritative for the six
                 // ordered-list fields. Preserve the old first-value fallback
                 // only for legacy aliases that its canonical mapping does not
                 // classify (for example an album-artist-sort carrier).
@@ -2888,6 +2894,11 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
             Some(ImageTagField::Performer) => {
                 if metadata.performer.is_empty() {
                     metadata.performer = MetadataValueList::from_scalar(value);
+                }
+            }
+            Some(ImageTagField::Arranger) => {
+                if metadata.arranger.is_empty() {
+                    metadata.arranger = MetadataValueList::from_scalar(value);
                 }
             }
             Some(ImageTagField::Date) => set_if_empty(&mut metadata.date, value),
@@ -2926,6 +2937,7 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
         || metadata.date.is_some()
         || metadata.composer.is_some()
         || metadata.performer.is_some()
+        || metadata.arranger.is_some()
         || metadata.isrc.is_some()
         || metadata.publisher.is_some()
         || metadata.copyright.is_some()
@@ -2948,6 +2960,7 @@ enum ImageTagField {
     Date,
     Composer,
     Performer,
+    Arranger,
     Isrc,
     Publisher,
     Copyright,
@@ -2967,6 +2980,7 @@ fn cue_image_tag_field(key: &str) -> Option<ImageTagField> {
         "date" | "year" | "recordingdate" | "tdrc" | "tyer" => Some(ImageTagField::Date),
         "composer" | "tcom" => Some(ImageTagField::Composer),
         "performer" => Some(ImageTagField::Performer),
+        "arranger" => Some(ImageTagField::Arranger),
         "isrc" | "tsrc" => Some(ImageTagField::Isrc),
         "publisher" | "label" | "tpub" => Some(ImageTagField::Publisher),
         "copyright" | "copyrightmessage" | "tcop" => Some(ImageTagField::Copyright),
@@ -3122,6 +3136,7 @@ fn cue_track_metadata(
         album_artist,
         composer: image.composer.clone(),
         performer,
+        arranger: image.arranger.clone(),
         genre,
         date: sheet.date.clone().or_else(|| image.date.clone()),
         track_number: Some(numbering.output_number),
@@ -6110,7 +6125,7 @@ FILE "lofty-image.flac" WAVE
         .expect("write minimal CUE sidecar");
 
         let mut metaflac = std::process::Command::new("metaflac");
-        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "GENRE"] {
+        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "ARRANGER", "GENRE"] {
             metaflac.arg(format!("--remove-tag={key}"));
         }
         for (key, value) in [
@@ -6126,6 +6141,9 @@ FILE "lofty-image.flac" WAVE
             ("PERFORMER", "P1"),
             ("PERFORMER", "P2"),
             ("PERFORMER", "P1"),
+            ("ARRANGER", "R1"),
+            ("ARRANGER", "R2"),
+            ("ARRANGER", "R1"),
             ("GENRE", "G1"),
             ("GENRE", "G2"),
             ("GENRE", "G1"),
@@ -6140,6 +6158,7 @@ FILE "lofty-image.flac" WAVE
         assert_eq!(image_metadata.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
         assert_eq!(image_metadata.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
         assert_eq!(image_metadata.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(image_metadata.arranger.values(), &["R1".to_string(), "R2".to_string(), "R1".to_string()]);
         assert_eq!(image_metadata.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
 
         let mut req = test_request(&image);
@@ -6166,6 +6185,7 @@ FILE "lofty-image.flac" WAVE
         // retain the complete list.
         assert_eq!(track.artist.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
         assert_eq!(track.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(track.arranger.values(), &["R1".to_string(), "R2".to_string(), "R1".to_string()]);
         assert_eq!(track.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
         assert_eq!(track.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
         assert_eq!(track.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);

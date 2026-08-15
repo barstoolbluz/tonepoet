@@ -8282,17 +8282,27 @@ const MP4_ALBUM_ARTIST_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
 const MP4_GENRE_ATOM_IDENT: lofty::mp4::AtomIdent<'static> =
     lofty::mp4::AtomIdent::Fourcc(*b"\xa9gen");
 
-fn mp4_performer_atom_ident() -> lofty::mp4::AtomIdent<'static> {
+fn mp4_itunes_freeform_atom_ident(name: &'static str) -> lofty::mp4::AtomIdent<'static> {
     lofty::mp4::AtomIdent::Freeform {
         mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
-        name: std::borrow::Cow::Borrowed("PERFORMER"),
+        name: std::borrow::Cow::Borrowed(name),
     }
+}
+
+fn mp4_performer_atom_ident() -> lofty::mp4::AtomIdent<'static> {
+    mp4_itunes_freeform_atom_ident("PERFORMER")
+}
+
+fn mp4_arranger_atom_ident() -> lofty::mp4::AtomIdent<'static> {
+    mp4_itunes_freeform_atom_ident("ARRANGER")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Mp4NativeMultiValueState {
     artist: Vec<String>,
     composer: Vec<String>,
+    performer: Vec<String>,
+    arranger: Vec<String>,
 }
 
 impl Mp4NativeMultiValueState {
@@ -8300,6 +8310,8 @@ impl Mp4NativeMultiValueState {
         match canonical_metadata_display_key(display_key).as_str() {
             "ARTIST" => Some(&self.artist),
             "COMPOSER" => Some(&self.composer),
+            "PERFORMER" => Some(&self.performer),
+            "ARRANGER" => Some(&self.arranger),
             _ => None,
         }
     }
@@ -8327,9 +8339,13 @@ fn mp4_native_multivalue_state_from_mp4(
     let Some(ilst) = mp4.ilst() else {
         return Mp4NativeMultiValueState::default();
     };
+    let performer_ident = mp4_performer_atom_ident();
+    let arranger_ident = mp4_arranger_atom_ident();
     Mp4NativeMultiValueState {
         artist: mp4_native_text_values_for_ident(ilst, &MP4_ARTIST_ATOM_IDENT),
         composer: mp4_native_text_values_for_ident(ilst, &MP4_COMPOSER_ATOM_IDENT),
+        performer: mp4_native_text_values_for_ident(ilst, &performer_ident),
+        arranger: mp4_native_text_values_for_ident(ilst, &arranger_ident),
     }
 }
 
@@ -8353,11 +8369,11 @@ fn read_mp4_native_multivalue_state(
     Ok(mp4_native_multivalue_state_from_mp4(&mp4))
 }
 
-/// Conversion-only concrete MP4 recovery for the five Phase-4 list fields.
+/// Conversion-only concrete MP4 recovery for the six ordered-list fields.
 ///
 /// Keep this separate from `Mp4NativeMultiValueState`: that state is part of
-/// the editor's write-preservation machinery and intentionally covers only the
-/// two fields that the MP4 backend may write repeatedly. Source recovery has a
+/// the editor's write-preservation machinery and intentionally covers the four
+/// fields that the MP4 backend may write repeatedly. Source recovery has a
 /// broader job: it must retain every physical value found in the input even
 /// when a later MP3/M4A output will collapse that field by capability policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -8366,6 +8382,7 @@ struct Mp4PipelineSetValuedTextState {
     album_artist: Vec<String>,
     composer: Vec<String>,
     performer: Vec<String>,
+    arranger: Vec<String>,
     genre: Vec<String>,
 }
 
@@ -8376,11 +8393,13 @@ fn mp4_pipeline_set_valued_text_state_from_mp4(
         return Mp4PipelineSetValuedTextState::default();
     };
     let performer_ident = mp4_performer_atom_ident();
+    let arranger_ident = mp4_arranger_atom_ident();
     Mp4PipelineSetValuedTextState {
         artist: mp4_native_text_values_for_ident(ilst, &MP4_ARTIST_ATOM_IDENT),
         album_artist: mp4_native_text_values_for_ident(ilst, &MP4_ALBUM_ARTIST_ATOM_IDENT),
         composer: mp4_native_text_values_for_ident(ilst, &MP4_COMPOSER_ATOM_IDENT),
         performer: mp4_native_text_values_for_ident(ilst, &performer_ident),
+        arranger: mp4_native_text_values_for_ident(ilst, &arranger_ident),
         genre: mp4_native_text_values_for_ident(ilst, &MP4_GENRE_ATOM_IDENT),
     }
 }
@@ -8405,7 +8424,7 @@ fn read_mp4_pipeline_set_valued_text_state(
     Ok(mp4_pipeline_set_valued_text_state_from_mp4(&mp4))
 }
 
-/// Read the conversion pipeline's five ordered-list fields through the same
+/// Read the conversion pipeline's six ordered-list fields through the same
 /// canonical format mapping used by the editor. This deliberately has its own
 /// field set: the shipped editor registry excludes ALBUMARTIST, while Phase 4
 /// pipeline metadata must carry it losslessly for native repeating carriers.
@@ -8421,7 +8440,7 @@ pub(crate) fn read_pipeline_set_valued_text_fields(
         let display_key = canonical_editor_display_key(item.key(), tag.tag_type());
         if !matches!(
             display_key.as_str(),
-            "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+            "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER" | "GENRE"
         ) {
             continue;
         }
@@ -8445,6 +8464,7 @@ pub(crate) fn read_pipeline_set_valued_text_fields(
                     ("ALBUMARTIST", state.album_artist),
                     ("COMPOSER", state.composer),
                     ("PERFORMER", state.performer),
+                    ("ARRANGER", state.arranger),
                     ("GENRE", state.genre),
                 ] {
                     if !values.is_empty() {
@@ -8472,6 +8492,8 @@ fn overlay_mp4_native_multivalue_editor_fields(
     for (display_key, item_key, values) in [
         ("ARTIST", lofty::tag::ItemKey::TrackArtist, &state.artist),
         ("COMPOSER", lofty::tag::ItemKey::Composer, &state.composer),
+        ("PERFORMER", lofty::tag::ItemKey::Performer, &state.performer),
+        ("ARRANGER", lofty::tag::ItemKey::Arranger, &state.arranger),
     ] {
         if values.is_empty() {
             continue;
@@ -9461,7 +9483,7 @@ struct EditorTagChange {
     values: Option<MetadataFieldValues>,
     /// Whether this caller treats the logical field as an ordered value list.
     /// Editor callers derive this from the shipped set-valued registry; the
-    /// conversion pipeline has its own five-field contract, which additionally
+    /// conversion pipeline has its own six-field contract, which additionally
     /// includes ALBUMARTIST. Keeping the bit on the change preserves the editor
     /// registry exactly while still reusing every audited backend serializer.
     list_semantics: bool,
@@ -9547,19 +9569,24 @@ fn repeated_instance_loss_warnings(
 
 fn id3_multivalue_interop_warning(display_key: &str, count: usize) -> String {
     format!(
-        "{display_key} has {count} values and was written as one ID3v2.4 multi-value text frame; ID3v2.4-aware readers can see all values, while common tools including ffmpeg and VLC and tonepoet conversion reads may expose only the first value",
+        "{display_key} has {count} values and was written as one ID3v2.4 multi-value text frame; tonepoet editor and conversion reads preserve all values, while common external tools including ffmpeg and VLC may expose only the first value",
     )
 }
 
 fn mp4_multivalue_interop_warning(display_key: &str, count: usize) -> String {
     format!(
-        "{display_key} has {count} values and was written as one MP4 ilst metadata atom with multiple data atoms; MP4-aware readers can see all values, while ffmpeg, VLC, and tonepoet conversion reads see only the first value",
+        "{display_key} has {count} values and was written as one MP4 ilst metadata atom with multiple data atoms; tonepoet editor and conversion reads preserve all values, while common external tools including ffmpeg and VLC may expose only the first value",
     )
 }
 
 fn mp4_native_multivalue_fields(state: &Mp4NativeMultiValueState) -> Vec<(String, usize)> {
-    [("ARTIST", state.artist.len()), ("COMPOSER", state.composer.len())]
-        .into_iter()
+    [
+        ("ARTIST", state.artist.len()),
+        ("COMPOSER", state.composer.len()),
+        ("PERFORMER", state.performer.len()),
+        ("ARRANGER", state.arranger.len()),
+    ]
+    .into_iter()
         .filter_map(|(display_key, count)| {
             (count > 1).then_some((display_key.to_string(), count))
         })
@@ -10154,9 +10181,10 @@ fn public_list_writer_field_has_list_semantics(display_key: &str) -> bool {
         || canonical_metadata_display_key(display_key) == "ALBUMARTIST"
 }
 
-pub fn write_all_tag_value_lists(
+fn write_tag_value_lists_with_target_type(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Vec<String>)],
+    target_type: Option<lofty::tag::TagType>,
 ) -> Result<MetadataWriteCommitReport, String> {
     if changes.is_empty() {
         return Ok(MetadataWriteCommitReport::default());
@@ -10167,7 +10195,7 @@ pub fn write_all_tag_value_lists(
     for (item_key, values) in changes {
         let display_key = canonical_editor_display_key(
             item_key,
-            lofty::tag::TagType::VorbisComments,
+            target_type.unwrap_or(lofty::tag::TagType::VorbisComments),
         );
         if !seen_fields.insert(display_key.clone()) {
             return Err(format!(
@@ -10193,7 +10221,7 @@ pub fn write_all_tag_value_lists(
             canonical_metadata_display_key(&entry.display_key) == display_key
         });
         editor_changes.push(EditorTagChange {
-            tag_type: None,
+            tag_type: target_type,
             existed,
             display_key,
             item_key: item_key.clone(),
@@ -10228,6 +10256,24 @@ pub fn write_all_tag_value_lists(
             );
     }
     Ok(report)
+}
+
+pub fn write_all_tag_value_lists(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Vec<String>)],
+) -> Result<MetadataWriteCommitReport, String> {
+    write_tag_value_lists_with_target_type(path, changes, None)
+}
+
+/// Conversion-only boundary for establishing a complete authoritative ID3v2
+/// view in a container such as WAV whose primary command-line metadata carrier
+/// is different. This deliberately reuses the editor serializer and its
+/// repeated-field capability policy instead of introducing a second ID3 writer.
+pub(crate) fn write_all_tag_value_lists_to_id3v2(
+    path: &std::path::Path,
+    changes: &[(lofty::tag::ItemKey, Vec<String>)],
+) -> Result<MetadataWriteCommitReport, String> {
+    write_tag_value_lists_with_target_type(path, changes, Some(lofty::tag::TagType::Id3v2))
 }
 
 pub fn write_all_tags_with_cancel(
@@ -13819,12 +13865,17 @@ fn resolved_editor_change_target_type(
 struct Mp4NativeMultiValueOverlay {
     artist: Option<Vec<String>>,
     composer: Option<Vec<String>>,
+    performer: Option<Vec<String>>,
+    arranger: Option<Vec<String>>,
     force_write: bool,
 }
 
 impl Mp4NativeMultiValueOverlay {
     fn is_empty(&self) -> bool {
-        self.artist.is_none() && self.composer.is_none()
+        self.artist.is_none()
+            && self.composer.is_none()
+            && self.performer.is_none()
+            && self.arranger.is_none()
     }
 }
 
@@ -13842,6 +13893,8 @@ fn prepare_mp4_native_multivalue_overlay(
         // are intentionally canonicalized to one atom on the next real write.
         artist: (state.artist.len() > 1).then(|| state.artist.clone()),
         composer: (state.composer.len() > 1).then(|| state.composer.clone()),
+        performer: (state.performer.len() > 1).then(|| state.performer.clone()),
+        arranger: (state.arranger.len() > 1).then(|| state.arranger.clone()),
         force_write: false,
     };
 
@@ -13861,11 +13914,13 @@ fn prepare_mp4_native_multivalue_overlay(
         match canonical_key.as_str() {
             "ARTIST" => overlay.artist = Some(desired.clone()),
             "COMPOSER" => overlay.composer = Some(desired.clone()),
+            "PERFORMER" => overlay.performer = Some(desired.clone()),
+            "ARRANGER" => overlay.arranger = Some(desired.clone()),
             _ => unreachable!("MP4 repeated-field capability must stay field-scoped"),
         }
 
         // Keep the established generic Tag path authoritative for every
-        // single-value MP4 field. For the two native list fields, feed that
+        // single-value MP4 field. For the four native list fields, feed that
         // bridge only the first value, then apply the complete ordered list via
         // concrete Ilst after serialization. This prevents the ID3 NUL-frame
         // representation from leaking into MP4.
@@ -13886,6 +13941,8 @@ fn prepare_mp4_native_multivalue_overlay_for_primary_changes(
     let mut overlay = Mp4NativeMultiValueOverlay {
         artist: (state.artist.len() > 1).then(|| state.artist.clone()),
         composer: (state.composer.len() > 1).then(|| state.composer.clone()),
+        performer: (state.performer.len() > 1).then(|| state.performer.clone()),
+        arranger: (state.arranger.len() > 1).then(|| state.arranger.clone()),
         force_write: false,
     };
 
@@ -13907,6 +13964,8 @@ fn prepare_mp4_native_multivalue_overlay_for_primary_changes(
         match canonical_key.as_str() {
             "ARTIST" => overlay.artist = Some(desired),
             "COMPOSER" => overlay.composer = Some(desired),
+            "PERFORMER" => overlay.performer = Some(desired),
+            "ARRANGER" => overlay.arranger = Some(desired),
             _ => unreachable!("MP4 repeated-field capability must stay field-scoped"),
         }
     }
@@ -13945,13 +14004,21 @@ fn apply_mp4_native_multivalue_overlay_to_mp4(
     mp4: &mut lofty::mp4::Mp4File,
     overlay: &Mp4NativeMultiValueOverlay,
 ) -> bool {
+    let performer_ident = mp4_performer_atom_ident();
+    let arranger_ident = mp4_arranger_atom_ident();
     let artist_changed = overlay.artist.as_ref().is_some_and(|values| {
         !mp4_ident_has_canonical_data_layout(mp4, &MP4_ARTIST_ATOM_IDENT, values)
     });
     let composer_changed = overlay.composer.as_ref().is_some_and(|values| {
         !mp4_ident_has_canonical_data_layout(mp4, &MP4_COMPOSER_ATOM_IDENT, values)
     });
-    if !artist_changed && !composer_changed {
+    let performer_changed = overlay.performer.as_ref().is_some_and(|values| {
+        !mp4_ident_has_canonical_data_layout(mp4, &performer_ident, values)
+    });
+    let arranger_changed = overlay.arranger.as_ref().is_some_and(|values| {
+        !mp4_ident_has_canonical_data_layout(mp4, &arranger_ident, values)
+    });
+    if !artist_changed && !composer_changed && !performer_changed && !arranger_changed {
         return false;
     }
 
@@ -13969,6 +14036,8 @@ fn apply_mp4_native_multivalue_overlay_to_mp4(
             overlay.composer.as_ref(),
             composer_changed,
         ),
+        (&performer_ident, overlay.performer.as_ref(), performer_changed),
+        (&arranger_ident, overlay.arranger.as_ref(), arranger_changed),
     ] {
         if !changed {
             continue;
@@ -15519,7 +15588,8 @@ fn prepare_lofty_write(
             // The generic MP4 bridge cannot represent AtomDataStorage::Multiple
             // and truncates it while reading. Snapshot the concrete ilst before
             // generic preparation so every actual rewrite can restore untouched
-            // lists and explicit ARTIST/COMPOSER changes can be emitted natively.
+            // lists and explicit ARTIST/COMPOSER/PERFORMER/ARRANGER changes
+            // can be emitted natively.
             let state = read_mp4_native_multivalue_state(path)?;
             let (generic_changes, overlay) =
                 prepare_mp4_native_multivalue_overlay(&tagged, &state, changes);
@@ -16812,7 +16882,7 @@ mod tests {
                 && warning.contains("ID3v2.4")
                 && warning.contains("ffmpeg")
                 && warning.contains("VLC")
-                && warning.contains("tonepoet conversion")
+                && warning.contains("preserve all values")
         }), "missing ID3 interoperability warning for {display_key}: {warnings:?}");
     }
 
@@ -16837,7 +16907,7 @@ mod tests {
                 && warning.contains("multiple data atoms")
                 && warning.contains("ffmpeg")
                 && warning.contains("VLC")
-                && warning.contains("tonepoet conversion")
+                && warning.contains("preserve all values")
         }), "missing MP4 interoperability warning for {display_key}: {warnings:?}");
         assert!(
             !warnings.iter().any(|warning| {
@@ -17152,48 +17222,61 @@ mod tests {
 
         let artist_values = ["Alice", "Alice", "Bob"];
         let composer_values = ["Carol", "Dave", "Dave"];
+        let performer_values = ["Miles Davis", "John Coltrane", "Miles Davis"];
+        let arranger_values = ["Gil Evans", "Quincy Jones", "Gil Evans"];
 
-        let result = apply_editor_list_change(path, "ARTIST", &artist_values, &[]);
-        assert_id3_multivalue_interop_warning(&result, "ARTIST");
-        assert_eq!(editor_slot_values(path, "ARTIST"), owned_test_values(&artist_values));
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
+        ] {
+            let result = apply_editor_list_change(path, display_key, &values, &[]);
+            assert_id3_multivalue_interop_warning(&result, display_key);
+            assert_eq!(editor_slot_values(path, display_key), owned_test_values(&values));
+        }
+
         assert_eq!(
             id3_physical_text_values(path, "TPE1"),
             owned_test_values(&artist_values),
-        );
-
-        let result = apply_editor_list_change(path, "COMPOSER", &composer_values, &[]);
-        assert_id3_multivalue_interop_warning(&result, "ARTIST");
-        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
-        assert_eq!(
-            editor_slot_values(path, "COMPOSER"),
-            owned_test_values(&composer_values),
         );
         assert_eq!(
             id3_physical_text_values(path, "TCOM"),
             owned_test_values(&composer_values),
         );
-        // Writing COMPOSER serializes the whole loaded ID3 tag. ARTIST must
-        // already have been re-coalesced before that serializer boundary.
-        assert_eq!(editor_slot_values(path, "ARTIST"), owned_test_values(&artist_values));
         assert_eq!(
-            id3_physical_text_values(path, "TPE1"),
-            owned_test_values(&artist_values),
+            id3_physical_extended_text_value(path, "PERFORMER"),
+            performer_values.join("\0"),
+            "PERFORMER must use one lossless NUL-delimited TXXX payload",
+        );
+        assert_eq!(
+            id3_physical_extended_text_value(path, "ARRANGER"),
+            arranger_values.join("\0"),
+            "ARRANGER must use one lossless NUL-delimited TXXX payload",
         );
 
+        // A whole-tag save triggered by an unrelated scalar edit must preserve
+        // every repeated field and its canonical physical representation.
         let result = apply_editor_list_change(path, "TITLE", &["Unrelated edit"], &[]);
-        assert_id3_multivalue_interop_warning(&result, "ARTIST");
-        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
-        for (display_key, frame_id, values) in [
-            ("ARTIST", "TPE1", artist_values),
-            ("COMPOSER", "TCOM", composer_values),
+        for display_key in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
+            assert_id3_multivalue_interop_warning(&result, display_key);
+        }
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
         ] {
             assert_eq!(editor_slot_values(path, display_key), owned_test_values(&values));
-            assert_eq!(id3_physical_text_values(path, frame_id), owned_test_values(&values));
         }
+        assert_eq!(id3_physical_text_values(path, "TPE1"), owned_test_values(&artist_values));
+        assert_eq!(id3_physical_text_values(path, "TCOM"), owned_test_values(&composer_values));
+        assert_eq!(id3_physical_extended_text_value(path, "PERFORMER"), performer_values.join("\0"));
+        assert_eq!(id3_physical_extended_text_value(path, "ARRANGER"), arranger_values.join("\0"));
 
         let before = std::fs::read(path).expect("snapshot ID3 multi-value carrier");
-        let result = apply_editor_list_change(path, "COMPOSER", &composer_values, &[]);
-        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
+        let result = apply_editor_list_change(path, "ARRANGER", &arranger_values, &[]);
+        assert_id3_multivalue_interop_warning(&result, "ARRANGER");
         assert_eq!(
             std::fs::read(path).expect("read repeated ID3 multi-value save"),
             before,
@@ -17289,6 +17372,33 @@ mod tests {
             bytes,
             "repeating an already-satisfied multi-value edit must be byte-identical",
         );
+
+        let performer = ["Performer A", "Performer B", "Performer A"];
+        let arranger = ["Arranger A", "Arranger B", "Arranger A"];
+        for (display_key, values) in [("PERFORMER", performer), ("ARRANGER", arranger)] {
+            assert_saved_without_warnings(&apply_editor_list_change(
+                &path, display_key, &values, &[],
+            ));
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+            assert_eq!(
+                lofty_vorbis_physical_values(&path, display_key),
+                owned_test_values(&values),
+            );
+        }
+
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path,
+            "TITLE",
+            &["Preserve repeated names"],
+            &[],
+        ));
+        for (display_key, values) in [("PERFORMER", performer), ("ARRANGER", arranger)] {
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+            assert_eq!(
+                lofty_vorbis_physical_values(&path, display_key),
+                owned_test_values(&values),
+            );
+        }
     }
 
     fn append_invalid_key_ape_item(path: &std::path::Path) -> Vec<u8> {
@@ -17319,7 +17429,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_public_value_list_writer_round_trips_all_five_fields_on_wavpack() {
+    fn pipeline_public_value_list_writer_round_trips_all_six_fields_on_wavpack() {
         use lofty::tag::ItemKey;
 
         let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-public-wavpack-multivalue");
@@ -17329,6 +17439,7 @@ mod tests {
             (ItemKey::AlbumArtist, owned_test_values(&["AA1", "AA2"])),
             (ItemKey::Composer, owned_test_values(&["C1", "C2", "C1"])),
             (ItemKey::Performer, owned_test_values(&["P1", "P2"])),
+            (ItemKey::Arranger, owned_test_values(&["R1", "R2", "R1"])),
             (ItemKey::Genre, owned_test_values(&["G1", "G2"])),
         ];
 
@@ -17350,6 +17461,7 @@ mod tests {
         assert_eq!(pipeline_metadata_values(&metadata.album_artist), owned_test_values(&["AA1", "AA2"]));
         assert_eq!(pipeline_metadata_values(&metadata.composer), owned_test_values(&["C1", "C2", "C1"]));
         assert_eq!(pipeline_metadata_values(&metadata.performer), owned_test_values(&["P1", "P2"]));
+        assert_eq!(pipeline_metadata_values(&metadata.arranger), owned_test_values(&["R1", "R2", "R1"]));
         assert_eq!(pipeline_metadata_values(&metadata.genre), owned_test_values(&["G1", "G2"]));
     }
 
@@ -17446,6 +17558,33 @@ mod tests {
             bytes,
             "repeating an already-satisfied APEv2 multi-value edit must be byte-identical",
         );
+
+        let performer = ["Performer A", "Performer B", "Performer A"];
+        let arranger = ["Arranger A", "Arranger B", "Arranger A"];
+        for (display_key, values) in [("PERFORMER", performer), ("ARRANGER", arranger)] {
+            assert_saved_without_warnings(&apply_editor_list_change(
+                &path, display_key, &values, &[],
+            ));
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+            assert_eq!(
+                native_ape_physical_text_values(&path, display_key),
+                owned_test_values(&values),
+            );
+        }
+
+        assert_saved_without_warnings(&apply_editor_list_change(
+            &path,
+            "TITLE",
+            &["Preserve repeated names"],
+            &[],
+        ));
+        for (display_key, values) in [("PERFORMER", performer), ("ARRANGER", arranger)] {
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+            assert_eq!(
+                native_ape_physical_text_values(&path, display_key),
+                owned_test_values(&values),
+            );
+        }
     }
 
     #[test]
@@ -17571,27 +17710,42 @@ mod tests {
         let path = temp.path().join("multivalue.dsf");
         crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write DSF fixture");
 
-        for (display_key, frame_id, values) in [
-            ("ARTIST", "TPE1", ["Alice", "Alice", "Bob"]),
-            ("COMPOSER", "TCOM", ["Carol", "Dave", "Dave"]),
+        let artist_values = ["Alice", "Alice", "Bob"];
+        let composer_values = ["Carol", "Dave", "Dave"];
+        let performer_values = ["Miles Davis", "John Coltrane", "Miles Davis"];
+        let arranger_values = ["Gil Evans", "Quincy Jones", "Gil Evans"];
+
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
         ] {
             let result = apply_editor_list_change(&path, display_key, &values, &[]);
             assert_id3_multivalue_interop_warning(&result, display_key);
-            if display_key == "COMPOSER" {
-                assert_id3_multivalue_interop_warning(&result, "ARTIST");
-            }
             assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+        }
+
+        for (frame_id, values) in [("TPE1", artist_values), ("TCOM", composer_values)] {
             let (frame_count, physical_values) =
                 crate::dsf_tags::test_text_frame_values(&path, frame_id)
-                    .expect("inspect DSF ID3 text frame");
+                    .expect("inspect DSF ID3 standard text frame");
             assert_eq!(frame_count, 1, "DSF {frame_id} must be exactly one frame");
             assert_eq!(physical_values, owned_test_values(&values));
         }
+        for (display_key, values) in [
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
+        ] {
+            let (frame_count, physical_values) =
+                crate::dsf_tags::test_extended_text_value(&path, display_key)
+                    .expect("inspect DSF ID3 TXXX frame");
+            assert_eq!(frame_count, 1, "DSF {display_key} must be exactly one TXXX frame");
+            assert_eq!(physical_values, vec![values.join("\0")]);
+        }
 
-        let artist_values = ["Alice", "Alice", "Bob"];
-        let composer_values = ["Carol", "Dave", "Dave"];
         let before = std::fs::read(&path).expect("snapshot DSF multi-value carrier");
-        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
+        let result = apply_editor_list_change(&path, "ARRANGER", &arranger_values, &[]);
         assert_saved_without_warnings(&result);
         assert_eq!(
             std::fs::read(&path).expect("read repeated DSF multi-value save"),
@@ -17600,16 +17754,16 @@ mod tests {
         );
 
         let result = apply_editor_list_change(&path, "TITLE", &["Unrelated edit"], &[]);
-        assert_id3_multivalue_interop_warning(&result, "ARTIST");
-        assert_id3_multivalue_interop_warning(&result, "COMPOSER");
-        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
-        assert_eq!(editor_slot_values(&path, "COMPOSER"), owned_test_values(&composer_values));
-        for (frame_id, values) in [("TPE1", artist_values), ("TCOM", composer_values)] {
-            let (frame_count, physical_values) =
-                crate::dsf_tags::test_text_frame_values(&path, frame_id)
-                    .expect("inspect DSF frame after unrelated edit");
-            assert_eq!(frame_count, 1);
-            assert_eq!(physical_values, owned_test_values(&values));
+        for display_key in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
+            assert_id3_multivalue_interop_warning(&result, display_key);
+        }
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
+        ] {
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
         }
     }
 
@@ -18205,12 +18359,14 @@ mod tests {
             (ItemKey::TrackArtist, owned_test_values(&["A", "B", "A"])),
             (ItemKey::AlbumArtist, owned_test_values(&["AA1", "AA2"])),
             (ItemKey::Composer, owned_test_values(&["C1", "C2", "C1"])),
-            (ItemKey::Performer, owned_test_values(&["P1", "P2"])),
+            (ItemKey::Performer, owned_test_values(&["P1", "P2", "P1"])),
+            (ItemKey::Arranger, owned_test_values(&["R1", "R2", "R1"])),
             (ItemKey::Genre, owned_test_values(&["G1", "G2"])),
         ];
 
-        let report = write_all_tag_value_lists(&path, &changes).expect("pipeline fixed-vocabulary list write");
-        for supported in ["ARTIST", "COMPOSER"] {
+        let report = write_all_tag_value_lists(&path, &changes)
+            .expect("pipeline fixed-vocabulary list write");
+        for supported in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
             assert!(
                 report.durability_warnings.iter().any(|warning| {
                     warning.contains(supported) && warning.contains(expected_interop_fragment)
@@ -18219,7 +18375,7 @@ mod tests {
                 report.durability_warnings
             );
         }
-        for collapsed in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+        for collapsed in ["ALBUMARTIST", "GENRE"] {
             assert!(
                 report.durability_warnings.iter().any(|warning| {
                     warning.contains(collapsed) && warning.contains("stores one value")
@@ -18235,11 +18391,11 @@ mod tests {
         assert!(source_warnings.is_empty(), "unexpected source warnings: {source_warnings:?}");
         assert_eq!(pipeline_metadata_values(&metadata.artist), owned_test_values(&["A", "B", "A"]));
         assert_eq!(pipeline_metadata_values(&metadata.composer), owned_test_values(&["C1", "C2", "C1"]));
+        assert_eq!(pipeline_metadata_values(&metadata.performer), owned_test_values(&["P1", "P2", "P1"]));
+        assert_eq!(pipeline_metadata_values(&metadata.arranger), owned_test_values(&["R1", "R2", "R1"]));
         assert_eq!(metadata.album_artist.len(), 1);
-        assert_eq!(metadata.performer.len(), 1);
         assert_eq!(metadata.genre.len(), 1);
         assert_eq!(metadata.album_artist.as_deref(), Some("AA1; AA2"));
-        assert_eq!(metadata.performer.as_deref(), Some("P1; P2"));
         assert_eq!(metadata.genre.as_deref(), Some("G1; G2"));
     }
 
@@ -18264,37 +18420,41 @@ mod tests {
     }
 
     #[test]
-    fn mp4_artist_and_composer_round_trip_as_canonical_multi_data_atoms() {
+    fn mp4_repeatable_fields_round_trip_as_canonical_multi_data_atoms() {
         let _xdg = isolated_metadata_journal_home("tonepoet-mp4-native-multivalue-roundtrip");
         let (_temp, path) = copy_numbering_fixture("native-multi.m4a", MP4_NUMBERING_FIXTURE);
         let artist_values = ["Alice", "Alice", "Bob"];
         let composer_values = ["Carol", "Dave", "Dave"];
+        let performer_values = ["Miles Davis", "John Coltrane", "Miles Davis"];
+        let arranger_values = ["Gil Evans", "Quincy Jones", "Gil Evans"];
 
-        let result = apply_editor_list_change(&path, "ARTIST", &artist_values, &[]);
-        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
-        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
-        assert_eq!(
-            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
-            vec![owned_test_values(&artist_values)],
-            "tonepoet MP4 ARTIST must be one atom containing all data atoms",
-        );
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
+        ] {
+            let result = apply_editor_list_change(&path, display_key, &values, &[]);
+            assert_mp4_multivalue_interop_warning(&result, display_key);
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+        }
 
-        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
-        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
-        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
-        assert_eq!(
-            editor_slot_values(&path, "COMPOSER"),
-            owned_test_values(&composer_values),
-        );
-        assert_eq!(
-            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
-            vec![owned_test_values(&composer_values)],
-            "tonepoet MP4 COMPOSER must be one atom containing all data atoms",
-        );
+        for (ident, values, label) in [
+            (MP4_ARTIST_ATOM_IDENT.clone(), artist_values, "ARTIST"),
+            (MP4_COMPOSER_ATOM_IDENT.clone(), composer_values, "COMPOSER"),
+            (mp4_performer_atom_ident(), performer_values, "PERFORMER"),
+            (mp4_arranger_atom_ident(), arranger_values, "ARRANGER"),
+        ] {
+            assert_eq!(
+                mp4_text_atom_groups(&path, &ident),
+                vec![owned_test_values(&values)],
+                "tonepoet MP4 {label} must be one atom containing all data atoms",
+            );
+        }
 
         let before = std::fs::read(&path).expect("snapshot MP4 multi-value carrier");
-        let result = apply_editor_list_change(&path, "COMPOSER", &composer_values, &[]);
-        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
+        let result = apply_editor_list_change(&path, "ARRANGER", &arranger_values, &[]);
+        assert_mp4_multivalue_interop_warning(&result, "ARRANGER");
         assert_eq!(
             std::fs::read(&path).expect("read repeated MP4 multi-value save"),
             before,
@@ -18302,21 +18462,17 @@ mod tests {
         );
 
         let result = apply_editor_list_change(&path, "TITLE", &["Unrelated edit"], &[]);
-        assert_mp4_multivalue_interop_warning(&result, "ARTIST");
-        assert_mp4_multivalue_interop_warning(&result, "COMPOSER");
-        assert_eq!(editor_slot_values(&path, "ARTIST"), owned_test_values(&artist_values));
-        assert_eq!(
-            editor_slot_values(&path, "COMPOSER"),
-            owned_test_values(&composer_values),
-        );
-        assert_eq!(
-            mp4_text_atom_groups(&path, &MP4_ARTIST_ATOM_IDENT),
-            vec![owned_test_values(&artist_values)],
-        );
-        assert_eq!(
-            mp4_text_atom_groups(&path, &MP4_COMPOSER_ATOM_IDENT),
-            vec![owned_test_values(&composer_values)],
-        );
+        for display_key in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
+            assert_mp4_multivalue_interop_warning(&result, display_key);
+        }
+        for (display_key, values) in [
+            ("ARTIST", artist_values),
+            ("COMPOSER", composer_values),
+            ("PERFORMER", performer_values),
+            ("ARRANGER", arranger_values),
+        ] {
+            assert_eq!(editor_slot_values(&path, display_key), owned_test_values(&values));
+        }
     }
 
     #[test]
@@ -18402,18 +18558,19 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_mp4_foreign_multi_data_reads_all_five_ordered_list_fields() {
+    fn pipeline_mp4_foreign_multi_data_reads_all_six_ordered_list_fields() {
         use lofty::tag::ItemKey;
 
-        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-mp4-five-field-source-read");
+        let _xdg = isolated_metadata_journal_home("tonepoet-pipeline-mp4-six-field-source-read");
         let (_temp, path) = copy_numbering_fixture(
-            "pipeline-foreign-five-field.m4a",
+            "pipeline-foreign-six-field.m4a",
             MP4_NUMBERING_FIXTURE,
         );
         let artist = ["Artist A", "Artist B", "Artist A"];
         let album_artist = ["Album Artist A", "Album Artist B", "Album Artist A"];
         let composer = ["Composer A", "Composer B", "Composer A"];
         let performer = ["Performer A", "Performer B", "Performer A"];
+        let arranger = ["Arranger A", "Arranger B", "Arranger A"];
         let genre = ["Genre A", "Genre B", "Genre A"];
 
         for (ident, values) in [
@@ -18421,6 +18578,7 @@ mod tests {
             (MP4_ALBUM_ARTIST_ATOM_IDENT.clone(), &album_artist),
             (MP4_COMPOSER_ATOM_IDENT.clone(), &composer),
             (mp4_performer_atom_ident(), &performer),
+            (mp4_arranger_atom_ident(), &arranger),
             (MP4_GENRE_ATOM_IDENT.clone(), &genre),
         ] {
             seed_mp4_native_multi_data_atom(&path, ident, values);
@@ -18435,17 +18593,19 @@ mod tests {
         assert_eq!(metadata.album_artist.values(), &owned_test_values(&album_artist));
         assert_eq!(metadata.composer.values(), &owned_test_values(&composer));
         assert_eq!(metadata.performer.values(), &owned_test_values(&performer));
+        assert_eq!(metadata.arranger.values(), &owned_test_values(&arranger));
         assert_eq!(metadata.genre.values(), &owned_test_values(&genre));
 
-        // The editor's MP4 write-preservation state remains intentionally
-        // two-field. This test is conversion-read coverage, not a capability
-        // expansion for Phase 1-3 editor writes.
+        // The editor write-preservation state covers the four repeatable MP4
+        // fields, while the conversion-only state additionally recovers the
+        // scalar-policy ALBUMARTIST and GENRE lists from foreign inputs.
         let editor_state = read_mp4_native_multivalue_state(&path)
             .expect("read editor MP4 native multi-value state");
         assert_eq!(editor_state.artist, owned_test_values(&artist));
         assert_eq!(editor_state.composer, owned_test_values(&composer));
+        assert_eq!(editor_state.performer, owned_test_values(&performer));
+        assert_eq!(editor_state.arranger, owned_test_values(&arranger));
         assert!(editor_state.values_for_display_key("ALBUMARTIST").is_none());
-        assert!(editor_state.values_for_display_key("PERFORMER").is_none());
         assert!(editor_state.values_for_display_key("GENRE").is_none());
 
         let recovered_changes = vec![
@@ -18453,11 +18613,12 @@ mod tests {
             (ItemKey::AlbumArtist, metadata.album_artist.values().to_vec()),
             (ItemKey::Composer, metadata.composer.values().to_vec()),
             (ItemKey::Performer, metadata.performer.values().to_vec()),
+            (ItemKey::Arranger, metadata.arranger.values().to_vec()),
             (ItemKey::Genre, metadata.genre.values().to_vec()),
         ];
 
         let (_wavpack_temp, wavpack_path) =
-            copy_numbering_fixture("pipeline-recovered-five-field.wv", APE_NUMBERING_FIXTURE);
+            copy_numbering_fixture("pipeline-recovered-six-field.wv", APE_NUMBERING_FIXTURE);
         let wavpack_report = write_all_tag_value_lists(&wavpack_path, &recovered_changes)
             .expect("persist recovered MP4 lists to WavPack");
         assert!(
@@ -18465,7 +18626,7 @@ mod tests {
                 .durability_warnings
                 .iter()
                 .any(|warning| warning.contains("stores one value")),
-            "WavPack must retain all five recovered lists: {:?}",
+            "WavPack must retain all six recovered lists: {:?}",
             wavpack_report.durability_warnings,
         );
         let (wavpack_metadata, wavpack_warnings, _) =
@@ -18481,13 +18642,14 @@ mod tests {
         );
         assert_eq!(wavpack_metadata.composer.values(), metadata.composer.values());
         assert_eq!(wavpack_metadata.performer.values(), metadata.performer.values());
+        assert_eq!(wavpack_metadata.arranger.values(), metadata.arranger.values());
         assert_eq!(wavpack_metadata.genre.values(), metadata.genre.values());
 
         let (_m4a_temp, m4a_path) =
-            copy_numbering_fixture("pipeline-recovered-five-field.m4a", MP4_NUMBERING_FIXTURE);
+            copy_numbering_fixture("pipeline-recovered-six-field.m4a", MP4_NUMBERING_FIXTURE);
         let m4a_report = write_all_tag_value_lists(&m4a_path, &recovered_changes)
             .expect("persist recovered MP4 lists to M4A");
-        for supported in ["ARTIST", "COMPOSER"] {
+        for supported in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
             assert!(
                 m4a_report
                     .durability_warnings
@@ -18497,7 +18659,7 @@ mod tests {
                 m4a_report.durability_warnings,
             );
         }
-        for collapsed in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+        for collapsed in ["ALBUMARTIST", "GENRE"] {
             assert!(
                 m4a_report
                     .durability_warnings
@@ -18515,11 +18677,11 @@ mod tests {
         assert!(m4a_warnings.is_empty(), "{m4a_warnings:?}");
         assert_eq!(m4a_metadata.artist.values(), metadata.artist.values());
         assert_eq!(m4a_metadata.composer.values(), metadata.composer.values());
+        assert_eq!(m4a_metadata.performer.values(), metadata.performer.values());
+        assert_eq!(m4a_metadata.arranger.values(), metadata.arranger.values());
         assert_eq!(m4a_metadata.album_artist.len(), 1);
-        assert_eq!(m4a_metadata.performer.len(), 1);
         assert_eq!(m4a_metadata.genre.len(), 1);
         assert_eq!(m4a_metadata.album_artist.as_deref(), Some("Album Artist A; Album Artist B; Album Artist A"));
-        assert_eq!(m4a_metadata.performer.as_deref(), Some("Performer A; Performer B; Performer A"));
         assert_eq!(m4a_metadata.genre.as_deref(), Some("Genre A; Genre B; Genre A"));
     }
 
@@ -18647,31 +18809,38 @@ mod tests {
     }
 
     #[test]
-    fn performer_arranger_genre_and_lyricist_remain_single_value_on_mp4_this_phase() {
-        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-deferred-set-valued-fields");
-        let (_temp, path) = copy_numbering_fixture("deferred.m4a", MP4_NUMBERING_FIXTURE);
-        for display_key in ["PERFORMER", "ARRANGER", "GENRE", "LYRICIST"] {
+    fn performer_arranger_are_multivalue_while_genre_lyricist_stay_scalar_on_mp4() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-mp4-performer-arranger-multivalue");
+        let (_temp, path) = copy_numbering_fixture("performer-arranger.m4a", MP4_NUMBERING_FIXTURE);
+        for display_key in ["PERFORMER", "ARRANGER"] {
+            let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
+            assert_mp4_multivalue_interop_warning(&result, display_key);
+            assert_eq!(editor_slot_values(&path, display_key), vec!["One".to_string(), "Two".to_string()]);
+        }
+        for display_key in ["GENRE", "LYRICIST"] {
             let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
             let warnings = saved_warnings(&result);
             assert!(warnings.iter().any(|warning| warning.contains(display_key)));
-            assert!(warnings
-                .iter()
-                .any(|warning| warning.contains("legacy joined representation")));
+            assert!(warnings.iter().any(|warning| warning.contains("legacy joined representation")));
             assert_eq!(editor_slot_values(&path, display_key), vec!["One; Two".to_string()]);
         }
     }
 
     #[test]
-    fn performer_arranger_genre_and_lyricist_remain_single_value_on_id3_this_phase() {
-        let _xdg = isolated_metadata_journal_home("tonepoet-id3-deferred-set-valued-fields");
-        let (_temp, path) = copy_numbering_fixture("deferred.mp3", ID3V2_NUMBERING_FIXTURE);
-        for display_key in ["PERFORMER", "ARRANGER", "GENRE", "LYRICIST"] {
+    fn performer_arranger_are_multivalue_while_genre_lyricist_stay_scalar_on_id3() {
+        let _xdg = isolated_metadata_journal_home("tonepoet-id3-performer-arranger-multivalue");
+        let (_temp, path) = copy_numbering_fixture("performer-arranger.mp3", ID3V2_NUMBERING_FIXTURE);
+        for display_key in ["PERFORMER", "ARRANGER"] {
+            let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
+            assert_id3_multivalue_interop_warning(&result, display_key);
+            assert_eq!(editor_slot_values(&path, display_key), vec!["One".to_string(), "Two".to_string()]);
+            assert_eq!(id3_physical_extended_text_value(&path, display_key), "One\0Two");
+        }
+        for display_key in ["GENRE", "LYRICIST"] {
             let result = apply_editor_list_change(&path, display_key, &["One", "Two"], &[]);
             let warnings = saved_warnings(&result);
             assert!(warnings.iter().any(|warning| warning.contains(display_key)));
-            assert!(warnings
-                .iter()
-                .any(|warning| warning.contains("legacy joined representation")));
+            assert!(warnings.iter().any(|warning| warning.contains("legacy joined representation")));
             assert_eq!(editor_slot_values(&path, display_key), vec!["One; Two".to_string()]);
         }
     }

@@ -1351,6 +1351,7 @@ fn track_metadata(
         album_artist: dvdv_track_value(sidecar_track, &["ALBUMARTIST"]).into(),
         composer: dvdv_track_value(sidecar_track, &["COMPOSER"]).into(),
         performer: performer.into(),
+        arranger: dvdv_track_value(sidecar_track, &["ARRANGER"]).into(),
         genre: dvdv_track_value(sidecar_track, &["GENRE"]).into(),
         date: dvdv_track_value(sidecar_track, &["DATE", "YEAR"]),
         track_number: Some(output_track_number),
@@ -1458,6 +1459,7 @@ fn is_dvdv_standard_track_key(key: &str) -> bool {
             | "ARTIST"
             | "ALBUMARTIST"
             | "PERFORMER"
+            | "ARRANGER"
             | "COMPOSER"
             | "GENRE"
             | "DATE"

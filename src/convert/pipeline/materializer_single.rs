@@ -204,6 +204,7 @@ pub(crate) fn merge_sidecar_cue_track_metadata(
     cue_override!(artist);
     cue_override!(album_artist);
     cue_override!(performer);
+    cue_override!(arranger);
     cue_override!(genre);
     cue_override!(date);
     cue_override!(track_number);
@@ -665,6 +666,7 @@ fn track_metadata_from_lofty_tag(
     let album_artist = take_values(&mut set_values, "ALBUMARTIST");
     let composer = take_values(&mut set_values, "COMPOSER");
     let performer = take_values(&mut set_values, "PERFORMER");
+    let arranger = take_values(&mut set_values, "ARRANGER");
     let genre = take_values(&mut set_values, "GENRE");
 
     (
@@ -674,6 +676,7 @@ fn track_metadata_from_lofty_tag(
             album_artist,
             composer,
             performer,
+            arranger,
             genre,
             date: tag.year().map(|value| value.to_string()),
             track_number: tag.track().map(|value| value as u32),
@@ -747,6 +750,7 @@ fn track_metadata_from_neutral_ape_rows(
         album_artist: texts("ALBUMARTIST"),
         composer: texts("COMPOSER"),
         performer: texts("PERFORMER"),
+        arranger: texts("ARRANGER"),
         genre: texts("GENRE"),
         date: year(),
         track_number: number("TRACKNUMBER"),
@@ -832,6 +836,8 @@ mod tests {
             (ItemKey::Composer, "Composer B"),
             (ItemKey::Performer, "Performer A"),
             (ItemKey::Performer, "Performer B"),
+            (ItemKey::Arranger, "Arranger A"),
+            (ItemKey::Arranger, "Arranger B"),
             (ItemKey::Genre, "Genre A"),
             (ItemKey::Genre, "Genre B"),
         ] {
@@ -844,6 +850,7 @@ mod tests {
         assert_eq!(list_values(&metadata.album_artist), vec!["Album A", "Album B"]);
         assert_eq!(list_values(&metadata.composer), vec!["Composer A", "Composer B"]);
         assert_eq!(list_values(&metadata.performer), vec!["Performer A", "Performer B"]);
+        assert_eq!(list_values(&metadata.arranger), vec!["Arranger A", "Arranger B"]);
         assert_eq!(list_values(&metadata.genre), vec!["Genre A", "Genre B"]);
     }
 
@@ -864,11 +871,21 @@ mod tests {
             ItemKey::Composer,
             ItemValue::Text("C1\0C2".to_string()),
         ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Performer,
+            ItemValue::Text("P1\0P2\0P1".to_string()),
+        ));
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Arranger,
+            ItemValue::Text("R1\0R2\0R1".to_string()),
+        ));
 
         let (metadata, warnings) = track_metadata_from_lofty_tag(Path::new("source.wv"), &tag);
         assert!(warnings.is_empty());
         assert_eq!(list_values(&metadata.artist), vec!["A", "B", "A"]);
         assert_eq!(list_values(&metadata.album_artist), vec!["AA1", "AA2"]);
+        assert_eq!(list_values(&metadata.performer), vec!["P1", "P2", "P1"]);
+        assert_eq!(list_values(&metadata.arranger), vec!["R1", "R2", "R1"]);
         assert_eq!(list_values(&metadata.composer), vec!["C1", "C2"]);
         assert!(metadata.extra.values().all(|value| !value.contains("; ")),
             "custom/provenance extras remain scalar rather than list-projected");
@@ -1292,13 +1309,14 @@ mod tests {
                 metadata.album_artist.as_deref(),
                 metadata.composer.as_deref(),
                 metadata.performer.as_deref(),
+                metadata.arranger.as_deref(),
                 metadata.genre.as_deref(),
                 metadata.date.as_deref(),
                 metadata.track_number,
                 metadata.disc_number,
                 metadata.isrc.as_deref(),
             ),
-            (None, None, None, None, None, None, None, None, None, None),
+            (None, None, None, None, None, None, None, None, None, None, None),
         );
         assert_eq!(
             (

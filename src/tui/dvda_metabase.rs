@@ -513,6 +513,7 @@ pub struct DvdaResolvedTrackMetadata {
     pub album_artist: Option<String>,
     pub composer: Option<String>,
     pub performer: Option<String>,
+    pub arranger: Option<String>,
     pub genre: Option<String>,
     pub date: Option<String>,
     pub track_number: Option<u32>,
@@ -599,6 +600,7 @@ pub fn resolved_track_metadata(
         .or_else(|| album_value(metabase, &["ALBUMARTIST", "ALBUM ARTIST", "ARTIST"]));
     out.composer = track_value(metabase, track_id, &["COMPOSER"]);
     out.performer = track_value(metabase, track_id, &["PERFORMER"]).or_else(|| out.artist.clone());
+    out.arranger = track_value(metabase, track_id, &["ARRANGER"]);
     out.genre = track_value(metabase, track_id, &["GENRE"]).or_else(|| album_value(metabase, &["GENRE"]));
     out.date = track_value(metabase, track_id, &["DATE", "YEAR"])
         .or_else(|| album_value(metabase, &["DATE", "YEAR"]));
@@ -684,6 +686,7 @@ fn is_structured_track_key(key: &str) -> bool {
             | "ALBUM ARTIST"
             | "COMPOSER"
             | "PERFORMER"
+            | "ARRANGER"
             | "GENRE"
             | "DATE"
             | "YEAR"

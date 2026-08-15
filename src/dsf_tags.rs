@@ -204,6 +204,12 @@ pub fn to_track_metadata(snapshot: &DsfTagSnapshot) -> crate::convert::pipeline:
             .cloned()
             .unwrap_or_default()
             .into(),
+        arranger: snapshot
+            .fields
+            .get("ARRANGER")
+            .cloned()
+            .unwrap_or_default()
+            .into(),
         genre: snapshot.fields.get("GENRE").cloned().unwrap_or_default().into(),
         date: snapshot.first("DATE").map(ToOwned::to_owned),
         track_number: snapshot.parsed_u32("TRACKNUMBER"),
@@ -3216,7 +3222,7 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             }
             let preserve_repeated_values = matches!(
                 canonical_key.as_str(),
-                "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+                "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER" | "GENRE"
             );
             let target = fields.entry(canonical_key).or_default();
             for value in values {
@@ -3348,7 +3354,7 @@ fn resolve_value_changes(
             }
         }
 
-        if !matches!(key.as_str(), "ARTIST" | "COMPOSER")
+        if !matches!(key.as_str(), "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER")
             && values.as_ref().is_some_and(|values| values.len() > 1)
         {
             return Err(format!(
@@ -3591,11 +3597,14 @@ mod backend {
             push_owned(&mut fields, "COMMENT", comment.text.clone());
         }
         for extended in tag.extended_texts() {
-            push_owned(
-                &mut fields,
-                extended.description.trim().to_ascii_uppercase(),
-                extended.value.clone(),
-            );
+            let key = extended.description.trim().to_ascii_uppercase();
+            if matches!(key.as_str(), "PERFORMER" | "ARRANGER") {
+                for value in extended.value.split('\0') {
+                    push_owned(&mut fields, key.clone(), value.to_string());
+                }
+            } else {
+                push_owned(&mut fields, key, extended.value.clone());
+            }
         }
         push_text_frame_values(&mut fields, tag, "TCOM", "COMPOSER");
         for frame in tag.frames() {
@@ -3645,6 +3654,11 @@ mod backend {
                     };
                     set_text_values(tag, frame_id, values, &change.canonical_key)?;
                 }
+                ("PERFORMER", Some(values)) | ("ARRANGER", Some(values))
+                    if values.len() > 1 =>
+                {
+                    set_extended_text_values(tag, &change.canonical_key, values)?;
+                }
                 (_, Some(values)) if values.len() > 1 => {
                     return Err(format!(
                         "DSF metadata field {} does not support repeated values on this write path",
@@ -3684,6 +3698,24 @@ mod backend {
             .unwrap_or_default();
         Ok((matching.len(), values))
     }
+
+    #[cfg(test)]
+    pub(super) fn test_extended_text_value(
+        path: &Path,
+        description: &str,
+    ) -> Result<(usize, Vec<String>), String> {
+        let location = super::inspect_dsf_metadata_location(path)?;
+        let tag = read_tag(path, location)?;
+        let matching = tag
+            .extended_texts()
+            .filter(|frame| frame.description.eq_ignore_ascii_case(description))
+            .collect::<Vec<_>>();
+        Ok((
+            matching.len(),
+            matching.iter().map(|frame| frame.value.clone()).collect(),
+        ))
+    }
+
 
     #[cfg(test)]
     pub(super) fn test_extended_text_values(
@@ -3811,6 +3843,26 @@ mod backend {
         Ok(())
     }
 
+    fn set_extended_text_values(
+        tag: &mut Tag,
+        canonical_key: &str,
+        values: &[String],
+    ) -> Result<(), String> {
+        if values.iter().any(|value| value.contains('\0')) {
+            return Err(format!(
+                "refusing DSF metadata field {canonical_key} containing an embedded NUL delimiter"
+            ));
+        }
+        remove_extended_text_aliases(tag, canonical_key);
+        if !values.is_empty() {
+            tag.add_frame(ExtendedText {
+                description: canonical_key.to_string(),
+                value: values.join("\0"),
+            });
+        }
+        Ok(())
+    }
+
     fn set_number_pair(tag: &mut Tag, track_pair: bool, change: &DsfTagChange) {
         let (number, total) = if track_pair {
             (tag.track(), tag.total_tracks())
@@ -3871,6 +3923,14 @@ pub(crate) fn test_text_frame_values(
     frame_id: &str,
 ) -> Result<(usize, Vec<String>), String> {
     backend::test_text_frame_values(path, frame_id)
+}
+
+#[cfg(test)]
+pub(crate) fn test_extended_text_value(
+    path: &Path,
+    description: &str,
+) -> Result<(usize, Vec<String>), String> {
+    backend::test_extended_text_value(path, description)
 }
 
 #[cfg(test)]
@@ -3945,11 +4005,11 @@ mod tests {
     }
 
     #[test]
-    fn dsf_read_preserves_all_five_pipeline_value_lists_without_widening_write_capability() {
+    fn dsf_read_preserves_all_six_pipeline_value_lists_and_writer_scope() {
         use id3::frame::ExtendedText;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("five-field-multivalue.dsf");
+        let path = temp.path().join("six-field-multivalue.dsf");
         let mut tag = id3::Tag::new();
         tag.set_text_values(
             "TPE1",
@@ -3967,13 +4027,9 @@ mod tests {
             "TCON",
             ["G1", "G2", "G1"].into_iter().map(str::to_string),
         );
-        // Distinct TXXX descriptions canonicalize to the same PERFORMER key,
-        // exercising duplicate preservation without using the production
-        // writer (which intentionally does not support repeated PERFORMER).
         for (description, value) in [
-            ("PERFORMER", "P1"),
-            ("performer", "P2"),
-            (" PERFORMER ", "P1"),
+            ("PERFORMER", "P1\0P2\0P1"),
+            ("ARRANGER", "R1\0R2\0R1"),
         ] {
             tag.add_frame(ExtendedText {
                 description: description.to_string(),
@@ -3988,7 +4044,7 @@ mod tests {
 
         let outcome = read_with_warnings(&path).expect("read DSF fixture");
         assert!(outcome.warnings.is_empty(), "unexpected warnings: {:?}", outcome.warnings);
-        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "GENRE"] {
+        for key in ["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "ARRANGER", "GENRE"] {
             assert_eq!(
                 outcome.snapshot.stored_value_count(key),
                 3,
@@ -4000,23 +4056,62 @@ mod tests {
         assert_eq!(track.album_artist.values(), &["AA1".to_string(), "AA2".to_string(), "AA1".to_string()]);
         assert_eq!(track.composer.values(), &["C1".to_string(), "C2".to_string(), "C1".to_string()]);
         assert_eq!(track.performer.values(), &["P1".to_string(), "P2".to_string(), "P1".to_string()]);
+        assert_eq!(track.arranger.values(), &["R1".to_string(), "R2".to_string(), "R1".to_string()]);
         assert_eq!(track.genre.values(), &["G1".to_string(), "G2".to_string(), "G1".to_string()]);
 
-        for key in ["ALBUMARTIST", "PERFORMER", "GENRE"] {
+        for key in ["ALBUMARTIST", "GENRE"] {
             let error = resolve_value_changes(&[DsfTagValueChange {
                 canonical_key: key.to_string(),
                 values: Some(vec!["one".to_string(), "two".to_string()]),
             }])
-            .expect_err("DSF output capability must remain ARTIST/COMPOSER-only");
+            .expect_err("DSF scalar-policy field must reject repeated output values");
             assert!(error.contains("does not support repeated values"), "{error}");
         }
-        for key in ["ARTIST", "COMPOSER"] {
+        for key in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
             resolve_value_changes(&[DsfTagValueChange {
                 canonical_key: key.to_string(),
                 values: Some(vec!["one".to_string(), "two".to_string()]),
             }])
-            .expect("DSF writer still supports repeated ARTIST/COMPOSER");
+            .expect("DSF writer supports repeated value-list field");
         }
+    }
+
+    #[test]
+    fn dsf_performer_arranger_production_writer_round_trips_order_and_duplicates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("performer-arranger.dsf");
+        write_test_dsf_fixture(&path, None).expect("write DSF fixture");
+        let performer = vec!["P1".to_string(), "P2".to_string(), "P1".to_string()];
+        let arranger = vec!["R1".to_string(), "R2".to_string(), "R1".to_string()];
+
+        write_values_with_control(
+            &path,
+            &[
+                DsfTagValueChange {
+                    canonical_key: "PERFORMER".to_string(),
+                    values: Some(performer.clone()),
+                },
+                DsfTagValueChange {
+                    canonical_key: "ARRANGER".to_string(),
+                    values: Some(arranger.clone()),
+                },
+            ],
+            &|| false,
+            &|_| {},
+        )
+        .expect("write repeated DSF PERFORMER/ARRANGER");
+
+        let snapshot = read(&path).expect("read repeated DSF PERFORMER/ARRANGER");
+        assert_eq!(snapshot.fields.get("PERFORMER"), Some(&performer));
+        assert_eq!(snapshot.fields.get("ARRANGER"), Some(&arranger));
+        let (performer_frames, performer_payloads) =
+            test_extended_text_value(&path, "PERFORMER").expect("inspect PERFORMER TXXX");
+        let (arranger_frames, arranger_payloads) =
+            test_extended_text_value(&path, "ARRANGER").expect("inspect ARRANGER TXXX");
+        assert_eq!(performer_frames, 1);
+        assert_eq!(arranger_frames, 1);
+        assert_eq!(performer_payloads, vec!["P1\0P2\0P1".to_string()]);
+        assert_eq!(arranger_payloads, vec!["R1\0R2\0R1".to_string()]);
     }
 
     #[test]

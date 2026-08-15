@@ -12088,6 +12088,7 @@ pub struct BluRayTrackTagOverlay {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub performer: Option<String>,
+    pub arranger: Option<String>,
 }
 
 pub fn bluray_album_tag_overlay(sidecar: &BluRayMetadataSidecar) -> BluRayAlbumTagOverlay {
@@ -12104,6 +12105,7 @@ pub fn bluray_track_tag_overlay(track: &BluRayMetadataTrack) -> BluRayTrackTagOv
         title: bluray_metadata_tag_value(&track.tags, &["TITLE"]).map(str::to_string),
         artist: bluray_metadata_tag_value(&track.tags, &["ARTIST"]).map(str::to_string),
         performer: bluray_metadata_tag_value(&track.tags, &["PERFORMER"]).map(str::to_string),
+        arranger: bluray_metadata_tag_value(&track.tags, &["ARRANGER"]).map(str::to_string),
     }
 }
 
@@ -17515,6 +17517,7 @@ ALBUM = "Sibling"
                 ("TITLE".to_string(), "Legacy One".to_string()),
                 ("ARTIST".to_string(), "Artist wins".to_string()),
                 ("PERFORMER".to_string(), "Performer fallback".to_string()),
+                ("ARRANGER".to_string(), "Legacy Arranger".to_string()),
             ]),
             extra: BTreeMap::new(),
         }];
@@ -17522,6 +17525,7 @@ ALBUM = "Sibling"
             .expect("legacy fallback allowed");
         assert_eq!(overlay.title.as_deref(), Some("Legacy One"));
         assert_eq!(bluray_track_overlay_performer_value(&overlay), Some("Artist wins"));
+        assert_eq!(overlay.arranger.as_deref(), Some("Legacy Arranger"));
         assert!(bluray_track_tag_overlay_for_authored_chapter(&sidecar, 1, false).is_none());
     }
 }

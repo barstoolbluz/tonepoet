@@ -4319,10 +4319,11 @@ fn prepared_artifact_requires_post_encode_metadata(
                     &tags,
                 )
         }
-        // MP3 needs the post stage for its repeat-capable standard fields and
-        // for NUL-separated custom APE provenance. M4A/MP4 custom/freeform
-        // provenance is already covered by m4a_artifact_has_freeform_metadata.
-        "mp3" => {
+        // ID3-bearing MP3/WAV/AIFF outputs need the post stage for their
+        // repeat-capable fields and for NUL-separated custom APE provenance.
+        // M4A/MP4 custom/freeform provenance is already covered by
+        // m4a_artifact_has_freeform_metadata.
+        "mp3" | "wav" | "aiff" | "aif" => {
             !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
                 || source_provenance_requires_scalar_projection(
                     &track.metadata,
@@ -4643,7 +4644,7 @@ pub async fn apply_metadata_with_tool_limits(
 fn pipeline_set_valued_tag_key(key: &str) -> bool {
     matches!(
         normalize_metadata_key(key).as_str(),
-        "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "GENRE"
+        "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER" | "GENRE"
     )
 }
 
@@ -5074,6 +5075,14 @@ pub(crate) fn authoritative_metadata_tags(
         "PERFORMER",
         &meta.performer,
     );
+    push_authoritative_metadata_value_list(
+        &mut tags,
+        fallback_recovered,
+        meta,
+        album,
+        "ARRANGER",
+        &meta.arranger,
+    );
     if let Some(v) = authoritative_canonical_value(
         fallback_recovered,
         meta,
@@ -5315,6 +5324,7 @@ const AUTHORITATIVE_CUE_MANAGED_TAG_KEYS: &[&str] = &[
     "COMMENT",
     "COMPOSER",
     "PERFORMER",
+    "ARRANGER",
     "ISRC",
     "PUBLISHER",
     "COPYRIGHT",
@@ -5533,6 +5543,7 @@ fn wvtag_tag_args(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FfmpegMetadataCarrier {
     Auto,
+    AiffId3v2,
     Rf64,
 }
 
@@ -5594,6 +5605,16 @@ fn ffmpeg_metadata_rewrite_args(
     args.push("copy".into());
     match carrier {
         FfmpegMetadataCarrier::Auto => {}
+        FfmpegMetadataCarrier::AiffId3v2 => {
+            // FFmpeg's AIFF muxer defaults `write_id3v2` off. Without an ID3
+            // chunk the authoritative rewrite retains only the small native
+            // AIFF text subset, so fields such as artist/album/date/track and
+            // the later repeatable-name overlay have no coherent carrier.
+            args.push("-write_id3v2".into());
+            args.push("1".into());
+            args.push("-id3v2_version".into());
+            args.push("4".into());
+        }
         FfmpegMetadataCarrier::Rf64 => {
             // `.rf64` is not an ffmpeg filename alias for the WAV muxer, and a
             // same-extension rewrite of a small RF64 file otherwise defaults
@@ -5710,13 +5731,84 @@ async fn apply_m4a_freeform_tags(
     Ok(())
 }
 
-fn wave_metadata_rewrite_requires_rf64(path: &Path) -> Result<bool, MetadataError> {
+fn wave_metadata_is_rf64(path: &Path) -> Result<bool, MetadataError> {
     use std::io::Read as _;
 
     let mut file = fs::File::open(path)?;
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic)?;
     Ok(magic == *b"RF64")
+}
+
+fn metadata_uses_rf64_carrier(path: &Path, ext: &str) -> Result<bool, MetadataError> {
+    match ext {
+        "rf64" => Ok(true),
+        "wav" => wave_metadata_is_rf64(path),
+        _ => Ok(false),
+    }
+}
+
+fn rf64_metadata_key_is_supported(key: &str, tags: &[(String, String)]) -> bool {
+    match key {
+        // FFmpeg 7.1.x's WAV/RF64 INFO carrier persists these mappings.
+        "TITLE" | "ARTIST" | "ALBUM" | "GENRE" | "DATE" | "TRACKNUMBER" | "COMMENT"
+        | "COPYRIGHT" => true,
+        // TRACKTOTAL is persisted only as part of the combined `track=N/T`
+        // value generated when TRACKNUMBER is present. On its own FFmpeg drops
+        // it, so do not claim independent carrier support.
+        "TRACKTOTAL" => tags.iter().any(|(candidate, _)| candidate == "TRACKNUMBER"),
+        _ => false,
+    }
+}
+
+fn first_unsupported_rf64_metadata_field(tags: &[(String, String)]) -> Option<&str> {
+    tags.iter()
+        .map(|(key, _)| key.as_str())
+        .find(|key| !rf64_metadata_key_is_supported(key, tags))
+}
+
+fn rf64_unsupported_metadata_policy_error(field: &str) -> &'static str {
+    match field {
+        "ALBUMARTIST" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested ALBUMARTIST metadata"
+        }
+        "DISCNUMBER" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested DISCNUMBER metadata"
+        }
+        "DISCTOTAL" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested DISCTOTAL metadata"
+        }
+        "COMPOSER" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested COMPOSER metadata"
+        }
+        "PERFORMER" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested PERFORMER metadata"
+        }
+        "ARRANGER" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested ARRANGER metadata"
+        }
+        "ISRC" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested ISRC metadata"
+        }
+        "PUBLISHER" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested PUBLISHER metadata"
+        }
+        "PRE_EMPHASIS" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested PRE_EMPHASIS metadata"
+        }
+        "CUE_FLAGS" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested CUE_FLAGS metadata"
+        }
+        "CATALOG" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested CATALOG metadata"
+        }
+        "TRACKTOTAL" => {
+            "RF64's current FFmpeg metadata carrier cannot preserve requested TRACKTOTAL metadata without TRACKNUMBER"
+        }
+        _ => {
+            "RF64's current FFmpeg metadata carrier cannot preserve a requested custom metadata field"
+        }
+    }
 }
 
 fn metadata_tag_command(
@@ -5743,10 +5835,10 @@ fn metadata_tag_command(
         }
         "mp3" | "m4a" | "mp4" | "wav" | "rf64" | "aiff" | "aif" => {
             let tmp = metadata_rewrite_temp_path(path)?;
-            let carrier = if ext == "rf64"
-                || (ext == "wav" && wave_metadata_rewrite_requires_rf64(path)?)
-            {
+            let carrier = if metadata_uses_rf64_carrier(path, ext)? {
                 FfmpegMetadataCarrier::Rf64
+            } else if matches!(ext, "aiff" | "aif") {
+                FfmpegMetadataCarrier::AiffId3v2
             } else {
                 FfmpegMetadataCarrier::Auto
             };
@@ -5945,6 +6037,7 @@ fn pipeline_multivalue_write_changes(
         ("ALBUMARTIST", ItemKey::AlbumArtist),
         ("COMPOSER", ItemKey::Composer),
         ("PERFORMER", ItemKey::Performer),
+        ("ARRANGER", ItemKey::Arranger),
         ("GENRE", ItemKey::Genre),
     ]
     .into_iter()
@@ -5959,12 +6052,61 @@ fn pipeline_multivalue_write_changes(
     .collect()
 }
 
+fn pipeline_authoritative_id3v2_write_changes(
+    tags: &[(String, String)],
+) -> Vec<(lofty::tag::ItemKey, Vec<String>)> {
+    use lofty::tag::ItemKey;
+
+    // The primary WAV FFmpeg rewrite uses RIFF INFO. If a repeated field later
+    // requires ID3v2, that new primary tag must carry the complete authoritative
+    // metadata view rather than only the repeated fields, or tonepoet's next
+    // primary-tag read can hide otherwise-valid RIFF INFO metadata.
+    let mut grouped = Vec::<(String, Vec<String>)>::new();
+    for (key, value) in tags {
+        let canonical = crate::tui::probe::canonical_metadata_display_key(key);
+        if let Some((_, values)) = grouped
+            .iter_mut()
+            .find(|(existing, _)| existing == &canonical)
+        {
+            values.push(value.clone());
+        } else {
+            grouped.push((canonical, vec![value.clone()]));
+        }
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(canonical, values)| {
+            let first = values.first()?.clone();
+            let values = if matches!(
+                canonical.as_str(),
+                "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER"
+            ) {
+                values
+            } else if pipeline_set_valued_tag_key(&canonical) && values.len() > 1 {
+                vec![values.join("; ")]
+            } else {
+                vec![first]
+            };
+            let item_key = match canonical.as_str() {
+                // Keep the pipeline's standard copyright field on TCOP even
+                // though the editor's generic new-row table does not currently
+                // need a dedicated COPYRIGHT entry.
+                "COPYRIGHT" => ItemKey::CopyrightMessage,
+                _ => crate::tui::probe::item_key_for_new_editor_row(&canonical),
+            };
+            Some((item_key, values))
+        })
+        .collect()
+}
+
 fn pipeline_multivalue_field_name(item_key: &lofty::tag::ItemKey) -> &'static str {
     match item_key {
         lofty::tag::ItemKey::TrackArtist => "ARTIST",
         lofty::tag::ItemKey::AlbumArtist => "ALBUMARTIST",
         lofty::tag::ItemKey::Composer => "COMPOSER",
         lofty::tag::ItemKey::Performer => "PERFORMER",
+        lofty::tag::ItemKey::Arranger => "ARRANGER",
         lofty::tag::ItemKey::Genre => "GENRE",
         _ => "metadata field",
     }
@@ -5980,6 +6122,17 @@ fn external_scalar_collapse_warnings(
     }
     pipeline_multivalue_write_changes(tags)
         .into_iter()
+        .filter(|(item_key, _)| match ext {
+            "wav" | "aiff" | "aif" => matches!(
+                item_key,
+                lofty::tag::ItemKey::AlbumArtist | lofty::tag::ItemKey::Genre
+            ),
+            "rf64" => matches!(
+                item_key,
+                lofty::tag::ItemKey::TrackArtist | lofty::tag::ItemKey::Genre
+            ),
+            _ => false,
+        })
         .map(|(item_key, values)| {
             let key = pipeline_multivalue_field_name(&item_key);
             format!(
@@ -5989,6 +6142,19 @@ fn external_scalar_collapse_warnings(
             )
         })
         .collect()
+}
+
+fn external_scalar_collapse_warnings_for_file(
+    path: &Path,
+    ext: &str,
+    tags: &[(String, String)],
+) -> Result<Vec<String>, MetadataError> {
+    let policy_ext = if metadata_uses_rf64_carrier(path, ext)? {
+        "rf64"
+    } else {
+        ext
+    };
+    Ok(external_scalar_collapse_warnings(path, policy_ext, tags))
 }
 
 fn fixed_vocab_scalar_collapse_warnings(
@@ -6004,7 +6170,7 @@ fn fixed_vocab_scalar_collapse_warnings(
     pipeline_multivalue_write_changes(tags)
         .into_iter()
         .filter(|(item_key, _)| {
-            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Genre)
         })
         .map(|(item_key, values)| {
             let key = pipeline_multivalue_field_name(&item_key);
@@ -6027,7 +6193,10 @@ fn pipeline_multivalue_overlay_changes_for_extension(
         .into_iter()
         .filter(|(item_key, _)| match ext {
             "wv" => true,
-            "mp3" | "m4a" | "mp4" => matches!(item_key, ItemKey::TrackArtist | ItemKey::Composer),
+            "mp3" | "wav" | "aiff" | "aif" | "m4a" | "mp4" => matches!(
+                item_key,
+                ItemKey::TrackArtist | ItemKey::Composer | ItemKey::Performer | ItemKey::Arranger
+            ),
             _ => false,
         })
         .collect()
@@ -6079,18 +6248,19 @@ fn dsf_authoritative_value_changes(
         .map(|(canonical_key, values)| {
             let values = if values.is_empty() {
                 None
-            } else if matches!(canonical_key.as_str(), "ARTIST" | "COMPOSER") {
-                // The audited DSF writer persists these two as ordered ID3v2.4
-                // text-value lists, including duplicates.
-                Some(values)
             } else if matches!(
                 canonical_key.as_str(),
-                "ALBUMARTIST" | "PERFORMER" | "GENRE"
-            ) && values.len() > 1
+                "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER"
+            ) {
+                // The audited DSF writer persists these as ordered ID3v2.4
+                // value lists, including duplicates. ARTIST/COMPOSER use
+                // standard text frames; PERFORMER/ARRANGER use TXXX.
+                Some(values)
+            } else if matches!(canonical_key.as_str(), "ALBUMARTIST" | "GENRE")
+                && values.len() > 1
             {
-                // DSF's current write contract intentionally remains scalar
-                // for these fields. Match the pipeline's established scalar
-                // projection rather than expanding backend capability here.
+                // These fields remain scalar by the fixed-vocabulary policy.
+                // Match the pipeline's established scalar projection.
                 Some(vec![values.join("; ")])
             } else {
                 // Every other pipeline/custom field is scalar. Mapped aliases
@@ -6115,7 +6285,7 @@ fn dsf_scalar_collapse_warnings(
     pipeline_multivalue_write_changes(tags)
         .into_iter()
         .filter(|(item_key, _)| {
-            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+            matches!(item_key, ItemKey::AlbumArtist | ItemKey::Genre)
         })
         .map(|(item_key, values)| {
             let key = pipeline_multivalue_field_name(&item_key);
@@ -6179,7 +6349,10 @@ async fn apply_pipeline_multivalue_overlay(
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "wv" | "mp3" | "m4a" | "mp4") {
+    if !matches!(
+        ext.as_str(),
+        "wv" | "mp3" | "wav" | "aiff" | "aif" | "m4a" | "mp4"
+    ) {
         return Ok(());
     }
 
@@ -6191,9 +6364,29 @@ async fn apply_pipeline_multivalue_overlay(
         return Ok(());
     }
 
+    if metadata_uses_rf64_carrier(path, &ext)? {
+        // Lofty 0.21.1's WAV reader accepts RIFF/WAVE, not RF64/WAVE.
+        // Production rejects authoritative fields that FFmpeg's RF64 INFO
+        // carrier cannot preserve before the primary rewrite; supported RF64
+        // values stay on that validated carrier. Do not route RF64 through the
+        // RIFF-only in-process ID3v2 overlay merely because its suffix is
+        // `.wav`. Small `-rf64 auto` outputs that remain RIFF still use the
+        // complete authoritative ID3v2 projection below.
+        return Ok(());
+    }
+
     let overlay_path = path.to_path_buf();
+    let authoritative_id3v2_changes =
+        (ext == "wav").then(|| pipeline_authoritative_id3v2_write_changes(&tags));
     let report = tokio::task::spawn_blocking(move || {
-        crate::tui::probe::write_all_tag_value_lists(&overlay_path, &changes)
+        if let Some(authoritative_changes) = authoritative_id3v2_changes {
+            crate::tui::probe::write_all_tag_value_lists_to_id3v2(
+                &overlay_path,
+                &authoritative_changes,
+            )
+        } else {
+            crate::tui::probe::write_all_tag_value_lists(&overlay_path, &changes)
+        }
     })
     .await
     .map_err(|error| {
@@ -6260,7 +6453,19 @@ async fn tag_audio_file(
         return Ok(None);
     }
 
-    for warning in external_scalar_collapse_warnings(path, &ext, &tags) {
+    if metadata_uses_rf64_carrier(path, &ext)? {
+        if let Some(field) = first_unsupported_rf64_metadata_field(&tags) {
+            // FFmpeg's WAV/RF64 INFO carrier silently ignores metadata outside
+            // its small native mapping. Reject before creating the rewrite
+            // temp file or invoking any tool so a successful conversion cannot
+            // masquerade as authoritative metadata preservation.
+            return Err(MetadataError::PolicyRejected(
+                rf64_unsupported_metadata_policy_error(field),
+            ));
+        }
+    }
+
+    for warning in external_scalar_collapse_warnings_for_file(path, &ext, &tags)? {
         log::warn!("{warning}");
     }
     for warning in fixed_vocab_scalar_collapse_warnings(path, &ext, &tags) {
@@ -6338,7 +6543,11 @@ async fn apply_production_metadata_to_file(
 
     // Artwork remuxes and the M4A freeform pass run first. The audited editor
     // writer is the final metadata mutation for formats whose command-line
-    // writer cannot represent repeated values (WavPack/ID3v2.4/MP4).
+    // writer cannot represent repeated values (WavPack/ID3v2.4/MP4). For RIFF
+    // WAV, the same pass establishes a complete authoritative ID3v2 view
+    // whenever repeated fields require that primary carrier. RF64 remains on
+    // its validated FFmpeg INFO carrier; unsupported RF64 fields are rejected
+    // before the primary rewrite because Lofty 0.21.1 cannot parse RF64.
     apply_pipeline_multivalue_overlay(path, meta, album).await?;
 
     Ok(ProductionMetadataMutationOutcome {
@@ -6425,6 +6634,7 @@ mod metadata_writer_command_tests {
                 title: Some("Cue Track".to_string()),
                 artist: Some("Cue Performer".to_string()).into(),
                 performer: Some("Cue Performer".to_string()).into(),
+                arranger: Some("Cue Arranger".to_string()).into(),
                 composer: Some("Cue Composer".to_string()).into(),
                 genre: Some("Fusion".to_string()).into(),
                 date: Some("2026".to_string()),
@@ -6489,6 +6699,7 @@ mod metadata_writer_command_tests {
         assert!(tags.contains(&("ISRC".to_string(), "USRC17607839".to_string())));
         assert!(tags.contains(&("CATALOG".to_string(), "ABC-123".to_string())));
         assert!(tags.contains(&("PERFORMER".to_string(), "Cue Performer".to_string())));
+        assert!(tags.contains(&("ARRANGER".to_string(), "Cue Arranger".to_string())));
         assert!(tags.contains(&("PRE_EMPHASIS".to_string(), "1".to_string())));
         assert_no_internal_metadata_tags(&tags);
     }
@@ -6787,6 +6998,7 @@ mod metadata_writer_command_tests {
         track.artist = vec!["A".to_string(), "B".to_string(), "A".to_string()].into();
         track.composer = vec!["C1".to_string(), "C2".to_string()].into();
         track.performer = vec!["P1".to_string(), "P2".to_string()].into();
+        track.arranger = vec!["R1".to_string(), "R2".to_string()].into();
         track.genre = vec!["G1".to_string(), "G2".to_string()].into();
         track.album_artist = vec!["AA1".to_string(), "AA2".to_string()].into();
         album.total_tracks = 12;
@@ -6804,6 +7016,7 @@ mod metadata_writer_command_tests {
         assert_eq!(values("ALBUMARTIST"), vec!["AA1", "AA2"]);
         assert_eq!(values("COMPOSER"), vec!["C1", "C2"]);
         assert_eq!(values("PERFORMER"), vec!["P1", "P2"]);
+        assert_eq!(values("ARRANGER"), vec!["R1", "R2"]);
         assert_eq!(values("GENRE"), vec!["G1", "G2"]);
         assert_eq!(values("TRACKNUMBER").len(), 1, "TRACKNUMBER stays scalar");
         assert_eq!(values("DISCNUMBER").len(), 1, "DISCNUMBER stays scalar");
@@ -6873,17 +7086,17 @@ mod metadata_writer_command_tests {
             ("ARTIST".to_string(), "B".to_string()),
             ("TITLE".to_string(), "Song".to_string()),
         ];
-        assert_eq!(
-            external_scalar_collapse_warnings(Path::new("track.wav"), "wav", &tags).len(),
-            1
+        assert!(
+            external_scalar_collapse_warnings(Path::new("track.wav"), "wav", &tags).is_empty(),
+            "WAV ID3 overlay preserves repeatable fixed-vocabulary fields",
         );
         assert_eq!(
             external_scalar_collapse_warnings(Path::new("track.rf64"), "rf64", &tags).len(),
             1
         );
-        assert_eq!(
-            external_scalar_collapse_warnings(Path::new("track.aiff"), "aiff", &tags).len(),
-            1
+        assert!(
+            external_scalar_collapse_warnings(Path::new("track.aiff"), "aiff", &tags).is_empty(),
+            "AIFF ID3 overlay preserves repeatable fixed-vocabulary fields",
         );
         assert!(external_scalar_collapse_warnings(Path::new("track.w64"), "w64", &tags).is_empty());
         for ext in [
@@ -6901,6 +7114,198 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
+    fn rf64_content_named_wav_uses_rf64_capability_and_warning_policy() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let riff = temp.path().join("riff.wav");
+        let rf64_wav = temp.path().join("rf64.wav");
+        fs::write(&riff, b"RIFF\0\0\0\0WAVE").expect("write RIFF marker");
+        fs::write(&rf64_wav, b"RF64\0\0\0\0WAVE").expect("write RF64 marker");
+
+        assert!(!metadata_uses_rf64_carrier(&riff, "wav").expect("classify RIFF WAV"));
+        assert!(metadata_uses_rf64_carrier(&rf64_wav, "wav").expect("classify RF64 WAV"));
+        assert!(
+            metadata_uses_rf64_carrier(Path::new("track.rf64"), "rf64")
+                .expect("classify explicit RF64"),
+        );
+
+        let supported_tags = vec![
+            ("ARTIST".to_string(), "A1".to_string()),
+            ("ARTIST".to_string(), "A2".to_string()),
+        ];
+        assert!(
+            external_scalar_collapse_warnings_for_file(&riff, "wav", &supported_tags)
+                .expect("RIFF warning policy")
+                .is_empty(),
+            "ordinary RIFF WAV preserves repeated ARTIST through ID3v2",
+        );
+        let rf64_warnings =
+            external_scalar_collapse_warnings_for_file(&rf64_wav, "wav", &supported_tags)
+                .expect("RF64-in-WAV warning policy");
+        assert_eq!(rf64_warnings.len(), 1);
+        assert!(rf64_warnings[0].contains("ARTIST"));
+        assert!(rf64_warnings[0].contains("writing one joined scalar value"));
+
+        let unsupported_tags = vec![
+            ("PERFORMER".to_string(), "P1".to_string()),
+            ("PERFORMER".to_string(), "P2".to_string()),
+            ("ARRANGER".to_string(), "R1".to_string()),
+            ("ARRANGER".to_string(), "R2".to_string()),
+        ];
+        assert_eq!(
+            first_unsupported_rf64_metadata_field(&unsupported_tags),
+            Some("PERFORMER"),
+        );
+        assert!(
+            external_scalar_collapse_warnings_for_file(&rf64_wav, "wav", &unsupported_tags)
+                .expect("unsupported RF64 warning policy")
+                .is_empty(),
+            "unsupported RF64 fields are rejected, not described as scalar writes",
+        );
+
+        let explicit_rf64_warnings =
+            external_scalar_collapse_warnings_for_file(
+                Path::new("track.rf64"),
+                "rf64",
+                &supported_tags,
+            )
+            .expect("explicit RF64 warning policy");
+        assert_eq!(explicit_rf64_warnings, rf64_warnings);
+    }
+
+    #[test]
+    fn rf64_metadata_capability_table_rejects_fields_ffmpeg_drops() {
+        let supported = vec![
+            ("TITLE".to_string(), "T".to_string()),
+            ("ARTIST".to_string(), "A".to_string()),
+            ("ALBUM".to_string(), "AL".to_string()),
+            ("GENRE".to_string(), "G".to_string()),
+            ("DATE".to_string(), "2026".to_string()),
+            ("TRACKNUMBER".to_string(), "4".to_string()),
+            ("TRACKTOTAL".to_string(), "9".to_string()),
+            ("COMMENT".to_string(), "C".to_string()),
+            ("COPYRIGHT".to_string(), "COPY".to_string()),
+        ];
+        assert_eq!(first_unsupported_rf64_metadata_field(&supported), None);
+
+        for field in [
+            "ALBUMARTIST",
+            "DISCNUMBER",
+            "DISCTOTAL",
+            "COMPOSER",
+            "PERFORMER",
+            "ARRANGER",
+            "ISRC",
+            "PUBLISHER",
+            "PRE_EMPHASIS",
+            "CUE_FLAGS",
+            "CATALOG",
+            "CUSTOM_KEY",
+        ] {
+            let tags = vec![(field.to_string(), "value".to_string())];
+            assert_eq!(
+                first_unsupported_rf64_metadata_field(&tags),
+                Some(field),
+                "{field} must fail closed on RF64",
+            );
+        }
+
+        let total_without_number = vec![("TRACKTOTAL".to_string(), "9".to_string())];
+        assert_eq!(
+            first_unsupported_rf64_metadata_field(&total_without_number),
+            Some("TRACKTOTAL"),
+        );
+    }
+
+    #[tokio::test]
+    async fn rf64_content_named_wav_rejects_unsupported_metadata_before_mutation() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let path = temp.path().join("track.wav");
+        let marker = b"RF64\0\0\0\0WAVE";
+        let runner = RealToolRunner::new(HashMap::new());
+
+        let cases = [
+            (
+                "PERFORMER",
+                TrackMetadata {
+                    performer: vec!["P1".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "PERFORMER",
+                TrackMetadata {
+                    performer: vec!["P1".to_string(), "P2".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "ARRANGER",
+                TrackMetadata {
+                    arranger: vec!["R1".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "ARRANGER",
+                TrackMetadata {
+                    arranger: vec!["R1".to_string(), "R2".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+        ];
+
+        for (field, track) in cases {
+            fs::write(&path, marker).expect("reset RF64 marker");
+            let before = fs::read(&path).expect("read RF64 marker before rejection");
+            let error = tag_audio_file(
+                &path,
+                &track,
+                &AlbumMetadata::default(),
+                &runner,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("unsupported RF64 metadata must fail closed before tool execution");
+            match error {
+                MetadataError::PolicyRejected(message) => assert!(
+                    message.contains(field),
+                    "policy error must name {field}: {message}",
+                ),
+                other => panic!("expected RF64 policy rejection for {field}, got {other:?}"),
+            }
+            assert_eq!(
+                fs::read(&path).expect("read RF64 marker after rejection"),
+                before,
+                "RF64 rejection must leave the source bytes untouched",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rf64_content_named_wav_skips_riff_only_in_process_overlay() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let path = temp.path().join("track.wav");
+        let marker = b"RF64\0\0\0\0WAVE";
+        fs::write(&path, marker).expect("write RF64 marker");
+        let track = TrackMetadata {
+            performer: vec!["P1".to_string(), "P2".to_string()].into(),
+            arranger: vec!["R1".to_string(), "R2".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+
+        apply_pipeline_multivalue_overlay(&path, &track, &AlbumMetadata::default())
+            .await
+            .expect("RF64-in-WAV must bypass Lofty's RIFF-only overlay");
+        let after = fs::read(&path).expect("read untouched RF64 marker");
+        assert_eq!(
+            after.as_slice(),
+            marker,
+            "RF64 overlay bypass must not mutate the carrier",
+        );
+    }
+
+    #[test]
     fn fixed_vocab_collapse_warning_covers_only_non_repeatable_mp3_mp4_fields() {
         let tags = vec![
             ("ARTIST".to_string(), "A1".to_string()),
@@ -6911,6 +7316,8 @@ mod metadata_writer_command_tests {
             ("COMPOSER".to_string(), "C2".to_string()),
             ("PERFORMER".to_string(), "P1".to_string()),
             ("PERFORMER".to_string(), "P2".to_string()),
+            ("ARRANGER".to_string(), "R1".to_string()),
+            ("ARRANGER".to_string(), "R2".to_string()),
             ("GENRE".to_string(), "G1".to_string()),
             ("GENRE".to_string(), "G2".to_string()),
         ];
@@ -6920,18 +7327,69 @@ mod metadata_writer_command_tests {
                 ext,
                 &tags,
             );
-            assert_eq!(warnings.len(), 3, "{ext}");
+            assert_eq!(warnings.len(), 2, "{ext}");
             assert!(warnings.iter().any(|warning| warning.contains("ALBUMARTIST")));
-            assert!(warnings.iter().any(|warning| warning.contains("PERFORMER")));
             assert!(warnings.iter().any(|warning| warning.contains("GENRE")));
-            assert!(!warnings.iter().any(|warning| warning.contains(": ARTIST has ")));
-            assert!(!warnings.iter().any(|warning| warning.contains(": COMPOSER has ")));
+            for repeatable in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
+                assert!(
+                    !warnings.iter().any(|warning| warning.contains(&format!(": {repeatable} has "))),
+                    "{ext} must not report scalar collapse for {repeatable}: {warnings:?}",
+                );
+            }
         }
         assert!(fixed_vocab_scalar_collapse_warnings(Path::new("track.wv"), "wv", &tags).is_empty());
     }
 
     #[test]
-    fn overlay_projection_skips_non_repeatable_mp3_mp4_fields() {
+    fn wav_authoritative_id3v2_projection_contains_complete_metadata_view() {
+        use lofty::tag::ItemKey;
+
+        let track = TrackMetadata {
+            title: Some("WAV title".to_string()),
+            artist: vec!["Artist A".to_string(), "Artist B".to_string()].into(),
+            performer: vec!["Performer A".to_string(), "Performer B".to_string()].into(),
+            arranger: vec!["Arranger A".to_string(), "Arranger B".to_string()].into(),
+            genre: vec!["Genre A".to_string(), "Genre B".to_string()].into(),
+            date: Some("2026".to_string()),
+            track_number: Some(7),
+            ..TrackMetadata::default()
+        };
+        let album = AlbumMetadata {
+            album: Some("WAV album".to_string()),
+            total_tracks: 9,
+            ..AlbumMetadata::default()
+        };
+        let tags = authoritative_metadata_tags(&track, &album);
+        let changes = pipeline_authoritative_id3v2_write_changes(&tags);
+        let values_for = |key: ItemKey| {
+            changes
+                .iter()
+                .find(|(candidate, _)| candidate == &key)
+                .map(|(_, values)| values.clone())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(values_for(ItemKey::TrackTitle), vec!["WAV title".to_string()]);
+        assert_eq!(
+            values_for(ItemKey::TrackArtist),
+            vec!["Artist A".to_string(), "Artist B".to_string()],
+        );
+        assert_eq!(values_for(ItemKey::AlbumTitle), vec!["WAV album".to_string()]);
+        assert_eq!(values_for(ItemKey::Genre), vec!["Genre A; Genre B".to_string()]);
+        assert_eq!(values_for(ItemKey::Year), vec!["2026".to_string()]);
+        assert_eq!(values_for(ItemKey::TrackNumber), vec!["7".to_string()]);
+        assert_eq!(
+            values_for(ItemKey::Performer),
+            vec!["Performer A".to_string(), "Performer B".to_string()],
+        );
+        assert_eq!(
+            values_for(ItemKey::Arranger),
+            vec!["Arranger A".to_string(), "Arranger B".to_string()],
+        );
+    }
+
+    #[test]
+    fn overlay_projection_includes_all_repeatable_fixed_vocab_fields() {
         use lofty::tag::ItemKey;
 
         let tags = vec![
@@ -6943,21 +7401,29 @@ mod metadata_writer_command_tests {
             ("COMPOSER".to_string(), "C2".to_string()),
             ("PERFORMER".to_string(), "P1".to_string()),
             ("PERFORMER".to_string(), "P2".to_string()),
+            ("ARRANGER".to_string(), "R1".to_string()),
+            ("ARRANGER".to_string(), "R2".to_string()),
             ("GENRE".to_string(), "G1".to_string()),
             ("GENRE".to_string(), "G2".to_string()),
         ];
-        for ext in ["mp3", "m4a", "mp4"] {
+        for ext in ["mp3", "wav", "aiff", "aif", "m4a", "mp4"] {
             let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, ext);
-            assert_eq!(changes.len(), 2, "{ext}");
-            assert!(changes.iter().any(|(key, _)| *key == ItemKey::TrackArtist));
-            assert!(changes.iter().any(|(key, _)| *key == ItemKey::Composer));
+            assert_eq!(changes.len(), 4, "{ext}");
+            for repeatable in [
+                ItemKey::TrackArtist,
+                ItemKey::Composer,
+                ItemKey::Performer,
+                ItemKey::Arranger,
+            ] {
+                assert!(changes.iter().any(|(key, _)| *key == repeatable), "{ext}: {repeatable:?}");
+            }
             assert!(!changes.iter().any(|(key, _)| {
-                matches!(key, ItemKey::AlbumArtist | ItemKey::Performer | ItemKey::Genre)
+                matches!(key, ItemKey::AlbumArtist | ItemKey::Genre)
             }));
         }
         assert_eq!(
             pipeline_multivalue_overlay_changes_for_extension(&tags, "wv").len(),
-            5,
+            6,
             "WavPack still overlays every repeat-capable pipeline field",
         );
     }
@@ -7456,6 +7922,43 @@ mod metadata_writer_command_tests {
     }
 
     #[test]
+    fn aiff_metadata_rewrite_enables_id3v24_only_for_aiff_destinations() {
+        let temp = tempfile::tempdir().expect("metadata test tempdir");
+        let tags = vec![("TITLE".to_string(), "AIFF metadata".to_string())];
+
+        for ext in ["aiff", "aif"] {
+            let input = temp.path().join(format!("track.{ext}"));
+            fs::write(&input, b"FORM\0\0\0\0AIFF").expect("write AIFF marker");
+            let (command, temporary) =
+                metadata_tag_command(&input, ext, &tags, &BTreeSet::new())
+                    .expect("build AIFF metadata command");
+            assert_eq!(command.binary, ToolBinary::Ffmpeg);
+            assert_pair(&command.args, "-write_id3v2", "1");
+            assert_pair(&command.args, "-id3v2_version", "4");
+            assert!(temporary.is_some());
+        }
+
+        for ext in ["mp3", "m4a"] {
+            let input = temp.path().join(format!("track.{ext}"));
+            fs::write(&input, b"source audio").expect("write metadata source");
+            let (command, temporary) =
+                metadata_tag_command(&input, ext, &tags, &BTreeSet::new())
+                    .expect("build non-AIFF metadata command");
+            assert!(!command.args.iter().any(|arg| arg == "-write_id3v2"));
+            assert!(!command.args.iter().any(|arg| arg == "-id3v2_version"));
+            assert!(temporary.is_some());
+        }
+
+        let wav = temp.path().join("track.wav");
+        fs::write(&wav, b"RIFF\0\0\0\0WAVE").expect("write WAV marker");
+        let (command, temporary) = metadata_tag_command(&wav, "wav", &tags, &BTreeSet::new())
+            .expect("build WAV metadata command");
+        assert!(!command.args.iter().any(|arg| arg == "-write_id3v2"));
+        assert!(!command.args.iter().any(|arg| arg == "-id3v2_version"));
+        assert!(temporary.is_some());
+    }
+
+    #[test]
     fn wav_metadata_rewrite_preserves_rf64_container_identity() {
         let temp = tempfile::tempdir().expect("metadata test tempdir");
         let input = temp.path().join("track.wav");
@@ -7923,6 +8426,7 @@ mod metadata_writer_command_tests {
                 album_artist: vec!["Album Artist A".to_string(), "Album Artist B".to_string()].into(),
                 composer: vec!["Composer A".to_string(), "Composer B".to_string(), "Composer A".to_string()].into(),
                 performer: vec!["Performer A".to_string(), "Performer B".to_string()].into(),
+                arranger: vec!["Arranger A".to_string(), "Arranger B".to_string(), "Arranger A".to_string()].into(),
                 genre: vec!["Genre A".to_string(), "Genre B".to_string(), "Genre A".to_string()].into(),
                 track_number: Some(1),
                 disc_number: Some(1),
@@ -7953,6 +8457,10 @@ mod metadata_writer_command_tests {
         assert_eq!(
             metadata.performer.values(),
             &["Performer A".to_string(), "Performer B".to_string()]
+        );
+        assert_eq!(
+            metadata.arranger.values(),
+            &["Arranger A".to_string(), "Arranger B".to_string(), "Arranger A".to_string()]
         );
         assert_eq!(
             metadata.genre.values(),
@@ -8103,6 +8611,7 @@ mod metadata_writer_command_tests {
             album_artist: vec!["AA1".to_string(), "AA2".to_string(), "AA1".to_string()].into(),
             composer: vec!["C1".to_string(), "C2".to_string(), "C1".to_string()].into(),
             performer: vec!["P1".to_string(), "P2".to_string(), "P1".to_string()].into(),
+            arranger: vec!["R1".to_string(), "R2".to_string(), "R1".to_string()].into(),
             genre: vec!["G1".to_string(), "G2".to_string(), "G1".to_string()].into(),
             date: Some("2026".to_string()),
             track_number: Some(3),
@@ -8160,14 +8669,17 @@ mod metadata_writer_command_tests {
             Some(&vec!["C1".to_string(), "C2".to_string(), "C1".to_string()])
         );
         assert_eq!(
+            snapshot.fields.get("PERFORMER"),
+            Some(&vec!["P1".to_string(), "P2".to_string(), "P1".to_string()])
+        );
+        assert_eq!(
+            snapshot.fields.get("ARRANGER"),
+            Some(&vec!["R1".to_string(), "R2".to_string(), "R1".to_string()])
+        );
+        assert_eq!(
             snapshot.fields.get("ALBUMARTIST"),
             Some(&vec!["AA1; AA2; AA1".to_string()]),
             "DSF ALBUMARTIST write capability remains scalar"
-        );
-        assert_eq!(
-            snapshot.fields.get("PERFORMER"),
-            Some(&vec!["P1; P2; P1".to_string()]),
-            "DSF PERFORMER write capability remains scalar"
         );
         assert_eq!(
             snapshot.fields.get("GENRE"),
@@ -8334,6 +8846,301 @@ mod metadata_writer_command_tests {
         assert!(rf64_tags.contains("TAG:artist=Planner metadata artist"), "{rf64_tags:?}");
         assert!(rf64_tags.contains("TAG:track=4"), "{rf64_tags:?}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rf64_content_with_wav_suffix_rejects_unsupported_metadata_before_mutation_when_ffmpeg_is_available() {
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            eprintln!("skipping RF64-in-WAV metadata capability regression; ffmpeg/ffprobe are required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-rf64-wav-suffix-capability");
+        let source = dir.join("source.wav");
+        create_sine_audio(
+            &source,
+            &["-c:a", "pcm_s16le", "-rf64", "always", "-f", "wav"],
+        );
+        assert_eq!(
+            &fs::read(&source).expect("read RF64 source marker")[..4],
+            b"RF64",
+            "test fixture must be actual RF64 despite its .wav suffix",
+        );
+        let source_bytes = fs::read(&source).expect("read pristine RF64 fixture");
+        let runner = RealToolRunner::new(HashMap::new());
+
+        let cases = [
+            (
+                "PERFORMER",
+                TrackMetadata {
+                    performer: vec!["P1".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "PERFORMER",
+                TrackMetadata {
+                    performer: vec!["P1".to_string(), "P2".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "ARRANGER",
+                TrackMetadata {
+                    arranger: vec!["R1".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+            (
+                "ARRANGER",
+                TrackMetadata {
+                    arranger: vec!["R1".to_string(), "R2".to_string()].into(),
+                    ..TrackMetadata::default()
+                },
+            ),
+        ];
+
+        for (index, (field, track)) in cases.into_iter().enumerate() {
+            let path = dir.join(format!("unsupported-{index}.wav"));
+            fs::write(&path, &source_bytes).expect("copy RF64 fixture");
+            let error = apply_production_metadata_to_file(
+                &path,
+                &track,
+                &AlbumMetadata::default(),
+                None,
+                &runner,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("unsupported RF64 metadata must fail closed");
+            match error {
+                MetadataError::PolicyRejected(message) => assert!(
+                    message.contains(field),
+                    "policy error must name {field}: {message}",
+                ),
+                other => panic!("expected RF64 policy rejection for {field}, got {other:?}"),
+            }
+            assert_eq!(
+                fs::read(&path).expect("read rejected RF64 output"),
+                source_bytes,
+                "RF64 policy rejection must occur before any metadata mutation",
+            );
+        }
+
+        let supported_path = dir.join("supported.wav");
+        fs::write(&supported_path, &source_bytes).expect("copy supported RF64 fixture");
+        let supported_track = TrackMetadata {
+            title: Some("RF64 supported title".to_string()),
+            artist: vec!["RF64 supported artist".to_string()].into(),
+            genre: vec!["RF64 supported genre".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+        let outcome = apply_production_metadata_to_file(
+            &supported_path,
+            &supported_track,
+            &AlbumMetadata::default(),
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("RF64 fields supported by FFmpeg's INFO carrier must remain writable");
+        assert_eq!(outcome.primary_mutator, Some(ToolBinary::Ffmpeg));
+        assert_eq!(
+            &fs::read(&supported_path).expect("read supported RF64 marker")[..4],
+            b"RF64",
+        );
+        let supported_bytes = fs::read(&supported_path).expect("read supported RF64 bytes");
+        assert!(
+            !supported_bytes.windows(4).any(|window| window == b"ID3 "),
+            "RF64 supported-field rewrite must remain on the native FFmpeg carrier",
+        );
+        let tags = run_stdout(
+            "ffprobe",
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-show_entries".to_string(),
+                "format_tags=title,artist,genre".to_string(),
+                "-of".to_string(),
+                "default=nw=1".to_string(),
+                supported_path.display().to_string(),
+            ],
+        );
+        assert!(tags.contains("TAG:title=RF64 supported title"), "{tags:?}");
+        assert!(tags.contains("TAG:artist=RF64 supported artist"), "{tags:?}");
+        assert!(tags.contains("TAG:genre=RF64 supported genre"), "{tags:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn common_repeated_carrier_metadata() -> (TrackMetadata, AlbumMetadata) {
+        (
+            TrackMetadata {
+                title: Some("Carrier round-trip title".to_string()),
+                artist: Some("Carrier Artist".to_string()).into(),
+                performer: vec!["Miles Davis".to_string(), "John Coltrane".to_string()].into(),
+                arranger: vec!["Gil Evans".to_string(), "Quincy Jones".to_string()].into(),
+                genre: Some("Jazz".to_string()).into(),
+                date: Some("2026".to_string()),
+                track_number: Some(7),
+                ..TrackMetadata::default()
+            },
+            AlbumMetadata {
+                album: Some("Carrier round-trip album".to_string()),
+                total_tracks: 9,
+                ..AlbumMetadata::default()
+            },
+        )
+    }
+
+    fn assert_common_repeated_carrier_metadata(metadata: &TrackMetadata) {
+        assert_eq!(metadata.title.as_deref(), Some("Carrier round-trip title"));
+        assert_eq!(metadata.artist.values(), &["Carrier Artist".to_string()]);
+        assert_eq!(
+            metadata.extra.get("album").map(String::as_str),
+            Some("Carrier round-trip album"),
+        );
+        assert_eq!(metadata.genre.values(), &["Jazz".to_string()]);
+        assert_eq!(metadata.date.as_deref(), Some("2026"));
+        assert_eq!(metadata.track_number, Some(7));
+        assert_eq!(
+            metadata.performer.values(),
+            &["Miles Davis".to_string(), "John Coltrane".to_string()],
+        );
+        assert_eq!(
+            metadata.arranger.values(),
+            &["Gil Evans".to_string(), "Quincy Jones".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn aiff_authoritative_metadata_round_trips_common_and_repeatable_fields_when_ffmpeg_is_available() {
+        use lofty::file::TaggedFileExt;
+
+        if !executable_on_path("ffmpeg") {
+            eprintln!("skipping AIFF authoritative metadata regression; ffmpeg is required");
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-aiff-id3v2-authoritative");
+        let path = dir.join("track.aiff");
+        create_sine_audio(&path, &["-c:a", "pcm_s16be", "-f", "aiff"]);
+        let (track, album) = common_repeated_carrier_metadata();
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &path,
+            &track,
+            &album,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply authoritative AIFF metadata");
+
+        let tagged = lofty::read_from_path(&path).expect("read tagged AIFF");
+        assert!(
+            tagged.tag(lofty::tag::TagType::Id3v2).is_some(),
+            "AIFF authoritative rewrite must establish an ID3v2 carrier",
+        );
+        let (metadata, _warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&path)
+                .expect("read AIFF through tonepoet pipeline reader");
+        assert!(!recovered);
+        assert_common_repeated_carrier_metadata(&metadata);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wav_repeated_overlay_establishes_complete_primary_id3_view_and_survives_next_conversion_when_tools_are_available() {
+        use lofty::file::TaggedFileExt;
+
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("metaflac")
+            || !ffmpeg_encoder_available("flac")
+        {
+            eprintln!(
+                "skipping WAV primary-ID3 regression; ffmpeg with FLAC encoder and metaflac are required"
+            );
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-wav-complete-primary-id3");
+        let wav = dir.join("track.wav");
+        create_sine_audio(&wav, &["-c:a", "pcm_s16le", "-f", "wav"]);
+        let (track, album) = common_repeated_carrier_metadata();
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &wav,
+            &track,
+            &album,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply authoritative WAV metadata");
+
+        let tagged = lofty::read_from_path(&wav).expect("read tagged WAV");
+        assert!(
+            tagged.tag(lofty::tag::TagType::Id3v2).is_some(),
+            "repeated WAV metadata must establish the ID3v2 primary carrier",
+        );
+        let (wav_metadata, _warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&wav)
+                .expect("read WAV through tonepoet pipeline reader");
+        assert!(!recovered);
+        assert_common_repeated_carrier_metadata(&wav_metadata);
+
+        // Exercise the next conversion boundary using tonepoet's own recovered
+        // metadata view. The audio encode is isolated from metadata so the
+        // subsequent production metadata stage is solely responsible for the
+        // FLAC tags, matching the pipeline's authoritative-write contract.
+        let flac = dir.join("track.flac");
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-i".to_string(),
+                wav.display().to_string(),
+                "-map_metadata".to_string(),
+                "-1".to_string(),
+                "-c:a".to_string(),
+                "flac".to_string(),
+                flac.display().to_string(),
+            ],
+        );
+        let reread_album = AlbumMetadata {
+            album: wav_metadata.extra.get("album").cloned(),
+            total_tracks: 9,
+            ..AlbumMetadata::default()
+        };
+        apply_production_metadata_to_file(
+            &flac,
+            &wav_metadata,
+            &reread_album,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply metadata recovered from WAV to FLAC");
+        let (flac_metadata, _warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&flac)
+                .expect("read converted FLAC through tonepoet pipeline reader");
+        assert!(!recovered);
+        assert_common_repeated_carrier_metadata(&flac_metadata);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -8778,6 +9585,17 @@ mod cue_real_output_matrix_tests {
                 container_contains: &["wav"],
                 codec: "pcm_s16le",
                 required_encoder: Some("pcm_s16le"),
+                required_taggers: &[],
+                artwork_supported: ArtworkExpectation::Unsupported,
+                supports_album_artist: false,
+            },
+            MatrixCase {
+                name: "cue_to_aiff",
+                format: tonepoet_pipeline::AudioFormat::Aiff,
+                extension: "aiff",
+                container_contains: &["aiff"],
+                codec: "pcm_s16be",
+                required_encoder: Some("pcm_s16be"),
                 required_taggers: &[],
                 artwork_supported: ArtworkExpectation::Unsupported,
                 supports_album_artist: false,
@@ -9261,6 +10079,18 @@ FILE "album.flac" WAVE
             .expect("custom-tag matrix source should contain one track");
         insert_source_text_tag(&mut track.metadata.extra, "PRE_EMPHASIS", "1");
         insert_source_text_tag(&mut track.metadata.extra, "MY_NOTE", "keep me");
+        track.metadata.performer = vec![
+            "Performer A".to_string(),
+            "Performer B".to_string(),
+            "Performer A".to_string(),
+        ]
+        .into();
+        track.metadata.arranger = vec![
+            "Arranger A".to_string(),
+            "Arranger B".to_string(),
+            "Arranger A".to_string(),
+        ]
+        .into();
         track.metadata.pre_emphasis = source_text_tags_indicate_pre_emphasis(&track.metadata.extra);
         assert!(track.metadata.pre_emphasis, "PRE_EMPHASIS=1 should promote to the first-class flag");
     }
@@ -9273,6 +10103,47 @@ FILE "album.flac" WAVE
         let context = format!("{} {pass}", case.name);
         assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
         assert_tag_value(&tags, "MY_NOTE", "keep me", &context);
+    }
+
+    fn assert_pipeline_repeatable_name_values(case: &MatrixCase, path: &Path, pass: &str) {
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(path)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} {pass} could not be read through the conversion metadata reader: {error}",
+                        case.name
+                    )
+                });
+        assert!(
+            !recovered,
+            "{} {pass} unexpectedly required fallback metadata recovery",
+            case.name
+        );
+        assert!(
+            warnings.is_empty(),
+            "{} {pass} emitted conversion metadata read warnings: {warnings:?}",
+            case.name
+        );
+        assert_eq!(
+            metadata.performer.values(),
+            &[
+                "Performer A".to_string(),
+                "Performer B".to_string(),
+                "Performer A".to_string(),
+            ],
+            "{} {pass} must preserve ordered PERFORMER values",
+            case.name
+        );
+        assert_eq!(
+            metadata.arranger.values(),
+            &[
+                "Arranger A".to_string(),
+                "Arranger B".to_string(),
+                "Arranger A".to_string(),
+            ],
+            "{} {pass} must preserve ordered ARRANGER values",
+            case.name
+        );
     }
 
     fn assert_any_tag_value(
@@ -9765,11 +10636,21 @@ FILE "album.flac" WAVE
             let first_probe = ffprobe_json(&output_path);
             assert_container_and_codec(&case, &output_path, &first_probe);
             assert_custom_tag_values(&case, &first_probe, "first metadata pass");
+            assert_pipeline_repeatable_name_values(
+                &case,
+                &output_path,
+                "first metadata pass",
+            );
             apply_metadata(&converted.artifacts, &source, &req, &runner, &cancel)
                 .await
                 .unwrap_or_else(|err| panic!("{} second metadata/artwork stage failed: {err}", case.name));
             let second_probe = ffprobe_json(&output_path);
             assert_custom_tag_values(&case, &second_probe, "second metadata pass");
+            assert_pipeline_repeatable_name_values(
+                &case,
+                &output_path,
+                "second metadata pass",
+            );
 
             assert_container_codec_duration_and_metadata(&case, &output_path, &second_probe);
             assert_artwork_behavior(&case, &output_path, &second_probe);
@@ -47853,6 +48734,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             title: Some("SACD DSF track".to_string()),
             artist: vec!["A".to_string(), "B".to_string(), "A".to_string()].into(),
             composer: vec!["C1".to_string(), "C2".to_string(), "C1".to_string()].into(),
+            performer: vec!["P1".to_string(), "P2".to_string(), "P1".to_string()].into(),
+            arranger: vec!["R1".to_string(), "R2".to_string(), "R1".to_string()].into(),
             track_number: Some(1),
             ..TrackMetadata::default()
         };
@@ -47901,9 +48784,15 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             snapshot.fields.get("COMPOSER"),
             Some(&vec!["C1".to_string(), "C2".to_string(), "C1".to_string()])
         );
+        assert_eq!(
+            snapshot.fields.get("PERFORMER"),
+            Some(&vec!["P1".to_string(), "P2".to_string(), "P1".to_string()])
+        );
+        assert_eq!(
+            snapshot.fields.get("ARRANGER"),
+            Some(&vec!["R1".to_string(), "R2".to_string(), "R1".to_string()])
+        );
     }
-
-
 
     #[test]
     fn dvd_audio_authoritative_metadata_prevents_empty_obligation_planner_skip() {
@@ -48151,6 +49040,25 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
             "scalar SingleFile metadata keeps the existing planner fast path",
         );
+
+        fixture.album.source.tracks[0].metadata.arranger =
+            vec!["R1".to_string(), "R2".to_string()].into();
+        for extension in ["mp3", "wav", "aiff", "aif", "m4a"] {
+            let mut repeated_artifact = artifact.clone();
+            repeated_artifact.staged_path.set_extension(extension);
+            let repeated_artifacts = ArtifactSet {
+                audio: AudioArtifacts::Tracks(vec![repeated_artifact]),
+                sidecars: Vec::new(),
+            };
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &repeated_artifacts,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "prepared repeated ARRANGER must force the authoritative post stage for {extension}",
+            );
+        }
     }
 
     #[test]

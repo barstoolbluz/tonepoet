@@ -743,6 +743,7 @@ fn track_metadata_has_tags(track: &TrackMetadata) -> bool {
         || has_non_empty_values(&track.album_artist)
         || has_non_empty_values(&track.composer)
         || has_non_empty_values(&track.performer)
+        || has_non_empty_values(&track.arranger)
         || has_non_empty_values(&track.genre)
         || has_non_empty_text(&track.date)
         || track.track_number.is_some()
@@ -2361,6 +2362,43 @@ mod tests {
             !source_needs_authoritative_metadata(&marker_only),
             "the recovery marker must not bypass the existing metadata-present conjunct"
         );
+    }
+
+    #[test]
+    fn arranger_only_fallback_recovery_requires_authoritative_metadata() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let mut recovered = source(
+            SourceKind::SingleFile,
+            track(TrackSourceRef::StagedFile(temp.path().join("arranger-only.wv"))),
+            temp.path(),
+        );
+        recovered.album_metadata.extra.insert(
+            FALLBACK_RECOVERED_METADATA_EXTRA_KEY.to_string(),
+            "native-apev2".to_string(),
+        );
+        recovered.album_metadata.album = None;
+        recovered.album_metadata.album_artist = None.into();
+        recovered.album_metadata.genre = None.into();
+        recovered.album_metadata.date = None;
+        recovered.album_metadata.total_discs = None;
+        recovered.album_metadata.disc_number = None;
+        recovered.tracks[0].metadata = TrackMetadata {
+            arranger: vec!["R1".to_string(), "R2".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+
+        assert!(
+            source_needs_authoritative_metadata(&recovered),
+            "ARRANGER recovered by the bounded fallback is substantive metadata",
+        );
+        let obligations = metadata_obligations_for_request(&req, &recovered);
+        assert!(obligations.authoritative_tags_applied);
+        assert!(orchestrator_metadata_stage_required(
+            PlannedMetadataSatisfaction::none(),
+            req.stages.metadata,
+            obligations,
+        ));
     }
 
     #[test]

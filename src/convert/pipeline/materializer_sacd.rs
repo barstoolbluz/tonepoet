@@ -365,6 +365,7 @@ fn track_metadata(
             .into(),
         composer: entry.text.composer.clone().into(),
         performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()).into(),
+        arranger: sc("ARRANGER").or_else(|| entry.text.arranger.clone()).into(),
         genre: sc("GENRE")
             .or_else(|| entry.genre.map(genre_to_string))
             .or_else(|| first_genre(metadata))
@@ -421,6 +422,7 @@ fn is_standard_sidecar_album_key(key: &str) -> bool {
             | "ALBUM"
             | "ARTIST"
             | "PERFORMER"
+            | "ARRANGER"
             | "GENRE"
             | "DATE"
             | "ISRC"
@@ -432,7 +434,7 @@ fn is_standard_sidecar_album_key(key: &str) -> bool {
 fn is_standard_sidecar_track_key(key: &str) -> bool {
     matches!(
         key,
-        "TITLE" | "ARTIST" | "PERFORMER" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER" | "TOTALTRACKS"
+        "TITLE" | "ARTIST" | "PERFORMER" | "ARRANGER" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER" | "TOTALTRACKS"
     )
 }
 

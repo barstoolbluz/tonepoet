@@ -2009,13 +2009,14 @@ mod tests {
                 metadata.album_artist.as_deref(),
                 metadata.composer.as_deref(),
                 metadata.performer.as_deref(),
+                metadata.arranger.as_deref(),
                 metadata.genre.as_deref(),
                 metadata.date.as_deref(),
                 metadata.track_number,
                 metadata.disc_number,
                 metadata.isrc.as_deref(),
             ),
-            (None, None, None, None, None, None, None, None, None, None),
+            (None, None, None, None, None, None, None, None, None, None, None),
         );
         assert_eq!(
             (
