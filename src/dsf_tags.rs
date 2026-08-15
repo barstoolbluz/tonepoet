@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DsfTagSnapshot {
-    /// Canonical editor display key -> ordered values. The five pipeline
+    /// Canonical editor display key -> ordered values. The six pipeline
     /// set-valued fields preserve duplicates; scalar/editor-only fields may
     /// still be canonicalized to distinct presentation values.
     pub fields: BTreeMap<String, Vec<String>>,
@@ -785,10 +785,10 @@ pub(crate) fn write_with_control_report(
 }
 
 /// Save ordered DSF/ID3 logical values without first projecting them through
-/// the editor's scalar display form. ARTIST and COMPOSER are persisted as one
-/// ID3v2.4 text frame whose NUL-separated payload preserves order and
-/// duplicates. Other fields remain scalar and fail closed if a caller attempts
-/// to pass more than one physical value.
+/// the editor's scalar display form. ARTIST/COMPOSER use one ID3v2.4 standard
+/// text frame and PERFORMER/ARRANGER use one TXXX frame; each NUL-separated
+/// payload preserves order and duplicates. Other fields remain scalar and fail
+/// closed if a caller attempts to pass more than one physical value.
 pub fn write_values_with_control(
     path: &Path,
     changes: &[DsfTagValueChange],
@@ -3428,7 +3428,7 @@ mod backend {
     }
 
     fn supported_multivalue_text_fields(tag: &Tag) -> Vec<(String, usize)> {
-        [("ARTIST", "TPE1"), ("COMPOSER", "TCOM")]
+        let mut fields = [("ARTIST", "TPE1"), ("COMPOSER", "TCOM")]
             .into_iter()
             .filter_map(|(display_key, frame_id)| {
                 let count = tag
@@ -3438,7 +3438,29 @@ mod backend {
                     .unwrap_or(0);
                 (count > 1).then(|| (display_key.to_string(), count))
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // PERFORMER/ARRANGER use TXXX rather than fixed text-frame IDs. Count
+        // only the canonical one-frame NUL-delimited representation that this
+        // writer emits; multiple independent scalar TXXX frames are not the
+        // interoperability case described by the warning.
+        for display_key in ["PERFORMER", "ARRANGER"] {
+            let matching = tag
+                .extended_texts()
+                .filter(|text| {
+                    super::canonical_metadata_key(&text.description) == display_key
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                continue;
+            }
+            let count = matching[0].value.split('\0').count();
+            if count > 1 {
+                fields.push((display_key.to_string(), count));
+            }
+        }
+
+        fields
     }
 
     pub(super) fn prepare_artwork_replace(
@@ -4084,7 +4106,7 @@ mod tests {
         let performer = vec!["P1".to_string(), "P2".to_string(), "P1".to_string()];
         let arranger = vec!["R1".to_string(), "R2".to_string(), "R1".to_string()];
 
-        write_values_with_control(
+        let report = write_values_with_control_report(
             &path,
             &[
                 DsfTagValueChange {
@@ -4100,6 +4122,11 @@ mod tests {
             &|_| {},
         )
         .expect("write repeated DSF PERFORMER/ARRANGER");
+        assert_eq!(
+            report.id3_multivalue_fields_written,
+            vec![("PERFORMER".to_string(), 3), ("ARRANGER".to_string(), 3)],
+            "DSF TXXX multi-values must participate in the ID3 interoperability warning report",
+        );
 
         let snapshot = read(&path).expect("read repeated DSF PERFORMER/ARRANGER");
         assert_eq!(snapshot.fields.get("PERFORMER"), Some(&performer));

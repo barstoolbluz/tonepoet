@@ -13443,19 +13443,18 @@ fn apply_typed_lofty_changes(
             .collect::<Vec<_>>();
 
         // Preserve physical ID3 frame position only for the serializer-sensitive
-        // same-key multi-value coalesce. Re-keying migrations (for example
-        // TIPL/UFID-derived typed items to TXXX fallbacks) must retain the
-        // established remove-then-append behavior because their destination
-        // key is intentionally different from the source carrier.
+        // same-key multi-value coalesce. Judge "same-key" from the physical
+        // items actually parsed from the carrier: normalized removal aliases
+        // may include a logical typed ItemKey that is not present on disk and
+        // must not force a remove-and-append rewrite. Genuine re-key migrations
+        // (for example TIPL/UFID-derived typed items to TXXX fallbacks) still
+        // have an actual source key different from the destination and retain
+        // the established remove-then-append behavior.
         let position_stable_same_key_multivalue = backend
             == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2
             && change.value.as_deref().is_some_and(|value| value.contains('\0'))
             && !parsed_removal_keys.is_empty()
             && parsed_removal_keys
-                .iter()
-                .all(|key| key == &change.persistence_key)
-            && change
-                .removal_keys
                 .iter()
                 .all(|key| key == &change.persistence_key);
 
@@ -14339,7 +14338,42 @@ fn apply_fixed_vocabulary_editor_changes(
     changes: &[EditorTagChange],
     backend: crate::metadata_persistence::MetadataPersistenceBackend,
 ) -> Result<bool, String> {
-    let normalized = normalized_fixed_vocabulary_editor_changes(backend, changes)?;
+    let mut normalized = normalized_fixed_vocabulary_editor_changes(backend, changes)?;
+
+    if backend == crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2 {
+        // ID3 TXXX descriptions are case-sensitive at Lofty's generic ItemKey
+        // boundary even though tonepoet's logical metadata identity is not.
+        // FFmpeg can therefore leave `arranger`/`performer` TXXX frames beside
+        // tonepoet's canonical `ARRANGER`/`PERFORMER` frame unless the overlay
+        // explicitly removes every physical key that canonicalizes to the same
+        // editor field. Discover those aliases from the parsed tag rather than
+        // guessing spellings, and attach them to the already-normalized change.
+        for editor_change in changes {
+            let canonical_key = canonical_metadata_display_key(&editor_change.display_key);
+            let persistence_key = fixed_vocabulary_editor_persistence_key(backend, editor_change);
+            let persistence_key =
+                crate::metadata_persistence::normalize_numbering_item_key_for_backend(
+                    backend,
+                    &persistence_key,
+                );
+            let Some(normalized_change) = normalized
+                .iter_mut()
+                .find(|change| change.persistence_key == persistence_key)
+            else {
+                continue;
+            };
+            for source_key in id3_source_item_keys_for_display_key(tag, &canonical_key) {
+                if !normalized_change
+                    .removal_keys
+                    .iter()
+                    .any(|candidate| candidate == &source_key)
+                {
+                    normalized_change.removal_keys.push(source_key);
+                }
+            }
+        }
+    }
+
     Ok(apply_typed_lofty_changes(tag, backend, normalized))
 }
 
@@ -17970,6 +18004,117 @@ mod tests {
             ],
             "an already-satisfied multi-value edit must not perturb item order",
         );
+    }
+
+    #[test]
+    fn id3_txxx_multivalue_coalesce_preserves_position_despite_logical_typed_alias() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+        let persistence_key = ItemKey::Unknown("ARRANGER".to_string());
+        let mut tag = Tag::new(TagType::Id3v2);
+        for (key, value) in [
+            (ItemKey::AlbumTitle, "Album"),
+            (persistence_key.clone(), "Gil Evans"),
+            (persistence_key.clone(), "Quincy Jones"),
+            (persistence_key.clone(), "Gil Evans"),
+            (ItemKey::TrackTitle, "Title"),
+        ] {
+            tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+
+        let normalized = vec![crate::metadata_persistence::NormalizedTypedLoftyChange {
+            persistence_key: persistence_key.clone(),
+            value: Some("Gil Evans\0Quincy Jones\0Gil Evans".to_string()),
+            // The editor's logical ItemKey is an alias that is not physically
+            // present. It must not disqualify same-carrier position stability.
+            removal_keys: vec![ItemKey::Arranger, persistence_key.clone()],
+        }];
+
+        assert!(apply_typed_lofty_changes(&mut tag, backend, normalized));
+        assert_eq!(
+            tag.items()
+                .map(|item| item.key().clone())
+                .collect::<Vec<_>>(),
+            vec![ItemKey::AlbumTitle, persistence_key.clone(), ItemKey::TrackTitle],
+            "canonical TXXX coalescing must retain the first frame position",
+        );
+        assert_eq!(
+            tag.get_string(&persistence_key),
+            Some("Gil Evans\0Quincy Jones\0Gil Evans"),
+        );
+    }
+
+    #[test]
+    fn id3_overlay_removes_case_variant_performer_arranger_txxx_shadows() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+        let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyId3v2;
+        for (display_key, logical_key, lower_key, joined, values) in [
+            (
+                "PERFORMER",
+                ItemKey::Performer,
+                "performer",
+                "Miles Davis; John Coltrane",
+                ["Miles Davis", "John Coltrane"],
+            ),
+            (
+                "ARRANGER",
+                ItemKey::Arranger,
+                "arranger",
+                "Gil Evans; Quincy Jones",
+                ["Gil Evans", "Quincy Jones"],
+            ),
+        ] {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.push_unchecked(TagItem::new(
+                ItemKey::Unknown(lower_key.to_string()),
+                ItemValue::Text(joined.to_string()),
+            ));
+            tag.push_unchecked(TagItem::new(
+                ItemKey::TrackTitle,
+                ItemValue::Text("Title".to_string()),
+            ));
+            let change = EditorTagChange {
+                tag_type: Some(TagType::Id3v2),
+                existed: true,
+                display_key: display_key.to_string(),
+                item_key: logical_key,
+                values: Some(MetadataFieldValues::from_stored_texts(
+                    values.into_iter().map(str::to_string),
+                )),
+                list_semantics: true,
+            };
+
+            assert!(
+                apply_fixed_vocabulary_editor_changes(&mut tag, &[change], backend)
+                    .expect("apply authoritative ID3 repeated-field overlay")
+            );
+            let canonical_key = ItemKey::Unknown(display_key.to_string());
+            assert_eq!(
+                tag.items()
+                    .filter(|item| {
+                        canonical_editor_display_key(item.key(), TagType::Id3v2) == display_key
+                    })
+                    .count(),
+                1,
+                "{display_key} must have exactly one logical ID3 carrier after shadow cleanup",
+            );
+            assert_eq!(
+                tag.get_string(&canonical_key),
+                Some(if display_key == "PERFORMER" {
+                    "Miles Davis\0John Coltrane"
+                } else {
+                    "Gil Evans\0Quincy Jones"
+                }),
+            );
+            assert!(
+                !tag.items().any(|item| {
+                    item.key() == &ItemKey::Unknown(lower_key.to_string())
+                }),
+                "case-variant {lower_key} TXXX shadow must be removed",
+            );
+        }
     }
 
     #[test]

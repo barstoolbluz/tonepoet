@@ -5931,27 +5931,97 @@ fn wvtag_artwork_args(path: &Path, artwork: &CueArtworkSidecar) -> Vec<String> {
     ]
 }
 
-fn cue_artwork_embed_command(
+fn metaflac_artwork_replace_commands(
+    path: &Path,
+    artwork: &CueArtworkSidecar,
+) -> Vec<ToolCommand> {
+    let command = |args: Vec<String>| ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+        binary: ToolBinary::Metaflac,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: deterministic_metadata_write_environment(),
+        timeout: Duration::from_secs(30),
+    };
+
+    vec![
+        command(vec![
+            "--remove".to_string(),
+            "--block-type=PICTURE".to_string(),
+            path.display().to_string(),
+        ]),
+        command(vec![
+            format!("--import-picture-from={}", artwork.path.display()),
+            path.display().to_string(),
+        ]),
+    ]
+}
+
+#[derive(Debug)]
+enum CueArtworkEmbedPlan {
+    /// Commands rewrite a same-directory temporary file that replaces the
+    /// source only after every mutation succeeds. `seed_from_source` is true
+    /// for in-place metadata tools such as metaflac and false for remuxers that
+    /// create the temporary output themselves.
+    Rewrite {
+        commands: Vec<ToolCommand>,
+        temp: MetadataRewriteTemp,
+        seed_from_source: bool,
+    },
+    /// The external tool has its own in-place semantics (currently WavPack).
+    InPlace { commands: Vec<ToolCommand> },
+}
+
+fn cue_artwork_embed_plan(
     path: &Path,
     ext: &str,
     artwork: &CueArtworkSidecar,
-) -> Result<Option<(ToolCommand, Option<MetadataRewriteTemp>)>, MetadataError> {
-    let (binary, args, tmp_path, timeout) = match ext {
-        "flac" | "mp3" | "m4a" | "mp4" => {
-            let tmp = metadata_rewrite_temp_path(path)?;
-            (
-                ToolBinary::Ffmpeg,
-                ffmpeg_artwork_rewrite_args(path, artwork, tmp.path(), ext),
-                Some(tmp),
-                Duration::from_secs(90),
-            )
+) -> Result<Option<CueArtworkEmbedPlan>, MetadataError> {
+    let plan = match ext {
+        "flac" => {
+            // Do not route FLAC through FFmpeg. A stream-copy remux folds
+            // repeated Vorbis comments into one semicolon-delimited scalar.
+            // Mutate a copied FLAC with metaflac instead so picture blocks can
+            // change without touching the authoritative comment list. Keeping
+            // the work on a temporary copy also preserves fail-closed replace
+            // semantics if picture removal or import fails midway.
+            let temp = metadata_rewrite_temp_path(path)?;
+            let commands = metaflac_artwork_replace_commands(temp.path(), artwork);
+            CueArtworkEmbedPlan::Rewrite {
+                commands,
+                temp,
+                seed_from_source: true,
+            }
         }
-        "wv" => (
-            ToolBinary::Wvtag,
-            wvtag_artwork_args(path, artwork),
-            None,
-            Duration::from_secs(30),
-        ),
+        "mp3" | "m4a" | "mp4" => {
+            let temp = metadata_rewrite_temp_path(path)?;
+            let command = ToolCommand {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                binary: ToolBinary::Ffmpeg,
+                args: ffmpeg_artwork_rewrite_args(path, artwork, temp.path(), ext),
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(90),
+            };
+            CueArtworkEmbedPlan::Rewrite {
+                commands: vec![command],
+                temp,
+                seed_from_source: false,
+            }
+        }
+        "wv" => CueArtworkEmbedPlan::InPlace {
+            commands: vec![ToolCommand {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                binary: ToolBinary::Wvtag,
+                args: wvtag_artwork_args(path, artwork),
+                secret_args: vec![],
+                cwd: None,
+                env: vec![],
+                timeout: Duration::from_secs(30),
+            }],
+        },
         // WAV/AIFF artwork conventions are not portable, raw AAC has no MP4
         // cover atom, and Opus/Ogg needs a METADATA_BLOCK_PICTURE writer rather
         // than FFmpeg attached-picture stream-copy. Keep these unsupported
@@ -5960,18 +6030,7 @@ fn cue_artwork_embed_command(
         _ => return Ok(None),
     };
 
-    Ok(Some((
-        ToolCommand {
-            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-            binary,
-            args,
-            secret_args: vec![],
-            cwd: None,
-            env: vec![],
-            timeout,
-        },
-        tmp_path,
-    )))
+    Ok(Some(plan))
 }
 
 async fn embed_cue_artwork_for_file(
@@ -5994,7 +6053,7 @@ async fn embed_cue_artwork_for_file(
         .unwrap_or("")
         .to_lowercase();
 
-    let Some((cmd, tmp_path)) = cue_artwork_embed_command(path, &ext, artwork)? else {
+    let Some(plan) = cue_artwork_embed_plan(path, &ext, artwork)? else {
         log::warn!(
             "CUE artwork sidecar {} is available, but target {} does not have an implemented post-encode artwork writer on this path",
             artwork.path.display(),
@@ -6003,19 +6062,41 @@ async fn embed_cue_artwork_for_file(
         return Ok(());
     };
 
-    let result = run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits)
-        .await
-        .map_err(MetadataError::Tool);
+    match plan {
+        CueArtworkEmbedPlan::Rewrite {
+            commands,
+            temp,
+            seed_from_source,
+        } => {
+            if seed_from_source {
+                if let Err(error) = fs::copy(path, temp.path()) {
+                    temp.cleanup_best_effort();
+                    return Err(MetadataError::Io(error));
+                }
+            }
 
-    if let Err(err) = result {
-        if let Some(tmp) = tmp_path.as_ref() {
-            tmp.cleanup_best_effort();
+            for command in commands {
+                if let Err(error) = run_tool_command_with_concurrency(
+                    command,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits,
+                )
+                .await
+                {
+                    temp.cleanup_best_effort();
+                    return Err(MetadataError::Tool(error));
+                }
+            }
+            replace_rewritten_metadata_file(path, temp)?;
         }
-        return Err(err);
-    }
-
-    if let Some(tmp) = tmp_path {
-        replace_rewritten_metadata_file(path, tmp)?;
+        CueArtworkEmbedPlan::InPlace { commands } => {
+            for command in commands {
+                run_tool_command_with_concurrency(command, runner, cancel, tool_concurrency_limits)
+                    .await
+                    .map_err(MetadataError::Tool)?;
+            }
+        }
     }
 
     Ok(())
@@ -7163,12 +7244,8 @@ mod metadata_writer_command_tests {
         );
 
         let explicit_rf64_warnings =
-            external_scalar_collapse_warnings_for_file(
-                Path::new("track.rf64"),
-                "rf64",
-                &supported_tags,
-            )
-            .expect("explicit RF64 warning policy");
+            external_scalar_collapse_warnings_for_file(&rf64_wav, "rf64", &supported_tags)
+                .expect("explicit RF64 warning policy");
         assert_eq!(explicit_rf64_warnings, rf64_warnings);
     }
 
@@ -9172,6 +9249,85 @@ mod metadata_writer_command_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn native_flac_pipeline_multivalue_survives_cover_artwork_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("metaflac")
+            || !ffmpeg_encoder_available("flac")
+            || !ffmpeg_encoder_available("mjpeg")
+        {
+            eprintln!(
+                "skipping FLAC artwork/multi-value regression; ffmpeg with flac+mjpeg encoders and metaflac are required"
+            );
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-metaflac-artwork-multivalue");
+        let flac_path = dir.join("track.flac");
+        let cover_path = dir.join("cover.jpg");
+        let exported_cover_path = dir.join("exported-cover.jpg");
+        create_sine_audio(&flac_path, &["-c:a", "flac"]);
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                "color=c=black:s=16x16:d=0.04".to_string(),
+                "-frames:v".to_string(),
+                "1".to_string(),
+                "-c:v".to_string(),
+                "mjpeg".to_string(),
+                cover_path.display().to_string(),
+            ],
+        );
+
+        let artwork = CueArtworkSidecar {
+            path: cover_path.clone(),
+            mime_type: Some("image/jpeg".to_string()),
+        };
+        let (track, album) = native_round_trip_multivalue_metadata();
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &flac_path,
+            &track,
+            &album,
+            Some(&artwork),
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply repeated FLAC metadata with cover artwork");
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(&flac_path)
+                .expect("read artwork-bearing FLAC through pipeline reader");
+        assert!(!recovered, "normal FLAC metadata should not use native APE recovery");
+        assert!(warnings.is_empty(), "unexpected FLAC metadata warnings: {warnings:?}");
+        assert_native_round_trip_multivalue_metadata(&metadata);
+
+        run_checked(
+            "metaflac",
+            &[
+                format!("--export-picture-to={}", exported_cover_path.display()),
+                flac_path.display().to_string(),
+            ],
+        );
+        assert_eq!(
+            fs::read(&exported_cover_path).expect("read exported FLAC picture"),
+            fs::read(&cover_path).expect("read source cover"),
+            "native FLAC artwork replacement must preserve the requested picture payload",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn native_opus_pipeline_multivalue_round_trips_through_tonepoet_reader_when_tools_are_available() {
         if !executable_on_path("ffmpeg")
@@ -9471,59 +9627,108 @@ mod metadata_writer_command_tests {
             mime_type: Some("image/jpeg".to_string()),
         };
 
-        for (target, ext) in [("track.flac", "flac"), ("track.mp3", "mp3"), ("track.m4a", "m4a")] {
-            let path = dir.join(target);
-            fs::write(&path, b"source audio").expect("write artwork source");
-            let (cmd, tmp) = cue_artwork_embed_command(&path, ext, &artwork)
-                .expect("artwork command allocation should succeed")
-                .expect("container supports post-encode CUE artwork embedding");
-            assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
-            let tmp = tmp.expect("FFmpeg artwork embedding must use sidecar temp replacement");
-            assert_eq!(tmp.path().parent(), Some(dir.as_path()));
-            assert!(
-                tmp.path()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(&format!(".tmp.{ext}"))),
-                "artwork rewrite temp should preserve target extension: {}",
-                tmp.path().display()
-            );
-            assert_pair(&cmd.args, "-map", "0:a");
-            assert_pair(&cmd.args, "-map", "1:v:0");
-            assert!(!cmd.args.windows(2).any(|pair| pair[0] == "-map" && pair[1] == "0:v"));
-            assert_pair(&cmd.args, "-disposition:v:0", "attached_pic");
-            assert_pair(&cmd.args, "-c:a", "copy");
-            assert_pair(&cmd.args, "-c:v", "copy");
-            tmp.cleanup_best_effort();
+        let flac_path = dir.join("track.flac");
+        fs::write(&flac_path, b"source audio").expect("write FLAC artwork source");
+        match cue_artwork_embed_plan(&flac_path, "flac", &artwork)
+            .expect("FLAC artwork command allocation should succeed")
+            .expect("FLAC supports post-encode CUE artwork embedding")
+        {
+            CueArtworkEmbedPlan::Rewrite {
+                commands,
+                temp,
+                seed_from_source,
+            } => {
+                assert!(seed_from_source, "metaflac must mutate a copied source file");
+                assert_eq!(commands.len(), 2, "FLAC artwork replacement is remove + import");
+                assert!(commands.iter().all(|command| matches!(command.binary, ToolBinary::Metaflac)));
+                assert_eq!(temp.path().parent(), Some(dir.as_path()));
+                assert!(
+                    temp.path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(".tmp.flac")),
+                    "FLAC artwork temp must preserve the target extension: {}",
+                    temp.path().display()
+                );
+                assert_eq!(
+                    commands[0].args,
+                    vec![
+                        "--remove".to_string(),
+                        "--block-type=PICTURE".to_string(),
+                        temp.path().display().to_string(),
+                    ]
+                );
+                assert_eq!(
+                    commands[1].args,
+                    vec![
+                        "--import-picture-from=cover.jpg".to_string(),
+                        temp.path().display().to_string(),
+                    ]
+                );
+                temp.cleanup_best_effort();
+            }
+            CueArtworkEmbedPlan::InPlace { .. } => panic!("FLAC artwork mutation must be fail-closed through a temp copy"),
         }
 
-        let m4a_path = dir.join("track.m4a");
-        fs::write(&m4a_path, b"source audio").expect("write m4a source");
-        let (m4a_cmd, m4a_tmp) = cue_artwork_embed_command(&m4a_path, "m4a", &artwork)
-            .expect("m4a artwork command allocation")
-            .expect("m4a artwork command");
-        assert_pair(&m4a_cmd.args, "-f", "ipod");
-        if let Some(tmp) = m4a_tmp { tmp.cleanup_best_effort(); }
+        for (target, ext) in [("track.mp3", "mp3"), ("track.m4a", "m4a")] {
+            let path = dir.join(target);
+            fs::write(&path, b"source audio").expect("write artwork source");
+            match cue_artwork_embed_plan(&path, ext, &artwork)
+                .expect("artwork command allocation should succeed")
+                .expect("container supports post-encode CUE artwork embedding")
+            {
+                CueArtworkEmbedPlan::Rewrite {
+                    commands,
+                    temp,
+                    seed_from_source,
+                } => {
+                    assert!(!seed_from_source, "FFmpeg creates its rewrite output");
+                    assert_eq!(commands.len(), 1);
+                    let cmd = &commands[0];
+                    assert!(matches!(cmd.binary, ToolBinary::Ffmpeg));
+                    assert_eq!(temp.path().parent(), Some(dir.as_path()));
+                    assert!(
+                        temp.path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.contains(".tonepoet-metadata.") && name.ends_with(&format!(".tmp.{ext}"))),
+                        "artwork rewrite temp should preserve target extension: {}",
+                        temp.path().display()
+                    );
+                    assert_pair(&cmd.args, "-map", "0:a");
+                    assert_pair(&cmd.args, "-map", "1:v:0");
+                    assert!(!cmd.args.windows(2).any(|pair| pair[0] == "-map" && pair[1] == "0:v"));
+                    assert_pair(&cmd.args, "-disposition:v:0", "attached_pic");
+                    assert_pair(&cmd.args, "-c:a", "copy");
+                    assert_pair(&cmd.args, "-c:v", "copy");
+                    if ext == "m4a" {
+                        assert_pair(&cmd.args, "-f", "ipod");
+                    } else {
+                        assert_pair(&cmd.args, "-id3v2_version", "3");
+                    }
+                    temp.cleanup_best_effort();
+                }
+                CueArtworkEmbedPlan::InPlace { .. } => panic!("FFmpeg artwork remux must use temp replacement"),
+            }
+        }
 
-        let mp3_path = dir.join("track.mp3");
-        fs::write(&mp3_path, b"source audio").expect("write mp3 source");
-        let (mp3_cmd, mp3_tmp) = cue_artwork_embed_command(&mp3_path, "mp3", &artwork)
-            .expect("mp3 artwork command allocation")
-            .expect("mp3 artwork command");
-        assert_pair(&mp3_cmd.args, "-id3v2_version", "3");
-        if let Some(tmp) = mp3_tmp { tmp.cleanup_best_effort(); }
-
-        let (wv_cmd, wv_tmp) = cue_artwork_embed_command(&dir.join("track.wv"), "wv", &artwork)
+        match cue_artwork_embed_plan(&dir.join("track.wv"), "wv", &artwork)
             .expect("WavPack artwork command allocation")
-            .expect("WavPack artwork command");
-        assert!(matches!(wv_cmd.binary, ToolBinary::Wvtag));
-        assert!(wv_tmp.is_none());
-        assert_pair(&wv_cmd.args, "-d", "Cover Art (Front)");
-        assert_pair(&wv_cmd.args, "--write-binary-tag", "Cover Art (Front)=@cover.jpg");
+            .expect("WavPack artwork command")
+        {
+            CueArtworkEmbedPlan::InPlace { commands } => {
+                assert_eq!(commands.len(), 1);
+                let cmd = &commands[0];
+                assert!(matches!(cmd.binary, ToolBinary::Wvtag));
+                assert_pair(&cmd.args, "-d", "Cover Art (Front)");
+                assert_pair(&cmd.args, "--write-binary-tag", "Cover Art (Front)=@cover.jpg");
+            }
+            CueArtworkEmbedPlan::Rewrite { .. } => panic!("wvtag should retain its native in-place artwork path"),
+        }
 
         for ext in ["wav", "aiff", "aif", "aac", "opus", "ogg"] {
             assert!(
-                cue_artwork_embed_command(&dir.join(format!("track.{ext}")), ext, &artwork)
+                cue_artwork_embed_plan(&dir.join(format!("track.{ext}")), ext, &artwork)
                     .expect("unsupported artwork command allocation should not fail")
                     .is_none(),
                 "{ext} artwork must stay explicitly unsupported on this path"
@@ -10909,15 +11114,46 @@ FILE "album.flac" WAVE
             // Remove custom/freeform fields so the MP4 case does not depend on
             // AtomicParsley and can prove the first metadata mutation itself.
             source.album_metadata.extra.clear();
-            let track = source.tracks.first_mut().expect("one CUE track");
-            track.metadata.title = Some("Planner spelling title".to_string());
-            track.metadata.artist = MetadataValueList::from_scalar("Planner spelling artist");
-            track.metadata.track_number = Some(4);
-            track.metadata.isrc = None;
-            track.metadata.publisher = None;
-            track.metadata.copyright = None;
-            track.metadata.comment = None;
-            track.metadata.extra.clear();
+            if case.extension == "rf64" {
+                // RF64 intentionally remains fail-closed for metadata outside
+                // FFmpeg's validated INFO mapping. Keep this leg focused on
+                // supported fields so it can still prove planner spelling,
+                // encoding, metadata persistence, and the RF64 marker without
+                // weakening production policy or the MP4 assertions.
+                source.album_metadata.album_artist = None.into();
+                source.album_metadata.disc_number = None;
+                source.album_metadata.total_discs = None;
+            }
+            {
+                let track = source.tracks.first_mut().expect("one CUE track");
+                track.metadata.title = Some("Planner spelling title".to_string());
+                track.metadata.artist = MetadataValueList::from_scalar("Planner spelling artist");
+                track.metadata.track_number = Some(4);
+                track.metadata.isrc = None;
+                track.metadata.publisher = None;
+                track.metadata.copyright = None;
+                track.metadata.comment = None;
+                track.metadata.extra.clear();
+                if case.extension == "rf64" {
+                    track.metadata.album_artist = None.into();
+                    track.metadata.disc_number = None;
+                    track.metadata.composer = None.into();
+                    track.metadata.performer = None.into();
+                    track.metadata.arranger = None.into();
+                    track.metadata.pre_emphasis = false;
+                }
+            }
+            if case.extension == "rf64" {
+                let tags = authoritative_metadata_tags(
+                    &source.tracks[0].metadata,
+                    &source.album_metadata,
+                );
+                assert_eq!(
+                    first_unsupported_rf64_metadata_field(&tags),
+                    None,
+                    "RF64 integration leg must request only supported metadata: {tags:?}",
+                );
+            }
 
             let plan = plan_outputs(&source, &req)
                 .unwrap_or_else(|error| panic!("{} output planning failed: {error}", case.name));

@@ -855,6 +855,52 @@ mod tests {
     }
 
     #[test]
+    fn single_file_writer_round_trips_ordered_performer_and_arranger_lists() {
+        use lofty::tag::ItemKey;
+
+        let temp = tempfile::tempdir().expect("single-file multi-value tempdir");
+        let path = temp.path().join("source.flac");
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/silence.flac"))
+            .expect("write FLAC fixture");
+
+        crate::tui::probe::write_all_tag_value_lists(
+            &path,
+            &[
+                (
+                    ItemKey::Performer,
+                    vec![
+                        "Performer A".to_string(),
+                        "Performer B".to_string(),
+                        "Performer A".to_string(),
+                    ],
+                ),
+                (
+                    ItemKey::Arranger,
+                    vec![
+                        "Arranger A".to_string(),
+                        "Arranger B".to_string(),
+                        "Arranger A".to_string(),
+                    ],
+                ),
+            ],
+        )
+        .expect("write single-file repeated PERFORMER/ARRANGER values");
+
+        let (metadata, warnings, recovered) = read_track_metadata_with_warnings(&path)
+            .expect("read single-file repeated metadata through materializer reader");
+        assert!(!recovered, "ordinary FLAC metadata must not use APE fallback recovery");
+        assert!(warnings.is_empty(), "unexpected single-file metadata warnings: {warnings:?}");
+        assert_eq!(
+            list_values(&metadata.performer),
+            vec!["Performer A", "Performer B", "Performer A"]
+        );
+        assert_eq!(
+            list_values(&metadata.arranger),
+            vec!["Arranger A", "Arranger B", "Arranger A"]
+        );
+    }
+
+    #[test]
     fn source_reader_expands_ape_nul_lists_without_widening_extra_map() {
         use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
