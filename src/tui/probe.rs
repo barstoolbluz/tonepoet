@@ -8368,6 +8368,28 @@ fn mp4_atom_ident_is_itunes_freeform(ident: &lofty::mp4::AtomIdent<'_>) -> bool 
     )
 }
 
+/// Whether the concrete MP4 overlay owns this scalar iTunes-freeform field.
+///
+/// Numbering identities are deliberately excluded even when generic MP4 key
+/// resolution represents an `Unknown` logical key as an iTunes freeform atom:
+/// `trkn`/`disk` are the sole physical owners of track/disc number and total.
+fn mp4_scalar_freeform_overlay_owns_field(
+    source_key: &lofty::tag::ItemKey,
+    canonical_key: &str,
+    ident: &lofty::mp4::AtomIdent<'_>,
+) -> bool {
+    let backend = crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst;
+    let is_numbering = crate::metadata_persistence::canonical_numbering_display_key_for_backend_item(
+        backend,
+        source_key,
+    )
+    .is_some()
+        || crate::metadata_persistence::logical_numbering_alias_group(canonical_key).is_some();
+    mp4_atom_ident_is_itunes_freeform(ident)
+        && !is_numbering
+        && !backend.supports_repeated_field(canonical_key)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Mp4NativeAtomState {
     ident: lofty::mp4::AtomIdent<'static>,
@@ -14434,9 +14456,7 @@ fn prepare_mp4_native_multivalue_overlay(
         let canonical_key = canonical_metadata_display_key(&change.display_key);
         let persistence_key = fixed_vocabulary_editor_persistence_key(backend, change);
         if let Some(ident) = mp4_item_key_atom_ident(&persistence_key) {
-            if mp4_atom_ident_is_itunes_freeform(&ident)
-                && !backend.supports_repeated_field(&canonical_key)
-            {
+            if mp4_scalar_freeform_overlay_owns_field(&change.item_key, &canonical_key, &ident) {
                 let desired =
                     editor_change_values_for_backend(change, backend).unwrap_or_default();
                 overlay.force_write |=
@@ -14517,7 +14537,7 @@ fn prepare_mp4_native_multivalue_overlay_for_primary_changes(
             .unwrap_or_default();
         if !backend.supports_repeated_field(&canonical_key) {
             if let Some(ident) = mp4_primary_persistence_atom_ident(item_key) {
-                if mp4_atom_ident_is_itunes_freeform(&ident) {
+                if mp4_scalar_freeform_overlay_owns_field(item_key, &canonical_key, &ident) {
                     overlay.force_write |=
                         !mp4_native_state_has_canonical_text_layout(state, &ident, &desired);
                     set_mp4_scalar_freeform_overlay(&mut overlay, ident, desired);
@@ -19640,6 +19660,48 @@ mod tests {
     }
 
     #[test]
+    fn mp4_scalar_freeform_overlay_excludes_numbering_and_keeps_custom_fields() {
+        for alias in [
+            "TRACKNUMBER",
+            "TRACKTOTAL",
+            "TOTALTRACKS",
+            "DISCNUMBER",
+            "DISKNUMBER",
+            "DISCTOTAL",
+            "DISKTOTAL",
+            "TOTALDISCS",
+            "trkn",
+            "disk",
+        ] {
+            let source_key = lofty::tag::ItemKey::Unknown(alias.to_string());
+            let canonical_key =
+                canonical_editor_display_key(&source_key, lofty::tag::TagType::Mp4Ilst);
+            let ident = mp4_itunes_freeform_atom_ident(alias);
+            assert!(
+                !mp4_scalar_freeform_overlay_owns_field(&source_key, &canonical_key, &ident),
+                "MP4 numbering alias {alias} must stay owned exclusively by trkn/disk",
+            );
+        }
+
+        for custom in ["PUBLISHER", "DISK-NUMBER"] {
+            let source_key = lofty::tag::ItemKey::Unknown(custom.to_string());
+            let canonical_key = canonical_metadata_display_key(custom);
+            let ident = mp4_itunes_freeform_atom_ident(custom);
+            assert!(
+                mp4_scalar_freeform_overlay_owns_field(&source_key, &canonical_key, &ident),
+                "non-numbering scalar freeform {custom} must remain overlay-authorable",
+            );
+        }
+
+        let performer_key = lofty::tag::ItemKey::Performer;
+        let performer = mp4_performer_atom_ident();
+        assert!(
+            !mp4_scalar_freeform_overlay_owns_field(&performer_key, "PERFORMER", &performer),
+            "repeated MP4 fields must stay on the native multi-value overlay path",
+        );
+    }
+
+    #[test]
     fn ordered_list_member_normalization_is_backend_independent_before_projection() {
         use lofty::tag::ItemKey;
 
@@ -20349,18 +20411,38 @@ mod tests {
             "re-edit must remain idempotently canonical rather than spawning aliases",
         );
 
-        let no_op = apply_editor_list_change(
-            &path,
+        let before_no_op = std::fs::read(&path).expect("snapshot canonical scalar freeform");
+        let snapshot = editor_list_snapshot(
             "PUBLISHER",
             &["Newer value"],
             &["Newer value"],
         );
+        let no_op_results = apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+            std::slice::from_ref(&path),
+            &[snapshot],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            tui_file_picker::VerificationMode::Standard,
+        );
         assert!(
-            !matches!(
-                &no_op.outcome,
-                crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
-            ),
-            "canonical no-op must not fail: {no_op:?}",
+            no_op_results.is_empty(),
+            "a value-identical canonical save must be skipped without a write result: {no_op_results:?}",
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read scalar freeform after no-op"),
+            before_no_op,
+            "a value-identical canonical save must not rewrite MP4 bytes",
+        );
+        assert!(mp4_text_atom_groups(&path, &mixed_ident).is_empty());
+        assert!(mp4_text_atom_groups(&path, &lower_ident).is_empty());
+        assert_eq!(
+            mp4_text_atom_groups(&path, &wrong_namespace_ident),
+            vec![vec!["Foreign namespace".to_string()]],
+            "no-op must preserve same-name freeforms in a different namespace",
         );
         assert_eq!(
             mp4_text_atom_groups(&path, &canonical_ident),
