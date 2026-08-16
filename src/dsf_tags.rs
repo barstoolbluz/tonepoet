@@ -3220,20 +3220,33 @@ fn canonicalize_snapshot(raw: DsfTagSnapshot) -> DsfTagSnapshot {
             if (normalized_key == canonical_key) != canonical_pass {
                 continue;
             }
-            let preserve_repeated_values = matches!(
-                canonical_key.as_str(),
-                "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER" | "GENRE"
+            let preserve_repeated_values = crate::metadata_persistence::field_is_in_contract(
+                &canonical_key,
+                crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
             );
             let target = fields.entry(canonical_key).or_default();
             for value in values {
                 if preserve_repeated_values {
-                    if !value.trim().is_empty() {
-                        target.push(value.clone());
+                    if let Some(value) =
+                        crate::metadata_persistence::normalize_ordered_metadata_member(value)
+                    {
+                        target.push(value);
                     }
                 } else {
                     append_distinct(target, value.clone());
                 }
             }
+        }
+    }
+    // Stored cardinality participates in transfer/collapse warnings, so blank
+    // physical members must not outlive the same normalization policy that
+    // removed them from the logical ordered list above.
+    for (key, values) in &fields {
+        if crate::metadata_persistence::field_is_in_contract(
+            key,
+            crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
+        ) {
+            stored_value_counts.insert(key.clone(), values.len());
         }
     }
     DsfTagSnapshot {
@@ -3307,18 +3320,15 @@ fn resolve_value_changes(
         let values = match change.values.as_ref() {
             None => None,
             Some(values) => {
-                let mut normalized = Vec::with_capacity(values.len());
                 for value in values {
                     if value.contains('\0') {
                         return Err(format!(
                             "refusing DSF metadata field {key} containing an embedded NUL delimiter"
                         ));
                     }
-                    let value = value.trim().to_string();
-                    if !value.is_empty() {
-                        normalized.push(value);
-                    }
                 }
+                let normalized =
+                    crate::metadata_persistence::normalize_ordered_metadata_values(values);
                 (!normalized.is_empty()).then_some(normalized)
             }
         };
@@ -3354,8 +3364,10 @@ fn resolve_value_changes(
             }
         }
 
-        if !matches!(key.as_str(), "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER")
-            && values.as_ref().is_some_and(|values| values.len() > 1)
+        if !crate::metadata_persistence::field_is_in_contract(
+            &key,
+            crate::metadata_persistence::FIXED_VOCABULARY_REPEATED_FIELDS,
+        ) && values.as_ref().is_some_and(|values| values.len() > 1)
         {
             return Err(format!(
                 "DSF metadata field {key} does not support repeated values on this write path"
@@ -4090,12 +4102,50 @@ mod tests {
             assert!(error.contains("does not support repeated values"), "{error}");
         }
         for key in ["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"] {
-            resolve_value_changes(&[DsfTagValueChange {
+            let resolved = resolve_value_changes(&[DsfTagValueChange {
                 canonical_key: key.to_string(),
-                values: Some(vec!["one".to_string(), "two".to_string()]),
+                values: Some(vec![
+                    "  one  ".to_string(),
+                    "".to_string(),
+                    "   ".to_string(),
+                    "two".to_string(),
+                    " one ".to_string(),
+                ]),
             }])
             .expect("DSF writer supports repeated value-list field");
+            assert_eq!(
+                resolved[0].values.as_deref(),
+                Some(&["one".to_string(), "two".to_string(), "one".to_string()][..]),
+                "DSF ordered-list normalization must trim/drop blanks without deduplicating",
+            );
         }
+    }
+
+    #[test]
+    fn dsf_snapshot_normalization_drops_blank_members_from_values_and_cardinality() {
+        let raw = DsfTagSnapshot {
+            fields: BTreeMap::from([(
+                "ARTIST".to_string(),
+                vec![
+                    "  A  ".to_string(),
+                    "".to_string(),
+                    "   ".to_string(),
+                    "B".to_string(),
+                    " A ".to_string(),
+                ],
+            )]),
+            stored_value_counts: BTreeMap::from([("ARTIST".to_string(), 5)]),
+        };
+        let normalized = canonicalize_snapshot(raw);
+        assert_eq!(
+            normalized.fields.get("ARTIST"),
+            Some(&vec!["A".to_string(), "B".to_string(), "A".to_string()]),
+        );
+        assert_eq!(
+            normalized.stored_value_count("ARTIST"),
+            3,
+            "blank physical members must not inflate transfer/cardinality provenance",
+        );
     }
 
     #[test]

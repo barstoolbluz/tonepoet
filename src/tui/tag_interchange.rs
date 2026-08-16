@@ -313,7 +313,8 @@ impl FirstTrackCollapseEligibility {
 pub struct FieldBlock {
     pub key: String,
     /// One ordered list per source position. Scalar tag-block lines decode to
-    /// zero-or-one-value lists; the v1 list marker preserves repeated values.
+    /// zero-or-one-value lists; the v1 list marker preserves repeated values
+    /// only for fields whose editor contract intentionally supports them.
     pub values: Vec<super::probe::MetadataFieldValues>,
 }
 
@@ -362,6 +363,12 @@ pub enum FieldBlockParseError {
     EmptyBlock { block: usize },
     InvalidKey { block: usize, key: String },
     MissingValues { block: usize, key: String },
+    ScalarFieldMultiValue {
+        block: usize,
+        key: String,
+        position: usize,
+        value_count: usize,
+    },
 }
 
 impl fmt::Display for FieldBlockParseError {
@@ -381,6 +388,20 @@ impl fmt::Display for FieldBlockParseError {
                 "tag block {} ({}) has no value lines",
                 block + 1,
                 key
+            ),
+            Self::ScalarFieldMultiValue {
+                block,
+                key,
+                position,
+                value_count,
+            } => write!(
+                f,
+                "tag block {} ({}) position {} contains {} structured values, but {} is a scalar editor field; refusing an implicit lossy collapse",
+                block + 1,
+                key,
+                position + 1,
+                value_count,
+                key,
             ),
         }
     }
@@ -565,12 +586,33 @@ pub fn parse_field_blocks(input: &str) -> Result<Vec<FieldBlock>, FieldBlockPars
                 key: key.to_string(),
             });
         }
-        let values = lines.map(decode_field_position).collect::<Vec<_>>();
+        let mut values = lines.map(decode_field_position).collect::<Vec<_>>();
         if values.is_empty() {
             return Err(FieldBlockParseError::MissingValues {
                 block: block_index,
                 key: key.to_string(),
             });
+        }
+        if !super::probe::metadata_field_is_set_valued(key) {
+            for (position, value) in values.iter_mut().enumerate() {
+                if value.value_count() <= 1 {
+                    continue;
+                }
+                let meaningful = value.normalized_list_texts();
+                if meaningful.len() > 1 {
+                    return Err(FieldBlockParseError::ScalarFieldMultiValue {
+                        block: block_index,
+                        key: key.to_string(),
+                        position,
+                        value_count: meaningful.len(),
+                    });
+                }
+                *value = meaningful
+                    .into_iter()
+                    .next()
+                    .map(super::probe::MetadataFieldValues::from_scalar)
+                    .unwrap_or_default();
+            }
         }
         parsed.push(FieldBlock {
             key: key.to_string(),
@@ -736,6 +778,91 @@ mod tests {
         let legacy = parse_field_blocks("COMPOSER\nAlice; Bob")
             .expect("legacy scalar field block stays readable");
         assert_eq!(legacy[0].values[0].to_texts(), vec!["Alice; Bob"]);
+    }
+
+    #[test]
+    fn scalar_field_blocks_reject_structured_multivalue_without_breaking_list_or_sentinel_semantics() {
+        let encoded_pair = format!(
+            "{MULTI_VALUE_LINE_PREFIX}{}",
+            serde_json::to_string(&vec!["A", "B"]).unwrap()
+        );
+        for key in ["TITLE", "ALBUMARTIST"] {
+            let input = format!("{key}\n{encoded_pair}");
+            let error = parse_field_blocks(&input)
+                .expect_err("scalar editor fields must reject structured multi-value input");
+            assert!(matches!(
+                &error,
+                FieldBlockParseError::ScalarFieldMultiValue {
+                    value_count: 2,
+                    ..
+                }
+            ));
+            assert!(
+                error.to_string().contains("implicit lossy collapse"),
+                "{key}: {error}"
+            );
+        }
+
+        let artist_values = vec![
+            "Artist A",
+            "Artist A",
+            "Artist B; Guest",
+            "@tonepoet-mv1:literal",
+        ];
+        let artist_input = format!(
+            "ARTIST\n{MULTI_VALUE_LINE_PREFIX}{}",
+            serde_json::to_string(&artist_values).unwrap()
+        );
+        let artist = parse_field_blocks(&artist_input)
+            .expect("ARTIST remains an ordered-list editor field");
+        assert_eq!(
+            artist[0].values[0].to_texts(),
+            artist_values.iter().map(|value| (*value).to_string()).collect::<Vec<_>>()
+        );
+
+        let one = format!(
+            "TITLE\n{MULTI_VALUE_LINE_PREFIX}{}",
+            serde_json::to_string(&vec!["One value"]).unwrap()
+        );
+        assert_eq!(
+            parse_field_blocks(&one).unwrap()[0].values[0].to_texts(),
+            vec!["One value".to_string()],
+            "a one-element encoded vector remains a scalar value",
+        );
+
+        let literal_prefix = "@tonepoet-mv1:literal scalar";
+        let escaped = format!(
+            "TITLE\n{MULTI_VALUE_LINE_PREFIX}{}",
+            serde_json::to_string(&vec![literal_prefix]).unwrap()
+        );
+        assert_eq!(
+            parse_field_blocks(&escaped).unwrap()[0].values[0].to_texts(),
+            vec![literal_prefix.to_string()],
+            "the encoded one-element sentinel escape must remain lossless",
+        );
+        let scalar_prefix = super::super::probe::MetadataFieldValues::from_scalar(literal_prefix);
+        let scalar_prefix_line = encode_field_position(&scalar_prefix);
+        assert!(
+            scalar_prefix_line.starts_with(MULTI_VALUE_LINE_PREFIX),
+            "a literal scalar beginning with the sentinel must be escaped on serialization",
+        );
+        let scalar_prefix_round_trip =
+            parse_field_blocks(&format!("TITLE\n{scalar_prefix_line}")).unwrap();
+        assert_eq!(
+            scalar_prefix_round_trip[0].values[0].to_texts(),
+            vec![literal_prefix.to_string()],
+            "scalar sentinel escaping must remain round-trip lossless",
+        );
+
+        let mostly_blank = format!(
+            "TITLE\n{MULTI_VALUE_LINE_PREFIX}{}",
+            serde_json::to_string(&vec!["  Kept  ", "", "   "]).unwrap()
+        );
+        assert_eq!(
+            parse_field_blocks(&mostly_blank).unwrap()[0].values[0].to_texts(),
+            vec!["Kept".to_string()],
+            "blank vector members use the shared meaningful-member policy before scalarization",
+        );
     }
 
     #[test]
@@ -1008,6 +1135,55 @@ mod tests {
                 "equal-cardinality edits, growth, and exact reverts must not warn"
             );
         }
+    }
+
+    #[test]
+    fn block_apply_cardinality_ignores_blank_ordered_list_members() {
+        let original = stored_list_entry("COMPOSER", &[&["Alice", "Bob"]]);
+
+        let mut no_collapse = editor_with_files(1, vec![original.clone()]);
+        let equal_after_normalization = vec![FieldBlock {
+            key: "COMPOSER".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_stored_texts([
+                "  Carol  ",
+                "   ",
+                "Dave",
+            ])],
+        }];
+        let report = apply_field_blocks_to_editor(&mut no_collapse, &equal_after_normalization)
+            .expect("apply normalized equal-cardinality list");
+        assert!(
+            report.collapsed_fields.is_empty(),
+            "blank members must not distort transfer cardinality comparisons",
+        );
+        assert_eq!(
+            no_collapse.active_surface().entries[0].per_file_values[0].to_texts(),
+            vec!["Carol".to_string(), "Dave".to_string()],
+            "tag-block transfer must apply the shared trim/drop policy before persistence",
+        );
+
+        let mut collapse = editor_with_files(1, vec![original]);
+        let one_after_normalization = vec![FieldBlock {
+            key: "COMPOSER".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_stored_texts([
+                " Carol ",
+                "",
+                "   ",
+            ])],
+        }];
+        let report = apply_field_blocks_to_editor(&mut collapse, &one_after_normalization)
+            .expect("apply normalized reducing list");
+        assert_eq!(
+            report.collapsed_fields,
+            vec![MetadataStoredValueCollapse {
+                display_key: "COMPOSER".to_string(),
+                slots: vec![0],
+            }],
+        );
+        assert_eq!(
+            collapse.active_surface().entries[0].per_file_values[0].to_texts(),
+            vec!["Carol".to_string()],
+        );
     }
 
     #[test]
@@ -2943,7 +3119,18 @@ fn plan_transfer_values_for_unified_cue_editor(
                         )
                     })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|value| {
+                if super::probe::metadata_field_is_set_valued(&canonical_key) {
+                    super::probe::MetadataFieldValues::from_stored_texts(
+                        value.normalized_list_texts(),
+                    )
+                } else {
+                    value
+                }
+            })
+            .collect::<Vec<_>>();
         let all_source_same = source_values
             .windows(2)
             .all(|pair| pair[0] == pair[1]);
@@ -2993,7 +3180,10 @@ fn plan_transfer_values_for_unified_cue_editor(
             }
         };
 
-        if values.iter().any(|values| values.value_count() > 1) {
+        if values
+            .iter()
+            .any(|values| values.normalized_list_value_count() > 1)
+        {
             plan.skipped_fields.push(format!(
                 "{} skipped: CUE cannot represent repeated values without loss",
                 canonical_key
@@ -3150,21 +3340,28 @@ fn plan_transfer_values_for_dimensions_with_collapse(
                 )
             })?;
             let stored_count = entry.stored_value_count_for_slot(source_index);
-            if stored_count > value.value_count()
+            let logical_count = value.normalized_list_value_count();
+            if stored_count > logical_count
                 && warned_stored_sources.insert(source_index)
             {
                 plan.cardinality_warnings.push(format!(
                     "{} source {} exposes {} list values for {} stored instances",
                     canonical_key,
                     source_index + 1,
-                    value.value_count(),
+                    logical_count,
                     stored_count
                 ));
             }
-            values.push(value.clone());
+            values.push(if super::probe::metadata_field_is_set_valued(&canonical_key) {
+                super::probe::MetadataFieldValues::from_stored_texts(value.normalized_list_texts())
+            } else {
+                value.clone()
+            });
         }
         if target_dimension.is_tracks()
-            && values.iter().any(|values| values.value_count() > 1)
+            && values
+                .iter()
+                .any(|values| values.normalized_list_value_count() > 1)
         {
             plan.skipped_fields.push(format!(
                 "{} skipped: CUE cannot represent repeated values without loss",
@@ -4206,14 +4403,14 @@ where
                 continue;
             }
             if super::probe::metadata_field_is_set_valued(&field.canonical_key)
-                && source_value.value_count() > 1
+                && source_value.normalized_list_value_count() > 1
                 && !backend.supports_repeated_field(&field.canonical_key)
             {
                 report.cardinality_warnings.push(format!(
                     "{}: {} has {} values but {} cannot round-trip repeated instances; the legacy scalar projection will be written",
                     target_path.display(),
                     field.canonical_key,
-                    source_value.value_count(),
+                    source_value.normalized_list_value_count(),
                     backend.label(),
                 ));
             }
@@ -5610,9 +5807,16 @@ pub(crate) fn apply_field_blocks_to_editor(
         }
         let values = (0..file_count)
             .map(|index| {
-                value_for_target(block, mode, index)
+                let value = value_for_target(block, mode, index)
                     .cloned()
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                if super::probe::metadata_field_is_set_valued(&block.key) {
+                    super::probe::MetadataFieldValues::from_stored_texts(
+                        value.normalized_list_texts(),
+                    )
+                } else {
+                    value
+                }
             })
             .collect::<Vec<_>>();
         let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);

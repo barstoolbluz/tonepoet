@@ -20,6 +20,60 @@ const ID3V2_FOOTER_LEN: u64 = 10;
 /// allowing attacker-controlled offsets or unbounded allocation/seek behavior.
 pub(crate) const MAX_ID3V2_FLAC_PREFIX_LEN: u64 = 16 * 1024 * 1024;
 
+/// Ordered-list fields exposed by the interactive metadata editor.
+///
+/// This contract is intentionally not the same as either the conversion
+/// pipeline contract or the repeatable subset of fixed-vocabulary backends.
+pub(crate) const EDITOR_ORDERED_LIST_FIELDS: &[&str] = &[
+    "ARTIST",
+    "COMPOSER",
+    "PERFORMER",
+    "GENRE",
+    "LYRICIST",
+    "ARRANGER",
+];
+
+/// Ordered-list fields carried end-to-end by conversion metadata.
+///
+/// ALBUMARTIST is conversion-visible while LYRICIST is editor-only.
+pub(crate) const PIPELINE_ORDERED_LIST_FIELDS: &[&str] = &[
+    "ARTIST",
+    "ALBUMARTIST",
+    "COMPOSER",
+    "PERFORMER",
+    "ARRANGER",
+    "GENRE",
+];
+
+/// Fields that fixed-vocabulary ID3v2/MP4 persistence can serialize as
+/// repeated ordered values without scalar projection.
+pub(crate) const FIXED_VOCABULARY_REPEATED_FIELDS: &[&str] =
+    &["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"];
+
+pub(crate) fn field_is_in_contract(canonical_display_key: &str, fields: &[&str]) -> bool {
+    fields.iter().any(|field| *field == canonical_display_key)
+}
+
+/// Normalize one logical ordered-list member before any backend projection.
+///
+/// Leading/trailing whitespace is not semantic, empty and whitespace-only
+/// members are absent, and duplicates/order among retained members are kept.
+pub(crate) fn normalize_ordered_metadata_member(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+pub(crate) fn normalize_ordered_metadata_values<I, S>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    values
+        .into_iter()
+        .filter_map(|value| normalize_ordered_metadata_member(value.as_ref()))
+        .collect()
+}
+
 // --- Shared tolerant APEv2 reader -------------------------------------------------
 //
 // This parser is intentionally UI-neutral. It is the single bounded read seam used
@@ -791,10 +845,7 @@ impl MetadataPersistenceBackend {
             | Self::LoftyVorbisComments
             | Self::LoftyApe => true,
             Self::NativeDsfId3 | Self::LoftyId3v2 | Self::LoftyMp4Ilst => {
-                matches!(
-                    canonical_display_key,
-                    "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER"
-                )
+                field_is_in_contract(canonical_display_key, FIXED_VOCABULARY_REPEATED_FIELDS)
             }
             Self::ReadOnlyApeFamily
             | Self::UnsupportedDff
@@ -2071,6 +2122,42 @@ mod tests {
         assert!(!MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("GENRE"));
         assert!(MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("PERFORMER"));
         assert!(MetadataPersistenceBackend::LoftyMp4Ilst.supports_repeated_field("ARRANGER"));
+    }
+
+    #[test]
+    fn ordered_list_field_contracts_are_intentionally_distinct_and_guarded() {
+        assert_eq!(
+            EDITOR_ORDERED_LIST_FIELDS,
+            &["ARTIST", "COMPOSER", "PERFORMER", "GENRE", "LYRICIST", "ARRANGER"]
+        );
+        assert_eq!(
+            PIPELINE_ORDERED_LIST_FIELDS,
+            &["ARTIST", "ALBUMARTIST", "COMPOSER", "PERFORMER", "ARRANGER", "GENRE"]
+        );
+        assert_eq!(
+            FIXED_VOCABULARY_REPEATED_FIELDS,
+            &["ARTIST", "COMPOSER", "PERFORMER", "ARRANGER"]
+        );
+
+        for field in FIXED_VOCABULARY_REPEATED_FIELDS {
+            assert!(field_is_in_contract(field, EDITOR_ORDERED_LIST_FIELDS));
+            assert!(field_is_in_contract(field, PIPELINE_ORDERED_LIST_FIELDS));
+        }
+        assert!(field_is_in_contract("LYRICIST", EDITOR_ORDERED_LIST_FIELDS));
+        assert!(!field_is_in_contract("LYRICIST", PIPELINE_ORDERED_LIST_FIELDS));
+        assert!(field_is_in_contract("ALBUMARTIST", PIPELINE_ORDERED_LIST_FIELDS));
+        assert!(!field_is_in_contract("ALBUMARTIST", EDITOR_ORDERED_LIST_FIELDS));
+        assert!(field_is_in_contract("GENRE", EDITOR_ORDERED_LIST_FIELDS));
+        assert!(field_is_in_contract("GENRE", PIPELINE_ORDERED_LIST_FIELDS));
+        assert!(!field_is_in_contract("GENRE", FIXED_VOCABULARY_REPEATED_FIELDS));
+    }
+
+    #[test]
+    fn ordered_list_normalization_trims_drops_blanks_and_preserves_ordered_duplicates() {
+        assert_eq!(
+            normalize_ordered_metadata_values(["  A  ", "", "   ", "B", " A "]),
+            vec!["A".to_string(), "B".to_string(), "A".to_string()]
+        );
     }
 
     #[test]

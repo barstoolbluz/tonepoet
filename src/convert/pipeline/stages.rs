@@ -4642,9 +4642,9 @@ pub async fn apply_metadata_with_tool_limits(
 }
 
 fn pipeline_set_valued_tag_key(key: &str) -> bool {
-    matches!(
+    crate::metadata_persistence::field_is_in_contract(
         normalize_metadata_key(key).as_str(),
-        "ARTIST" | "ALBUMARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER" | "GENRE"
+        crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
     )
 }
 
@@ -6159,9 +6159,9 @@ fn pipeline_authoritative_id3v2_write_changes(
         .into_iter()
         .filter_map(|(canonical, values)| {
             let first = values.first()?.clone();
-            let values = if matches!(
-                canonical.as_str(),
-                "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER"
+            let values = if crate::metadata_persistence::field_is_in_contract(
+                &canonical,
+                crate::metadata_persistence::FIXED_VOCABULARY_REPEATED_FIELDS,
             ) {
                 values
             } else if pipeline_set_valued_tag_key(&canonical) && values.len() > 1 {
@@ -6329,9 +6329,9 @@ fn dsf_authoritative_value_changes(
         .map(|(canonical_key, values)| {
             let values = if values.is_empty() {
                 None
-            } else if matches!(
-                canonical_key.as_str(),
-                "ARTIST" | "COMPOSER" | "PERFORMER" | "ARRANGER"
+            } else if crate::metadata_persistence::field_is_in_contract(
+                &canonical_key,
+                crate::metadata_persistence::FIXED_VOCABULARY_REPEATED_FIELDS,
             ) {
                 // The audited DSF writer persists these as ordered ID3v2.4
                 // value lists, including duplicates. ARTIST/COMPOSER use
@@ -6420,10 +6420,19 @@ async fn apply_dsf_authoritative_metadata(
     Ok(())
 }
 
+async fn propagate_pipeline_overlay_cancellation(
+    cancel: CancellationToken,
+    metadata_cancel: crate::tui::probe::MetadataWriteCancelFlag,
+) {
+    cancel.cancelled().await;
+    metadata_cancel.cancel();
+}
+
 async fn apply_pipeline_multivalue_overlay(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
+    cancel: &CancellationToken,
 ) -> Result<(), MetadataError> {
     let ext = path
         .extension()
@@ -6456,21 +6465,49 @@ async fn apply_pipeline_multivalue_overlay(
         return Ok(());
     }
 
+    if cancel.is_cancelled() {
+        return Err(MetadataError::InProcessWrite(format!(
+            "metadata save cancelled before final multi-value overlay for '{}'",
+            path.display()
+        )));
+    }
+
     let overlay_path = path.to_path_buf();
     let authoritative_id3v2_changes =
         (ext == "wav").then(|| pipeline_authoritative_id3v2_write_changes(&tags));
+    let metadata_cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+    let worker_cancel = metadata_cancel.clone();
+    let worker_token = cancel.clone();
+    let bridge_cancel = metadata_cancel.clone();
+    let bridge_token = cancel.clone();
+    let cancellation_bridge = tokio::spawn(propagate_pipeline_overlay_cancellation(
+        bridge_token,
+        bridge_cancel,
+    ));
     let report = tokio::task::spawn_blocking(move || {
+        // Close the scheduling gap between the async pre-check above and the
+        // bridge task becoming runnable. Later cancellation is propagated by
+        // the bridge through the same shared metadata-write flag.
+        if worker_token.is_cancelled() {
+            worker_cancel.cancel();
+        }
         if let Some(authoritative_changes) = authoritative_id3v2_changes {
-            crate::tui::probe::write_all_tag_value_lists_to_id3v2(
+            crate::tui::probe::write_all_tag_value_lists_to_id3v2_with_cancel(
                 &overlay_path,
                 &authoritative_changes,
+                Some(&worker_cancel),
             )
         } else {
-            crate::tui::probe::write_all_tag_value_lists(&overlay_path, &changes)
+            crate::tui::probe::write_all_tag_value_lists_with_cancel(
+                &overlay_path,
+                &changes,
+                Some(&worker_cancel),
+            )
         }
     })
-    .await
-    .map_err(|error| {
+    .await;
+    cancellation_bridge.abort();
+    let report = report.map_err(|error| {
         MetadataError::InProcessWrite(format!(
             "metadata writer worker for '{}' did not complete: {error}",
             path.display()
@@ -6629,7 +6666,7 @@ async fn apply_production_metadata_to_file(
     // whenever repeated fields require that primary carrier. RF64 remains on
     // its validated FFmpeg INFO carrier; unsupported RF64 fields are rejected
     // before the primary rewrite because Lofty 0.21.1 cannot parse RF64.
-    apply_pipeline_multivalue_overlay(path, meta, album).await?;
+    apply_pipeline_multivalue_overlay(path, meta, album, cancel).await?;
 
     Ok(ProductionMetadataMutationOutcome {
         primary_mutator,
@@ -6736,6 +6773,78 @@ mod metadata_writer_command_tests {
                 ..AlbumMetadata::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn final_multivalue_overlay_rejects_preexisting_cancellation_without_mutation() {
+        let temp = tempfile::tempdir().expect("metadata cancellation tempdir");
+        let path = temp.path().join("cancelled-overlay.m4a");
+        fs::write(
+            &path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/metadata_persistence/mp4.m4a"
+            )),
+        )
+        .expect("copy MP4 cancellation fixture");
+        let before = fs::read(&path).expect("snapshot MP4 cancellation fixture");
+        let track = TrackMetadata {
+            performer: vec!["One".to_string(), "Two".to_string()].into(),
+            ..TrackMetadata::default()
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = apply_pipeline_multivalue_overlay(
+            &path,
+            &track,
+            &AlbumMetadata::default(),
+            &cancel,
+        )
+        .await
+        .expect_err("pre-cancelled final overlay must fail before metadata mutation");
+        assert!(
+            error.to_string().contains("cancelled before final multi-value overlay"),
+            "unexpected cancellation error: {error}",
+        );
+        assert_eq!(
+            fs::read(&path).expect("read MP4 after pre-cancelled overlay"),
+            before,
+            "pre-cancelled final overlay must leave the carrier byte-identical",
+        );
+    }
+
+    #[tokio::test]
+    async fn final_multivalue_overlay_cancellation_bridge_reaches_in_progress_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cancel = CancellationToken::new();
+        let metadata_cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let worker_cancel = metadata_cancel.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_worker = Arc::clone(&started);
+        let worker = tokio::task::spawn_blocking(move || {
+            started_worker.store(true, Ordering::SeqCst);
+            while !worker_cancel.is_cancelled() {
+                std::thread::yield_now();
+            }
+        });
+        let bridge = tokio::spawn(propagate_pipeline_overlay_cancellation(
+            cancel.clone(),
+            metadata_cancel,
+        ));
+
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        worker
+            .await
+            .expect("in-progress metadata worker must observe bridged cancellation");
+        bridge
+            .await
+            .expect("cancellation propagation task must complete cleanly");
     }
 
     fn assert_no_internal_metadata_tags(tags: &[(String, String)]) {
@@ -7371,7 +7480,12 @@ mod metadata_writer_command_tests {
             ..TrackMetadata::default()
         };
 
-        apply_pipeline_multivalue_overlay(&path, &track, &AlbumMetadata::default())
+        apply_pipeline_multivalue_overlay(
+            &path,
+            &track,
+            &AlbumMetadata::default(),
+            &CancellationToken::new(),
+        )
             .await
             .expect("RF64-in-WAV must bypass Lofty's RIFF-only overlay");
         let after = fs::read(&path).expect("read untouched RF64 marker");
