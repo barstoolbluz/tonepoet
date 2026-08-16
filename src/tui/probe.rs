@@ -9677,7 +9677,11 @@ fn editor_change_values_for_backend(
             (!values.is_empty()).then(|| vec![values.join("; ")])
         }
     } else {
-        let value = values.as_str().trim();
+        // Scalar editor values are user-authored text, not ordered-list
+        // members. Preserve them verbatim; only an actually empty scalar is a
+        // clear. List-member whitespace normalization belongs exclusively to
+        // `normalized_list_texts()` above.
+        let value = values.as_str();
         (!value.is_empty()).then(|| vec![value.to_string()])
     }
 }
@@ -10066,7 +10070,10 @@ fn editor_changes_scalar_projection(
                     (!values.is_empty()).then(|| values.join("; "))
                 }
                 Some(values) => {
-                    let value = values.as_str().trim();
+                    // Keep scalar projection semantically identical to the
+                    // backend-specific path above: whitespace is payload for
+                    // scalars, while only the empty string means clear.
+                    let value = values.as_str();
                     (!value.is_empty()).then(|| value.to_string())
                 }
             };
@@ -13809,10 +13816,13 @@ fn apply_changes_to_lofty_tag(
 
         let mut changed = false;
         for (key, new_value) in changes {
+            // Generic Lofty carriers follow the same scalar contract as the
+            // editor projections: preserve non-empty text byte-for-byte and
+            // reserve only the empty string for clear semantics.
             let normalized_value = new_value
                 .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
+                .filter(|value| !value.is_empty())
+                .cloned();
             let mut matching_count = 0usize;
             let mut matching_text = None;
             for item in tag.items() {
@@ -17676,6 +17686,73 @@ mod tests {
             matches!(&result.outcome, crate::tui::app::MetadataEditorWriteOutcome::Saved),
             "unexpected metadata write result: {result:?}"
         );
+    }
+
+    #[test]
+    fn scalar_editor_values_preserve_padding_and_whitespace_only_verbatim() {
+        use crate::metadata_persistence::MetadataPersistenceBackend;
+        use lofty::tag::{ItemKey, Tag, TagType};
+
+        let backend = MetadataPersistenceBackend::LoftyId3v2;
+        for requested in [" padded scalar ", " "] {
+            let change = EditorTagChange {
+                tag_type: None,
+                existed: false,
+                display_key: "COMMENT".to_string(),
+                item_key: ItemKey::Comment,
+                values: Some(MetadataFieldValues::from_stored_text(requested)),
+                list_semantics: false,
+            };
+            assert_eq!(
+                editor_change_values_for_backend(&change, backend),
+                Some(vec![requested.to_string()]),
+                "backend projection must preserve scalar whitespace verbatim",
+            );
+            assert_eq!(
+                editor_changes_scalar_projection(std::slice::from_ref(&change))[0]
+                    .1
+                    .as_deref(),
+                Some(requested),
+                "generic scalar projection must preserve the same contract",
+            );
+
+            let mut riff = Tag::new(TagType::RiffInfo);
+            assert!(
+                apply_changes_to_lofty_tag(
+                    &mut riff,
+                    &[(ItemKey::Comment, Some(requested.to_string()))],
+                )
+                .expect("apply scalar change to generic Lofty carrier"),
+                "first scalar write should mutate the generic carrier",
+            );
+            assert_eq!(
+                riff.get_string(&ItemKey::Comment),
+                Some(requested),
+                "generic Lofty persistence must not trim scalar payloads",
+            );
+        }
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-scalar-whitespace-verbatim");
+        for (file_name, requested) in [
+            ("padded-scalar.mp3", " padded scalar "),
+            ("whitespace-only-scalar.mp3", " "),
+        ] {
+            let (_temp, path) = copy_numbering_fixture(file_name, ID3V2_NUMBERING_FIXTURE);
+            let originals = editor_slot_values(&path, "COMMENT");
+            let original_refs = originals.iter().map(String::as_str).collect::<Vec<_>>();
+            let result = apply_editor_list_change(
+                &path,
+                "COMMENT",
+                &[requested],
+                &original_refs,
+            );
+            assert_saved_without_warnings(&result);
+            assert_eq!(
+                editor_slot_values(&path, "COMMENT"),
+                vec![requested.to_string()],
+                "scalar COMMENT must round-trip exactly, including whitespace-only payloads",
+            );
+        }
     }
 
     fn owned_test_values(values: &[&str]) -> Vec<String> {
@@ -28749,9 +28826,9 @@ mod tests {
     /// the embed plan must switch to FLAC's native CUESHEET metadata
     /// block instead of a Vorbis comment.
     ///
-    /// The save path uses `val.trim()` (probe.rs:1116-ish), so the
-    /// trailing newline gets stripped — we compare against the
-    /// trim_end of the producer output, not the raw producer.
+    /// This test intentionally writes a trimmed fixture payload so it isolates
+    /// Lofty's multi-line serialization behavior from editor whitespace
+    /// policy. Compare against that same explicit fixture projection.
     #[test]
     fn lofty_cuesheet_vorbis_comment_round_trips_multiline() {
         use lofty::config::WriteOptions;

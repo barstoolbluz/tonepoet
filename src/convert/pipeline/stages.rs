@@ -8609,6 +8609,28 @@ mod metadata_writer_command_tests {
         run_checked("ffmpeg", &args);
     }
 
+    fn create_jpeg_cover(path: &Path) {
+        run_checked(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-loglevel".to_string(),
+                "error".to_string(),
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                "color=c=black:s=16x16:d=0.04".to_string(),
+                "-frames:v".to_string(),
+                "1".to_string(),
+                "-c:v".to_string(),
+                "mjpeg".to_string(),
+                path.display().to_string(),
+            ],
+        );
+    }
+
     fn native_round_trip_multivalue_metadata() -> (TrackMetadata, AlbumMetadata) {
         (
             TrackMetadata {
@@ -9381,25 +9403,7 @@ mod metadata_writer_command_tests {
         let cover_path = dir.join("cover.jpg");
         let exported_cover_path = dir.join("exported-cover.jpg");
         create_sine_audio(&flac_path, &["-c:a", "flac"]);
-        run_checked(
-            "ffmpeg",
-            &[
-                "-y".to_string(),
-                "-hide_banner".to_string(),
-                "-nostdin".to_string(),
-                "-loglevel".to_string(),
-                "error".to_string(),
-                "-f".to_string(),
-                "lavfi".to_string(),
-                "-i".to_string(),
-                "color=c=black:s=16x16:d=0.04".to_string(),
-                "-frames:v".to_string(),
-                "1".to_string(),
-                "-c:v".to_string(),
-                "mjpeg".to_string(),
-                cover_path.display().to_string(),
-            ],
-        );
+        create_jpeg_cover(&cover_path);
 
         let artwork = CueArtworkSidecar {
             path: cover_path.clone(),
@@ -9437,6 +9441,124 @@ mod metadata_writer_command_tests {
             fs::read(&exported_cover_path).expect("read exported FLAC picture"),
             fs::read(&cover_path).expect("read source cover"),
             "native FLAC artwork replacement must preserve the requested picture payload",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_artwork_embed_precedes_final_multivalue_overlay_when_tools_are_available() {
+        use lofty::file::TaggedFileExt;
+
+        if !executable_on_path("ffmpeg")
+            || !ffmpeg_encoder_available("libmp3lame")
+            || !ffmpeg_encoder_available("mjpeg")
+        {
+            eprintln!(
+                "skipping MP3 artwork/multi-value ordering regression; ffmpeg with libmp3lame+mjpeg encoders is required"
+            );
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-mp3-artwork-multivalue-order");
+        let mp3_path = dir.join("track.mp3");
+        let cover_path = dir.join("cover.jpg");
+        create_sine_audio(&mp3_path, &["-c:a", "libmp3lame", "-b:a", "128k"]);
+        create_jpeg_cover(&cover_path);
+
+        let artwork = CueArtworkSidecar {
+            path: cover_path,
+            mime_type: Some("image/jpeg".to_string()),
+        };
+        let (track, album) = native_round_trip_multivalue_metadata();
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &mp3_path,
+            &track,
+            &album,
+            Some(&artwork),
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply repeated MP3 metadata with cover artwork");
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &mp3_path,
+            )
+            .expect("read artwork-bearing MP3 through pipeline reader");
+        assert!(!recovered, "normal MP3 metadata should not use fallback recovery");
+        assert!(warnings.is_empty(), "unexpected MP3 metadata warnings: {warnings:?}");
+        assert_eq!(metadata.artist.values(), track.artist.values());
+        assert_eq!(metadata.composer.values(), track.composer.values());
+        assert_eq!(metadata.performer.values(), track.performer.values());
+        assert_eq!(metadata.arranger.values(), track.arranger.values());
+
+        let tagged = lofty::read_from_path(&mp3_path).expect("read tagged MP3 artwork carrier");
+        let picture_count = tagged
+            .tag(lofty::tag::TagType::Id3v2)
+            .map(|tag| tag.pictures().iter().count())
+            .unwrap_or(0);
+        assert_eq!(
+            picture_count,
+            1,
+            "ordering guard must exercise and preserve a real artwork embed",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wavpack_overlay_reexpands_albumartist_and_genre_when_tools_are_available() {
+        if !executable_on_path("ffmpeg")
+            || !executable_on_path("wvtag")
+            || !ffmpeg_encoder_available("wavpack")
+        {
+            eprintln!(
+                "skipping WavPack ALBUMARTIST/GENRE multi-value regression; ffmpeg with wavpack encoder and wvtag are required"
+            );
+            return;
+        }
+
+        let dir = temp_test_dir("tonepoet-wavpack-albumartist-genre-multivalue");
+        let wavpack_path = dir.join("track.wv");
+        create_sine_audio(&wavpack_path, &["-c:a", "wavpack"]);
+
+        let (track, album) = native_round_trip_multivalue_metadata();
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_production_metadata_to_file(
+            &wavpack_path,
+            &track,
+            &album,
+            None,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("apply repeated WavPack metadata");
+
+        let (metadata, warnings, recovered) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &wavpack_path,
+            )
+            .expect("read tagged WavPack through pipeline reader");
+        assert!(!recovered, "normal WavPack metadata should not use fallback recovery");
+        assert!(
+            warnings.is_empty(),
+            "unexpected WavPack metadata warnings: {warnings:?}"
+        );
+        assert_eq!(
+            metadata.album_artist.values(),
+            track.album_artist.values(),
+            "WavPack overlay must re-expand ordered ALBUMARTIST values after wvtag scalar projection",
+        );
+        assert_eq!(
+            metadata.genre.values(),
+            track.genre.values(),
+            "WavPack overlay must re-expand ordered GENRE values after wvtag scalar projection",
         );
 
         let _ = fs::remove_dir_all(&dir);

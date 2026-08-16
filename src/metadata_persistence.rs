@@ -1157,10 +1157,14 @@ pub(crate) fn normalized_typed_lofty_changes(
     let mut pending = Vec::<PendingChange>::new();
     for (key, value) in changes {
         let persistence_key = normalize_numbering_item_key_for_backend(backend, key);
+        // This layer normalizes logical keys and detects conflicting writes;
+        // it must not rewrite user-authored scalar payloads. Ordered-list
+        // members are normalized before they reach this function, while an
+        // actually empty scalar remains the deletion sentinel.
         let normalized_value = value
             .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .cloned();
 
         let index = if let Some(index) = pending
             .iter()
