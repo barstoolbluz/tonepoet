@@ -7,8 +7,8 @@ use super::message::AppMessage;
 
 #[cfg(test)]
 pub(crate) mod test_probe {
+    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct ArtworkDispatch {
@@ -17,14 +17,18 @@ pub(crate) mod test_probe {
         pub target_paths: Vec<PathBuf>,
     }
 
-    static ARTWORK_DISPATCHES: OnceLock<Mutex<Vec<ArtworkDispatch>>> = OnceLock::new();
-
-    fn dispatches() -> &'static Mutex<Vec<ArtworkDispatch>> {
-        ARTWORK_DISPATCHES.get_or_init(|| Mutex::new(Vec::new()))
+    thread_local! {
+        // Per-test-thread rather than a process-global: the dispatch is recorded
+        // synchronously on the same thread the test drives, and cargo runs each
+        // test on its own thread, so this isolates parallel tests from clobbering
+        // each other's probe state (each test also clears at start, so sequential
+        // thread reuse is safe).
+        static ARTWORK_DISPATCHES: RefCell<Vec<ArtworkDispatch>> =
+            const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn clear_artwork_dispatches() {
-        dispatches().lock().expect("dispatch probe lock").clear();
+        ARTWORK_DISPATCHES.with(|dispatches| dispatches.borrow_mut().clear());
     }
 
     pub(crate) fn record_artwork_dispatch(
@@ -32,14 +36,15 @@ pub(crate) mod test_probe {
         picture_type: lofty::picture::PictureType,
         target_paths: Vec<PathBuf>,
     ) {
-        dispatches()
-            .lock()
-            .expect("dispatch probe lock")
-            .push(ArtworkDispatch { image_path, picture_type, target_paths });
+        ARTWORK_DISPATCHES.with(|dispatches| {
+            dispatches
+                .borrow_mut()
+                .push(ArtworkDispatch { image_path, picture_type, target_paths });
+        });
     }
 
     pub(crate) fn last_artwork_dispatch() -> Option<ArtworkDispatch> {
-        dispatches().lock().expect("dispatch probe lock").last().cloned()
+        ARTWORK_DISPATCHES.with(|dispatches| dispatches.borrow().last().cloned())
     }
 }
 
