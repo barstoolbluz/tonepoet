@@ -459,3 +459,84 @@ valid alternatives.
 4. **Avoid** full probe-at-selection boundary validation for every candidate — expensive, and it lives
    in the LODESTAR/cue-authority selection area that has regressed repeatedly (high blast radius).
 
+---
+
+## 10. gnuDB lookup runs a synchronous CUE directory-scan + parse on the reducer thread (can block the TUI on slow/network folders)
+
+**Discovered:** 2026-08-17, during the two-source adversarial audit of the per-track multi-value work.
+**Pre-existing** — present verbatim at `b8d96d0`; **not** a regression from that work.
+
+**Symptom.** Triggering gnuDB ("get tags") on a large or slow (e.g. sshfs) folder can freeze the TUI
+thread for the duration of a CUE directory scan and `.cue` parse.
+
+**Root cause.** `execute_gnudb_query` (`src/tui/context_menu.rs:~4181-4188`) calls
+`collect_single_image_cue_infos_for_sources` and `discover_multi_file_cues_for_sources`
+**synchronously on the reducer, before** the `spawn_blocking` boundary. Those touch disk:
+`collect_cue_paths_from_source` → `gnudb::find_cues_in_dir` (`read_dir`) + `path.is_dir()` stat
+(`src/tui/command.rs:~1018-1027`), and `detect_single_image_cue` / `parse_cue_file` /
+`resolve_cue_cue_file_reference` open and parse `.cue` files (`command.rs:~1330/1367/1045`). The
+2026-08-17 F1 gnuDB corrective correctly moved the *newly-added* ISO/disc-header probing
+(`is_*_iso`, `read_optical_disc_*`) off the reducer into `prepare_gnudb_virtual_disc_toc_blocking`
+behind `spawn_blocking`, but did not (and was not scoped to) move this pre-existing CUE scan. The
+browse-hang invariant guard is substring-scoped to `context_menu.rs` symbols, so it never covered
+these `command.rs` cue helpers.
+
+**No data loss** — responsiveness/UX only.
+
+**Fix direction.** Move the CUE discovery (`collect_single_image_cue_infos_for_sources` +
+`discover_multi_file_cues_for_sources`) into a `spawn_blocking` worker — either the existing
+`prepare_gnudb_virtual_disc_toc_blocking` or a sibling — so the gnuDB reducer performs no synchronous
+disk I/O. Preserve the empty-source synchronous fast path (the `"GNUDB: selection contains no
+supported lookup sources"` message must stay immediate) and the operation-ID lifecycle.
+
+---
+
+## 11. Native FLAC metadata write refused on an sshfs-mounted, well-formed FLAC — message blames the file, but cause is likely an in-process leaked write-claim (partial diagnosis)
+
+**Discovered:** 2026-08-17, field-test editing metadata on
+`~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/UK/1969 - Led Zeppelin (UK 1st Press Version 6 … Superhype Publishing)/Led Zeppelin I.flac` (a 1.9 GB 24/192 FLAC). **Partial diagnosis — needs the
+untruncated error + a restart test to confirm** (see "Owed" below).
+
+**Symptom.** Save fails: *"Metadata: 0 saved, 1 failed, unsaved changes remain — native FLAC
+metadata-region tag write refused for '<path>': <native_err>"*. The `<native_err>` (the text **after**
+the path — the actual diagnosis) was **truncated** in the field report. The FLAC is left unmodified.
+
+**Ruled out (empirically).** The message's suggested remedies do **not** apply here:
+- **Not padding:** the file has a **1 MB PADDING** block (ample); ironically a sibling FLAC that was
+  *not* reported failing has none.
+- **Not an ID3 prefix:** header is `fLaC` at offset 0.
+- **Not symlink / hardlinks:** regular file, `links=1`.
+- **Not a stale on-disk journal/lock sidecar:** the directory holds only `Art/`, `cover.jpg`, `.cue`,
+  `.flac` — no `.tonepoet-write-lock` / `.tonepoet-meta-journal` / `.tonepoet-artwork-rollback`.
+- **Not basic sshfs durability failure:** the file is on a `fuse.sshfs` mount, but the exact ops the
+  native writer uses — create + `fsync` + `rename` a sidecar, `O_RDWR` open + `fsync`/`sync_data` on
+  the FLAC (`overwrite_metadata_region`, `src/tui/probe.rs:2349`) — all **succeed** when tested there.
+
+**Leading hypothesis (unconfirmed): an in-process write-claim collision, not a file/FS problem.** The
+observed message is the wrapper `native_flac_write_refused_error` (`probe.rs:13271`) around the
+truncated `native_err`. Given a well-formed file and a working filesystem, the most consistent producer
+of this shape is `acquire_common_write_claim` (`probe.rs:3250`): *"cannot start native FLAC tag write
+for '…': another metadata/artwork mutation for the same FLAC is already in progress in this process."*
+This is an **in-memory, session-scoped** lock (`COMMON_WRITE_LOCKS`). If a prior write attempt on this
+same FLAC in the same TUI session didn't release it (a spawned write task cancelled/panicked, or an
+earlier aborted mutation), every subsequent write to that file is refused for the rest of the session,
+and it propagates straight into this "refused" message. **This is the same aborted-write family as
+issue #3** (`current_exe()`-deleted helper-spawn failures leaving inconsistent state).
+
+**Owed to confirm.**
+1. The **untruncated** status line — the text after the path is the `native_err` and names the exact
+   cause definitively.
+2. Whether a **fresh TUI restart clears it** — restart clears ⇒ leaked in-process claim (confirmed);
+   persists ⇒ environmental/file-specific (then copy the FLAC to local disk and test the write there to
+   isolate sshfs).
+
+**Fix direction.**
+1. **If the leaked-claim hypothesis holds** (a real bug): a leaked `COMMON_WRITE_LOCKS` entry permanently
+   blocks all metadata writes to a file for the session after any aborted mutation. Ensure the claim is
+   released on every write-task exit path (cancellation, panic, error) — an RAII guard / `Drop`-based
+   release rather than an explicit release that an early return can skip.
+2. **Message accuracy (regardless of cause):** the refusal hard-codes FLAC-structural remedies
+   ("Repair the FLAC, add sufficient FLAC padding") — actively misleading when the file is pristine with
+   ample padding and the cause is an in-process lock or environment. Key the surfaced advice off the
+   `native_err` category (in-process claim vs. durability failure vs. genuine structural).
+
