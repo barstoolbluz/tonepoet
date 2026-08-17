@@ -6704,6 +6704,30 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 );
             }
         }
+        AppMessage::GnudbVirtualDiscTocComplete {
+            operation_id,
+            result,
+        } => {
+            if !gnudb_operation_is_current(app, operation_id) {
+                return;
+            }
+            match result {
+                Ok((source, durations, label)) => {
+                    super::context_menu::launch_virtual_disc_gnudb(
+                        operation_id,
+                        app,
+                        tx,
+                        source,
+                        durations,
+                        label,
+                    );
+                }
+                Err(error) => {
+                    retire_gnudb_operation_with_editor_restore(app, operation_id);
+                    app.set_status(error);
+                }
+            }
+        }
         AppMessage::GnudbQueryComplete {
             operation_id,
             result,
@@ -15406,6 +15430,27 @@ mod musicbrainz_completion_dispatch_tests {
         let current = advance_gnudb_operation(&mut app, stale).expect("advance GNUDB operation");
         app.set_status("current workflow status");
         let before_status = app.status_message.as_ref().map(|(message, _)| message.clone());
+
+        handle_message(
+            &mut app,
+            AppMessage::GnudbVirtualDiscTocComplete {
+                operation_id: stale,
+                result: Ok((
+                    std::path::PathBuf::from("stale.iso"),
+                    vec![60.0],
+                    "SACD",
+                )),
+            },
+            &tx(),
+        );
+        assert_eq!(
+            app.active_gnudb_operation.map(|active| active.operation_id),
+            Some(current)
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.clone()),
+            before_status
+        );
 
         handle_message(
             &mut app,

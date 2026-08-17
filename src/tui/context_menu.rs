@@ -2009,26 +2009,10 @@ where
                 ));
             }
             Some(DirectSourceKind::DiscImage) => {
-                let entries = if crate::convert::sacd::is_sacd_iso(path) {
-                    super::keybindings::read_sacd_tag_entries_for_copy(path)?
-                } else if crate::disc::dvda_utils::is_dvda_iso(path) {
-                    super::keybindings::read_dvda_tag_entries_for_copy(path)?
-                } else if crate::disc::dvdv_utils::is_dvdv_iso(path) {
-                    return Err(format!(
-                        "Copy tags: tags for DVD-Video image '{}' require materialization",
-                        path.display()
-                    ));
-                } else if crate::disc::bluray_utils::is_bluray_iso(path) {
-                    return Err(format!(
-                        "Copy tags: tags for Blu-ray image '{}' require materialization",
-                        path.display()
-                    ));
-                } else {
-                    return Err(format!(
-                        "Copy tags: admitted disc image '{}' has no tag reader",
-                        path.display()
-                    ));
-                };
+                // This helper is reached only from `launch_tag_clipboard_copy`'s
+                // `spawn_blocking` closure. Keep all optical-disc classifiers and
+                // synchronous disc reads on that worker, never on the Browse reducer.
+                let entries = super::keybindings::read_optical_disc_tag_entries_for_copy(path)?;
                 let count = entries
                     .iter()
                     .map(|entry| entry.per_file_values.len())
@@ -4092,6 +4076,71 @@ pub(super) fn handle_gnudb_split_cue_album_grouping_complete(
     );
 }
 
+/// Synchronously perform authoritative direct-source discovery and optical-disc
+/// TOC preparation for GNUDB. This function may read directories, ISO headers,
+/// and disc structures; callers must invoke it only from `spawn_blocking`.
+fn prepare_gnudb_virtual_disc_toc_blocking(
+    paths: &[std::path::PathBuf],
+) -> Result<(std::path::PathBuf, Vec<f64>, &'static str), String> {
+    let admitted_sources = super::command::expand_metadata_read_sources_limited(
+        paths,
+        TAG_CLIPBOARD_COPY_MAX_VISITED,
+        TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+        || false,
+        "GNUDB",
+        "GNUDB source discovery cancelled",
+    )?;
+
+    let classified_sources = admitted_sources
+        .into_iter()
+        .filter_map(|path| {
+            crate::convert::source_admission::direct_source_kind(&path).map(|kind| (path, kind))
+        })
+        .collect::<Vec<_>>();
+
+    let mut disc_images = classified_sources
+        .iter()
+        .filter_map(|(path, kind)| {
+            matches!(
+                *kind,
+                crate::convert::source_admission::DirectSourceKind::DiscImage
+            )
+            .then(|| path.to_path_buf())
+        })
+        .collect::<Vec<_>>();
+
+    if disc_images.len() == 1 {
+        let source = disc_images.pop().expect("single disc-image source");
+        let (durations, label) =
+            super::keybindings::read_optical_disc_track_durations_for_gnudb(&source)?;
+        return Ok((source, durations, label));
+    }
+    if disc_images.len() > 1 {
+        return Err("GNUDB: select one optical-disc image at a time".to_string());
+    }
+    if let Some((path, _)) = classified_sources.iter().find(|(_, kind)| {
+        matches!(
+            *kind,
+            crate::convert::source_admission::DirectSourceKind::ArchivePreview
+        )
+    }) {
+        return Err(format!(
+            "GNUDB: archive '{}' requires materialization before TOC lookup",
+            path.display()
+        ));
+    }
+    if classified_sources.iter().any(|(_, kind)| {
+        matches!(
+            *kind,
+            crate::convert::source_admission::DirectSourceKind::Cue
+        )
+    }) {
+        return Err("GNUDB: selected CUE did not yield a usable audio/TOC layout".to_string());
+    }
+
+    Err("GNUDB: selection contains no supported lookup sources".to_string())
+}
+
 /// Execute a GNUDB lookup for the current Browse selection, with the same
 /// bulk-operation guard as command-mode tagging flows.
 pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -4104,22 +4153,14 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     ) {
         return;
     }
-    // Collect audio file paths, group by disc, query GNUDB.
+    // Collect ordinary audio/CUE inputs first. Authoritative direct-source
+    // admission is intentionally deferred: generic ISO classification probes
+    // file headers and therefore belongs only on the blocking worker below.
     let paths = super::command::collect_selection_for_file_ops(app);
-    let admitted_sources = match super::command::expand_metadata_read_sources_limited(
-        &paths,
-        TAG_CLIPBOARD_COPY_MAX_VISITED,
-        TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
-        || false,
-        "GNUDB",
-        "GNUDB source discovery cancelled",
-    ) {
-        Ok(sources) => sources,
-        Err(error) => {
-            app.set_status(error);
-            return;
-        }
-    };
+    if paths.is_empty() {
+        app.set_status("GNUDB: selection contains no supported lookup sources");
+        return;
+    }
     let mut audio_paths: Vec<std::path::PathBuf> =
         crate::convert::queue_expansion::expand_paths_to_all_audio(&paths)
             .into_iter()
@@ -4163,74 +4204,30 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         return;
     }
     if cue_infos.is_empty() && multi_file_cue_layouts.is_empty() && audio_paths.is_empty() {
-        let disc_images = admitted_sources
-            .iter()
-            .filter(|path| {
-                matches!(
-                    crate::convert::source_admission::direct_source_kind(path),
-                    Some(crate::convert::source_admission::DirectSourceKind::DiscImage)
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if disc_images.len() == 1 {
-            let source = &disc_images[0];
-            let virtual_disc = if crate::convert::sacd::is_sacd_iso(source) {
-                super::keybindings::read_sacd_track_durations_for_gnudb(source)
-                    .map(|durations| (durations, "SACD"))
-            } else if crate::disc::dvda_utils::is_dvda_iso(source) {
-                super::keybindings::read_dvda_track_durations_for_gnudb(source)
-                    .map(|durations| (durations, "DVD-Audio"))
-            } else if crate::disc::dvdv_utils::is_dvdv_iso(source) {
-                Err(format!(
-                    "GNUDB: DVD-Video image '{}' requires a materialized audio/TOC adapter",
-                    source.display()
-                ))
-            } else if crate::disc::bluray_utils::is_bluray_iso(source) {
-                Err(format!(
-                    "GNUDB: Blu-ray image '{}' requires a materialized audio/TOC adapter",
-                    source.display()
-                ))
-            } else {
-                Err(format!(
-                    "GNUDB: admitted disc image '{}' has no TOC adapter",
-                    source.display()
-                ))
-            };
-            match virtual_disc {
-                Ok((durations, label)) => {
-                    launch_virtual_disc_gnudb(app, tx, source.clone(), durations, label);
-                }
-                Err(error) => app.set_status(error),
+        let operation_id = match super::event_loop::begin_gnudb_operation(app) {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                app.set_status(error);
+                return;
             }
-            return;
-        }
-        if disc_images.len() > 1 {
-            app.set_status("GNUDB: select one optical-disc image at a time");
-            return;
-        }
-        if let Some(path) = admitted_sources.iter().find(|path| {
-            matches!(
-                crate::convert::source_admission::direct_source_kind(path),
-                Some(crate::convert::source_admission::DirectSourceKind::ArchivePreview)
-            )
-        }) {
-            app.set_status(format!(
-                "GNUDB: archive '{}' requires materialization before TOC lookup",
-                path.display()
-            ));
-            return;
-        }
-        if admitted_sources.iter().any(|path| {
-            matches!(
-                crate::convert::source_admission::direct_source_kind(path),
-                Some(crate::convert::source_admission::DirectSourceKind::Cue)
-            )
-        }) {
-            app.set_status("GNUDB: selected CUE did not yield a usable audio/TOC layout");
-            return;
-        }
-        app.set_status("GNUDB: selection contains no supported lookup sources");
+        };
+        app.set_status("GNUDB: inspecting selected direct source...");
+        super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
+            let result = match tokio::task::spawn_blocking(move || {
+                prepare_gnudb_virtual_disc_toc_blocking(&paths)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!(
+                    "GNUDB: direct-source/TOC worker did not complete: {error}"
+                )),
+            };
+            super::message::AppMessage::GnudbVirtualDiscTocComplete {
+                operation_id,
+                result,
+            }
+        });
         return;
     }
     let operation_id = match super::event_loop::begin_gnudb_operation(app) {
@@ -4399,20 +4396,17 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     }
 }
 
-fn launch_virtual_disc_gnudb(
+pub(super) fn launch_virtual_disc_gnudb(
+    operation_id: super::message::TagsMbOperationId,
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     source: PathBuf,
     durations: Vec<f64>,
     label: &'static str,
 ) {
-    let operation_id = match super::event_loop::begin_gnudb_operation(app) {
-        Ok(operation_id) => operation_id,
-        Err(error) => {
-            app.set_status(error);
-            return;
-        }
-    };
+    if !super::event_loop::gnudb_operation_is_current(app, operation_id) {
+        return;
+    }
     let disc_id = super::gnudb::compute_disc_id(&durations);
     let paths_for_editor = vec![source; durations.len()];
     app.set_status(format!(
@@ -4737,6 +4731,98 @@ mod tests {
                 && !production.contains("is_bluray_iso"),
             "browse context-menu construction must not synchronously probe disc-image headers"
         );
+    }
+
+    #[test]
+    fn gnudb_reducer_defers_authoritative_direct_source_admission_to_blocking_worker() {
+        let source = include_str!("context_menu.rs");
+        let execute = source
+            .split("pub(super) fn execute_gnudb_query")
+            .nth(1)
+            .expect("GNUDB executor")
+            .split("pub(super) fn launch_virtual_disc_gnudb")
+            .next()
+            .expect("GNUDB executor body");
+        let blocking = execute
+            .find("tokio::task::spawn_blocking")
+            .expect("GNUDB direct-source preparation must have a blocking boundary");
+        let reducer_prefix = &execute[..blocking];
+        assert!(
+            !reducer_prefix.contains("expand_metadata_read_sources_limited")
+                && !reducer_prefix.contains("direct_source_kind(")
+                && !reducer_prefix.contains("prepare_gnudb_virtual_disc_toc_blocking"),
+            "GNUDB reducer must not reach authoritative/probing direct-source admission before spawn_blocking"
+        );
+        assert!(
+            execute[blocking..].contains("prepare_gnudb_virtual_disc_toc_blocking(&paths)"),
+            "GNUDB direct-source preparation must execute behind spawn_blocking"
+        );
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        assert_eq!(
+            production
+                .matches("prepare_gnudb_virtual_disc_toc_blocking(")
+                .count(),
+            2,
+            "blocking preparation must have exactly one production call site in addition to its definition"
+        );
+
+        let preparation = source
+            .split("fn prepare_gnudb_virtual_disc_toc_blocking")
+            .nth(1)
+            .expect("GNUDB blocking preparation helper")
+            .split("/// Execute a GNUDB lookup")
+            .next()
+            .expect("GNUDB blocking preparation body");
+        assert!(
+            preparation.contains("expand_metadata_read_sources_limited")
+                && preparation.contains("direct_source_kind(&path)")
+                && preparation.contains("read_optical_disc_track_durations_for_gnudb(&source)"),
+            "blocking preparation must retain authoritative admission and optical TOC probing"
+        );
+    }
+
+    fn write_synthetic_sacd_header(path: &std::path::Path) {
+        use std::io::{Seek, Write};
+
+        const SECTOR_SIZE: u64 = 2048;
+        const MASTER_TOC_LSN: u64 = 510;
+        let mut file = std::fs::File::create(path).expect("create synthetic SACD header");
+        file.set_len((MASTER_TOC_LSN + 1) * SECTOR_SIZE)
+            .expect("size synthetic SACD header");
+        file.seek(std::io::SeekFrom::Start(MASTER_TOC_LSN * SECTOR_SIZE))
+            .expect("seek synthetic SACD header");
+        file.write_all(b"SACDMTOC")
+            .expect("write synthetic SACD header");
+    }
+
+    #[test]
+    fn gnudb_blocking_direct_source_preparation_keeps_generic_iso_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let generic_iso = temp.path().join("generic.iso");
+        std::fs::write(&generic_iso, vec![0_u8; 4096]).expect("generic ISO fixture");
+
+        let error = prepare_gnudb_virtual_disc_toc_blocking(&[generic_iso])
+            .expect_err("generic ISO must remain outside direct-source admission");
+        assert_eq!(
+            error,
+            "GNUDB: selection contains no supported lookup sources"
+        );
+    }
+
+    #[test]
+    fn gnudb_blocking_direct_source_preparation_refuses_multiple_optical_images() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("disc-one.iso");
+        let second = temp.path().join("disc-two.iso");
+        write_synthetic_sacd_header(&first);
+        write_synthetic_sacd_header(&second);
+
+        let error = prepare_gnudb_virtual_disc_toc_blocking(&[first, second])
+            .expect_err("multiple admitted optical images must be refused before TOC parsing");
+        assert_eq!(error, "GNUDB: select one optical-disc image at a time");
     }
 
     #[tokio::test]
@@ -5312,7 +5398,7 @@ mod tests {
                     .status_message
                     .as_ref()
                     .map(|(message, _)| message.as_str()),
-                Some("No audio files for GNUDB lookup")
+                Some("GNUDB: selection contains no supported lookup sources")
             );
 
             let mut clipboard = AppState::new_for_test(TonepoetConfig::default());

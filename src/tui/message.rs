@@ -722,6 +722,12 @@ pub enum AppMessage {
         result: Box<Result<crate::tui::archive_listing::ArchiveListing, String>>,
         password: Option<String>,
     },
+    /// Result of the blocking optical-disc classifier/TOC read used to seed
+    /// a GNUDB lookup. The operation ID makes late completions total no-ops.
+    GnudbVirtualDiscTocComplete {
+        operation_id: TagsMbOperationId,
+        result: Result<(std::path::PathBuf, Vec<f64>, &'static str), String>,
+    },
     /// Result of an async GNUDB query.
     GnudbQueryComplete {
         operation_id: TagsMbOperationId,

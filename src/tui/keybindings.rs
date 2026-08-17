@@ -15559,17 +15559,28 @@ fn metadata_editor_commit_detail_edit(
             return false;
         }
 
-        let replacement_texts = metadata_editor_parse_semicolon_list(&text);
         let replacement = super::probe::MetadataFieldValues::from_stored_texts(
-            replacement_texts.iter().cloned(),
+            metadata_editor_parse_semicolon_list(&text),
         );
         let before = state.active_surface().entries.get(field_idx).cloned();
         let mut changed = false;
         if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
             for slot in targets.iter().copied() {
+                // The whole-row editor renders an ordered list as `; `-joined text,
+                // which is ambiguous with a single stored scalar containing the same
+                // delimiter. An exact reproduction of this slot's original display is
+                // therefore a restore operation, not a request to reinterpret it as a
+                // newly split list. Restore the original representation verbatim so
+                // equality, save-diffing, and source-cardinality provenance round-trip.
+                let desired = entry
+                    .per_file_originals
+                    .get(slot)
+                    .filter(|original| original.as_str() == text.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| replacement.clone());
                 if let Some(values) = entry.per_file_values.get_mut(slot) {
-                    if *values != replacement {
-                        values.replace_stored_texts(replacement_texts.iter().cloned());
+                    if *values != desired {
+                        *values = desired;
                         changed = true;
                     }
                 }
@@ -31314,6 +31325,65 @@ pub(crate) fn read_sacd_track_durations_for_gnudb(
         return Err("GNUDB: SACD area has zero tracks".to_string());
     }
     Ok(durations)
+}
+
+/// Read tags from an admitted optical-disc image without materializing audio.
+///
+/// Callers must run this on a blocking worker: classifier probes and the SACD/
+/// DVD-A readers can synchronously read disc structures. Keeping this adapter
+/// here prevents Browse context-menu reducers from acquiring disc-I/O helpers.
+pub(crate) fn read_optical_disc_tag_entries_for_copy(
+    source_path: &std::path::Path,
+) -> Result<Vec<super::probe::TagEntry>, String> {
+    if crate::convert::sacd::is_sacd_iso(source_path) {
+        read_sacd_tag_entries_for_copy(source_path)
+    } else if crate::disc::dvda_utils::is_dvda_iso(source_path) {
+        read_dvda_tag_entries_for_copy(source_path)
+    } else if crate::disc::dvdv_utils::is_dvdv_iso(source_path) {
+        Err(format!(
+            "Copy tags: tags for DVD-Video image '{}' require materialization",
+            source_path.display()
+        ))
+    } else if crate::disc::bluray_utils::is_bluray_iso(source_path) {
+        Err(format!(
+            "Copy tags: tags for Blu-ray image '{}' require materialization",
+            source_path.display()
+        ))
+    } else {
+        Err(format!(
+            "Copy tags: admitted disc image '{}' has no tag reader",
+            source_path.display()
+        ))
+    }
+}
+
+/// Build the virtual-CD TOC durations used by GNUDB for an admitted optical
+/// disc image. This performs synchronous disc probing and therefore must only
+/// be called from a blocking worker, never from an event-loop reducer.
+pub(crate) fn read_optical_disc_track_durations_for_gnudb(
+    source_path: &std::path::Path,
+) -> Result<(Vec<f64>, &'static str), String> {
+    if crate::convert::sacd::is_sacd_iso(source_path) {
+        read_sacd_track_durations_for_gnudb(source_path).map(|durations| (durations, "SACD"))
+    } else if crate::disc::dvda_utils::is_dvda_iso(source_path) {
+        read_dvda_track_durations_for_gnudb(source_path)
+            .map(|durations| (durations, "DVD-Audio"))
+    } else if crate::disc::dvdv_utils::is_dvdv_iso(source_path) {
+        Err(format!(
+            "GNUDB: DVD-Video image '{}' requires a materialized audio/TOC adapter",
+            source_path.display()
+        ))
+    } else if crate::disc::bluray_utils::is_bluray_iso(source_path) {
+        Err(format!(
+            "GNUDB: Blu-ray image '{}' requires a materialized audio/TOC adapter",
+            source_path.display()
+        ))
+    } else {
+        Err(format!(
+            "GNUDB: admitted disc image '{}' has no TOC adapter",
+            source_path.display()
+        ))
+    }
 }
 
 /// Cheaply test whether `path` is writable: succeeds if we can open
