@@ -6,7 +6,94 @@ hand to a reasoning-model brief without re-diagnosing.
 
 ---
 
-## 1. Confirmation dialog is fixed-height (9 rows) — long recovery prompts clip their text and buttons
+## 1. Single-image (taggable) FLAC + sidecar CUE: metadata SAVE rewrites the multi-GB image and embeds a CUESHEET instead of writing the sidecar only
+
+> **⚠ DO NOT brief or implement yet.** The root cause is diagnosed and verified, but the *handling* is
+> an open design question (see "Open design questions" below) — it touches the LODESTAR
+> metadata-source-selection area (regressed 6–7×) **and** raises whether the editor SAVE path should honor
+> `aggregate_metadata_target_priority` at all. **Prompt the user to discuss the approach afresh before
+> writing any brief.**
+
+**Discovered:** 2026-08-16, editing metadata at folder level on single-image vinyl rips
+(Led Zeppelin UK/JP discographies, `~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/`). Field cases
+kept: `UK/1969 - Led Zeppelin II (…Killing Floor Edition)/` (one 1.7 GB 24/192 FLAC + `Led Zeppelin II.cue`),
+`JP/1975 - Physical Graffiti (…P-6317 8N)/` (already operated on — its `LP1.flac`/`LP2.flac` now carry an
+embedded `CUESHEET`).
+
+**Symptom.** Editing/updating metadata on a **single-image FLAC album with a sidecar `.cue`** (one big
+`.flac` = whole album/side, N logical tracks defined by the sidecar) is extremely slow, and **embeds a
+`CUESHEET` tag into the FLAC**. The user expected the small sidecar `.cue` to be rewritten (instant) and the
+image left untouched. On 24/192 or 32/192 images the full-file rewrite "takes forever." Empirically
+confirmed: the JP FLACs the user operated on carry a `CUESHEET` **vorbis comment** holding tonepoet's
+*regenerated* sheet (`FILE "…LP1.flac" FLAC` — the sidecar says `WAVE` — plus the editor's per-track titles);
+the UK FLAC not operated on the same way has **no** `CUESHEET` comment.
+
+**Root cause — the editor SAVE path's sidecar-only fast path excludes single-image *taggable* albums.** Both
+symptoms (slow image rewrite + embedded CUESHEET) share one cause and are verified against source:
+
+- The metadata-editor SAVE is `metadata_editor_save` (`src/tui/keybindings.rs:11721`). It does **not** use the
+  `resolve_directory_metadata_groups`/`resolve_aggregate_metadata_target` machinery (that is the **Transfer
+  Tags** path). Its fast/slow fork is a single boolean, `sidecar_only`, from
+  `cue_sidecar_writeback_plan_for_state` (`:12118`, computed at **`:12315`**):
+  `sidecar_only = metadata_editor_dedicated_sidecar_authority(state) && (!metadata_sidecar_authority || required_audio_paths.is_empty())`.
+  For a single-image surface (`paths.len() == 1`) this reduces to `metadata_editor_dedicated_sidecar_authority(state)`.
+- `metadata_editor_dedicated_sidecar_authority` (`:11163`) = `native_multi_file_sidecar_authority || untaggable_sidecar_authority`:
+  - `native_multi_file_sidecar_authority` (`:11133`) is gated on **`surface.paths.len() > 1`** (`:11137`) — false for a single image.
+  - `untaggable_sidecar_authority` (`:11145`) requires **every** file to be `FileReadState::Unsupported` (`:11154`) — false for a taggable FLAC.
+  So for a single-image **taggable** FLAC, `dedicated_sidecar_authority = false` → `sidecar_only = false`.
+- With `sidecar_only == false`, the save takes the image-write branch: `apply_metadata_editor_tag_changes_…`
+  writes full per-file tags into the FLAC (`~:12035`/`:12038`), and `metadata_editor_forced_delete_items`
+  (`:11471`, which early-returns empty **only when** `dedicated_sidecar_authority` is true, `:11474`) lets the
+  synthetic `CUESHEET` row be written to the image via `lofty::tag::ItemKey::Unknown("CUESHEET")` (`:11481`).
+  Result: a multi-GB FLAC rewrite that also embeds the regenerated CUESHEET, then the sidecar writeback.
+- The surface itself is genuinely sidecar-authoritative: `build_unified_cue_album_sheet`'s single-image branch
+  (`:21627`) fires `requires_synthetic_surface` because `metadata_cue_surface_proves_image_content` (`:27497`,
+  one carrier owns >1 track) is true, so `cue_source = Sidecar(_)` and `cue_album_synthetic_sheet = Some(_)`.
+  The classification is right; only the save-time *authority predicate* is over-narrow.
+
+**Why the priority preference doesn't help.** The user's `aggregate_metadata_target_priority`
+(`[IndividualFiles, SidecarCue, EmbeddedCue]`) is **not consulted by the SAVE path at all** — verified: the
+only nearby priority reference is inside `metadata_editor_open_tag_transfer_picker` (`~:12969`, the Transfer
+Tags path). Save decides purely on the structural authority predicate above.
+
+**Why the user thought it was fixed (gap, not regression).** `git blame`: the `paths.len() > 1` gate was
+introduced by **`086ec65`** ("Round-13: multi-file cue-album authority (sidecar-only editing)"), deliberately
+scoped to *multi-file* cue albums. The single-image synthetic-surface branch was added later by **`51b7130`**
+(clipboard/untaggable-carrier work), whose save-time authority (`untaggable_sidecar_authority`) covers only the
+**untaggable-carrier** sub-case. The **taggable single-image + multi-track sidecar** sub-case was routed into the
+synthetic surface but never given a matching save-time sidecar-authority predicate. The multi-value Phase 1/2
+(`3ae33e5`/`f65d304`) and CUE-authority (`d520f67`) work did not touch this predicate.
+
+**Data.** No source-audio loss, but two undesired side effects: (a) slow full rewrite of large images on every
+save; (b) a `CUESHEET` tag is silently embedded into images that had none (already baked into the JP Physical
+Graffiti FLACs — reversible later with `metaflac --remove-tag=CUESHEET`, a separate cleanup, not done).
+
+**Fix direction (verified target; DO NOT act before the design discussion).** Make a single-image, **taggable**,
+sidecar-backed synthetic album qualify as a dedicated sidecar authority so `sidecar_only` becomes true and the
+FLAC is not rewritten: the predicate consumed at `:12315` should recognize `cue_album_synthetic_sheet.is_some()`
++ `cue_source == Sidecar(_)` + `metadata_cue_surface_proves_image_content`, **regardless of `paths.len()`** — the
+`paths.len() > 1` gate at `:11137` is the specific over-narrow condition. Preserve two carve-outs: (a) genuine
+per-file edits that are **not** CUE-representable must still be refused/warned (the `sidecar_unsupported` guard,
+`~:11891`) so real per-file tags aren't silently dropped; (b) `required_audio_paths` /
+`metadata_editor_audio_tag_changes_required_for_sidecar_writeback` (`:12322`) should still allow an image write
+when the user edited a field that only lives in the image, not the CUE. A test (`keybindings.rs:69860`,
+`single_image_sidecar_albumartist_edit_clear_and_delete_round_trip`) currently **codifies the wrong behavior**
+(expects image-write-then-sidecar; never asserts `plan.sidecar_only`) and must be re-pointed.
+
+**Open design questions (discuss with the user before briefing):**
+1. **Scope of the fix.** Just close the single-image-taggable gap (minimal, targeted), or the deeper question:
+   should the editor SAVE path honor `aggregate_metadata_target_priority` the way Transfer Tags does, so the
+   preference is uniformly binding across both paths? The latter is larger and lands squarely in the LODESTAR
+   area.
+2. **Should embedding a CUESHEET into a taggable image ever be default behavior?** Today it happens as a side
+   effect of the slow path; under the fix it would stop for single-image sidecar albums — confirm that is the
+   desired outcome (vs. an opt-in "also embed CUESHEET" mode).
+3. **Cleanup of already-embedded CUESHEETs** (the JP FLACs) — separate task; decide whether tonepoet should
+   offer to strip them or leave manual.
+
+---
+
+## 2. Confirmation dialog is fixed-height (9 rows) — long recovery prompts clip their text and buttons
 
 **Discovered:** 2026-08-09, on a startup archive-recovery prompt in a second tonepoet instance.
 
@@ -47,7 +134,7 @@ recovery; the second instance also had a pending archive session waiting.
 
 ---
 
-## 2. `current_exe()`-deleted → cryptic ENOENT when a file op runs from a pre-rebuild TUI
+## 3. `current_exe()`-deleted → cryptic ENOENT when a file op runs from a pre-rebuild TUI
 
 **Discovered:** 2026-08-09, on a Ctrl+X (cut/move) in a stale tonepoet instance.
 
@@ -106,7 +193,7 @@ was rebuilt underneath it; relaunch tonepoet after any rebuild.
 
 ---
 
-## 3. Metadata stage `tool timed out after 30s` on a large multi-track conversion
+## 4. Metadata stage `tool timed out after 30s` on a large multi-track conversion
 
 **Discovered:** 2026-08-12, on a Donna Summer conversion. Likely explains an earlier failure of a
 7-LP Allman Brothers box-set conversion (a few weeks prior) — same class (large, many-track, heavy
@@ -155,7 +242,7 @@ the exact conversion) to name the precise tool + args.
 
 ---
 
-## 4. DSD-to-PCM auto-gain inflates DC-bias readings and flips `negligible`→`significant` — the DC threshold is absolute (level-dependent), not a conversion defect
+## 5. DSD-to-PCM auto-gain inflates DC-bias readings and flips `negligible`→`significant` — the DC threshold is absolute (level-dependent), not a conversion defect
 
 **Discovered:** 2026-08-13, converting Charles Mingus *Blues & Roots* SACD → FLAC (SoX rate `-u`, DSD64→176.4k, DSD→32-bit int, DSD gain **auto**, margin 0.15 dB).
 
@@ -173,7 +260,7 @@ the exact conversion) to name the precise tool + args.
 
 ---
 
-## 5. Cross-process DB init lock can time out during a schema migration under heavy concurrent load (self-recovering, no corruption)
+## 6. Cross-process DB init lock can time out during a schema migration under heavy concurrent load (self-recovering, no corruption)
 
 **Discovered:** 2026-08-13, during the adversarial audit of the multi-value Phase-1 cross-session DB-open hardening (`src/db.rs`, committed on `hardening` @ `3ae33e5`). Not observed in the field — a code-review finding on the new lock path, filed for completeness.
 
@@ -221,10 +308,10 @@ migrating process polls, never finds a gap, and times out at 30 s.
 
 ---
 
-## 6. File-task startup recovery auto-replays every pending operation with no prompt and no supersession
+## 7. File-task startup recovery auto-replays every pending operation with no prompt and no supersession
 
 **Discovered:** 2026-08-13, restarting tonepoet after the several Ctrl+X cut/copy operations that
-had failed with the `current_exe()`-deleted helper-spawn error (issue #2). On relaunch, **all** of
+had failed with the `current_exe()`-deleted helper-spawn error (issue #3). On relaunch, **all** of
 those failed operations were automatically re-queued and began replaying without the user being asked.
 
 **Symptom (field report).** After restart, the file-task recovery re-triggered every copy/cut that
@@ -243,7 +330,7 @@ at `app.rs:12383`–`12400` then pushes **each** recovery into `file_transfers.q
 `recovered: true`, which the serial transfer dispatcher processes **automatically**. There is:
 - **No confirmation prompt.** The enqueue happens directly during state construction — no dialog,
   just a status line. (Contrast: the *archive* staged-edits recovery **does** prompt — the 4-button
-  `ARCHIVE_STARTUP_RECOVERY` dialog, see issue #1. File-task recovery has no equivalent.)
+  `ARCHIVE_STARTUP_RECOVERY` dialog, see issue #2. File-task recovery has no equivalent.)
 - **No supersession / dedup.** Every pending journal is enqueued independently; nothing collapses two
   journals for the same source→destination, or drops an operation a later one logically superseded.
   Note the code *does* single out `recoveries.last()` (the newest) as the clipboard/retry surface
@@ -257,10 +344,10 @@ chance to veto before the filesystem work begins.
 
 **Fix direction.**
 1. **Prompt, don't auto-execute.** Gate file-task startup recovery behind a confirmation surface
-   (mirroring the archive-recovery prompt, issue #1) that **lists exactly which operations are teed
+   (mirroring the archive-recovery prompt, issue #2) that **lists exactly which operations are teed
    up for replay** — source → destination and kind (copy/cut) per item — and lets the user replay
    all, replay a selected subset, or discard. Do not enqueue into the serial dispatcher until the
-   user chooses. (Design note: the fixed-height confirmation dialog in issue #1 would need the
+   user chooses. (Design note: the fixed-height confirmation dialog in issue #2 would need the
    size-to-content fix to list many operations.)
 2. **Supersession / dedup before enqueue.** Collapse or drop journals that are logically superseded —
    e.g., multiple journals for the same source+destination pair, or an operation a later journal
@@ -280,7 +367,7 @@ chance to veto before the filesystem work begins.
 
 ---
 
-## 7. Containerless / untaggable outputs (raw PCM, DFF, W64, raw AAC) handle metadata THREE inconsistent ways — need a unified policy
+## 8. Containerless / untaggable outputs (raw PCM, DFF, W64, raw AAC) handle metadata THREE inconsistent ways — need a unified policy
 
 **Raised:** 2026-08-14 (reasoning-model observations during Phase-4 pipeline work — raw PCM, then DFF).
 
@@ -308,7 +395,7 @@ The key is a **single, predictable rule** across the family instead of today's g
 
 ---
 
-## 8. Multi-cue folder chooser offers a structurally-unmaterializable CUE as an equal "viable" option; materialize then dead-ends with an opaque error
+## 9. Multi-cue folder chooser offers a structurally-unmaterializable CUE as an equal "viable" option; materialize then dead-ends with an opaque error
 
 **Discovered:** 2026-08-16, materializing a folder-selected album. Field case (kept for reproduction):
 `~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/JP/1975 - Physical Graffiti (Japan 1st Press Swan Song Records P-6317 8N)/`.
@@ -371,3 +458,4 @@ valid alternatives.
    per-disc cues — use those?") instead of dead-ending on the error.
 4. **Avoid** full probe-at-selection boundary validation for every candidate — expensive, and it lives
    in the LODESTAR/cue-authority selection area that has regressed repeatedly (high blast radius).
+
