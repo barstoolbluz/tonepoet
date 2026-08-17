@@ -293,6 +293,15 @@ pub enum ContextAction {
     /// MetadataEditor detail overlay: field-level revert toggle
     /// (operates on per_file_values).
     MetadataDetailToggleRevert,
+    /// MetadataEditor detail overlay: copy/paste the selected field's
+    /// structured per-track values across editor sessions/folders.
+    MetadataDetailCopyField,
+    MetadataDetailPasteField,
+    /// MetadataEditor detail overlay: transfer only the selected field through
+    /// the existing carrier picker machinery.
+    MetadataDetailTransferTags {
+        direction: TagTransferDirection,
+    },
     /// MetadataEditor detail overlay: snap per_file_values back to the
     /// as-retrieved MB proposal.
     MetadataDetailRestore,
@@ -1877,11 +1886,13 @@ fn launch_tag_clipboard_copy(
             // Preserve metadata-expansion semantics while adding both a hard
             // traversal bound and cooperative cancellation. No stale request
             // may continue recursively reading an arbitrarily large tree.
-            let source_paths = match super::command::expand_audio_paths_for_metadata_limited(
+            let source_paths = match super::command::expand_metadata_read_sources_limited(
                 &roots,
                 TAG_CLIPBOARD_COPY_MAX_VISITED,
                 TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
                 || worker_cancel.load(Ordering::Acquire),
+                "Copy tags",
+                "Copy tags superseded by a newer request",
             ) {
                 Ok(paths) => paths,
                 Err(reason) => return (Vec::new(), Err(reason)),
@@ -1896,42 +1907,15 @@ fn launch_tag_clipboard_copy(
             if source_paths.is_empty() {
                 return (
                     source_paths,
-                    Err("Copy tags: selection contains no audio files".to_string()),
+                    Err("Copy tags: selection contains no supported metadata sources".to_string()),
                 );
             }
 
-            let result = super::probe::read_all_tags_merged_with_metadata_cancellable(
+            let result = read_copy_tag_entries_from_admitted_sources(
                 &source_paths,
+                selection,
                 || worker_cancel.load(Ordering::Acquire),
-            )
-            .and_then(|merged| {
-                let failure_count = merged
-                    .metadata_errors
-                    .iter()
-                    .filter(|issue| {
-                        issue
-                            .as_ref()
-                            .is_some_and(super::probe::MetadataReadIssue::blocks_metadata_use)
-                    })
-                    .count();
-                if failure_count == source_paths.len() {
-                    let detail = merged
-                        .metadata_errors
-                        .iter()
-                        .flatten()
-                        .find(|issue| issue.blocks_metadata_use())
-                        .map(|issue| issue.reason.as_str())
-                        .unwrap_or("all selected files failed metadata reading");
-                    return Err(format!("Copy tags failed: {detail}"));
-                }
-                let entries = merged
-                    .entries
-                    .iter()
-                    .filter(|entry| tag_entry_matches_copy_selection(entry, selection))
-                    .cloned()
-                    .collect();
-                Ok((entries, failure_count))
-            });
+            );
             (source_paths, result)
         })
         .await;
@@ -1951,6 +1935,231 @@ fn launch_tag_clipboard_copy(
             })
             .await;
     });
+}
+
+fn read_copy_tag_entries_from_admitted_sources<F>(
+    source_paths: &[PathBuf],
+    selection: TagCopySelection,
+    cancelled: F,
+) -> Result<(Vec<crate::tui::probe::TagEntry>, usize), String>
+where
+    F: Fn() -> bool,
+{
+    use crate::convert::source_admission::{direct_source_kind, DirectSourceKind};
+
+    let classified = source_paths
+        .iter()
+        .map(|path| (path, direct_source_kind(path)))
+        .collect::<Vec<_>>();
+    let has_audio = classified
+        .iter()
+        .any(|(_, kind)| matches!(kind, Some(DirectSourceKind::Audio)));
+    let has_disc_image = classified
+        .iter()
+        .any(|(_, kind)| matches!(kind, Some(DirectSourceKind::DiscImage)));
+    if has_audio && has_disc_image {
+        return Err(
+            "Copy tags: selection mixes loose audio with an optical-disc image; select one carrier set"
+                .to_string(),
+        );
+    }
+
+    let mut audio_paths = Vec::new();
+    let mut groups: Vec<(usize, Vec<crate::tui::probe::TagEntry>)> = Vec::new();
+    for (path, kind) in classified {
+        if cancelled() {
+            return Err("Copy tags superseded by a newer request".to_string());
+        }
+        match kind {
+            Some(DirectSourceKind::Audio) => audio_paths.push(path.to_path_buf()),
+            Some(DirectSourceKind::Cue) => {
+                // Preserve loose-audio precedence only when the CUE is truly
+                // metadata for already-split files. A synthetic split CUE is
+                // the per-track authority even when its backing image is also
+                // discovered by folder traversal, so silently ignoring it
+                // would collapse logical tracks to physical files.
+                if has_audio {
+                    if let Ok(member) =
+                        crate::convert::split_cue_album::admit_split_cue_member(path)
+                    {
+                        if member.contributes_synthetic_album_part() {
+                            return Err(format!(
+                                "Copy tags: tags for CUE source '{}' require materialization",
+                                path.display()
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                return Err(format!(
+                    "Copy tags: tags for CUE source '{}' require materialization",
+                    path.display()
+                ));
+            }
+            Some(DirectSourceKind::ArchivePreview) => {
+                // Likewise, an archive sitting beside loose audio must not turn
+                // a formerly valid album-folder copy into an error. The loose
+                // files are the concrete metadata authority in this mixed set.
+                if has_audio {
+                    continue;
+                }
+                return Err(format!(
+                    "Copy tags: tags for archive '{}' require materialization",
+                    path.display()
+                ));
+            }
+            Some(DirectSourceKind::DiscImage) => {
+                let entries = if crate::convert::sacd::is_sacd_iso(path) {
+                    super::keybindings::read_sacd_tag_entries_for_copy(path)?
+                } else if crate::disc::dvda_utils::is_dvda_iso(path) {
+                    super::keybindings::read_dvda_tag_entries_for_copy(path)?
+                } else if crate::disc::dvdv_utils::is_dvdv_iso(path) {
+                    return Err(format!(
+                        "Copy tags: tags for DVD-Video image '{}' require materialization",
+                        path.display()
+                    ));
+                } else if crate::disc::bluray_utils::is_bluray_iso(path) {
+                    return Err(format!(
+                        "Copy tags: tags for Blu-ray image '{}' require materialization",
+                        path.display()
+                    ));
+                } else {
+                    return Err(format!(
+                        "Copy tags: admitted disc image '{}' has no tag reader",
+                        path.display()
+                    ));
+                };
+                let count = entries
+                    .iter()
+                    .map(|entry| entry.per_file_values.len())
+                    .max()
+                    .unwrap_or(0);
+                let selected = entries
+                    .into_iter()
+                    .filter(|entry| tag_entry_matches_copy_selection(entry, selection))
+                    .collect::<Vec<_>>();
+                groups.push((count, selected));
+            }
+            None => {
+                return Err(format!(
+                    "Copy tags: '{}' is no longer admitted as a metadata source",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let mut failure_count = 0usize;
+    if !audio_paths.is_empty() {
+        let merged = super::probe::read_all_tags_merged_with_metadata_cancellable(
+            &audio_paths,
+            &cancelled,
+        )?;
+        failure_count = merged
+            .metadata_errors
+            .iter()
+            .filter(|issue| {
+                issue
+                    .as_ref()
+                    .is_some_and(super::probe::MetadataReadIssue::blocks_metadata_use)
+            })
+            .count();
+        if failure_count == audio_paths.len() {
+            let detail = merged
+                .metadata_errors
+                .iter()
+                .flatten()
+                .find(|issue| issue.blocks_metadata_use())
+                .map(|issue| issue.reason.as_str())
+                .unwrap_or("all selected files failed metadata reading");
+            return Err(format!("Copy tags failed: {detail}"));
+        }
+        groups.push((
+            audio_paths.len(),
+            merged
+                .entries
+                .into_iter()
+                .filter(|entry| tag_entry_matches_copy_selection(entry, selection))
+                .collect(),
+        ));
+    }
+
+    Ok((merge_copy_tag_entry_groups(groups), failure_count))
+}
+
+fn merge_copy_tag_entry_groups(
+    groups: Vec<(usize, Vec<crate::tui::probe::TagEntry>)>,
+) -> Vec<crate::tui::probe::TagEntry> {
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut total_positions = 0usize;
+    let mut merged: BTreeMap<String, (crate::tui::probe::TagEntry, Vec<crate::tui::probe::MetadataFieldValues>)> =
+        BTreeMap::new();
+    for (position_count, entries) in groups {
+        let by_key = entries
+            .into_iter()
+            .map(|entry| (entry.display_key.clone(), entry))
+            .collect::<HashMap<_, _>>();
+
+        for (key, (template, values)) in &mut merged {
+            if let Some(entry) = by_key.get(key) {
+                values.extend((0..position_count).map(|slot| {
+                    entry
+                        .per_file_values
+                        .get(slot)
+                        .cloned()
+                        .unwrap_or_default()
+                }));
+            } else {
+                values.extend((0..position_count).map(|_| Default::default()));
+            }
+            let _ = template;
+        }
+
+        for (key, entry) in by_key {
+            if merged.contains_key(&key) {
+                continue;
+            }
+            let mut values = (0..total_positions)
+                .map(|_| Default::default())
+                .collect::<Vec<crate::tui::probe::MetadataFieldValues>>();
+            values.extend((0..position_count).map(|slot| {
+                entry
+                    .per_file_values
+                    .get(slot)
+                    .cloned()
+                    .unwrap_or_default()
+            }));
+            merged.insert(key, (entry, values));
+        }
+        total_positions = total_positions.saturating_add(position_count);
+    }
+
+    let mut entries = merged
+        .into_values()
+        .map(|(mut entry, values)| {
+            let all_same = values.windows(2).all(|pair| pair[0] == pair[1]);
+            let display = if all_same {
+                values
+                    .first()
+                    .map(crate::tui::probe::MetadataFieldValues::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                "<multiple values>".to_string()
+            };
+            entry.value = display.clone();
+            entry.original = display;
+            entry.is_mixed = !all_same;
+            entry.has_multiple_stored_values = values.iter().any(|value| value.value_count() > 1);
+            entry.per_file_stored_value_counts = values.iter().map(|value| value.value_count()).collect();
+            entry.per_file_values = values.clone();
+            entry.per_file_originals = values;
+            entry
+        })
+        .collect::<Vec<_>>();
+    crate::tui::probe::sort_entries_standard_first_existing_only(&mut entries);
+    entries
 }
 
 pub(crate) fn handle_tag_clipboard_copy_complete(
@@ -3452,6 +3661,59 @@ pub fn execute_context_action(
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
             }
         }
+        ContextAction::MetadataDetailCopyField => {
+            if let Some(state) = app.pending_metadata_editor.take() {
+                match super::keybindings::metadata_editor_copy_detail_field(app, &state) {
+                    Ok(count) => app.set_status(format!(
+                        "metadata editor: copied this field across {} track{}",
+                        count,
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    Err(reason) => app.set_status(reason),
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDetailPasteField => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                match super::keybindings::metadata_editor_paste_detail_field(app, &mut state) {
+                    Ok(report) if report.changed_slots == 0 => app.set_status(
+                        "metadata editor: field clipboard already matches this field",
+                    ),
+                    Ok(report) => {
+                        let mut status = format!(
+                            "metadata editor: pasted this field into {} track{}; review before save",
+                            report.changed_slots,
+                            if report.changed_slots == 1 { "" } else { "s" }
+                        );
+                        if report.collapsed_stored_values {
+                            status.push_str(
+                                "; warning: one or more stored multi-value lists were reduced",
+                            );
+                        }
+                        app.set_status(status);
+                    }
+                    Err(reason) => app.set_status(reason),
+                }
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataDetailTransferTags { direction } => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: detail menu lost its editor session");
+                return;
+            };
+            super::keybindings::metadata_editor_open_field_tag_transfer_picker(
+                app,
+                &mut state,
+                direction,
+            );
+            app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            app.set_status(match direction {
+                TagTransferDirection::From => "metadata editor: choose a source for this field",
+                TagTransferDirection::To => "metadata editor: choose a target for this field",
+            });
+        }
         ContextAction::MetadataDetailRestore => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
                 let idx = state.detail_field_idx;
@@ -3844,6 +4106,20 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
     }
     // Collect audio file paths, group by disc, query GNUDB.
     let paths = super::command::collect_selection_for_file_ops(app);
+    let admitted_sources = match super::command::expand_metadata_read_sources_limited(
+        &paths,
+        TAG_CLIPBOARD_COPY_MAX_VISITED,
+        TAG_CLIPBOARD_COPY_MAX_AUDIO_FILES,
+        || false,
+        "GNUDB",
+        "GNUDB source discovery cancelled",
+    ) {
+        Ok(sources) => sources,
+        Err(error) => {
+            app.set_status(error);
+            return;
+        }
+    };
     let mut audio_paths: Vec<std::path::PathBuf> =
         crate::convert::queue_expansion::expand_paths_to_all_audio(&paths)
             .into_iter()
@@ -3887,7 +4163,74 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         return;
     }
     if cue_infos.is_empty() && multi_file_cue_layouts.is_empty() && audio_paths.is_empty() {
-        app.set_status("No audio files for GNUDB lookup");
+        let disc_images = admitted_sources
+            .iter()
+            .filter(|path| {
+                matches!(
+                    crate::convert::source_admission::direct_source_kind(path),
+                    Some(crate::convert::source_admission::DirectSourceKind::DiscImage)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if disc_images.len() == 1 {
+            let source = &disc_images[0];
+            let virtual_disc = if crate::convert::sacd::is_sacd_iso(source) {
+                super::keybindings::read_sacd_track_durations_for_gnudb(source)
+                    .map(|durations| (durations, "SACD"))
+            } else if crate::disc::dvda_utils::is_dvda_iso(source) {
+                super::keybindings::read_dvda_track_durations_for_gnudb(source)
+                    .map(|durations| (durations, "DVD-Audio"))
+            } else if crate::disc::dvdv_utils::is_dvdv_iso(source) {
+                Err(format!(
+                    "GNUDB: DVD-Video image '{}' requires a materialized audio/TOC adapter",
+                    source.display()
+                ))
+            } else if crate::disc::bluray_utils::is_bluray_iso(source) {
+                Err(format!(
+                    "GNUDB: Blu-ray image '{}' requires a materialized audio/TOC adapter",
+                    source.display()
+                ))
+            } else {
+                Err(format!(
+                    "GNUDB: admitted disc image '{}' has no TOC adapter",
+                    source.display()
+                ))
+            };
+            match virtual_disc {
+                Ok((durations, label)) => {
+                    launch_virtual_disc_gnudb(app, tx, source.clone(), durations, label);
+                }
+                Err(error) => app.set_status(error),
+            }
+            return;
+        }
+        if disc_images.len() > 1 {
+            app.set_status("GNUDB: select one optical-disc image at a time");
+            return;
+        }
+        if let Some(path) = admitted_sources.iter().find(|path| {
+            matches!(
+                crate::convert::source_admission::direct_source_kind(path),
+                Some(crate::convert::source_admission::DirectSourceKind::ArchivePreview)
+            )
+        }) {
+            app.set_status(format!(
+                "GNUDB: archive '{}' requires materialization before TOC lookup",
+                path.display()
+            ));
+            return;
+        }
+        if admitted_sources.iter().any(|path| {
+            matches!(
+                crate::convert::source_admission::direct_source_kind(path),
+                Some(crate::convert::source_admission::DirectSourceKind::Cue)
+            )
+        }) {
+            app.set_status("GNUDB: selected CUE did not yield a usable audio/TOC layout");
+            return;
+        }
+        app.set_status("GNUDB: selection contains no supported lookup sources");
         return;
     }
     let operation_id = match super::event_loop::begin_gnudb_operation(app) {
@@ -4054,6 +4397,36 @@ pub(super) fn execute_gnudb_query(app: &mut AppState, tx: &mpsc::Sender<AppMessa
             }
         });
     }
+}
+
+fn launch_virtual_disc_gnudb(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    source: PathBuf,
+    durations: Vec<f64>,
+    label: &'static str,
+) {
+    let operation_id = match super::event_loop::begin_gnudb_operation(app) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            app.set_status(error);
+            return;
+        }
+    };
+    let disc_id = super::gnudb::compute_disc_id(&durations);
+    let paths_for_editor = vec![source; durations.len()];
+    app.set_status(format!(
+        "Querying gnudb.org ({label} virtual TOC, disc ID: {})...",
+        disc_id.disc_id
+    ));
+    super::event_loop::spawn_gnudb_worker(tx.clone(), operation_id, async move {
+        let result = super::gnudb::query_gnudb(&disc_id).await;
+        super::message::AppMessage::GnudbQueryComplete {
+            operation_id,
+            result,
+            paths: paths_for_editor,
+        }
+    });
 }
 
 /// Launch a GNUDB query for a single-image CUE album.
@@ -4268,6 +4641,76 @@ mod tests {
             } => (generation, request, expansion),
             other => panic!("expected BrowseConvertExpansionComplete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn copy_tags_folder_refuses_synthetic_cue_even_with_backing_audio() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let audio = album.join("album.flac");
+        let cue = album.join("album.cue");
+        std::fs::write(&audio, b"fixture").expect("backing audio");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 01:00:00\n",
+            ),
+        )
+        .expect("synthetic cue");
+
+        let admitted = crate::tui::command::expand_metadata_read_sources_limited(
+            std::slice::from_ref(&album),
+            32,
+            32,
+            || false,
+            "Copy tags",
+            "cancelled",
+        )
+        .expect("folder metadata sources");
+        assert!(admitted.contains(&cue));
+        assert!(admitted.contains(&audio));
+
+        let error = read_copy_tag_entries_from_admitted_sources(
+            &admitted,
+            TagCopySelection::All,
+            || false,
+        )
+        .expect_err("synthetic CUE must not collapse to its backing image");
+        assert!(
+            error.contains("require materialization") && error.contains("album.cue"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn copy_tags_cue_role_keeps_one_track_per_file_as_metadata_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&first, b"fixture").expect("first audio");
+        std::fs::write(&second, b"fixture").expect("second audio");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"01.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "FILE \"02.flac\" WAVE\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("metadata-sidecar cue");
+
+        let member = crate::convert::split_cue_album::admit_split_cue_member(&cue)
+            .expect("one-track-per-file CUE should be admitted");
+        assert!(
+            !member.contributes_synthetic_album_part(),
+            "one-track-per-file CUE must remain a metadata sidecar"
+        );
+        assert_eq!(member.referenced_audio, vec![first, second]);
     }
 
     #[test]
@@ -5894,6 +6337,82 @@ mod tests {
             .unwrap_or("");
         assert!(status.contains("MusicBrainz values applied to ARTIST"));
         assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn metadata_detail_edit_refuses_deleted_row_until_restored() {
+        let values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        let performer = crate::tui::probe::TagEntry {
+            row_scope: crate::tui::probe::RowScope::File,
+            display_key: "PERFORMER".to_string(),
+            item_key: lofty::tag::ItemKey::Performer,
+            value: "<multiple values>".to_string(),
+            original: "<multiple values>".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: true,
+            per_file_stored_value_counts: vec![2, 2],
+            per_file_values: values.clone(),
+            per_file_originals: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        };
+        let mut state = MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/a.flac"),
+                std::path::PathBuf::from("/tmp/b.flac"),
+            ],
+            vec![performer],
+            vec!["a.flac".to_string(), "b.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.cursor = 0;
+        state.active_surface_mut().deleted.push(0);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+
+        execute_context_action(
+            &mut app,
+            ContextAction::MetadataEditValuesPerFile,
+            &tx,
+            false,
+        );
+
+        let mut parked = app
+            .pending_metadata_editor
+            .take()
+            .expect("detail edit refusal must retain the parked editor");
+        assert_eq!(parked.phase, crate::tui::app::MetadataEditorPhase::Editing);
+        assert!(parked.detail_edit.is_none());
+        assert!(parked.active_surface().deleted.contains(&0));
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(status, _)| status.contains("restore field before editing")));
+
+        parked.active_surface_mut().deleted.clear();
+        app.pending_metadata_editor = Some(parked);
+        execute_context_action(
+            &mut app,
+            ContextAction::MetadataEditValuesPerFile,
+            &tx,
+            false,
+        );
+
+        let parked = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("restored row must remain parked after opening detail view");
+        assert_eq!(
+            parked.phase,
+            crate::tui::app::MetadataEditorPhase::DetailEdit
+        );
+        assert_eq!(parked.detail_field_idx, 0);
     }
 
     #[test]

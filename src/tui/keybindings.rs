@@ -3764,6 +3764,7 @@ pub(crate) fn handle_host_clipboard_read_complete(
         }
     };
 
+    let mut success_status: Option<String> = None;
     let applied = match target {
         super::message::HostClipboardPasteTarget::BrowseInlineEdit { target } => app
             .browse_inline_edit
@@ -3796,7 +3797,7 @@ pub(crate) fn handle_host_clipboard_read_complete(
                 state
                     .edit_input
                     .as_mut()
-                    .map(|input| input.insert_string(&text))
+                    .map(|input| input.insert_string(single_line_clipboard_text(&text)))
                     .is_some()
             }
             _ => false,
@@ -3815,8 +3816,34 @@ pub(crate) fn handle_host_clipboard_read_complete(
                 state
                     .detail_edit
                     .as_mut()
-                    .map(|input| input.insert_string(&text))
+                    .map(|input| input.insert_string(single_line_clipboard_text(&text)))
                     .is_some()
+            }
+            _ => false,
+        },
+        super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+            session_id,
+            field_index,
+        } => match &mut app.active_overlay {
+            ActiveOverlay::MetadataEditor(state)
+                if state.active_surface().technical_details.session_id == session_id
+                    && state.phase == MetadataEditorPhase::DetailEdit
+                    && state.detail_field_idx == field_index
+                    && state.detail_edit.is_none() =>
+            {
+                let changed =
+                    metadata_editor_apply_detail_whole_field_text(state, field_index, &text);
+                if changed > 0 {
+                    success_status = Some(format!(
+                        "Pasted clipboard lines into {changed} track{}; review in the detail view before saving",
+                        if changed == 1 { "" } else { "s" }
+                    ));
+                } else {
+                    success_status = Some(
+                        "Clipboard paste made no changes to this field".to_string(),
+                    );
+                }
+                true
             }
             _ => false,
         },
@@ -3847,7 +3874,7 @@ pub(crate) fn handle_host_clipboard_read_complete(
     };
 
     if applied {
-        app.set_status("Pasted from host clipboard");
+        app.set_status(success_status.unwrap_or_else(|| "Pasted from host clipboard".to_string()));
     } else {
         app.set_status("Host clipboard result ignored because the editor changed");
     }
@@ -10979,11 +11006,10 @@ pub(super) fn metadata_editor_begin_cursor_value_edit(
         return Some("metadata editor: cannot edit binary field".to_string());
     }
 
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
     let is_mixed = entry.is_mixed;
     let slot_count = entry.per_file_values.len();
-    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
-    let value = entry.value.clone();
-    if set_valued || (is_mixed && slot_count > 1) {
+    if !set_valued && is_mixed && slot_count > 1 {
         return metadata_editor_begin_detail_edit_for_entry(state, cursor, false);
     }
 
@@ -10993,7 +11019,7 @@ pub(super) fn metadata_editor_begin_cursor_value_edit(
             .unwrap_or_else(|| "no writable file slots".to_string());
         return Some(format!("metadata editor: cannot edit blocked field — {reason}"));
     }
-    if blocked > 0 {
+    if blocked > 0 && !set_valued {
         if let Some(status) = metadata_editor_begin_detail_edit_for_entry(state, cursor, true) {
             return Some(status);
         }
@@ -11006,6 +11032,23 @@ pub(super) fn metadata_editor_begin_cursor_value_edit(
         ));
     }
 
+    // A mixed set-valued row must never seed the literal "<multiple values>"
+    // placeholder into the bulk editor. Seed from the first writable slot so
+    // opening is non-destructive and commit remains the only write point.
+    let value = if set_valued && is_mixed {
+        metadata_editor_first_writable_slot(state, cursor, slot_count)
+            .and_then(|slot| {
+                state
+                    .active_surface()
+                    .entries
+                    .get(cursor)
+                    .and_then(|entry| entry.per_file_values.get(slot))
+            })
+            .map(|values| values.as_str().to_string())
+            .unwrap_or_default()
+    } else {
+        entry.value.clone()
+    };
     state.edit_input = Some(if select_existing_value {
         super::text_input::TextInputState::new_selected(value)
     } else {
@@ -12930,6 +12973,35 @@ pub(crate) fn metadata_editor_open_tag_transfer_picker(
     direction: super::app::TagTransferDirection,
     scope: super::app::TagTransferScope,
 ) {
+    metadata_editor_open_tag_transfer_picker_scoped(app, state, direction, scope, None);
+}
+
+pub(crate) fn metadata_editor_open_field_tag_transfer_picker(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    direction: super::app::TagTransferDirection,
+) {
+    let field_key = state
+        .active_surface()
+        .entries
+        .get(state.detail_field_idx)
+        .map(|entry| entry.display_key.clone());
+    metadata_editor_open_tag_transfer_picker_scoped(
+        app,
+        state,
+        direction,
+        super::app::TagTransferScope::All,
+        field_key,
+    );
+}
+
+fn metadata_editor_open_tag_transfer_picker_scoped(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    direction: super::app::TagTransferDirection,
+    scope: super::app::TagTransferScope,
+    field_key: Option<String>,
+) {
     let start_dir = state
         .active_surface()
         .paths
@@ -12965,6 +13037,7 @@ pub(crate) fn metadata_editor_open_tag_transfer_picker(
         super::app::FilePickerPurpose::MetadataTagTransfer {
             direction,
             scope,
+            field_key,
             metadata_target_priority:
                 crate::config::normalized_aggregate_metadata_target_priority(
                     &app.config.conversion.aggregate_metadata_target_priority,
@@ -14879,26 +14952,46 @@ fn metadata_editor_commit_inline_edit(
         return false;
     };
     let new_value = input.text;
+    let set_valued = state
+        .active_surface()
+        .entries
+        .get(state.cursor)
+        .map(|entry| super::probe::metadata_field_is_set_valued(&entry.display_key))
+        .unwrap_or(false);
+    let parsed_list = set_valued.then(|| metadata_editor_parse_semicolon_list(&new_value));
+    let parsed_values = parsed_list
+        .as_ref()
+        .map(|values| super::probe::MetadataFieldValues::from_stored_texts(values.iter().cloned()));
     let collapse_warning = state
         .active_surface()
         .entries
         .get(state.cursor)
         .and_then(|entry| {
-            let collapsed_slots = entry.stored_value_collapse_slots(
-                entry
-                    .per_file_values
-                    .iter()
-                    .enumerate()
-                    .filter(|(slot, _)| {
-                        metadata_editor_entry_slot_edit_block_reason(
-                            state,
-                            state.cursor,
-                            *slot,
-                        )
+            let writable_slots = entry
+                .per_file_values
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| {
+                    metadata_editor_entry_slot_edit_block_reason(state, state.cursor, *slot)
                         .is_none()
-                    })
-                    .map(|(slot, _)| (slot, new_value.as_str())),
-            );
+                })
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>();
+            let collapsed_slots = if let Some(replacement) = parsed_values.as_ref() {
+                entry.stored_list_collapse_slots(
+                    writable_slots
+                        .iter()
+                        .copied()
+                        .map(|slot| (slot, replacement)),
+                )
+            } else {
+                entry.stored_value_collapse_slots(
+                    writable_slots
+                        .iter()
+                        .copied()
+                        .map(|slot| (slot, new_value.as_str())),
+                )
+            };
             (!collapsed_slots.is_empty()).then(|| entry.display_key.clone())
         });
     let updated = if state.cursor < state.active_surface().entries.len() {
@@ -14914,14 +15007,300 @@ fn metadata_editor_commit_inline_edit(
         app.set_status("metadata editor: edit ignored — no writable file slots for this field");
     } else if updated > 0 {
         if let Some(key) = collapse_warning {
-            app.set_status(format!(
-                "metadata editor: editing {key} collapsed multiple stored values into one value"
-            ));
+            if set_valued {
+                app.set_status(format!(
+                    "metadata editor: editing {key} reduced the stored multi-value list for one or more files"
+                ));
+            } else {
+                app.set_status(format!(
+                    "metadata editor: editing {key} collapsed multiple stored values into one value"
+                ));
+            }
         }
     }
     state.phase = super::app::MetadataEditorPhase::Editing;
     recalc_dirty(state);
     updated > 0
+}
+
+fn metadata_editor_parse_semicolon_list(text: &str) -> Vec<String> {
+    text.split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn metadata_field_key_is_known(key: &str) -> bool {
+    let canonical = super::probe::canonical_metadata_display_key(key);
+    !matches!(
+        super::probe::item_key_for_new_editor_row(&canonical),
+        lofty::tag::ItemKey::Unknown(_)
+    )
+}
+
+pub(crate) fn metadata_field_keys_match(source: &str, target: &str) -> bool {
+    if metadata_field_key_is_known(source) && metadata_field_key_is_known(target) {
+        super::probe::canonical_metadata_display_key(source)
+            == super::probe::canonical_metadata_display_key(target)
+    } else {
+        source == target
+    }
+}
+
+pub(crate) fn metadata_editor_copy_detail_field(
+    app: &mut AppState,
+    state: &super::app::MetadataEditorState,
+) -> Result<usize, String> {
+    let entry = state
+        .active_surface()
+        .entries
+        .get(state.detail_field_idx)
+        .ok_or_else(|| "metadata editor: selected field is no longer available".to_string())?;
+    if entry.is_binary {
+        return Err("metadata editor: binary fields cannot be copied as tag values".to_string());
+    }
+    if entry.per_file_values.is_empty() {
+        return Err("metadata editor: selected field has no positional values".to_string());
+    }
+
+    app.metadata_field_clipboard = Some(super::tag_interchange::FieldBlock {
+        key: entry.display_key.clone(),
+        values: entry.per_file_values.clone(),
+    });
+
+    // Mirror the same single-field payload into the process-wide textual
+    // clipboard so the existing tag-block interoperability remains useful.
+    // The structured AppState carrier above is authoritative for in-app paste.
+    let serialized = super::tag_interchange::serialize_tag_entries(std::iter::once(entry));
+    if !serialized.text.is_empty() {
+        tui_file_picker::write_shared_text_clipboard(serialized.text);
+    }
+    Ok(entry.per_file_values.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataFieldPasteReport {
+    pub changed_slots: usize,
+    pub collapsed_stored_values: bool,
+}
+
+pub(crate) fn metadata_editor_paste_detail_field(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) -> Result<MetadataFieldPasteReport, String> {
+    if state.read_only {
+        return Err("read-only editor (SACD ISO)".to_string());
+    }
+    let field_idx = state.detail_field_idx;
+    if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, field_idx) {
+        return Err(reason);
+    }
+    let block = app
+        .metadata_field_clipboard
+        .clone()
+        .ok_or_else(|| "metadata editor: field clipboard is empty".to_string())?;
+    let target = state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .ok_or_else(|| "metadata editor: selected field is no longer available".to_string())?;
+    if !metadata_field_keys_match(&block.key, &target.display_key) {
+        return Err(format!(
+            "metadata editor: field clipboard contains {}, but the selected field is {}",
+            block.key, target.display_key
+        ));
+    }
+    if target.is_binary {
+        return Err("metadata editor: binary fields cannot receive field clipboard values".to_string());
+    }
+
+    let slot_count = target.per_file_values.len();
+    let writable = (0..slot_count)
+        .map(|slot| metadata_editor_entry_slot_edit_block_reason(state, field_idx, slot).is_none())
+        .collect::<Vec<_>>();
+    let before = target.clone();
+    let mut changed = 0usize;
+    if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
+        for (slot, replacement) in block.values.iter().take(slot_count).enumerate() {
+            if !writable.get(slot).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(current) = entry.per_file_values.get_mut(slot) else {
+                continue;
+            };
+            if current != replacement {
+                *current = replacement.clone();
+                changed = changed.saturating_add(1);
+            }
+        }
+        if changed > 0 {
+            metadata_editor_recompute_entry_display(entry);
+        }
+    }
+    if changed == 0 {
+        return Ok(MetadataFieldPasteReport {
+            changed_slots: 0,
+            collapsed_stored_values: false,
+        });
+    }
+
+    let collapsed_stored_values = state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .is_some_and(|after| {
+            after
+            .per_file_values
+            .iter()
+            .enumerate()
+            .take(block.values.len().min(slot_count))
+            .filter(|(slot, _)| writable.get(*slot).copied().unwrap_or(false))
+            .any(|(slot, values)| {
+                !before
+                    .stored_list_collapse_slots(std::iter::once((slot, values)))
+                    .is_empty()
+            })
+        });
+    metadata_editor_clamp_detail_value_cursor(state);
+    recalc_dirty(state);
+    Ok(MetadataFieldPasteReport {
+        changed_slots: changed,
+        collapsed_stored_values,
+    })
+}
+
+fn metadata_editor_detail_field_key(
+    state: &super::app::MetadataEditorState,
+    field_idx: usize,
+) -> Option<String> {
+    state
+        .active_surface()
+        .entries
+        .get(field_idx)
+        .map(|entry| super::probe::canonical_metadata_display_key(&entry.display_key))
+}
+
+pub(super) fn metadata_editor_has_detail_paste_snapshot(
+    state: &super::app::MetadataEditorState,
+    field_idx: usize,
+) -> bool {
+    let session_id = state.active_surface().technical_details.session_id;
+    let Some(field_key) = metadata_editor_detail_field_key(state, field_idx) else {
+        return false;
+    };
+    state
+        .detail_paste_snapshots
+        .iter()
+        .any(|snapshot| snapshot.session_id == session_id && snapshot.field_key == field_key)
+}
+
+/// Apply plain host-clipboard lines to the currently-open detail field.
+///
+/// Line i maps to positional slot i. Short input leaves trailing slots
+/// untouched, overflow is ignored, and blocked slots keep their existing
+/// values without shifting the mapping. This intentionally does not use the
+/// internal FieldBlock codec: user clipboard text is line-oriented and uses
+/// `;` only inside set-valued rows.
+pub(super) fn metadata_editor_apply_detail_whole_field_text(
+    state: &mut super::app::MetadataEditorState,
+    field_idx: usize,
+    text: &str,
+) -> usize {
+    if state.read_only
+        || state.phase != super::app::MetadataEditorPhase::DetailEdit
+        || state.detail_field_idx != field_idx
+        || metadata_editor_unpersistable_per_track_reason(state, field_idx).is_some()
+    {
+        return 0;
+    }
+
+    let Some(entry) = state.active_surface().entries.get(field_idx) else {
+        return 0;
+    };
+    let session_id = state.active_surface().technical_details.session_id;
+    let field_key = super::probe::canonical_metadata_display_key(&entry.display_key);
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
+    let slot_count = entry.per_file_values.len();
+    let before = entry.per_file_values.clone();
+    let writable_slots = (0..slot_count)
+        .map(|slot| {
+            metadata_editor_entry_slot_edit_block_reason(state, field_idx, slot).is_none()
+        })
+        .collect::<Vec<_>>();
+
+    let mut changed = 0usize;
+    if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
+        for (slot, line) in text.split('\n').take(slot_count).enumerate() {
+            if !writable_slots.get(slot).copied().unwrap_or(false) {
+                continue;
+            }
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let replacement = if set_valued {
+                super::probe::MetadataFieldValues::from_stored_texts(
+                    metadata_editor_parse_semicolon_list(line).into_iter(),
+                )
+            } else {
+                super::probe::MetadataFieldValues::from_scalar(line.to_string())
+            };
+            if entry.per_file_values.get(slot) == Some(&replacement) {
+                continue;
+            }
+            if let Some(values) = entry.per_file_values.get_mut(slot) {
+                *values = replacement;
+                changed = changed.saturating_add(1);
+            }
+        }
+        if changed > 0 {
+            metadata_editor_recompute_entry_display(entry);
+        }
+    }
+
+    if changed == 0 {
+        return 0;
+    }
+
+    metadata_editor_clamp_detail_value_cursor(state);
+
+    // Keep one rejectable snapshot per field. A later paste into the same field
+    // replaces it with that paste's immediate pre-state, while snapshots for
+    // other fields remain available and unrelated edits remain untouched.
+    state.detail_paste_snapshots.retain(|snapshot| {
+        !(snapshot.session_id == session_id && snapshot.field_key == field_key)
+    });
+    state
+        .detail_paste_snapshots
+        .push(super::app::MetadataDetailPasteSnapshot {
+            session_id,
+            field_key,
+            per_file_values: before,
+        });
+    recalc_dirty(state);
+    changed
+}
+
+fn metadata_editor_revert_detail_field_paste(
+    state: &mut super::app::MetadataEditorState,
+    field_idx: usize,
+) -> bool {
+    let session_id = state.active_surface().technical_details.session_id;
+    let Some(field_key) = metadata_editor_detail_field_key(state, field_idx) else {
+        return false;
+    };
+    let Some(snapshot_idx) = state.detail_paste_snapshots.iter().rposition(|snapshot| {
+        snapshot.session_id == session_id && snapshot.field_key == field_key
+    }) else {
+        return false;
+    };
+    let snapshot = state.detail_paste_snapshots.remove(snapshot_idx);
+    let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) else {
+        return false;
+    };
+    entry.per_file_values = snapshot.per_file_values;
+    metadata_editor_recompute_entry_display(entry);
+    metadata_editor_clamp_detail_value_cursor(state);
+    recalc_dirty(state);
+    true
 }
 
 fn metadata_editor_detail_is_set_valued(
@@ -14983,16 +15362,9 @@ fn metadata_editor_clamp_detail_value_cursor(state: &mut super::app::MetadataEdi
 }
 
 fn metadata_editor_refresh_detail_shared_mode(state: &mut super::app::MetadataEditorState) {
-    let field_idx = state.detail_field_idx;
-    let is_mixed = state
-        .active_surface()
-        .entries
-        .get(field_idx)
-        .map(|entry| entry.is_mixed)
-        .unwrap_or(false);
-    if is_mixed {
-        state.detail_apply_shared = false;
-    }
+    // `detail_apply_shared` is an explicit user-selected edit scope. Data
+    // becoming mixed must not silently revoke that scope while navigating or
+    // after the first shared mutation.
     metadata_editor_clamp_detail_value_cursor(state);
 }
 
@@ -15027,17 +15399,18 @@ fn metadata_editor_begin_set_value_edit(
     let initial = if add {
         String::new()
     } else {
-        let Some(value) = state
+        let Some(values) = state
             .active_surface()
             .entries
             .get(field_idx)
             .and_then(|entry| entry.per_file_values.get(state.detail_cursor))
-            .and_then(|values| values.value_text(state.detail_value_cursor))
         else {
-            app.set_status("metadata editor: this field has no value to edit; press a to add one");
+            app.set_status("metadata editor: this field has no editable slot");
             return false;
         };
-        value.to_string()
+        // Primary row edit is the complete ordered list for this track. The
+        // single-value cursor remains for secondary delete/reorder actions.
+        values.as_str().to_string()
     };
     state.detail_edit = Some(super::text_input::TextInputState::new_selected(initial));
     true
@@ -15172,12 +15545,76 @@ fn metadata_editor_commit_detail_edit(
                 true
             });
         }
-        if text.trim().is_empty() {
-            return metadata_editor_remove_selected_set_value(app, state);
+
+        let targets = metadata_editor_detail_target_slots(state, field_idx);
+        if targets.is_empty() {
+            if let Some(reason) = metadata_editor_detail_value_edit_refusal(
+                state,
+                field_idx,
+                detail_cursor,
+            ) {
+                app.set_status(reason);
+            }
+            recalc_dirty(state);
+            return false;
         }
-        return metadata_editor_mutate_set_values(app, state, |values, index| {
-            values.edit_value(index, text.clone())
-        });
+
+        let replacement_texts = metadata_editor_parse_semicolon_list(&text);
+        let replacement = super::probe::MetadataFieldValues::from_stored_texts(
+            replacement_texts.iter().cloned(),
+        );
+        let before = state.active_surface().entries.get(field_idx).cloned();
+        let mut changed = false;
+        if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
+            for slot in targets.iter().copied() {
+                if let Some(values) = entry.per_file_values.get_mut(slot) {
+                    if *values != replacement {
+                        values.replace_stored_texts(replacement_texts.iter().cloned());
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                metadata_editor_recompute_entry_display(entry);
+            }
+        }
+        if !changed {
+            recalc_dirty(state);
+            return false;
+        }
+
+        if let (Some(before), Some(after)) = (
+            before.as_ref(),
+            state.active_surface().entries.get(field_idx),
+        ) {
+            let collapsed = targets.iter().copied().any(|slot| {
+                after
+                    .per_file_values
+                    .get(slot)
+                    .map(|values| {
+                        !before
+                            .stored_list_collapse_slots(std::iter::once((slot, values)))
+                            .is_empty()
+                    })
+                    .unwrap_or(false)
+            });
+            if collapsed {
+                app.set_status(if targets.len() == 1 {
+                    format!(
+                        "metadata editor: editing {} reduced the stored multi-value list for this track",
+                        after.display_key
+                    )
+                } else {
+                    format!(
+                        "metadata editor: editing {} reduced the stored multi-value list for one or more tracks",
+                        after.display_key
+                    )
+                });
+            }
+        }
+        metadata_editor_refresh_detail_shared_mode(state);
+        recalc_dirty(state);
+        return true;
     }
 
     let n_values = state
@@ -15331,14 +15768,11 @@ fn metadata_editor_advance_detail_edit(
         state.detail_cursor = idx;
         metadata_editor_clamp_detail_value_cursor(state);
         let entry = &state.active_surface().entries[field_idx];
-        let value = if super::probe::metadata_field_is_set_valued(&entry.display_key) {
-            entry.per_file_values[idx]
-                .value_text(state.detail_value_cursor)
-                .unwrap_or("")
-                .to_string()
-        } else {
-            entry.per_file_values[idx].as_str().to_string()
-        };
+        // Tab/BackTab advances the primary whole-row editor. Seed it from the
+        // complete stored representation, exactly like Enter does; the
+        // member-oriented detail_value_cursor belongs only to the secondary
+        // h/l, a, x, [ and ] affordances.
+        let value = entry.per_file_values[idx].as_str().to_string();
         state.detail_edit_add = false;
         state.detail_edit = Some(super::text_input::TextInputState::new_selected(value));
         ensure_detail_visible(state);
@@ -16208,10 +16642,10 @@ fn handle_metadata_editor_key(
                 return;
             }
 
-            // Detail overlay navigation. `j`/`k` move across the
-            // file/track axis. Set-valued fields add an orthogonal value
-            // cursor: `h`/`l` choose a value, `a` adds, `x` removes, and
-            // `[`/`]` reorder without ever parsing a delimiter-joined string.
+            // Detail overlay navigation. `j`/`k` move across the file/track
+            // axis. Enter edits the complete `; `-joined row for set-valued
+            // fields; `h`/`l`, `a`, `x`, and `[`/`]` remain secondary
+            // single-value navigation/manipulation affordances.
             let set_valued = metadata_editor_detail_is_set_valued(state, field_idx);
             match key.code {
                 KeyCode::Esc => {
@@ -16237,6 +16671,71 @@ fn handle_metadata_editor_key(
                         || key.modifiers.contains(KeyModifiers::SHIFT);
                     metadata_editor_advance_detail_cursor(state, reverse);
                     metadata_editor_clamp_detail_value_cursor(state);
+                }
+                KeyCode::Char('s')
+                    if set_valued && key.modifiers == KeyModifiers::NONE =>
+                {
+                    state.detail_apply_shared = !state.detail_apply_shared;
+                    app.set_status(if state.detail_apply_shared {
+                        "metadata editor: detail edits now apply to all writable tracks"
+                    } else {
+                        "metadata editor: detail edits now apply only to the current track"
+                    });
+                }
+                KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                    match metadata_editor_copy_detail_field(app, state) {
+                        Ok(count) => app.set_status(format!(
+                            "metadata editor: copied this field across {} track{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        )),
+                        Err(reason) => app.set_status(reason),
+                    }
+                }
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                    match metadata_editor_paste_detail_field(app, state) {
+                        Ok(report) if report.changed_slots == 0 => app.set_status(
+                            "metadata editor: field clipboard already matches this field",
+                        ),
+                        Ok(report) => {
+                            let mut status = format!(
+                                "metadata editor: pasted this field into {} track{}; review before save",
+                                report.changed_slots,
+                                if report.changed_slots == 1 { "" } else { "s" }
+                            );
+                            if report.collapsed_stored_values {
+                                status.push_str(
+                                    "; warning: one or more stored multi-value lists were reduced",
+                                );
+                            }
+                            app.set_status(status);
+                        }
+                        Err(reason) => app.set_status(reason),
+                    }
+                }
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
+                    if state.read_only {
+                        app.set_status("read-only editor (SACD ISO)");
+                    } else {
+                        begin_host_clipboard_paste(
+                            app,
+                            tx,
+                            super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                                session_id: state.active_surface().technical_details.session_id,
+                                field_index: state.detail_field_idx,
+                            },
+                        );
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::NONE => {
+                    let field_idx = state.detail_field_idx;
+                    if metadata_editor_revert_detail_field_paste(state, field_idx) {
+                        app.set_status(
+                            "metadata editor: reverted the latest clipboard paste for this field",
+                        );
+                    } else {
+                        app.set_status("metadata editor: no field paste to revert");
+                    }
                 }
                 KeyCode::Left | KeyCode::Char('h') if set_valued => {
                     state.detail_value_cursor = state.detail_value_cursor.saturating_sub(1);
@@ -28645,6 +29144,31 @@ fn sort_disc_editor_entries(entries: &mut Vec<super::probe::TagEntry>, n_tracks:
     super::probe::sort_entries_standard_first_existing_only(entries);
 }
 
+/// Copy-tags must expose source metadata, not the blank numbering rows that
+/// disc-backed editors synthesize solely as Auto-populate targets.  Require
+/// both the explicit zero-cardinality marker and empty per-slot values so a
+/// real numbering row is never hidden merely because its text is blank.
+fn is_synthetic_disc_numbering_placeholder(entry: &super::probe::TagEntry) -> bool {
+    let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+    let numbering_placeholder = matches!(
+        key.as_str(),
+        "TRACKTOTAL" | "DISCNUMBER" | "DISCTOTAL"
+    );
+    if !numbering_placeholder || entry.per_file_values.is_empty() {
+        return false;
+    }
+
+    entry.per_file_stored_value_counts.len() == entry.per_file_values.len()
+        && entry
+            .per_file_stored_value_counts
+            .iter()
+            .all(|count| *count == 0)
+        && entry
+            .per_file_values
+            .iter()
+            .all(|values| values.normalized_list_texts().is_empty())
+}
+
 pub fn build_dvda_editor_state(
     source_path: &std::path::Path,
     disc: &crate::tui::dvda::DvdaDisc,
@@ -28892,6 +29416,53 @@ pub fn build_dvda_multitab_editor_state(
     let (mut state, label, n_tracks, _) = states.remove(active_idx);
     state.set_presentation_surfaces(tabs, active_idx);
     Ok((state, label, n_tracks))
+}
+
+/// Read the same real per-track DVD-A tag model used by the metadata editor,
+/// without decoding audio. This is the read-only bridge used by Copy tags;
+/// it intentionally shares the parser/metabase builder instead of inventing a
+/// second optical-disc tag interpretation.
+pub(crate) fn read_dvda_tag_entries_for_copy(
+    source_path: &std::path::Path,
+) -> Result<Vec<super::probe::TagEntry>, String> {
+    let (disc, store_id, metabase_path, metabase, _parse_note) =
+        load_dvda_metabase_context(source_path)?;
+    let disc_contents = crate::disc::dvda_utils::map_dvda_source(source_path).ok();
+    let (state, _label, _count) = build_dvda_editor_state(
+        source_path,
+        &disc,
+        disc_contents.as_ref(),
+        &store_id,
+        metabase_path.as_ref(),
+        metabase.as_ref(),
+        None,
+    )?;
+    Ok(state
+        .active_surface()
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.display_key.eq_ignore_ascii_case("DVDA_GROUP")
+                && !is_synthetic_disc_numbering_placeholder(entry)
+        })
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn read_dvda_track_durations_for_gnudb(
+    source_path: &std::path::Path,
+) -> Result<Vec<f64>, String> {
+    let (disc, _store_id, _metabase_path, _metabase, _parse_note) =
+        load_dvda_metabase_context(source_path)?;
+    let group = super::dvda_metabase::select_group(&disc, None).map_err(|error| error.to_string())?;
+    let durations = super::dvda_metabase::group_track_addrs(&disc, group)
+        .into_iter()
+        .map(|track| f64::from(track.len_in_pts) / 90_000.0)
+        .collect::<Vec<_>>();
+    if durations.is_empty() {
+        return Err("GNUDB: DVD-Audio group has zero tracks".to_string());
+    }
+    Ok(durations)
 }
 
 fn find_single_dvda_source_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -30690,6 +31261,59 @@ pub fn build_sacd_multitab_editor_state(
     let (mut state, label, n_tracks) = states.remove(0);
     state.set_presentation_surfaces(tabs, 0);
     Ok((state, label, n_tracks))
+}
+
+/// Read real per-track SACD tags through the editor's ScarletBook + sidecar
+/// model. Stereo remains the builder's preferred area, matching the existing
+/// single-surface editor semantics and requiring no audio materialization.
+pub(crate) fn read_sacd_tag_entries_for_copy(
+    iso_path: &std::path::Path,
+) -> Result<Vec<super::probe::TagEntry>, String> {
+    let md = super::sacd::parse_sacd_iso(iso_path)
+        .map_err(|error| format!("SACD parse failed: {error}"))?;
+    let sidecar_path = super::sacd_sidecar::find_sidecar_for_iso(iso_path);
+    let sidecar = sidecar_path
+        .as_ref()
+        .and_then(|path| match super::sacd_sidecar::parse_sidecar(path) {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) => {
+                log::warn!(
+                    "SACD sidecar parse failed for Copy tags; falling back to ScarletBook for '{}': {}",
+                    path.display(),
+                    error,
+                );
+                None
+            }
+        });
+    let (state, _area, _count) = build_sacd_editor_state(iso_path, &md, sidecar.as_ref())?;
+    Ok(state
+        .active_surface()
+        .entries
+        .iter()
+        .filter(|entry| !is_synthetic_disc_numbering_placeholder(entry))
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn read_sacd_track_durations_for_gnudb(
+    iso_path: &std::path::Path,
+) -> Result<Vec<f64>, String> {
+    let md = super::sacd::parse_sacd_iso(iso_path)
+        .map_err(|error| format!("GNUDB: SACD parse failed: {error}"))?;
+    let area = md
+        .stereo
+        .as_ref()
+        .or(md.multi_channel.as_ref())
+        .ok_or_else(|| "GNUDB: SACD has no readable area".to_string())?;
+    let durations = area
+        .tracks
+        .iter()
+        .map(|track| track.duration.total_seconds())
+        .collect::<Vec<_>>();
+    if durations.is_empty() {
+        return Err("GNUDB: SACD area has zero tracks".to_string());
+    }
+    Ok(durations)
 }
 
 /// Cheaply test whether `path` is writable: succeeds if we can open
@@ -33394,8 +34018,18 @@ pub(super) fn build_metadata_row_context_menu_for_column(
     }
     let is_binary = state.active_surface().entries.get(row).map(|e| e.is_binary).unwrap_or(true);
     if !is_binary {
+        let set_valued = state
+            .active_surface()
+            .entries
+            .get(row)
+            .map(|entry| super::probe::metadata_field_is_set_valued(&entry.display_key))
+            .unwrap_or(false);
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Edit value".to_string(),
+            label: if set_valued {
+                "Edit (in-place)".to_string()
+            } else {
+                "Edit value".to_string()
+            },
             action: ContextAction::MetadataEditValue,
             shortcut: None,
             enabled: true,
@@ -33404,10 +34038,16 @@ pub(super) fn build_metadata_row_context_menu_for_column(
             .active_surface()
             .entries
             .get(row)
-            .is_some_and(|entry| entry.is_mixed && entry.per_file_values.len() > 1)
+            .is_some_and(|entry| {
+                set_valued || (entry.is_mixed && entry.per_file_values.len() > 1)
+            })
         {
             entries.push(ContextMenuEntry::Item(ContextMenuItem {
-                label: "Edit values (per file)".to_string(),
+                label: if set_valued {
+                    "Edit".to_string()
+                } else {
+                    "Edit values (per file)".to_string()
+                },
                 action: ContextAction::MetadataEditValuesPerFile,
                 shortcut: None,
                 enabled: true,
@@ -33589,6 +34229,38 @@ fn build_metadata_detail_context_menu(
                 label: "Restore (snap to MB values)".to_string(),
                 action: ContextAction::MetadataDetailRestore,
                 shortcut: Some(":restore".to_string()),
+                enabled: true,
+            }));
+            entries.push(ContextMenuEntry::Separator);
+        }
+        if !entry.is_binary {
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Copy (this field)".to_string(),
+                action: ContextAction::MetadataDetailCopyField,
+                shortcut: Some("Ctrl+C".to_string()),
+                enabled: true,
+            }));
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Paste (this field)".to_string(),
+                action: ContextAction::MetadataDetailPasteField,
+                shortcut: Some("Ctrl+P".to_string()),
+                enabled: !state.read_only,
+            }));
+            entries.push(ContextMenuEntry::Separator);
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Transfer tags from... (this field)".to_string(),
+                action: ContextAction::MetadataDetailTransferTags {
+                    direction: super::app::TagTransferDirection::From,
+                },
+                shortcut: None,
+                enabled: !state.read_only,
+            }));
+            entries.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Transfer tags to... (this field)".to_string(),
+                action: ContextAction::MetadataDetailTransferTags {
+                    direction: super::app::TagTransferDirection::To,
+                },
+                shortcut: None,
                 enabled: true,
             }));
             entries.push(ContextMenuEntry::Separator);
@@ -36053,6 +36725,34 @@ fn handle_metadata_editor_mouse_in_area(
                     // in browsing mode, when MB populated the field).
                     if state.detail_edit.is_none() {
                         match app.button_map.find_button_at(mx, my) {
+                            Some(super::button_map::TuiButton::MetadataDetailPasteWholeField) => {
+                                if state.read_only {
+                                    app.set_status("read-only editor (SACD ISO)");
+                                } else {
+                                    begin_host_clipboard_paste(
+                                        app,
+                                        tx,
+                                        super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                                            session_id: state.active_surface().technical_details.session_id,
+                                            field_index: state.detail_field_idx,
+                                        },
+                                    );
+                                }
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
+                            Some(super::button_map::TuiButton::MetadataDetailRevertPaste) => {
+                                let field_idx = state.detail_field_idx;
+                                if metadata_editor_revert_detail_field_paste(&mut state, field_idx) {
+                                    app.set_status(
+                                        "metadata editor: reverted the latest clipboard paste for this field",
+                                    );
+                                } else {
+                                    app.set_status("metadata editor: no field paste to revert");
+                                }
+                                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                return;
+                            }
                             Some(super::button_map::TuiButton::MetadataDetailRevert) => {
                                 let field_idx = state.detail_field_idx;
                                 let mut status = None;
@@ -36107,25 +36807,76 @@ fn handle_metadata_editor_mouse_in_area(
                             _ => {}
                         }
                     }
-                    // Dynamic pills: [:fix-caps] if the field is a
-                    // capitalize-applicable text key, Enter, Esc. Pills are
-                    // only added in browsing mode (not while inline-editing
-                    // a value). :import-cue was removed from both footers —
-                    // it rebuilds a GnudbReview with no editor session and
-                    // the command refuses while the editor is open.
+                    // Keep this hit-test list byte-for-byte synchronized with
+                    // `draw_metadata_detail`: centering depends on every
+                    // rendered pill, including non-clickable affordances.
                     let mut pills: Vec<(&str, &str)> = Vec::new();
                     if state.detail_edit.is_some() {
-                        pills.extend_from_slice(&[
-                            ("Enter confirm", "enter"),
-                            ("Esc cancel", "esc"),
-                        ]);
+                        let set_valued = metadata_editor_detail_is_set_valued(
+                            &state,
+                            state.detail_field_idx,
+                        );
+                        pills.push((
+                            if set_valued && state.detail_edit_add {
+                                "Enter add"
+                            } else {
+                                "Enter confirm"
+                            },
+                            "enter",
+                        ));
+                        pills.push(("Esc cancel", "esc"));
+                        if set_valued {
+                            pills.push((
+                                if state.detail_apply_shared {
+                                    "editing: ALL TRACKS"
+                                } else {
+                                    "editing: THIS TRACK"
+                                },
+                                "noop",
+                            ));
+                        }
                     } else {
+                        let set_valued = metadata_editor_detail_is_set_valued(
+                            &state,
+                            state.detail_field_idx,
+                        );
+                        pills.push(("tags", "tags"));
                         if let Some(entry) = state.active_surface().entries.get(state.detail_field_idx) {
                             if is_fix_caps_applicable(&entry.display_key) {
                                 pills.push((":fix-caps", ":fix-caps"));
                             }
                         }
-                        pills.extend_from_slice(&[("Enter edit", "enter"), ("Esc back", "esc")]);
+                        if set_valued {
+                            pills.push((
+                                if state.detail_apply_shared {
+                                    "editing: ALL TRACKS [s]"
+                                } else {
+                                    "editing: THIS TRACK [s]"
+                                },
+                                "noop",
+                            ));
+                        }
+                        pills.push(("Paste from Clipboard [p]", "noop"));
+                        if metadata_editor_has_detail_paste_snapshot(&state, state.detail_field_idx)
+                        {
+                            pills.push(("Undo Paste [u]", "noop"));
+                        }
+                        if set_valued {
+                            pills.extend_from_slice(&[
+                                ("Enter edit list", "enter"),
+                                ("a add", "noop"),
+                                ("x delete", "noop"),
+                                ("[/] reorder", "noop"),
+                                ("j/k track", "noop"),
+                                ("Esc back", "esc"),
+                            ]);
+                        } else {
+                            pills.extend_from_slice(&[
+                                ("Enter edit", "enter"),
+                                ("j/k track", "noop"),
+                                ("Esc back", "esc"),
+                            ]);
+                        }
                     }
                     // The renderer appends extra pills (revert/restore +
                     // a 4-char gap) after the dynamic pills when the
@@ -36159,6 +36910,16 @@ fn handle_metadata_editor_mouse_in_area(
                     if let Some(action) =
                         footer_pill_hit_with_extra(&pills, extra_width, mx, inner_x, inner_w)
                     {
+                        if action == "tags" {
+                            let entries = build_metadata_detail_context_menu(&state);
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
+                                origin: (mx, my),
+                                anchor_bottom: true,
+                            };
+                            return;
+                        }
                         if action.starts_with(':') {
                             app.active_overlay = ActiveOverlay::MetadataEditor(state);
                             let cmd = super::command::parse_command(&action[1..]);
@@ -36355,6 +37116,9 @@ pub(super) fn metadata_editor_begin_detail_edit_for_entry(
     if entry_idx >= state.active_surface().entries.len() {
         return None;
     }
+    if state.active_surface().deleted.contains(&entry_idx) {
+        return Some("metadata editor: restore field before editing".to_string());
+    }
     if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, entry_idx) {
         return Some(reason);
     }
@@ -36368,12 +37132,12 @@ pub(super) fn metadata_editor_begin_detail_edit_for_entry(
     if entry.per_file_values.len() <= 1 && !set_valued {
         return None;
     }
-    let apply_shared = set_valued && !entry.is_mixed;
-
     state.detail_field_idx = entry_idx;
     state.detail_cursor = 0;
     state.detail_value_cursor = 0;
-    state.detail_apply_shared = apply_shared;
+    // Detail editing is precision-first even when every slot currently agrees.
+    // Shared/all-slots editing is always explicit and opt-in.
+    state.detail_apply_shared = false;
     state.detail_edit_add = false;
     state.detail_scroll = 0;
     state.detail_edit = None;
@@ -36448,13 +37212,20 @@ fn metadata_editor_apply_inline_value_to_writable_slots(
         })
         .collect();
 
+    let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
+    let parsed_values = set_valued.then(|| metadata_editor_parse_semicolon_list(&new_value));
+
     let Some(entry) = state.active_surface_mut().entries.get_mut(entry_idx) else {
         return 0;
     };
     let mut updated = 0usize;
     for (idx, slot) in entry.per_file_values.iter_mut().enumerate() {
         if writable_slots.get(idx).copied().unwrap_or(true) {
-            slot.replace_scalar(new_value.clone());
+            if let Some(values) = parsed_values.as_ref() {
+                slot.replace_stored_texts(values.iter().cloned());
+            } else {
+                slot.replace_scalar(new_value.clone());
+            }
             updated = updated.saturating_add(1);
         }
     }
@@ -54621,6 +55392,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::CuePreviewEditCancel
             | TuiButton::MetadataDetailRevert
             | TuiButton::MetadataDetailRestore
+            | TuiButton::MetadataDetailPasteWholeField
+            | TuiButton::MetadataDetailRevertPaste
             | TuiButton::MetadataDetailsAnalyze
             | TuiButton::MetadataReplayGainScanTrack
             | TuiButton::MetadataReplayGainScanAlbum
@@ -54887,6 +55660,95 @@ mod phase4_tests {
     }
 
     #[test]
+    fn dvda_copy_tag_reader_excludes_internal_group_row_but_keeps_real_titles() {
+        use crate::tui::dvda::{parse_dvda_volume, DirectoryDvdaVolume};
+        use crate::tui::dvda_metabase::{
+            compute_store_id, expected_sidecar_path_for_source, write_metabase, DvdaMetabase,
+        };
+
+        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dvda/ap_i_robot");
+        let td = tempfile::tempdir().expect("tempdir");
+        let source = td.path().join("disc");
+        let audio_ts = source.join("AUDIO_TS");
+        std::fs::create_dir_all(&audio_ts).expect("create DVD-A AUDIO_TS fixture directory");
+        for entry in std::fs::read_dir(&fixture_root).expect("read DVD-A fixture") {
+            let entry = entry.expect("DVD-A fixture entry");
+            if entry.file_type().expect("fixture file type").is_file() {
+                std::fs::copy(entry.path(), audio_ts.join(entry.file_name()))
+                    .expect("copy DVD-A fixture file");
+            }
+        }
+
+        let volume = DirectoryDvdaVolume::new(&source);
+        let disc = parse_dvda_volume(&volume).expect("parse DVD-A fixture");
+        let store_id = compute_store_id(&volume).expect("DVD-A store id");
+        let group = crate::tui::dvda_metabase::select_group(&disc, None)
+            .expect("DVD-A fixture audio group");
+        let track_ids = crate::tui::dvda_metabase::group_track_ids(&disc, group);
+        assert!(track_ids.len() >= 2, "fixture must expose multiple DVD-A tracks");
+
+        let metabase = DvdaMetabase {
+            store_id: store_id.clone(),
+            tracks: track_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let title = format!("Copy Title {}", index + 1);
+                    let track_number = (index + 1).to_string();
+                    dvda_metabase_track(
+                        id,
+                        &[("TITLE", title.as_str()), ("TRACKNUMBER", track_number.as_str())],
+                    )
+                })
+                .collect(),
+        };
+        let metabase_path = expected_sidecar_path_for_source(&source, &store_id)
+            .expect("DVD-A metabase path");
+        write_metabase(&metabase, &metabase_path).expect("write DVD-A metabase");
+
+        let entries = read_dvda_tag_entries_for_copy(&source).expect("DVD-A Copy tags read");
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.display_key.eq_ignore_ascii_case("DVDA_GROUP")));
+        for synthetic_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.display_key.eq_ignore_ascii_case(synthetic_key)),
+                "DVD-A Copy tags must not expose synthetic blank {synthetic_key}"
+            );
+        }
+        let title = entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("DVD-A TITLE row");
+        assert_eq!(title.per_file_values.len(), track_ids.len());
+        assert_eq!(title.per_file_values[0].as_str(), "Copy Title 1");
+        assert_eq!(title.per_file_values[1].as_str(), "Copy Title 2");
+
+        let serialized = super::super::tag_interchange::serialize_tag_entries(entries.iter());
+        assert!(!serialized
+            .keys
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case("DVDA_GROUP")));
+        assert!(!serialized.text.contains("DVDA_GROUP"));
+        for synthetic_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            assert!(
+                !serialized
+                    .keys
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(synthetic_key)),
+                "serialized DVD-A Copy tags must omit {synthetic_key}"
+            );
+            assert!(
+                !serialized.text.contains(synthetic_key),
+                "serialized DVD-A Copy tags text must omit {synthetic_key}"
+            );
+        }
+    }
+
+    #[test]
     fn dvda_tab_label_does_not_duplicate_existing_group_prefix() {
         let presentation = dvd_audio_presentation(
             3,
@@ -55077,7 +55939,7 @@ mod phase4_tests {
     }
 
     #[test]
-    fn set_valued_cursor_edit_always_enters_detail_mode() {
+    fn set_valued_cursor_edit_enters_inline_bulk_mode() {
         let mut composer = entry(
             "COMPOSER",
             ItemKey::Composer,
@@ -55096,13 +55958,16 @@ mod phase4_tests {
         let mut state = two_file_editor(vec![composer]);
         state.cursor = 0;
         assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
-        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::DetailEdit);
-        assert!(state.edit_input.is_none());
-        assert!(state.detail_apply_shared);
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::InlineEdit);
+        assert_eq!(
+            state.edit_input.as_ref().map(|input| input.text.as_str()),
+            Some("A; B")
+        );
+        assert!(!state.detail_apply_shared);
     }
 
     #[test]
-    fn set_valued_detail_add_edit_reorder_remove_preserves_discrete_values() {
+    fn set_valued_detail_defaults_to_current_track_and_shared_mode_is_explicit() {
         let mut composer = entry(
             "COMPOSER",
             ItemKey::Composer,
@@ -55118,36 +55983,790 @@ mod phase4_tests {
         composer.original = composer.value.clone();
         composer.is_mixed = false;
 
-        let mut state = two_file_editor(vec![composer]);
-        state.detail_field_idx = 0;
-        state.detail_cursor = 0;
-        state.detail_apply_shared = true;
-        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        let mut state = Box::new(two_file_editor(vec![composer]));
+        assert_eq!(
+            metadata_editor_begin_detail_edit_for_entry(&mut state, 0, false),
+            None
+        );
+        assert!(!state.detail_apply_shared);
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
 
         state.detail_edit_add = true;
         state.detail_edit = Some(super::super::text_input::TextInputState::new("C".to_string()));
         assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
-        for slot in &state.active_surface().entries[0].per_file_values {
-            assert_eq!(slot.to_texts(), ["A", "B", "C"]);
-        }
+        assert_eq!(state.active_surface().entries[0].per_file_values[0].to_texts(), ["A", "B", "C"]);
+        assert_eq!(state.active_surface().entries[0].per_file_values[1].to_texts(), ["A", "B"]);
+
+        // Becoming mixed must not alter the explicit scope bit. The user owns
+        // this mode, not the current data shape. Exercise the real keyboard
+        // dispatch so the byobu-safe `s` affordance cannot regress silently.
+        assert!(!state.detail_apply_shared);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        assert!(state.detail_apply_shared);
 
         state.detail_value_cursor = 1;
-        state.detail_edit = Some(super::super::text_input::TextInputState::new("B2".to_string()));
+        state.detail_edit = Some(super::super::text_input::TextInputState::new(
+            "A; B2; C".to_string(),
+        ));
         assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
-        for slot in &state.active_surface().entries[0].per_file_values {
-            assert_eq!(slot.to_texts(), ["A", "B2", "C"]);
-        }
+        assert!(state.detail_apply_shared);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B2", "C"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["A", "B2", "C"]
+        );
 
         assert!(metadata_editor_move_selected_set_value(&mut app, &mut state, false));
-        for slot in &state.active_surface().entries[0].per_file_values {
-            assert_eq!(slot.to_texts(), ["A", "C", "B2"]);
-        }
+        assert!(state.detail_apply_shared);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "C", "B2"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["A", "C", "B2"]
+        );
 
         assert!(metadata_editor_remove_selected_set_value(&mut app, &mut state));
-        for slot in &state.active_surface().entries[0].per_file_values {
-            assert_eq!(slot.to_texts(), ["A", "C"]);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "C"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["A", "C"]
+        );
+        assert!(state.detail_apply_shared);
+    }
+
+    #[test]
+    fn metadata_detail_focused_footer_mouse_hit_test_matches_rendered_scope_geometry() {
+        fn state_for_focused_detail(shared: bool) -> Box<MetadataEditorState> {
+            let mut performer = entry(
+                "PERFORMER",
+                ItemKey::Performer,
+                &["A; B", "C; D"],
+                &["A; B", "C; D"],
+            );
+            performer.per_file_values = vec![
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+            ];
+            performer.per_file_originals = performer.per_file_values.clone();
+            performer.is_mixed = true;
+
+            let mut state = Box::new(two_file_editor(vec![performer]));
+            state.phase = MetadataEditorPhase::DetailEdit;
+            state.detail_field_idx = 0;
+            state.detail_cursor = 0;
+            state.detail_apply_shared = shared;
+            state.detail_edit = Some(super::super::text_input::TextInputState::new(
+                "E; F".to_string(),
+            ));
+            state
         }
+
+        fn rendered_pill_center(
+            pills: &[(&str, &str)],
+            action: &str,
+            row_x: u16,
+            row_w: u16,
+        ) -> u16 {
+            let total_w = pills
+                .iter()
+                .map(|(label, _)| super::super::display_width::width(label) + 2)
+                .sum::<usize>()
+                + pills.len().saturating_sub(1);
+            let mut x = row_x as usize + (row_w as usize).saturating_sub(total_w) / 2;
+            for (label, pill_action) in pills {
+                let width = super::super::display_width::width(label) + 2;
+                if *pill_action == action {
+                    return (x + width / 2) as u16;
+                }
+                x += width + 1;
+            }
+            panic!("missing rendered footer action {action}");
+        }
+
+        let area = ratatui::layout::Rect::new(0, 0, 180, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        // Default THIS TRACK scope: click the visible center of Enter confirm.
+        let per_track_pills = [
+            ("Enter confirm", "enter"),
+            ("Esc cancel", "esc"),
+            ("editing: THIS TRACK", "noop"),
+        ];
+        let enter_x = rendered_pill_center(
+            &per_track_pills,
+            "enter",
+            layout.inner.x,
+            layout.inner.width,
+        );
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_for_focused_detail(false));
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: enter_x,
+                row: layout.footer_area.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("Enter footer click should keep the detail editor open");
+        };
+        assert!(state.detail_edit.is_none());
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["E", "F"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+
+        // Explicit ALL TRACKS scope: click the visible center of Esc cancel.
+        // A miss would leave detail_edit active, which catches geometry drift.
+        let shared_pills = [
+            ("Enter confirm", "enter"),
+            ("Esc cancel", "esc"),
+            ("editing: ALL TRACKS", "noop"),
+        ];
+        let esc_x = rendered_pill_center(
+            &shared_pills,
+            "esc",
+            layout.inner.x,
+            layout.inner.width,
+        );
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state_for_focused_detail(true));
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: esc_x,
+                row: layout.footer_area.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("Esc footer click should keep the detail editor open");
+        };
+        assert!(state.detail_edit.is_none());
+        assert!(state.detail_apply_shared);
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+    }
+
+    #[test]
+    fn metadata_detail_tags_footer_opens_field_scoped_menu_and_parks_same_field() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["A; B", "C; D"],
+            &["A; B", "C; D"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+
+        let mut state = Box::new(two_file_editor(vec![performer]));
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_cursor = 1;
+        state.detail_edit = None;
+
+        let area = ratatui::layout::Rect::new(0, 0, 180, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let pills = vec![
+            ("tags", "tags"),
+            (":fix-caps", ":fix-caps"),
+            ("editing: THIS TRACK [s]", "noop"),
+            ("Paste from Clipboard [p]", "noop"),
+            ("Enter edit list", "enter"),
+            ("a add", "noop"),
+            ("x delete", "noop"),
+            ("[/] reorder", "noop"),
+            ("j/k track", "noop"),
+            ("Esc back", "esc"),
+        ];
+        let x = (layout.inner.x..layout.inner.x + layout.inner.width)
+            .find(|x| {
+                footer_pill_hit_with_extra(
+                    &pills,
+                    0,
+                    *x,
+                    layout.inner.x,
+                    layout.inner.width,
+                ) == Some("tags")
+            })
+            .expect("detail tags pill should be hittable");
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: x,
+                row: layout.footer_area.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            area,
+        );
+
+        let parked = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("detail editor should be parked behind its tags menu");
+        assert_eq!(parked.phase, MetadataEditorPhase::DetailEdit);
+        assert_eq!(parked.detail_field_idx, 0);
+        assert_eq!(parked.detail_cursor, 1);
+
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("detail tags pill should open the field-scoped context menu");
+        };
+        let entries = &levels[0].entries;
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(&item.action, crate::tui::context_menu::ContextAction::MetadataDetailCopyField)
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(
+                    &item.action,
+                    crate::tui::context_menu::ContextAction::MetadataDetailTransferTags {
+                        direction: crate::tui::app::TagTransferDirection::From,
+                    }
+                )
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(
+                    &item.action,
+                    crate::tui::context_menu::ContextAction::MetadataDetailTransferTags {
+                        direction: crate::tui::app::TagTransferDirection::To,
+                    }
+                )
+        )));
+    }
+
+    #[test]
+    fn set_valued_detail_tab_advancement_preserves_whole_row_lists() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["A; B", "C; D"],
+            &["A; B", "C; D"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.value = "<multiple values>".to_string();
+        performer.is_mixed = true;
+
+        let mut state = Box::new(two_file_editor(vec![performer]));
+        assert_eq!(
+            metadata_editor_begin_detail_edit_for_entry(&mut state, 0, false),
+            None
+        );
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("A; B")
+        );
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.detail_cursor, 1);
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("C; D")
+        );
+
+        // Commit the untouched second row through the same Tab path. Merely
+        // traversing the primary editor must not collapse C; D to C.
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+
+        // BackTab shares the same advancement helper and must seed the whole
+        // list as well.
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.detail_cursor, 1);
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("C; D")
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+    }
+
+    #[test]
+    fn set_valued_inline_semicolon_edit_trims_drops_empty_and_fans_out() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::TrackArtist,
+            &["Old", "Different"],
+            &["Old", "Different"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Different"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+
+        let mut state = two_file_editor(vec![performer]);
+        state.cursor = 0;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::InlineEdit);
+        // Mixed rows seed a real slot value, never the display placeholder.
+        assert_eq!(state.edit_input.as_ref().unwrap().text, "Old");
+
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            " Jimmy Page ; ; John Bonham; John Paul Jones ; Robert Plant ; ".to_string(),
+        ));
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(
+                slot.to_texts(),
+                ["Jimmy Page", "John Bonham", "John Paul Jones", "Robert Plant"]
+            );
+        }
+        assert!(!state.active_surface().entries[0].is_mixed);
+        assert_eq!(
+            state.active_surface().entries[0].value,
+            "Jimmy Page; John Bonham; John Paul Jones; Robert Plant"
+        );
+    }
+
+    #[test]
+    fn set_valued_detail_enter_edits_the_complete_list_for_one_track() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::TrackArtist,
+            &["A; B", "C; D"],
+            &["A; B", "C; D"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+
+        let mut state = two_file_editor(vec![performer]);
+        assert_eq!(
+            metadata_editor_begin_detail_edit_for_entry(&mut state, 0, false),
+            None
+        );
+        state.detail_cursor = 1;
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_begin_set_value_edit(&mut app, &mut state, false));
+        assert_eq!(state.detail_edit.as_ref().unwrap().text, "C; D");
+
+        state.detail_edit = Some(super::super::text_input::TextInputState::new(
+            " E ; ; F ; G ".to_string(),
+        ));
+        assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["E", "F", "G"]
+        );
+    }
+
+    #[test]
+    fn detail_whole_field_paste_maps_short_exact_and_overflow_scalar_lines() {
+        let make_state = || {
+            let mut state = two_file_editor(vec![entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["One", "Two"],
+                &["One", "Two"],
+            )]);
+            state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+            state.detail_field_idx = 0;
+            state
+        };
+
+        let mut short = make_state();
+        assert_eq!(metadata_editor_apply_detail_whole_field_text(&mut short, 0, "Alpha"), 1);
+        assert_eq!(short.active_surface().entries[0].per_file_values[0].as_str(), "Alpha");
+        assert_eq!(short.active_surface().entries[0].per_file_values[1].as_str(), "Two");
+
+        let mut exact = make_state();
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(&mut exact, 0, "Alpha\nBeta"),
+            2
+        );
+        assert_eq!(exact.active_surface().entries[0].per_file_values[0].as_str(), "Alpha");
+        assert_eq!(exact.active_surface().entries[0].per_file_values[1].as_str(), "Beta");
+
+        let mut overflow = make_state();
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(
+                &mut overflow,
+                0,
+                "Alpha\nBeta\nDropped",
+            ),
+            2
+        );
+        assert_eq!(overflow.active_surface().entries[0].per_file_values[0].as_str(), "Alpha");
+        assert_eq!(overflow.active_surface().entries[0].per_file_values[1].as_str(), "Beta");
+
+        let mut trailing_blank = make_state();
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(&mut trailing_blank, 0, "Alpha\r\n"),
+            2,
+            "split-by-newline semantics must preserve a final empty clipboard line",
+        );
+        assert_eq!(
+            trailing_blank.active_surface().entries[0].per_file_values[0].as_str(),
+            "Alpha"
+        );
+        assert_eq!(
+            trailing_blank.active_surface().entries[0].per_file_values[1].as_str(),
+            "",
+            "an explicit blank second line clears the second scalar slot",
+        );
+    }
+
+    #[test]
+    fn detail_whole_field_paste_splits_each_set_valued_line_and_drops_overflow() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::TrackArtist,
+            &["Old A", "Old B"],
+            &["Old A", "Old B"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old A"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old B"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+        let mut state = two_file_editor(vec![performer]);
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(
+                &mut state,
+                0,
+                "Jimmy Page; John Bonham\nJohn Paul Jones; ; Robert Plant\nIgnored",
+            ),
+            2
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["Jimmy Page", "John Bonham"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["John Paul Jones", "Robert Plant"]
+        );
+        assert!(state.active_surface().entries[0].is_mixed);
+    }
+
+    #[test]
+    fn detail_whole_field_paste_clamps_member_cursor_after_list_shrinks() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["A; B; C", "D; E; F"],
+            &["A; B; C", "D; E; F"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B", "C"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["D", "E", "F"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+
+        let mut state = Box::new(two_file_editor(vec![performer]));
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_cursor = 0;
+        state.detail_value_cursor = 2;
+
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(&mut state, 0, "X"),
+            1
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["X"]
+        );
+        assert_eq!(state.detail_value_cursor, 0);
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].value_count(),
+            0,
+            "the secondary delete action must remain usable immediately after paste"
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["D", "E", "F"]
+        );
+    }
+
+    #[test]
+    fn reverting_field_paste_preserves_later_edits_to_other_fields() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::TrackArtist,
+            &["Old A", "Old B"],
+            &["Old A", "Old B"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old A"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old B"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+        let title = entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Title 1", "Title 2"],
+            &["Title 1", "Title 2"],
+        );
+        let mut state = two_file_editor(vec![performer, title]);
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(
+                &mut state,
+                0,
+                "New A; New A2\nNew B",
+            ),
+            2
+        );
+        assert!(metadata_editor_has_detail_paste_snapshot(&state, 0));
+
+        // Leave the detail view, make a later TITLE edit, then reopen the
+        // original field. Rejecting the paste must restore only PERFORMER.
+        state.phase = crate::tui::app::MetadataEditorPhase::Editing;
+        assert_eq!(
+            metadata_editor_apply_inline_value_to_writable_slots(
+                &mut state,
+                1,
+                "Later title edit".to_string(),
+            ),
+            2
+        );
+        assert_eq!(
+            metadata_editor_begin_detail_edit_for_entry(&mut state, 0, false),
+            None
+        );
+        assert!(metadata_editor_revert_detail_field_paste(&mut state, 0));
+
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["Old A"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["Old B"]
+        );
+        for title_slot in &state.active_surface().entries[1].per_file_values {
+            assert_eq!(title_slot.as_str(), "Later title edit");
+        }
+        assert!(!metadata_editor_has_detail_paste_snapshot(&state, 0));
+    }
+
+    #[test]
+    fn detail_ctrl_copy_paste_round_trips_per_track_ordered_lists_across_editors() {
+        let mut source_entry = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["A; B", "C; D"],
+            &["A; B", "C; D"],
+        );
+        source_entry.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        source_entry.per_file_originals = source_entry.per_file_values.clone();
+        source_entry.is_mixed = true;
+        source_entry.value = "<multiple values>".to_string();
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut source = Box::new(two_file_editor(vec![source_entry]));
+        source.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        source.detail_field_idx = 0;
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut source,
+            &tx,
+        );
+        let copied = app.metadata_field_clipboard.as_ref().expect("field clipboard");
+        assert_eq!(copied.key, "PERFORMER");
+        assert_eq!(copied.values[0].to_texts(), ["A", "B"]);
+        assert_eq!(copied.values[1].to_texts(), ["C", "D"]);
+
+        let mut target_entry = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["Old 1", "Old 2"],
+            &["Old 1", "Old 2"],
+        );
+        // Genuinely track-scoped rows must not be skipped by this direct field
+        // clipboard path.
+        target_entry.row_scope = crate::tui::probe::RowScope::Track;
+        let mut target = Box::new(two_file_editor(vec![target_entry]));
+        target.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        target.detail_field_idx = 0;
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &mut target,
+            &tx,
+        );
+
+        assert_eq!(target.active_surface().entries[0].per_file_values[0].to_texts(), ["A", "B"]);
+        assert_eq!(target.active_surface().entries[0].per_file_values[1].to_texts(), ["C", "D"]);
+        assert!(target.active_surface().entries[0].is_mixed);
+    }
+
+    #[test]
+    fn field_clipboard_is_lenient_on_count_but_exact_for_custom_field_names() {
+        assert!(metadata_field_keys_match("Album Artist", "ALBUMARTIST"));
+        assert!(metadata_field_keys_match("Year", "DATE"));
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.metadata_field_clipboard = Some(crate::tui::tag_interchange::FieldBlock {
+            key: "CUSTOM Field".to_string(),
+            values: vec![
+                crate::tui::probe::MetadataFieldValues::from_scalar("One"),
+                crate::tui::probe::MetadataFieldValues::from_scalar("Overflow"),
+                crate::tui::probe::MetadataFieldValues::from_scalar("Dropped"),
+            ],
+        });
+        let mut custom = entry(
+            "CUSTOM Field",
+            ItemKey::Unknown("CUSTOM Field".to_string()),
+            &["Old", "Keep"],
+            &["Old", "Keep"],
+        );
+        custom.row_scope = crate::tui::probe::RowScope::Track;
+        let mut state = two_file_editor(vec![custom]);
+        state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        let report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
+        assert_eq!(report.changed_slots, 2);
+        assert!(!report.collapsed_stored_values);
+        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "One");
+        assert_eq!(state.active_surface().entries[0].per_file_values[1].as_str(), "Overflow");
+
+        // A short source updates only the matching prefix and preserves the
+        // remaining target slot. The inverse (more source slots than target
+        // slots) is covered above by positional `.take(slot_count)` semantics.
+        app.metadata_field_clipboard = Some(crate::tui::tag_interchange::FieldBlock {
+            key: "CUSTOM Field".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Short")],
+        });
+        let short_report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
+        assert_eq!(short_report.changed_slots, 1);
+        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "Short");
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].as_str(),
+            "Overflow",
+            "fill-short must leave unmatched target positions intact",
+        );
+
+        app.metadata_field_clipboard = Some(crate::tui::tag_interchange::FieldBlock {
+            key: "custom field".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Wrong")],
+        });
+        let err = metadata_editor_paste_detail_field(&mut app, &mut state)
+            .expect_err("custom field names are exact, not case-canonicalized");
+        assert!(err.contains("clipboard contains"));
     }
 
     #[test]
@@ -55249,6 +56868,119 @@ ignored".to_string()),
             app.browse_inline_edit.as_ref().unwrap().input.text,
             "oldnew-name",
             "single-line editors must consume only the first host-clipboard line"
+        );
+    }
+
+    #[test]
+    fn host_clipboard_metadata_inline_uses_only_first_line_before_list_commit() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["Old", "Old"],
+            &["Old", "Old"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Old"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.value = "Old".to_string();
+        performer.original = performer.value.clone();
+
+        let mut state = two_file_editor(vec![performer]);
+        state.cursor = 0;
+        assert_eq!(
+            metadata_editor_begin_cursor_value_edit(&mut state, true),
+            None
+        );
+        state.edit_input = Some(crate::tui::text_input::TextInputState::new(String::new()));
+        let session_id = state.active_surface().technical_details.session_id;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.host_clipboard_paste_generation = 17;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        handle_host_clipboard_read_complete(
+            &mut app,
+            17,
+            super::super::message::HostClipboardPasteTarget::MetadataInline {
+                session_id,
+                field_index: 0,
+            },
+            Ok("A; B\nC; D".to_string()),
+        );
+
+        let ActiveOverlay::MetadataEditor(mut state) =
+            std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+        else {
+            panic!("metadata editor must remain open");
+        };
+        assert_eq!(state.edit_input.as_ref().unwrap().text, "A; B");
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "B"]);
+        }
+    }
+
+    #[test]
+    fn host_clipboard_metadata_detail_uses_only_first_line_and_keeps_track_focus() {
+        let mut performer = entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &["A; B", "C; D"],
+            &["A; B", "C; D"],
+        );
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = true;
+        performer.value = "<multiple values>".to_string();
+
+        let mut state = two_file_editor(vec![performer]);
+        assert_eq!(
+            metadata_editor_begin_detail_edit_for_entry(&mut state, 0, false),
+            None
+        );
+        state.detail_cursor = 1;
+        let mut setup_app = AppState::new_for_test(TonepoetConfig::default());
+        assert!(metadata_editor_begin_set_value_edit(
+            &mut setup_app,
+            &mut state,
+            false,
+        ));
+        state.detail_edit = Some(crate::tui::text_input::TextInputState::new(String::new()));
+        let session_id = state.active_surface().technical_details.session_id;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.host_clipboard_paste_generation = 23;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        handle_host_clipboard_read_complete(
+            &mut app,
+            23,
+            super::super::message::HostClipboardPasteTarget::MetadataDetail {
+                session_id,
+                field_index: 0,
+                detail_index: 1,
+            },
+            Ok("X; Y\nZ".to_string()),
+        );
+
+        let ActiveOverlay::MetadataEditor(mut state) =
+            std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+        else {
+            panic!("metadata editor must remain open");
+        };
+        assert_eq!(state.detail_cursor, 1);
+        assert_eq!(state.detail_edit.as_ref().unwrap().text, "X; Y");
+        assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["X", "Y"]
         );
     }
 
@@ -55475,7 +57207,9 @@ ignored".to_string()),
         assert_eq!(state.active_surface().entries[0].value, "Solo Artist");
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("metadata editor: editing ARTIST collapsed multiple stored values into one value")
+            Some(
+                "metadata editor: editing ARTIST reduced the stored multi-value list for one or more files"
+            )
         );
     }
 
@@ -55524,7 +57258,7 @@ ignored".to_string()),
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some(
-                "metadata editor: editing ARTIST for this file collapsed multiple stored values into one value"
+                "metadata editor: editing ARTIST reduced the stored multi-value list for this track"
             )
         );
         assert_eq!(
@@ -63106,6 +64840,68 @@ ignored".to_string()),
     }
 
     #[test]
+    fn sacd_copy_tag_reader_yields_real_per_track_titles_without_audio_decode() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("copy-tags.iso");
+        let md = make_hybrid_md();
+        write_hybrid_iso_fixture(&iso_path, &md);
+
+        let entries = read_sacd_tag_entries_for_copy(&iso_path).expect("SACD tag read");
+        let title = entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE row");
+        assert_eq!(title.per_file_values.len(), 2);
+        assert_eq!(title.per_file_values[0].as_str(), "StereoT1");
+        assert_eq!(title.per_file_values[1].as_str(), "StereoT2");
+        assert!(title.is_mixed);
+        for synthetic_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.display_key.eq_ignore_ascii_case(synthetic_key)),
+                "SACD Copy tags must not expose synthetic blank {synthetic_key}"
+            );
+        }
+        let serialized = super::super::tag_interchange::serialize_tag_entries(entries.iter());
+        for synthetic_key in ["TRACKTOTAL", "DISCNUMBER", "DISCTOTAL"] {
+            assert!(
+                !serialized
+                    .keys
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(synthetic_key)),
+                "serialized SACD Copy tags must omit {synthetic_key}"
+            );
+            assert!(
+                !serialized.text.contains(synthetic_key),
+                "serialized SACD Copy tags text must omit {synthetic_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn sacd_copy_tag_reader_falls_back_to_scarletbook_when_sidecar_is_malformed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("copy-tags-malformed-sidecar.iso");
+        let md = make_hybrid_md();
+        write_hybrid_iso_fixture(&iso_path, &md);
+        let sidecar_path = super::super::sacd_sidecar::expected_sidecar_path_for_iso(&iso_path)
+            .expect("same-stem SACD sidecar path");
+        std::fs::write(&sidecar_path, b"<root><store id=\"truncated\"")
+            .expect("write malformed sidecar");
+
+        let entries = read_sacd_tag_entries_for_copy(&iso_path)
+            .expect("malformed optional sidecar must fall back to ScarletBook");
+        let title = entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE row");
+        assert_eq!(title.per_file_values.len(), 2);
+        assert_eq!(title.per_file_values[0].as_str(), "StereoT1");
+        assert_eq!(title.per_file_values[1].as_str(), "StereoT2");
+    }
+
+    #[test]
     fn switch_area_to_mch_lands_on_mch_area() {
         let (state, res) = switch_helper(super::super::command::SacdAreaTarget::MultiChannel);
         assert_eq!(res.unwrap(), "MCH");
@@ -66142,6 +67938,7 @@ mod single_image_metadata_editor_regression_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: crate::tui::app::TagTransferScope::All,
+                field_key: None,
                 source_entries: vec![cuesheet_tag_entry(&changed, &original)],
                 source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
                 result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {
@@ -76598,6 +78395,7 @@ mod mb_picker_verification_lifecycle_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 source_entries: vec![album_entry("Unsaved Album")],
                 source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
                 result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {
@@ -77020,6 +78818,7 @@ mod metadata_editor_inline_navigation_tests {
             crate::tui::app::FilePickerPurpose::MetadataTagTransfer {
                 direction: crate::tui::app::TagTransferDirection::To,
                 scope: crate::tui::app::TagTransferScope::All,
+                field_key: None,
                 metadata_target_priority,
             } if metadata_target_priority.as_slice()
                 == &[IndividualFiles, EmbeddedCue, SidecarCue]

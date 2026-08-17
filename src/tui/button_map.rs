@@ -185,6 +185,11 @@ pub enum TuiButton {
     /// MetadataEditor detail-overlay restore pill (per-file values
     /// snap back to the as-retrieved MB proposal).
     MetadataDetailRestore,
+    /// MetadataEditor detail-overlay whole-field host clipboard paste.
+    MetadataDetailPasteWholeField,
+    /// MetadataEditor detail-overlay field-scoped rejection of the latest
+    /// whole-field paste for the current field.
+    MetadataDetailRevertPaste,
     /// MetadataEditor Details tab: analyze HDCD + non-spectral PRE facts.
     MetadataDetailsAnalyze,
     /// MetadataEditor ReplayGain tab: scan all active tracks.
@@ -431,6 +436,8 @@ impl TuiButton {
             | Self::MetadataEntryView(_)
             | Self::MetadataDetailRevert
             | Self::MetadataDetailRestore
+            | Self::MetadataDetailPasteWholeField
+            | Self::MetadataDetailRevertPaste
             | Self::MetadataDetailsAnalyze
             | Self::MetadataReplayGainScanTrack
             | Self::MetadataReplayGainScanAlbum

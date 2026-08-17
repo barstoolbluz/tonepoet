@@ -6327,6 +6327,9 @@ pub enum FilePickerPurpose {
     MetadataTagTransfer {
         direction: TagTransferDirection,
         scope: TagTransferScope,
+        /// Optional detail-overlay field scope. Standard metadata fields are
+        /// matched canonically; custom fields retain exact-name semantics.
+        field_key: Option<String>,
         /// Frozen active order for classifying a directory selected by this
         /// transfer operation.
         metadata_target_priority: Vec<crate::config::AggregateMetadataTarget>,
@@ -7829,6 +7832,18 @@ impl PresentationTab {
 /// - Background worker results enter via explicit reduction methods.
 /// - Read-only tab scroll values are clamped before they are stored.
 #[derive(Debug, Clone)]
+pub struct MetadataDetailPasteSnapshot {
+    /// Surface identity prevents a snapshot from crossing presentation/editor
+    /// ownership even if a row index is later reused.
+    pub session_id: u64,
+    /// Canonical field identity survives row insertion/reordering inside the
+    /// same editor session better than a positional index alone.
+    pub field_key: String,
+    /// Exact pre-paste per-slot ordered values for field-scoped rejection.
+    pub per_file_values: Vec<crate::tui::probe::MetadataFieldValues>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MetadataEditorModel {
     /// Active file-backed surface when the editor is not presentation-backed.
     pub file_surface: PresentationTab,
@@ -7851,14 +7866,19 @@ pub struct MetadataEditorModel {
     pub detail_cursor: usize,
     /// Selected value within the current detail slot for set-valued fields.
     pub detail_value_cursor: usize,
-    /// True when a set-valued field is shared across all slots and detail
-    /// mutations should fan out to every writable slot.
+    /// Explicit detail-edit scope toggle for set-valued fields. False is the
+    /// safe/default per-slot mode; true fans detail mutations out to every
+    /// writable slot until the user toggles it off or closes the detail view.
     pub detail_apply_shared: bool,
     /// True while the detail input is creating a new value rather than
     /// replacing the selected value.
     pub detail_edit_add: bool,
     pub detail_scroll: usize,
     pub detail_edit: Option<crate::tui::text_input::TextInputState>,
+    /// Latest rejectable whole-field clipboard paste for each field in this
+    /// editor session. Snapshots intentionally outlive the detail sub-view so
+    /// rejecting a paste never requires discarding unrelated later edits.
+    pub detail_paste_snapshots: Vec<MetadataDetailPasteSnapshot>,
     pub mb_back: Option<MbBackCache>,
     pub gnudb_back: Option<Box<GnudbReviewState>>,
     /// One MusicBrainz lookup may own an editor session at a time.
@@ -7918,6 +7938,7 @@ impl Default for MetadataEditorModel {
             detail_edit_add: false,
             detail_scroll: 0,
             detail_edit: None,
+            detail_paste_snapshots: Vec::new(),
             mb_back: None,
             gnudb_back: None,
             tags_mb_in_flight: false,
@@ -11404,6 +11425,11 @@ pub struct AppState {
     /// restored after the command executes or review completes.
     pub pending_metadata_editor: Option<Box<MetadataEditorState>>,
 
+    /// Structured field clipboard for cross-folder Copy/Paste in the metadata
+    /// detail overlay. App ownership is deliberate: it survives overlay close,
+    /// Browse navigation, and tab switches while retaining per-track lists.
+    pub metadata_field_clipboard: Option<crate::tui::tag_interchange::FieldBlock>,
+
     /// Browse-screen archive metadata extraction currently in flight. This owns
     /// the temporary staging directory until a matching completion opens the
     /// editor or an error/stale result cleans it up.
@@ -12495,6 +12521,7 @@ impl AppState {
             browse_context_action_paths: None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
+            metadata_field_clipboard: None,
             pending_browse_archive_metadata: None,
             pending_browse_archive_rename: None,
             pending_browse_archive_delete: None,
@@ -18230,6 +18257,7 @@ mod metadata_presentation_tab_tests {
             FilePickerPurpose::MetadataTagTransfer {
                 direction: TagTransferDirection::From,
                 scope: TagTransferScope::All,
+                field_key: None,
                 metadata_target_priority: Vec::new(),
             },
             FilePickerPurpose::Generic {

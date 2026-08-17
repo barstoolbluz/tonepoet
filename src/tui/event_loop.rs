@@ -1186,6 +1186,7 @@ fn reduce_file_picker_complete(
         super::app::FilePickerPurpose::MetadataTagTransfer {
             direction,
             scope,
+            field_key,
             metadata_target_priority,
         } => {
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
@@ -1228,10 +1229,26 @@ fn reduce_file_picker_complete(
                         state.begin_tag_transfer_preparation();
                     match direction {
                         super::app::TagTransferDirection::To => {
-                            let (source_entries, source_dimension) =
+                            let (mut source_entries, source_dimension) =
                                 super::tag_interchange::metadata_editor_transfer_snapshot(&state);
+                            if let Some(field_key) = field_key.as_deref() {
+                                source_entries.retain(|entry| {
+                                    super::keybindings::metadata_field_keys_match(
+                                        &entry.display_key,
+                                        field_key,
+                                    )
+                                });
+                                if source_entries.len() != 1 {
+                                    app.set_status(format!(
+                                        "metadata editor: selected field {field_key} is no longer uniquely available"
+                                    ));
+                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                                    return true;
+                                }
+                            }
                             let worker_tx = tx.clone();
                             let worker_priority = metadata_target_priority.clone();
+                            let worker_field_key = field_key.clone();
                             app.set_status("metadata editor: resolving tag-transfer target carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
@@ -1251,6 +1268,7 @@ fn reduce_file_picker_complete(
                                         editor_session,
                                         editor_fingerprint,
                                         scope,
+                                        field_key: worker_field_key,
                                         source_entries,
                                         source_dimension,
                                         result,
@@ -1261,6 +1279,7 @@ fn reduce_file_picker_complete(
                         super::app::TagTransferDirection::From => {
                             let worker_tx = tx.clone();
                             let worker_priority = metadata_target_priority.clone();
+                            let worker_field_key = field_key.clone();
                             app.set_status("metadata editor: reading tag-transfer source carrier...");
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
@@ -1289,6 +1308,7 @@ fn reduce_file_picker_complete(
                                         editor_session,
                                         editor_fingerprint,
                                         scope,
+                                        field_key: worker_field_key,
                                         result,
                                     })
                                     .await;
@@ -1984,13 +2004,19 @@ fn reduce_file_task_complete(
     // Completion reduction must remain control-plane-only. Directory scans run
     // on the existing cancellable scan worker; tree rebuilding and selection
     // probes can synchronously touch a dead mount and therefore do not run here.
-    if all_completed {
-        app.browse.cursor_restore_target = completed_destinations
-            .last()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned());
-        app.browse.cursor_restore_scroll_offset = None;
-        app.browse.refresh_after_file_task_nonblocking();
+    // Refresh every open Browse tab that actually displays a successful
+    // destination parent. Transfers can be minimized while the user switches
+    // tabs, so the active tab is not necessarily the destination anymore.
+    let destination_refreshed_tabs =
+        refresh_browse_destination_views_after_file_task(app, &completed_destinations);
+    if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
+        && !completed_sources.is_empty()
+    {
+        refresh_browse_source_views_after_move(
+            app,
+            &completed_sources,
+            &destination_refreshed_tabs,
+        );
     }
 
     let mut status = if all_completed {
@@ -2048,6 +2074,90 @@ fn reduce_file_task_complete(
         app.set_routine_file_operation_status(status);
     }
     finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+}
+
+fn refresh_browse_destination_views_after_file_task(
+    app: &mut AppState,
+    completed_destinations: &[std::path::PathBuf],
+) -> std::collections::BTreeSet<crate::tui::browse::BrowseTabId> {
+    let mut destination_targets = std::collections::BTreeMap::new();
+    for destination in completed_destinations {
+        let Some(parent) = destination.parent() else {
+            continue;
+        };
+        destination_targets.insert(
+            parent.to_path_buf(),
+            destination
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+        );
+    }
+    if destination_targets.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+
+    let tab_ids = app
+        .browse
+        .tab_infos()
+        .into_iter()
+        .map(|info| info.id)
+        .collect::<Vec<_>>();
+    let mut refreshed_tabs = std::collections::BTreeSet::new();
+    for tab_id in tab_ids {
+        let Some(tab) = app.browse.tab_mut(tab_id) else {
+            continue;
+        };
+        let Some(restore_target) = destination_targets.get(&tab.current_dir) else {
+            continue;
+        };
+
+        tab.cursor_restore_target = restore_target.clone();
+        tab.cursor_restore_scroll_offset = None;
+        tab.refresh_after_file_task_nonblocking();
+        refreshed_tabs.insert(tab_id);
+    }
+    refreshed_tabs
+}
+
+fn refresh_browse_source_views_after_move(
+    app: &mut AppState,
+    completed_sources: &[std::path::PathBuf],
+    destination_refreshed_tabs: &std::collections::BTreeSet<crate::tui::browse::BrowseTabId>,
+) {
+    let source_parents = completed_sources
+        .iter()
+        .filter_map(|source| source.parent().map(std::path::Path::to_path_buf))
+        .collect::<std::collections::BTreeSet<_>>();
+    if source_parents.is_empty() {
+        return;
+    }
+
+    let tab_ids = app
+        .browse
+        .tab_infos()
+        .into_iter()
+        .map(|info| info.id)
+        .collect::<Vec<_>>();
+    for tab_id in tab_ids {
+        let Some(tab) = app.browse.tab_mut(tab_id) else {
+            continue;
+        };
+
+        // Tree invalidation is deterministic from the completed move plan and
+        // requires no filesystem access. It also closes the expanded-sidebar
+        // stale-node gap when no tab is currently displaying the source parent.
+        tab.prune_tree_paths_after_move(completed_sources);
+
+        // A tab already refreshed because it displays a successful destination
+        // parent must not receive a second source scan/cancel cycle (notably for
+        // same-directory moves). Every other tab displaying a source parent is
+        // refreshed regardless of which tab happens to be active now.
+        if source_parents.contains(&tab.current_dir)
+            && !destination_refreshed_tabs.contains(&tab_id)
+        {
+            tab.refresh_after_file_task_nonblocking();
+        }
+    }
 }
 
 pub(super) fn finalize_file_transfer_scheduler(
@@ -4331,6 +4441,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             editor_session,
             editor_fingerprint,
             scope,
+            field_key,
             source_entries,
             source_dimension,
             result,
@@ -4371,9 +4482,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         app.set_status(error);
                         return;
                     }
-                    let edit_count = super::tag_interchange::metadata_editor_unsaved_edit_count(
-                        &taken.state,
-                    );
+                    let edit_count = if field_key.is_some() {
+                        source_entries
+                            .iter()
+                            .filter(|entry| {
+                                entry.value != entry.original
+                                    || entry.per_file_values != entry.per_file_originals
+                                    || entry.mb_proposed_value.is_some()
+                                    || entry.mb_proposed_per_file.is_some()
+                            })
+                            .count()
+                    } else {
+                        super::tag_interchange::metadata_editor_unsaved_edit_count(&taken.state)
+                    };
                     if edit_count > 0 {
                         let target_label = target.label();
                         let target_count = target.count();
@@ -4384,14 +4505,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         };
                         app.pending_metadata_editor = Some(taken.state);
                         app.active_overlay = ActiveOverlay::Confirmation {
-                            message: format!(
-                                "Transfer {} unsaved edit{} to {} ({} {})?",
-                                edit_count,
-                                if edit_count == 1 { "" } else { "s" },
-                                target_label,
-                                target_count,
-                                target_unit,
-                            ),
+                            message: if let Some(field_key) = field_key.as_deref() {
+                                format!(
+                                    "Transfer unsaved {field_key} edits to {target_label} ({target_count} {target_unit})?"
+                                )
+                            } else {
+                                format!(
+                                    "Transfer {} unsaved edit{} to {} ({} {})?",
+                                    edit_count,
+                                    if edit_count == 1 { "" } else { "s" },
+                                    target_label,
+                                    target_count,
+                                    target_unit,
+                                )
+                            },
                             action: super::app::ConfirmAction::MetadataTransferUnsaved {
                                 source_entries,
                                 source_dimension,
@@ -4431,6 +4558,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             editor_session,
             editor_fingerprint,
             scope,
+            field_key,
             result,
         } => {
             let Some(mut taken) = take_metadata_editor_with_restore_slot(app) else {
@@ -4458,7 +4586,22 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
 
             match result {
-                Ok((entries, source_dimension, source_carrier)) => {
+                Ok((mut entries, source_dimension, source_carrier)) => {
+                    if let Some(field_key) = field_key.as_deref() {
+                        entries.retain(|entry| {
+                            super::keybindings::metadata_field_keys_match(
+                                &entry.display_key,
+                                field_key,
+                            )
+                        });
+                        if entries.len() != 1 {
+                            restore_taken_metadata_editor(app, taken);
+                            app.set_status(format!(
+                                "metadata editor: source does not contain exactly one matching {field_key} field"
+                            ));
+                            return;
+                        }
+                    }
                     match super::tag_interchange::apply_transfer_entries_to_editor_with_dimension(
                         &mut taken.state,
                         &entries,
@@ -7602,24 +7745,30 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 }
                 use super::app::MetadataEditorPhase;
                 if state.phase == MetadataEditorPhase::DetailEdit {
-                    let field_idx = state.detail_field_idx;
-                    if field_idx < state.active_surface().entries.len() {
-                        let display_key = state.active_surface().entries[field_idx]
-                            .display_key
-                            .clone();
-                        state.detail_edit = None;
-                        match super::keybindings::metadata_editor_apply_detail_paste(
-                            &mut state,
-                            field_idx,
-                            &text,
-                        ) {
-                            Ok(result) => app.set_status(
-                                super::keybindings::metadata_editor_detail_paste_status(
-                                    &display_key,
-                                    &result,
-                                ),
-                            ),
-                            Err(reason) => app.set_status(reason),
+                    if let Some(input) = state.detail_edit.as_mut() {
+                        // Detail row editors are single-line inputs. Keep terminal
+                        // paste on the focused editor; commit owns list parsing.
+                        let first_line = text.lines().next().unwrap_or("");
+                        for c in first_line.chars() {
+                            input.insert_char(c);
+                        }
+                    } else {
+                        let field_idx = state.detail_field_idx;
+                        if field_idx < state.active_surface().entries.len() {
+                            let changed =
+                                super::keybindings::metadata_editor_apply_detail_whole_field_text(
+                                    &mut state,
+                                    field_idx,
+                                    text,
+                                );
+                            app.set_status(if changed > 0 {
+                                format!(
+                                    "Pasted clipboard lines into {changed} track{}; review in the detail view before saving",
+                                    if changed == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                "Clipboard paste made no changes to this field".to_string()
+                            });
                         }
                     }
                 } else if state.phase == MetadataEditorPhase::InlineEdit {
@@ -8104,6 +8253,48 @@ mod metadata_detail_paste_tests {
         }
     }
 
+    fn set_valued_entry(key: &str, item_key: ItemKey, slots: &[&[&str]]) -> TagEntry {
+        let per_file_values = slots
+            .iter()
+            .map(|values| {
+                crate::tui::probe::MetadataFieldValues::from_stored_texts(
+                    values.iter().copied(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let is_mixed = per_file_values
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]);
+        let display = if is_mixed {
+            "<multiple values>".to_string()
+        } else {
+            per_file_values
+                .first()
+                .map(|values| values.as_str().to_string())
+                .unwrap_or_default()
+        };
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: key.to_string(),
+            item_key,
+            value: display.clone(),
+            original: display,
+            is_binary: false,
+            is_mixed,
+            has_multiple_stored_values: per_file_values
+                .iter()
+                .any(|values| values.value_count() > 1),
+            per_file_stored_value_counts: per_file_values
+                .iter()
+                .map(|values| values.value_count())
+                .collect(),
+            per_file_originals: per_file_values.clone(),
+            per_file_values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
     #[test]
     fn editing_phase_bracketed_paste_uses_block_then_row_classification_and_reports_errors() {
         let mut state = MetadataEditorState::for_files(
@@ -8149,22 +8340,12 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn detail_paste_status_keeps_cardinality_warning() {
-        let entry = TagEntry {
-            row_scope: RowScope::File,
-            display_key: "ARTIST".to_string(),
-            item_key: ItemKey::TrackArtist,
-            value: "<multiple values>".to_string(),
-            original: "<multiple values>".to_string(),
-            is_binary: false,
-            is_mixed: true,
-            has_multiple_stored_values: true,
-            per_file_stored_value_counts: vec![2, 1],
-            per_file_values: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
-            per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec!["Alpha; Beta".to_string(), "Gamma".to_string()]),
-            mb_proposed_value: None,
-            mb_proposed_per_file: None,
-        };
+    fn detail_bracketed_paste_without_row_editor_uses_list_aware_whole_field_path() {
+        let entry = set_valued_entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &[&["Old A"], &["Old B"]],
+        );
         let mut state = MetadataEditorState::for_files(
             vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
             vec![entry],
@@ -8177,27 +8358,99 @@ mod metadata_detail_paste_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
         let (tx, _rx) = mpsc::channel(8);
-        handle_paste(&mut app, "Solo\nDelta", &tx);
+        handle_paste(&mut app, "A; B\nC; D", &tx);
 
-        assert_eq!(
-            app.status_message
-                .as_ref()
-                .map(|(message, _)| message.as_str()),
-            Some(
-                "Pasted 2 values; warning: 1 carrier for ARTIST collapsed multiple stored values into one value"
-            ),
-        );
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
             panic!("metadata editor should remain open");
         };
         assert_eq!(
-            state.active_surface().entries[0].per_file_values,
-            vec!["Solo", "Delta"],
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
         );
         assert_eq!(
-            state.active_surface().entries[0].per_file_stored_value_counts,
-            vec![2, 1],
-            "paste must retain source-cardinality provenance until save reduction",
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+        assert!(super::super::keybindings::metadata_editor_has_detail_paste_snapshot(
+            state, 0
+        ));
+    }
+
+    #[test]
+    fn detail_bracketed_paste_with_row_editor_stays_in_focused_text_input() {
+        let entry = set_valued_entry(
+            "PERFORMER",
+            ItemKey::Performer,
+            &[&["A", "B"], &["C", "D"]],
+        );
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
+            vec![entry],
+            vec!["a".to_string(), "b".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        state.detail_cursor = 1;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should remain open");
+        };
+        assert_eq!(state.detail_cursor, 1);
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("C; D")
+        );
+
+        handle_paste(&mut app, "X; Y", &tx);
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should remain open after terminal paste");
+        };
+        assert_eq!(state.detail_cursor, 1);
+        assert_eq!(
+            state.detail_edit.as_ref().map(|input| input.text.as_str()),
+            Some("X; Y")
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["C", "D"]
+        );
+
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should remain open after commit");
+        };
+        assert!(state.detail_edit.is_none());
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[0].to_texts(),
+            ["A", "B"]
+        );
+        assert_eq!(
+            state.active_surface().entries[0].per_file_values[1].to_texts(),
+            ["X", "Y"]
         );
     }
 }
@@ -15447,6 +15700,7 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 source_entries: vec![title("Stale outbound")],
                 source_dimension: super::super::tag_interchange::TransferDimension::Files(1),
                 result: Ok(super::super::tag_interchange::TransferCarrier::Files {
@@ -15475,6 +15729,7 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 result: Ok((
                     vec![title("Current inbound")],
                     super::super::tag_interchange::TransferDimension::Files(1),
@@ -15534,6 +15789,7 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 result: Ok((
                     vec![title("Applied once")],
                     super::super::tag_interchange::TransferDimension::Files(1),
@@ -15564,6 +15820,7 @@ mod editor_tag_transfer_preparation_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 result: Ok((
                     vec![title("Duplicate delivery")],
                     super::super::tag_interchange::TransferDimension::Files(1),
@@ -17772,6 +18029,312 @@ mod minimized_file_transfer_attention_tests {
 mod browse_tab_async_routing_tests {
     use super::*;
     use crate::config::TonepoetConfig;
+
+    #[tokio::test]
+    async fn completed_move_refreshes_background_source_tab_and_prunes_sidebar_node() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_parent = temp.path().join("source-parent");
+        let destination = temp.path().join("destination");
+        let moved = source_parent.join("moved-album");
+        std::fs::create_dir_all(&moved).expect("moved source fixture");
+        std::fs::create_dir_all(&destination).expect("destination fixture");
+
+        let (tx, _rx) = mpsc::channel(32);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = source_parent.clone();
+        app.browse.set_tx(tx.clone());
+        let source_id = app.browse.active_tab_id();
+        let parent_depth = app
+            .browse
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == source_parent)
+            .map(|node| node.depth)
+            .unwrap_or(0);
+        app.browse.tree_nodes.push(crate::tui::browse::BrowseTreeNode {
+            path: moved.clone(),
+            name: "moved-album".to_string(),
+            depth: parent_depth.saturating_add(1),
+            expanded: true,
+            has_children: true,
+        });
+
+        assert!(app.browse.open_dir_in_new_tab(destination.clone(), true));
+        let destination_id = app.browse.active_tab_id();
+        assert_ne!(source_id, destination_id);
+        let completed_destination = destination.join("moved-album");
+        let destination_refreshed_tabs = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&completed_destination),
+        );
+        let destination_generation = app
+            .browse
+            .pending_scan_generation()
+            .expect("destination refresh scan");
+
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&moved),
+            &destination_refreshed_tabs,
+        );
+
+        assert_eq!(app.browse.active_tab_id(), destination_id);
+        assert_eq!(
+            app.browse.pending_scan_generation(),
+            Some(destination_generation),
+            "source invalidation must not restart/cancel the destination scan",
+        );
+        let source = app.browse.tab_mut(source_id).expect("source tab remains live");
+        assert_eq!(source.current_dir, source_parent);
+        assert!(
+            source.pending_scan_generation().is_some(),
+            "the background source parent needs its own tab-scoped refresh",
+        );
+        assert!(
+            !source.tree_nodes.iter().any(|node| node.path == moved),
+            "the stale expanded moved node must disappear immediately",
+        );
+    }
+
+    #[tokio::test]
+    async fn same_directory_move_does_not_restart_destination_scan_during_source_invalidation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("same-dir");
+        let moved_source = dir.join("old-album");
+        let moved_destination = dir.join("moved-album");
+        std::fs::create_dir_all(&dir).expect("same-dir fixture");
+
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = dir.clone();
+        app.browse.set_tx(tx);
+        let tab_id = app.browse.active_tab_id();
+        app.browse.tree_nodes.push(crate::tui::browse::BrowseTreeNode {
+            path: moved_source.clone(),
+            name: "old-album".to_string(),
+            depth: 1,
+            expanded: true,
+            has_children: true,
+        });
+
+        let destination_refreshed_tabs = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&moved_destination),
+        );
+        assert!(destination_refreshed_tabs.contains(&tab_id));
+        let destination_generation = app
+            .browse
+            .pending_scan_generation()
+            .expect("destination refresh scan");
+
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&moved_source),
+            &destination_refreshed_tabs,
+        );
+
+        assert_eq!(
+            app.browse.pending_scan_generation(),
+            Some(destination_generation),
+            "source invalidation must not restart a tab already refreshed as the destination",
+        );
+        assert!(
+            !app.browse.tree_nodes.iter().any(|node| node.path == moved_source),
+            "source tree pruning still applies even when the scan itself is deduplicated",
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_move_refreshes_active_source_parent_when_destination_scan_was_not_started() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_parent = temp.path().join("source-parent");
+        let moved = source_parent.join("moved-album");
+        std::fs::create_dir_all(&source_parent).expect("source parent fixture");
+
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = source_parent.clone();
+        app.browse.set_tx(tx);
+        assert!(app.browse.pending_scan_generation().is_none());
+
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&moved),
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert!(
+            app.browse.pending_scan_generation().is_some(),
+            "partial completion has no destination refresh to cover the active source parent",
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_cut_completion_refreshes_successful_source_parent_and_retains_failed_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_parent = temp.path().join("source-parent");
+        let destination = temp.path().join("destination");
+        let unrelated = temp.path().join("unrelated");
+        let moved = source_parent.join("moved-album");
+        let failed = source_parent.join("failed-album");
+        std::fs::create_dir_all(&source_parent).expect("source parent fixture");
+        std::fs::create_dir_all(&destination).expect("destination fixture");
+        std::fs::create_dir_all(&unrelated).expect("unrelated fixture");
+
+        let (tx, _rx) = mpsc::channel(32);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = source_parent.clone();
+        app.browse.set_tx(tx.clone());
+        let source_id = app.browse.active_tab_id();
+        assert!(app.browse.pending_scan_generation().is_none());
+        let parent_depth = app
+            .browse
+            .tree_nodes
+            .iter()
+            .find(|node| node.path == source_parent)
+            .map(|node| node.depth)
+            .unwrap_or(0);
+        app.browse.tree_nodes.push(crate::tui::browse::BrowseTreeNode {
+            path: moved.clone(),
+            name: "moved-album".to_string(),
+            depth: parent_depth.saturating_add(1),
+            expanded: true,
+            has_children: true,
+        });
+
+        assert!(app.browse.open_dir_in_new_tab(destination.clone(), true));
+        let destination_id = app.browse.active_tab_id();
+        assert_ne!(source_id, destination_id);
+        let destination_generation_before = app
+            .browse
+            .pending_scan_generation()
+            .expect("opening the destination tab starts its initial scan");
+
+        assert!(app.browse.open_dir_in_new_tab(unrelated.clone(), true));
+        let unrelated_id = app.browse.active_tab_id();
+        assert_ne!(unrelated_id, source_id);
+        assert_ne!(unrelated_id, destination_id);
+        let unrelated_generation_before = app
+            .browse
+            .pending_scan_generation()
+            .expect("opening the unrelated tab starts its initial scan");
+        let unrelated_cursor_restore_target_before = app.browse.cursor_restore_target.clone();
+
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![moved.clone(), failed.clone()],
+        )
+        .expect("cut clipboard");
+        app.browse
+            .replace_filesystem_clipboard_from_user(clipboard.clone());
+        let clipboard_owner_generation = app.browse.filesystem_clipboard_generation;
+        let moved_destination = destination.join("moved-album");
+        let failed_destination = destination.join("failed-album");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Cut,
+            mappings: vec![
+                tui_file_picker::PasteMapping {
+                    source: moved.clone(),
+                    destination: moved_destination.clone(),
+                },
+                tui_file_picker::PasteMapping {
+                    source: failed.clone(),
+                    destination: failed_destination.clone(),
+                },
+            ],
+        };
+        let session_id = 1401;
+        app.file_transfers.pending_by_session.insert(
+            session_id,
+            crate::tui::browse::PendingClipboardPaste {
+                session_id,
+                clipboard,
+                clipboard_owner_generation: Some(clipboard_owner_generation),
+                plan,
+                retry_plan: None,
+            },
+        );
+        app.file_transfers.active_session_id = Some(session_id);
+        let report = tui_file_picker::FileTaskCompletionReport {
+            is_move: true,
+            roots: vec![
+                tui_file_picker::FileTaskRootResult {
+                    source: moved.clone(),
+                    destination: moved_destination,
+                    disposition: tui_file_picker::FileTaskRootDisposition::Completed,
+                    message: None,
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
+                },
+                tui_file_picker::FileTaskRootResult {
+                    source: failed.clone(),
+                    destination: failed_destination,
+                    disposition: tui_file_picker::FileTaskRootDisposition::Failed,
+                    message: Some("simulated filesystem failure".to_string()),
+                    undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
+                    proof: None,
+                },
+            ],
+        };
+
+        reduce_file_task_complete(&mut app, session_id, report, None, &tx);
+
+        assert_eq!(
+            app.browse.active_tab_id(),
+            unrelated_id,
+            "completion must not switch away from the tab the user chose while the transfer ran",
+        );
+        assert_eq!(
+            app.browse.pending_scan_generation(),
+            Some(unrelated_generation_before),
+            "an unrelated active tab must not be rescanned just because a transfer completed",
+        );
+        assert_eq!(
+            app.browse.cursor_restore_target,
+            unrelated_cursor_restore_target_before,
+            "an unrelated active tab must not inherit the successful destination cursor target",
+        );
+        {
+            let destination_tab = app
+                .browse
+                .tab_mut(destination_id)
+                .expect("destination tab remains live");
+            assert_eq!(destination_tab.current_dir, destination);
+            assert!(
+                destination_tab
+                    .pending_scan_generation()
+                    .is_some_and(|generation| generation > destination_generation_before),
+                "the tab displaying the successful destination must receive the completion refresh",
+            );
+            assert_eq!(
+                destination_tab.cursor_restore_target.as_deref(),
+                Some("moved-album"),
+                "the cursor target belongs to the destination tab, not whichever tab is active",
+            );
+        }
+        let source = app.browse.tab_mut(source_id).expect("source tab remains live");
+        assert_eq!(source.current_dir, source_parent);
+        assert!(
+            source.pending_scan_generation().is_some(),
+            "a successful root must invalidate its source parent even when a sibling root fails",
+        );
+        assert!(
+            !source.tree_nodes.iter().any(|node| node.path == moved),
+            "the successfully moved path must be pruned immediately",
+        );
+        assert_eq!(
+            app.browse
+                .filesystem_clipboard
+                .as_ref()
+                .expect("failed root remains on the Cut clipboard")
+                .paths(),
+            &[failed]
+        );
+    }
 
     #[tokio::test]
     async fn colliding_scan_generations_complete_into_the_owning_background_tab() {

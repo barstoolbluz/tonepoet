@@ -6497,10 +6497,11 @@ fn draw_metadata_detail(
             .get(state.detail_cursor)
             .map(super::probe::MetadataFieldValues::value_count)
             .unwrap_or(0);
-        if state.detail_apply_shared {
-            format!("  [shared · {selected_count} values]")
-        } else if entry.is_mixed {
+        let multiple_slots = entry.per_file_values.len() > 1;
+        if multiple_slots && entry.is_mixed {
             format!("  [differs across slots · {selected_count} values here]")
+        } else if multiple_slots {
+            format!("  [shared · {selected_count} values]")
         } else {
             format!("  [{selected_count} values]")
         }
@@ -6647,7 +6648,7 @@ fn draw_metadata_detail(
         // ImportCue rebuilds a GnudbReview with no editor session, so
         // running it from inside the editor would destroy unsaved edits
         // (the command itself also refuses while the editor is open).
-        Line::from(vec![
+        let mut pills = vec![
             footer_pill(
                 if set_valued && state.detail_edit_add {
                     "Enter add"
@@ -6659,7 +6660,20 @@ fn draw_metadata_detail(
             ),
             pill_gap(),
             footer_pill("Esc cancel", theme.purple, theme),
-        ])
+        ];
+        if set_valued {
+            pills.push(pill_gap());
+            pills.push(footer_pill(
+                if state.detail_apply_shared {
+                    "editing: ALL TRACKS"
+                } else {
+                    "editing: THIS TRACK"
+                },
+                theme.purple,
+                theme,
+            ));
+        }
+        Line::from(pills)
     } else {
         // Browsing per-file values. Append [revert]/[use MB] +
         // [restore] pills when MB populated this field, so the
@@ -6667,6 +6681,8 @@ fn draw_metadata_detail(
         // <multiple values> in the main editor (where the per-row
         // pill is hidden).
         let mut pills = Vec::new();
+        pills.push(footer_pill("tags", theme.blue, theme));
+        pills.push(pill_gap());
         let entry_opt = state.active_surface().entries.get(state.detail_field_idx);
         if let Some(entry) = entry_opt {
             if super::keybindings::is_fix_caps_applicable(&entry.display_key) {
@@ -6675,10 +6691,52 @@ fn draw_metadata_detail(
             }
         }
         if set_valued {
+            pills.push(footer_pill(
+                if state.detail_apply_shared {
+                    "editing: ALL TRACKS [s]"
+                } else {
+                    "editing: THIS TRACK [s]"
+                },
+                theme.purple,
+                theme,
+            ));
+            pills.push(pill_gap());
+        }
+
+        // Whole-field paste is deliberately a detail-overlay action: its
+        // per-track result is immediately reviewable in the rows below before
+        // the user saves. Record the exact pill rectangle after centering.
+        let paste_offset = pills
+            .iter()
+            .map(|span| super::display_width::width(span.content.as_ref()))
+            .sum::<usize>() as u16;
+        let paste_span = footer_pill("Paste from Clipboard [p]", theme.blue, theme);
+        let paste_w_chars = super::display_width::width(paste_span.content.as_ref()) as u16;
+        pills.push(paste_span);
+        pills.push(pill_gap());
+
+        let has_paste_snapshot = super::keybindings::metadata_editor_has_detail_paste_snapshot(
+            state,
+            state.detail_field_idx,
+        );
+        let mut paste_revert_offset: Option<u16> = None;
+        let mut paste_revert_w_chars: u16 = 0;
+        if has_paste_snapshot {
+            paste_revert_offset = Some(
+                pills
+                    .iter()
+                    .map(|span| super::display_width::width(span.content.as_ref()))
+                    .sum::<usize>() as u16,
+            );
+            let span = footer_pill("Undo Paste [u]", theme.amber, theme);
+            paste_revert_w_chars = super::display_width::width(span.content.as_ref()) as u16;
+            pills.push(span);
+            pills.push(pill_gap());
+        }
+
+        if set_valued {
             pills.extend_from_slice(&[
-                footer_pill("h/l value", theme.cyan, theme),
-                pill_gap(),
-                footer_pill("Enter edit", theme.green, theme),
+                footer_pill("Enter edit list", theme.green, theme),
                 pill_gap(),
                 footer_pill("a add", theme.green, theme),
                 pill_gap(),
@@ -6686,13 +6744,15 @@ fn draw_metadata_detail(
                 pill_gap(),
                 footer_pill("[/] reorder", theme.blue, theme),
                 pill_gap(),
-                footer_pill("j/k slot", theme.amber, theme),
+                footer_pill("j/k track", theme.amber, theme),
                 pill_gap(),
                 footer_pill("Esc back", theme.purple, theme),
             ]);
         } else {
             pills.extend_from_slice(&[
                 footer_pill("Enter edit", theme.green, theme),
+                pill_gap(),
+                footer_pill("j/k track", theme.amber, theme),
                 pill_gap(),
                 footer_pill("Esc back", theme.purple, theme),
             ]);
@@ -6745,6 +6805,16 @@ fn draw_metadata_detail(
             Paragraph::new(footer_line),
             Rect::new(render_x, footer_area.y, total_chars, 1),
         );
+        button_map.record_button(
+            super::button_map::TuiButton::MetadataDetailPasteWholeField,
+            Rect::new(render_x + paste_offset, footer_area.y, paste_w_chars, 1),
+        );
+        if let Some(off) = paste_revert_offset {
+            button_map.record_button(
+                super::button_map::TuiButton::MetadataDetailRevertPaste,
+                Rect::new(render_x + off, footer_area.y, paste_revert_w_chars, 1),
+            );
+        }
         if let Some(off) = revert_offset {
             button_map.record_button(
                 super::button_map::TuiButton::MetadataDetailRevert,
@@ -8838,6 +8908,107 @@ mod tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn metadata_detail_footer_renders_live_scope_and_registered_paste_button() {
+        let mut performer = tag("PERFORMER", "A; B", vec!["A; B", "A; B"]);
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["A", "B"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+        performer.is_mixed = false;
+        let mut state = MetadataEditorState::for_files(
+            vec![PathBuf::from("/tmp/01.flac"), PathBuf::from("/tmp/02.flac")],
+            vec![performer],
+            vec!["01".to_string(), "02".to_string()],
+            super::super::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = super::super::app::MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+
+        let render = |state: &MetadataEditorState| {
+            let backend = ratatui::backend::TestBackend::new(180, 12);
+            let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+            let mut buttons = super::super::button_map::ButtonRenderMap::new();
+            terminal
+                .draw(|frame| {
+                    draw_metadata_detail(
+                        frame,
+                        state,
+                        Rect::new(0, 0, 180, 10),
+                        Rect::new(0, 10, 180, 1),
+                        180,
+                        10,
+                        &mut buttons,
+                        theme,
+                    )
+                })
+                .expect("draw detail");
+            let body = (0..10).fold(String::new(), |mut text, y| {
+                for x in 0..180 {
+                    text.push_str(terminal.backend().buffer().get(x, y).symbol());
+                }
+                text.push('\n');
+                text
+            });
+            let footer = (0..180).fold(String::new(), |mut text, x| {
+                text.push_str(terminal.backend().buffer().get(x, 10).symbol());
+                text
+            });
+            (body, footer, buttons)
+        };
+
+        let (uniform_per_track_body, per_track_footer, per_track_buttons) = render(&state);
+        assert!(uniform_per_track_body.contains("[shared · 2 values]"));
+        assert!(per_track_footer.contains("tags"));
+        assert!(per_track_footer.contains("editing: THIS TRACK [s]"));
+        assert!(per_track_footer.contains("Paste from Clipboard [p]"));
+        assert!((0..180).any(|x| {
+            per_track_buttons.find_button_at(x, 10)
+                == Some(super::super::button_map::TuiButton::MetadataDetailPasteWholeField)
+        }));
+
+        state.detail_apply_shared = true;
+        let (uniform_shared_body, shared_footer, _) = render(&state);
+        assert!(uniform_shared_body.contains("[shared · 2 values]"));
+        assert!(shared_footer.contains("editing: ALL TRACKS [s]"));
+        assert!(!shared_footer.contains("editing: THIS TRACK [s]"));
+
+        state.active_surface_mut().entries[0].per_file_values[1] =
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["C", "D"]);
+        state.active_surface_mut().entries[0].is_mixed = true;
+        state.detail_apply_shared = false;
+        let (mixed_per_track_body, mixed_per_track_footer, _) = render(&state);
+        assert!(mixed_per_track_body.contains("[differs across slots · 2 values here]"));
+        assert!(mixed_per_track_footer.contains("editing: THIS TRACK [s]"));
+
+        state.detail_apply_shared = true;
+        let (mixed_shared_body, mixed_shared_footer, _) = render(&state);
+        assert!(mixed_shared_body.contains("[differs across slots · 2 values here]"));
+        assert!(mixed_shared_footer.contains("editing: ALL TRACKS [s]"));
+
+        state.detail_edit = Some(super::super::text_input::TextInputState::new(
+            "A; C".to_string(),
+        ));
+        state.detail_apply_shared = false;
+        let (_, editing_per_track_footer, _) = render(&state);
+        assert!(editing_per_track_footer.contains("Enter confirm"));
+        assert!(editing_per_track_footer.contains("Esc cancel"));
+        assert!(editing_per_track_footer.contains("editing: THIS TRACK"));
+        assert!(!editing_per_track_footer.contains("editing: THIS TRACK [s]"));
+
+        state.detail_apply_shared = true;
+        let (_, editing_shared_footer, _) = render(&state);
+        assert!(editing_shared_footer.contains("Enter confirm"));
+        assert!(editing_shared_footer.contains("Esc cancel"));
+        assert!(editing_shared_footer.contains("editing: ALL TRACKS"));
+        assert!(!editing_shared_footer.contains("editing: THIS TRACK"));
+        assert!(!editing_shared_footer.contains("editing: ALL TRACKS [s]"));
     }
 
     fn metadata_state_with_read_state(

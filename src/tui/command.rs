@@ -116,6 +116,38 @@ where
         cancelled,
         "Copy tags",
         "Copy tags superseded by a newer request",
+        |path| matches!(
+            crate::convert::classify::classify_file(path),
+            crate::convert::classify::EntryKind::AudioFile(_)
+        ),
+        "audio files",
+    )
+}
+
+/// Bounded read-source expansion for metadata/tag lookup operations. Unlike
+/// the audio-only maintenance collector, this routes concrete files through
+/// the converter's authoritative source-admission boundary so CUE, archive,
+/// and supported optical-disc images are admitted consistently.
+pub(crate) fn expand_metadata_read_sources_limited<F>(
+    paths: &[PathBuf],
+    max_visited: usize,
+    max_sources: usize,
+    cancelled: F,
+    operation: &str,
+    cancellation_message: &str,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: Fn() -> bool,
+{
+    expand_audio_paths_limited_for_operation(
+        paths,
+        max_visited,
+        max_sources,
+        cancelled,
+        operation,
+        cancellation_message,
+        crate::convert::source_admission::is_direct_queue_source_path,
+        "sources",
     )
 }
 
@@ -138,6 +170,11 @@ where
         cancelled,
         "Transfer tags",
         "Transfer tags cancelled during bounded directory traversal",
+        |path| matches!(
+            crate::convert::classify::classify_file(path),
+            crate::convert::classify::EntryKind::AudioFile(_)
+        ),
+        "audio files",
     )
 }
 
@@ -148,6 +185,8 @@ fn expand_audio_paths_limited_for_operation<F>(
     cancelled: F,
     operation: &str,
     cancellation_message: &str,
+    admit: fn(&std::path::Path) -> bool,
+    item_label: &str,
 ) -> Result<Vec<PathBuf>, String>
 where
     F: Fn() -> bool,
@@ -167,23 +206,22 @@ where
         }
     }
 
-    fn push_audio(
+    fn push_path(
         path: PathBuf,
         out: &mut Vec<PathBuf>,
         seen: &mut HashSet<PathBuf>,
-        max_audio_files: usize,
+        max_items: usize,
         operation: &str,
+        admit: fn(&std::path::Path) -> bool,
+        item_label: &str,
     ) -> Result<(), String> {
-        if !matches!(
-            crate::convert::classify::classify_file(&path),
-            crate::convert::classify::EntryKind::AudioFile(_)
-        ) {
+        if !admit(&path) {
             return Ok(());
         }
         if seen.insert(queue_path_key(&path)) {
-            if out.len() >= max_audio_files {
+            if out.len() >= max_items {
                 return Err(format!(
-                    "{operation} refused: selection exceeds {max_audio_files} audio files"
+                    "{operation} refused: selection exceeds {max_items} {item_label}"
                 ));
             }
             out.push(path);
@@ -245,14 +283,30 @@ where
                     if cancelled() {
                         return Err(cancellation_message.to_string());
                     }
-                    push_audio(file, &mut out, &mut seen, max_audio_files, operation)?;
+                    push_path(
+                        file,
+                        &mut out,
+                        &mut seen,
+                        max_audio_files,
+                        operation,
+                        admit,
+                        item_label,
+                    )?;
                 }
                 // Reverse push preserves ascending depth-first traversal.
                 for directory in directories.into_iter().rev() {
                     stack.push((directory, true));
                 }
             } else {
-                push_audio(path, &mut out, &mut seen, max_audio_files, operation)?;
+                push_path(
+                    path,
+                    &mut out,
+                    &mut seen,
+                    max_audio_files,
+                    operation,
+                    admit,
+                    item_label,
+                )?;
             }
         }
     }
@@ -20463,6 +20517,44 @@ mod tag_copy_expansion_tests {
         .expect_err("directory entry must exceed traversal cap");
         assert!(traversal_err.contains("exceeds 1 filesystem entries"));
     }
+
+    #[test]
+    fn metadata_read_source_expansion_admits_cue_and_archive_via_source_admission() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let cue = root.join("album.cue");
+        let iso = root.join("album.iso");
+        let archive = root.join("album.zip");
+        let audio_path = root.join("track.flac");
+        fs::write(&cue, b"FILE \"track.flac\" WAVE\n").expect("cue");
+        fs::write(&archive, b"PK").expect("archive");
+        const SECTOR_SIZE: u64 = 2_048;
+        const MASTER_TOC_LSN: u64 = 510;
+        let mut iso_file = std::fs::File::create(&iso).expect("ISO fixture");
+        iso_file
+            .set_len((MASTER_TOC_LSN + 1) * SECTOR_SIZE)
+            .expect("size ISO fixture");
+        iso_file
+            .seek(SeekFrom::Start(MASTER_TOC_LSN * SECTOR_SIZE))
+            .expect("seek ISO fixture");
+        iso_file.write_all(b"SACDMTOC").expect("write SACD magic");
+        drop(iso_file);
+        audio(&audio_path);
+
+        let expanded = expand_metadata_read_sources_limited(
+            &[root.to_path_buf()],
+            32,
+            8,
+            || false,
+            "Copy tags",
+            "cancelled",
+        )
+        .expect("admitted sources");
+
+        assert_eq!(expanded, vec![cue, iso, archive, audio_path]);
+    }
 }
 
 #[cfg(test)]
@@ -20543,6 +20635,7 @@ mod round6_application_quit_lifecycle_tests {
                 editor_session,
                 editor_fingerprint,
                 scope: TagTransferScope::All,
+                field_key: None,
                 source_entries: vec![album_entry("Unsaved Album", "Original Album")],
                 source_dimension: crate::tui::tag_interchange::TransferDimension::Files(1),
                 result: Ok(crate::tui::tag_interchange::TransferCarrier::Files {

@@ -19628,6 +19628,65 @@ mod tests {
     }
 
     #[test]
+    fn distinct_per_track_performer_lists_round_trip_through_save_reopen_and_converter_read() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home("tonepoet-per-track-performer-roundtrip");
+        let temp = tempfile::tempdir().expect("per-track performer tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        std::fs::write(&first, NATIVE_FLAC_NUMBERING_FIXTURE).expect("first FLAC fixture");
+        std::fs::write(&second, NATIVE_FLAC_NUMBERING_FIXTURE).expect("second FLAC fixture");
+
+        write_all_tag_value_lists(
+            &first,
+            &[(ItemKey::Performer, owned_test_values(&["Alice", "Bob"]))],
+        )
+        .expect("write first PERFORMER list");
+        write_all_tag_value_lists(
+            &second,
+            &[(ItemKey::Performer, owned_test_values(&["Carol", "Dave", "Eve"]))],
+        )
+        .expect("write second PERFORMER list");
+
+        let reopened = read_all_tags_merged_with_metadata(&[first.clone(), second.clone()])
+            .expect("reopen merged editor metadata");
+        let performer = reopened
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "PERFORMER")
+            .expect("PERFORMER row after reopen");
+        assert_eq!(performer.per_file_values.len(), 2);
+        assert_eq!(performer.per_file_values[0].to_texts(), ["Alice", "Bob"]);
+        assert_eq!(
+            performer.per_file_values[1].to_texts(),
+            ["Carol", "Dave", "Eve"],
+        );
+        assert!(performer.is_mixed);
+
+        let (first_metadata, first_warnings, _) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &first,
+            )
+            .expect("converter read first track");
+        let (second_metadata, second_warnings, _) =
+            crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings(
+                &second,
+            )
+            .expect("converter read second track");
+        assert!(first_warnings.is_empty(), "unexpected first-track warnings: {first_warnings:?}");
+        assert!(second_warnings.is_empty(), "unexpected second-track warnings: {second_warnings:?}");
+        assert_eq!(
+            pipeline_metadata_values(&first_metadata.performer),
+            owned_test_values(&["Alice", "Bob"]),
+        );
+        assert_eq!(
+            pipeline_metadata_values(&second_metadata.performer),
+            owned_test_values(&["Carol", "Dave", "Eve"]),
+        );
+    }
+
+    #[test]
     fn mp4_repeatable_fields_round_trip_as_canonical_multi_data_atoms() {
         let _xdg = isolated_metadata_journal_home("tonepoet-mp4-native-multivalue-roundtrip");
         let (_temp, path) = copy_numbering_fixture("native-multi.m4a", MP4_NUMBERING_FIXTURE);

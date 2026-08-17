@@ -4511,6 +4511,34 @@ impl BrowseState {
         }
     }
 
+    /// Remove move-completed directory paths from the already materialized
+    /// sidebar tree without touching the filesystem. A subsequent directory
+    /// scan remains authoritative, but this makes source-side invalidation
+    /// immediate even when the source parent is visible only as an expanded
+    /// tree node rather than as a tab's current directory.
+    pub(crate) fn prune_tree_paths_after_move(&mut self, moved_sources: &[PathBuf]) {
+        if moved_sources.is_empty() || self.tree_nodes.is_empty() {
+            return;
+        }
+        let cursor_path = self.tree_nodes.get(self.tree_cursor).map(|node| node.path.clone());
+        self.tree_nodes.retain(|node| {
+            !moved_sources
+                .iter()
+                .any(|source| node.path == *source || node.path.starts_with(source))
+        });
+        if self.tree_nodes.is_empty() {
+            self.tree_nodes = initial_browse_tree_shell(&self.current_dir);
+            self.tree_cursor = 0;
+            self.tree_scroll = 0;
+            return;
+        }
+        self.tree_cursor = cursor_path
+            .as_ref()
+            .and_then(|path| self.tree_nodes.iter().position(|node| &node.path == path))
+            .unwrap_or_else(|| self.tree_cursor.min(self.tree_nodes.len().saturating_sub(1)));
+        self.ensure_tree_visible();
+    }
+
     /// Start an async directory scan. Cancels any in-flight scan first. The
     /// worker streams bounded batches; terminal completion remains authoritative.
     fn begin_async_scan(&mut self) {

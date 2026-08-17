@@ -144,6 +144,13 @@ pub enum HostClipboardPasteTarget {
         field_index: usize,
         detail_index: usize,
     },
+    /// Whole-field paste requested from inside the metadata detail overlay.
+    /// Unlike `MetadataDetail`, this maps clipboard lines to positional slots
+    /// and therefore guards the field/session rather than a transient cursor.
+    MetadataDetailWholeField {
+        session_id: u64,
+        field_index: usize,
+    },
     FilePickerOverlay {
         session_id: u64,
     },
@@ -246,6 +253,7 @@ pub enum AppMessage {
         editor_session: MetadataEditorSessionGuard,
         editor_fingerprint: u64,
         scope: crate::tui::app::TagTransferScope,
+        field_key: Option<String>,
         source_entries: Vec<crate::tui::probe::TagEntry>,
         source_dimension: crate::tui::tag_interchange::TransferDimension,
         result: Result<crate::tui::tag_interchange::TransferCarrier, String>,
@@ -258,6 +266,7 @@ pub enum AppMessage {
         editor_session: MetadataEditorSessionGuard,
         editor_fingerprint: u64,
         scope: crate::tui::app::TagTransferScope,
+        field_key: Option<String>,
         result: Result<(
             Vec<crate::tui::probe::TagEntry>,
             crate::tui::tag_interchange::TransferDimension,
