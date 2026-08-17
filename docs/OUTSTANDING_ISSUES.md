@@ -305,3 +305,69 @@ So the same underlying situation — an output with nowhere to put tags plus met
 3. **Optional metadata sidecar = keep the tags alongside (opt-in, off by default).** Since these formats can't embed tags, write a **companion sidecar**: a **CUE sidecar** is the natural carrier (standard for headerless/raw audio; tonepoet already *generates* CUE sheets via `crates/tonepoet-features/src/cue_generator.rs` **and** already reads sidecar CUEs as conversion sources, so it round-trips), **or** a lighter `.json`/`.txt` sidecar, **or** lean on the conversion log (already captures per-track metadata). Gate behind a config toggle / CLI flag (e.g. `--metadata-sidecar`).
 
 The key is a **single, predictable rule** across the family instead of today's grab-bag (raw PCM silently succeeds, DFF late-errors, W64 policy-rejects).
+
+---
+
+## 8. Multi-cue folder chooser offers a structurally-unmaterializable CUE as an equal "viable" option; materialize then dead-ends with an opaque error
+
+**Discovered:** 2026-08-16, materializing a folder-selected album. Field case (kept for reproduction):
+`~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/JP/1975 - Physical Graffiti (Japan 1st Press Swan Song Records P-6317 8N)/`.
+
+**Symptom.** Selecting the **folder** (not a specific `.cue`) surfaced the multi-CUE chooser. The
+folder holds three cues — `Physical Graffiti All LP's.cue` (a 2-`FILE`, 15-track combined cue),
+`Physical Graffiti LP1.cue` (single-`FILE`, 6 tracks), `Physical Graffiti LP2.cue` (single-`FILE`,
+9 tracks). Choosing the combined `All LP's.cue` failed materialization with a truncated status:
+`Materialize: source parse failed: track 9 ends beyond image duration for …/Physical Graffiti (Japan 1st Press S…`
+
+**Root cause — two distinct gaps; the CUE file itself is malformed (authored outside tonepoet).**
+
+*(a) The offered cue is genuinely un-materializable (malformed source file, NOT tonepoet-authored).*
+`All LP's.cue` is an **invalid multi-`FILE` cue**: per the CUE spec, `INDEX` times reset to
+`00:00:00` at each new `FILE`, but this cue's second `FILE` section (`LP2.flac`) keeps **cumulative**
+timestamps continuing LP1's timeline — every LP2 track is offset by exactly **+30:30:48** (LP1's last
+`INDEX`, "Kashmir"). Proof vs. the folder's clean `LP2.cue`: "Down by the Seaside" is `10:56:54`
+there but `41:27:27` in the combined cue (Δ = 30:30:48); "In the Light" is `00:00:00` vs `30:30:48`.
+Mapped onto the real image (`LP2.flac` = **43:46**, 504,210,154 samples @ 192 kHz), track 9 starts at
+`41:27` (in bounds) but its segment *ends* at track 10's start `46:43` — **past 43:46** — so the
+boundary guard `!is_lossy_tail && end > probe.total_samples` fires
+(`src/convert/pipeline/materializer_cue.rs:1808`, message at `:1810`). The rejection is **correct**;
+using this cue would misalign every LP2 track. **tonepoet did not author this file** (verified): its
+synthetic merger emits per-`FILE`-relative `INDEX` times *verbatim* and resets `FILE` per image
+(`generate_queue_synthetic_cue_album`, `src/convert/queue_expansion.rs:1694`), so it cannot produce
+the cumulative offset; synthetic merges are written to `/tmp/tonepoet-synthetic-cue-albums/…/album.cue`
+(`queue_expansion.rs:1772`, `SYNTHETIC_CUE_ALBUM_DIR` `:1701`) and generated output cues to the
+*conversion output dir* as `{title}.cue` (`crates/tonepoet-features/src/cue_generator.rs:101`/`:183`)
+— tonepoet **never** writes a cue into the source folder, and neither name/shape matches. The Aug-16
+mtime (vs. the Aug-10 FLACs/`LP2.cue`) indicates it was created today by the user or an external tool.
+
+*(b) The chooser presents it as an equal, unmarked, "viable" choice — the deep viability check runs
+too late.* The multi-CUE prompt is built from cues that pass **admission**, and admission only
+verifies that each cue's `FILE` references **resolve to local audio**
+(`SplitCueFolderSelection::NeedsChoice` → `QueueCueSelectionPrompt { candidates }`,
+`queue_expansion.rs:947`; `admit_split_cue_member` / `resolve_split_cue_file_reference`,
+`src/convert/split_cue_album.rs:1277`/`1439`). `All LP's.cue`'s two `FILE` refs *do* resolve, so it is
+offered with no signal it cannot materialize. The boundary check that catches the overflow needs the
+probed sample counts and only happens at **materialize** time, *after* the user has picked — so the
+user is steered into a dead-end error, with no hint that the folder's own `LP1.cue` + `LP2.cue` are
+valid alternatives.
+
+**No data loss** (parse fails before any output is written; source untouched).
+
+**Immediate workaround.** Convert with the per-disc cues (`LP1.cue` → `LP1.flac`, `LP2.cue` →
+`LP2.flac`); both have correct per-`FILE` timebases. Ignore/delete the combined `All LP's.cue`.
+
+**Fix direction.**
+1. **Clearer materialize error** (cheap, safe, standalone). Replace the truncated
+   `track N ends beyond image duration` with a message that names the cue and explains the cause —
+   *"this cue's second FILE section uses cumulative timestamps instead of resetting to 00:00 (malformed
+   multi-FILE cue) — try the per-disc cues."*
+2. **Probe-free structural pre-screen at selection time.** The malformed pattern is detectable
+   **without probing**: in a multi-`FILE` cue, a non-first `FILE`'s first track `INDEX 01` that does
+   **not** reset near `00:00` (specifically, ≈ the previous `FILE`'s last `INDEX 01` — cumulative
+   continuation) is the signature. Use it to **mark or drop** such a cue in the chooser so a
+   known-bad option isn't presented as equally viable. Purely structural; no sample-count probing.
+3. **(Nice-to-have) Post-failure re-offer.** When the chosen cue fails to materialize and the folder
+   has other viable cues, re-surface them ("`All LP's.cue` is malformed; the folder also has valid
+   per-disc cues — use those?") instead of dead-ending on the error.
+4. **Avoid** full probe-at-selection boundary validation for every candidate — expensive, and it lives
+   in the LODESTAR/cue-authority selection area that has regressed repeatedly (high blast radius).
