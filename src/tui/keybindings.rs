@@ -14952,21 +14952,27 @@ fn metadata_editor_commit_inline_edit(
         return false;
     };
     let new_value = input.text;
-    let set_valued = state
+    let (set_valued, representation_noop) = state
         .active_surface()
         .entries
         .get(state.cursor)
-        .map(|entry| super::probe::metadata_field_is_set_valued(&entry.display_key))
-        .unwrap_or(false);
-    let parsed_list = set_valued.then(|| metadata_editor_parse_semicolon_list(&new_value));
+        .map(|entry| {
+            let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
+            (
+                set_valued,
+                metadata_editor_inline_value_is_representation_noop(entry, &new_value),
+            )
+        })
+        .unwrap_or((false, false));
+    let parsed_list = (set_valued && !representation_noop)
+        .then(|| metadata_editor_parse_semicolon_list(&new_value));
     let parsed_values = parsed_list
         .as_ref()
         .map(|values| super::probe::MetadataFieldValues::from_stored_texts(values.iter().cloned()));
-    let collapse_warning = state
-        .active_surface()
-        .entries
-        .get(state.cursor)
-        .and_then(|entry| {
+    let collapse_warning = if representation_noop {
+        None
+    } else {
+        state.active_surface().entries.get(state.cursor).and_then(|entry| {
             let writable_slots = entry
                 .per_file_values
                 .iter()
@@ -14993,13 +14999,22 @@ fn metadata_editor_commit_inline_edit(
                 )
             };
             (!collapsed_slots.is_empty()).then(|| entry.display_key.clone())
-        });
+        })
+    };
     let updated = if state.cursor < state.active_surface().entries.len() {
-        metadata_editor_apply_inline_value_to_writable_slots(
-            state,
-            state.cursor,
-            new_value,
-        )
+        if representation_noop {
+            if metadata_editor_unpersistable_per_track_reason(state, state.cursor).is_some() {
+                0
+            } else {
+                metadata_editor_entry_slot_counts(state, state.cursor).0
+            }
+        } else {
+            metadata_editor_apply_inline_value_to_writable_slots(
+                state,
+                state.cursor,
+                new_value,
+            )
+        }
     } else {
         0
     };
@@ -15029,6 +15044,20 @@ fn metadata_editor_parse_semicolon_list(text: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// A set-valued inline edit is a representation-preserving no-op only when the
+/// row is not mixed and the submitted text exactly matches the row's current
+/// rendered value. Mixed rows deliberately seed the editor from one writable
+/// slot rather than from `entry.value`, so they must always take the bulk-set
+/// path and normalize every writable slot to the same parsed list.
+fn metadata_editor_inline_value_is_representation_noop(
+    entry: &super::probe::TagEntry,
+    new_value: &str,
+) -> bool {
+    super::probe::metadata_field_is_set_valued(&entry.display_key)
+        && !entry.is_mixed
+        && entry.value == new_value
 }
 
 fn metadata_field_key_is_known(key: &str) -> bool {
@@ -15237,9 +15266,16 @@ pub(super) fn metadata_editor_apply_detail_whole_field_text(
             }
             let line = line.strip_suffix('\r').unwrap_or(line);
             let replacement = if set_valued {
-                super::probe::MetadataFieldValues::from_stored_texts(
-                    metadata_editor_parse_semicolon_list(line).into_iter(),
-                )
+                entry
+                    .per_file_originals
+                    .get(slot)
+                    .filter(|original| original.as_str() == line)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        super::probe::MetadataFieldValues::from_stored_texts(
+                            metadata_editor_parse_semicolon_list(line).into_iter(),
+                        )
+                    })
             } else {
                 super::probe::MetadataFieldValues::from_scalar(line.to_string())
             };
@@ -56034,6 +56070,150 @@ mod phase4_tests {
             Some("A; B")
         );
         assert!(!state.detail_apply_shared);
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "B"]);
+        }
+        assert!(!crate::tui::probe::metadata_editor_has_changes(&state));
+    }
+
+    #[test]
+    fn inline_commit_of_unchanged_single_frame_semicolon_value_is_idempotent() {
+        let e = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta"],
+            &["Alpha; Beta"],
+        );
+        assert_eq!(
+            e.per_file_values[0].values().len(),
+            1,
+            "setup: original must be one stored member"
+        );
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/a.flac")],
+            vec![e],
+            vec!["a".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.cursor = 0;
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "Alpha; Beta".to_string(),
+        ));
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        let slot = &state.active_surface().entries[0].per_file_values[0];
+        assert_eq!(slot.values().len(), 1);
+        assert_eq!(slot.to_texts(), ["Alpha; Beta"]);
+        assert!(!crate::tui::probe::metadata_editor_has_changes(&state));
+        assert!(
+            app.status_message
+                .as_ref()
+                .map(|(message, _)| !message.contains("reduced the stored multi-value list"))
+                .unwrap_or(true),
+            "an unchanged representation-preserving commit must not warn"
+        );
+    }
+
+    #[test]
+    fn inline_commit_of_genuinely_new_set_value_splits_all_writable_slots() {
+        let artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Old", "Old"],
+            &["Old", "Old"],
+        );
+        let mut state = two_file_editor(vec![artist]);
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.cursor = 0;
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "X; Y".to_string(),
+        ));
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["X", "Y"]);
+            assert_eq!(slot.values().len(), 2);
+        }
+        assert!(crate::tui::probe::metadata_editor_has_changes(&state));
+    }
+
+    #[test]
+    fn mixed_set_valued_inline_commit_uses_bulk_semantics_not_seed_noop() {
+        let artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["A; B", "C"],
+            &["A; B", "C"],
+        );
+        assert!(artist.is_mixed);
+        assert_eq!(artist.value, "<multiple values>");
+        assert_eq!(artist.per_file_values[0].values().len(), 1);
+        assert_eq!(artist.per_file_values[1].values().len(), 1);
+
+        let mut state = two_file_editor(vec![artist]);
+        state.cursor = 0;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+        assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+        assert_eq!(
+            state.edit_input.as_ref().map(|input| input.text.as_str()),
+            Some("A; B"),
+            "mixed set-valued rows seed from the first writable slot, not entry.value"
+        );
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        let counts = state.active_surface().entries[0]
+            .per_file_values
+            .iter()
+            .map(|slot| slot.values().len())
+            .collect::<Vec<_>>();
+        assert_eq!(counts, vec![2, 2]);
+        assert_ne!(counts, vec![1, 2], "bulk commit must never produce mixed representation");
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["A", "B"]);
+        }
+    }
+
+    #[test]
+    fn unchanged_inline_commit_preserves_current_representation_after_prior_edit() {
+        let artist = entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &["Old", "Old"],
+            &["Old", "Old"],
+        );
+        let mut state = two_file_editor(vec![artist]);
+        assert_eq!(
+            metadata_editor_apply_inline_value_to_writable_slots(
+                &mut state,
+                0,
+                "X; Y".to_string(),
+            ),
+            2
+        );
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["X", "Y"]);
+        }
+
+        state.cursor = 0;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        for slot in &state.active_surface().entries[0].per_file_values {
+            assert_eq!(slot.to_texts(), ["X", "Y"]);
+        }
+        assert_eq!(
+            state.active_surface().entries[0].per_file_originals[0].to_texts(),
+            ["Old"],
+            "the no-op must preserve current state rather than restoring originals"
+        );
+        assert!(crate::tui::probe::metadata_editor_has_changes(&state));
     }
 
     #[test]
@@ -56609,6 +56789,39 @@ mod phase4_tests {
             ["John Paul Jones", "Robert Plant"]
         );
         assert!(state.active_surface().entries[0].is_mixed);
+    }
+
+    #[test]
+    fn detail_whole_field_paste_preserves_exact_original_set_value_representation() {
+        let performer = entry(
+            "PERFORMER",
+            ItemKey::TrackArtist,
+            &["Alpha; Beta", "Gamma"],
+            &["Alpha; Beta", "Gamma"],
+        );
+        assert_eq!(performer.per_file_values[0].to_texts(), ["Alpha; Beta"]);
+        assert_eq!(performer.per_file_values[0].values().len(), 1);
+
+        let mut state = two_file_editor(vec![performer]);
+        state.phase = MetadataEditorPhase::DetailEdit;
+        state.detail_field_idx = 0;
+
+        assert_eq!(
+            metadata_editor_apply_detail_whole_field_text(
+                &mut state,
+                0,
+                "Alpha; Beta\nDelta; Epsilon",
+            ),
+            1,
+            "only the genuinely changed second slot should count as changed"
+        );
+        let entry = &state.active_surface().entries[0];
+        assert_eq!(entry.per_file_values[0].to_texts(), ["Alpha; Beta"]);
+        assert_eq!(entry.per_file_values[0].values().len(), 1);
+        assert_eq!(entry.per_file_values[1].to_texts(), ["Delta", "Epsilon"]);
+        assert_eq!(entry.per_file_values[1].values().len(), 2);
+        assert!(metadata_editor_has_detail_paste_snapshot(&state, 0));
+        assert!(crate::tui::probe::metadata_editor_has_changes(&state));
     }
 
     #[test]
