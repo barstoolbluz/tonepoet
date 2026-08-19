@@ -2023,14 +2023,13 @@ fn current_test_coordination_root_override() -> Option<PathBuf> {
 pub(crate) struct ScopedTestCoordinationRootGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
-    _temp_dir: Option<tempfile::TempDir>,
     previous_root_env: Option<std::ffi::OsString>,
     previous_inherit_env: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
 impl ScopedTestCoordinationRootGuard {
-    fn install(path: PathBuf, temp_dir: Option<tempfile::TempDir>) -> Self {
+    fn install(path: PathBuf) -> Self {
         let serial = test_coordination_serial()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2050,7 +2049,6 @@ impl ScopedTestCoordinationRootGuard {
         Self {
             _serial: serial,
             root: path,
-            _temp_dir: temp_dir,
             previous_root_env,
             previous_inherit_env,
         }
@@ -2063,19 +2061,30 @@ impl ScopedTestCoordinationRootGuard {
 
 #[cfg(test)]
 pub(crate) fn scoped_test_coordination_root() -> ScopedTestCoordinationRootGuard {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("tonepoet-test-concurrency-")
-        .tempdir()
-        .expect("create isolated test coordination root");
-    let root = temp_dir.path().join("concurrency-v1");
-    ScopedTestCoordinationRootGuard::install(root, Some(temp_dir))
+    // The override is process-visible so production-like worker threads can
+    // inherit it. A parallel libtest worker can therefore capture this path
+    // before it has entered the serialized fixture protocol. Deleting the
+    // directory when this guard drops races that in-flight borrower and can
+    // turn an otherwise valid lease staging create into ENOENT.
+    //
+    // Use a run-private, UUID-namespaced root beneath the cargo-test fallback
+    // and never delete it from inside the test process. The path is never
+    // reused, so retirement cannot expose stale authority to a later scoped
+    // test, and no production coordination semantics are changed.
+    let process_root = cargo_test_coordination_root()
+        .expect("unit tests must have a process-private coordination root");
+    let root = process_root
+        .join("scoped")
+        .join(Uuid::new_v4().to_string());
+    create_private_dir(&root).expect("create isolated test coordination root");
+    ScopedTestCoordinationRootGuard::install(root)
 }
 
 #[cfg(test)]
 pub(crate) fn install_scoped_test_coordination_root(
     path: &Path,
 ) -> ScopedTestCoordinationRootGuard {
-    ScopedTestCoordinationRootGuard::install(path.to_path_buf(), None)
+    ScopedTestCoordinationRootGuard::install(path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -2757,6 +2766,63 @@ mod tests {
             Some(expected.as_os_str()),
             "the scoped environment root must be visible to spawned workers"
         );
+    }
+
+    #[test]
+    fn scoped_test_coordination_root_retirement_keeps_captured_family_path_alive() {
+        let scope = scoped_test_coordination_root();
+        let expected_root = scope.path().to_path_buf();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            // This is the problematic libtest interleaving: an unrelated worker
+            // resolves the process-visible scoped root while the owner is live,
+            // but does not create its lease staging file until after retirement.
+            let root = coordination_root();
+            assert_eq!(root, expected_root);
+            let family_dir = root.join(LeaseFamily::EphemeralMutation {
+                claim_id: Uuid::new_v4(),
+            }
+            .namespace());
+            create_private_dir(&family_dir).expect("create captured family directory");
+            captured_tx
+                .send(())
+                .expect("report captured coordination root");
+            retired_rx
+                .recv()
+                .expect("wait for scoped-root retirement");
+
+            let staging = family_dir.join(format!(
+                ".{}--{}.lease.tmp-{}",
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .mode(0o600);
+            }
+            let file = options
+                .open(&staging)
+                .expect("captured coordination family must survive scoped-root retirement");
+            drop(file);
+            std::fs::remove_file(&staging).expect("remove retirement regression staging file");
+        });
+
+        captured_rx
+            .recv()
+            .expect("worker must capture scoped root before retirement");
+        drop(scope);
+        retired_tx
+            .send(())
+            .expect("release worker after scoped-root retirement");
+        worker.join().expect("captured-root worker");
     }
 
     #[test]

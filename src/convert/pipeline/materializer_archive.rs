@@ -563,11 +563,19 @@ pub async fn repackage_archive_with_progress_and_cancel<F>(
 where
     F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
 {
+    // Entering the operation is itself observable progress. Emit this before
+    // the first cancellation check so a pre-cancelled request still has the
+    // same initial state transition as every other repackage attempt.
+    progress(ArchiveRepackageProgressSnapshot::new(
+        ArchiveRepackageStage::Validating,
+        ArchiveRepackageStage::Validating.status_label(),
+    ));
+    check_repackage_cancelled(cancel)?;
+
     // Fail before staging traversal or any child-process work when the target
     // format cannot be created. This keeps the direct save path aligned with
     // the UI preflight and preserves actionable tool-resolution errors even
     // when ToolRunner intentionally redacts spawn details.
-    check_repackage_cancelled(cancel)?;
     let format = repackage_archive_format(original_archive)?;
     require_repackage_format_tool_available(format, tool_paths)?;
 
@@ -575,12 +583,6 @@ where
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| original_archive.display().to_string());
-
-    progress(ArchiveRepackageProgressSnapshot::new(
-        ArchiveRepackageStage::Validating,
-        ArchiveRepackageStage::Validating.status_label(),
-    ));
-    check_repackage_cancelled(cancel)?;
     let staging_stats = validate_repackage_staging_tree(staging_dir, cancel)?;
     let planned_bytes = staging_stats.bytes_total.max(1);
     progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(

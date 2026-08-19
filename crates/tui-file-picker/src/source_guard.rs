@@ -7501,6 +7501,51 @@ mod verified_removal_tests {
     }
 
     #[test]
+    fn host_managed_picker_refresh_never_restores_interrupted_removal_without_host_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("copy.flac");
+        fs::write(&source, b"operation bytes").expect("source");
+        let (source_manifest, destination_manifest) = copy_proof(&source, &destination);
+
+        let removal = prepare_verified_removal(
+            &source_manifest,
+            &destination_manifest,
+            &destination,
+        )
+        .expect("prepare verified removal");
+        let quarantine = removal.quarantine_root().to_path_buf();
+        let journal = removal.journal.as_ref().expect("journal").path.clone();
+        rewrite_removal_journal_with_stale_owner(&removal);
+        removal.journal.as_ref().expect("journal").deactivate();
+        std::mem::forget(removal);
+        assert!(!destination.exists(), "fixture must begin detached");
+        assert!(quarantine.exists());
+        assert!(journal.exists());
+
+        let mut picker = crate::state::FilePickerState::new_host_managed(
+            crate::state::FilePickerConfig {
+                start_dir: temp.path().to_path_buf(),
+                operation_policy: crate::state::FileOperationPolicy::default(),
+                ..crate::state::FilePickerConfig::default()
+            },
+        );
+        picker.refresh();
+
+        assert!(
+            !destination.exists(),
+            "host-managed picker construction/refresh must not perform unclaimed recovery",
+        );
+        assert!(quarantine.exists(), "detached object must remain quarantined");
+        assert!(journal.exists(), "recovery journal must remain for host-owned recovery");
+
+        let report = recover_interrupted_verified_removals_internal(temp.path(), true)
+            .expect("test cleanup recovery");
+        assert_eq!(report.restored, vec![destination.clone()]);
+        assert!(destination.exists());
+    }
+
+    #[test]
     fn host_recovery_api_discovers_then_restores_only_the_admitted_detach() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source.flac");

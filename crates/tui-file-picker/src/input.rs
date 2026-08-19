@@ -108,6 +108,12 @@ impl FilePickerState {
         if self.handle_paste_task_key(key) {
             return FilePickerAction::None;
         }
+        if self.host_mutation_in_flight() {
+            self.set_error(FilePickerError::OperationDisabled(
+                "host-managed filesystem operation is still running",
+            ));
+            return FilePickerAction::None;
+        }
 
         // Tab commands live above pane-local dispatch so their byobu-safe
         // chords are consistent in Tree and Files focus. Ctrl+W deliberately
@@ -353,6 +359,12 @@ impl FilePickerState {
             area
         };
         if self.handle_paste_task_mouse(mouse, progress_area) {
+            return FilePickerAction::None;
+        }
+        if self.host_mutation_in_flight() {
+            self.set_error(FilePickerError::OperationDisabled(
+                "host-managed filesystem operation is still running",
+            ));
             return FilePickerAction::None;
         }
 

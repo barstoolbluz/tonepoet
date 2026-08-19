@@ -6233,6 +6233,19 @@ impl QueuedFileTransfer {
     }
 }
 
+/// Correlation state for a paste initiated by the metadata artwork picker but
+/// executed by Tonepoet's hardened file-task worker. The picker session id is
+/// stable even if the progress overlay temporarily preempts the editor.
+#[derive(Debug, Clone)]
+pub struct ArtworkPickerFileTask {
+    pub picker_session_id: u64,
+    pub request: tui_file_picker::FilePickerHostMutationRequest,
+    /// Host-owned exact plan frozen after filesystem-aware destination
+    /// planning and before worker dispatch. The picker request intentionally
+    /// carries only UI intent, so no picker-owned filesystem probe is needed.
+    pub plan: tui_file_picker::PastePlan,
+}
+
 /// App-side serial scheduler and per-job reconciliation registry for Browse
 /// copy/move transfers. The worker layer remains one-helper-per-job; this state
 /// only decides which queued snapshot owns the single active slot.
@@ -11384,6 +11397,15 @@ pub struct AppState {
     /// Serial Browse transfer scheduler plus per-session reconciliation state.
     pub file_transfers: FileTransferQueueState,
 
+    /// Host-managed artwork-picker paste jobs keyed by file-task session id.
+    /// These use the same worker/admission path as Browse but reconcile their
+    /// logical clipboard and selection back into the embedded picker.
+    pub artwork_picker_file_tasks: BTreeMap<u64, ArtworkPickerFileTask>,
+
+    /// Exact durable retry authority retained by the hosted worker for an
+    /// incomplete artwork-picker cut/paste, keyed by picker session id.
+    pub artwork_picker_paste_retries: BTreeMap<u64, crate::tui::browse::BrowsePasteRetryPlan>,
+
     /// Overlay displaced by the explicit queued-transfer loss confirmation.
     /// Cancelling quit restores it byte-for-byte, including a live transfer's
     /// control sender and any conflict state.
@@ -12528,6 +12550,8 @@ impl AppState {
             minimized_file_task_progress: None,
             file_task_preempted_overlay: None,
             file_transfers,
+            artwork_picker_file_tasks: BTreeMap::new(),
+            artwork_picker_paste_retries: BTreeMap::new(),
             queued_quit_preempted_overlay: None,
             quit_with_queued_file_transfers_confirmed: false,
             file_operation_undo: FileOperationUndoJournal::default(),

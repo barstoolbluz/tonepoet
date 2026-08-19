@@ -13275,7 +13275,10 @@ fn metadata_editor_open_tag_transfer_picker_scoped(
     ));
 }
 
-fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super::app::MetadataEditorState>) {
+fn metadata_editor_open_artwork_picker(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+) {
     let picture_type = metadata_editor_current_artwork_type(state)
         .unwrap_or(lofty::picture::PictureType::CoverFront);
     let dir = app
@@ -13292,20 +13295,22 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     state.pending_artwork_type = None;
-    let picker = tui_file_picker::FilePickerState::new(file_picker_config_with_browse_sort(
-        app,
-        tui_file_picker::FilePickerConfig {
-        start_dir: dir,
-        filter: tui_file_picker::FilePickerFilter::Images,
-        title: "Select artwork image".to_string(),
-        theme: file_picker_theme_from_theme(&app.theme),
-        selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
-        operation_policy: artwork_file_picker_policy(
-            app.file_task_verbose_degrade_notices,
+    let picker = tui_file_picker::FilePickerState::new_host_managed(
+        file_picker_config_with_browse_sort(
+            app,
+            tui_file_picker::FilePickerConfig {
+                start_dir: dir,
+                filter: tui_file_picker::FilePickerFilter::Images,
+                title: "Select artwork image".to_string(),
+                theme: file_picker_theme_from_theme(&app.theme),
+                selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
+                operation_policy: artwork_file_picker_policy(
+                    app.file_task_verbose_degrade_notices,
+                ),
+                ..tui_file_picker::FilePickerConfig::default()
+            },
         ),
-        ..tui_file_picker::FilePickerConfig::default()
-        },
-    ));
+    );
     state.file_picker = Some(crate::tui::app::MetadataFilePickerState::new(
         crate::tui::app::FilePickerPurpose::SelectArtwork { picture_type },
         picker,
@@ -13315,7 +13320,12 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
 fn artwork_file_picker_policy(
     verbose_degrade_notices: bool,
 ) -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy::selection_only(verbose_degrade_notices)
+    // Artwork selection is a full file-manager surface, not a selection-only
+    // modal. Preserve the crate's established create/cut/copy/paste/delete
+    // capabilities and only project the host's presentation preference here.
+    let mut policy = tui_file_picker::FileOperationPolicy::default();
+    policy.verbose_degrade_notices = verbose_degrade_notices;
+    policy
 }
 
 pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_file_picker::FilePickerTheme {
@@ -14363,6 +14373,505 @@ fn report_file_picker_open_result(
     }
 }
 
+#[derive(Debug)]
+enum ArtworkPickerHostSyncCommit {
+    Complete {
+        committed_mappings: Option<Vec<tui_file_picker::PasteMapping>>,
+        warning: Option<String>,
+    },
+    DeletePartial {
+        deleted: Vec<std::path::PathBuf>,
+        error: tui_file_picker::FilePickerError,
+    },
+}
+
+fn artwork_picker_host_error(
+    op: &'static str,
+    path: impl Into<std::path::PathBuf>,
+    message: impl Into<String>,
+) -> tui_file_picker::FilePickerError {
+    tui_file_picker::FilePickerError::Io {
+        op,
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+fn execute_artwork_picker_rename_request(
+    mappings: &[tui_file_picker::PasteMapping],
+    verification: tui_file_picker::VerificationMode,
+) -> Result<Option<String>, tui_file_picker::FilePickerError> {
+    let Some(first) = mappings.first() else {
+        return Ok(None);
+    };
+    let base_dir = first
+        .source
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| {
+            artwork_picker_host_error(
+                "host-managed rename admission",
+                first.source.clone(),
+                "source has no parent directory",
+            )
+        })?;
+    let mut items = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        if mapping.source.parent() != Some(base_dir.as_path())
+            || mapping.destination.parent() != Some(base_dir.as_path())
+        {
+            return Err(artwork_picker_host_error(
+                "host-managed rename admission",
+                mapping.source.clone(),
+                "picker rename request crossed parent directories",
+            ));
+        }
+        let target = mapping
+            .destination
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                artwork_picker_host_error(
+                    "host-managed rename admission",
+                    mapping.destination.clone(),
+                    "destination filename is not valid UTF-8",
+                )
+            })?;
+        items.push((mapping.source.clone(), target.to_string()));
+    }
+    let mut plan = crate::tui::rename_plan::RenamePlan::new(base_dir, items);
+    if crate::tui::rename_plan::validate_plan(&mut plan) > 0 {
+        return Err(tui_file_picker::FilePickerError::DestinationExists(
+            first.destination.clone(),
+        ));
+    }
+    let report = crate::tui::rename_plan::execute_plan_with_proofs_at_verification(
+        &mut plan,
+        verification,
+    )
+    .map_err(|error| {
+        artwork_picker_host_error(
+            "host-managed claimed rename",
+            first.source.clone(),
+            error,
+        )
+    })?;
+    Ok(report.warning)
+}
+
+fn execute_artwork_picker_host_mutation_sync(
+    request: &tui_file_picker::FilePickerHostMutationRequest,
+    policy: tui_file_picker::FileOperationPolicy,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<ArtworkPickerHostSyncCommit, tui_file_picker::FilePickerError> {
+    use crate::concurrency::{
+        ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+    };
+
+    match request {
+        tui_file_picker::FilePickerHostMutationRequest::Create { kind, path } => {
+            let scope = match kind {
+                tui_file_picker::FilePickerCreateKind::File => ClaimScope::Exact,
+                tui_file_picker::FilePickerCreateKind::Folder => ClaimScope::Subtree,
+            };
+            let claim = PathClaim::resolve_with_semantics(
+                path,
+                ClaimMode::Write,
+                scope,
+                PathResolutionSemantics::NamespaceObject,
+            )
+            .map_err(|error| {
+                artwork_picker_host_error("host-managed create admission", path.clone(), error)
+            })?;
+            let admitted = claim.identity.resolved_io_path.clone();
+            let _guard = MutationClaimGuard::acquire_ephemeral(vec![claim]).map_err(|error| {
+                artwork_picker_host_error("host-managed create busy", path.clone(), error)
+            })?;
+            let result = match kind {
+                tui_file_picker::FilePickerCreateKind::File => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&admitted)
+                    .map(|_| ()),
+                tui_file_picker::FilePickerCreateKind::Folder => std::fs::create_dir(&admitted),
+            };
+            result.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    tui_file_picker::FilePickerError::DestinationExists(path.clone())
+                } else {
+                    artwork_picker_host_error("host-managed create", path.clone(), error.to_string())
+                }
+            })?;
+            Ok(ArtworkPickerHostSyncCommit::Complete {
+                committed_mappings: None,
+                warning: None,
+            })
+        }
+        tui_file_picker::FilePickerHostMutationRequest::Rename {
+            source,
+            destination,
+        } => {
+            let warning = execute_artwork_picker_rename_request(
+                &[tui_file_picker::PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }],
+                verification,
+            )?;
+            Ok(ArtworkPickerHostSyncCommit::Complete {
+                committed_mappings: None,
+                warning,
+            })
+        }
+        tui_file_picker::FilePickerHostMutationRequest::CaseRename { mappings } => {
+            let warning = execute_artwork_picker_rename_request(mappings, verification)?;
+            Ok(ArtworkPickerHostSyncCommit::Complete {
+                committed_mappings: None,
+                warning,
+            })
+        }
+        tui_file_picker::FilePickerHostMutationRequest::Duplicate {
+            sources,
+            exact_destination,
+        } => {
+            let mappings = if let Some(destination) = exact_destination {
+                let [source] = sources.as_slice() else {
+                    return Err(artwork_picker_host_error(
+                        "host-managed duplicate planning",
+                        destination.clone(),
+                        "an exact duplicate destination requires exactly one source",
+                    ));
+                };
+                if !source.is_file() {
+                    return Err(tui_file_picker::FilePickerError::WrongSelectionMode(
+                        "Duplicate supports files only",
+                    ));
+                }
+                if destination.exists() {
+                    return Err(tui_file_picker::FilePickerError::DestinationExists(
+                        destination.clone(),
+                    ));
+                }
+                vec![tui_file_picker::PasteMapping {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }]
+            } else {
+                tui_file_picker::plan_duplicate_files_in_place(sources, policy)?
+            };
+            // Freeze the no-clobber destination plan on the host side, then
+            // reuse it through the same admission +
+            // MutationClaimGuard path as Browse duplicate.
+            let admission = super::file_task_runtime::file_task_path_admission(false, &mappings)
+                .map_err(|error| {
+                    artwork_picker_host_error(
+                        "host-managed duplicate admission",
+                        mappings
+                            .first()
+                            .map(|mapping| mapping.source.clone())
+                            .unwrap_or_default(),
+                        error,
+                    )
+                })?;
+            let _guard = MutationClaimGuard::acquire_ephemeral(admission.claims).map_err(|error| {
+                artwork_picker_host_error(
+                    "host-managed duplicate busy",
+                    mappings
+                        .first()
+                        .map(|mapping| mapping.source.clone())
+                        .unwrap_or_default(),
+                    error,
+                )
+            })?;
+            tui_file_picker::execute_duplicate_plan(&admission.admitted_mappings, policy)
+                .map_err(|error| {
+                    artwork_picker_host_error(
+                        "host-managed duplicate",
+                        mappings
+                            .first()
+                            .map(|mapping| mapping.source.clone())
+                            .unwrap_or_default(),
+                        error.message(),
+                    )
+                })?;
+            Ok(ArtworkPickerHostSyncCommit::Complete {
+                committed_mappings: Some(mappings),
+                warning: None,
+            })
+        }
+        tui_file_picker::FilePickerHostMutationRequest::Delete {
+            paths,
+            policy: delete_policy,
+        } => {
+            let mut claims = Vec::with_capacity(paths.len());
+            let mut admitted = Vec::with_capacity(paths.len());
+            for path in paths {
+                let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                    artwork_picker_host_error(
+                        "host-managed delete admission",
+                        path.clone(),
+                        error.to_string(),
+                    )
+                })?;
+                let scope = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    ClaimScope::Subtree
+                } else {
+                    ClaimScope::Exact
+                };
+                let claim = PathClaim::resolve_with_semantics(
+                    path,
+                    ClaimMode::Write,
+                    scope,
+                    PathResolutionSemantics::NamespaceObject,
+                )
+                .map_err(|error| {
+                    artwork_picker_host_error("host-managed delete admission", path.clone(), error)
+                })?;
+                admitted.push(claim.identity.resolved_io_path.clone());
+                claims.push(claim);
+            }
+            // Acquire the complete set before the first delete. A conflicting
+            // Tonepoet session therefore rejects the entire request without a
+            // partial namespace mutation.
+            let _guard = MutationClaimGuard::acquire_ephemeral(claims).map_err(|error| {
+                artwork_picker_host_error(
+                    "host-managed delete busy",
+                    paths.first().cloned().unwrap_or_default(),
+                    error,
+                )
+            })?;
+            let mut deleted = Vec::new();
+            for (logical, admitted) in paths.iter().zip(admitted.iter()) {
+                if let Err(error) = tui_file_picker::delete_path_with_policy(admitted, *delete_policy) {
+                    if deleted.is_empty() {
+                        return Err(error);
+                    }
+                    return Ok(ArtworkPickerHostSyncCommit::DeletePartial { deleted, error });
+                }
+                deleted.push(logical.clone());
+            }
+            Ok(ArtworkPickerHostSyncCommit::Complete {
+                committed_mappings: None,
+                warning: None,
+            })
+        }
+        tui_file_picker::FilePickerHostMutationRequest::Paste { .. } => Err(
+            artwork_picker_host_error(
+                "host-managed paste dispatch",
+                std::path::PathBuf::new(),
+                "paste must execute through Tonepoet's hosted file-task worker",
+            ),
+        ),
+    }
+}
+
+fn start_artwork_picker_host_paste(
+    app: &mut AppState,
+    picker_session_id: u64,
+    request: tui_file_picker::FilePickerHostMutationRequest,
+    tx: &mpsc::Sender<AppMessage>,
+) -> Result<(), tui_file_picker::FilePickerError> {
+    let tui_file_picker::FilePickerHostMutationRequest::Paste {
+        clipboard,
+        target_dir,
+    } = &request
+    else {
+        return Err(artwork_picker_host_error(
+            "host-managed paste dispatch",
+            std::path::PathBuf::new(),
+            "request is not a paste",
+        ));
+    };
+
+    let retained_retry = app
+        .artwork_picker_paste_retries
+        .remove(&picker_session_id)
+        .filter(|retry| retry.matches(clipboard, target_dir));
+    let exact_recovery_retry = retained_retry
+        .as_ref()
+        .is_some_and(|retry| retry.recovery_journal_path.is_some());
+    let plan = match retained_retry.as_ref() {
+        Some(retry) => retry.plan.clone(),
+        None => tui_file_picker::plan_filesystem_paste_for_dispatch(clipboard, target_dir)?,
+    };
+    let retry_plan = retained_retry
+        .clone()
+        .or_else(|| Some(super::browse::BrowsePasteRetryPlan::from_plan(plan.clone())));
+    let conflict_policy = if exact_recovery_retry {
+        Some(tui_file_picker::ConflictPolicyPreset::Skip)
+    } else {
+        Some(tui_file_picker::ConflictPolicyPreset::Ask)
+    };
+    let sources = plan
+        .mappings
+        .iter()
+        .map(|mapping| mapping.source.clone())
+        .collect::<Vec<_>>();
+    let destinations = plan
+        .mappings
+        .iter()
+        .map(|mapping| mapping.destination.clone())
+        .collect::<Vec<_>>();
+    let is_move = clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut;
+    let Some(file_task_session_id) = start_file_op(
+        app,
+        &sources,
+        target_dir.to_string_lossy().as_ref(),
+        false,
+        is_move,
+        tx,
+        conflict_policy,
+        Some(destinations),
+        retry_plan,
+        true,
+        false,
+        false,
+    ) else {
+        if let Some(retry) = retained_retry {
+            app.artwork_picker_paste_retries
+                .insert(picker_session_id, retry);
+        }
+        return Err(artwork_picker_host_error(
+            "host-managed paste dispatch",
+            target_dir.clone(),
+            "Tonepoet file-task worker is busy; no filesystem mutation started",
+        ));
+    };
+    app.artwork_picker_file_tasks.insert(
+        file_task_session_id,
+        super::app::ArtworkPickerFileTask {
+            picker_session_id,
+            request,
+            plan,
+        },
+    );
+    Ok(())
+}
+
+fn dispatch_artwork_picker_host_mutation(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    picker_session_id: u64,
+    request: tui_file_picker::FilePickerHostMutationRequest,
+    policy: tui_file_picker::FileOperationPolicy,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let is_paste = matches!(
+        request,
+        tui_file_picker::FilePickerHostMutationRequest::Paste { .. }
+    );
+    if is_paste {
+        let result = start_artwork_picker_host_paste(app, picker_session_id, request, tx);
+        if let Err(error) = result {
+            if let Some(session) = state
+                .file_picker
+                .as_mut()
+                .filter(|session| session.session_id == picker_session_id)
+            {
+                session.picker.complete_host_mutation_failure(error);
+            }
+        }
+        return;
+    }
+
+    let result = execute_artwork_picker_host_mutation_sync(
+        &request,
+        policy,
+        app.config.file_operations.verification,
+    );
+    let Some(session) = state
+        .file_picker
+        .as_mut()
+        .filter(|session| session.session_id == picker_session_id)
+    else {
+        return;
+    };
+    match result {
+        Ok(ArtworkPickerHostSyncCommit::Complete {
+            committed_mappings,
+            warning,
+        }) => {
+            session
+                .picker
+                .complete_host_mutation_success(request, committed_mappings, warning);
+        }
+        Ok(ArtworkPickerHostSyncCommit::DeletePartial { deleted, error }) => {
+            session.picker.complete_host_delete_partial(&deleted, error);
+        }
+        Err(error) => session.picker.complete_host_mutation_failure(error),
+    }
+}
+
+fn finish_metadata_file_picker_input(
+    app: &mut AppState,
+    state: &mut Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+    editor_session_id: u64,
+    picker_session_id: u64,
+    purpose: super::app::FilePickerPurpose,
+    action: tui_file_picker::FilePickerAction,
+) {
+    let Some(session) = state
+        .file_picker
+        .as_mut()
+        .filter(|session| session.session_id == picker_session_id)
+    else {
+        return;
+    };
+    let host_clipboard_requested = session.picker.take_host_clipboard_paste_request();
+    let host_mutation = session.picker.take_host_mutation_request();
+    let operation_policy = session.picker.file_operation_policy();
+    let ignored_directories = session.picker.take_last_selection_ignored_directories();
+
+    if host_clipboard_requested {
+        begin_host_clipboard_paste(
+            app,
+            tx,
+            super::message::HostClipboardPasteTarget::MetadataFilePicker {
+                editor_session_id,
+                picker_session_id,
+            },
+        );
+        return;
+    }
+    if let Some(request) = host_mutation {
+        if matches!(
+            &purpose,
+            super::app::FilePickerPurpose::SelectArtwork { .. }
+        ) {
+            dispatch_artwork_picker_host_mutation(
+                app,
+                state,
+                picker_session_id,
+                request,
+                operation_policy,
+                tx,
+            );
+        } else if let Some(session) = state
+            .file_picker
+            .as_mut()
+            .filter(|session| session.session_id == picker_session_id)
+        {
+            session.picker.complete_host_mutation_failure(artwork_picker_host_error(
+                "host-managed mutation dispatch",
+                session.picker.current_dir().to_path_buf(),
+                "only the Tonepoet artwork picker is configured for host-managed mutations",
+            ));
+        }
+        return;
+    }
+    if let Err(err) = send_file_picker_completion(
+        app,
+        tx,
+        picker_session_id,
+        purpose,
+        ignored_directories,
+        action,
+    ) {
+        app.set_status(format!("file picker: failed to queue completion: {err}"));
+    }
+}
+
 fn handle_metadata_file_picker_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -14373,31 +14882,18 @@ fn handle_metadata_file_picker_key(
     let Some(session) = state.file_picker.as_mut() else {
         return;
     };
-    let session_id = session.session_id;
+    let picker_session_id = session.session_id;
     let purpose = session.purpose.clone();
     let action = session.picker.handle_key(key);
-    if session.picker.take_host_clipboard_paste_request() {
-        begin_host_clipboard_paste(
-            app,
-            tx,
-            super::message::HostClipboardPasteTarget::MetadataFilePicker {
-                editor_session_id,
-                picker_session_id: session_id,
-            },
-        );
-        return;
-    }
-    let ignored_directories = session.picker.take_last_selection_ignored_directories();
-    if let Err(err) = send_file_picker_completion(
+    finish_metadata_file_picker_input(
         app,
+        state,
         tx,
-        session_id,
+        editor_session_id,
+        picker_session_id,
         purpose,
-        ignored_directories,
         action,
-    ) {
-        app.set_status(format!("file picker: failed to queue completion: {err}"));
-    }
+    );
 }
 
 fn send_file_picker_completion(
@@ -14495,10 +14991,11 @@ fn handle_metadata_file_picker_mouse(
     tx: &mpsc::Sender<AppMessage>,
     parent: Rect,
 ) {
+    let editor_session_id = state.active_surface().technical_details.session_id;
     let Some(session) = state.file_picker.as_mut() else {
         return;
     };
-    let session_id = session.session_id;
+    let picker_session_id = session.session_id;
     let purpose = session.purpose.clone();
     let area = if session.picker.is_maximized() {
         parent
@@ -14506,17 +15003,15 @@ fn handle_metadata_file_picker_mouse(
         super::draw_overlays::file_picker_overlay_area(parent)
     };
     let action = session.picker.handle_mouse(mouse, area);
-    let ignored_directories = session.picker.take_last_selection_ignored_directories();
-    if let Err(err) = send_file_picker_completion(
+    finish_metadata_file_picker_input(
         app,
+        state,
         tx,
-        session_id,
+        editor_session_id,
+        picker_session_id,
         purpose,
-        ignored_directories,
         action,
-    ) {
-        app.set_status(format!("file picker: failed to queue completion: {err}"));
-    }
+    );
 }
 
 fn handle_global_file_picker_mouse(
@@ -39884,6 +40379,7 @@ fn do_file_op(
         None,
         false,
         false,
+        true,
     );
 }
 
@@ -39899,6 +40395,7 @@ fn start_file_op(
     clipboard_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
     start_minimized: bool,
     scheduler_dispatch: bool,
+    clear_browse_selection: bool,
 ) -> Option<u64> {
     if sources.is_empty() {
         app.set_status("no files selected for copy/move");
@@ -39945,7 +40442,9 @@ fn start_file_op(
         sources.len()
     ));
 
-    app.browse.clear_multi_selection();
+    if clear_browse_selection {
+        app.browse.clear_multi_selection();
+    }
 
     let job = FileTaskJob {
         session_id,
@@ -40186,6 +40685,7 @@ pub(super) fn maybe_start_next_file_transfer(
         Some(destinations),
         dispatch_retry_plan.clone(),
         start_minimized,
+        true,
         true,
     ) else {
         app.file_transfers.queued.push_front(queued);
@@ -67174,16 +67674,12 @@ mod artwork_file_picker_handoff_tests {
         assert!(!keybindings.contains(&format!("{}{}", "FilePickerState::", "for_artwork")));
     }
 
-    #[test]
-    fn artwork_plus_opens_crate_picker_with_images_and_explicit_non_mutating_policy() {
-        // AppState startup scans the process-global file-task journal override.
-        // Serialize this test with fixtures that temporarily replace that
-        // environment so it cannot adopt another test's live journal.
-        let _file_task_environment = super::super::file_task_runtime::test_environment_lock();
+    fn assert_artwork_plus_opens_crate_picker_with_images_and_file_manager_policy() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("cover.png"), b"png").expect("image fixture");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.last_artwork_picker_dir = Some(temp.path().to_path_buf());
+        app.file_task_verbose_degrade_notices = true;
         let (tx, _rx) = channel();
         let mut state = make_editor_fixture(temp.path());
 
@@ -67208,6 +67704,246 @@ mod artwork_file_picker_handoff_tests {
         assert!(policy.allow_copy);
         assert!(policy.allow_paste);
         assert!(policy.allow_delete);
+        assert!(policy.allow_rename);
+        assert!(policy.allow_duplicate);
+        assert!(policy.verbose_degrade_notices);
+        assert_eq!(
+            session.picker.mutation_execution(),
+            tui_file_picker::FilePickerMutationExecution::HostManaged,
+            "full artwork file-manager authority must cross Tonepoet host admission before I/O",
+        );
+    }
+
+    #[test]
+    fn artwork_plus_opens_crate_picker_with_images_and_file_manager_policy() {
+        // AppState startup scans the process-global file-task journal override.
+        // Serialize this test with fixtures that temporarily replace that
+        // environment so it cannot adopt another test's live journal.
+        let _file_task_environment = super::super::file_task_runtime::test_environment_lock();
+        assert_artwork_plus_opens_crate_picker_with_images_and_file_manager_policy();
+    }
+
+    #[test]
+    fn artwork_plus_opens_crate_picker_with_images_and_explicit_non_mutating_policy() {
+        // Compatibility alias for the round-5 regression filter. The historical
+        // name was inaccurate: artwork selection intentionally exposes the
+        // picker's file-manager operations. Keep the filter executable while
+        // the canonical test above states the actual contract.
+        let _file_task_environment = super::super::file_task_runtime::test_environment_lock();
+        assert_artwork_plus_opens_crate_picker_with_images_and_file_manager_policy();
+    }
+
+    fn hold_conflicting_artwork_write(
+        path: &Path,
+    ) -> crate::concurrency::MutationClaimGuard {
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("conflicting write claim");
+        crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])
+            .expect("hold conflicting artwork write")
+    }
+
+    #[test]
+    fn artwork_host_create_rejects_conflicting_tonepoet_claim_then_succeeds() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("new-cover.jpg");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Create {
+            kind: tui_file_picker::FilePickerCreateKind::File,
+            path: target.clone(),
+        };
+        let guard = hold_conflicting_artwork_write(&target);
+
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("conflicting Tonepoet write must reject picker create");
+        assert!(!target.exists(), "create must not happen before admission");
+
+        drop(guard);
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("create after claim release");
+        assert!(target.is_file(), "picker create should retain file semantics");
+    }
+
+    #[test]
+    fn artwork_host_rename_rejects_conflicting_tonepoet_claim_then_succeeds() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("cover.jpg");
+        let destination = temp.path().join("front.jpg");
+        fs::write(&source, b"cover").expect("source");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Rename {
+            source: source.clone(),
+            destination: destination.clone(),
+        };
+        let guard = hold_conflicting_artwork_write(&source);
+
+        let error = execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("conflicting Tonepoet write must reject picker rename");
+        assert!(error.message().to_ascii_lowercase().contains("busy")
+            || error.message().to_ascii_lowercase().contains("overlap"));
+        assert_eq!(fs::read(&source).expect("source retained"), b"cover");
+        assert!(!destination.exists(), "destination must not appear before admission");
+
+        drop(guard);
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("rename after claim release");
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).expect("renamed destination"), b"cover");
+    }
+
+    #[test]
+    fn artwork_host_duplicate_rejects_conflicting_tonepoet_claim_then_succeeds() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("cover.jpg");
+        let destination = temp.path().join("cover-copy.jpg");
+        fs::write(&source, b"cover").expect("source");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Duplicate {
+            sources: vec![source.clone()],
+            exact_destination: Some(destination.clone()),
+        };
+        let guard = hold_conflicting_artwork_write(&source);
+
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("conflicting Tonepoet write must reject picker duplicate");
+        assert_eq!(fs::read(&source).expect("source retained"), b"cover");
+        assert!(!destination.exists(), "duplicate must not appear before admission");
+
+        drop(guard);
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("duplicate after claim release");
+        assert_eq!(fs::read(&source).expect("source retained"), b"cover");
+        assert_eq!(fs::read(&destination).expect("duplicate"), b"cover");
+    }
+
+    #[test]
+    fn artwork_host_delete_rejects_conflicting_tonepoet_claim_then_succeeds_with_picker_policy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("cover.jpg");
+        fs::write(&source, b"cover").expect("source");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Delete {
+            paths: vec![source.clone()],
+            policy: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+        };
+        let guard = hold_conflicting_artwork_write(&source);
+
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("conflicting Tonepoet write must reject picker delete");
+        assert_eq!(fs::read(&source).expect("source retained"), b"cover");
+
+        drop(guard);
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect("delete after claim release");
+        assert!(!source.exists(), "picker delete policy should remove the file");
+    }
+
+    #[test]
+    fn artwork_host_paste_routes_exact_plan_to_hosted_file_task_worker() {
+        let _file_task_environment = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir(&source_dir).expect("source dir");
+        fs::create_dir(&target_dir).expect("target dir");
+        let source = source_dir.join("cover.jpg");
+        let destination = target_dir.join("cover.jpg");
+        fs::write(&source, b"cover").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Paste {
+            clipboard,
+            target_dir: target_dir.clone(),
+        };
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.test_file_task_dispatches = Some(Vec::new());
+        let (tx, _rx) = channel();
+
+        start_artwork_picker_host_paste(&mut app, 77, request.clone(), &tx)
+            .expect("hosted paste dispatch");
+
+        let dispatches = app
+            .test_file_task_dispatches
+            .as_ref()
+            .expect("dispatch capture");
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].1, vec![source.clone()]);
+        assert_eq!(dispatches[0].2, vec![destination.clone()]);
+        assert!(
+            !destination.exists(),
+            "test dispatch seam proves picker did not execute paste filesystem I/O directly",
+        );
+        let file_task_session_id = dispatches[0].0;
+        let pending = app
+            .artwork_picker_file_tasks
+            .get(&file_task_session_id)
+            .expect("artwork task correlation");
+        assert_eq!(pending.picker_session_id, 77);
+        assert_eq!(pending.request, request);
+        assert_eq!(pending.plan.mappings.len(), 1);
+        assert_eq!(pending.plan.mappings[0].source, source);
+        assert_eq!(pending.plan.mappings[0].destination, destination);
+    }
+
+    #[test]
+    fn artwork_host_delete_preserves_non_recursive_picker_delete_policy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("artwork-dir");
+        fs::create_dir(&directory).expect("directory");
+        fs::write(directory.join("cover.jpg"), b"cover").expect("child");
+        let request = tui_file_picker::FilePickerHostMutationRequest::Delete {
+            paths: vec![directory.clone()],
+            policy: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
+        };
+
+        execute_artwork_picker_host_mutation_sync(
+            &request,
+            tui_file_picker::FileOperationPolicy::default(),
+            tui_file_picker::VerificationMode::Standard,
+        )
+        .expect_err("non-empty directory must not become recursive delete");
+        assert!(directory.exists());
+        assert!(directory.join("cover.jpg").exists());
     }
 
     #[test]

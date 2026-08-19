@@ -1705,10 +1705,11 @@ fn reduce_file_task_progress(
         app.set_status(status);
     }
     let defer_clipboard_refresh = terminal
-        && app
+        && (app
             .file_transfers
             .pending_by_session
-            .contains_key(&session_id);
+            .contains_key(&session_id)
+            || app.artwork_picker_file_tasks.contains_key(&session_id));
     if refresh_after_terminal && !defer_clipboard_refresh {
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
@@ -1761,6 +1762,124 @@ fn terminal_update_from_completion_report(
             totals,
         }
     }
+}
+
+fn reconcile_artwork_picker_file_task(
+    app: &mut AppState,
+    pending: super::app::ArtworkPickerFileTask,
+    report: &tui_file_picker::FileTaskCompletionReport,
+    worker_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
+) -> bool {
+    let picker_session_id = pending.picker_session_id;
+    let (completed_sources, completed_destinations, remaining_sources, is_move) =
+        match &pending.request {
+            tui_file_picker::FilePickerHostMutationRequest::Paste { clipboard, .. } => {
+                let mut completed_sources = Vec::new();
+                let mut completed_destinations = Vec::new();
+                let mut remaining_sources = Vec::new();
+                for mapping in &pending.plan.mappings {
+                    let completed = report
+                        .roots
+                        .iter()
+                        .find(|root| root.source == mapping.source)
+                        .is_some_and(|root| root.disposition.is_completed());
+                    if completed {
+                        completed_sources.push(mapping.source.clone());
+                        completed_destinations.push(mapping.destination.clone());
+                    } else {
+                        remaining_sources.push(mapping.source.clone());
+                    }
+                }
+                (
+                    completed_sources,
+                    completed_destinations,
+                    remaining_sources,
+                    clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut,
+                )
+            }
+            _ => (Vec::new(), Vec::new(), Vec::new(), false),
+        };
+
+    // The progress reducer deliberately defers generic Browse refresh while a
+    // hosted artwork transfer is pending. Reuse the normal nonblocking Browse
+    // completion refresh here so a picker-owned paste cannot leave another
+    // Tonepoet surface displaying stale source/destination rows.
+    let destination_refreshed_tabs =
+        refresh_browse_destination_views_after_file_task(app, &completed_destinations);
+    if is_move && !completed_sources.is_empty() {
+        refresh_browse_source_views_after_move(
+            app,
+            &completed_sources,
+            &destination_refreshed_tabs,
+        );
+    }
+    app.artwork_picker_paste_retries.remove(&picker_session_id);
+    if !remaining_sources.is_empty() {
+        if let Some(retry) = worker_retry_plan
+            .as_ref()
+            .and_then(|retry| retry.retain_sources(&remaining_sources))
+        {
+            app.artwork_picker_paste_retries
+                .insert(picker_session_id, retry);
+        }
+    }
+
+    fn reconcile_editor(
+        editor: &mut Box<super::app::MetadataEditorState>,
+        picker_session_id: u64,
+        request: &tui_file_picker::FilePickerHostMutationRequest,
+        plan: &tui_file_picker::PastePlan,
+        report: &tui_file_picker::FileTaskCompletionReport,
+    ) -> bool {
+        let Some(session) = editor
+            .file_picker
+            .as_mut()
+            .filter(|session| session.session_id == picker_session_id)
+        else {
+            return false;
+        };
+        let _ = session
+            .picker
+            .complete_host_paste(request.clone(), plan, report);
+        true
+    }
+
+    if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(editor) = app.pending_metadata_editor.as_mut() {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.file_task_preempted_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.pending_editor_context_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.queued_quit_preempted_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    // No live picker can consume an in-memory exact retry token for this
+    // session anymore. The durable file-task journal remains authoritative
+    // for crash/startup recovery, so do not retain dead-session UI state.
+    app.artwork_picker_paste_retries.remove(&picker_session_id);
+    false
 }
 
 fn reduce_file_task_complete(
@@ -1874,6 +1993,36 @@ fn reduce_file_task_complete(
         )
     {
         app.active_overlay = ActiveOverlay::None;
+    }
+
+    if let Some(pending_artwork) = app.artwork_picker_file_tasks.remove(&session_id) {
+        let reconciled = reconcile_artwork_picker_file_task(
+            app,
+            pending_artwork,
+            &report,
+            worker_retry_plan,
+        );
+        let requires_attention = !report_finished_cleanly
+            || undo_record_warning.is_some()
+            || !reconciled;
+        if let Some(warning) = undo_record_warning {
+            app.set_status(format!(
+                "artwork-picker file task completed, but undo was not retained: {warning}"
+            ));
+        } else if !reconciled {
+            app.set_status(concat!(
+                "artwork-picker file task completed after its picker closed; ",
+                "filesystem result retained in task history",
+            ));
+        } else if report_finished_cleanly {
+            app.set_status("Artwork picker file operation completed");
+        } else {
+            app.set_status("Artwork picker file operation completed with retryable or warning roots");
+        }
+        if app.file_transfers.active_session_id == Some(session_id) {
+            finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+        }
+        return;
     }
 
     let Some(pending) = app.file_transfers.pending_by_session.remove(&session_id) else {

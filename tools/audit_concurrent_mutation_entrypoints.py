@@ -852,7 +852,8 @@ def main() -> int:
     )
     require(
         "copy-undo recovery host admission",
-        "permits_filesystem_mutation" in picker_refresh
+        "FilePickerMutationExecution::Direct" in picker_refresh
+        and "permits_filesystem_mutation" in picker_refresh
         and "recover_interrupted_verified_removals_once" in picker_refresh
         and contains_all(picker_mutation_policy, [
             "allow_new_file",
@@ -872,7 +873,12 @@ def main() -> int:
             "admitted_original",
             "admitted_quarantine",
         ]),
-        "selection-only modal refresh must perform no automatic copy-undo restore; main Browse must claim each original/quarantine pair before restoring admitted paths",
+        (
+            "only direct-execution picker refresh may perform automatic copy-undo restore; "
+            "host-managed/selection-only embedded surfaces must leave recovery to host "
+            "admission, while main Browse claims each original/quarantine pair before "
+            "restoring admitted paths"
+        ),
     )
 
 
@@ -888,6 +894,9 @@ def main() -> int:
     picker_case_rename = function_body(
         "crates/tui-file-picker/src/state.rs", "apply_path_case_transform"
     )
+    picker_case_plan = function_body(
+        "crates/tui-file-picker/src/state.rs", "plan_picker_case_rename_transaction"
+    )
     picker_duplicate_helper = function_body(
         "crates/tui-file-picker/src/state.rs", "plan_duplicate_files_in_place"
     )
@@ -899,6 +908,48 @@ def main() -> int:
     )
     artwork_picker_policy = function_body(
         "src/tui/keybindings.rs", "artwork_file_picker_policy"
+    )
+    artwork_picker_open = function_body(
+        "src/tui/keybindings.rs", "metadata_editor_open_artwork_picker"
+    )
+    artwork_picker_post_input = function_body(
+        "src/tui/keybindings.rs", "finish_metadata_file_picker_input"
+    )
+    artwork_picker_key = function_body(
+        "src/tui/keybindings.rs", "handle_metadata_file_picker_key"
+    )
+    artwork_picker_mouse = function_body(
+        "src/tui/keybindings.rs", "handle_metadata_file_picker_mouse"
+    )
+    artwork_host_dispatch = function_body(
+        "src/tui/keybindings.rs", "dispatch_artwork_picker_host_mutation"
+    )
+    artwork_host_sync = function_body(
+        "src/tui/keybindings.rs", "execute_artwork_picker_host_mutation_sync"
+    )
+    artwork_host_rename = function_body(
+        "src/tui/keybindings.rs", "execute_artwork_picker_rename_request"
+    )
+    artwork_host_paste = function_body(
+        "src/tui/keybindings.rs", "start_artwork_picker_host_paste"
+    )
+    picker_create = function_body(
+        "crates/tui-file-picker/src/state.rs", "try_create_named_item"
+    )
+    picker_rename = function_body(
+        "crates/tui-file-picker/src/state.rs", "try_rename_current"
+    )
+    picker_duplicate_action = function_body(
+        "crates/tui-file-picker/src/state.rs", "duplicate_action_paths"
+    )
+    picker_duplicate_named = function_body(
+        "crates/tui-file-picker/src/state.rs", "try_duplicate_current"
+    )
+    picker_paste = function_body(
+        "crates/tui-file-picker/src/state.rs", "try_paste_clipboard_to"
+    )
+    picker_delete = function_body(
+        "crates/tui-file-picker/src/state.rs", "try_confirm_delete"
     )
     browse_tag_transfer_picker = function_body(
         "src/tui/context_menu.rs", "open_browse_tag_transfer_picker"
@@ -932,11 +983,123 @@ def main() -> int:
         and "self.begin_rename_path(path)" in text("crates/tui-file-picker/src/input.rs")
         and "FileOperationPolicy::selection_only" in tag_block_picker
         and "FileOperationPolicy::selection_only" in tag_transfer_picker
-        and "FileOperationPolicy::selection_only" in artwork_picker_policy
         and "FileOperationPolicy::selection_only" in browse_tag_transfer_picker
         and "FileOperationPolicy::selection_only" in destination_picker_policy
         and "FileOperationPolicy::selection_only" in preset_picker_policy_body,
-        "root-reachable modal selectors must disable create/cut/paste/delete/rename/case-rename/duplicate at the picker mutation boundary",
+        "selection-only modal selectors must disable create/cut/paste/delete/rename/case-rename/duplicate at the picker mutation boundary",
+    )
+    require(
+        "artwork picker retains established file-manager operation authority",
+        "FileOperationPolicy::default()" in artwork_picker_policy
+        and "selection_only" not in artwork_picker_policy
+        and "FilePickerState::new_host_managed" in artwork_picker_open
+        and strip_cfg_test_modules(text("src/tui/keybindings.rs")).count(
+            "FilePickerState::new_host_managed("
+        ) == 1,
+        (
+            "artwork selection must preserve full file-manager authority while explicitly "
+            "selecting Tonepoet-owned mutation execution before first refresh"
+        ),
+    )
+    require(
+        "artwork picker host-managed mutation boundary",
+        contains_all(artwork_picker_post_input, [
+            "take_host_mutation_request",
+            "dispatch_artwork_picker_host_mutation",
+            "FilePickerPurpose::SelectArtwork",
+        ])
+        and "finish_metadata_file_picker_input" in artwork_picker_key
+        and "finish_metadata_file_picker_input" in artwork_picker_mouse
+        and contains_all(artwork_host_dispatch, [
+            "start_artwork_picker_host_paste",
+            "execute_artwork_picker_host_mutation_sync",
+            "complete_host_mutation_success",
+            "complete_host_mutation_failure",
+        ])
+        and contains_all(picker_create, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Create",
+            "queue_host_mutation",
+        ])
+        and contains_all(picker_rename, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Rename",
+            "queue_host_mutation",
+        ])
+        and contains_all(picker_duplicate_action, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Duplicate",
+            "queue_host_mutation",
+        ])
+        and contains_all(picker_duplicate_named, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Duplicate",
+        ])
+        and contains_all(picker_paste, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Paste",
+            "queue_host_mutation",
+        ])
+        and contains_all(picker_delete, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::Delete",
+        ])
+        and contains_all(picker_case_rename, [
+            "FilePickerMutationExecution::HostManaged",
+            "FilePickerHostMutationRequest::CaseRename",
+        ])
+        and picker_create.find("FilePickerMutationExecution::HostManaged")
+            < picker_create.find("path.exists()")
+        and picker_duplicate_action.find("FilePickerMutationExecution::HostManaged")
+            < picker_duplicate_action.find("duplicate_files_in_place")
+        and picker_duplicate_named.find("FilePickerMutationExecution::HostManaged")
+            < picker_duplicate_named.find("source.is_file()")
+        and picker_duplicate_named.find("FilePickerMutationExecution::HostManaged")
+            < picker_duplicate_named.find("destination.exists()")
+        and contains_all(picker_begin_duplicate, [
+            "cached_is_directory",
+            "unique_path_from_cached_entries",
+            "FilePickerMutationExecution::Direct && !path.is_file()",
+        ])
+        and picker_paste.find("FilePickerMutationExecution::HostManaged")
+            < picker_paste.find("target_dir.is_dir()")
+        and picker_paste.find("FilePickerMutationExecution::HostManaged")
+            < picker_paste.find("plan_filesystem_paste_with_retry")
+        and ".exists()" not in picker_case_plan,
+        (
+            "every mutating command exposed by the host-managed artwork picker must yield "
+            "immutable intent before picker-owned filesystem probing or mutation"
+        ),
+    )
+    require(
+        "artwork picker mutations join Tonepoet shared coordination",
+        contains_all(artwork_host_sync, [
+            "PathResolutionSemantics::NamespaceObject",
+            "MutationClaimGuard::acquire_ephemeral",
+            "plan_duplicate_files_in_place",
+            "file_task_path_admission(false, &mappings)",
+            "execute_duplicate_plan",
+            "delete_path_with_policy",
+            "execute_artwork_picker_rename_request",
+        ])
+        and contains_all(artwork_host_rename, [
+            "RenamePlan::new",
+            "validate_plan",
+            "execute_plan_with_proofs_at_verification",
+        ])
+        and contains_all(artwork_host_paste, [
+            "plan_filesystem_paste_for_dispatch",
+            "BrowsePasteRetryPlan::from_plan",
+            "start_file_op",
+            "artwork_picker_file_tasks.insert",
+        ])
+        and "FilePickerMutationExecution::Direct" in picker_refresh
+        and "recover_interrupted_verified_removals_once" in picker_refresh,
+        (
+            "full artwork file-manager authority must use Tonepoet "
+            "create/rename/duplicate/delete claims and the hosted file-task path for paste; "
+            "host-managed refresh must not run picker-owned recovery"
+        ),
     )
 
     wizard_events_source = strip_cfg_test_modules(

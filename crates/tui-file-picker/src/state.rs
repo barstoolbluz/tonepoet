@@ -803,6 +803,25 @@ fn default_picker_title_case(value: &str) -> String {
     output
 }
 
+/// Decide who is allowed to execute filesystem mutations initiated by this picker.
+///
+/// `Direct` preserves the standalone crate behavior. `HostManaged` is an explicit
+/// integration boundary for embedding applications that must perform admission,
+/// locking, journaling, or other coordination before any filesystem mutation.
+/// In host-managed mode the picker only plans immutable mutation requests; it
+/// never performs the corresponding filesystem I/O itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerMutationExecution {
+    Direct,
+    HostManaged,
+}
+
+impl Default for FilePickerMutationExecution {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilePickerConfig {
     pub start_dir: PathBuf,
@@ -1209,6 +1228,14 @@ pub struct FilePickerState {
     pub(crate) maximized: bool,
     pub(crate) free_space_bytes: Option<u64>,
     pub(crate) operation_policy: FileOperationPolicy,
+    pub(crate) mutation_execution: FilePickerMutationExecution,
+    /// Planned host-owned mutation waiting to cross the embedding boundary.
+    /// No filesystem mutation has occurred while this is `Some`.
+    pending_host_mutation: Option<FilePickerHostMutationRequest>,
+    /// Set after the host consumes a request and cleared only by an explicit
+    /// host completion/failure callback. This prevents a second mutation from
+    /// racing the admitted operation while the picker UI remains responsive.
+    host_mutation_in_flight: bool,
     pub(crate) pending_create: Option<FilePickerCreateKind>,
     pub(crate) pending_name_action: Option<FilePickerNameAction>,
     pub(crate) pending_name_source: Option<PathBuf>,
@@ -1227,7 +1254,23 @@ pub struct FilePickerState {
 }
 
 impl FilePickerState {
+    /// Construct a standalone picker with the historical direct-execution
+    /// behavior. Existing embedding code therefore requires no opt-in change.
     pub fn new(config: FilePickerConfig) -> Self {
+        Self::new_with_mutation_execution(config, FilePickerMutationExecution::Direct)
+    }
+
+    /// Construct a picker whose embedding host owns every filesystem mutation.
+    /// The mode is installed before the initial refresh, so picker-owned crash
+    /// recovery cannot run before the host admission boundary becomes active.
+    pub fn new_host_managed(config: FilePickerConfig) -> Self {
+        Self::new_with_mutation_execution(config, FilePickerMutationExecution::HostManaged)
+    }
+
+    fn new_with_mutation_execution(
+        config: FilePickerConfig,
+        mutation_execution: FilePickerMutationExecution,
+    ) -> Self {
         let start_dir = normalize_start_dir(&config.start_dir);
         let show_preview = config.show_preview || matches!(config.filter, FilePickerFilter::Images);
         let mut state = Self {
@@ -1299,6 +1342,9 @@ impl FilePickerState {
             maximized: false,
             free_space_bytes: None,
             operation_policy: config.operation_policy,
+            mutation_execution,
+            pending_host_mutation: None,
+            host_mutation_in_flight: false,
             pending_create: None,
             pending_name_action: None,
             pending_name_source: None,
@@ -1375,6 +1421,9 @@ impl FilePickerState {
         std::mem::swap(&mut self.bookmarks, &mut other.bookmarks);
         std::mem::swap(&mut self.maximized, &mut other.maximized);
         std::mem::swap(&mut self.operation_policy, &mut other.operation_policy);
+        std::mem::swap(&mut self.mutation_execution, &mut other.mutation_execution);
+        std::mem::swap(&mut self.pending_host_mutation, &mut other.pending_host_mutation);
+        std::mem::swap(&mut self.host_mutation_in_flight, &mut other.host_mutation_in_flight);
         std::mem::swap(&mut self.pending_create, &mut other.pending_create);
         std::mem::swap(&mut self.pending_name_action, &mut other.pending_name_action);
         std::mem::swap(&mut self.pending_name_source, &mut other.pending_name_source);
@@ -1525,6 +1574,8 @@ impl FilePickerState {
         cloned.text_pointer = None;
         cloned.text_last_click = None;
         cloned.paste_task = None;
+        cloned.pending_host_mutation = None;
+        cloned.host_mutation_in_flight = false;
         cloned
     }
 
@@ -1532,22 +1583,25 @@ impl FilePickerState {
         // Build a fresh context instead of cloning and clearing a potentially
         // huge directory listing. New/Open-in-New-Tab stay O(size of target
         // directory), while Duplicate deliberately clones the current view.
-        let mut state = Box::new(Self::new(FilePickerConfig {
-            start_dir: dir,
-            filter: self.filter.clone(),
-            title: self.title.clone(),
-            theme: self.theme.clone(),
-            selection_mode: self.selection_mode,
-            show_hidden: self.show_hidden,
-            sort_key: self.sort_key,
-            sort_reverse: self.sort_reverse,
-            show_preview: self.show_preview,
-            conflict_policy: self.conflict_policy,
-            operation_policy: self.operation_policy,
-            hide_extension: self.hide_extension.clone(),
-            save_mode: self.save_mode.clone(),
-            title_case: self.title_case,
-        }));
+        let mut state = Box::new(Self::new_with_mutation_execution(
+            FilePickerConfig {
+                start_dir: dir,
+                filter: self.filter.clone(),
+                title: self.title.clone(),
+                theme: self.theme.clone(),
+                selection_mode: self.selection_mode,
+                show_hidden: self.show_hidden,
+                sort_key: self.sort_key,
+                sort_reverse: self.sort_reverse,
+                show_preview: self.show_preview,
+                conflict_policy: self.conflict_policy,
+                operation_policy: self.operation_policy,
+                hide_extension: self.hide_extension.clone(),
+                save_mode: self.save_mode.clone(),
+                title_case: self.title_case,
+            },
+            self.mutation_execution,
+        ));
         state.tabs = None;
         state
     }
@@ -1761,6 +1815,8 @@ impl FilePickerState {
 
     pub(crate) fn tab_switch_blocked_by_modal(&self) -> bool {
         self.paste_task.is_some()
+            || self.pending_host_mutation.is_some()
+            || self.host_mutation_in_flight
             || self.menu_open
             || self.submenu_open
             || self.properties_open
@@ -2624,6 +2680,452 @@ impl FilePickerState {
         self.operation_policy
     }
 
+    /// Execution boundary selected by the embedding host.
+    pub fn mutation_execution(&self) -> FilePickerMutationExecution {
+        self.mutation_execution
+    }
+
+    /// Consume the next host-owned mutation request. In host-managed mode this
+    /// is the sole transition from picker planning to host execution.
+    pub fn take_host_mutation_request(&mut self) -> Option<FilePickerHostMutationRequest> {
+        let request = self.pending_host_mutation.take()?;
+        self.host_mutation_in_flight = true;
+        Some(request)
+    }
+
+    /// Whether a host-owned filesystem operation has been dispatched and has
+    /// not yet reported completion.
+    pub fn host_mutation_in_flight(&self) -> bool {
+        self.host_mutation_in_flight
+    }
+
+    fn queue_host_mutation(
+        &mut self,
+        request: FilePickerHostMutationRequest,
+    ) -> Result<(), FilePickerError> {
+        if self.mutation_execution != FilePickerMutationExecution::HostManaged {
+            return Err(FilePickerError::OperationDisabled(
+                "host-managed mutation request outside host-managed mode",
+            ));
+        }
+        if self.pending_host_mutation.is_some() || self.host_mutation_in_flight {
+            return Err(FilePickerError::OperationDisabled(
+                "another host-managed filesystem operation is already running",
+            ));
+        }
+        self.pending_host_mutation = Some(request);
+        Ok(())
+    }
+
+    fn finish_host_name_action(&mut self) {
+        self.pending_create = None;
+        self.pending_name_action = None;
+        self.pending_name_source = None;
+        self.pending_name_parent = None;
+        self.create_name_input = TextInputState::empty();
+        self.restore_pane_focus();
+    }
+
+    /// Report successful execution of an exact host-managed request. The host
+    /// calls this only after its admission/coordination layer has committed the
+    /// filesystem operation. No filesystem mutation occurs in this method.
+    pub fn complete_host_mutation_success(
+        &mut self,
+        request: FilePickerHostMutationRequest,
+        committed_mappings: Option<Vec<PasteMapping>>,
+        committed_warning: Option<String>,
+    ) {
+        self.host_mutation_in_flight = false;
+        self.clear_error();
+        match request {
+            FilePickerHostMutationRequest::Create { path, .. } => {
+                let parent = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.current_dir.clone());
+                refresh_tree_children(&mut self.tree_nodes, &parent, self.show_hidden);
+                if same_path(&parent, &self.current_dir) {
+                    self.selected = Some(path.clone());
+                    self.refresh();
+                    self.select_path_in_entries(&path);
+                } else {
+                    self.select_tree_node_for_current_dir();
+                }
+                self.finish_host_name_action();
+            }
+            FilePickerHostMutationRequest::Rename { source, destination } => {
+                let parent = destination
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.current_dir.clone());
+                let remapped_current = self
+                    .current_dir
+                    .strip_prefix(&source)
+                    .ok()
+                    .map(|suffix| destination.join(suffix));
+                for path in self
+                    .history_back
+                    .iter_mut()
+                    .chain(self.history_forward.iter_mut())
+                {
+                    if let Ok(suffix) = path.strip_prefix(&source) {
+                        *path = destination.join(suffix);
+                    }
+                }
+                refresh_tree_children(&mut self.tree_nodes, &parent, self.show_hidden);
+                if let Some(current) = remapped_current {
+                    self.adopt_committed_current_dir(current);
+                } else if same_path(&parent, &self.current_dir) {
+                    self.selected = Some(destination.clone());
+                    self.refresh();
+                    self.select_path_in_entries(&destination);
+                } else {
+                    self.select_tree_node_for_current_dir();
+                }
+                self.finish_host_name_action();
+                if let Some(message) = committed_warning {
+                    self.set_error(committed_operation_warning(
+                        &source,
+                        &destination,
+                        message,
+                    ));
+                }
+            }
+            FilePickerHostMutationRequest::Duplicate { .. } => {
+                let Some(mappings) = committed_mappings else {
+                    self.set_error(FilePickerError::Io {
+                        op: "host-managed duplicate completion",
+                        path: self.current_dir.clone(),
+                        message: "host reported duplicate success without committed mappings"
+                            .to_string(),
+                    });
+                    return;
+                };
+                let destinations = mappings
+                    .iter()
+                    .map(|mapping| mapping.destination.clone())
+                    .collect::<Vec<_>>();
+                if destinations.len() > 1 {
+                    self.replace_multi_selected(destinations.iter().cloned());
+                }
+                self.selected = destinations.last().cloned();
+                self.refresh();
+                if let Some(path) = self.selected.clone() {
+                    self.select_path_in_entries(&path);
+                }
+                if self.pending_name_action == Some(FilePickerNameAction::Duplicate) {
+                    self.finish_host_name_action();
+                }
+                if let Some(message) = committed_warning {
+                    if let Some(path) = destinations.last() {
+                        self.set_error(FilePickerError::Io {
+                            op: "host-managed duplicate committed with warning",
+                            path: path.clone(),
+                            message,
+                        });
+                    }
+                }
+            }
+            FilePickerHostMutationRequest::CaseRename { mappings } => {
+                let destinations = mappings
+                    .iter()
+                    .map(|mapping| mapping.destination.clone())
+                    .collect::<Vec<_>>();
+                self.replace_multi_selected(destinations.iter().cloned());
+                self.selected = destinations.last().cloned();
+                self.refresh();
+                if let Some(path) = self.selected.clone() {
+                    self.select_path_in_entries(&path);
+                }
+                self.select_tree_node_for_current_dir();
+                if let Some(message) = committed_warning {
+                    if let Some(path) = destinations.last() {
+                        self.set_error(FilePickerError::Io {
+                            op: "host-managed case rename committed with warning",
+                            path: path.clone(),
+                            message,
+                        });
+                    }
+                }
+            }
+            FilePickerHostMutationRequest::Delete { paths, .. } => {
+                let refresh_parents = paths
+                    .iter()
+                    .filter_map(|path| path.parent().map(Path::to_path_buf))
+                    .collect::<Vec<_>>();
+                for path in &paths {
+                    self.retain_multi_selected(|selected| !same_path(selected, path));
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|selected| same_path(selected, path))
+                    {
+                        self.selected = None;
+                    }
+                }
+                self.pending_delete.clear();
+                repair_navigation_stack(&mut self.history_back);
+                repair_navigation_stack(&mut self.history_forward);
+                if let Some(repaired_current) = nearest_existing_directory(&self.current_dir) {
+                    self.current_dir = repaired_current;
+                }
+                for parent in refresh_parents {
+                    if parent.is_dir() {
+                        refresh_tree_children(&mut self.tree_nodes, &parent, self.show_hidden);
+                    }
+                }
+                self.refresh();
+                self.select_tree_node_for_current_dir();
+                self.delete_confirm_button = DeleteConfirmButton::Cancel;
+                self.restore_pane_focus();
+                if let Some(message) = committed_warning {
+                    let path = paths
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| self.current_dir.clone());
+                    self.set_error(FilePickerError::Io {
+                        op: "host-managed delete committed with warning",
+                        path,
+                        message,
+                    });
+                }
+            }
+            FilePickerHostMutationRequest::Paste { .. } => {
+                self.set_error(FilePickerError::Io {
+                    op: "host-managed paste completion",
+                    path: self.current_dir.clone(),
+                    message: "paste must be reconciled from its file-task completion report"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    /// Reconcile the picker's established partial-delete semantics after the
+    /// host acquired the complete claim set but an individual delete failed
+    /// after earlier roots committed. Already deleted roots leave the pending
+    /// set; untouched roots remain selected in the confirmation for retry.
+    pub fn complete_host_delete_partial(
+        &mut self,
+        deleted: &[PathBuf],
+        error: FilePickerError,
+    ) {
+        self.host_mutation_in_flight = false;
+        let refresh_parents = deleted
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        self.pending_delete
+            .retain(|pending| !deleted.iter().any(|path| same_path(pending, path)));
+        for path in deleted {
+            self.retain_multi_selected(|selected| !same_path(selected, path));
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| same_path(selected, path))
+            {
+                self.selected = None;
+            }
+        }
+        repair_navigation_stack(&mut self.history_back);
+        repair_navigation_stack(&mut self.history_forward);
+        if let Some(repaired_current) = nearest_existing_directory(&self.current_dir) {
+            self.current_dir = repaired_current;
+        }
+        for parent in refresh_parents {
+            if parent.is_dir() {
+                refresh_tree_children(&mut self.tree_nodes, &parent, self.show_hidden);
+            }
+        }
+        self.refresh();
+        self.select_tree_node_for_current_dir();
+        if self.pending_delete.is_empty() {
+            self.delete_confirm_button = DeleteConfirmButton::Cancel;
+            self.restore_pane_focus();
+        }
+        self.set_error(error);
+    }
+
+    /// Report a host admission or execution failure. Pending editors and delete
+    /// confirmation remain intact so the user can retry after a conflicting
+    /// Tonepoet operation releases its claim.
+    pub fn complete_host_mutation_failure(&mut self, error: FilePickerError) {
+        self.host_mutation_in_flight = false;
+        self.set_error(error);
+    }
+
+    /// Reconcile a host-managed paste from the host's authoritative file-task
+    /// report. Logical host-plan mappings, not resolved admission paths, drive
+    /// UI selection/history so symlink aliases are never rewritten by the
+    /// host coordination layer.
+    pub fn complete_host_paste(
+        &mut self,
+        request: FilePickerHostMutationRequest,
+        plan: &PastePlan,
+        report: &crate::FileTaskCompletionReport,
+    ) -> Result<(), FilePickerError> {
+        let FilePickerHostMutationRequest::Paste {
+            clipboard,
+            target_dir,
+        } = request
+        else {
+            self.host_mutation_in_flight = false;
+            return Err(FilePickerError::Io {
+                op: "host-managed paste completion",
+                path: self.current_dir.clone(),
+                message: "completion did not match a paste request".to_string(),
+            });
+        };
+        self.host_mutation_in_flight = false;
+        if report.roots.len() != plan.mappings.len() {
+            let error = FilePickerError::Io {
+                op: "host-managed paste completion",
+                path: target_dir,
+                message: format!(
+                    "file-task report root count {} does not match planned root count {}",
+                    report.roots.len(),
+                    plan.mappings.len(),
+                ),
+            };
+            self.set_error(error.clone());
+            return Err(error);
+        }
+
+        let mut completed = Vec::new();
+        let mut remaining = Vec::new();
+        let mut failure_messages = Vec::new();
+        for logical in &plan.mappings {
+            // File-task admission may resolve an I/O destination through a
+            // symlink alias, but the worker preserves the lexical top-level
+            // source identity. Reconcile by that stable identity rather than
+            // relying on report order or comparing an admitted destination.
+            let root = report
+                .roots
+                .iter()
+                .find(|root| root.source == logical.source);
+            if root.is_some_and(|root| root.disposition.is_completed()) {
+                completed.push(logical.clone());
+                if let Some(message) = root.and_then(|root| root.message.as_ref()) {
+                    failure_messages.push(format!("committed warning: {message}"));
+                }
+            } else {
+                remaining.push(logical.clone());
+                let message = root
+                    .map(|root| {
+                        root.message
+                            .clone()
+                            .unwrap_or_else(|| format!("{:?}", root.disposition))
+                    })
+                    .unwrap_or_else(|| "host file-task report omitted this source".to_string());
+                failure_messages.push(format!("{}: {message}", logical.source.display()));
+            }
+        }
+
+        // Exact retry authority for a host-managed paste belongs to the host
+        // worker/journal layer. Keeping a second picker-owned retry token would
+        // create two sources of truth for destination identity.
+        self.paste_retry_plan = None;
+
+        let completed_sources = completed
+            .iter()
+            .map(|mapping| mapping.source.clone())
+            .collect::<Vec<_>>();
+        let completed_destinations = completed
+            .iter()
+            .map(|mapping| mapping.destination.clone())
+            .collect::<Vec<_>>();
+        let remapped_current = if clipboard.mode() == FilePickerClipboardMode::Cut
+            && !completed_sources.is_empty()
+        {
+            FilesystemClipboard::new(FilePickerClipboardMode::Cut, completed_sources.clone())
+                .and_then(|completed_clipboard| {
+                    for path in self
+                        .history_back
+                        .iter_mut()
+                        .chain(self.history_forward.iter_mut())
+                    {
+                        if let Some(remapped) = crate::remap_path_after_cut(
+                            path,
+                            &completed_clipboard,
+                            &completed_destinations,
+                        ) {
+                            *path = remapped;
+                        }
+                    }
+                    crate::remap_path_after_cut(
+                        &self.current_dir,
+                        &completed_clipboard,
+                        &completed_destinations,
+                    )
+                })
+        } else {
+            None
+        };
+
+        self.clipboard = if remaining.is_empty() {
+            if clipboard.mode() == FilePickerClipboardMode::Copy {
+                Some(clipboard.clone())
+            } else {
+                None
+            }
+        } else {
+            FilesystemClipboard::new(
+                clipboard.mode(),
+                remaining.iter().map(|mapping| mapping.source.clone()),
+            )
+        };
+
+        let mut refresh_parents = HashSet::new();
+        refresh_parents.insert(target_dir.clone());
+        for mapping in &completed {
+            if let Some(parent) = mapping.source.parent() {
+                refresh_parents.insert(parent.to_path_buf());
+            }
+            if let Some(parent) = mapping.destination.parent() {
+                refresh_parents.insert(parent.to_path_buf());
+            }
+        }
+        for parent in refresh_parents {
+            if parent.is_dir() {
+                refresh_tree_children(&mut self.tree_nodes, &parent, self.show_hidden);
+            }
+        }
+        if let Some(current) = remapped_current {
+            self.adopt_committed_current_dir(current);
+        } else {
+            self.refresh();
+            self.replace_multi_selected(completed_destinations.iter().cloned());
+            self.selected = completed_destinations.last().cloned();
+            if let Some(path) = self.selected.clone() {
+                self.select_path_in_entries(&path);
+            }
+        }
+
+        if remaining.is_empty() && failure_messages.is_empty() {
+            self.clear_error();
+            Ok(())
+        } else if remaining.is_empty() {
+            self.set_error(FilePickerError::Io {
+                op: "host-managed paste committed with warning",
+                path: target_dir,
+                message: failure_messages.join(" | "),
+            });
+            Ok(())
+        } else {
+            let error = FilePickerError::Io {
+                op: "host-managed paste incomplete",
+                path: target_dir,
+                message: format!(
+                    "{} root(s) remain retryable: {}",
+                    remaining.len(),
+                    failure_messages.join(" | "),
+                ),
+            };
+            self.set_error(error.clone());
+            Err(error)
+        }
+    }
+
     pub fn set_file_operation_policy(&mut self, policy: FileOperationPolicy) {
         self.operation_policy = policy;
     }
@@ -2740,7 +3242,9 @@ impl FilePickerState {
     pub fn refresh(&mut self) {
         self.clear_error();
         self.entries.clear();
-        if self.operation_policy.permits_filesystem_mutation() {
+        if self.mutation_execution == FilePickerMutationExecution::Direct
+            && self.operation_policy.permits_filesystem_mutation()
+        {
             match crate::source_guard::recover_interrupted_verified_removals_once(&self.current_dir) {
                 Ok(report) => {
                     for restored in report.restored {
@@ -3318,6 +3822,12 @@ impl FilePickerState {
             FilePickerNameAction::Duplicate => self.try_duplicate_current(&name),
         };
         match result {
+            Ok(()) if self.pending_host_mutation.is_some() => {
+                // Host-managed execution has not happened yet. Keep the inline
+                // editor and its immutable source/parent context alive until
+                // the embedding host reports success or failure.
+                true
+            }
             Ok(()) => {
                 self.pending_create = None;
                 self.pending_name_action = None;
@@ -3381,7 +3891,15 @@ impl FilePickerState {
             self.set_error(FilePickerError::OperationDisabled("duplicate"));
             return false;
         }
-        if !path.is_file() {
+        let cached_is_directory = self
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .is_some_and(|entry| entry.is_dir);
+        if (self.mutation_execution == FilePickerMutationExecution::HostManaged
+            && cached_is_directory)
+            || (self.mutation_execution == FilePickerMutationExecution::Direct && !path.is_file())
+        {
             self.set_error(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
             return false;
         }
@@ -3393,8 +3911,14 @@ impl FilePickerState {
         let stem = strip_configured_extension(source_name, self.hide_extension.as_deref());
         let candidate = append_configured_extension(format!("{}-copy", stem), self.hide_extension.as_deref());
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let candidate_path = parent.join(candidate);
+        let suggested_path = if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            unique_path_from_cached_entries(&candidate_path, &self.entries)
+        } else {
+            unique_path(&candidate_path)
+        };
         self.create_name_input = TextInputState::new_selected(strip_configured_extension(
-            unique_path(&parent.join(candidate))
+            suggested_path
                 .file_name()
                 .and_then(OsStr::to_str)
                 .unwrap_or("copy"),
@@ -3418,6 +3942,14 @@ impl FilePickerState {
         }
         if paths.len() == 1 {
             self.begin_duplicate_path(paths[0].clone());
+            return Ok(());
+        }
+
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            self.queue_host_mutation(FilePickerHostMutationRequest::Duplicate {
+                sources: paths,
+                exact_destination: None,
+            })?;
             return Ok(());
         }
 
@@ -3451,6 +3983,12 @@ impl FilePickerState {
         let destination = parent.join(file_name);
         if destination == source {
             return Ok(());
+        }
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            return self.queue_host_mutation(FilePickerHostMutationRequest::Rename {
+                source,
+                destination,
+            });
         }
         let remapped_current = self
             .current_dir
@@ -3525,9 +4063,6 @@ impl FilePickerState {
             .clone()
             .or_else(|| self.entries.get(self.file_cursor).map(|entry| entry.path.clone()))
             .ok_or(FilePickerError::NoSelection)?;
-        if !source.is_file() {
-            return Err(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
-        }
         let parent = self
             .pending_name_parent
             .clone()
@@ -3535,6 +4070,15 @@ impl FilePickerState {
             .ok_or(FilePickerError::NoSelection)?;
         let file_name = append_configured_extension(display_name.trim().to_string(), self.hide_extension.as_deref());
         let destination = parent.join(file_name);
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            return self.queue_host_mutation(FilePickerHostMutationRequest::Duplicate {
+                sources: vec![source],
+                exact_destination: Some(destination),
+            });
+        }
+        if !source.is_file() {
+            return Err(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
+        }
         if destination.exists() {
             return Err(FilePickerError::DestinationExists(destination));
         }
@@ -3634,6 +4178,9 @@ impl FilePickerState {
         validate_new_item_name(name)?;
         let parent = self.pending_name_parent.clone().unwrap_or_else(|| self.current_dir.clone());
         let path = parent.join(name);
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            return self.queue_host_mutation(FilePickerHostMutationRequest::Create { kind, path });
+        }
         if path.exists() {
             return Err(FilePickerError::DestinationExists(path));
         }
@@ -3749,10 +4296,18 @@ impl FilePickerState {
         if self.paste_task.as_ref().is_some_and(|task| !task.progress.is_terminal()) {
             return Err(FilePickerError::OperationDisabled("another paste is already running"));
         }
+        let clipboard = self.clipboard.clone().ok_or(FilePickerError::ClipboardEmpty)?;
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            self.queue_host_mutation(FilePickerHostMutationRequest::Paste {
+                clipboard,
+                target_dir: target_dir.to_path_buf(),
+            })?;
+            self.close_menu();
+            return Ok(());
+        }
         if !target_dir.is_dir() {
             return Err(FilePickerError::NotADirectory(target_dir.to_path_buf()));
         }
-        let clipboard = self.clipboard.clone().ok_or(FilePickerError::ClipboardEmpty)?;
         let retry_plan = self.paste_retry_plan.clone();
         let (plan, resume_existing_destinations) = plan_filesystem_paste_with_retry(
             &clipboard,
@@ -4184,6 +4739,12 @@ impl FilePickerState {
         if self.pending_delete.is_empty() {
             return Err(FilePickerError::NoPendingDelete);
         }
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            return self.queue_host_mutation(FilePickerHostMutationRequest::Delete {
+                paths: self.pending_delete.clone(),
+                policy: self.operation_policy.delete,
+            });
+        }
 
         let refresh_parents = self
             .pending_delete
@@ -4193,7 +4754,7 @@ impl FilePickerState {
         let mut delete_error = None;
 
         while let Some(path) = self.pending_delete.first().cloned() {
-            match delete_path(&path, self.operation_policy.delete) {
+            match delete_path_with_policy(&path, self.operation_policy.delete) {
                 Ok(()) => {
                     self.pending_delete.remove(0);
                     self.retain_multi_selected(|selected| !same_path(selected, &path));
@@ -4282,6 +4843,15 @@ impl FilePickerState {
             FilePickerMenuAction::RenameLowercase => name.to_lowercase(),
             _ => name.to_string(),
         };
+        if self.mutation_execution == FilePickerMutationExecution::HostManaged {
+            let mappings = plan_picker_case_rename_transaction(&paths, transform)?;
+            let count = mappings.len();
+            if count == 0 {
+                return Ok(0);
+            }
+            self.queue_host_mutation(FilePickerHostMutationRequest::CaseRename { mappings })?;
+            return Ok(count);
+        }
         let destinations = execute_picker_case_rename_transaction(&paths, transform)?;
         if destinations.is_empty() {
             return Ok(0);
@@ -4504,6 +5074,77 @@ pub struct PasteMapping {
 pub struct PastePlan {
     pub mode: FilePickerClipboardMode,
     pub mappings: Vec<PasteMapping>,
+}
+
+/// Immutable filesystem mutation planned by a picker whose embedding host owns
+/// execution. Constructing one of these values performs no filesystem mutation.
+/// The host must either execute the exact request through its admission layer
+/// and report completion, or report failure and leave picker state unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePickerHostMutationRequest {
+    Create {
+        kind: FilePickerCreateKind,
+        path: PathBuf,
+    },
+    Rename {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    Duplicate {
+        /// Cached/UI-selected sources. In host-managed mode the picker does
+        /// not stat them or allocate destination suffixes; the embedding host
+        /// performs that planning under its own admission boundary.
+        sources: Vec<PathBuf>,
+        /// User-authored destination from the inline single-file duplicate
+        /// editor. `None` requests the picker's normal automatic `-copy`
+        /// destination planning on the host side.
+        exact_destination: Option<PathBuf>,
+    },
+    Paste {
+        clipboard: FilesystemClipboard,
+        target_dir: PathBuf,
+    },
+    Delete {
+        paths: Vec<PathBuf>,
+        policy: DeletePolicy,
+    },
+    CaseRename {
+        mappings: Vec<PasteMapping>,
+    },
+}
+
+impl FilePickerHostMutationRequest {
+    /// Logical paths whose namespace/read authority the host must admit before
+    /// executing this request. This is primarily useful for diagnostics/tests;
+    /// the embedding application remains responsible for assigning exact claim
+    /// modes and scopes for each operation kind.
+    pub fn paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Create { path, .. } => vec![path.as_path()],
+            Self::Rename { source, destination } => {
+                vec![source.as_path(), destination.as_path()]
+            }
+            Self::Duplicate {
+                sources,
+                exact_destination,
+            } => sources
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(exact_destination.iter().map(PathBuf::as_path))
+                .collect(),
+            Self::CaseRename { mappings } => mappings
+                .iter()
+                .flat_map(|mapping| [mapping.source.as_path(), mapping.destination.as_path()])
+                .collect(),
+            Self::Paste { clipboard, target_dir } => clipboard
+                .paths()
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(std::iter::once(target_dir.as_path()))
+                .collect(),
+            Self::Delete { paths, .. } => paths.iter().map(PathBuf::as_path).collect(),
+        }
+    }
 }
 
 /// Authoritative copy-time and post-publication evidence retained for one
@@ -6751,6 +7392,51 @@ fn verify_case_rename_identity(
     )
 }
 
+fn plan_picker_case_rename_transaction(
+    paths: &[PathBuf],
+    transform: impl Fn(&str) -> String,
+) -> Result<Vec<PasteMapping>, FilePickerError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parent = paths[0]
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| FilePickerError::InvalidNewItemName(paths[0].display().to_string()))?;
+    let mut mappings = Vec::new();
+    for source in paths {
+        if source.parent() != Some(parent.as_path()) {
+            return Err(FilePickerError::Io {
+                op: "case rename planning",
+                path: source.clone(),
+                message: "all selected paths must share one parent directory".to_string(),
+            });
+        }
+        let name = source.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+            FilePickerError::InvalidNewItemName(source.display().to_string())
+        })?;
+        let destination = parent.join(transform(name));
+        if destination.as_path() != source.as_path() {
+            mappings.push(PasteMapping {
+                source: source.clone(),
+                destination,
+            });
+        }
+    }
+    if mappings.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let case_key = |path: &Path| path.to_string_lossy().to_lowercase();
+    let mut destination_keys = HashSet::new();
+    for mapping in &mappings {
+        if !destination_keys.insert(case_key(&mapping.destination)) {
+            return Err(FilePickerError::DestinationExists(mapping.destination.clone()));
+        }
+    }
+    Ok(mappings)
+}
+
 fn execute_picker_case_rename_transaction(
     paths: &[PathBuf],
     transform: impl Fn(&str) -> String,
@@ -6950,6 +7636,36 @@ fn unique_path(path: &Path) -> PathBuf {
         };
         let candidate = parent.join(name);
         if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem} copy"))
+}
+
+/// Choose the same duplicate-name sequence using only the picker's already
+/// rendered directory snapshot. Host-managed embeddings use this for the
+/// inline editor suggestion so opening the editor does not perform an
+/// unadmitted filesystem probe. The host still re-plans/validates against the
+/// live namespace before execution.
+fn unique_path_from_cached_entries(path: &Path, entries: &[FilePickerEntry]) -> PathBuf {
+    let cached_contains = |candidate: &Path| {
+        entries
+            .iter()
+            .any(|entry| entry.path.as_path() == candidate)
+    };
+    if !cached_contains(path) {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("item");
+    let extension = path.extension().and_then(OsStr::to_str);
+    for index in 2..10_000usize {
+        let name = match extension {
+            Some(extension) => format!("{stem} {index}.{extension}"),
+            None => format!("{stem} {index}"),
+        };
+        let candidate = parent.join(name);
+        if !cached_contains(&candidate) {
             return candidate;
         }
     }
@@ -7842,7 +8558,7 @@ fn preserve_linux_xattrs(src: &Path, dst: &Path) -> Vec<String> {
     warnings
 }
 
-fn delete_path(path: &Path, policy: DeletePolicy) -> Result<(), FilePickerError> {
+pub fn delete_path_with_policy(path: &Path, policy: DeletePolicy) -> Result<(), FilePickerError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| io_error("read delete metadata", path, err))?;
     if metadata.is_dir() {
         match policy {
@@ -8910,7 +9626,7 @@ mod tests {
         fs::create_dir(&directory).expect("directory");
         fs::write(directory.join("track.flac"), b"audio").expect("track");
 
-        let error = delete_path(&directory, DeletePolicy::FilesAndEmptyDirectories)
+        let error = delete_path_with_policy(&directory, DeletePolicy::FilesAndEmptyDirectories)
             .expect_err("explicit default delete must not recurse");
 
         assert!(directory.exists());
@@ -10692,6 +11408,94 @@ mod tabbed_browsing_tests {
     }
 }
 
+
+#[cfg(test)]
+mod host_managed_mutation_boundary_tests {
+    use super::*;
+    use std::fs;
+
+    fn host_picker(dir: &Path) -> FilePickerState {
+        FilePickerState::new_host_managed(FilePickerConfig {
+            start_dir: dir.to_path_buf(),
+            operation_policy: FileOperationPolicy::default(),
+            ..FilePickerConfig::default()
+        })
+    }
+
+    #[test]
+    fn host_managed_create_defers_destination_existence_to_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("cover.jpg");
+        fs::write(&target, b"existing").expect("existing destination");
+        let mut picker = host_picker(temp.path());
+        picker.pending_name_parent = Some(temp.path().to_path_buf());
+
+        picker
+            .try_create_named_item(FilePickerCreateKind::File, "cover.jpg")
+            .expect("picker must yield intent without probing destination existence");
+        assert_eq!(fs::read(&target).expect("existing bytes"), b"existing");
+        assert_eq!(
+            picker.take_host_mutation_request(),
+            Some(FilePickerHostMutationRequest::Create {
+                kind: FilePickerCreateKind::File,
+                path: target,
+            })
+        );
+    }
+
+    #[test]
+    fn host_managed_named_duplicate_defers_type_and_destination_checks_to_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("not-a-file");
+        let destination = temp.path().join("cover-copy.jpg");
+        fs::create_dir(&source).expect("directory source");
+        fs::write(&destination, b"existing").expect("existing destination");
+        let mut picker = host_picker(temp.path());
+        picker.pending_name_source = Some(source.clone());
+        picker.pending_name_parent = Some(temp.path().to_path_buf());
+
+        picker
+            .try_duplicate_current("cover-copy.jpg")
+            .expect("picker must yield intent before host filesystem validation");
+        assert_eq!(fs::read(&destination).expect("existing bytes"), b"existing");
+        assert_eq!(
+            picker.take_host_mutation_request(),
+            Some(FilePickerHostMutationRequest::Duplicate {
+                sources: vec![source],
+                exact_destination: Some(destination),
+            })
+        );
+    }
+
+    #[test]
+    fn host_managed_paste_defers_target_validation_and_suffix_planning_to_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("cover.jpg");
+        let missing_target = temp.path().join("missing-target");
+        fs::write(&source, b"cover").expect("source");
+        let mut picker = host_picker(temp.path());
+        picker.clipboard = FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy,
+            vec![source.clone()],
+        );
+
+        picker
+            .try_paste_clipboard_to(&missing_target)
+            .expect("picker must yield intent before host target validation");
+        assert!(!missing_target.exists());
+        assert_eq!(
+            picker.take_host_mutation_request(),
+            Some(FilePickerHostMutationRequest::Paste {
+                clipboard: FilesystemClipboard::new(
+                    FilePickerClipboardMode::Copy,
+                    vec![source],
+                )
+                .expect("clipboard"),
+                target_dir: missing_target,
+            })
+        );
+    }
+}
 
 #[cfg(test)]
 mod selection_only_modal_policy_tests {
