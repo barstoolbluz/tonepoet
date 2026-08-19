@@ -2117,6 +2117,7 @@ mod tests {
 
     #[test]
     fn sidecar_cue_transfer_route_preserves_structure_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let cue = temp.path().join("album.cue");
@@ -2290,6 +2291,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn unsupported_carrier_sidecar_write_blocks_audio_and_commits_only_cue() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("01.dff");
         let second = temp.path().join("02.dff");
@@ -2377,6 +2379,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_flac_cue_transfer_round_trips_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let original = concat!(
@@ -2469,6 +2472,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_wavpack_cue_transfer_uses_existing_metadata_writer() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-embedded-wavpack-cue-transfer",
         );
@@ -2530,6 +2534,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_cue_set_transfer_writes_each_carrier_without_crossing_sheet_boundaries() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let mut carriers = Vec::new();
         for (name, first_track) in [("disc-1.flac", 1_u32), ("disc-2.flac", 1_u32)] {
@@ -2788,6 +2793,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn metadata_sidecar_member_failure_leaves_sidecar_byte_identical() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("multi-FILE transfer tempdir");
         let first = temp.path().join("01.flac");
         let second = temp.path().join("02.flac");

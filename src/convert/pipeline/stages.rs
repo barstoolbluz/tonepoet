@@ -13234,6 +13234,7 @@ mod replaygain_existing_tag_policy_tests {
 
     #[test]
     fn conversion_log_distinguishes_trusted_disabled_and_no_output_replaygain() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let source = super::pipeline_test_helpers::log_test_source();
         let mut req = replaygain_request(
             Path::new("/tmp"),
@@ -29692,7 +29693,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             staging,
             Some(runner),
         );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
     if matches!(current_outcome, AlbumOutcome::Partial { .. })
         && artifacts.as_ref().map(audio_artifact_count).unwrap_or(0) == 0
@@ -29714,19 +29715,19 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             staging,
             Some(runner),
         );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
 
     if req.merge {
         emit_stage_started(reporter, &item_id, PipelineStage::Merge).await;
-        match merge_tracks_with_tool_limits(
+        match Box::pin(merge_tracks_with_tool_limits(
             artifacts.take().expect("artifacts present"),
             &req,
             &staging,
             runner,
             cancel,
             tool_concurrency_limits.clone(),
-        )
+        ))
         .await
         {
             Ok((merged_artifacts, record)) => {
@@ -29748,7 +29749,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     staging,
                     Some(runner),
                 );
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
             }
         }
     } else {
@@ -29773,14 +29774,14 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
         } else {
-            match apply_metadata_with_tool_limits(
+            match Box::pin(apply_metadata_with_tool_limits(
                 artifacts.as_ref().expect("artifacts present"),
                 source.as_ref().expect("source present"),
                 &req,
                 runner,
                 cancel,
                 tool_concurrency_limits.clone(),
-            )
+            ))
             .await
             {
                 Ok(record) => {
@@ -29801,7 +29802,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                         staging,
                         Some(runner),
                     );
-                    return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                    return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
                 }
             }
         }
@@ -29813,14 +29814,14 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match apply_replaygain_with_source_and_tool_limits(
+        match Box::pin(apply_replaygain_with_source_and_tool_limits(
             artifacts.as_ref().expect("artifacts present"),
             source.as_ref(),
             &req,
             runner,
             cancel,
             tool_concurrency_limits.clone(),
-        )
+        ))
         .await
         {
             Ok(record) => {
@@ -29841,7 +29842,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     staging,
                     Some(runner),
                 );
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
             }
         }
     } else {
@@ -29851,12 +29852,12 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     }
 
     if let Some(artifacts_mut) = artifacts.as_mut() {
-        if let Err(err) = verify_reference_artifacts_after_metadata(
+        if let Err(err) = Box::pin(verify_reference_artifacts_after_metadata(
             artifacts_mut,
             runner,
             cancel,
             tool_concurrency_limits.as_ref(),
-        )
+        ))
         .await
         {
             let record = stage_record(
@@ -29881,12 +29882,12 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             staging,
             Some(runner),
         );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
 
     if req.stages.features == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::Features).await;
-        match run_features(
+        match Box::pin(run_features(
             artifacts.take().expect("artifacts present"),
             &current_outcome,
             source.as_ref().expect("source present"),
@@ -29894,7 +29895,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             &staging,
             runner,
             cancel,
-        )
+        ))
         .await
         {
             Ok((feature_artifacts, record)) => {
@@ -29916,7 +29917,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                     staging,
                     Some(runner),
                 );
-                return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+                return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
             }
         }
     } else {
@@ -29936,7 +29937,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             staging,
             Some(runner),
         );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
     if matches!(current_outcome, AlbumOutcome::Blocked { .. }) {
         return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
@@ -29948,7 +29949,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
             staging,
             Some(runner),
         );
-        return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+        return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
 
     // Native Reference publication always carries manifest-v2 authority.
@@ -30022,7 +30023,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 publication_binding.as_ref(),
             );
             let album_is_fully_successful = matches!(current_outcome, AlbumOutcome::Complete { .. });
-            if let Some(action_record) = execute_post_actions_stage(
+            if let Some(action_record) = Box::pin(execute_post_actions_stage(
                 &req,
                 &source_value,
                 artifacts.as_ref(),
@@ -30032,7 +30033,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 album_is_fully_successful,
                 reporter,
                 cancel,
-            )
+            ))
             .await
             {
                 // Post-action failure never rewrites a successful publication
@@ -30054,11 +30055,11 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
                 reason: BlockReason::PublishFailed,
             };
             return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
-            return finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome).await;
+            return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
         }
     }
 
-    finalize_report_with_binding(
+    Box::pin(finalize_report_with_binding(
         &req,
         reporter,
         source,
@@ -30067,7 +30068,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
         published,
         current_outcome,
         publication_binding,
-    )
+    ))
     .await
 }
 
@@ -41607,6 +41608,7 @@ mod cue_container_extension_tests {
 
     #[test]
     fn staged_aac_path_does_not_inherit_raw_aac_suffix() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let id = TrackId {
             source_ordinal: 5,
             disc_number: None,

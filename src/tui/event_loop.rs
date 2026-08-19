@@ -2892,6 +2892,7 @@ mod browse_archive_mutation_claim_tests {
 
     #[test]
     fn same_archive_save_is_busy_while_disjoint_archive_remains_admissible() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let contested = temp.path().join("album.zip");
         let disjoint = temp.path().join("other.zip");

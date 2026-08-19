@@ -2229,20 +2229,25 @@ fn sync_directory_best_effort(_path: &Path) {}
 mod tests {
     use super::*;
 
-    struct JournalDirGuard;
+    struct JournalDirGuard {
+        _concurrency: crate::concurrency::ScopedTestCoordinationRootGuard,
+    }
 
     impl JournalDirGuard {
         fn install(path: &Path) -> Self {
+            let concurrency = crate::concurrency::install_scoped_test_coordination_root(
+                &path.join("claims"),
+            );
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
-            std::env::set_var("TONEPOET_CONCURRENCY_DIR", path.join("claims"));
-            Self
+            Self {
+                _concurrency: concurrency,
+            }
         }
     }
 
     impl Drop for JournalDirGuard {
         fn drop(&mut self) {
             std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
-            std::env::remove_var("TONEPOET_CONCURRENCY_DIR");
         }
     }
 
@@ -2318,6 +2323,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_task_destination_admission_preserves_symlink_then_parent_dir_semantics() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2360,6 +2366,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_task_symlink_source_admission_protects_namespace_object_for_copy_and_move() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");

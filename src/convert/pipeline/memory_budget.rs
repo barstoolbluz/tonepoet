@@ -1382,8 +1382,9 @@ mod tests {
     #[test]
     fn execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let previous_concurrency = std::env::var_os("TONEPOET_CONCURRENCY_DIR");
-        std::env::set_var("TONEPOET_CONCURRENCY_DIR", temp.path().join("claims"));
+        let _concurrency = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
 
         let staging_parent = temp.path().join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
@@ -1440,10 +1441,6 @@ mod tests {
         assert!(!claimed_dir.exists(), "retired staging ownership permits stale cleanup");
         assert!(!staging_parent.join(".claimed-job.run.lock").exists());
 
-        match previous_concurrency {
-            Some(previous) => std::env::set_var("TONEPOET_CONCURRENCY_DIR", previous),
-            None => std::env::remove_var("TONEPOET_CONCURRENCY_DIR"),
-        }
     }
 
     #[test]

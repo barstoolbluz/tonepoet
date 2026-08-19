@@ -960,21 +960,29 @@ fn executable_path_is_available(path: &Path) -> bool {
     resolve_executable_path(path).is_some()
 }
 
-/// `env_clear()` also removes `PATH`. Resolve bare program names against the
-/// parent environment before constructing a closed-environment child, while
-/// preserving explicit paths so spawn failures still occur at the correct
+/// Resolve bare program names against the parent process PATH before the
+/// supervised launch. `Command` would normally perform that lookup itself for
+/// inherited environments, but the supervision layer must first canonicalize
+/// and open the exact executable, so leaving a bare name unresolved would
+/// incorrectly canonicalize it relative to cwd. Explicit absolute/relative
+/// paths are preserved so filesystem/spawn failures still occur at the correct
 /// supervised stage.
 pub(crate) fn resolve_command_launch_path(
     candidate: PathBuf,
-    environment_policy: CommandEnvironmentPolicy,
-) -> PathBuf {
-    if environment_policy == CommandEnvironmentPolicy::ClearAndSet
-        && candidate.components().count() == 1
-        && !candidate.is_absolute()
-    {
-        resolve_executable_path(&candidate).unwrap_or(candidate)
+    _environment_policy: CommandEnvironmentPolicy,
+) -> std::io::Result<PathBuf> {
+    if candidate.components().count() == 1 && !candidate.is_absolute() {
+        resolve_executable_path(&candidate).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "cannot resolve bare tool executable '{}' via PATH",
+                    candidate.display()
+                ),
+            )
+        })
     } else {
-        candidate
+        Ok(candidate)
     }
 }
 
@@ -1193,7 +1201,8 @@ impl ToolRunner for RealToolRunner {
         let path = resolve_command_launch_path(
             self.resolve_binary(binary),
             CommandEnvironmentPolicy::ClearAndSet,
-        );
+        )
+        .ok()?;
         self.tool_version_for_resolved_path(binary, &path)
     }
 
@@ -1219,7 +1228,8 @@ impl ToolRunner for RealToolRunner {
         let binary_path = resolve_command_launch_path(
             self.resolve_binary(cmd.binary),
             cmd.environment_policy,
-        );
+        )
+        .map_err(ToolRunnerError::Io)?;
         self.run_with_binary_path(cmd, binary_path, cancel).await
     }
 
@@ -1286,11 +1296,19 @@ impl ToolRunner for RealToolRunner {
             let producer_path = resolve_command_launch_path(
                 self.resolve_binary(producer.binary),
                 producer.environment_policy,
-            );
+            )
+            .map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            })?;
             let consumer_path = resolve_command_launch_path(
                 self.resolve_binary(consumer.binary),
                 consumer.environment_policy,
-            );
+            )
+            .map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            })?;
 
             // The transport pipe is ordinary stdio, not ownership authority.
             // Each external endpoint is launched under its own tonepoet
@@ -1834,6 +1852,122 @@ mod real_tool_runner_tests {
         let mut paths = HashMap::new();
         paths.insert(binary.canonical_name().to_string(), PathBuf::from(program));
         RealToolRunner::new(paths)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_environment_bare_program_resolves_from_path_before_supervision() {
+        let bare = PathBuf::from("sh");
+        let expected = resolve_executable_path(&bare).expect("test PATH should provide sh");
+        let resolved = resolve_command_launch_path(
+            bare,
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        )
+        .expect("bare sh should resolve through PATH");
+        assert_eq!(resolved, expected);
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn bare_program_missing_from_path_is_not_reinterpreted_relative_to_cwd() {
+        let bare = PathBuf::from(
+            "tonepoet-path-miss-regression-9f3c65b7-0ec7-4f16-9f28-b7e77f695a4a",
+        );
+        assert!(
+            resolve_executable_path(&bare).is_none(),
+            "test precondition: unique bare name must be absent from PATH"
+        );
+
+        let error = resolve_command_launch_path(
+            bare,
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        )
+        .expect_err("a bare PATH miss must fail before supervised canonicalization");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn normal_run_propagates_bare_path_miss_as_not_found() {
+        let program = "tonepoet-path-miss-run-regression-4506a7e8-7d13-4581-b1ee-812b05b3b434";
+        let bare = PathBuf::from(program);
+        assert!(
+            resolve_executable_path(&bare).is_none(),
+            "test precondition: unique bare name must be absent from PATH"
+        );
+
+        let runner = runner_with_override(ToolBinary::Ffmpeg, program);
+        let error = runner
+            .run(
+                ToolCommand {
+                    environment_policy:
+                        tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                    binary: ToolBinary::Ffmpeg,
+                    args: Vec::new(),
+                    secret_args: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    timeout: Duration::from_secs(1),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a bare PATH miss must fail before supervised canonicalization");
+        assert!(matches!(
+            error,
+            ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipeline_propagates_bare_path_miss_as_not_found() {
+        let missing =
+            "tonepoet-path-miss-pipeline-regression-3ec73960-528e-418a-9e0c-7694c951cf32";
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), PathBuf::from(missing));
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), PathBuf::from("sh"));
+        let runner = RealToolRunner::new(paths);
+
+        let command = |binary| ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            binary,
+            args: Vec::new(),
+            secret_args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            timeout: Duration::from_secs(1),
+        };
+        let error = runner
+            .run_pipeline(
+                command(ToolBinary::Ffmpeg),
+                command(ToolBinary::Sox),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("pipeline must fail before launching when a bare tool is absent from PATH");
+        assert!(matches!(
+            error.error,
+            ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(error.other_commands.is_empty());
+    }
+
+    #[test]
+    fn explicit_relative_program_path_is_preserved_for_filesystem_resolution() {
+        let relative = PathBuf::from(
+            "./tonepoet-relative-tool-regression-72821aae-e206-46ee-96d1-135fe9fce270",
+        );
+        assert!(relative.components().count() > 1);
+        let resolved = resolve_command_launch_path(
+            relative.clone(),
+            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        )
+        .expect("explicit relative path is not a PATH lookup");
+        assert_eq!(resolved, relative);
+
+        let error = std::fs::canonicalize(&resolved)
+            .expect_err("unique explicit relative fixture should be absent from the filesystem");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

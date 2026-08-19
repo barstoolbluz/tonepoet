@@ -2842,6 +2842,7 @@ mod tests {
 
     #[test]
     fn validated_sidecar_rewrite_refuses_a_change_after_snapshot_validation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_compare_and_rewrite");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -2878,6 +2879,7 @@ mod tests {
 
     #[test]
     fn create_sidecar_is_atomic_create_only_and_never_overwrites() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_create_only");
         let cue_path = dir.join("album.cue");
         let replacement = concat!(
@@ -2916,6 +2918,7 @@ mod tests {
 
     #[test]
     fn invalid_sidecar_replacement_refuses_read_only_placeholder_without_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("invalid_sidecar_readonly");
         let cue_path = dir.join("album.cue");
         let invalid = b"not a cue\n";
@@ -2949,6 +2952,7 @@ mod tests {
 
     #[test]
     fn sidecar_writeback_rewrites_utf8_metadata_only_as_golden_bytes_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_golden");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3043,6 +3047,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_utf8_bom_album_insertion_keeps_bom_at_byte_zero_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_bom_insert");
         let cue_path = dir.join("album.cue");
         let original_body = "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old\"\n    INDEX 01 00:00:00\n";
@@ -3113,6 +3118,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn authoritative_sidecar_writeback_sets_and_deletes_owned_fields_on_byte_span_path() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("authoritative_sidecar_byte_span");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3208,6 +3214,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn authoritative_sidecar_writeback_deletes_isrc_and_fields_on_utf8_bom_reencode_path() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("authoritative_sidecar_utf8_bom");
         let cue_path = dir.join("album.cue");
         let body = concat!(
@@ -3248,6 +3255,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_refuses_double_quotes_in_quoted_metadata_without_changing_sidecar() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_quote_refusal");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"Old\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old One\"\n    INDEX 01 00:00:00\n";
@@ -3264,6 +3272,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_rewrites_shift_jis_metadata_only_as_golden_bytes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_sjis_golden");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3352,6 +3361,7 @@ FILE \"generated.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_falls_back_to_utf8_when_legacy_encoding_cannot_represent_text() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_fallback");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"日本\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"日本一\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"日本二\"\n    INDEX 01 01:00:00\n";
@@ -3380,6 +3390,7 @@ FILE \"generated.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_read_only_sidecar_is_left_unchanged() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_readonly");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"Old\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Old Two\"\n    INDEX 01 01:00:00\n";
@@ -3865,6 +3876,7 @@ mod writeback_end_to_end_tests {
     /// structure byte-preserved, and a second save is a no-op.
     #[test]
     fn editor_corrected_album_writes_back_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !tool_ok("ffmpeg") || !tool_ok("metaflac") {
             eprintln!("skipping: ffmpeg or metaflac unavailable");
             return;

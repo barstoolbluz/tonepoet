@@ -12,8 +12,10 @@ use super::{
 use log::info;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3495,7 +3497,9 @@ fn scratch_postprocess_retry_original_error(report: &PipelineReport) -> String {
     .unwrap_or_else(|| "scratch-scoped postprocess storage exhaustion".to_string())
 }
 
-async fn run_album_postprocess_work(
+type AlbumPostprocessFuture = Pin<Box<dyn Future<Output = QueueWorkOutput> + Send + 'static>>;
+
+fn run_album_postprocess_work(
     album: ScheduledAlbum,
     outputs: Vec<ScheduledTrackOutput>,
     tool_paths: HashMap<String, PathBuf>,
@@ -3503,19 +3507,27 @@ async fn run_album_postprocess_work(
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
     worker_cancel: CancellationToken,
-) -> QueueWorkOutput {
+) -> AlbumPostprocessFuture {
     let item_id = album.req.item_id.clone();
     let work = run_album_postprocess_work_scoped(
-        album, outputs, tool_paths, version_cache, progress_tx, tool_concurrency_limits, worker_cancel
+        album,
+        outputs,
+        tool_paths,
+        version_cache,
+        progress_tx,
+        tool_concurrency_limits,
+        worker_cancel,
     );
-    if crate::concurrency::runtime_execution_id(&item_id).is_some() {
-        crate::concurrency::with_runtime_execution_scope(item_id, work).await
-    } else {
-        work.await
-    }
+    Box::pin(async move {
+        if crate::concurrency::runtime_execution_id(&item_id).is_some() {
+            crate::concurrency::with_runtime_execution_scope(item_id, work).await
+        } else {
+            work.await
+        }
+    })
 }
 
-async fn run_album_postprocess_work_scoped(
+fn run_album_postprocess_work_scoped(
     album: ScheduledAlbum,
     outputs: Vec<ScheduledTrackOutput>,
     tool_paths: HashMap<String, PathBuf>,
@@ -3523,107 +3535,112 @@ async fn run_album_postprocess_work_scoped(
     progress_tx: broadcast::Sender<ProgressUpdate>,
     tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
     worker_cancel: CancellationToken,
-) -> QueueWorkOutput {
-    let item_id = album.req.item_id.clone();
-    let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone())
-        .with_execution_item(item_id.clone());
-    let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
-    let scratch_retry_context = if album.staging.is_scratch_staging() {
-        Some((
-            album.req.clone(),
-            album.staging.root.clone(),
-            album.req.output_root.clone(),
-        ))
-    } else {
-        None
-    };
-
-    if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context.clone() {
-        if !worker_cancel.is_cancelled()
-            && scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
-                &outputs,
-                &staging_root,
-                &output_root,
-            )
-        {
-            let original_error = scratch_track_retry_original_error(&outputs);
-            retry_req.scratch_staging = None;
-            log::warn!(
-                "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
-                retry_req.job_id,
-                item_id,
-                disk_staging_parent_for(&retry_req).display(),
-                original_error
-            );
-            drop(outputs);
-            drop(album);
-            let report = retry_scratch_backed_item_once_on_disk_for_scheduler(
-                retry_req,
-                &runner,
-                &reporter,
-                &worker_cancel,
-                &tool_paths,
-                Some(tool_concurrency_limits),
-            )
-            .await;
-            let warning_count = source_warning_count(report.source.as_ref());
-            let status = map_album_outcome(
-                &report.outcome,
-                report.published.as_ref(),
-                report.durable_log.as_deref(),
-                warning_count,
-            );
-            return QueueWorkOutput::PostProcessed { item_id, status };
-        }
-    }
-
-    let report = finish_pipeline_album_for_scheduler_with_tool_limits(
-        album,
-        outputs,
-        &runner,
-        &reporter,
-        &worker_cancel,
-        Some(tool_concurrency_limits.clone()),
-    )
-    .await;
-    let report = if let Some((mut retry_req, _staging_root, _output_root)) = scratch_retry_context {
-        if !worker_cancel.is_cancelled() && pipeline_report_requests_scratch_disk_retry(&report) {
-            let original_error = report
-                .scratch_retry_intent
-                .as_ref()
-                .map(|intent| intent.original_error.clone())
-                .unwrap_or_else(|| scratch_postprocess_retry_original_error(&report));
-            retry_req.scratch_staging = None;
-            log::warn!(
-                "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
-                retry_req.job_id,
-                item_id,
-                disk_staging_parent_for(&retry_req).display(),
-                original_error
-            );
-            retry_scratch_backed_item_once_on_disk_for_scheduler(
-                retry_req,
-                &runner,
-                &reporter,
-                &worker_cancel,
-                &tool_paths,
-                Some(tool_concurrency_limits),
-            )
-            .await
+) -> AlbumPostprocessFuture {
+    Box::pin(async move {
+        let item_id = album.req.item_id.clone();
+        let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone())
+            .with_execution_item(item_id.clone());
+        let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
+        let scratch_retry_context = if album.staging.is_scratch_staging() {
+            Some((
+                album.req.clone(),
+                album.staging.root.clone(),
+                album.req.output_root.clone(),
+            ))
         } else {
-            report
+            None
+        };
+
+        if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context.clone() {
+            if !worker_cancel.is_cancelled()
+                && scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
+                    &outputs,
+                    &staging_root,
+                    &output_root,
+                )
+            {
+                let original_error = scratch_track_retry_original_error(&outputs);
+                retry_req.scratch_staging = None;
+                log::warn!(
+                    "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
+                    retry_req.job_id,
+                    item_id,
+                    disk_staging_parent_for(&retry_req).display(),
+                    original_error
+                );
+                drop(outputs);
+                drop(album);
+                let report = Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
+                    retry_req,
+                    &runner,
+                    &reporter,
+                    &worker_cancel,
+                    &tool_paths,
+                    Some(tool_concurrency_limits),
+                ))
+                .await;
+                let warning_count = source_warning_count(report.source.as_ref());
+                let status = map_album_outcome(
+                    &report.outcome,
+                    report.published.as_ref(),
+                    report.durable_log.as_deref(),
+                    warning_count,
+                );
+                return QueueWorkOutput::PostProcessed { item_id, status };
+            }
         }
-    } else {
-        report
-    };
-    let warning_count = source_warning_count(report.source.as_ref());
-    let status = map_album_outcome(
-        &report.outcome,
-        report.published.as_ref(),
-        report.durable_log.as_deref(),
-        warning_count,
-    );
-    QueueWorkOutput::PostProcessed { item_id, status }
+
+        let report = Box::pin(finish_pipeline_album_for_scheduler_with_tool_limits(
+            album,
+            outputs,
+            &runner,
+            &reporter,
+            &worker_cancel,
+            Some(tool_concurrency_limits.clone()),
+        ))
+        .await;
+        let report =
+            if let Some((mut retry_req, _staging_root, _output_root)) = scratch_retry_context {
+                if !worker_cancel.is_cancelled()
+                    && pipeline_report_requests_scratch_disk_retry(&report)
+                {
+                    let original_error = report
+                        .scratch_retry_intent
+                        .as_ref()
+                        .map(|intent| intent.original_error.clone())
+                        .unwrap_or_else(|| scratch_postprocess_retry_original_error(&report));
+                    retry_req.scratch_staging = None;
+                    log::warn!(
+                        "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
+                        retry_req.job_id,
+                        item_id,
+                        disk_staging_parent_for(&retry_req).display(),
+                        original_error
+                    );
+                    Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
+                        retry_req,
+                        &runner,
+                        &reporter,
+                        &worker_cancel,
+                        &tool_paths,
+                        Some(tool_concurrency_limits),
+                    ))
+                    .await
+                } else {
+                    report
+                }
+            } else {
+                report
+            };
+        let warning_count = source_warning_count(report.source.as_ref());
+        let status = map_album_outcome(
+            &report.outcome,
+            report.published.as_ref(),
+            report.durable_log.as_deref(),
+            warning_count,
+        );
+        QueueWorkOutput::PostProcessed { item_id, status }
+    })
 }
 
 async fn retry_scratch_backed_item_once_on_disk_for_scheduler(
@@ -3639,14 +3656,14 @@ async fn retry_scratch_backed_item_once_on_disk_for_scheduler(
         return report;
     }
 
-    run_pipeline_item_with_tool_paths_and_tool_limits(
+    Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits(
         retry_req,
         runner,
         reporter,
         cancel,
         tool_paths,
         tool_concurrency_limits,
-    )
+    ))
     .await
 }
 

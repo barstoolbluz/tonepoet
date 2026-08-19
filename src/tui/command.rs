@@ -1509,6 +1509,7 @@ FILE "missing.flac" FLAC
 
     #[test]
     fn rejected_cue_referencing_selected_audio_still_fails_closed() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let selected = temp.path().join("selected.flac");
         std::fs::write(&selected, b"selected").expect("selected audio");
@@ -4099,6 +4100,7 @@ mod cue_write_claim_tests {
 
     #[test]
     fn direct_cue_write_is_busy_before_mutation_and_disjoint_write_still_runs() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let contested = temp.path().join("album.cue");
         let disjoint = temp.path().join("other.cue");
@@ -9340,6 +9342,7 @@ mod delete_command_dispatch_tests {
 
     #[test]
     fn del_is_rejected_outside_browse() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         assert_eq!(
             delete_command_dispatch_for(AppScreen::Queue, false),
             DeleteCommandDispatch::NotBrowse
@@ -17366,6 +17369,7 @@ MUSICBRAINZ_TRACKID = "recording-id"
 
     #[test]
     fn bluray_custom_field_deletions_remove_stale_toml_keys() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let root = unique_dir("custom-delete-toml");
         std::fs::create_dir_all(&root).expect("create sidecar dir");
         let path = root.join(BLURAY_METADATA_SIDECAR_NAME);
@@ -17475,6 +17479,7 @@ CUT_NOTE = "Old Cut Two"
 
     #[test]
     fn bluray_preserving_save_updates_target_without_dropping_siblings() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let root = unique_dir("preserve");
         std::fs::create_dir_all(&root).expect("create sidecar dir");
         let path = root.join("tonepoet.bluray.metadata.toml");
@@ -17559,6 +17564,7 @@ ALBUM = "Sibling"
 
     #[test]
     fn bluray_dirty_multi_presentation_save_updates_all_dirty_tabs_once() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let root = unique_dir("multi-tab-save");
         std::fs::create_dir_all(&root).expect("create sidecar dir");
         let path = root.join(BLURAY_METADATA_SIDECAR_NAME);
@@ -17726,6 +17732,7 @@ ALBUM = "Sibling"
 
     #[test]
     fn bluray_save_is_deterministic_and_preserves_multiple_presentations() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let root = unique_dir("deterministic-save");
         std::fs::create_dir_all(&root).expect("create sidecar dir");
         let path = root.join(BLURAY_METADATA_SIDECAR_NAME);
@@ -20889,6 +20896,7 @@ mod round6_application_quit_lifecycle_tests {
     #[cfg(unix)]
     #[test]
     fn dvdv_and_bluray_atomic_publish_replace_final_symlink_entry_not_referent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
         use crate::concurrency::{
             ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,

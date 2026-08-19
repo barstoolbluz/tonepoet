@@ -146,7 +146,8 @@ where
     let binary_path = resolve_command_launch_path(
         resolve_binary_with_tool_paths(cmd.binary, tool_paths),
         cmd.environment_policy,
-    );
+    )
+    .map_err(ToolRunnerError::Io)?;
     run_streaming_tool_with_probe_at_path(binary_path, cmd, cancel, tracker, heartbeat, parse_line)
         .await
 }

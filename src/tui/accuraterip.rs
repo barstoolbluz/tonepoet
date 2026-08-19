@@ -1714,6 +1714,7 @@ mod batch_report_claim_tests {
 
     #[test]
     fn report_publication_is_busy_before_write_and_disjoint_report_still_runs() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let contested = temp.path().join("accuraterip-report.txt");
         let disjoint_dir = temp.path().join("other");
@@ -2868,6 +2869,7 @@ mod repair_path_semantics_tests {
 
     #[test]
     fn offset_correction_preserves_final_namespace_entry_but_copy_repair_follows_referent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let referent = temp.path().join("real.flac");
         let link = temp.path().join("track.flac");

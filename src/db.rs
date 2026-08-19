@@ -397,6 +397,12 @@ pub fn observable_tonepoet_peer_processes() -> Vec<String> {
     let mut signals = Vec::new();
     #[cfg(unix)]
     {
+        // A Cargo harness must be hermetic with respect to a developer's live
+        // TUI and sibling test binaries. Production activation retains the
+        // conservative peer check below.
+        if crate::concurrency::running_under_cargo_test_harness() {
+            return signals;
+        }
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.filter_map(Result::ok) {
                 let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue; };
@@ -5747,6 +5753,7 @@ mod tests {
 
     #[test]
     fn concurrent_processes_open_and_write_one_wal_database() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         const CHILD_COUNT: usize = 6;
         let temp = tempfile::tempdir().expect("cross-process database tempdir");
         let db_path = temp.path().join("tonepoet.db");
@@ -5765,6 +5772,8 @@ mod tests {
                 .env(CROSS_PROCESS_DB_GATE_ENV, &gate)
                 .env(CROSS_PROCESS_DB_CHILD_ID_ENV, child_id.to_string())
                 .env(CROSS_PROCESS_DB_SUCCESS_DIR_ENV, &success_dir)
+                .env("TONEPOET_CONCURRENCY_DIR", crate::concurrency::coordination_root())
+                .env("TONEPOET_TEST_CONCURRENCY_DIR_INHERIT", "1")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -5892,6 +5901,7 @@ mod tests {
 
     #[test]
     fn empty_queue_session_creates_no_durable_scope_history() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("empty queue tempdir");
         let db_path = temp.path().join("tonepoet.db");
         let db = Database::open_path(&db_path).expect("open v24 database");
@@ -5916,6 +5926,7 @@ mod tests {
 
     #[test]
     fn execution_coordinator_activates_only_the_selected_item() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("execution coordinator tempdir");
         let db_path = temp.path().join("tonepoet.db");
         let db = Database::open_path(&db_path).expect("open v24 database");
@@ -5993,6 +6004,7 @@ mod tests {
 
     #[test]
     fn concurrent_queue_scopes_preserve_rows_and_recover_in_scope_order() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("queue process tempdir");
         let db_path = temp.path().join("tonepoet.db");
         // Activate v24 before children start so this test exercises scoped
@@ -6011,6 +6023,8 @@ mod tests {
                 .env(QUEUE_SCOPE_PROCESS_ID_ENV, id)
                 .env(QUEUE_SCOPE_PROCESS_READY_ENV, &ready)
                 .env(QUEUE_SCOPE_PROCESS_RELEASE_ENV, &release)
+                .env("TONEPOET_CONCURRENCY_DIR", crate::concurrency::coordination_root())
+                .env("TONEPOET_TEST_CONCURRENCY_DIR_INHERIT", "1")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -6289,6 +6303,7 @@ mod tests {
 
     #[test]
     fn v23_migrates_queue_order_and_initializes_existing_authority_markers() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tonepoet.db");
         {
@@ -6408,6 +6423,7 @@ mod tests {
 
     #[test]
     fn v23_empty_authorities_import_once_then_mark_done() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tonepoet.db");
         {
@@ -6627,6 +6643,7 @@ mod tests {
 
     #[test]
     fn queue_sync_round_trips_order_and_only_writes_changed_rows() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let mut items = vec![
             queue_item("A", "/music/a.flac", crate::convert::ConversionStatus::Paused),
@@ -6663,6 +6680,7 @@ mod tests {
 
     #[test]
     fn live_scope_processing_round_trips_without_restart_reclassification() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let mut processing = queue_item(
             "B",
@@ -6703,6 +6721,7 @@ mod tests {
 
     #[test]
     fn queue_cancelled_partial_and_offline_dotdot_names_survive_restart() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let cancelled = queue_item(
             "cancelled",
@@ -6736,6 +6755,7 @@ mod tests {
 
     #[test]
     fn queue_whole_query_failure_is_distinct_from_empty() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         db.conn
             .execute("DROP TABLE conversion_queue_v24", [])
@@ -6748,6 +6768,7 @@ mod tests {
 
     #[test]
     fn live_processing_queue_row_is_not_rewritten_by_load() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let processing = queue_item(
             "processing",
@@ -6781,6 +6802,7 @@ mod tests {
 
     #[test]
     fn retryable_terminal_queue_row_keeps_secret_reference_across_reload() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let db = Database::open_memory().expect("database");
         let mut failed = queue_item(
@@ -6810,6 +6832,7 @@ mod tests {
 
     #[test]
     fn failed_queue_publication_never_retires_the_only_secret_reference() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let db = Database::open_memory().expect("database");
         let mut item = queue_item(
@@ -7071,6 +7094,7 @@ mod tests {
 
     #[test]
     fn committed_cleanup_failure_preserves_new_bytes_during_later_recovery() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7121,6 +7145,7 @@ mod tests {
 
     #[test]
     fn committed_journal_delete_failure_preserves_new_bytes_and_recovery_never_restores() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7170,6 +7195,7 @@ mod tests {
 
     #[test]
     fn rolled_back_journal_delete_failure_retains_terminal_state_without_reapplying_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7221,6 +7247,7 @@ mod tests {
 
     #[test]
     fn allocating_recovery_retires_marker_without_replacing_destination() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7248,6 +7275,7 @@ mod tests {
 
     #[test]
     fn rolled_back_terminal_recovery_never_reapplies_stale_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7324,6 +7352,7 @@ mod tests {
 
     #[test]
     fn stale_metadata_recovery_restores_exact_bytes_and_clears_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7344,6 +7373,7 @@ mod tests {
 
     #[test]
     fn stale_prepared_metadata_recovery_defers_while_conversion_read_claim_is_live() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7382,6 +7412,7 @@ mod tests {
 
     #[test]
     fn stale_prepared_metadata_recovery_defers_while_file_operation_write_claim_is_live() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.mp3");
@@ -7422,6 +7453,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_stale_restore_stays_on_original_parent_target_after_external_alias_rebind() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -7469,6 +7501,7 @@ mod tests {
 
     #[test]
     fn stale_metadata_recovery_failure_retains_journal_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -7504,6 +7537,7 @@ mod tests {
 
     #[test]
     fn stale_metadata_recovery_missing_marker_reports_failure_and_retains_blocking_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");

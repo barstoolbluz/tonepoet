@@ -736,6 +736,7 @@ mod live_mount_repro {
     #[test]
     #[ignore]
     fn directory_rename_on_live_mount() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let Some(base) = std::env::var_os("TONEPOET_REPRO_DIR") else {
             eprintln!("TONEPOET_REPRO_DIR not set; skipping");
             return;
@@ -791,6 +792,7 @@ mod tests {
 
     #[test]
     fn shared_claim_blocks_bulk_rename_before_namespace_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = tmp_dir();
         let source = dir.join("track.flac");
         let destination = dir.join("01 - track.flac");
@@ -818,6 +820,7 @@ mod tests {
 
     #[test]
     fn directory_rename_subtree_claim_conflicts_with_descendant_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = tmp_dir();
         let source = dir.join("Album");
         let child = source.join("track.flac");
@@ -847,6 +850,7 @@ mod tests {
 
     #[test]
     fn disjoint_bulk_rename_remains_concurrent_with_unrelated_claim() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = tmp_dir();
         let source = dir.join("track.flac");
         let unrelated = dir.join("unrelated.flac");
@@ -1142,6 +1146,7 @@ mod tests {
 
     #[test]
     fn standard_directory_rename_and_replay_proofs_remain_digest_free() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = tmp_dir();
         let source = dir.join("album");
         fs::create_dir(&source).expect("album");

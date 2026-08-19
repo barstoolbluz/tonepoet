@@ -17446,6 +17446,7 @@ mod conversion_actions_tests {
 
     #[test]
     fn automatic_post_phase_claims_admit_opposite_order_destinations_atomically() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let fixture = Fixture::new();
         fs::write(fixture.album_dir.join("track.flac"), b"track").unwrap();
         let x = fixture._temp.path().join("external-x");
@@ -17494,6 +17495,7 @@ mod conversion_actions_tests {
 
     #[test]
     fn automatic_phase_admission_registers_one_complete_execution_claim_before_actions() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let fixture = Fixture::new();
         fs::write(fixture.album_dir.join("track.flac"), b"track").unwrap();
         let x = fixture._temp.path().join("runtime-x");
@@ -17595,6 +17597,7 @@ mod conversion_actions_tests {
 
     #[test]
     fn automatic_pre_phase_claims_admit_complete_create_folder_set() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let fixture = Fixture::new();
         let x = fixture._temp.path().join("pre-x");
         let y = fixture._temp.path().join("pre-y");
@@ -17640,6 +17643,7 @@ mod conversion_actions_tests {
 
     #[test]
     fn phase_claims_already_inside_album_write_capability_are_not_republished() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let fixture = Fixture::new();
         let context = fixture.context(ActionPhase::Post);
         let pipeline = ActionPipeline {

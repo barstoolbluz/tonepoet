@@ -10764,6 +10764,7 @@ mod keychain_state_retry_tests {
 
     #[test]
     fn failed_load_is_retried_and_recovers_after_backend_unlock() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let mut state = KeychainState::default();
         let first = state.ensure_loaded_with(|| Err("secret service is locked".to_string()));
 
@@ -15519,6 +15520,7 @@ mod queue_persistence_boundary_tests {
 
     #[test]
     fn run_acquisition_is_durable_as_interrupted_without_mutating_live_queued_state() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         // new_for_test disables persist_queue (to avoid the legacy real-JSON
         // fallback), but this test exercises the durable acquisition write,
         // which is gated on persist_queue. The database is an isolated temp DB

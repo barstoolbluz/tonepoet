@@ -658,6 +658,98 @@ pub struct PersistentLease {
     claims: Arc<[PathClaim]>,
 }
 
+/// Removes a coordination pathname owned by this creation attempt on ordinary
+/// error or unwind. On Unix the cleanup is inode-bound so a same-user pathname
+/// rebind cannot make the guard remove somebody else's file. SIGKILL/power-loss
+/// recovery is handled by atomic publication plus scanner/lifecycle repair.
+struct PendingPathCleanup {
+    path: PathBuf,
+    #[cfg(unix)]
+    expected_dev: u64,
+    #[cfg(unix)]
+    expected_ino: u64,
+    armed: bool,
+}
+
+impl PendingPathCleanup {
+    fn new(path: PathBuf, file: &File) -> Result<Self, String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("fstat pending coordination file {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "pending coordination file is not regular: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                path,
+                expected_dev: metadata.dev(),
+                expected_ino: metadata.ino(),
+                armed: true,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { path, armed: true })
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove_owned_path_now(&mut self) -> Result<(), String> {
+        if !self.still_owns_path() {
+            return Err(format!(
+                "coordination pathname rebound before cleanup: {}",
+                self.path.display()
+            ));
+        }
+        std::fs::remove_file(&self.path).map_err(|error| {
+            format!(
+                "remove owned coordination pathname {}: {error}",
+                self.path.display()
+            )
+        })?;
+        self.disarm();
+        Ok(())
+    }
+
+    fn still_owns_path(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+                return false;
+            };
+            metadata.file_type().is_file()
+                && metadata.dev() == self.expected_dev
+                && metadata.ino() == self.expected_ino
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
+impl Drop for PendingPathCleanup {
+    fn drop(&mut self) {
+        if !self.armed || !self.still_owns_path() {
+            return;
+        }
+        if std::fs::remove_file(&self.path).is_ok() {
+            if let Some(parent) = self.path.parent() {
+                let _ = sync_coordination_directory(parent);
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for PersistentLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PersistentLease")
@@ -679,12 +771,210 @@ fn open_existing_descriptor(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+fn verify_coordination_path_binding(
+    file: &File,
+    path: &Path,
+    label: &str,
+) -> Result<std::fs::Metadata, String> {
+    let descriptor_metadata = file
+        .metadata()
+        .map_err(|e| format!("fstat {label} {}: {e}", path.display()))?;
+    if !descriptor_metadata.file_type().is_file() {
+        return Err(format!("{label} descriptor is not a regular file: {}", path.display()));
+    }
+    let pathname_metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("lstat {label} pathname {}: {e}", path.display()))?;
+    if !pathname_metadata.file_type().is_file() {
+        return Err(format!("{label} pathname is not a regular file: {}", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if descriptor_metadata.dev() != pathname_metadata.dev()
+            || descriptor_metadata.ino() != pathname_metadata.ino()
+        {
+            return Err(format!("{label} pathname rebound after open: {}", path.display()));
+        }
+    }
+    Ok(descriptor_metadata)
+}
+
+fn sync_coordination_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let directory = File::open(path)
+            .map_err(|e| format!("open coordination directory for fsync {}: {e}", path.display()))?;
+        if let Err(error) = directory.sync_all() {
+            #[cfg(target_os = "macos")]
+            if matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP)) {
+                return Ok(());
+            }
+            return Err(format!(
+                "fsync coordination directory {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn reclaim_empty_descriptor_from_locked_file(file: &File, path: &Path) -> Result<bool, String> {
+    let metadata =
+        verify_coordination_path_binding(file, path, "empty coordination descriptor")?;
+    if metadata.len() != 0 {
+        return Ok(false);
+    }
+    let mut cleanup = PendingPathCleanup::new(path.to_path_buf(), file)?;
+    cleanup.remove_owned_path_now().map_err(|error| {
+        format!(
+            "reclaim empty coordination descriptor {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_coordination_directory(parent)?;
+    }
+    Ok(true)
+}
+
+fn structurally_ephemeral_descriptor_path(path: &Path) -> bool {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        != Some("ephemeral-mutation")
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(base) = name.strip_suffix(".lease") else {
+        return false;
+    };
+    let Some((lifecycle, descriptor)) = base.split_once("--") else {
+        return false;
+    };
+    Uuid::parse_str(lifecycle).is_ok() && Uuid::parse_str(descriptor).is_ok()
+}
+
+fn reclaim_invalid_ephemeral_descriptor_from_locked_file(
+    file: &File,
+    path: &Path,
+) -> Result<bool, String> {
+    if !structurally_ephemeral_descriptor_path(path) {
+        return Ok(false);
+    }
+    verify_coordination_path_binding(file, path, "invalid ephemeral coordination descriptor")?;
+    let mut cleanup = PendingPathCleanup::new(path.to_path_buf(), file)?;
+    cleanup.remove_owned_path_now().map_err(|error| {
+        format!(
+            "reclaim invalid ephemeral coordination descriptor {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_coordination_directory(parent)?;
+    }
+    Ok(true)
+}
+
+fn reclaim_unlocked_empty_descriptor_locked(path: &Path) -> Result<bool, String> {
+    let file = match open_existing_descriptor(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(format!(
+                "open possible empty coordination descriptor {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => reclaim_empty_descriptor_from_locked_file(&file, path),
+        Err(error) if is_lock_contended(&error) => Ok(false),
+        Err(error) => Err(format!(
+            "lock possible empty coordination descriptor {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn structurally_descriptor_temp_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((identity, temp_id)) = name.split_once(".lease.tmp-") else {
+        return false;
+    };
+    let Some((lifecycle_id, descriptor_id)) = identity.split_once("--") else {
+        return false;
+    };
+    Uuid::parse_str(lifecycle_id).is_ok()
+        && Uuid::parse_str(descriptor_id).is_ok()
+        && Uuid::parse_str(temp_id).is_ok()
+}
+
+fn remove_abandoned_descriptor_temp_locked(path: &Path) -> Result<bool, String> {
+    if !structurally_descriptor_temp_path(path) {
+        return Ok(false);
+    }
+    let file = match open_existing_descriptor(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "open abandoned persistent lease staging file {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if is_lock_contended(&error) => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "lock abandoned persistent lease staging file {}: {error}",
+                path.display()
+            ))
+        }
+    }
+    verify_coordination_path_binding(&file, path, "persistent lease staging file")?;
+    let mut cleanup = PendingPathCleanup::new(path.to_path_buf(), &file)?;
+    cleanup.remove_owned_path_now().map_err(|error| {
+        format!(
+            "remove abandoned persistent lease staging file {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn cleanup_abandoned_descriptor_temps_locked(family_dir: &Path) -> Result<(), String> {
+    let mut removed_any = false;
+    for entry in std::fs::read_dir(family_dir)
+        .map_err(|e| format!("read persistent lease family {}: {e}", family_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read persistent lease family entry: {e}"))?;
+        removed_any |= remove_abandoned_descriptor_temp_locked(&entry.path())?;
+    }
+    if removed_any {
+        sync_coordination_directory(family_dir)?;
+    }
+    Ok(())
+}
+
 impl PersistentLease {
     pub fn create(family: LeaseFamily, claims: &[PathClaim]) -> Result<Self, String> {
         let root = coordination_root();
         create_private_dir(&root)?;
         let _registry = RegistryLock::acquire(&root)?;
-        Self::create_while_registry_locked(&root, family, claims, None)
+        Self::create_while_registry_locked(&root, family, claims, None, false)
     }
 
     fn create_while_registry_locked(
@@ -692,68 +982,172 @@ impl PersistentLease {
         family: LeaseFamily,
         claims: &[PathClaim],
         coordination_group: Option<String>,
+        registry_scan_swept_staging: bool,
     ) -> Result<Self, String> {
         let family_dir = root.join(family.namespace());
         create_private_dir(&family_dir)?;
         let lifecycle_id = family.lifecycle_id();
         let singular_lifecycle = matches!(
-            family,
+            &family,
             LeaseFamily::JournalOperation { .. }
                 | LeaseFamily::QueueScope { .. }
                 | LeaseFamily::QueueExecution { .. }
         );
         if singular_lifecycle {
             let prefix = format!("{lifecycle_id}--");
+            let mut removed_staging = false;
             for entry in std::fs::read_dir(&family_dir)
                 .map_err(|e| format!("read persistent lease family {}: {e}", family_dir.display()))?
             {
                 let entry = entry.map_err(|e| format!("read persistent lease family entry: {e}"))?;
+                let path = entry.path();
+                if !registry_scan_swept_staging {
+                    removed_staging |= remove_abandoned_descriptor_temp_locked(&path)?;
+                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with(&prefix) && name.ends_with(".lease") {
+                    if reclaim_unlocked_empty_descriptor_locked(&path)? {
+                        continue;
+                    }
                     return Err(format!(
                         "persistent lease lifecycle already has a descriptor: {:?} at {}",
                         family,
-                        entry.path().display()
+                        path.display()
                     ));
                 }
             }
+            if removed_staging {
+                sync_coordination_directory(&family_dir)?;
+            }
+        } else if !registry_scan_swept_staging {
+            cleanup_abandoned_descriptor_temps_locked(&family_dir)?;
         }
         let descriptor_id = Uuid::new_v4();
         let path = family_dir.join(format!("{lifecycle_id}--{descriptor_id}.lease"));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = options.open(&path)
-            .map_err(|e| format!("create persistent lease {}: {e}", path.display()))?;
-        set_private_file_permissions(&file)?;
-        file.try_lock_exclusive()
-            .map_err(|e| format!("lock new persistent lease {}: {e}", path.display()))?;
+        // Complete every fallible/allocating in-memory preparation before any
+        // pathname is published. Once `final_cleanup` is disarmed below, the
+        // success path is move-only.
+        let descriptor_claims = claims.to_vec();
+        let retained_claims: Arc<[PathClaim]> = descriptor_claims.clone().into();
         let body = LeaseDescriptor {
             schema: DESCRIPTOR_SCHEMA,
             descriptor_id,
             family: family.clone(),
             owner: OwnerProcessIdentity::current(),
             created_unix_ms: unix_ms(),
-            claims: claims.to_vec(),
+            claims: descriptor_claims,
             coordination_group,
         };
         let encoded = serde_json::to_vec(&body)
             .map_err(|e| format!("serialize persistent lease {}: {e}", path.display()))?;
-        file.write_all(&encoded)
-            .map_err(|e| format!("write persistent lease {}: {e}", path.display()))?;
-        file.flush()
-            .map_err(|e| format!("flush persistent lease {}: {e}", path.display()))?;
+        // EphemeralMutation has no post-crash recovery authority: after a
+        // machine loss every holder is dead and its unlocked descriptor is
+        // reclaimable. Durable lifecycle families, by contrast, must preserve
+        // their descriptor body across power loss because it reserves recovery
+        // authority after the owner disappears.
+        let crash_durable_descriptor = !matches!(
+            &family,
+            LeaseFamily::EphemeralMutation { .. }
+        );
+
+        // Build the complete descriptor on an unscanned name first. The file
+        // lock is taken before any bytes are written and remains attached to
+        // this inode after no-clobber publication below.
+        let temp_path = family_dir.join(format!(
+            ".{lifecycle_id}--{descriptor_id}.lease.tmp-{}",
+            Uuid::new_v4()
+        ));
+        let mut temp_options = OpenOptions::new();
+        temp_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            temp_options
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .mode(0o600);
+        }
+        let mut file = temp_options.open(&temp_path).map_err(|e| {
+            format!(
+                "create persistent lease staging file {}: {e}",
+                temp_path.display()
+            )
+        })?;
+        let mut temp_cleanup = PendingPathCleanup::new(temp_path.clone(), &file)?;
+        set_private_file_permissions(&file)?;
+        file.try_lock_exclusive().map_err(|e| {
+            format!(
+                "lock new persistent lease staging file {}: {e}",
+                temp_path.display()
+            )
+        })?;
+        file.write_all(&encoded).map_err(|e| {
+            format!(
+                "write persistent lease staging file {}: {e}",
+                temp_path.display()
+            )
+        })?;
+        if crash_durable_descriptor {
+            file.sync_all().map_err(|e| {
+                format!(
+                    "fsync persistent lease staging file {}: {e}",
+                    temp_path.display()
+                )
+            })?;
+        } else {
+            // `File::flush` preserves the previous cheap ephemeral behavior;
+            // no durable recovery authority survives a machine loss.
+            file.flush().map_err(|e| {
+                format!(
+                    "flush persistent lease staging file {}: {e}",
+                    temp_path.display()
+                )
+            })?;
+        }
+        verify_coordination_path_binding(&file, &temp_path, "persistent lease staging file")?;
+
+        // Publish with a filesystem-level no-clobber operation. A hard link is
+        // atomic, fails if `path` already exists, and names the already complete
+        // locked inode directly. Thus scanners can never observe an empty or
+        // partially written descriptor created by this implementation. The
+        // temp link is removed only after the final link is verified.
+        std::fs::hard_link(&temp_path, &path).map_err(|e| {
+            format!(
+                "publish persistent lease {} from {} without clobber: {e}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        let mut final_cleanup = PendingPathCleanup::new(path.clone(), &file)?;
+        verify_coordination_path_binding(&file, &path, "published persistent lease")?;
+        if crash_durable_descriptor {
+            // Make the final link durable before retiring the staging link. If
+            // power is lost after this point, recovery authority is reachable
+            // through `path` even if the subsequent unlink is only partially
+            // persisted.
+            sync_coordination_directory(&family_dir)?;
+        }
+        temp_cleanup.remove_owned_path_now().map_err(|error| {
+            format!(
+                "remove published persistent lease staging link {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        // Do not fsync the directory again solely for staging-link retirement.
+        // The pre-unlink directory sync above already makes the final recovery
+        // pathname durable. If a crash resurrects this hidden hard-link name,
+        // startup/admission cleanup recognizes and removes it.
+        // Close the publication window with the same pathname/inode binding
+        // check used by readers. Do not return an authority whose public name
+        // was rebound while publication cleanup was in progress.
+        verify_coordination_path_binding(&file, &path, "published persistent lease")?;
+        final_cleanup.disarm();
         Ok(Self {
             file,
             descriptor_path: path,
             descriptor_id,
             family,
-            claims: claims.to_vec().into(),
+            claims: retained_claims,
         })
     }
 
@@ -912,7 +1306,11 @@ impl MutationClaimGuard {
             }
         }
         let lease = PersistentLease::create_while_registry_locked(
-            &root, family, &claims, coordination_group
+            &root,
+            family,
+            &claims,
+            coordination_group,
+            true,
         )?;
         Ok(Self { lease, claims: claims.into() })
     }
@@ -1046,13 +1444,24 @@ fn classify_descriptor(path: &Path) -> Result<Option<(ClaimAvailability, LeaseFa
         Err(error) if is_lock_contended(&error) => true,
         Err(error) => return Err(format!("probe coordination descriptor {}: {error}", path.display())),
     };
-    let descriptor = read_descriptor_from(&mut file, path).map_err(|error| {
-        if lock_state {
-            format!("malformed contended coordination descriptor (fail closed): {error}")
-        } else {
-            format!("malformed coordination descriptor requires lifecycle repair: {error}")
+    if !lock_state && reclaim_empty_descriptor_from_locked_file(&file, path)? {
+        return Ok(None);
+    }
+    let descriptor = match read_descriptor_from(&mut file, path) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            if !lock_state
+                && reclaim_invalid_ephemeral_descriptor_from_locked_file(&file, path)?
+            {
+                return Ok(None);
+            }
+            return Err(if lock_state {
+                format!("malformed contended coordination descriptor (fail closed): {error}")
+            } else {
+                format!("malformed coordination descriptor requires lifecycle repair: {error}")
+            });
         }
-    })?;
+    };
     let availability = classify_availability(&descriptor.family, lock_state);
     Ok(Some((availability, descriptor.family, descriptor.claims, descriptor.coordination_group)))
 }
@@ -1090,11 +1499,19 @@ fn descriptor_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
         let entry = entry.map_err(|e| format!("read coordination root entry: {e}"))?;
         let ty = entry.file_type().map_err(|e| format!("inspect coordination entry: {e}"))?;
         if !ty.is_dir() { continue; }
-        for child in std::fs::read_dir(entry.path()).map_err(|e| format!("read coordination family {}: {e}", entry.path().display()))? {
+        let family_dir = entry.path();
+        let mut removed_staging = false;
+        for child in std::fs::read_dir(&family_dir).map_err(|e| format!("read coordination family {}: {e}", family_dir.display()))? {
             let child = child.map_err(|e| format!("read coordination descriptor entry: {e}"))?;
-            if child.path().extension().and_then(|v| v.to_str()) == Some("lease") {
-                paths.push(child.path());
+            let child_path = child.path();
+            if child_path.extension().and_then(|v| v.to_str()) == Some("lease") {
+                paths.push(child_path);
+            } else {
+                removed_staging |= remove_abandoned_descriptor_temp_locked(&child_path)?;
             }
+        }
+        if removed_staging {
+            sync_coordination_directory(&family_dir)?;
         }
     }
     paths.sort();
@@ -1102,22 +1519,9 @@ fn descriptor_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn read_descriptor_from(file: &mut File, path: &Path) -> Result<LeaseDescriptor, String> {
-    let descriptor_metadata = file.metadata()
-        .map_err(|e| format!("fstat persistent lease {}: {e}", path.display()))?;
+    let descriptor_metadata = verify_coordination_path_binding(file, path, "persistent lease")?;
     if descriptor_metadata.len() > DESCRIPTOR_MAX_BYTES {
         return Err(format!("persistent lease descriptor exceeds {} bytes: {}", DESCRIPTOR_MAX_BYTES, path.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let pathname_metadata = std::fs::symlink_metadata(path)
-            .map_err(|e| format!("lstat persistent lease pathname {}: {e}", path.display()))?;
-        if !pathname_metadata.file_type().is_file() {
-            return Err(format!("persistent lease pathname is not a regular file: {}", path.display()));
-        }
-        if descriptor_metadata.dev() != pathname_metadata.dev() || descriptor_metadata.ino() != pathname_metadata.ino() {
-            return Err(format!("persistent lease pathname rebound after open: {}", path.display()));
-        }
     }
     file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek persistent lease {}: {e}", path.display()))?;
     let mut bytes = Vec::with_capacity(descriptor_metadata.len() as usize);
@@ -1227,7 +1631,264 @@ fn reject_detectable_legacy_mutation_ambiguity_except(legacy_exception: Option<&
     Ok(())
 }
 
+const TEST_CONCURRENCY_INHERIT_ENV: &str = "TONEPOET_TEST_CONCURRENCY_DIR_INHERIT";
+
+#[cfg(test)]
+struct TestCoordinationRootOverrideState {
+    owner: std::thread::ThreadId,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+fn test_coordination_serial() -> &'static Mutex<()> {
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    SERIAL.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+fn test_coordination_override_state() -> &'static Mutex<Option<TestCoordinationRootOverrideState>> {
+    static STATE: OnceLock<Mutex<Option<TestCoordinationRootOverrideState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn scoped_test_coordination_state() -> &'static Mutex<Option<PathBuf>> {
+    static STATE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Thread-owned root override for narrowly local descriptor fixtures. This is
+/// intentionally not inherited by worker threads. Tests whose coordination
+/// activity can cross a thread/task boundary must use
+/// `scoped_test_coordination_root` (or its explicit-path variant) instead.
+#[cfg(test)]
+pub(crate) struct TestCoordinationRootGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    owner: std::thread::ThreadId,
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_coordination_root(path: &Path) -> TestCoordinationRootGuard {
+    let serial = test_coordination_serial()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let owner = std::thread::current().id();
+    let mut state = test_coordination_override_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *state = Some(TestCoordinationRootOverrideState {
+        owner: owner.clone(),
+        path: path.to_path_buf(),
+    });
+    drop(state);
+    TestCoordinationRootGuard {
+        _serial: serial,
+        owner,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCoordinationRootGuard {
+    fn drop(&mut self) {
+        let mut state = test_coordination_override_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .as_ref()
+            .is_some_and(|current| current.owner == self.owner)
+        {
+            *state = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn current_test_coordination_root_override() -> Option<PathBuf> {
+    let owner = std::thread::current().id();
+    test_coordination_override_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|current| current.owner == owner)
+        .map(|current| current.path.clone())
+}
+
+/// Process-visible, serialized coordination root for one coordination-touching
+/// unit test. The guard owns the environment override for the whole test so
+/// worker threads/tasks and production-like helper subprocesses inherit the
+/// same registry. Every coordination-touching unit test must hold this serial
+/// scope; unrelated tests need not.
+#[cfg(test)]
+pub(crate) struct ScopedTestCoordinationRootGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    root: PathBuf,
+    _temp_dir: Option<tempfile::TempDir>,
+    previous_root_env: Option<std::ffi::OsString>,
+    previous_inherit_env: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl ScopedTestCoordinationRootGuard {
+    fn install(path: PathBuf, temp_dir: Option<tempfile::TempDir>) -> Self {
+        let serial = test_coordination_serial()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_root_env = std::env::var_os("TONEPOET_CONCURRENCY_DIR");
+        let previous_inherit_env = std::env::var_os(TEST_CONCURRENCY_INHERIT_ENV);
+
+        {
+            let mut state = scoped_test_coordination_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(state.is_none(), "test coordination scope must be singular");
+            *state = Some(path.clone());
+        }
+        std::env::set_var("TONEPOET_CONCURRENCY_DIR", &path);
+        std::env::remove_var(TEST_CONCURRENCY_INHERIT_ENV);
+
+        Self {
+            _serial: serial,
+            root: path,
+            _temp_dir: temp_dir,
+            previous_root_env,
+            previous_inherit_env,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_test_coordination_root() -> ScopedTestCoordinationRootGuard {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("tonepoet-test-concurrency-")
+        .tempdir()
+        .expect("create isolated test coordination root");
+    let root = temp_dir.path().join("concurrency-v1");
+    ScopedTestCoordinationRootGuard::install(root, Some(temp_dir))
+}
+
+#[cfg(test)]
+pub(crate) fn install_scoped_test_coordination_root(
+    path: &Path,
+) -> ScopedTestCoordinationRootGuard {
+    ScopedTestCoordinationRootGuard::install(path.to_path_buf(), None)
+}
+
+#[cfg(test)]
+impl Drop for ScopedTestCoordinationRootGuard {
+    fn drop(&mut self) {
+        let mut state = scoped_test_coordination_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.as_deref() == Some(self.root.as_path()) {
+            *state = None;
+        }
+        drop(state);
+
+        match self.previous_root_env.take() {
+            Some(previous) => std::env::set_var("TONEPOET_CONCURRENCY_DIR", previous),
+            None => std::env::remove_var("TONEPOET_CONCURRENCY_DIR"),
+        }
+        match self.previous_inherit_env.take() {
+            Some(previous) => std::env::set_var(TEST_CONCURRENCY_INHERIT_ENV, previous),
+            None => std::env::remove_var(TEST_CONCURRENCY_INHERIT_ENV),
+        }
+    }
+}
+
+#[cfg(test)]
+fn current_scoped_test_coordination_root() -> Option<PathBuf> {
+    scoped_test_coordination_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Cargo's test executables live under `target/{profile}/deps` and carry a
+/// metadata hash suffix.  Detect that shape at runtime as well as under
+/// `cfg(test)` so integration-test dependencies never fall back to the user's
+/// real coordination registry.
+pub(crate) fn running_under_cargo_test_harness() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(deps) = executable.parent() else {
+        return false;
+    };
+    if deps.file_name().and_then(|value| value.to_str()) != Some("deps") {
+        return false;
+    }
+    let Some(profile_dir) = deps.parent() else {
+        return false;
+    };
+    // Integration-test dependencies are compiled without cfg(test). Require
+    // Cargo's adjacent fingerprint directory as well as the hashed libtest
+    // executable shape so an installed production binary named `*-deadbeef`
+    // under an unrelated `deps/` directory cannot disable activation checks.
+    if !profile_dir.join(".fingerprint").is_dir() {
+        return false;
+    }
+    let Some(stem) = executable.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some((_, suffix)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    suffix.len() >= 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cargo_test_coordination_root() -> Option<PathBuf> {
+    // Safety fallback only: coordination-touching unit tests are required to
+    // hold `scoped_test_coordination_root` (or an approved explicit fixture).
+    // Keeping a process-private fallback prevents an accidentally unscoped
+    // future test from ever consulting the user's real ~/.config registry;
+    // it is not the isolation boundary for reviewed coordination tests.
+    if !running_under_cargo_test_harness() {
+        return None;
+    }
+    static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
+    Some(
+        TEST_ROOT
+            .get_or_init(|| {
+                std::env::temp_dir()
+                    .join("tonepoet-test-concurrency-v1")
+                    .join(format!(
+                        "{}-{:016x}",
+                        std::process::id(),
+                        process_instance_token()
+                    ))
+            })
+            .clone(),
+    )
+}
+
 pub fn coordination_root() -> PathBuf {
+    if running_under_cargo_test_harness() {
+        #[cfg(test)]
+        if let Some(path) = current_scoped_test_coordination_root() {
+            return path;
+        }
+        #[cfg(test)]
+        if let Some(path) = current_test_coordination_root_override() {
+            return path;
+        }
+        if std::env::var_os(TEST_CONCURRENCY_INHERIT_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            if let Some(path) = std::env::var_os("TONEPOET_CONCURRENCY_DIR") {
+                return PathBuf::from(path);
+            }
+        }
+        if let Some(path) = cargo_test_coordination_root() {
+            return path;
+        }
+    }
     if let Some(path) = std::env::var_os("TONEPOET_CONCURRENCY_DIR") {
         return PathBuf::from(path);
     }
@@ -1346,16 +2007,15 @@ pub fn register_runtime_execution(
             return Err(format!("item {item_id} already has a different runtime execution authority"));
         }
     }
-    let item_supervisor = if cfg!(test) && std::env::var_os("TONEPOET_SCRIPT_SUPERVISOR_HELPER").is_none() {
-        // Pure unit tests exercise queue/DB state without a real CLI binary;
-        // integration tests set the helper to CARGO_BIN_EXE_tonepoet and cover
-        // the actual process boundary. Production always starts the supervisor.
-        None
-    } else {
-        let queue_file = queue_lease.duplicate_lifetime_file()?;
-        Some(crate::convert::script_supervisor::ItemExecutionSupervisorClient::start(&[queue_file])
-            .map_err(|error| format!("start item execution supervisor for {item_id}: {error}"))?)
-    };
+    // Unit and integration tests use the same item-supervisor process boundary
+    // as production. `resolve_supervisor_helper_executable` maps a Cargo test
+    // harness to the built tonepoet binary without requiring an environment
+    // override, so tests do not silently skip lifecycle supervision.
+    let queue_file = queue_lease.duplicate_lifetime_file()?;
+    let item_supervisor = Some(
+        crate::convert::script_supervisor::ItemExecutionSupervisorClient::start(&[queue_file])
+            .map_err(|error| format!("start item execution supervisor for {item_id}: {error}"))?,
+    );
     let mut map = runtime_execution_authorities()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1768,13 +2428,74 @@ mod tests {
     use super::*;
 
     fn with_root<T>(f: impl FnOnce(&Path) -> T) -> T {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _serial = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("TONEPOET_CONCURRENCY_DIR", dir.path());
-        let result = f(dir.path());
-        std::env::remove_var("TONEPOET_CONCURRENCY_DIR");
-        result
+        let _root = install_test_coordination_root(dir.path());
+        f(dir.path())
+    }
+
+    #[test]
+    fn scoped_test_coordination_root_is_visible_to_spawned_worker_thread() {
+        let scope = scoped_test_coordination_root();
+        let expected = scope.path().to_path_buf();
+        assert_eq!(coordination_root(), expected);
+
+        let (worker_root, worker_env_root) = std::thread::spawn(|| {
+            (
+                coordination_root(),
+                std::env::var_os("TONEPOET_CONCURRENCY_DIR"),
+            )
+        })
+        .join()
+        .expect("coordination-root worker thread");
+        assert_eq!(
+            worker_root, expected,
+            "a worker spawned by a scoped coordination test must share its registry"
+        );
+        assert_eq!(
+            worker_env_root.as_deref(),
+            Some(expected.as_os_str()),
+            "the scoped environment root must be visible to spawned workers"
+        );
+    }
+
+    #[test]
+    fn scoped_test_coordination_roots_isolate_durable_state_between_tests() {
+        let parent = tempfile::tempdir().expect("test root parent");
+        let root_a = parent.path().join("test-a");
+        let root_b = parent.path().join("test-b");
+        let family = LeaseFamily::JournalOperation {
+            job_id: Uuid::new_v4(),
+        };
+
+        let descriptor_a = {
+            let scope_a = install_scoped_test_coordination_root(&root_a);
+            assert_eq!(coordination_root(), scope_a.path().to_path_buf());
+            let lease = PersistentLease::create(family.clone(), &[])
+                .expect("create recovery-reserved descriptor in test root A");
+            let descriptor = lease.descriptor_path().to_path_buf();
+            drop(lease);
+            descriptor
+        };
+        assert!(descriptor_a.exists(), "root A descriptor must survive owner drop");
+
+        {
+            let scope_b = install_scoped_test_coordination_root(&root_b);
+            assert_eq!(coordination_root(), scope_b.path().to_path_buf());
+            assert!(
+                find_family_descriptor(&family)
+                    .expect("scan isolated test root B")
+                    .is_none(),
+                "root B must not enumerate durable state from root A"
+            );
+            let guard = MutationClaimGuard::acquire_ephemeral(Vec::new())
+                .expect("root B admission must ignore root A recovery authority");
+            drop(guard);
+        }
+
+        assert!(
+            descriptor_a.exists(),
+            "activity in root B must never retire root A recovery authority"
+        );
     }
 
     #[test]
@@ -2311,6 +3032,100 @@ mod tests {
             assert!(error.contains("lifecycle repair"), "generic admission must not infer durable malformed state: {error}");
             retire_setup_orphan_by_path_identity(&path, &LeaseFamily::JournalOperation { job_id }).unwrap();
             assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    fn zero_length_crash_orphan_is_reclaimed_by_next_admission() {
+        with_root(|root| {
+            let orphan_family = LeaseFamily::JournalOperation { job_id: Uuid::new_v4() };
+            let family_dir = root.join(orphan_family.namespace());
+            create_private_dir(&family_dir).unwrap();
+            let orphan_path = family_dir.join(format!(
+                "{}--{}.lease",
+                orphan_family.lifecycle_id(),
+                Uuid::new_v4()
+            ));
+            let orphan = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&orphan_path)
+                .unwrap();
+            set_private_file_permissions(&orphan).unwrap();
+            drop(orphan);
+            assert_eq!(std::fs::metadata(&orphan_path).unwrap().len(), 0);
+
+            let guard = MutationClaimGuard::acquire_ephemeral(Vec::new())
+                .expect("admission should self-heal an unlocked zero-length create orphan");
+            assert!(
+                !orphan_path.exists(),
+                "zero-length descriptor left by a killed creator must be reclaimed"
+            );
+            drop(guard);
+        });
+    }
+
+    #[test]
+    fn malformed_unlocked_ephemeral_descriptor_is_reclaimable_after_machine_loss() {
+        with_root(|root| {
+            let claim_id = Uuid::new_v4();
+            let family = LeaseFamily::EphemeralMutation { claim_id };
+            let family_dir = root.join(family.namespace());
+            create_private_dir(&family_dir).unwrap();
+            let orphan_path =
+                family_dir.join(format!("{claim_id}--{}.lease", Uuid::new_v4()));
+            std::fs::write(&orphan_path, b"{\"schema\":1").unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(Vec::new())
+                .expect("unlocked malformed ephemeral state has no recovery authority");
+            assert!(!orphan_path.exists());
+            drop(guard);
+        });
+    }
+
+    #[test]
+    fn singular_lifecycle_create_reclaims_zero_length_reservation_orphan() {
+        with_root(|root| {
+            let job_id = Uuid::new_v4();
+            let family = LeaseFamily::JournalOperation { job_id };
+            let family_dir = root.join(family.namespace());
+            create_private_dir(&family_dir).unwrap();
+            let orphan_path = family_dir.join(format!("{job_id}--{}.lease", Uuid::new_v4()));
+            let orphan = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&orphan_path)
+                .unwrap();
+            set_private_file_permissions(&orphan).unwrap();
+            drop(orphan);
+
+            let lease = PersistentLease::create(family, &[])
+                .expect("singular lifecycle creation should repair its empty reservation orphan");
+            assert!(!orphan_path.exists());
+            assert!(lease.descriptor_path().exists());
+        });
+    }
+
+    #[test]
+    fn singular_lifecycle_create_cleans_abandoned_atomic_staging_file() {
+        with_root(|root| {
+            let job_id = Uuid::new_v4();
+            let family = LeaseFamily::JournalOperation { job_id };
+            let family_dir = root.join(family.namespace());
+            create_private_dir(&family_dir).unwrap();
+            let abandoned = family_dir.join(format!(
+                ".{job_id}--{}.lease.tmp-{}",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ));
+            std::fs::write(&abandoned, b"partial descriptor body").unwrap();
+
+            let lease = PersistentLease::create(family, &[])
+                .expect("new lifecycle creation should retire abandoned unscanned staging files");
+            assert!(!abandoned.exists());
+            assert!(lease.descriptor_path().exists());
         });
     }
 

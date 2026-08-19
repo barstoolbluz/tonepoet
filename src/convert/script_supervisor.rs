@@ -461,6 +461,65 @@ fn validate_supervisor_result(
     Ok(())
 }
 
+fn cargo_test_helper_candidate(current_executable: &Path) -> Option<PathBuf> {
+    let deps = current_executable.parent()?;
+    if deps.file_name().and_then(|value| value.to_str()) != Some("deps") {
+        return None;
+    }
+    let profile_dir = deps.parent()?;
+    if !profile_dir.join(".fingerprint").is_dir() {
+        return None;
+    }
+    let stem = current_executable.file_stem()?.to_str()?;
+    let (_, hash) = stem.rsplit_once('-')?;
+    if hash.len() < 8 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(profile_dir.join(format!(
+        "tonepoet{}",
+        std::env::consts::EXE_SUFFIX
+    )))
+}
+
+fn resolve_supervisor_helper_executable(
+    explicit: Option<&Path>,
+) -> Result<PathBuf, ScriptSupervisorError> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("TONEPOET_SCRIPT_SUPERVISOR_HELPER") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let current = std::env::current_exe().map_err(|error| {
+        ScriptSupervisorError::Internal(format!(
+            "cannot locate the current executable for script supervision: {error}"
+        ))
+    })?;
+    let Some(default_test_helper) = cargo_test_helper_candidate(&current) else {
+        // Production behavior remains re-exec of the running tonepoet binary.
+        return Ok(current);
+    };
+
+    // Cargo may expose the real binary explicitly for integration tests. Fall
+    // back to the standard target/{profile}/tonepoet sibling used by
+    // `cargo build && cargo test --lib` and by workspace test builds.
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_tonepoet") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    if default_test_helper.is_file() {
+        return Ok(default_test_helper);
+    }
+
+    Err(ScriptSupervisorError::Internal(format!(
+        "cargo test harness cannot re-exec the supervisor entrypoint; expected built tonepoet helper at {}",
+        default_test_helper.display()
+    )))
+}
+
 /// Run a script through the dedicated supervisor helper.
 ///
 /// `is_cancelled` is polled by the parent.  The helper independently enforces
@@ -519,20 +578,8 @@ where
         ));
     }
 
-    let helper_executable = match invocation.helper_executable.as_ref() {
-        Some(path) => path.clone(),
-        // Test hook: a libtest binary's main is the harness, not the
-        // supervisor entrypoint, so in-crate tests point this at the real
-        // tonepoet binary. Production never sets it.
-        None => match std::env::var_os("TONEPOET_SCRIPT_SUPERVISOR_HELPER") {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_exe().map_err(|error| {
-                ScriptSupervisorError::Internal(format!(
-                    "cannot locate the current executable for script supervision: {error}"
-                ))
-            })?,
-        },
-    };
+    let helper_executable =
+        resolve_supervisor_helper_executable(invocation.helper_executable.as_deref())?;
     let mut command = Command::new(helper_executable);
     command
         .arg(INTERNAL_SUBCOMMAND)
@@ -794,14 +841,7 @@ impl ItemExecutionSupervisorClient {
     pub fn start(initial_lifetime_files: &[Arc<File>]) -> Result<Self, ScriptSupervisorError> {
         let (parent, child_stream) = UnixStream::pair()?;
         let request_fd = child_stream.as_raw_fd();
-        let helper = match std::env::var_os("TONEPOET_SCRIPT_SUPERVISOR_HELPER") {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_exe().map_err(|error| {
-                ScriptSupervisorError::Internal(format!(
-                    "cannot locate current executable for item supervision: {error}"
-                ))
-            })?,
-        };
+        let helper = resolve_supervisor_helper_executable(None)?;
         let retained_fds = initial_lifetime_files
             .iter()
             .map(|file| file.as_raw_fd())
@@ -4927,6 +4967,22 @@ mod tests {
     use super::linux::supervisor_identity;
     #[cfg(target_os = "macos")]
     use super::macos::supervisor_identity;
+
+    #[test]
+    fn cargo_test_helper_candidate_targets_unharnessed_sibling_binary() {
+        let temp = tempfile::tempdir().expect("temp target root");
+        let profile = temp.path().join("target").join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+        let current = deps.join("tonepoet-0123456789abcdef");
+        let expected = profile.join(format!(
+            "tonepoet{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert_eq!(cargo_test_helper_candidate(&current), Some(expected));
+        assert_eq!(cargo_test_helper_candidate(&profile.join("tonepoet")), None);
+    }
 
     #[test]
     fn supervisor_spec_round_trips_without_shell_reinterpretation() {

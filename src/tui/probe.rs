@@ -6324,6 +6324,7 @@ pub(crate) fn unified_cue_row_shape(
 #[cfg(test)]
 #[test]
 fn unified_cue_row_shape_contract_is_semantic_when_dimensions_are_equal() {
+    let _coordination = crate::concurrency::scoped_test_coordination_root();
     use UnifiedCueAxis::{File, Presentation, Track};
 
     let equal_dimensions = UnifiedCueDimensions {
@@ -22787,6 +22788,7 @@ mod tests {
 
     #[test]
     fn musepack_reads_renamed_wavpack_and_refuses_mutation_before_transaction() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-musepack-read-only",
         );
@@ -26635,6 +26637,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_standard_metadata_production_route_refuses_hardlinks() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-windows-hardlink",
         );
@@ -26802,6 +26805,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_write_is_end_to_end_semantic_and_budget_pinned() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-e2e",
         );
@@ -26898,6 +26902,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_bounded_memory_route_is_semantic_and_budget_pinned() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-bounded-e2e",
         );
@@ -27001,6 +27006,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_noop_refuses_armed_journal_before_success() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-noop-journal",
         );
@@ -27059,6 +27065,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_noop_refuses_stale_legacy_backup_before_success() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-noop-backup",
         );
@@ -27971,6 +27978,7 @@ mod tests {
 
     #[test]
     fn stale_flac_metadata_recovery_defers_under_live_shared_read_and_write_claims() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         for (label, mode) in [
             ("conversion-read", crate::concurrency::ClaimMode::Read),
             ("file-operation-write", crate::concurrency::ClaimMode::Write),
@@ -28058,6 +28066,7 @@ mod tests {
 
     #[test]
     fn unparseable_artwork_rollback_defers_under_live_shared_claim() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("artwork-recovery-busy.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -28173,6 +28182,7 @@ mod tests {
 
     #[test]
     fn ordinary_flac_read_with_no_recovery_artifact_is_claim_free() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("claim-free-read.flac");
         write_synthetic_flac(&path, &[("TITLE", "Readable")], 4096, 4096);
@@ -30639,6 +30649,7 @@ mod live_metadata_perf_harness {
     #[test]
     #[ignore]
     fn live_metadata_edit_perf() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let Some(fixture) = std::env::var_os("TONEPOET_METADATA_PERF_FILE") else {
             eprintln!("TONEPOET_METADATA_PERF_FILE not set; skipping");
             return;
@@ -30870,6 +30881,7 @@ mod cue_sidecar_contract_tests {
 
     #[test]
     fn cue_sidecar_representability_is_key_based_and_shared() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         for key in [
             "CUESHEET",
             "TITLE",
@@ -30900,6 +30912,7 @@ mod concurrent_metadata_admission_tests {
 
     #[test]
     fn complete_metadata_batch_admission_is_atomic_and_cross_subsystem_visible() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let x = temp.path().join("x.mp3");
         let y = temp.path().join("y.m4a");
@@ -30979,6 +30992,7 @@ mod concurrent_metadata_admission_tests {
 
     #[test]
     fn existing_outer_metadata_authority_is_reused_without_nested_registry_admission() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("track.mp3");
         std::fs::write(&path, b"fixture").expect("fixture");
@@ -31008,6 +31022,7 @@ mod concurrent_metadata_admission_tests {
     #[cfg(unix)]
     #[test]
     fn metadata_admission_keeps_final_symlink_visible_to_existing_refusal_policy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");

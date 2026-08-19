@@ -5560,7 +5560,8 @@ FILE "side-b.flac" WAVE
             let binary_path = crate::convert::pipeline::tool::resolve_command_launch_path(
                 PathBuf::from(binary_name),
                 cmd.environment_policy,
-            );
+            )
+            .map_err(ToolRunnerError::Io)?;
             let mut process = std::process::Command::new(&binary_path);
             process.args(&cmd.args);
             if let Some(cwd) = &cmd.cwd {

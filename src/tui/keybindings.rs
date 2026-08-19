@@ -5737,6 +5737,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_create_file_and_folder_refresh_and_select_created_entry() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -5774,6 +5775,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_create_respects_prospective_namespace_claims_before_creation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::concurrency::{
             ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
         };
@@ -5837,6 +5839,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_create_refuses_overwrite_dot_components_and_path_separators() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let existing = temp.path().join("existing.txt");
@@ -5869,6 +5872,7 @@ mod inline_edit_behavior_tests {
 
     #[test]
     fn browse_create_refuses_archive_mode_without_touching_filesystem() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
         let archive = temp.path().join("album.zip");
@@ -11878,6 +11882,7 @@ mod metadata_save_progress_tests {
 
     #[test]
     fn dsf_byte_progress_footer_reports_file_phase_and_exact_byte_totals() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let detail = metadata_save_progress_detail(
             2,
             10,
@@ -24003,6 +24008,7 @@ mod aggregate_file_target_entry_tests {
 
     #[test]
     fn individual_file_target_hides_cuesheet_without_dropping_other_tags() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let mut entries = vec![
             entry("CUESHEET", "FILE \"album.flac\" WAVE"),
             entry("ALBUM", "Album"),
@@ -31875,6 +31881,7 @@ mod sidecar_editor_eligibility_tests {
 
     #[test]
     fn directory_eligibility_is_read_only() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let sentinel = temp.path().join("sentinel");
         std::fs::write(&sentinel, b"keep").expect("sentinel");
@@ -34248,6 +34255,7 @@ mod invalid_ape_repair_worker_contract_tests {
 
     #[test]
     fn cancelled_multi_file_worker_returns_one_precommit_result_per_target() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
         cancel.cancel();
         let paths = vec![
@@ -39523,6 +39531,7 @@ mod batch_removal_archive_atomicity_tests {
 
     #[test]
     fn staging_allocation_failure_preserves_complete_batch_state() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (_temp, mut app, _archive, _audio, _cursor) = archive_remaining_fixture(false);
         let before = snapshot(&app);
         let (tx, _rx) = mpsc::channel(1);
@@ -46521,13 +46530,20 @@ mod file_task_supervisor_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
-    struct FileTaskTestEnvironment;
+    struct FileTaskTestEnvironment {
+        _coordination: crate::concurrency::ScopedTestCoordinationRootGuard,
+    }
 
     impl FileTaskTestEnvironment {
         fn install(journal_dir: &std::path::Path, helper: &std::path::Path) -> Self {
+            let coordination = crate::concurrency::install_scoped_test_coordination_root(
+                &journal_dir.join("claims"),
+            );
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", journal_dir);
             std::env::set_var("TONEPOET_TEST_FILE_TASK_HELPER", helper);
-            Self
+            Self {
+                _coordination: coordination,
+            }
         }
     }
 
@@ -49344,27 +49360,6 @@ mod file_operation_safety_tests {
     };
     use std::fs;
 
-    struct TestConcurrencyEnvironment {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl TestConcurrencyEnvironment {
-        fn install(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("TONEPOET_CONCURRENCY_DIR");
-            std::env::set_var("TONEPOET_CONCURRENCY_DIR", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for TestConcurrencyEnvironment {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("TONEPOET_CONCURRENCY_DIR", previous),
-                None => std::env::remove_var("TONEPOET_CONCURRENCY_DIR"),
-            }
-        }
-    }
-
     #[derive(Clone)]
     struct FixedEndpointIdentityProvider {
         current: super::super::file_task_runtime::DurableEndpointVolumeIdentity,
@@ -49954,8 +49949,6 @@ mod file_operation_safety_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _journal_environment =
             TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
-        let _concurrency_environment =
-            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
         let source = temp.path().join("source.flac");
         let real_a = temp.path().join("real-a");
         let real_b = temp.path().join("real-b");
@@ -50058,8 +50051,6 @@ mod file_operation_safety_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _journal_environment =
             TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
-        let _concurrency_environment =
-            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
         let source = temp.path().join("source.flac");
         let real_a = temp.path().join("real-a");
         let real_b = temp.path().join("real-b");
@@ -50166,8 +50157,6 @@ mod file_operation_safety_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _journal_environment =
             TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
-        let _concurrency_environment =
-            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
 
         for is_move in [false, true] {
             let case = if is_move { "move" } else { "copy" };
@@ -51540,6 +51529,7 @@ mod file_operation_safety_tests {
 
     #[test]
     fn file_task_plan_rejects_descendant_destination_before_create() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("album");
         let nested_dest = source.join("nested");
@@ -52690,6 +52680,7 @@ mod bookmark_manager_activation_regression_tests {
 
     #[test]
     fn filtered_enter_queues_manager_activation_for_selected_result() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.bookmarks.entries = vec![
             super::super::bookmarks::Bookmark {
@@ -53301,6 +53292,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn permanent_delete_batch_is_busy_before_first_delete_when_any_member_is_claimed() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::concurrency::{
             ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
         };
@@ -53328,6 +53320,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn permanent_directory_delete_conflicts_with_descendant_read() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -53348,6 +53341,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn permanent_delete_is_blocked_by_recovery_reserved_claim() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::concurrency::{
             ClaimMode, ClaimScope, LeaseFamily, MutationClaimGuard, PathClaim,
             PathResolutionSemantics,
@@ -53379,6 +53373,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn permanent_delete_of_disjoint_paths_still_proceeds() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -53403,6 +53398,7 @@ mod permanent_delete_tests {
     #[cfg(unix)]
     #[test]
     fn permanent_delete_removes_symlink_entry_without_touching_referent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -53419,6 +53415,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn permanently_delete_paths_deduplicates_and_deletes_children_before_parents() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().join("album");
         let nested = dir.join("disc-1");
@@ -63327,6 +63324,7 @@ ignored".to_string()),
 
     #[tokio::test]
     async fn native_multi_file_sidecar_rejects_new_album_performer_until_all_tracks_are_populated() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -63559,6 +63557,7 @@ ignored".to_string()),
 
     #[tokio::test]
     async fn native_multi_file_sidecar_authority_edits_read_only_images_and_persists_deletions() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -66008,6 +66007,7 @@ ignored".to_string()),
 
     #[test]
     fn save_sacd_sidecar_empty_value_removes_meta_key() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         // Clearing a tag in the editor should remove the meta entry
         // from the sidecar entirely, not leave value="" sitting there.
         let xml = r#"<root><store id="X" type="SACD" version="1.1">
@@ -66046,6 +66046,7 @@ ignored".to_string()),
 
     #[test]
     fn save_sacd_sidecar_refuses_when_track_count_mismatches() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         // Sidecar declares 2 tracks (TOTALTRACKS=2) but editor was
         // built from a ScarletBook with 3 tracks. save_sacd_sidecar
         // must refuse rather than silently misalign.
@@ -66655,6 +66656,7 @@ ignored".to_string()),
 
     #[test]
     fn save_sacd_sidecar_writes_multi_tab_areas_without_implicit_mirror() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::disc::model::{PresentationId, SacdAreaId};
         use crate::tui::sacd_sidecar::parse_sidecar;
 
@@ -72122,6 +72124,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[tokio::test]
     async fn four_file_native_multi_file_album_consolidates_persists_reopens_and_queues_once() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -72492,6 +72495,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[tokio::test]
     async fn multipart_metadata_sidecars_remain_independent_field_authorities() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -73400,6 +73404,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[tokio::test]
     async fn foxy_exact_selection_persists_through_real_wavpack_save_worker() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -74306,6 +74311,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[tokio::test]
     async fn presplit_metadata_sidecar_keeps_non_cue_track_fields_file_authoritative() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -74488,6 +74494,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn presplit_sidecar_save_preserves_field_authority_without_clean_churn() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -77711,6 +77718,7 @@ FILE "03.dff" WAVE
 
     #[test]
     fn cue_less_untaggable_transfer_target_materializes_sidecar_with_real_file_refs() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album-dff-new");
         std::fs::create_dir_all(&album).expect("album directory");
@@ -77779,6 +77787,7 @@ FILE "03.dff" WAVE
     #[cfg(unix)]
     #[test]
     fn cue_less_untaggable_transfer_read_only_directory_reports_failure_without_false_success() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipping read-only directory assertion as root");
             return;
@@ -77874,6 +77883,7 @@ FILE "03.dff" WAVE
 
     #[test]
     fn cue_less_untaggable_transfer_recovers_exact_empty_placeholder_but_rejects_raced_sidecar() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album-dff-placeholder");
         std::fs::create_dir_all(&album).expect("album directory");
@@ -77986,6 +77996,7 @@ FILE "03.dff" WAVE
 
     #[test]
     fn unsupported_partial_single_file_write_changes_only_selected_cue_track() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (_temp, paths, cue) = unsupported_three_track_album_fixture();
         let cancel = super::super::probe::MetadataWriteCancelFlag::new();
         let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
@@ -78037,6 +78048,7 @@ FILE "03.dff" WAVE
 
     #[test]
     fn unsupported_partial_non_contiguous_subset_preserves_authored_order_and_middle_track() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let (_temp, paths, cue) = unsupported_three_track_album_fixture();
         let cancel = super::super::probe::MetadataWriteCancelFlag::new();
         let priority = [IndividualFiles, SidecarCue, EmbeddedCue];
@@ -78185,6 +78197,7 @@ FILE "03.dff" WAVE
 
     #[test]
     fn taggable_partial_file_selection_stays_on_direct_file_path_and_writes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use super::single_image_metadata_editor_regression_tests::{
             create_flac_fixture, fixture_tool_available,
         };
@@ -78259,6 +78272,7 @@ FILE "03.flac" WAVE
 
     #[test]
     fn dff_shn_dts_folder_file_and_explicit_cue_classification_use_sidecar_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let cancel = super::super::probe::MetadataWriteCancelFlag::new();
         let individual_first = [IndividualFiles, SidecarCue, EmbeddedCue];
 
@@ -78862,6 +78876,7 @@ mod untaggable_carrier_sidecar_regression_tests {
     /// edit visibly, and reports the warning.
     #[tokio::test]
     async fn unrepresentable_field_refuses_strict_and_warn_reverts_and_saves() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let audio = temp.path().join("album.dff");
         let cue = temp.path().join("album.cue");
@@ -83136,13 +83151,20 @@ mod file_picker_browse_parity_regression_tests {
 
     pub(super) struct TestFileTaskJournalEnvironment {
         previous: Option<std::ffi::OsString>,
+        _coordination: crate::concurrency::ScopedTestCoordinationRootGuard,
     }
 
     impl TestFileTaskJournalEnvironment {
         pub(super) fn install(path: &std::path::Path) -> Self {
+            let coordination = crate::concurrency::install_scoped_test_coordination_root(
+                &path.join("claims"),
+            );
             let previous = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
-            Self { previous }
+            Self {
+                previous,
+                _coordination: coordination,
+            }
         }
     }
 
@@ -84884,6 +84906,7 @@ mod round4_undo_replay_tests {
     #[cfg(unix)]
     #[test]
     fn multi_root_copy_undo_preflights_every_root_before_deleting_any_root() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::os::unix::fs::PermissionsExt;
 
         fn copy_proof(
@@ -84955,6 +84978,7 @@ mod round4_undo_replay_tests {
 
     #[test]
     fn copy_undo_foreign_claim_rejects_complete_set_before_first_detach() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-copy-undo-shared-admission",
         );
@@ -85018,6 +85042,7 @@ mod round4_undo_replay_tests {
 
     #[test]
     fn move_undo_foreign_claim_is_busy_before_namespace_replay() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-move-undo-shared-admission",
         );

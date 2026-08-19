@@ -4558,6 +4558,7 @@ mod tests {
 
     #[test]
     fn duplicate_complete_set_busy_prevents_first_copy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-browse-duplicate-shared-admission",
         );
