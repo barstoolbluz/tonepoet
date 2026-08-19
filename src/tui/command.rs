@@ -3110,6 +3110,10 @@ pub enum Command {
     FileTaskMessages,
     /// Query or set routine file-operation capability-notice verbosity.
     FileTaskNotices(Option<String>),
+    /// Explicitly resume a reviewed crash-recovery entry. Optional queue id.
+    FileRecoveryResume(Option<u64>),
+    /// Defer a reviewed crash-recovery entry without changing its durable journal.
+    FileRecoveryDefer(Option<u64>),
     /// Create a file in the current browse directory. Empty opens an inline prompt.
     NewFile(Option<String>),
     /// Create a folder in the current browse directory. Empty opens an inline prompt.
@@ -3463,6 +3467,8 @@ impl std::fmt::Debug for Command {
             Command::EditFile(path) => f.debug_tuple("EditFile").field(path).finish(),
             Command::FileTaskMessages => f.write_str("FileTaskMessages"),
             Command::FileTaskNotices(value) => f.debug_tuple("FileTaskNotices").field(value).finish(),
+            Command::FileRecoveryResume(id) => f.debug_tuple("FileRecoveryResume").field(id).finish(),
+            Command::FileRecoveryDefer(id) => f.debug_tuple("FileRecoveryDefer").field(id).finish(),
             Command::Unknown(arg) => f.debug_tuple("Unknown").field(arg).finish(),
         }
     }
@@ -3639,6 +3645,28 @@ pub fn parse_command(input: &str) -> Command {
         "file-notices" => Command::FileTaskNotices(
             (!args.is_empty()).then(|| args.to_string()),
         ),
+        "recovery-resume" => {
+            let id = if args.trim().is_empty() {
+                None
+            } else {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => return Command::Unknown("usage: :recovery-resume [queue-id]".into()),
+                }
+            };
+            Command::FileRecoveryResume(id)
+        }
+        "recovery-defer" => {
+            let id = if args.trim().is_empty() {
+                None
+            } else {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => return Command::Unknown("usage: :recovery-defer [queue-id]".into()),
+                }
+            };
+            Command::FileRecoveryDefer(id)
+        }
         "new-file" => Command::NewFile((!args.is_empty()).then(|| args.to_string())),
         "new-folder" => Command::NewFolder((!args.is_empty()).then(|| args.to_string())),
         "del" | "delete" => Command::Delete,
@@ -4049,6 +4077,55 @@ fn edit_source_path_is_admitted(path: &std::path::Path) -> bool {
     path.is_dir() || crate::convert::source_admission::is_direct_queue_source_path(path)
 }
 
+/// Admit one user-visible CUE publication at the exact sidecar path. The
+/// final path resolution happens before the write so CUE save/generation joins
+/// the same cross-session mutation registry as moves, deletes, and metadata.
+fn write_cue_file_with_claim(path: &Path, content: &str) -> Result<PathBuf, String> {
+    let claim = crate::concurrency::PathClaim::resolve(
+        path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+    )?;
+    let admitted_path = claim.identity.resolved_io_path.clone();
+    let _mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    std::fs::write(&admitted_path, content).map_err(|error| error.to_string())?;
+    Ok(admitted_path)
+}
+
+#[cfg(test)]
+mod cue_write_claim_tests {
+    use super::write_cue_file_with_claim;
+    use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
+    #[test]
+    fn direct_cue_write_is_busy_before_mutation_and_disjoint_write_still_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let contested = temp.path().join("album.cue");
+        let disjoint = temp.path().join("other.cue");
+
+        let competing =
+            PathClaim::resolve(&contested, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        let competing_guard = MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let error = write_cue_file_with_claim(&contested, "FILE \"album.flac\" WAVE\n")
+            .expect_err("same CUE destination must be busy");
+        assert!(error.contains("live owner"), "unexpected busy error: {error}");
+        assert!(!contested.exists(), "busy admission must happen before the write");
+
+        write_cue_file_with_claim(&disjoint, "FILE \"other.flac\" WAVE\n")
+            .expect("disjoint CUE destination must remain concurrent");
+        assert_eq!(
+            std::fs::read_to_string(&disjoint).unwrap(),
+            "FILE \"other.flac\" WAVE\n"
+        );
+
+        drop(competing_guard);
+        write_cue_file_with_claim(&contested, "FILE \"album.flac\" WAVE\n")
+            .expect("released CUE destination must be retryable");
+        assert!(contested.exists());
+    }
+}
+
 pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMessage>) {
     match cmd {
         Command::Quit => {
@@ -4083,9 +4160,9 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     return;
                 }
                 let path = state.write_path.clone();
-                match std::fs::write(&path, &state.content) {
-                    Ok(()) => {
-                        let name = path
+                match write_cue_file_with_claim(&path, &state.content) {
+                    Ok(admitted_path) => {
+                        let name = admitted_path
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
@@ -4115,14 +4192,16 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &app.convert.metadata,
                 );
                 match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!(
-                            "Saved preset: {} | {}",
-                            path.display(),
-                            preset.resolved_semantics_summary()
-                        ));
+                        if let Some(warning) = outcome.index_warning() {
+                            app.set_status(format!("Saved preset: {}; SQLite index update failed and will be repaired on startup: {warning}", path.display()));
+                        } else {
+                            app.set_status(format!(
+                                "Saved preset: {} | {}", path.display(), preset.resolved_semantics_summary()
+                            ));
+                        }
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -4140,9 +4219,9 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     return;
                 }
                 let path = state.write_path.clone();
-                match std::fs::write(&path, &state.content) {
-                    Ok(()) => {
-                        let name = path
+                match write_cue_file_with_claim(&path, &state.content) {
+                    Ok(admitted_path) => {
+                        let name = admitted_path
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.display().to_string());
@@ -4171,11 +4250,15 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                     &app.convert.metadata,
                 );
                 match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         let summary = preset.resolved_semantics_summary();
                         app.preset.set_active_preset_path(name, path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!("Saved preset: {} | {summary}", path.display()));
+                        if let Some(warning) = outcome.index_warning() {
+                            app.set_status(format!("Saved preset: {} | {summary}; SQLite index update failed and will be repaired on startup: {warning}", path.display()));
+                        } else {
+                            app.set_status(format!("Saved preset: {} | {summary}", path.display()));
+                        }
                     }
                     Err(error) => app.set_status(format!("Save failed: {error}")),
                 }
@@ -4378,14 +4461,16 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 );
                 let path = super::presets::preset_file_path(&name);
                 match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         app.preset.set_active_preset_path(name.clone(), path.clone());
                         app.preset.modified = false;
-                        app.set_status(format!(
-                            "Saved preset: {} | {}",
-                            path.display(),
-                            preset.resolved_semantics_summary()
-                        ));
+                        if let Some(warning) = outcome.index_warning() {
+                            app.set_status(format!("Saved preset: {}; SQLite index update failed and will be repaired on startup: {warning}", path.display()));
+                        } else {
+                            app.set_status(format!(
+                                "Saved preset: {} | {}", path.display(), preset.resolved_semantics_summary()
+                            ));
+                        }
                     }
                     Err(e) => app.set_status(format!("Save failed: {}", e)),
                 }
@@ -4597,6 +4682,12 @@ Native helper failures, missing displays, denied clipboard access, and oversized
         }
         Command::Delete => {
             execute_delete(app, tx);
+        }
+        Command::FileRecoveryResume(queue_id) => {
+            super::keybindings::resume_file_transfer_recovery(app, queue_id, tx);
+        }
+        Command::FileRecoveryDefer(queue_id) => {
+            super::keybindings::defer_file_transfer_recovery(app, queue_id, tx);
         }
         Command::NewFile(name) => {
             execute_browse_create_command(app, super::app::BrowseCreateKind::File, name, tx);
@@ -5175,8 +5266,7 @@ Native helper failures, missing displays, denied clipboard access, and oversized
 
                         let cue_filename = super::cue_generate::cue_output_filename(&album);
                         let cue_path = output_dir.join(&cue_filename);
-                        std::fs::write(&cue_path, &cue_content)
-                            .map_err(|e| format!("CUE write failed: {}", e))?;
+                        let _admitted_cue_path = write_cue_file_with_claim(&cue_path, &cue_content)?;
 
                         let mode = if single_image {
                             "single image"
@@ -6655,39 +6745,63 @@ Native helper failures, missing displays, denied clipboard access, and oversized
                     if album { "album + track" } else { "track" },
                 ));
                 tokio::spawn(async move {
-                    let mut args = vec!["-s".to_string(), "i".to_string(), "-k".to_string()];
-                    if album {
-                        args.push("-a".to_string());
-                    } else {
-                        args.push("-r".to_string());
-                    }
-                    for p in &paths {
-                        args.push(p.to_string_lossy().to_string());
-                    }
-                    let output = tokio::process::Command::new("loudgain")
-                        .args(&args)
-                        .output()
-                        .await;
-                    let msg = match output {
-                        Ok(o) if o.status.success() => {
-                            format!(
-                                "ReplayGain tags written ({} file{})",
-                                db_paths.len(),
-                                if db_paths.len() == 1 { "" } else { "s" }
-                            )
+                    use crate::convert::pipeline::tool::{RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
+                    use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+                    use tonepoet_pipeline::CommandEnvironmentPolicy;
+                    use tokio_util::sync::CancellationToken;
+
+                    // Resolve every target before entering the registry critical
+                    // section. The ephemeral descriptor is then handed to the
+                    // trusted tonepoet supervisor, so a TUI/process death cannot
+                    // leave loudgain mutating files after the WRITE claims vanish.
+                    let claims = paths.iter().map(|path| {
+                        PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact)
+                    }).collect::<Result<Vec<_>, _>>();
+                    let output = match claims.and_then(MutationClaimGuard::acquire_ephemeral) {
+                        Ok(claim) => {
+                            let admitted_paths = claim
+                                .claims()
+                                .iter()
+                                .map(|path_claim| path_claim.identity.resolved_io_path.clone())
+                                .collect::<Vec<_>>();
+                            let lifetime = claim.lease().duplicate_lifetime_file();
+                            match lifetime {
+                                Ok(lifetime) => {
+                                    let mut args = vec!["-s".to_string(), "i".to_string(), "-k".to_string()];
+                                    if album { args.push("-a".to_string()); } else { args.push("-r".to_string()); }
+                                    for path in &admitted_paths { args.push(path.to_string_lossy().to_string()); }
+                                    let command = ToolCommand {
+                                        binary: ToolBinary::Loudgain,
+                                        args,
+                                        secret_args: Vec::new(),
+                                        cwd: None,
+                                        environment_policy: CommandEnvironmentPolicy::ClearAndSet,
+                                        env: Vec::new(),
+                                        timeout: std::time::Duration::from_secs(60 * 60),
+                                    };
+                                    let runner = RealToolRunner::new(std::collections::HashMap::new());
+                                    let cancel = CancellationToken::new();
+                                    let result = crate::concurrency::with_additional_supervision_lifetime_files(
+                                        vec![lifetime],
+                                        runner.run(command, &cancel),
+                                    ).await;
+                                    drop(claim);
+                                    result.map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            format!(
-                                "loudgain failed: {}",
-                                stderr.lines().next().unwrap_or("unknown error")
-                            )
-                        }
-                        Err(e) => format!("loudgain not found: {}", e),
+                        Err(error) => Err(error),
                     };
-                    let _ = tx
-                        .send(super::message::AppMessage::StatusMessage(msg))
-                        .await;
+                    let msg = match output {
+                        Ok(_) => format!(
+                            "ReplayGain tags written ({} file{})",
+                            db_paths.len(),
+                            if db_paths.len() == 1 { "" } else { "s" }
+                        ),
+                        Err(error) => format!("loudgain failed: {error}"),
+                    };
+                    let _ = tx.send(super::message::AppMessage::StatusMessage(msg)).await;
                 });
                 // Invalidate probe cache for the written files.
                 for r in &app.analysis_results {
@@ -6701,14 +6815,34 @@ Native helper failures, missing displays, denied clipboard access, and oversized
                 app.set_status("No analysis results — run :analyze first");
             } else {
                 let reports = super::dr_report::format_dr_reports(&app.analysis_results);
+                let report_paths = reports.iter()
+                    .map(|(dir, _)| dir.join("dr_analysis.txt"))
+                    .collect::<Vec<_>>();
+                let claims = report_paths.iter().map(|path| {
+                    crate::concurrency::PathClaim::resolve(
+                        path,
+                        crate::concurrency::ClaimMode::Write,
+                        crate::concurrency::ClaimScope::Exact,
+                    )
+                }).collect::<Result<Vec<_>, _>>();
+                let mutation_claim = claims.and_then(crate::concurrency::MutationClaimGuard::acquire_ephemeral);
                 let mut written = Vec::new();
                 let mut errors = Vec::new();
-                for (dir, text) in &reports {
-                    let path = dir.join("dr_analysis.txt");
-                    match std::fs::write(&path, text) {
-                        Ok(()) => written.push(path),
-                        Err(e) => errors.push(format!("{}: {}", dir.display(), e)),
+                match mutation_claim {
+                    Ok(claim) => {
+                        let admitted_paths = claim
+                            .claims()
+                            .iter()
+                            .map(|path_claim| path_claim.identity.resolved_io_path.clone())
+                            .collect::<Vec<_>>();
+                        for ((dir, text), path) in reports.iter().zip(&admitted_paths) {
+                            match std::fs::write(path, text) {
+                                Ok(()) => written.push(path.clone()),
+                                Err(e) => errors.push(format!("{}: {}", dir.display(), e)),
+                            }
+                        }
                     }
+                    Err(error) => errors.push(error),
                 }
                 if errors.is_empty() {
                     if written.len() == 1 {
@@ -9320,19 +9454,7 @@ pub(super) fn open_file_picker_for_copy_move(
 fn directory_destination_picker_policy(
     verbose_degrade_notices: bool,
 ) -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy {
-        allow_new_file: false,
-        allow_new_folder: true,
-        allow_cut: false,
-        allow_copy: false,
-        allow_paste: false,
-        allow_delete: false,
-        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
-        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
-        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
-        verbose_degrade_notices,
-        verification: tui_file_picker::VerificationMode::Standard,
-    }
+    tui_file_picker::FileOperationPolicy::selection_only(verbose_degrade_notices)
 }
 
 /// Open the Convert output-options destination picker. The picker starts in the
@@ -9425,19 +9547,7 @@ pub(super) fn open_file_picker_for_preset_save_as(app: &mut AppState) {
 fn preset_picker_policy(
     verbose_degrade_notices: bool,
 ) -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy {
-        allow_new_file: false,
-        allow_new_folder: false,
-        allow_cut: false,
-        allow_copy: false,
-        allow_paste: false,
-        allow_delete: true,
-        symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
-        cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
-        delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
-        verbose_degrade_notices,
-        verification: tui_file_picker::VerificationMode::Standard,
-    }
+    tui_file_picker::FileOperationPolicy::selection_only(verbose_degrade_notices)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10057,10 +10167,27 @@ pub fn save_dvdv_metadata_sidecar(
     source: &Path,
     state: &super::app::MetadataEditorState,
 ) -> Result<DvdVideoSidecarSaveOutcome, String> {
-    let sidecar_path = dvdv_metadata_sidecar_path_for_source(source)?;
+    let requested_sidecar_path = dvdv_metadata_sidecar_path_for_source(source)?;
+    let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+        &requested_sidecar_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let sidecar_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "DVD-Video sidecar admission produced no path claim".to_string())?;
+    let existing_presentations = if sidecar_path.exists() {
+        Some(parse_dvdv_metadata_sidecar_presentations(&sidecar_path)?)
+    } else {
+        None
+    };
     let target_presentation = dvdv_presentation_identity_from_state(state);
-    let existing_for_presentation = load_dvdv_metadata_sidecar_presentations(source)?
-        .and_then(|(_, sidecars)| {
+    let existing_for_presentation = existing_presentations
+        .and_then(|sidecars| {
             sidecars
                 .into_iter()
                 .find(|sidecar| dvdv_existing_sidecar_can_merge(sidecar, target_presentation.as_ref()))
@@ -10870,6 +10997,20 @@ pub fn load_bluray_metadata_sidecar_presentations(
     Ok(None)
 }
 
+fn load_bluray_metadata_sidecar_presentations_from_admitted_paths(
+    paths: &[PathBuf],
+) -> Result<Option<(PathBuf, Vec<BluRayMetadataSidecar>)>, String> {
+    for toml_path in paths {
+        if toml_path.exists() {
+            let payload = fs::read_to_string(toml_path)
+                .map_err(|e| format!("read Blu-ray metadata sidecar {}: {e}", toml_path.display()))?;
+            return parse_bluray_metadata_sidecar_presentations(&payload, toml_path)
+                .map(|sidecars| Some((toml_path.clone(), sidecars)));
+        }
+    }
+    Ok(None)
+}
+
 pub fn parse_bluray_metadata_sidecar_presentations(
     text: &str,
     path: &Path,
@@ -10909,6 +11050,25 @@ pub fn parse_bluray_metadata_sidecar_presentations(
 }
 
 pub fn save_bluray_metadata_sidecar(
+    path: &Path,
+    sidecars: &[BluRayMetadataSidecar],
+) -> Result<(), String> {
+    let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+        path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let admitted_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "Blu-ray sidecar admission produced no path claim".to_string())?;
+    save_bluray_metadata_sidecar_unclaimed(&admitted_path, sidecars)
+}
+
+fn save_bluray_metadata_sidecar_unclaimed(
     path: &Path,
     sidecars: &[BluRayMetadataSidecar],
 ) -> Result<(), String> {
@@ -10991,9 +11151,19 @@ pub fn save_bluray_metadata_sidecar_from_state(
     source: &Path,
     state: &super::app::MetadataEditorState,
 ) -> Result<BluRaySidecarSaveOutcome, String> {
-    let default_path = bluray_metadata_sidecar_path_for_source(source);
-    let (sidecar_path, mut sidecars) = load_bluray_metadata_sidecar_presentations(source)?
-        .unwrap_or_else(|| (default_path, Vec::new()));
+    let mutation_claim = acquire_bluray_sidecar_source_claims(source)?;
+    let admitted_candidates = mutation_claim
+        .claims()
+        .iter()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .collect::<Vec<_>>();
+    let default_path = admitted_candidates
+        .first()
+        .cloned()
+        .ok_or_else(|| "Blu-ray sidecar admission produced no candidate paths".to_string())?;
+    let (sidecar_path, mut sidecars) =
+        load_bluray_metadata_sidecar_presentations_from_admitted_paths(&admitted_candidates)?
+            .unwrap_or_else(|| (default_path, Vec::new()));
     let target = bluray_presentation_identity_from_state(state)
         .ok_or_else(|| "Blu-ray metadata editor is missing presentation identity".to_string())?;
     let existing_index = unique_bluray_sidecar_index(&sidecars, &target)?;
@@ -11011,7 +11181,7 @@ pub fn save_bluray_metadata_sidecar_from_state(
     } else {
         sidecars.push(sidecar);
     }
-    save_bluray_metadata_sidecar(&sidecar_path, &sidecars)?;
+    save_bluray_metadata_sidecar_unclaimed(&sidecar_path, &sidecars)?;
     let kind = if already_present {
         BluRaySidecarSaveKind::UpdatedPresentation
     } else if existed_before_save {
@@ -11086,8 +11256,20 @@ pub fn save_bluray_metadata_sidecar_dirty_presentations_from_state(
         });
     }
 
-    let (sidecar_path, mut sidecars) = load_bluray_metadata_sidecar_presentations(source)?
-        .unwrap_or_else(|| (default_path, Vec::new()));
+    let mutation_claim = acquire_bluray_sidecar_source_claims(source)?;
+    let admitted_candidates = mutation_claim
+        .claims()
+        .iter()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .collect::<Vec<_>>();
+    let default_path = admitted_candidates
+        .first()
+        .cloned()
+        .ok_or_else(|| "Blu-ray sidecar admission produced no candidate paths".to_string())?;
+
+    let (sidecar_path, mut sidecars) =
+        load_bluray_metadata_sidecar_presentations_from_admitted_paths(&admitted_candidates)?
+            .unwrap_or_else(|| (default_path, Vec::new()));
     let existed_before_save = sidecar_path.exists();
 
     let mut dirty_states = Vec::new();
@@ -11140,7 +11322,7 @@ pub fn save_bluray_metadata_sidecar_dirty_presentations_from_state(
     }
 
     if !saved_tab_indices.is_empty() {
-        save_bluray_metadata_sidecar(&sidecar_path, &sidecars)?;
+        save_bluray_metadata_sidecar_unclaimed(&sidecar_path, &sidecars)?;
     }
 
     Ok(BluRaySidecarSaveAllOutcome {
@@ -11153,6 +11335,23 @@ pub fn save_bluray_metadata_sidecar_dirty_presentations_from_state(
         skipped_clean_presentations,
         missing_identity_presentations,
     })
+}
+
+fn acquire_bluray_sidecar_source_claims(
+    source: &Path,
+) -> Result<crate::concurrency::MutationClaimGuard, String> {
+    let claims = bluray_metadata_sidecar_candidate_paths(source)
+        .into_iter()
+        .map(|path| {
+            crate::concurrency::PathClaim::resolve_with_semantics(
+                &path,
+                crate::concurrency::ClaimMode::Write,
+                crate::concurrency::ClaimScope::Exact,
+                crate::concurrency::PathResolutionSemantics::NamespaceObject,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::concurrency::MutationClaimGuard::acquire_ephemeral(claims)
 }
 
 fn bluray_metadata_editor_state_for_tab(
@@ -16391,7 +16590,7 @@ ARTIST = "Soloist"
         }
     }
 
-    fn sidecar_for_playlist(playlist_number: u32, album: &str) -> BluRayMetadataSidecar {
+    pub(super) fn sidecar_for_playlist(playlist_number: u32, album: &str) -> BluRayMetadataSidecar {
         let mut sidecar = sidecar_with_fingerprint(None);
         sidecar.source.presentation.as_mut().unwrap().playlist_number = playlist_number;
         sidecar.album.insert("ALBUM".to_string(), album.to_string());
@@ -20686,4 +20885,78 @@ mod round6_application_quit_lifecycle_tests {
             Some("CUE preview cancelled")
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn dvdv_and_bluray_atomic_publish_replace_final_symlink_entry_not_referent() {
+        use std::os::unix::fs::symlink;
+        use crate::concurrency::{
+            ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let dvd_referent = temp.path().join("dvd-master.toml");
+        let dvd_link = temp.path().join("dvd-sidecar.toml");
+        let dvd_original = DvdVideoMetadataSidecar {
+            schema_version: DVDV_METADATA_SIDECAR_SCHEMA_VERSION,
+            source: DvdVideoMetadataSource {
+                path: PathBuf::from("/fixtures/original.iso"),
+                sidecar_kind: "dvd_video".to_string(),
+                presentation: None,
+                extra: BTreeMap::new(),
+            },
+            album: BTreeMap::from([("ALBUM".to_string(), "Original DVD".to_string())]),
+            tracks: Vec::new(),
+            extra: BTreeMap::new(),
+        };
+        write_dvdv_metadata_sidecar_atomic(&dvd_referent, &dvd_original)
+            .expect("seed DVD referent");
+        let dvd_referent_before = std::fs::read(&dvd_referent).expect("read DVD referent");
+        symlink(&dvd_referent, &dvd_link).expect("DVD symlink");
+        let dvd_claim = PathClaim::resolve_with_semantics(
+            &dvd_link,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("DVD namespace claim");
+        assert_eq!(dvd_claim.identity.resolved_io_path, dvd_link);
+        let _dvd_guard = MutationClaimGuard::acquire_ephemeral(vec![dvd_claim])
+            .expect("DVD mutation admission");
+        let mut dvd_replacement = dvd_original.clone();
+        dvd_replacement
+            .album
+            .insert("ALBUM".to_string(), "Replacement DVD".to_string());
+        write_dvdv_metadata_sidecar_atomic(&dvd_link, &dvd_replacement)
+            .expect("replace DVD sidecar entry");
+        assert_eq!(std::fs::read(&dvd_referent).unwrap(), dvd_referent_before);
+        assert!(
+            !std::fs::symlink_metadata(&dvd_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "DVD sidecar symlink entry must be replaced"
+        );
+
+        let bluray_referent = temp.path().join("bluray-master.toml");
+        let bluray_link = temp.path().join("bluray-sidecar.toml");
+        let bluray_original = super::bluray_sidecar_tests::sidecar_for_playlist(1, "Original Blu-ray");
+        save_bluray_metadata_sidecar(&bluray_referent, std::slice::from_ref(&bluray_original))
+            .expect("seed Blu-ray referent");
+        let bluray_referent_before = std::fs::read(&bluray_referent).expect("read Blu-ray referent");
+        symlink(&bluray_referent, &bluray_link).expect("Blu-ray symlink");
+        let bluray_replacement = super::bluray_sidecar_tests::sidecar_for_playlist(1, "Replacement Blu-ray");
+        save_bluray_metadata_sidecar(&bluray_link, std::slice::from_ref(&bluray_replacement))
+            .expect("replace Blu-ray sidecar entry");
+        assert_eq!(std::fs::read(&bluray_referent).unwrap(), bluray_referent_before);
+        assert!(
+            !std::fs::symlink_metadata(&bluray_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Blu-ray sidecar symlink entry must be replaced"
+        );
+    }
+
 }

@@ -41,6 +41,10 @@ pub enum ToolBinary {
     Wvunpack,
     Wvtag,
     AtomicParsley,
+    /// System tar used for archive repackaging.
+    Tar,
+    /// RAR archiver used for archive repackaging.
+    Rar,
 }
 
 impl ToolBinary {
@@ -60,6 +64,8 @@ impl ToolBinary {
             Self::Wvunpack => "wvunpack",
             Self::Wvtag => "wvtag",
             Self::AtomicParsley => "AtomicParsley",
+            Self::Tar => "tar",
+            Self::Rar => "rar",
         }
     }
 
@@ -405,6 +411,8 @@ impl ToolRunner for StubToolRunner {
 pub struct RealToolRunner {
     tool_paths: HashMap<String, PathBuf>,
     version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
+    execution_item_id: Option<String>,
+    execution_supervisor: Option<crate::convert::script_supervisor::ItemExecutionSupervisorClient>,
 }
 
 impl RealToolRunner {
@@ -426,7 +434,22 @@ impl RealToolRunner {
         Self {
             tool_paths,
             version_cache,
+            execution_item_id: None,
+            execution_supervisor: None,
         }
+    }
+
+    /// Bind this runner to one durable queue execution. Scheduled fan-out
+    /// carries this explicit identity so task-local scope is never the only
+    /// route to the per-item supervisor.
+    pub fn with_execution_item(mut self, item_id: impl Into<String>) -> Self {
+        let item_id = item_id.into();
+        // Capture the typed process capability at runner construction. A bound
+        // scheduled runner never relies on whatever Tokio task happens to poll
+        // it later; missing authority remains a hard run-time error.
+        self.execution_supervisor = crate::concurrency::runtime_item_supervisor(&item_id).ok();
+        self.execution_item_id = Some(item_id);
+        self
     }
 
     /// Resolve a `ToolBinary` to an executable path.
@@ -551,6 +574,7 @@ fn cached_version_to_option(cached: &str) -> Option<String> {
 fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
     match binary {
         ToolBinary::SevenZip | ToolBinary::Ssrc => &[],
+        ToolBinary::Tar | ToolBinary::Rar => &["--version"],
         ToolBinary::Sox | ToolBinary::Opustags => &["--help"],
         // AtomicParsley emits its version banner on the zero-argument path;
         // `--version` is not its canonical identity probe.
@@ -613,7 +637,9 @@ pub(crate) fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr
             | ToolBinary::Flac
             | ToolBinary::Wvunpack
             | ToolBinary::Wvtag
-            | ToolBinary::AtomicParsley => first_version_like_token(line),
+            | ToolBinary::AtomicParsley
+            | ToolBinary::Tar
+            | ToolBinary::Rar => first_version_like_token(line),
         };
         if parsed.is_some() {
             return parsed;
@@ -967,149 +993,198 @@ fn executable_sha256(path: &Path) -> std::io::Result<Sha256Digest> {
 }
 
 impl RealToolRunner {
-    async fn run_with_binary_path(
+    pub(crate) async fn run_supervised_with_stdio(
+        &self,
+        cmd: ToolCommand,
+        binary_path: PathBuf,
+        cancel: &CancellationToken,
+        stdin_file: Option<Arc<std::fs::File>>,
+        stdout_file: Option<Arc<std::fs::File>>,
+        stderr_file: Option<Arc<std::fs::File>>,
+    ) -> Result<ToolOutput, ToolRunnerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            use crate::convert::script_supervisor::{
+                run_supervised, run_supervised_via_item_supervisor, ContainmentPreference,
+                RuntimeDirectoryIdentity, ScriptLifecycleEvent, SupervisedCommand,
+            };
+
+            let started = Instant::now();
+            let binary_path = std::fs::canonicalize(&binary_path).map_err(ToolRunnerError::Io)?;
+            let binary_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&binary_path)
+                .map_err(ToolRunnerError::Io)?;
+            let binary_meta = binary_file.metadata().map_err(ToolRunnerError::Io)?;
+            if !binary_meta.is_file() {
+                return Err(ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("tool executable is not a regular file: {}", binary_path.display()),
+                )));
+            }
+            let cwd = match cmd.cwd.as_ref() {
+                Some(path) => std::fs::canonicalize(path).map_err(ToolRunnerError::Io)?,
+                None => std::env::current_dir().map_err(ToolRunnerError::Io)?,
+            };
+            let cwd_file = std::fs::File::open(&cwd).map_err(ToolRunnerError::Io)?;
+            if !cwd_file.metadata().map_err(ToolRunnerError::Io)?.is_dir() {
+                return Err(ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("tool working directory is not a directory: {}", cwd.display()),
+                )));
+            }
+
+            let runtime_base = std::env::temp_dir().join("tonepoet-execution-supervisor");
+            std::fs::create_dir_all(&runtime_base).map_err(ToolRunnerError::Io)?;
+            std::fs::set_permissions(&runtime_base, std::fs::Permissions::from_mode(0o700))
+                .map_err(ToolRunnerError::Io)?;
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            let runtime_directory = runtime_base.join(&token);
+            std::fs::create_dir(&runtime_directory).map_err(ToolRunnerError::Io)?;
+            std::fs::set_permissions(&runtime_directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(ToolRunnerError::Io)?;
+            let runtime_meta = std::fs::metadata(&runtime_directory).map_err(ToolRunnerError::Io)?;
+            let runtime_identity = RuntimeDirectoryIdentity {
+                device: runtime_meta.dev(),
+                inode: runtime_meta.ino(),
+            };
+
+            let mut environment = if cmd.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                std::env::vars().collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
+            for entry in &cmd.env {
+                environment.insert(entry.key.clone(), entry.value.expose().to_string());
+            }
+
+            let explicit_execution_item = self.execution_item_id.clone();
+            let execution_item = explicit_execution_item.clone()
+                .or_else(crate::concurrency::current_execution_item);
+            let item_supervisor = if let Some(item_id) = explicit_execution_item.as_deref() {
+                Some(self.execution_supervisor.clone().ok_or_else(|| {
+                    ToolRunnerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("scheduled tool runner for {item_id} was created without an active item-supervisor capability"),
+                    ))
+                })?)
+            } else {
+                match execution_item.as_deref() {
+                    Some(item_id) => Some(crate::concurrency::runtime_item_supervisor(item_id)
+                        .map_err(|error| ToolRunnerError::Io(std::io::Error::new(std::io::ErrorKind::Other, error)))?),
+                    None => None,
+                }
+            };
+            let invocation = SupervisedCommand {
+                token: token.clone(),
+                runtime_directory: runtime_directory.clone(),
+                script_file: Arc::new(binary_file),
+                working_directory_file: Arc::new(cwd_file),
+                script: binary_path,
+                args: cmd.args.clone(),
+                working_directory: cwd,
+                environment,
+                timeout: cmd.timeout,
+                runtime_identity,
+                containment_preference: ContainmentPreference::Auto,
+                helper_executable: None,
+                // A queue execution's lifetime descriptors live in its one
+                // persistent item supervisor. Fresh per-command helpers are
+                // used only for non-queue callers that have no item authority.
+                retained_lifetime_files: if item_supervisor.is_some() {
+                    Vec::new()
+                } else {
+                    crate::concurrency::current_supervision_lifetime_files()
+                        .map_err(|error| ToolRunnerError::Io(std::io::Error::new(std::io::ErrorKind::Other, error)))?
+                },
+                stdin_file,
+                stdout_file,
+                stderr_file,
+            };
+            let cancellation = cancel.clone();
+            let containment_token = invocation.token.clone();
+            let containment_runtime = invocation.runtime_directory.clone();
+            let event_item = execution_item.clone();
+            let supervisor_for_run = item_supervisor.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut lifecycle = |event: &ScriptLifecycleEvent| {
+                    if let Some(item_id) = event_item.as_deref() {
+                        match event {
+                            ScriptLifecycleEvent::ContainmentPrepared { descriptor, .. } => {
+                                crate::concurrency::record_execution_containment(
+                                    item_id, &containment_token, &containment_runtime, descriptor
+                                ).map_err(crate::convert::script_supervisor::ScriptSupervisorError::Internal)?;
+                            }
+                            ScriptLifecycleEvent::UserCodeReleased { .. } => {
+                                crate::concurrency::mark_execution_containment_released(
+                                    item_id, &containment_token
+                                ).map_err(crate::convert::script_supervisor::ScriptSupervisorError::Internal)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                };
+                match supervisor_for_run.as_ref() {
+                    Some(supervisor) => run_supervised_via_item_supervisor(
+                        &invocation, supervisor, || cancellation.is_cancelled(), &mut lifecycle
+                    ),
+                    None => run_supervised(&invocation, || cancellation.is_cancelled(), &mut lifecycle),
+                }
+            }).await.map_err(|error| ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other, format!("tool supervisor task failed: {error}")
+            )))?.map_err(|error| ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other, format!("tool supervisor failed: {error}")
+            )))?;
+
+            let elapsed = started.elapsed();
+            let stdout_tail = String::from_utf8_lossy(&outcome.stdout_tail).into_owned();
+            let stderr_tail = String::from_utf8_lossy(&outcome.stderr_tail).into_owned();
+            let status = outcome.status;
+            let exit = map_exit_status(status);
+            let record = Self::build_record(&cmd, Some(exit), &stdout_tail, &stderr_tail, elapsed);
+            if outcome.containment_empty {
+                if let Some(item_id) = execution_item.as_deref() {
+                    let _ = crate::concurrency::clear_execution_containment(item_id, &token);
+                }
+                let _ = std::fs::remove_dir_all(&runtime_directory);
+            }
+            if outcome.cancelled {
+                return Err(ToolRunnerError::Cancelled { command: record });
+            }
+            if outcome.timed_out {
+                return Err(ToolRunnerError::Timeout { elapsed, command: record });
+            }
+            if status.success() {
+                Ok(ToolOutput { exit, stdout_tail, stderr_tail, elapsed, command: record })
+            } else {
+                Err(ToolRunnerError::NonZeroExit { exit, stderr_tail, command: record })
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // The v24 persistent-lease/containment protocol depends on Unix OFD
+            // inheritance. Fail closed rather than silently returning to a
+            // third-party-owned execution lifetime.
+            let _ = (cmd, binary_path, cancel, stdin_file, stdout_file, stderr_file);
+            Err(ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "concurrent mutation-capable external tools require tonepoet execution supervision on this platform",
+            )))
+        }
+    }
+
+    pub(crate) async fn run_with_binary_path(
         &self,
         cmd: ToolCommand,
         binary_path: PathBuf,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolRunnerError> {
-        let started = Instant::now();
-        let mut process = tokio::process::Command::new(&binary_path);
-        process
-            .args(&cmd.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(ref cwd) = cmd.cwd {
-            process.current_dir(cwd);
-        }
-        apply_command_environment(&mut process, &cmd);
-
-        let mut child = process.spawn().map_err(|_| ToolRunnerError::Spawn {
-            command: Self::build_record(&cmd, None, "", "", started.elapsed()),
-        })?;
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let stdout_task = tokio::spawn(async move {
-            match stdout_pipe {
-                Some(reader) => read_tail(reader).await,
-                None => String::new(),
-            }
-        });
-        let stderr_task = tokio::spawn(async move {
-            match stderr_pipe {
-                Some(reader) => read_tail(reader).await,
-                None => String::new(),
-            }
-        });
-
-        enum WaitOutcome {
-            Finished(Result<std::process::ExitStatus, std::io::Error>),
-            TimedOut,
-            Cancelled,
-        }
-
-        let outcome = tokio::select! {
-            status = child.wait() => WaitOutcome::Finished(status),
-            _ = tokio::time::sleep(cmd.timeout) => WaitOutcome::TimedOut,
-            _ = cancel.cancelled() => WaitOutcome::Cancelled,
-        };
-
-        let forced_status = match &outcome {
-            WaitOutcome::TimedOut | WaitOutcome::Cancelled => {
-                match terminate_and_reap_child(&mut child, "tool child").await {
-                    Ok(status) => Some(status),
-                    Err(message) => {
-                        let elapsed = started.elapsed();
-                        let stdout_tail = collect_tail_task(stdout_task).await;
-                        let stderr_tail = collect_tail_task(stderr_task).await;
-                        return Err(ToolRunnerError::Termination {
-                            message,
-                            command: Self::build_record(
-                                &cmd,
-                                None,
-                                &stdout_tail,
-                                &stderr_tail,
-                                elapsed,
-                            ),
-                        });
-                    }
-                }
-            }
-            WaitOutcome::Finished(Err(error)) => {
-                match terminate_and_reap_child(&mut child, "tool child after wait failure").await {
-                    Ok(status) => Some(status),
-                    Err(message) => {
-                        let elapsed = started.elapsed();
-                        let stdout_tail = collect_tail_task(stdout_task).await;
-                        let stderr_tail = collect_tail_task(stderr_task).await;
-                        return Err(ToolRunnerError::Termination {
-                            message: format!("wait failed: {error}; {message}"),
-                            command: Self::build_record(
-                                &cmd,
-                                None,
-                                &stdout_tail,
-                                &stderr_tail,
-                                elapsed,
-                            ),
-                        });
-                    }
-                }
-            }
-            WaitOutcome::Finished(Ok(_)) => None,
-        };
-
-        let elapsed = started.elapsed();
-        let stdout_tail = collect_tail_task(stdout_task).await;
-        let stderr_tail = collect_tail_task(stderr_task).await;
-
-        match outcome {
-            WaitOutcome::Finished(Ok(status)) => {
-                let exit = map_exit_status(status);
-                let record =
-                    Self::build_record(&cmd, Some(exit), &stdout_tail, &stderr_tail, elapsed);
-                if status.success() {
-                    Ok(ToolOutput {
-                        exit,
-                        stdout_tail,
-                        stderr_tail,
-                        elapsed,
-                        command: record,
-                    })
-                } else {
-                    Err(ToolRunnerError::NonZeroExit {
-                        exit,
-                        stderr_tail,
-                        command: record,
-                    })
-                }
-            }
-            WaitOutcome::Finished(Err(error)) => {
-                let _ = forced_status.expect("wait failure path reaps child");
-                Err(ToolRunnerError::Io(error))
-            }
-            WaitOutcome::TimedOut => Err(ToolRunnerError::Timeout {
-                elapsed,
-                command: Self::build_record(
-                    &cmd,
-                    forced_status.map(map_exit_status),
-                    &stdout_tail,
-                    &stderr_tail,
-                    elapsed,
-                ),
-            }),
-            WaitOutcome::Cancelled => Err(ToolRunnerError::Cancelled {
-                command: Self::build_record(
-                    &cmd,
-                    forced_status.map(map_exit_status),
-                    &stdout_tail,
-                    &stderr_tail,
-                    elapsed,
-                ),
-            }),
-        }
+        self.run_supervised_with_stdio(cmd, binary_path, cancel, None, None, None).await
     }
+
 }
 
 #[async_trait]
@@ -1192,340 +1267,105 @@ impl ToolRunner for RealToolRunner {
     }
 
 
+    #[allow(unsafe_code)] // raw fd handling for lease-lifetime file inheritance into spawned tools
     async fn run_pipeline(
         &self,
         producer: ToolCommand,
         consumer: ToolCommand,
         cancel: &CancellationToken,
     ) -> Result<ToolPipelineOutput, ToolPipelineError> {
-        if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
-            let _ = self.tool_version(producer.binary);
-        }
-        if consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
-            let _ = self.tool_version(consumer.binary);
-        }
-
-        let producer_path = resolve_command_launch_path(
-            self.resolve_binary(producer.binary),
-            producer.environment_policy,
-        );
-        let consumer_path = resolve_command_launch_path(
-            self.resolve_binary(consumer.binary),
-            consumer.environment_policy,
-        );
-        let started = Instant::now();
-
-        let mut producer_process = tokio::process::Command::new(&producer_path);
-        producer_process
-            .args(&producer.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(ref cwd) = producer.cwd {
-            producer_process.current_dir(cwd);
-        }
-        apply_command_environment(&mut producer_process, &producer);
-        let mut producer_child = producer_process.spawn().map_err(|_| ToolPipelineError {
-            error: ToolRunnerError::Spawn {
-                command: Self::build_record(&producer, None, "", "", started.elapsed()),
-            },
-            other_commands: Vec::new(),
-        })?;
-        let producer_stderr_pipe = producer_child.stderr.take();
-        let producer_stderr_task = tokio::spawn(async move {
-            match producer_stderr_pipe {
-                Some(reader) => read_tail(reader).await,
-                None => String::new(),
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(producer.binary);
             }
-        });
-        let producer_stdout = match producer_child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let termination =
-                    terminate_and_reap_child(&mut producer_child, "pipeline producer").await;
-                let producer_stderr = collect_tail_task(producer_stderr_task).await;
-                let elapsed = started.elapsed();
-                let producer_record = Self::build_record(
-                    &producer,
-                    termination.as_ref().ok().copied().map(map_exit_status),
-                    "",
-                    &producer_stderr,
-                    elapsed,
-                );
+            if consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(consumer.binary);
+            }
+            let producer_path = resolve_command_launch_path(
+                self.resolve_binary(producer.binary),
+                producer.environment_policy,
+            );
+            let consumer_path = resolve_command_launch_path(
+                self.resolve_binary(consumer.binary),
+                consumer.environment_policy,
+            );
+
+            // The transport pipe is ordinary stdio, not ownership authority.
+            // Each external endpoint is launched under its own tonepoet
+            // supervisor, and both supervisors independently retain the same
+            // QueueExecution/path/staging OFDs. A killed originating session
+            // therefore cannot orphan mutation-capable producer/consumer work.
+            let mut fds = [-1_i32; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                 return Err(ToolPipelineError {
-                    error: match termination {
-                        Ok(_) => ToolRunnerError::Io(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "pipeline producer stdout is unavailable",
-                        )),
-                        Err(message) => ToolRunnerError::Termination {
-                            message,
-                            command: producer_record.clone(),
-                        },
-                    },
-                    other_commands: vec![producer_record],
+                    error: ToolRunnerError::Io(std::io::Error::last_os_error()),
+                    other_commands: Vec::new(),
                 });
             }
-        };
-        let consumer_stdin: Stdio = match producer_stdout.try_into() {
-            Ok(stdin) => stdin,
-            Err(error) => {
-                let termination =
-                    terminate_and_reap_child(&mut producer_child, "pipeline producer").await;
-                let producer_stderr = collect_tail_task(producer_stderr_task).await;
-                let elapsed = started.elapsed();
-                let producer_record = Self::build_record(
-                    &producer,
-                    termination.as_ref().ok().copied().map(map_exit_status),
-                    "",
-                    &producer_stderr,
-                    elapsed,
-                );
-                return Err(ToolPipelineError {
-                    error: match termination {
-                        Ok(_) => ToolRunnerError::Io(error),
-                        Err(message) => ToolRunnerError::Termination {
-                            message,
-                            command: producer_record.clone(),
-                        },
-                    },
-                    other_commands: vec![producer_record],
-                });
-            }
-        };
+            // SAFETY: pipe2 returned two newly-owned descriptors.
+            let read_end = Arc::new(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+            let write_end = Arc::new(unsafe { std::fs::File::from_raw_fd(fds[1]) });
 
-        let mut consumer_process = tokio::process::Command::new(&consumer_path);
-        consumer_process
-            .args(&consumer.args)
-            .stdin(consumer_stdin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(ref cwd) = consumer.cwd {
-            consumer_process.current_dir(cwd);
-        }
-        apply_command_environment(&mut consumer_process, &consumer);
-        let mut consumer_child = match consumer_process.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                let termination =
-                    terminate_and_reap_child(&mut producer_child, "pipeline producer").await;
-                let producer_stderr = collect_tail_task(producer_stderr_task).await;
-                let elapsed = started.elapsed();
-                let consumer_record = Self::build_record(&consumer, None, "", "", elapsed);
-                let producer_record = Self::build_record(
-                    &producer,
-                    termination.as_ref().ok().copied().map(map_exit_status),
-                    "",
-                    &producer_stderr,
-                    elapsed,
-                );
-                return Err(ToolPipelineError {
-                    error: match termination {
-                        Ok(_) => ToolRunnerError::Spawn {
-                            command: consumer_record,
-                        },
-                        Err(message) => ToolRunnerError::Termination {
-                            message,
-                            command: producer_record.clone(),
-                        },
-                    },
-                    other_commands: vec![producer_record],
-                });
-            }
-        };
-        let consumer_stdout_pipe = consumer_child.stdout.take();
-        let consumer_stderr_pipe = consumer_child.stderr.take();
-        let consumer_stdout_task = tokio::spawn(async move {
-            match consumer_stdout_pipe {
-                Some(reader) => read_tail(reader).await,
-                None => String::new(),
-            }
-        });
-        let consumer_stderr_task = tokio::spawn(async move {
-            match consumer_stderr_pipe {
-                Some(reader) => read_tail(reader).await,
-                None => String::new(),
-            }
-        });
+            let producer_future = self.run_supervised_with_stdio(
+                producer,
+                producer_path,
+                cancel,
+                None,
+                Some(write_end),
+                None,
+            );
+            let consumer_future = self.run_supervised_with_stdio(
+                consumer,
+                consumer_path,
+                cancel,
+                Some(read_end),
+                None,
+                None,
+            );
+            let (producer_result, consumer_result) = tokio::join!(producer_future, consumer_future);
 
-        #[derive(Debug)]
-        enum StopReason {
-            Complete,
-            ProducerFailed,
-            ConsumerFailed,
-            TimedOut,
-            Cancelled,
-            WaitFailed(std::io::Error),
-        }
-
-        let deadline = Instant::now() + producer.timeout.min(consumer.timeout);
-        let mut producer_status = None;
-        let mut consumer_status = None;
-        let reason = loop {
-            if producer_status.is_none() {
-                match producer_child.try_wait() {
-                    Ok(status) => producer_status = status,
-                    Err(error) => break StopReason::WaitFailed(error),
+            fn command_from_error(error: &ToolRunnerError) -> Option<CommandRecord> {
+                match error {
+                    ToolRunnerError::Spawn { command }
+                    | ToolRunnerError::Timeout { command, .. }
+                    | ToolRunnerError::Cancelled { command }
+                    | ToolRunnerError::Termination { command, .. }
+                    | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
+                    ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => None,
                 }
             }
-            if consumer_status.is_none() {
-                match consumer_child.try_wait() {
-                    Ok(status) => consumer_status = status,
-                    Err(error) => break StopReason::WaitFailed(error),
+
+            match (producer_result, consumer_result) {
+                (Ok(producer), Ok(consumer)) => Ok(ToolPipelineOutput { producer, consumer }),
+                (Err(error), Ok(consumer)) => Err(ToolPipelineError {
+                    error,
+                    other_commands: vec![consumer.command],
+                }),
+                (Ok(producer), Err(error)) => Err(ToolPipelineError {
+                    error,
+                    other_commands: vec![producer.command],
+                }),
+                (Err(producer_error), Err(consumer_error)) => {
+                    let mut other_commands = Vec::new();
+                    if let Some(command) = command_from_error(&consumer_error) {
+                        other_commands.push(command);
+                    }
+                    Err(ToolPipelineError { error: producer_error, other_commands })
                 }
             }
-            if producer_status.is_some() && consumer_status.is_some() {
-                break StopReason::Complete;
-            }
-            if producer_status.as_ref().is_some_and(|status| !status.success()) {
-                break StopReason::ProducerFailed;
-            }
-            if consumer_status.as_ref().is_some_and(|status| !status.success()) {
-                break StopReason::ConsumerFailed;
-            }
-            if cancel.is_cancelled() {
-                break StopReason::Cancelled;
-            }
-            if Instant::now() >= deadline {
-                break StopReason::TimedOut;
-            }
-            tokio::time::sleep(TOOL_PIPELINE_POLL_INTERVAL).await;
-        };
-
-        let terminal = match &reason {
-            StopReason::Complete => Ok((
-                producer_status.expect("complete producer status"),
-                consumer_status.expect("complete consumer status"),
-            )),
-            _ => {
-                make_pipeline_terminal(
-                    &mut producer_child,
-                    &mut consumer_child,
-                    producer_status,
-                    consumer_status,
-                    "after pipeline stop",
-                )
-                .await
-            }
-        };
-
-        let elapsed = started.elapsed();
-        let producer_stderr = collect_tail_task(producer_stderr_task).await;
-        let consumer_stdout = collect_tail_task(consumer_stdout_task).await;
-        let consumer_stderr = collect_tail_task(consumer_stderr_task).await;
-
-        let (producer_status, consumer_status) = match terminal {
-            Ok(statuses) => statuses,
-            Err(failure) => {
-                let producer_record = Self::build_record(
-                    &producer,
-                    failure.producer_status.map(map_exit_status),
-                    "",
-                    &producer_stderr,
-                    elapsed,
-                );
-                let consumer_record = Self::build_record(
-                    &consumer,
-                    failure.consumer_status.map(map_exit_status),
-                    &consumer_stdout,
-                    &consumer_stderr,
-                    elapsed,
-                );
-                return Err(ToolPipelineError {
-                    error: ToolRunnerError::Termination {
-                        message: failure.message,
-                        command: consumer_record,
-                    },
-                    other_commands: vec![producer_record],
-                });
-            }
-        };
-
-        let producer_exit = map_exit_status(producer_status);
-        let consumer_exit = map_exit_status(consumer_status);
-        let producer_record = Self::build_record(
-            &producer,
-            Some(producer_exit),
-            "",
-            &producer_stderr,
-            elapsed,
-        );
-        let consumer_record = Self::build_record(
-            &consumer,
-            Some(consumer_exit),
-            &consumer_stdout,
-            &consumer_stderr,
-            elapsed,
-        );
-
-        match reason {
-            StopReason::TimedOut => Err(ToolPipelineError {
-                error: ToolRunnerError::Timeout {
-                    elapsed,
-                    command: consumer_record,
-                },
-                other_commands: vec![producer_record],
-            }),
-            StopReason::Cancelled => Err(ToolPipelineError {
-                error: ToolRunnerError::Cancelled {
-                    command: consumer_record,
-                },
-                other_commands: vec![producer_record],
-            }),
-            StopReason::WaitFailed(error) => Err(ToolPipelineError {
-                error: ToolRunnerError::Io(error),
-                other_commands: vec![producer_record, consumer_record],
-            }),
-            StopReason::ProducerFailed => Err(ToolPipelineError {
-                error: ToolRunnerError::NonZeroExit {
-                    exit: producer_exit,
-                    stderr_tail: producer_stderr,
-                    command: producer_record,
-                },
-                other_commands: vec![consumer_record],
-            }),
-            StopReason::ConsumerFailed => Err(ToolPipelineError {
-                error: ToolRunnerError::NonZeroExit {
-                    exit: consumer_exit,
-                    stderr_tail: consumer_stderr,
-                    command: consumer_record,
-                },
-                other_commands: vec![producer_record],
-            }),
-            StopReason::Complete if !consumer_status.success() => Err(ToolPipelineError {
-                error: ToolRunnerError::NonZeroExit {
-                    exit: consumer_exit,
-                    stderr_tail: consumer_stderr,
-                    command: consumer_record,
-                },
-                other_commands: vec![producer_record],
-            }),
-            StopReason::Complete if !producer_status.success() => Err(ToolPipelineError {
-                error: ToolRunnerError::NonZeroExit {
-                    exit: producer_exit,
-                    stderr_tail: producer_stderr,
-                    command: producer_record,
-                },
-                other_commands: vec![consumer_record],
-            }),
-            StopReason::Complete => Ok(ToolPipelineOutput {
-                producer: ToolOutput {
-                    exit: producer_exit,
-                    stdout_tail: String::new(),
-                    stderr_tail: producer_stderr,
-                    elapsed,
-                    command: producer_record,
-                },
-                consumer: ToolOutput {
-                    exit: consumer_exit,
-                    stdout_tail: consumer_stdout,
-                    stderr_tail: consumer_stderr,
-                    elapsed,
-                    command: consumer_record,
-                },
-            }),
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (producer, consumer, cancel);
+            Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "supervised external pipelines require Unix descriptor handoff",
+                )),
+                other_commands: Vec::new(),
+            })
         }
     }
 }

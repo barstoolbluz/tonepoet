@@ -11,19 +11,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
 use super::progress::{heartbeat, OperationProgressTracker};
 use super::reporter::PipelineReporter;
-use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 
 // =========================================================================
@@ -789,59 +787,43 @@ where
     match format {
         RepackageArchiveFormat::SevenZip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
-            let mut command = tokio::process::Command::new(seven_zip);
-            command
-                .arg("a")
-                .arg("-t7z")
-                .arg(temp_archive)
-                .arg("-mmt=on")
-                .arg(".")
-                .current_dir(staging_dir);
-            run_repackage_command(command, "create 7z archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::SevenZip, seven_zip,
+                vec!["a".into(), "-t7z".into(), temp_archive.display().to_string(), "-mmt=on".into(), ".".into()],
+                Some(staging_dir.to_path_buf()), "create 7z archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
-            let mut command = tokio::process::Command::new(seven_zip);
-            command
-                .arg("a")
-                .arg("-tzip")
-                .arg(temp_archive)
-                .arg(".")
-                .current_dir(staging_dir);
-            run_repackage_command(command, "create zip archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::SevenZip, seven_zip,
+                vec!["a".into(), "-tzip".into(), temp_archive.display().to_string(), ".".into()],
+                Some(staging_dir.to_path_buf()), "create zip archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::Tar => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
-            let mut command = tokio::process::Command::new(tar);
-            command
-                .arg("cf")
-                .arg(temp_archive)
-                .arg("-C")
-                .arg(staging_dir)
-                .arg(".");
-            run_repackage_command(command, "create tar archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::Tar, tar,
+                vec!["cf".into(), temp_archive.display().to_string(), "-C".into(), staging_dir.display().to_string(), ".".into()],
+                None, "create tar archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::TarGz => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
-            let mut command = tokio::process::Command::new(tar);
-            command
-                .arg("czf")
-                .arg(temp_archive)
-                .arg("-C")
-                .arg(staging_dir)
-                .arg(".");
-            run_repackage_command(command, "create tar.gz archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::Tar, tar,
+                vec!["czf".into(), temp_archive.display().to_string(), "-C".into(), staging_dir.display().to_string(), ".".into()],
+                None, "create tar.gz archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
-            let mut command = tokio::process::Command::new(rar);
-            command
-                .arg("a")
-                .arg("-r")
-                .arg(temp_archive)
-                .arg(".")
-                .current_dir(staging_dir);
-            run_repackage_command(command, "create rar archive", cancel, monitor, progress)
+            run_repackage_command(
+                ToolBinary::Rar, rar,
+                vec!["a".into(), "-r".into(), temp_archive.display().to_string(), ".".into()],
+                Some(staging_dir.to_path_buf()), "create rar archive", cancel, monitor, progress
+            )
                 .await
                 .map_err(|err| {
                     if err.contains("not found") || err.contains("No such file") {
@@ -877,21 +859,24 @@ where
     match format {
         RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
-            let mut command = tokio::process::Command::new(seven_zip);
-            command.arg("t").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::SevenZip, seven_zip, vec!["t".into(), temp_archive.display().to_string()],
+                None, "verify repackaged archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => {
             let tar = repackage_tool_path(tool_paths, &["tar"]);
-            let mut command = tokio::process::Command::new(tar);
-            command.arg("tf").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged tar archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::Tar, tar, vec!["tf".into(), temp_archive.display().to_string()],
+                None, "verify repackaged tar archive", cancel, monitor, progress
+            ).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
-            let mut command = tokio::process::Command::new(rar);
-            command.arg("t").arg(temp_archive);
-            run_repackage_command(command, "verify repackaged rar archive", cancel, monitor, progress).await
+            run_repackage_command(
+                ToolBinary::Rar, rar, vec!["t".into(), temp_archive.display().to_string()],
+                None, "verify repackaged rar archive", cancel, monitor, progress
+            ).await
         }
     }
 }
@@ -967,7 +952,10 @@ struct RepackageCommandMonitor<'a> {
 }
 
 async fn run_repackage_command<F>(
-    mut command: tokio::process::Command,
+    binary: ToolBinary,
+    binary_path: PathBuf,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
     label: &str,
     cancel: &CancellationToken,
     monitor: RepackageCommandMonitor<'_>,
@@ -976,104 +964,59 @@ async fn run_repackage_command<F>(
 where
     F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
 {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("{label}: command not found or failed to start: {err}"))?;
-
-    let mut stdout_task = child.stdout.take().map(|mut stdout| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf).await;
-            buf
-        })
-    });
-    let mut stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf).await;
-            buf
-        })
-    });
-
+    let runner = RealToolRunner::new(HashMap::new());
+    let command = ToolCommand {
+        binary,
+        args,
+        secret_args: Vec::new(),
+        cwd,
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        env: Vec::new(),
+        // Archive repackaging was historically unbounded. Keep a generous
+        // safety ceiling while preserving explicit cancellation.
+        timeout: Duration::from_secs(24 * 60 * 60),
+    };
+    let future = runner.run_with_binary_path(command, binary_path, cancel);
+    tokio::pin!(future);
     let started = Instant::now();
     let mut last_emit = Instant::now();
     let mut last_bytes = 0u64;
     loop {
-        if cancel.is_cancelled() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
-        }
-        match child
-            .try_wait()
-            .map_err(|err| format!("{label}: failed to poll child process: {err}"))?
-        {
-            Some(status) => {
-                let stdout = match stdout_task.take() {
-                    Some(task) => task.await.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                let stderr = match stderr_task.take() {
-                    Some(task) => task.await.unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                if status.success() {
-                    let done = monitor
-                        .complete_bytes_done
-                        .or_else(|| observed_file_len(monitor.observed_path))
-                        .unwrap_or(last_bytes);
-                    progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
-                        monitor.stage,
-                        monitor.status,
-                        monitor.archive_label,
-                        done,
-                        monitor.bytes_total.or(Some(done.max(1))),
-                        None,
-                    ));
-                    return Ok(());
+        tokio::select! {
+            result = &mut future => {
+                match result {
+                    Ok(_) => {
+                        let done = monitor.complete_bytes_done
+                            .or_else(|| observed_file_len(monitor.observed_path))
+                            .unwrap_or(last_bytes);
+                        progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                            monitor.stage, monitor.status, monitor.archive_label, done,
+                            monitor.bytes_total.or(Some(done.max(1))), None,
+                        ));
+                        return Ok(());
+                    }
+                    Err(super::errors::ToolRunnerError::Cancelled { .. }) => {
+                        return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+                    }
+                    Err(error) => return Err(format!("{label}: {error}")),
                 }
-                let stderr = String::from_utf8_lossy(&stderr);
-                let stdout = String::from_utf8_lossy(&stdout);
-                let detail = if !stderr.trim().is_empty() {
-                    stderr.trim().to_string()
-                } else {
-                    stdout.trim().to_string()
-                };
-                return if detail.is_empty() {
-                    Err(format!("{label}: command exited with status {status}"))
-                } else {
-                    Err(format!("{label}: {detail}"))
-                };
             }
-            None => {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 let now = Instant::now();
                 if now.saturating_duration_since(last_emit) >= Duration::from_millis(250) {
                     let bytes_done = observed_file_len(monitor.observed_path).unwrap_or(last_bytes);
                     let elapsed = now.saturating_duration_since(started).as_secs_f64();
                     let rate = if elapsed > 0.0 && bytes_done >= last_bytes {
                         Some((bytes_done as f64 / elapsed).round() as u64).filter(|rate| *rate > 0)
-                    } else {
-                        None
-                    };
+                    } else { None };
                     last_bytes = bytes_done;
                     last_emit = now;
                     progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
-                        monitor.stage,
-                        monitor.status,
-                        monitor.archive_label,
-                        monitor
-                            .bytes_total
-                            .map(|total| bytes_done.min(total))
-                            .unwrap_or(bytes_done),
-                        monitor.bytes_total,
-                        rate,
+                        monitor.stage, monitor.status, monitor.archive_label,
+                        monitor.bytes_total.map(|total| bytes_done.min(total)).unwrap_or(bytes_done),
+                        monitor.bytes_total, rate,
                     ));
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     }
@@ -3097,6 +3040,31 @@ mod tests {
         assert!(
             !backup.exists(),
             "backup path should be consumed by restoration after failed install"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_atomic_install_replaces_symlink_entry_not_referent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let referent = temp.path().join("real.zip");
+        let original = temp.path().join("Album.zip");
+        let temp_archive = temp.path().join("new.zip");
+        let backup = temp.path().join("Album.zip.backup");
+        fs::write(&referent, b"referent archive").expect("referent archive");
+        fs::write(&temp_archive, b"new archive").expect("new archive");
+        symlink(&referent, &original).expect("archive symlink");
+
+        replace_archive_atomically(&original, &temp_archive, &backup, None)
+            .expect("install through lexical archive entry");
+
+        assert_eq!(fs::read(&referent).unwrap(), b"referent archive");
+        assert_eq!(fs::read(&original).unwrap(), b"new archive");
+        assert!(
+            !fs::symlink_metadata(&original).unwrap().file_type().is_symlink(),
+            "archive publication must replace the symlink entry itself"
         );
     }
 

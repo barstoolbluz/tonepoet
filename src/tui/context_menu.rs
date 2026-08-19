@@ -13,6 +13,23 @@ use super::message::AppMessage;
 use crate::convert::ConversionStatus;
 
 
+fn duplicate_files_with_shared_admission(
+    paths: &[PathBuf],
+    policy: tui_file_picker::FileOperationPolicy,
+) -> Result<Vec<PathBuf>, String> {
+    let plan = tui_file_picker::plan_duplicate_files_in_place(paths, policy)
+        .map_err(|error| error.message().to_string())?;
+    let logical_created = plan
+        .iter()
+        .map(|mapping| mapping.destination.clone())
+        .collect::<Vec<_>>();
+    let admission = super::file_task_runtime::file_task_path_admission(false, &plan)?;
+    let _guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(admission.claims)?;
+    tui_file_picker::execute_duplicate_plan(&admission.admitted_mappings, policy)
+        .map_err(|error| error.message().to_string())?;
+    Ok(logical_created)
+}
+
 fn persist_browse_config(app: &mut AppState) {
     let browsing = app.browse.capture_browsing_config();
     app.config.browsing = browsing.clone();
@@ -2253,15 +2270,9 @@ fn open_browse_tag_transfer_picker(
                 title: title.to_string(),
                 theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
                 selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
-                operation_policy: tui_file_picker::FileOperationPolicy {
-                    allow_new_file: false,
-                    allow_new_folder: false,
-                    allow_cut: false,
-                    allow_copy: false,
-                    allow_paste: false,
-                    allow_delete: false,
-                    ..tui_file_picker::FileOperationPolicy::default()
-                },
+                operation_policy: tui_file_picker::FileOperationPolicy::selection_only(
+                    app.file_task_verbose_degrade_notices,
+                ),
                 ..tui_file_picker::FilePickerConfig::default()
             },
         ),
@@ -3072,10 +3083,9 @@ pub fn execute_context_action(
                 return;
             }
             let selection = super::command::collect_selection_for_file_ops_scoped(app);
-            match tui_file_picker::duplicate_files_in_place(
-                &selection.paths,
-                tui_file_picker::FileOperationPolicy::default(),
-            ) {
+            let policy = tui_file_picker::FileOperationPolicy::default();
+            let result = duplicate_files_with_shared_admission(&selection.paths, policy);
+            match result {
                 Ok(created) => {
                     app.browse.refresh_with_search(Some(tx));
                     app.browse.multi_selected = created.clone();
@@ -3091,7 +3101,7 @@ pub fn execute_context_action(
                         if created.len() == 1 { "" } else { "s" }
                     ));
                 }
-                Err(err) => app.set_status(format!("Duplicate failed: {}", err.message())),
+                Err(error) => app.set_status(format!("Duplicate failed: {error}")),
             }
             super::command::surface_stale_selection_notice(app, selection.dropped_stale_count);
         }
@@ -4545,6 +4555,42 @@ fn resolve_convert_start(app: &AppState, invert: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_complete_set_busy_prevents_first_copy() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-browse-duplicate-shared-admission",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.flac");
+        let second = temp.path().join("b.flac");
+        std::fs::write(&first, b"a").expect("first source");
+        std::fs::write(&second, b"b").expect("second source");
+        let first_destination = temp.path().join("a-copy.flac");
+        let second_destination = temp.path().join("b-copy.flac");
+
+        let foreign_claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            &second_destination,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("foreign destination claim");
+        let _foreign = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![foreign_claim])
+            .expect("foreign owner");
+
+        let error = duplicate_files_with_shared_admission(
+            &[first.clone(), second.clone()],
+            tui_file_picker::FileOperationPolicy::default(),
+        )
+        .expect_err("conflicting later duplicate destination must reject whole set");
+
+        assert!(error.contains("Busy") || error.contains("conflict") || error.contains("owned"));
+        assert!(!first_destination.exists(), "first duplicate must not be created before Busy");
+        assert!(!second_destination.exists(), "claimed duplicate destination remains absent");
+        assert_eq!(std::fs::read(first).expect("first source retained"), b"a");
+        assert_eq!(std::fs::read(second).expect("second source retained"), b"b");
+    }
     use crate::config::TonepoetConfig;
 
     #[tokio::test]

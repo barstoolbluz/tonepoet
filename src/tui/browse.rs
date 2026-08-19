@@ -4462,6 +4462,90 @@ impl BrowseState {
         }
     }
 
+    fn recover_interrupted_copy_undo_with_claims(&self) {
+        let targets = match tui_file_picker::discover_interrupted_verified_removal_restore_targets(
+            &self.current_dir,
+        ) {
+            Ok(targets) => targets,
+            Err(error) => {
+                log::debug!(
+                    "could not inspect {} for interrupted copy-undo recovery: {error}",
+                    self.current_dir.display(),
+                );
+                return;
+            }
+        };
+
+        for target in targets {
+            let scope = match std::fs::symlink_metadata(target.quarantine()) {
+                Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                    crate::concurrency::ClaimScope::Subtree
+                }
+                Ok(_) => crate::concurrency::ClaimScope::Exact,
+                Err(error) => {
+                    log::debug!(
+                        "copy-undo quarantine {} changed before admission: {error}",
+                        target.quarantine().display(),
+                    );
+                    continue;
+                }
+            };
+            let original_claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+                target.original(),
+                crate::concurrency::ClaimMode::Write,
+                scope,
+                crate::concurrency::PathResolutionSemantics::NamespaceObject,
+            ) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    log::warn!("could not resolve copy-undo original recovery claim: {error}");
+                    continue;
+                }
+            };
+            let quarantine_claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+                target.quarantine(),
+                crate::concurrency::ClaimMode::Write,
+                scope,
+                crate::concurrency::PathResolutionSemantics::NamespaceObject,
+            ) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    log::warn!("could not resolve copy-undo quarantine recovery claim: {error}");
+                    continue;
+                }
+            };
+            let admitted_original = original_claim.identity.resolved_io_path.clone();
+            let admitted_quarantine = quarantine_claim.identity.resolved_io_path.clone();
+            let _guard = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![
+                original_claim,
+                quarantine_claim,
+            ]) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::debug!(
+                        "deferred interrupted copy-undo recovery for {}: {error}",
+                        target.original().display(),
+                    );
+                    continue;
+                }
+            };
+            match tui_file_picker::recover_interrupted_verified_removal_restore_target(
+                &target,
+                &admitted_original,
+                &admitted_quarantine,
+            ) {
+                Ok(restored) => log::warn!(
+                    "restored copy-undo removal interrupted before deletion: {}",
+                    restored.display(),
+                ),
+                Err(error) => log::warn!(
+                    "retained interrupted copy-undo recovery state for {}: {error}",
+                    target.journal_path().display(),
+                ),
+            }
+        }
+    }
+
     /// Full refresh: re-scan disk, then re-apply the view filters/sort.
     /// Uses async scan if tx is available, otherwise falls back to synchronous.
     pub fn refresh(&mut self) {
@@ -4480,6 +4564,10 @@ impl BrowseState {
             self.refresh_archive_view_with_search(tx);
             return;
         }
+        // Generic modal pickers are selection-only and never perform recovery
+        // mutations during refresh. Main Browse owns this recovery boundary so
+        // every quarantine -> original restore joins Tonepoet's shared registry.
+        self.recover_interrupted_copy_undo_with_claims();
         self.sync_tree_shell_to_current_dir();
         self.invalidate_recursive_search_for_refresh();
         if self.scan_tx.is_some() {

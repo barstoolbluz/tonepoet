@@ -5261,6 +5261,139 @@ fn recover_interrupted_verified_removals_internal(
     }
     Ok(report)
 }
+
+/// One dead-owner copy-undo recovery that would restore a quarantined object
+/// into a currently absent public namespace entry. Discovery is read-only so a
+/// host can acquire its own cross-process mutation authority before restoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedRemovalRestoreTarget {
+    journal_path: PathBuf,
+    original: PathBuf,
+    quarantine: PathBuf,
+}
+
+impl InterruptedRemovalRestoreTarget {
+    pub fn journal_path(&self) -> &Path { &self.journal_path }
+    pub fn original(&self) -> &Path { &self.original }
+    pub fn quarantine(&self) -> &Path { &self.quarantine }
+}
+
+/// Discover only recovery records whose next safe action would mutate a user
+/// namespace by restoring quarantine -> original. No filesystem mutation occurs
+/// here; invalid, live-owner, occupied, and marker-cleanup-only records are not
+/// returned.
+pub fn discover_interrupted_verified_removal_restore_targets(
+    directory: &Path,
+) -> Result<Vec<InterruptedRemovalRestoreTarget>, String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!("scan copy-undo recovery directory {}: {error}", directory.display())
+    })?;
+    let mut targets = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("read copy-undo recovery entry in {}: {error}", directory.display())
+        })?;
+        let journal_path = entry.path();
+        let Some((_phase, expected_quarantine_name)) = journal_identity_from_path(&journal_path) else {
+            continue;
+        };
+        if is_active_removal_journal(&journal_path) {
+            continue;
+        }
+        let Ok(payload) = read_regular_recovery_journal(&journal_path) else {
+            continue;
+        };
+        let Ok(record) = parse_journal_payload(&payload) else {
+            continue;
+        };
+        if owner_token_is_live(&record.owner_token)
+            || record.quarantine_name != expected_quarantine_name
+            || record.original_name == record.quarantine_name
+        {
+            continue;
+        }
+        let original = directory.join(&record.original_name);
+        let quarantine = directory.join(&record.quarantine_name);
+        if fs::symlink_metadata(&original).is_err() && fs::symlink_metadata(&quarantine).is_ok() {
+            targets.push(InterruptedRemovalRestoreTarget {
+                journal_path,
+                original,
+                quarantine,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+/// Restore one previously discovered copy-undo target using paths that the host
+/// already admitted. The journal is re-read and rebound to the admitted parent
+/// before proof verification/publication, so a mutable display alias is not
+/// resolved again after host admission.
+pub fn recover_interrupted_verified_removal_restore_target(
+    target: &InterruptedRemovalRestoreTarget,
+    admitted_original: &Path,
+    admitted_quarantine: &Path,
+) -> Result<PathBuf, String> {
+    let journal_name = target.journal_path.file_name().ok_or_else(|| {
+        format!("copy-undo recovery journal has no filename: {}", target.journal_path.display())
+    })?;
+    let admitted_parent = admitted_original.parent().ok_or_else(|| {
+        format!("admitted copy-undo recovery target has no parent: {}", admitted_original.display())
+    })?;
+    let admitted_journal = admitted_parent.join(journal_name);
+    let (phase, expected_quarantine_name) = journal_identity_from_path(&admitted_journal)
+        .ok_or_else(|| format!("invalid copy-undo recovery journal name: {}", admitted_journal.display()))?;
+    if is_active_removal_journal(&admitted_journal) {
+        return Err(format!("copy-undo recovery journal is live-owned: {}", admitted_journal.display()));
+    }
+    let payload = read_regular_recovery_journal(&admitted_journal)?;
+    let record = parse_journal_payload(&payload)?;
+    if owner_token_is_live(&record.owner_token) {
+        return Err(format!("copy-undo recovery journal owner is still live: {}", admitted_journal.display()));
+    }
+    if record.quarantine_name != expected_quarantine_name
+        || record.original_name == record.quarantine_name
+        || target.original.file_name() != Some(record.original_name.as_os_str())
+        || target.quarantine.file_name() != Some(record.quarantine_name.as_os_str())
+    {
+        return Err("copy-undo recovery identity changed after admission".to_string());
+    }
+    if fs::symlink_metadata(admitted_original).is_ok() {
+        return Err(format!(
+            "interrupted copy-undo detach cannot be restored because original pathname {} is occupied",
+            admitted_original.display(),
+        ));
+    }
+    if fs::symlink_metadata(admitted_quarantine).is_err() {
+        return Err(format!("copy-undo quarantine disappeared before recovery: {}", admitted_quarantine.display()));
+    }
+    if let Err(error) = verify_recovery_commitment_at(
+        admitted_quarantine,
+        record.verification,
+        record.commitment,
+    ) {
+        let state = match phase {
+            VerifiedRemovalPhase::DeletionStarted => "destructive cleanup may already be partial",
+            _ => "the detached object was replaced or changed",
+        };
+        return Err(format!(
+            "interrupted copy-undo state was not restored because {state}: {error}",
+        ));
+    }
+    rename_path_no_replace(admitted_quarantine, admitted_original).map_err(|error| {
+        format!(
+            "restore interrupted copy-undo detach {} -> {}: {error}",
+            admitted_quarantine.display(),
+            admitted_original.display(),
+        )
+    })?;
+    fs::remove_file(&admitted_journal).map_err(|error| {
+        format!("remove restored recovery journal {}: {error}", admitted_journal.display())
+    })?;
+    sync_journal_parent(&admitted_journal)?;
+    Ok(target.original.clone())
+}
+
 /// Scan a directory during each filesystem refresh. Recovery markers can be
 /// created by this process or another process after an earlier clean scan, so
 /// caching a directory as permanently recovered would strand later crashes.
@@ -7306,6 +7439,43 @@ mod verified_removal_tests {
         assert_eq!(report.restored, vec![destination.clone()]);
         assert!(report.retained.is_empty(), "unexpected retained state: {:?}", report.retained);
         assert!(destination.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn host_recovery_api_discovers_then_restores_only_the_admitted_detach() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.flac");
+        let destination = temp.path().join("copy.flac");
+        fs::write(&source, b"operation bytes").expect("source");
+        let (source_manifest, destination_manifest) = copy_proof(&source, &destination);
+
+        let removal = prepare_verified_removal(
+            &source_manifest,
+            &destination_manifest,
+            &destination,
+        )
+        .expect("prepare verified removal");
+        let quarantine = removal.quarantine_root().to_path_buf();
+        let journal = removal.journal.as_ref().expect("journal").path.clone();
+        removal.journal.as_ref().expect("journal").deactivate();
+        std::mem::forget(removal);
+
+        let targets = discover_interrupted_verified_removal_restore_targets(temp.path())
+            .expect("discover restore targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].original(), destination.as_path());
+        assert_eq!(targets[0].quarantine(), quarantine.as_path());
+
+        let restored = recover_interrupted_verified_removal_restore_target(
+            &targets[0],
+            &destination,
+            &quarantine,
+        )
+        .expect("restore admitted target");
+        assert_eq!(restored, destination);
+        assert_eq!(fs::read(&restored).expect("restored bytes"), b"operation bytes");
+        assert!(!quarantine.exists());
         assert!(!journal.exists());
     }
 

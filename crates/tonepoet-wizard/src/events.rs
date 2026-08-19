@@ -4,8 +4,27 @@ use super::types::{
     ReplayGainMode, SimpleWizard,
 };
 use super::ui::ButtonId;
-use crate::presets::{ConversionPreset, PresetManager};
+use crate::presets::PresetManager;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+fn validate_custom_destination(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(String::new());
+    }
+    let path = std::path::Path::new(input);
+    if path.exists() {
+        return if path.is_dir() {
+            Ok(input.to_string())
+        } else {
+            Err("Invalid Path")
+        };
+    }
+    match path.parent() {
+        Some(parent) if parent.exists() && parent.is_dir() => Ok(input.to_string()),
+        _ => Err("Invalid Path"),
+    }
+}
 
 impl SimpleWizard {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -122,15 +141,8 @@ impl SimpleWizard {
                 true // Button was handled
             }
             Some(ButtonId::SavePreset) => {
-                // Show the preset name popup
-                self.popup_state = Some(PopupState {
-                    popup_type: PopupType::PresetName,
-                    input_text: String::new(),
-                    cursor_pos: 0,
-                    view_offset: 0,
-                    error_message: None,
-                    focused_element: PopupFocus::Input,
-                });
+                // Legacy wizard preset writes are intentionally disabled.
+                // The main Tonepoet preset manager owns coordinated persistence.
                 true
             }
             Some(ButtonId::BrowseButton) => {
@@ -169,7 +181,7 @@ impl SimpleWizard {
                                         cursor_pos: 0,
                                         view_offset: 0,
                                         error_message: Some(
-                                            "No presets found. Save a preset first!".to_string(),
+                                            "No presets found. Create presets from the main Tonepoet preset manager.".to_string(),
                                         ),
                                         focused_element: PopupFocus::OkButton,
                                     });
@@ -201,55 +213,10 @@ impl SimpleWizard {
                 if let Some(popup_state) = &self.popup_state {
                     match &popup_state.popup_type {
                         PopupType::PresetName => {
-                            // Check if preset already exists
-                            match PresetManager::new() {
-                                Ok(manager) => {
-                                    let preset_name = popup_state.input_text.clone();
-                                    if manager.preset_exists(&preset_name) {
-                                        // Show overwrite confirmation
-                                        self.popup_state = Some(PopupState {
-                                            popup_type: PopupType::OverwriteConfirm { preset_name },
-                                            input_text: String::new(),
-                                            cursor_pos: 0,
-                                            view_offset: 0,
-                                            error_message: None,
-                                            focused_element: PopupFocus::Input,
-                                        });
-                                        return true;
-                                    }
-
-                                    // Preset doesn't exist, save it
-                                    let mut preset = ConversionPreset::from(&*self);
-                                    preset.name = preset_name;
-
-                                    match manager.save_preset(&preset) {
-                                        Ok(_) => {
-                                        }
-                                        Err(_e) => {
-                                        }
-                                    }
-                                }
-                                Err(_e) => {
-                                }
-                            }
+                            // Read-only legacy wizard: no direct preset persistence.
                         }
-                        PopupType::OverwriteConfirm { preset_name } => {
-                            // User confirmed overwrite
-                            match PresetManager::new() {
-                                Ok(manager) => {
-                                    let mut preset = ConversionPreset::from(&*self);
-                                    preset.name = preset_name.clone();
-
-                                    match manager.save_preset(&preset) {
-                                        Ok(_) => {
-                                        }
-                                        Err(_e) => {
-                                        }
-                                    }
-                                }
-                                Err(_e) => {
-                                }
-                            }
+                        PopupType::OverwriteConfirm { .. } => {
+                            // Read-only legacy wizard: overwrite is not performed here.
                         }
                         PopupType::TextInput { field } => {
                             // Apply the text input to the appropriate field
@@ -261,81 +228,16 @@ impl SimpleWizard {
                                     self.copy_subdirectories = popup_state.input_text.clone();
                                 }
                                 EditingField::CustomDestination => {
-                                    // Validate the path
-                                    let input_path = popup_state.input_text.trim();
-                                    if input_path.is_empty() {
-                                        // Empty path is allowed (will use default)
-                                        if let DestinationMode::Custom(ref mut path) =
-                                            self.destination_mode
-                                        {
-                                            *path = String::new();
-                                        } else {
-                                            self.destination_mode =
-                                                DestinationMode::Custom(String::new());
+                                    let input_path = popup_state.input_text.clone();
+                                    match validate_custom_destination(&input_path) {
+                                        Ok(destination) => {
+                                            self.destination_mode = DestinationMode::Custom(destination);
                                         }
-                                    } else {
-                                        // Check if path is valid
-                                        let path = std::path::Path::new(input_path);
-
-                                        if path.exists() && path.is_dir() {
-                                            // Path exists and is a directory - valid
-                                            if let DestinationMode::Custom(ref mut dest_path) =
-                                                self.destination_mode
-                                            {
-                                                *dest_path = input_path.to_string();
-                                            } else {
-                                                self.destination_mode =
-                                                    DestinationMode::Custom(input_path.to_string());
+                                        Err(message) => {
+                                            if let Some(popup) = self.popup_state.as_mut() {
+                                                popup.error_message = Some(message.to_string());
                                             }
-                                        } else if let Some(parent) = path.parent() {
-                                            // Check if parent exists (we can create the final folder)
-                                            if parent.exists() && parent.is_dir() {
-                                                // Additional check: verify we can actually write to the parent
-                                                // For paths like /your-mom, even though / exists, we likely can't write there
-                                                let test_path = parent.join(".convert_wizard_test");
-                                                match std::fs::File::create(&test_path) {
-                                                    Ok(_) => {
-                                                        // We can write here, clean up test file
-                                                        let _ = std::fs::remove_file(&test_path);
-
-                                                        // Store the path as-is, we'll create the folder during conversion
-                                                        if let DestinationMode::Custom(
-                                                            ref mut dest_path,
-                                                        ) = self.destination_mode
-                                                        {
-                                                            *dest_path = input_path.to_string();
-                                                        } else {
-                                                            self.destination_mode =
-                                                                DestinationMode::Custom(
-                                                                    input_path.to_string(),
-                                                                );
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        // Can't write to parent directory
-                                                        if let Some(ref mut popup) =
-                                                            self.popup_state
-                                                        {
-                                                            popup.error_message = Some("Invalid Path - No write permission".to_string());
-                                                        }
-                                                        return true; // Don't close popup
-                                                    }
-                                                }
-                                            } else {
-                                                // Invalid path - keep popup open with error
-                                                if let Some(ref mut popup) = self.popup_state {
-                                                    popup.error_message =
-                                                        Some("Invalid Path".to_string());
-                                                }
-                                                return true; // Don't close popup
-                                            }
-                                        } else {
-                                            // Invalid path - keep popup open with error
-                                            if let Some(ref mut popup) = self.popup_state {
-                                                popup.error_message =
-                                                    Some("Invalid Path".to_string());
-                                            }
-                                            return true; // Don't close popup
+                                            return true;
                                         }
                                     }
                                 }
@@ -360,8 +262,21 @@ impl SimpleWizard {
                                 }
                             }
                         }
-                        PopupType::FileBrowser(_) | PopupType::NewFolder { .. } => {
-                            // These are handled elsewhere
+                        PopupType::NewFolder { parent_path } => {
+                            let folder_name = popup_state.input_text.trim();
+                            if !folder_name.is_empty() {
+                                let new_path = parent_path.join(folder_name);
+                                self.destination_mode = DestinationMode::Custom(
+                                    new_path.to_string_lossy().to_string(),
+                                );
+                                if self.needs_destination_selection {
+                                    self.needs_destination_selection = false;
+                                    self.should_start_conversion = true;
+                                }
+                            }
+                        }
+                        PopupType::FileBrowser(_) => {
+                            // File-browser selection is handled by its dedicated buttons.
                         }
                     }
                 }
@@ -1782,10 +1697,7 @@ impl SimpleWizard {
                         ButtonId::SavePreset => self.focused_nav_button = Some(ButtonId::Back),
                         ButtonId::Back => self.focused_nav_button = Some(ButtonId::Next),
                         ButtonId::Next => self.focused_nav_button = Some(ButtonId::Cancel),
-                        ButtonId::Cancel => {
-                            // Return to Save Preset button
-                            self.focused_nav_button = Some(ButtonId::SavePreset);
-                        }
+                        ButtonId::Cancel => self.focused_nav_button = Some(ButtonId::Back),
                         _ => {}
                     }
                     return true;
@@ -1794,16 +1706,7 @@ impl SimpleWizard {
                     // Activate the focused button
                     match nav_button {
                         ButtonId::SavePreset => {
-                            // Trigger save preset action
-                            self.handle_mouse(
-                                MouseEvent {
-                                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                                    column: 0,
-                                    row: 0,
-                                    modifiers: crossterm::event::KeyModifiers::empty(),
-                                },
-                                Some(ButtonId::SavePreset),
-                            );
+                            self.focused_nav_button = Some(ButtonId::Back);
                         }
                         ButtonId::Back => {
                             self.previous_step();
@@ -1833,8 +1736,8 @@ impl SimpleWizard {
 
         match key.code {
             KeyCode::Tab => {
-                // Start Tab navigation at Save Preset button
-                self.focused_nav_button = Some(ButtonId::SavePreset);
+                // Legacy preset saving is disabled; start on Back instead.
+                self.focused_nav_button = Some(ButtonId::Back);
                 true
             }
             KeyCode::Enter => {
@@ -1934,40 +1837,18 @@ impl SimpleWizard {
                                 return true;
                             }
                             PopupFocus::Input | PopupFocus::OkButton => {
-                                // Create the new folder
-                                let folder_name = popup_state.input_text.clone();
+                                // Treat New Folder as a prospective conversion destination.
+                                // The conversion path creates it later under output WRITE admission.
+                                let folder_name = popup_state.input_text.trim();
                                 if !folder_name.is_empty() {
-                                    let new_path = parent_path.join(&folder_name);
-                                    match std::fs::create_dir(&new_path) {
-                                        Ok(_) => {
-                                            // Success - open browser at parent path and select the new folder
-                                            let mut browser =
-                                                crate::types::FileBrowser::new(parent_path.clone());
-
-                                            // Find and select the newly created folder
-                                            for (index, entry) in browser.entries.iter().enumerate()
-                                            {
-                                                if entry.name == folder_name {
-                                                    browser.selected_index = index;
-                                                    break;
-                                                }
-                                            }
-
-                                            self.popup_state = Some(PopupState {
-                                                popup_type: PopupType::FileBrowser(Box::new(
-                                                    browser,
-                                                )),
-                                                input_text: String::new(),
-                                                cursor_pos: 0,
-                                                view_offset: 0,
-                                                error_message: None,
-                                                focused_element: PopupFocus::Input,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            popup_state.error_message =
-                                                Some(format!("Failed to create folder: {}", e));
-                                        }
+                                    let new_path = parent_path.join(folder_name);
+                                    self.destination_mode = DestinationMode::Custom(
+                                        new_path.to_string_lossy().to_string(),
+                                    );
+                                    self.popup_state = None;
+                                    if self.needs_destination_selection {
+                                        self.needs_destination_selection = false;
+                                        self.should_start_conversion = true;
                                     }
                                     return true;
                                 }
@@ -2050,56 +1931,10 @@ impl SimpleWizard {
 
                     match popup_type {
                         PopupType::PresetName => {
-                            // Check if preset already exists
-                            match PresetManager::new() {
-                                Ok(manager) => {
-                                    if manager.preset_exists(&input_text) {
-                                        // Show overwrite confirmation
-                                        self.popup_state = Some(PopupState {
-                                            popup_type: PopupType::OverwriteConfirm {
-                                                preset_name: input_text,
-                                            },
-                                            input_text: String::new(),
-                                            cursor_pos: 0,
-                                            view_offset: 0,
-                                            error_message: None,
-                                            focused_element: PopupFocus::Input,
-                                        });
-                                        return true;
-                                    }
-
-                                    // Preset doesn't exist, save it
-                                    let mut preset = ConversionPreset::from(&*self);
-                                    preset.name = input_text;
-
-                                    match manager.save_preset(&preset) {
-                                        Ok(_) => {
-                                        }
-                                        Err(_e) => {
-                                        }
-                                    }
-                                }
-                                Err(_e) => {
-                                }
-                            }
+                            // Read-only legacy wizard: no direct preset persistence.
                         }
-                        PopupType::OverwriteConfirm { preset_name } => {
-                            // User confirmed overwrite
-                            match PresetManager::new() {
-                                Ok(manager) => {
-                                    let mut preset = ConversionPreset::from(&*self);
-                                    preset.name = preset_name.clone();
-
-                                    match manager.save_preset(&preset) {
-                                        Ok(_) => {
-                                        }
-                                        Err(_e) => {
-                                        }
-                                    }
-                                }
-                                Err(_e) => {
-                                }
-                            }
+                        PopupType::OverwriteConfirm { .. } => {
+                            // Read-only legacy wizard: overwrite is not performed here.
                         }
                         PopupType::TextInput { field } => {
                             // Apply the text input to the appropriate field
@@ -2111,81 +1946,13 @@ impl SimpleWizard {
                                     self.copy_subdirectories = input_text;
                                 }
                                 EditingField::CustomDestination => {
-                                    // Validate the path
-                                    let input_path = input_text.trim();
-                                    if input_path.is_empty() {
-                                        // Empty path is allowed (will use default)
-                                        if let DestinationMode::Custom(ref mut path) =
-                                            self.destination_mode
-                                        {
-                                            *path = String::new();
-                                        } else {
-                                            self.destination_mode =
-                                                DestinationMode::Custom(String::new());
+                                    match validate_custom_destination(&input_text) {
+                                        Ok(destination) => {
+                                            self.destination_mode = DestinationMode::Custom(destination);
                                         }
-                                    } else {
-                                        // Check if path is valid
-                                        let path = std::path::Path::new(input_path);
-
-                                        if path.exists() && path.is_dir() {
-                                            // Path exists and is a directory - valid
-                                            if let DestinationMode::Custom(ref mut dest_path) =
-                                                self.destination_mode
-                                            {
-                                                *dest_path = input_path.to_string();
-                                            } else {
-                                                self.destination_mode =
-                                                    DestinationMode::Custom(input_path.to_string());
-                                            }
-                                        } else if let Some(parent) = path.parent() {
-                                            // Check if parent exists (we can create the final folder)
-                                            if parent.exists() && parent.is_dir() {
-                                                // Additional check: verify we can actually write to the parent
-                                                // For paths like /your-mom, even though / exists, we likely can't write there
-                                                let test_path = parent.join(".convert_wizard_test");
-                                                match std::fs::File::create(&test_path) {
-                                                    Ok(_) => {
-                                                        // We can write here, clean up test file
-                                                        let _ = std::fs::remove_file(&test_path);
-
-                                                        // Store the path as-is, we'll create the folder during conversion
-                                                        if let DestinationMode::Custom(
-                                                            ref mut dest_path,
-                                                        ) = self.destination_mode
-                                                        {
-                                                            *dest_path = input_path.to_string();
-                                                        } else {
-                                                            self.destination_mode =
-                                                                DestinationMode::Custom(
-                                                                    input_path.to_string(),
-                                                                );
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        // Can't write to parent directory
-                                                        if let Some(ref mut popup) =
-                                                            self.popup_state
-                                                        {
-                                                            popup.error_message = Some("Invalid Path - No write permission".to_string());
-                                                        }
-                                                        return true; // Don't close popup
-                                                    }
-                                                }
-                                            } else {
-                                                // Invalid path - keep popup open with error
-                                                if let Some(ref mut popup) = self.popup_state {
-                                                    popup.error_message =
-                                                        Some("Invalid Path".to_string());
-                                                }
-                                                return true; // Don't close popup
-                                            }
-                                        } else {
-                                            // Invalid path - keep popup open with error
-                                            if let Some(ref mut popup) = self.popup_state {
-                                                popup.error_message =
-                                                    Some("Invalid Path".to_string());
-                                            }
-                                            return true; // Don't close popup
+                                        Err(message) => {
+                                            popup_state.error_message = Some(message.to_string());
+                                            return true;
                                         }
                                     }
                                 }
@@ -2655,5 +2422,93 @@ pub fn handle_file_browser_mouse(
             }
         }
         _ => BrowserAction::Continue,
+    }
+}
+
+#[cfg(test)]
+mod release_gate_no_mutation_tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "tonepoet-wizard-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn custom_destination_validation_never_writes_permission_probe() {
+        let temp = TestDir::new("custom-destination");
+        let sentinel = temp.path().join(".convert_wizard_test");
+        std::fs::write(&sentinel, b"keep-me").expect("sentinel");
+        let destination = temp.path().join("NewAlbum");
+
+        assert_eq!(
+            validate_custom_destination(destination.to_str().expect("utf8 path")),
+            Ok(destination.to_string_lossy().to_string())
+        );
+        assert_eq!(std::fs::read(&sentinel).expect("sentinel preserved"), b"keep-me");
+        assert!(!destination.exists(), "validation must not create the destination");
+    }
+
+    #[test]
+    fn new_folder_dialog_records_prospective_destination_without_create_dir() {
+        let temp = TestDir::new("new-folder");
+        let destination = temp.path().join("NewAlbum");
+        let mut wizard = SimpleWizard::new();
+        wizard.needs_destination_selection = true;
+        wizard.popup_state = Some(PopupState {
+            popup_type: PopupType::NewFolder {
+                parent_path: temp.path().to_path_buf(),
+            },
+            input_text: "NewAlbum".to_string(),
+            cursor_pos: "NewAlbum".len(),
+            view_offset: 0,
+            error_message: None,
+            focused_element: PopupFocus::Input,
+        });
+
+        assert!(wizard.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())));
+        assert_eq!(
+            wizard.destination_mode,
+            DestinationMode::Custom(destination.to_string_lossy().to_string())
+        );
+        assert!(!destination.exists(), "legacy wizard must not create destination folders");
+        assert!(wizard.should_start_conversion);
+        assert!(!wizard.needs_destination_selection);
+    }
+
+    #[test]
+    fn legacy_save_preset_control_has_no_write_flow() {
+        let mut wizard = SimpleWizard::new();
+        wizard.current_step = 3;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(wizard.handle_mouse(mouse, Some(ButtonId::SavePreset)));
+        assert!(wizard.popup_state.is_none(), "legacy SavePreset must not open a persistence dialog");
     }
 }

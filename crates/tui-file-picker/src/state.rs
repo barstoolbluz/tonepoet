@@ -425,6 +425,10 @@ pub struct FileOperationPolicy {
     pub allow_paste: bool,
     /// Allow delete requests. Deletion still requires confirmation.
     pub allow_delete: bool,
+    /// Allow rename and filename case-transform operations.
+    pub allow_rename: bool,
+    /// Allow duplicate/copy-in-place operations.
+    pub allow_duplicate: bool,
     /// Policy for symlinks encountered during copy.
     pub symlink_copy: SymlinkCopyPolicy,
     /// Policy for cut/paste when `rename` crosses devices.
@@ -449,12 +453,44 @@ impl Default for FileOperationPolicy {
             allow_copy: true,
             allow_paste: true,
             allow_delete: true,
+            allow_rename: true,
+            allow_duplicate: true,
             symlink_copy: SymlinkCopyPolicy::Reject,
             cross_device_cut: CrossDeviceCutPolicy::Reject,
             delete: DeletePolicy::FilesAndEmptyDirectories,
             verbose_degrade_notices: false,
             verification: VerificationMode::Standard,
         }
+    }
+}
+
+impl FileOperationPolicy {
+    /// Policy for embedded modal selectors that must never mutate filesystem entries.
+    pub fn selection_only(verbose_degrade_notices: bool) -> Self {
+        Self {
+            allow_new_file: false,
+            allow_new_folder: false,
+            allow_cut: false,
+            allow_copy: false,
+            allow_paste: false,
+            allow_delete: false,
+            allow_rename: false,
+            allow_duplicate: false,
+            verbose_degrade_notices,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this picker policy permits any operation that changes a
+    /// filesystem namespace or file contents. Clipboard-only cut/copy are not
+    /// mutations until a paste executes.
+    pub fn permits_filesystem_mutation(self) -> bool {
+        self.allow_new_file
+            || self.allow_new_folder
+            || self.allow_paste
+            || self.allow_delete
+            || self.allow_rename
+            || self.allow_duplicate
     }
 }
 
@@ -2704,34 +2740,36 @@ impl FilePickerState {
     pub fn refresh(&mut self) {
         self.clear_error();
         self.entries.clear();
-        match crate::source_guard::recover_interrupted_verified_removals_once(&self.current_dir) {
-            Ok(report) => {
-                for restored in report.restored {
-                    log::warn!(
-                        "restored copy-undo removal interrupted before deletion: {}",
-                        restored.display(),
-                    );
+        if self.operation_policy.permits_filesystem_mutation() {
+            match crate::source_guard::recover_interrupted_verified_removals_once(&self.current_dir) {
+                Ok(report) => {
+                    for restored in report.restored {
+                        log::warn!(
+                            "restored copy-undo removal interrupted before deletion: {}",
+                            restored.display(),
+                        );
+                    }
+                    let mut retained_messages = Vec::new();
+                    for (retained, reason) in report.retained {
+                        log::error!(
+                            "retained interrupted copy-undo recovery state at {}: {reason}",
+                            retained.display(),
+                        );
+                        retained_messages.push(format!("{}: {reason}", retained.display()));
+                    }
+                    if !retained_messages.is_empty() {
+                        self.set_error(FilePickerError::Io {
+                            op: "recover interrupted copy undo",
+                            path: self.current_dir.clone(),
+                            message: retained_messages.join("; "),
+                        });
+                    }
                 }
-                let mut retained_messages = Vec::new();
-                for (retained, reason) in report.retained {
-                    log::error!(
-                        "retained interrupted copy-undo recovery state at {}: {reason}",
-                        retained.display(),
-                    );
-                    retained_messages.push(format!("{}: {reason}", retained.display()));
-                }
-                if !retained_messages.is_empty() {
-                    self.set_error(FilePickerError::Io {
-                        op: "recover interrupted copy undo",
-                        path: self.current_dir.clone(),
-                        message: retained_messages.join("; "),
-                    });
-                }
+                Err(error) => log::error!(
+                    "could not scan {} for interrupted copy-undo recovery state: {error}",
+                    self.current_dir.display(),
+                ),
             }
-            Err(error) => log::error!(
-                "could not scan {} for interrupted copy-undo recovery state: {error}",
-                self.current_dir.display(),
-            ),
         }
         let read_dir = match fs::read_dir(&self.current_dir) {
             Ok(read_dir) => read_dir,
@@ -3306,6 +3344,10 @@ impl FilePickerState {
     }
 
     pub(crate) fn begin_rename_path(&mut self, path: PathBuf) -> bool {
+        if !self.operation_policy.allow_rename {
+            self.set_error(FilePickerError::OperationDisabled("rename"));
+            return false;
+        }
         let Some(name) = path.file_name().and_then(OsStr::to_str).map(str::to_string) else {
             self.set_error(FilePickerError::InvalidNewItemName(path.display().to_string()));
             return false;
@@ -3335,6 +3377,10 @@ impl FilePickerState {
     }
 
     pub(crate) fn begin_duplicate_path(&mut self, path: PathBuf) -> bool {
+        if !self.operation_policy.allow_duplicate {
+            self.set_error(FilePickerError::OperationDisabled("duplicate"));
+            return false;
+        }
         if !path.is_file() {
             self.set_error(FilePickerError::WrongSelectionMode("Duplicate supports files only"));
             return false;
@@ -3363,6 +3409,9 @@ impl FilePickerState {
     }
 
     pub(crate) fn duplicate_action_paths(&mut self) -> Result<(), FilePickerError> {
+        if !self.operation_policy.allow_duplicate {
+            return Err(FilePickerError::OperationDisabled("duplicate"));
+        }
         let paths = self.action_paths();
         if paths.is_empty() {
             return Err(FilePickerError::NoSelection);
@@ -3383,6 +3432,9 @@ impl FilePickerState {
     }
 
     pub(crate) fn try_rename_current(&mut self, display_name: &str) -> Result<(), FilePickerError> {
+        if !self.operation_policy.allow_rename {
+            return Err(FilePickerError::OperationDisabled("rename"));
+        }
         validate_new_item_name(display_name)?;
         let source = self
             .pending_name_source
@@ -3464,6 +3516,9 @@ impl FilePickerState {
     }
 
     pub(crate) fn try_duplicate_current(&mut self, display_name: &str) -> Result<(), FilePickerError> {
+        if !self.operation_policy.allow_duplicate {
+            return Err(FilePickerError::OperationDisabled("duplicate"));
+        }
         validate_new_item_name(display_name)?;
         let source = self
             .pending_name_source
@@ -4213,6 +4268,9 @@ impl FilePickerState {
         &mut self,
         action: FilePickerMenuAction,
     ) -> Result<usize, FilePickerError> {
+        if !self.operation_policy.allow_rename {
+            return Err(FilePickerError::OperationDisabled("rename"));
+        }
         let paths = self.action_paths();
         if paths.is_empty() {
             return Err(FilePickerError::NoSelection);
@@ -4368,8 +4426,9 @@ impl FilePickerState {
             FilePickerMenuAction::NewFolder => self.operation_policy.allow_new_folder,
             FilePickerMenuAction::Cut => self.operation_policy.allow_cut && !action_paths.is_empty(),
             FilePickerMenuAction::Copy => self.operation_policy.allow_copy && !action_paths.is_empty(),
-            FilePickerMenuAction::Rename => single,
-            FilePickerMenuAction::Duplicate => !action_paths.is_empty()
+            FilePickerMenuAction::Rename => self.operation_policy.allow_rename && single,
+            FilePickerMenuAction::Duplicate => self.operation_policy.allow_duplicate
+                && !action_paths.is_empty()
                 && action_paths.iter().all(|path| path.is_file()),
             FilePickerMenuAction::Delete => self.operation_policy.allow_delete && !action_paths.is_empty(),
             FilePickerMenuAction::Paste => {
@@ -4409,7 +4468,9 @@ impl FilePickerState {
                 .is_some_and(|input| !input.text.is_empty()),
             FilePickerMenuAction::RenameTitleCase
             | FilePickerMenuAction::RenameUppercase
-            | FilePickerMenuAction::RenameLowercase => !action_paths.is_empty(),
+            | FilePickerMenuAction::RenameLowercase => {
+                self.operation_policy.allow_rename && !action_paths.is_empty()
+            }
             FilePickerMenuAction::OpenSystemDefault => single
                 && action_paths.first().is_some_and(|path| path.is_file()),
             FilePickerMenuAction::OpenInNewTab => single
@@ -5366,6 +5427,20 @@ pub fn duplicate_files_in_place(
     paths: &[PathBuf],
     policy: FileOperationPolicy,
 ) -> Result<Vec<PathBuf>, FilePickerError> {
+    let plan = plan_duplicate_files_in_place(paths, policy)?;
+    execute_duplicate_plan(&plan, policy)
+}
+
+/// Resolve every duplicate destination without mutating the filesystem. Hosts
+/// that provide a cross-process mutation registry can admit the complete plan
+/// before calling [`execute_duplicate_plan`].
+pub fn plan_duplicate_files_in_place(
+    paths: &[PathBuf],
+    policy: FileOperationPolicy,
+) -> Result<Vec<PasteMapping>, FilePickerError> {
+    if !policy.allow_duplicate {
+        return Err(FilePickerError::OperationDisabled("duplicate"));
+    }
     if paths.is_empty() {
         return Err(FilePickerError::NoSelection);
     }
@@ -5375,21 +5450,37 @@ pub fn duplicate_files_in_place(
         ));
     }
 
-    // Resolve every destination before mutating the filesystem. This keeps
-    // naming deterministic and prevents a late collision from leaving an
-    // avoidable partial result.
     let mut reserved = HashSet::new();
     let mut plans = Vec::with_capacity(paths.len());
     for source in paths {
         let candidate = duplicate_candidate_path(source);
         let destination = unique_path_reserving(&candidate, &reserved);
         reserved.insert(destination.clone());
-        plans.push((source.clone(), destination));
+        plans.push(PasteMapping {
+            source: source.clone(),
+            destination,
+        });
+    }
+    Ok(plans)
+}
+
+/// Execute a previously planned duplicate set exactly. The caller is
+/// responsible for any host-level cross-process admission required around the
+/// complete plan.
+pub fn execute_duplicate_plan(
+    plan: &[PasteMapping],
+    policy: FileOperationPolicy,
+) -> Result<Vec<PathBuf>, FilePickerError> {
+    if !policy.allow_duplicate {
+        return Err(FilePickerError::OperationDisabled("duplicate"));
+    }
+    if plan.is_empty() {
+        return Err(FilePickerError::NoSelection);
     }
 
-    let mut completed: Vec<PathBuf> = Vec::with_capacity(plans.len());
-    for (source, destination) in plans {
-        if let Err(copy_error) = safe_copy_path(&source, &destination, policy) {
+    let mut completed: Vec<PathBuf> = Vec::with_capacity(plan.len());
+    for mapping in plan {
+        if let Err(copy_error) = safe_copy_path(&mapping.source, &mapping.destination, policy) {
             // Duplicates are newly-created outputs, so rollback is safe and
             // materially stronger than exposing a half-completed bulk action.
             for created in completed.iter().rev() {
@@ -5407,7 +5498,7 @@ pub fn duplicate_files_in_place(
             }
             return Err(copy_error);
         }
-        completed.push(destination);
+        completed.push(mapping.destination.clone());
     }
     Ok(completed)
 }
@@ -10598,5 +10689,90 @@ mod tabbed_browsing_tests {
             FilePickerAction::Selected(b),
             "directory mode still returns the current directory"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod selection_only_modal_policy_tests {
+    use super::*;
+
+    #[test]
+    fn selection_only_policy_blocks_every_filesystem_mutation_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let selection_only = FileOperationPolicy::selection_only(false);
+        assert!(
+            !selection_only.permits_filesystem_mutation(),
+            "selection-only modal refresh must not run automatic recovery mutations"
+        );
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            operation_policy: selection_only,
+            ..FilePickerConfig::default()
+        });
+        let index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(index, 8);
+
+        assert!(!picker.create_new_file());
+        assert!(!picker.create_new_folder());
+        assert!(!picker.begin_rename_current());
+        assert!(!picker.begin_duplicate_current());
+        assert!(!picker.request_delete_current());
+        assert!(matches!(
+            picker.try_paste_clipboard_to(temp.path()),
+            Err(FilePickerError::OperationDisabled("paste"))
+        ));
+        assert!(matches!(
+            picker.apply_path_case_transform(FilePickerMenuAction::RenameUppercase),
+            Err(FilePickerError::OperationDisabled("rename"))
+        ));
+        assert!(matches!(
+            duplicate_files_in_place(&[source.clone()], FileOperationPolicy::selection_only(false)),
+            Err(FilePickerError::OperationDisabled("duplicate"))
+        ));
+
+        assert_eq!(fs::read(&source).expect("source preserved"), b"audio");
+        assert_eq!(
+            fs::read_dir(temp.path()).expect("read dir").count(),
+            1,
+            "selection-only picker must not create, rename, duplicate, paste, or delete entries"
+        );
+    }
+
+    #[test]
+    fn selection_only_menu_disables_rename_duplicate_case_and_new_delete_paste() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        fs::write(&source, b"audio").expect("source");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            operation_policy: FileOperationPolicy::selection_only(false),
+            ..FilePickerConfig::default()
+        });
+        let index = picker
+            .entries()
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("source visible");
+        picker.set_file_cursor(index, 8);
+        for action in [
+            FilePickerMenuAction::NewFile,
+            FilePickerMenuAction::NewFolder,
+            FilePickerMenuAction::Rename,
+            FilePickerMenuAction::Duplicate,
+            FilePickerMenuAction::Delete,
+            FilePickerMenuAction::Paste,
+            FilePickerMenuAction::RenameTitleCase,
+            FilePickerMenuAction::RenameUppercase,
+            FilePickerMenuAction::RenameLowercase,
+        ] {
+            assert!(!picker.is_menu_action_enabled(action), "{action:?} must be disabled");
+        }
     }
 }

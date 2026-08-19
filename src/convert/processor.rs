@@ -116,6 +116,12 @@ pub struct ProcessorConfig {
     pub scratch_memory_limit_percent: u8,
 }
 
+/// Durable transition invoked immediately before an initial queue item is
+/// admitted to the shared worker pool. Production processors require this
+/// capability so no mutation-capable pipeline can start without a committed
+/// QueueExecution authority.
+type ExecutionAcquisitionHook = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 /// Handles the actual conversion of audio files.
 pub struct ConversionProcessor {
     config: ProcessorConfig,
@@ -127,6 +133,7 @@ pub struct ConversionProcessor {
     /// External cancellation token from the TUI. When triggered, the
     /// scheduler cancels all in-flight workers and kills child processes.
     external_cancel: Option<CancellationToken>,
+    execution_acquisition_hook: Option<ExecutionAcquisitionHook>,
 }
 
 /// Progress update from a worker.
@@ -2095,6 +2102,7 @@ impl ConversionProcessor {
             scheduler_metrics: Arc::new(SchedulerMetrics::default()),
             tool_concurrency_limits: Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
             external_cancel: None,
+            execution_acquisition_hook: None,
         }
     }
 
@@ -2112,6 +2120,16 @@ impl ConversionProcessor {
     /// the scheduler will cancel all workers and kill child processes.
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.external_cancel = Some(token);
+    }
+
+    /// Install the durable per-item execution transition used by production
+    /// application entry points. The hook commits QueueExecution authority
+    /// before an initial work unit can enter the worker pool.
+    pub fn set_execution_acquisition_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.execution_acquisition_hook = Some(Arc::new(hook));
     }
 
     /// Set shared scheduler queue limits. Defaults to the legacy unbounded queue.
@@ -2153,6 +2171,14 @@ impl ConversionProcessor {
     ) -> ConversionResult<()> {
         info!("ConversionProcessor::process_queue starting shared pipeline scheduler");
 
+        #[cfg(not(test))]
+        if self.execution_acquisition_hook.is_none() {
+            return Err(ConversionError::ValidationError(
+                "conversion processor has no durable QueueExecution acquisition capability"
+                    .to_string(),
+            ));
+        }
+
         let progress_tx = if let Some(tx) = &self.progress_tx {
             tx.clone()
         } else {
@@ -2178,18 +2204,6 @@ impl ConversionProcessor {
                     item.options.output_dir = Some(default_dest.clone());
                 }
             }
-            let mut q = queue.write().await;
-            if let Some(queue_item) = q.find_item_mut(&item.id) {
-                queue_item.active_tracks.clear();
-                queue_item.closed_track_epochs.clear();
-                queue_item.status = ConversionStatus::Processing {
-                    progress: 0.0,
-                    message: Some(format!("Starting conversion to {}", item.output_format)),
-                    file_progress: None,
-                    phase: Some(ConversionPhase::Extracting),
-                    phase_progress: Some(0.0),
-                };
-            }
         }
 
         prepare_album_batches_for_queued_independent_single_file_jobs(&mut queued_items);
@@ -2201,6 +2215,8 @@ impl ConversionProcessor {
         );
         let outcomes = run_queue_with_shared_orchestrator(
             queued_items,
+            queue.clone(),
+            self.execution_acquisition_hook.clone(),
             progress_tx.clone(),
             self.lifecycle_tx.clone(),
             progress_rx,
@@ -2456,9 +2472,11 @@ impl SubmissionPump {
         }
     }
 
-    fn flush(
+    async fn flush(
         &mut self,
         pool: &SharedWorkerPool<QueueWorkOutput>,
+        queue: &std::sync::Arc<tokio::sync::RwLock<ConversionQueue>>,
+        execution_acquisition_hook: Option<&ExecutionAcquisitionHook>,
         pending_albums: &mut BTreeMap<String, PendingAlbum>,
         terminal: &mut BTreeMap<String, ConversionStatus>,
         job_to_item: &mut BTreeMap<String, String>,
@@ -2537,6 +2555,8 @@ impl SubmissionPump {
             }
 
             if let Some(item) = self.initial_items.pop_front() {
+                let item_id = item.id.clone();
+                let output_format = item.output_format.clone();
                 if let Some(unit) = build_initial_work(
                     item,
                     pool,
@@ -2550,6 +2570,65 @@ impl SubmissionPump {
                     tool_concurrency_limits.clone(),
                     scratch_staging.clone(),
                 ) {
+                    // Keep the queue write guard across the short durable
+                    // transition. This prevents a UI persistence snapshot from
+                    // observing Processing before the matching QueueExecution
+                    // descriptor/row is committed, or from deleting that row
+                    // between commit and runtime lease publication.
+                    let mut queue_guard = queue.write().await;
+                    let Some(queue_item) = queue_guard.find_item_mut(&item_id) else {
+                        pool.metrics().record_job_failed();
+                        terminal.insert(
+                            item_id.clone(),
+                            ConversionStatus::Failed {
+                                error: "queue item disappeared before durable execution acquisition".to_string(),
+                                log_path: None,
+                            },
+                        );
+                        continue;
+                    };
+                    queue_item.active_tracks.clear();
+                    queue_item.closed_track_epochs.clear();
+                    queue_item.status = ConversionStatus::Processing {
+                        progress: 0.0,
+                        message: Some(format!("Starting conversion to {}", output_format)),
+                        file_progress: None,
+                        phase: Some(ConversionPhase::Extracting),
+                        phase_progress: Some(0.0),
+                    };
+                    if queue_item.started_at.is_none() {
+                        queue_item.started_at = Some(chrono::Utc::now());
+                    }
+
+                    let acquisition = match execution_acquisition_hook {
+                        Some(hook) => hook(&item_id),
+                        None => {
+                            #[cfg(test)]
+                            {
+                                Ok(())
+                            }
+                            #[cfg(not(test))]
+                            {
+                                Err("conversion processor has no durable QueueExecution acquisition capability".to_string())
+                            }
+                        }
+                    };
+                    if let Err(error) = acquisition {
+                        queue_item.status = ConversionStatus::Interrupted;
+                        queue_item.started_at = None;
+                        drop(queue_guard);
+                        pool.metrics().record_job_failed();
+                        terminal.insert(
+                            item_id.clone(),
+                            ConversionStatus::Failed {
+                                error: format!("durable execution acquisition failed: {error}"),
+                                log_path: None,
+                            },
+                        );
+                        continue;
+                    }
+                    drop(queue_guard);
+
                     if !self.try_submit_unit(pool, unit, false) {
                         return;
                     }
@@ -2645,6 +2724,8 @@ fn record_terminal_status(
 
 async fn run_queue_with_shared_orchestrator(
     queued_items: Vec<ConversionItem>,
+    queue: std::sync::Arc<tokio::sync::RwLock<ConversionQueue>>,
+    execution_acquisition_hook: Option<ExecutionAcquisitionHook>,
     progress_tx: broadcast::Sender<ProgressUpdate>,
     lifecycle_tx: Option<mpsc::UnboundedSender<LifecycleEvent>>,
     mut progress_rx: Option<broadcast::Receiver<ProgressUpdate>>,
@@ -2682,6 +2763,8 @@ async fn run_queue_with_shared_orchestrator(
     while terminal.len() < total_items {
         submissions.flush(
             &pool,
+            &queue,
+            execution_acquisition_hook.as_ref(),
             &mut pending_albums,
             &mut terminal,
             &mut job_to_item,
@@ -2693,7 +2776,8 @@ async fn run_queue_with_shared_orchestrator(
             worker_count.max(1),
             tool_concurrency_limits.clone(),
             scratch_staging.clone(),
-        );
+        )
+        .await;
         submissions.record_backlog(pool.metrics(), &pending_albums);
         if terminal.len() >= total_items {
             break;
@@ -2988,7 +3072,8 @@ fn build_initial_work(
         unit_id: format!("{unit_prefix}:{submit_item_id}"),
         kind: materialize_kind,
         task: boxed_work(move |worker_cancel| async move {
-            let runner = RealToolRunner::with_version_cache(submit_tool_paths.clone(), submit_version_cache.clone());
+            let runner = RealToolRunner::with_version_cache(submit_tool_paths.clone(), submit_version_cache.clone())
+                .with_execution_item(submit_item_id.clone());
             let reporter = BroadcastReporter::new(submit_progress_tx, None, submit_item_id.clone(), None);
             let result = prepare_pipeline_item_for_scheduler(
                 request,
@@ -3025,7 +3110,8 @@ fn build_single_file_work(
         unit_id: format!("single-file:{item_id}"),
         kind: WorkKind::SingleFile,
         task: boxed_work(move |worker_cancel| async move {
-            let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone());
+            let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone())
+                .with_execution_item(item_id.clone());
             let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
             let report = run_pipeline_item_with_tool_paths_and_tool_limits(
                 request,
@@ -3419,7 +3505,28 @@ async fn run_album_postprocess_work(
     worker_cancel: CancellationToken,
 ) -> QueueWorkOutput {
     let item_id = album.req.item_id.clone();
-    let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone());
+    let work = run_album_postprocess_work_scoped(
+        album, outputs, tool_paths, version_cache, progress_tx, tool_concurrency_limits, worker_cancel
+    );
+    if crate::concurrency::runtime_execution_id(&item_id).is_some() {
+        crate::concurrency::with_runtime_execution_scope(item_id, work).await
+    } else {
+        work.await
+    }
+}
+
+async fn run_album_postprocess_work_scoped(
+    album: ScheduledAlbum,
+    outputs: Vec<ScheduledTrackOutput>,
+    tool_paths: HashMap<String, PathBuf>,
+    version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
+    progress_tx: broadcast::Sender<ProgressUpdate>,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+    worker_cancel: CancellationToken,
+) -> QueueWorkOutput {
+    let item_id = album.req.item_id.clone();
+    let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone())
+        .with_execution_item(item_id.clone());
     let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
     let scratch_retry_context = if album.staging.is_scratch_staging() {
         Some((
@@ -3616,8 +3723,15 @@ async fn run_single_item_with_shared_scheduler(
         worker_count,
         tool_concurrency_limits.as_ref(),
     );
+    let queue = {
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(item.clone());
+        std::sync::Arc::new(tokio::sync::RwLock::new(queue))
+    };
     let mut outcomes = run_queue_with_shared_orchestrator(
         vec![item],
+        queue,
+        None,
         progress_tx,
         None,
         None,
@@ -3767,6 +3881,16 @@ pub async fn process_item_with_scratch_policy(
     worker_count: usize,
     scratch_staging: ScratchStagingPolicy,
 ) -> ConversionResult<(String, ConversionStatus)> {
+    #[cfg(not(test))]
+    {
+        let _ = (&item, &progress_tx, &tool_paths, &_file_semaphore, worker_count, &scratch_staging);
+        return Err(ConversionError::ValidationError(
+            "direct single-item conversion is disabled because it cannot establish durable concurrent-session execution authority; use the coordinated queue processor"
+                .to_string(),
+        ));
+    }
+
+    #[cfg(test)]
     if !item.input_path.exists() {
         let error_msg = format!("Source file not found: {}", item.input_path.display());
         log::error!("{}", error_msg);
@@ -6886,6 +7010,7 @@ FILE "disc2.flac" WAVE
         let mut job_to_item = BTreeMap::new();
         let tool_paths = HashMap::new();
         let (progress_tx, _progress_rx) = broadcast::channel(16);
+        let test_queue = Arc::new(tokio::sync::RwLock::new(ConversionQueue::new()));
 
         submissions.enqueue_synthetic_album_fanout(
             "large-album".to_string(),
@@ -6899,6 +7024,8 @@ FILE "disc2.flac" WAVE
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             submissions.flush(
                 &pool,
+                &test_queue,
+                None,
                 &mut pending_albums,
                 &mut terminal,
                 &mut job_to_item,
@@ -6910,7 +7037,8 @@ FILE "disc2.flac" WAVE
                 1,
                 Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
                 None,
-            );
+            )
+            .await;
         })
         .await
         .expect("processor submission flush returns while result channel and ready queue are full");
@@ -6936,6 +7064,8 @@ FILE "disc2.flac" WAVE
 
         submissions.flush(
             &pool,
+            &test_queue,
+            None,
             &mut pending_albums,
             &mut terminal,
             &mut job_to_item,
@@ -6947,7 +7077,8 @@ FILE "disc2.flac" WAVE
             1,
             Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
             None,
-        );
+        )
+        .await;
         submissions.record_backlog(pool.metrics(), &pending_albums);
         let resumed = pool.metrics().snapshot();
         assert_eq!(submissions.pending_work_units(), 1);

@@ -4,7 +4,6 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::labels::detect_pressing_info;
 use super::metadata::{extract_metadata_from_flac, extract_year_from_flac_files};
@@ -650,178 +649,26 @@ fn capitalize_word_core(word: &str) -> String {
     }
 }
 
-/// Set album tag for a file based on its format
+/// Set album tag through tonepoet's metadata mutation boundary.
+///
+/// This deliberately avoids format-specific external mutators: the shared
+/// metadata writer owns exact-path admission, crash journal semantics, atomic
+/// publication where required, and post-write verification.
 fn set_album_tag(file_path: &Path, album: &str) -> Result<()> {
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .context("File has no extension")?;
-
-    match ext {
-        "flac" => {
-            // Use metaflac command
-            let output = Command::new("metaflac")
-                .arg("--remove-tag=ALBUM")
-                .arg(format!("--set-tag=ALBUM={}", album))
-                .arg(file_path)
-                .output()
-                .context("Failed to execute metaflac")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("metaflac failed: {}", stderr);
-            }
-            Ok(())
-        }
-        "wv" => {
-            // Use wvtag command
-            let output = Command::new("wvtag")
-                .arg("-q")
-                .arg("-w")
-                .arg(format!("ALBUM={}", album))
-                .arg(file_path)
-                .output()
-                .context("Failed to execute wvtag")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("wvtag failed: {}", stderr);
-            }
-            Ok(())
-        }
-        "mp3" | "m4a" | "aac" => {
-            // Use FFmpeg in-place with temp file
-            let temp_path = file_path.with_extension(format!("tmp.{}", ext));
-
-            let output = Command::new("ffmpeg")
-                .arg("-nostdin")
-                .arg("-i")
-                .arg(file_path)
-                .arg("-c")
-                .arg("copy")
-                .arg("-metadata")
-                .arg(format!("album={}", album))
-                .arg("-y")
-                .arg(&temp_path)
-                .output()
-                .context("Failed to execute ffmpeg")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = fs::remove_file(&temp_path); // Cleanup
-                bail!("ffmpeg failed: {}", stderr);
-            }
-
-            // Replace original with updated file
-            fs::rename(&temp_path, file_path).context("Failed to replace original file")?;
-            Ok(())
-        }
-        "opus" => {
-            // Use opustags command
-            let output = Command::new("opustags")
-                .arg("--delete")
-                .arg("ALBUM")
-                .arg("-s")
-                .arg(format!("ALBUM={}", album))
-                .arg("--in-place")
-                .arg(file_path)
-                .output()
-                .context("Failed to execute opustags")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("opustags failed: {}", stderr);
-            }
-            Ok(())
-        }
-        _ => {
-            // Unsupported format, skip silently
-            Ok(())
-        }
-    }
+    crate::tui::probe::write_all_tags(
+        file_path,
+        &[(lofty::tag::ItemKey::AlbumTitle, Some(album.to_string()))],
+    )
+    .map_err(anyhow::Error::msg)
 }
 
-/// Set title tag for a file based on its format
+/// Set title tag through the same mandatory metadata mutation boundary.
 fn set_title_tag(file_path: &Path, title: &str) -> Result<()> {
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .context("File has no extension")?;
-
-    match ext {
-        "flac" => {
-            let output = Command::new("metaflac")
-                .arg("--remove-tag=TITLE")
-                .arg(format!("--set-tag=TITLE={}", title))
-                .arg(file_path)
-                .output()
-                .context("Failed to execute metaflac")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("metaflac failed: {}", stderr);
-            }
-            Ok(())
-        }
-        "wv" => {
-            let output = Command::new("wvtag")
-                .arg("-q")
-                .arg("-w")
-                .arg(format!("TITLE={}", title))
-                .arg(file_path)
-                .output()
-                .context("Failed to execute wvtag")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("wvtag failed: {}", stderr);
-            }
-            Ok(())
-        }
-        "mp3" | "m4a" | "aac" => {
-            let temp_path = file_path.with_extension(format!("tmp.{}", ext));
-
-            let output = Command::new("ffmpeg")
-                .arg("-nostdin")
-                .arg("-i")
-                .arg(file_path)
-                .arg("-c")
-                .arg("copy")
-                .arg("-metadata")
-                .arg(format!("title={}", title))
-                .arg("-y")
-                .arg(&temp_path)
-                .output()
-                .context("Failed to execute ffmpeg")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = fs::remove_file(&temp_path);
-                bail!("ffmpeg failed: {}", stderr);
-            }
-
-            fs::rename(&temp_path, file_path).context("Failed to replace original file")?;
-            Ok(())
-        }
-        "opus" => {
-            let output = Command::new("opustags")
-                .arg("--delete")
-                .arg("TITLE")
-                .arg("-s")
-                .arg(format!("TITLE={}", title))
-                .arg("--in-place")
-                .arg(file_path)
-                .output()
-                .context("Failed to execute opustags")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("opustags failed: {}", stderr);
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+    crate::tui::probe::write_all_tags(
+        file_path,
+        &[(lofty::tag::ItemKey::TrackTitle, Some(title.to_string()))],
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// Updates album tags based on the folder name pattern for all supported audio formats.

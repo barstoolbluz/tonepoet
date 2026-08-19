@@ -597,6 +597,11 @@ impl StoreFileLock {
     }
 
     fn acquire(parent: &Path, target_path: &Path) -> anyhow::Result<Self> {
+        // StoreFileLock is deliberately a same-store serialization primitive,
+        // not a user-library path-registry boundary. Library metadata callers
+        // acquire their complete shared mutation set before entering backend
+        // writers; config, preset, and secret-store users retain only this
+        // established local/cross-process store lock.
         let lock_path = store_lock_path(parent, target_path);
         validate_lock_path_before_open(&lock_path)?;
 
@@ -1959,32 +1964,41 @@ impl TonepoetConfig {
     /// The entire secret-publication transaction is serialized by one OS lock:
     /// authoritative read, journal reconciliation, keyring mutation, atomic file
     /// publication, and journal retirement all occur under the same ownership.
-    pub fn save(&self) -> anyhow::Result<()> {
-        require_durable_config_save(self.save_with_outcome()?)
+    pub fn replace_entire_config(&self) -> anyhow::Result<()> {
+        require_durable_config_save(self.replace_entire_config_with_outcome()?)
     }
 
-    pub fn save_with_outcome(&self) -> anyhow::Result<ConfigSaveOutcome> {
-        self.save_to_path_with_outcome(Self::config_path())
+    pub fn replace_entire_config_with_outcome(&self) -> anyhow::Result<ConfigSaveOutcome> {
+        self.replace_entire_config_to_path_with_outcome(Self::config_path())
     }
 
     /// Save config to an explicit path. This exists so UI persistence paths can
     /// be tested against temporary config files without mutating the user's
     /// real configuration. Like `save`, it returns an error after replacement
     /// when publication durability cannot be confirmed.
-    pub fn save_to_path<P: AsRef<Path>>(&self, config_path: P) -> anyhow::Result<()> {
-        require_durable_config_save(self.save_to_path_with_outcome(config_path)?)
+    pub fn replace_entire_config_to_path<P: AsRef<Path>>(&self, config_path: P) -> anyhow::Result<()> {
+        require_durable_config_save(self.replace_entire_config_to_path_with_outcome(config_path)?)
     }
 
-    pub fn save_to_path_with_outcome<P: AsRef<Path>>(
+    pub fn replace_entire_config_to_path_with_outcome<P: AsRef<Path>>(
         &self,
         config_path: P,
     ) -> anyhow::Result<ConfigSaveOutcome> {
         self.save_to_path_with_outcome_impl(config_path.as_ref(), || Ok(()))
     }
 
+    #[cfg(test)]
+    pub fn save(&self) -> anyhow::Result<()> { self.replace_entire_config() }
+    #[cfg(test)]
+    pub fn save_with_outcome(&self) -> anyhow::Result<ConfigSaveOutcome> { self.replace_entire_config_with_outcome() }
+    #[cfg(test)]
+    pub fn save_to_path<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> { self.replace_entire_config_to_path(path) }
+    #[cfg(test)]
+    pub fn save_to_path_with_outcome<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<ConfigSaveOutcome> { self.replace_entire_config_to_path_with_outcome(path) }
+
     /// Atomically update selected settings at the default config path.
     ///
-    /// Unlike [`TonepoetConfig::save`], this refreshes the authoritative file
+    /// Unlike [`TonepoetConfig::replace_entire_config`], this refreshes the authoritative file
     /// while holding the store lock, applies only the caller's intended change,
     /// and republishes the merged config. UI persistence paths should use this
     /// method so an older in-memory snapshot cannot clobber unrelated settings.

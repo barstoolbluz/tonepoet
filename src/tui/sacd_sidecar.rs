@@ -1444,4 +1444,34 @@ mod tests {
             "at least one track should have a TITLE",
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_sidecar_publish_replaces_final_symlink_not_referent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("master.xml");
+        let link = temp.path().join("disc.xml");
+        std::fs::write(&referent, b"referent sentinel").expect("referent");
+        let before = std::fs::read(&referent).unwrap();
+        symlink(&referent, &link).expect("symlink");
+        let metadata = SidecarMetadata {
+            store_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            version: "1.1".to_string(),
+            tracks: vec![SidecarTrack {
+                id: 1,
+                meta: BTreeMap::from([("TITLE".to_string(), "Track".to_string())]),
+                replaygain: BTreeMap::new(),
+            }],
+        };
+
+        write_sidecar(&link, &metadata).expect("write SACD sidecar through lexical entry");
+        assert_eq!(std::fs::read(&referent).unwrap(), before);
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let reparsed = parse_sidecar(&link).expect("reparse replacement");
+        assert_eq!(reparsed.store_id, metadata.store_id);
+        assert_eq!(reparsed.tracks[0].meta.get("TITLE").map(String::as_str), Some("Track"));
+    }
+
 }

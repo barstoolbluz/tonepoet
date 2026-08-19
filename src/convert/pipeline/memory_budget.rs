@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use fs2::FileExt;
 
+use crate::concurrency::{
+    ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+};
 use super::types::SourceKind;
 
 const MIB: u64 = 1024 * 1024;
@@ -860,28 +863,63 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
     };
     let lock_path = staging_parent.join(&lock_file_name);
 
-    match probe_existing_run_lock(&lock_path) {
+    let run_lock = match probe_existing_run_lock(&lock_path) {
         Ok(RunLockProbe::Held) => {
             log::debug!(
                 "scratch stale cleanup: skipped active lock: staging_path={}, lock_holder={}",
                 staging_dir.display(),
                 lock_path.display()
             );
+            return;
         }
-        Ok(RunLockProbe::Missing) => {
-            remove_stale_staging_tree(staging_dir);
-        }
-        Ok(RunLockProbe::Unlocked(file)) => {
-            if remove_stale_staging_tree(staging_dir) {
-                remove_unlocked_stale_run_lock(file, &lock_path);
-            }
-        }
+        Ok(RunLockProbe::Missing) => RunLockProbe::Missing,
+        Ok(RunLockProbe::Unlocked(file)) => RunLockProbe::Unlocked(file),
         Err(err) => {
             log::warn!(
                 "could not check scratch run lock {} for stale staging tree {}; skipping cleanup: {err}",
                 lock_path.display(),
                 staging_dir.display()
             );
+            return;
+        }
+    };
+
+    // The legacy .run.lock is only a cheap local liveness hint. Final-family
+    // ExecutionStaging descriptors are the authority for cross-session staging
+    // lifetime, including RecoveryReserved state after every kernel holder has
+    // closed. Deletion therefore requires ordinary shared mutation admission.
+    let claim = match PathClaim::resolve_with_semantics(
+        staging_dir,
+        ClaimMode::Write,
+        ClaimScope::Subtree,
+        PathResolutionSemantics::NamespaceObject,
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            log::warn!(
+                "scratch stale cleanup: could not resolve shared claim for {}; leaving tree intact: {error}",
+                staging_dir.display(),
+            );
+            return;
+        }
+    };
+    let admitted_path = claim.identity.resolved_io_path.clone();
+    let _guard = match MutationClaimGuard::acquire_ephemeral(vec![claim]) {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::debug!(
+                "scratch stale cleanup: shared staging ownership kept {} intact: {error}",
+                staging_dir.display(),
+            );
+            return;
+        }
+    };
+
+    if remove_stale_staging_tree(&admitted_path) {
+        if let RunLockProbe::Unlocked(file) = run_lock {
+            // Retire the old compatibility lock only while the same shared
+            // mutation admission that authorized tree deletion remains held.
+            remove_unlocked_stale_run_lock(file, &lock_path);
         }
     }
 }
@@ -1339,6 +1377,73 @@ mod tests {
 
         assert!(!stale_dir.exists(), "first scratch validation should clean stale staging trees");
         assert!(!staging_parent.join(".job-item.run.lock").exists());
+    }
+
+    #[test]
+    fn execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let previous_concurrency = std::env::var_os("TONEPOET_CONCURRENCY_DIR");
+        std::env::set_var("TONEPOET_CONCURRENCY_DIR", temp.path().join("claims"));
+
+        let staging_parent = temp.path().join(".tonepoet-staging");
+        fs::create_dir_all(&staging_parent).expect("staging parent");
+        let claimed_dir = staging_parent.join("claimed-job");
+        fs::create_dir_all(&claimed_dir).expect("claimed staging dir");
+        fs::write(
+            claimed_dir.join(STAGING_OWNER_MARKER),
+            "run_lock=.claimed-job.run.lock
+",
+        )
+        .expect("claimed marker");
+        fs::write(staging_parent.join(".claimed-job.run.lock"), b"").expect("old unlocked run lock");
+
+        let unrelated_dir = staging_parent.join("unrelated-stale-job");
+        fs::create_dir_all(&unrelated_dir).expect("unrelated staging dir");
+        fs::write(
+            unrelated_dir.join(STAGING_OWNER_MARKER),
+            "run_lock=.unrelated-stale-job.run.lock
+",
+        )
+        .expect("unrelated marker");
+        fs::write(staging_parent.join(".unrelated-stale-job.run.lock"), b"")
+            .expect("unrelated old run lock");
+
+        let execution_id = uuid::Uuid::new_v4();
+        let family = crate::concurrency::LeaseFamily::ExecutionStaging { execution_id };
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            &claimed_dir,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Subtree,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("staging claim");
+        let guard = crate::concurrency::MutationClaimGuard::acquire(family.clone(), vec![claim])
+            .expect("live execution staging lease");
+        let descriptor = guard.lease().descriptor_path().to_path_buf();
+
+        cleanup_stale_staging_trees(&staging_parent).expect("cleanup while live");
+        assert!(claimed_dir.exists(), "live ExecutionStaging must protect its tree");
+        assert!(staging_parent.join(".claimed-job.run.lock").exists());
+        assert!(!unrelated_dir.exists(), "busy candidate must not block disjoint stale cleanup");
+
+        drop(guard);
+        cleanup_stale_staging_trees(&staging_parent).expect("cleanup while recovery reserved");
+        assert!(
+            claimed_dir.exists(),
+            "free final-family kernel lease remains RecoveryReserved until lifecycle retirement"
+        );
+        assert!(staging_parent.join(".claimed-job.run.lock").exists());
+
+        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)
+            .expect("retire execution staging after lifecycle release");
+        cleanup_stale_staging_trees(&staging_parent).expect("cleanup after lifecycle release");
+        assert!(!claimed_dir.exists(), "retired staging ownership permits stale cleanup");
+        assert!(!staging_parent.join(".claimed-job.run.lock").exists());
+
+        match previous_concurrency {
+            Some(previous) => std::env::set_var("TONEPOET_CONCURRENCY_DIR", previous),
+            None => std::env::remove_var("TONEPOET_CONCURRENCY_DIR"),
+        }
     }
 
     #[test]

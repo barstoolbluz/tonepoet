@@ -2020,6 +2020,7 @@ pub enum ActionsRunStatus {
 pub struct PreparedActionsRunAuthority {
     pub invocation_id: String,
     pub context: ActionContext,
+    pub plans: Vec<crate::convert::pipeline::ActionPlan>,
     pub expected_identity_sha256: String,
     pub preview_authority_sha256: String,
     pub invocation_state: ManualInvocationState,
@@ -2248,6 +2249,7 @@ fn build_actions_run_state_from_inputs(
         prepared: Some(PreparedActionsRunAuthority {
             invocation_id: prepared.invocation_id,
             context,
+            plans: prepared.plans.clone(),
             expected_identity_sha256,
             preview_authority_sha256: prepared.authority_sha256,
             invocation_state: prepared.state,
@@ -2427,6 +2429,7 @@ pub fn start_actions_run(state: &mut ActionsRunState, tx: &mpsc::Sender<AppMessa
     let invocation_id = prepared.invocation_id;
     let pipeline = state.pipeline.clone();
     let preview_context = prepared.context;
+    let prepared_plans = prepared.plans;
     let target = state.target.clone();
     let expected_identity_sha256 = prepared.expected_identity_sha256;
     let preview_authority_sha256 = prepared.preview_authority_sha256;
@@ -2439,20 +2442,42 @@ pub fn start_actions_run(state: &mut ActionsRunState, tx: &mpsc::Sender<AppMessa
                 &expected_identity_sha256,
                 &preview_context,
             )?;
+            let action_claims = crate::convert::pipeline::actions::shared_path_claims_for_action_plans(
+                &prepared_plans,
+                &context,
+            ).map_err(|error| error.to_string())?;
+            let _mutation_guard = if action_claims.is_empty() {
+                None
+            } else {
+                Some(crate::concurrency::MutationClaimGuard::acquire(
+                    crate::concurrency::LeaseFamily::EphemeralMutation { claim_id: uuid::Uuid::new_v4() },
+                    action_claims,
+                ).map_err(|error| format!("manual action concurrency admission failed: {error}"))?)
+            };
+            let manual_supervision_files = _mutation_guard
+                .as_ref()
+                .map(|guard| guard.lease().duplicate_lifetime_file())
+                .transpose()
+                .map_err(|error| format!("manual action supervisor lease handoff failed: {error}"))?
+                .into_iter()
+                .collect::<Vec<_>>();
             let filesystem = CapabilityActionFilesystem::new();
             let scripts = ProcessGroupScriptRunner;
             let engine = ActionEngine { filesystem: &filesystem, scripts: &scripts };
-            engine
-                .execute_prepared_explicit_phase_with_lock(
-                    &pipeline,
-                    &context,
-                    &expected_identity_sha256,
-                    &invocation_id,
-                    &preview_authority_sha256,
-                    &cancellation,
-                    &mut lock,
-                )
-                .map_err(|error| error.to_string())
+            crate::concurrency::with_thread_supervision_lifetime_files(
+                manual_supervision_files,
+                || engine
+                    .execute_prepared_explicit_phase_with_lock(
+                        &pipeline,
+                        &context,
+                        &expected_identity_sha256,
+                        &invocation_id,
+                        &preview_authority_sha256,
+                        &cancellation,
+                        &mut lock,
+                    )
+                    .map_err(|error| error.to_string()),
+            )
         })();
         let _ = tx.blocking_send(AppMessage::ActionsRunComplete { invocation_id, result });
     });

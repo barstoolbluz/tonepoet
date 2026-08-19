@@ -1558,6 +1558,19 @@ impl FilePickerState {
                 FilePickerMenuAction::Delete if !self.file_operation_policy().allow_delete => {
                     FilePickerError::OperationDisabled("delete")
                 }
+                FilePickerMenuAction::Rename if !self.file_operation_policy().allow_rename => {
+                    FilePickerError::OperationDisabled("rename")
+                }
+                FilePickerMenuAction::Duplicate if !self.file_operation_policy().allow_duplicate => {
+                    FilePickerError::OperationDisabled("duplicate")
+                }
+                FilePickerMenuAction::RenameTitleCase
+                | FilePickerMenuAction::RenameUppercase
+                | FilePickerMenuAction::RenameLowercase
+                    if !self.file_operation_policy().allow_rename =>
+                {
+                    FilePickerError::OperationDisabled("rename")
+                }
                 FilePickerMenuAction::Paste => FilePickerError::ClipboardEmpty,
                 _ => FilePickerError::NoSelection,
             });

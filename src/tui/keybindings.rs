@@ -1780,6 +1780,8 @@ fn undo_redo_policy(
         allow_copy: true,
         allow_paste: true,
         allow_delete: false,
+        allow_rename: false,
+        allow_duplicate: false,
         symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
         cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::CopyThenDelete,
         delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,
@@ -1955,10 +1957,57 @@ fn execute_file_operation_replay_worker(
     policy: tui_file_picker::FileOperationPolicy,
 ) -> super::message::FileOperationReplayResult {
     if entry.kind == FileOperationUndoKind::Copy && undo {
+        // Copy undo removes the complete set of previously-created destination
+        // namespace entries. Admit that whole set before the first quarantine
+        // rename so a foreign session cannot turn a replay into a partial
+        // cross-session commit.
+        let mut claims = Vec::with_capacity(entry.mappings.len());
+        let mut admitted_destinations = Vec::with_capacity(entry.mappings.len());
+        for mapping in &entry.mappings {
+            let scope = match std::fs::symlink_metadata(&mapping.destination) {
+                Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                    crate::concurrency::ClaimScope::Subtree
+                }
+                Ok(_) => crate::concurrency::ClaimScope::Exact,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::concurrency::ClaimScope::Exact
+                }
+                Err(error) => {
+                    return replay_failure_for_all(
+                        entry,
+                        format!(
+                            "inspect copy-undo destination {} before shared admission: {error}",
+                            mapping.destination.display(),
+                        ),
+                    )
+                }
+            };
+            let claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+                &mapping.destination,
+                crate::concurrency::ClaimMode::Write,
+                scope,
+                crate::concurrency::PathResolutionSemantics::NamespaceObject,
+            ) {
+                Ok(claim) => claim,
+                Err(error) => return replay_failure_for_all(entry, error),
+            };
+            admitted_destinations.push(claim.identity.resolved_io_path.clone());
+            claims.push(claim);
+        }
+        let _mutation_claim = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(claims) {
+            Ok(guard) => guard,
+            Err(error) => return replay_failure_for_all(entry, error),
+        };
+
         // Phase 1: detach every root without deleting anything. A failure
         // restores every previously detached root.
         let mut detached = Vec::with_capacity(entry.mappings.len());
-        for (index, mapping) in entry.mappings.iter().enumerate() {
+        for (index, (mapping, admitted_destination)) in entry
+            .mappings
+            .iter()
+            .zip(admitted_destinations.iter())
+            .enumerate()
+        {
             let Some(proof) = mapping.destination_proof.as_ref() else {
                 return replay_failure_for_all(
                     entry,
@@ -1968,7 +2017,7 @@ fn execute_file_operation_replay_worker(
             match tui_file_picker::prepare_verified_removal(
                 &proof.source_manifest,
                 &proof.destination_manifest,
-                &mapping.destination,
+                admitted_destination,
             ) {
                 Ok(removal) => detached.push((index, removal)),
                 Err(error) => {
@@ -2130,7 +2179,7 @@ fn execute_file_operation_replay_worker(
         };
     }
 
-    let plan = tui_file_picker::PastePlan {
+    let logical_plan = tui_file_picker::PastePlan {
         mode: if entry.kind == FileOperationUndoKind::Copy {
             tui_file_picker::FilePickerClipboardMode::Copy
         } else {
@@ -2151,6 +2200,23 @@ fn execute_file_operation_replay_worker(
                 }
             })
             .collect(),
+    };
+    let admission = match super::file_task_runtime::file_task_path_admission(
+        entry.kind != FileOperationUndoKind::Copy,
+        &logical_plan.mappings,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return replay_failure_for_all(entry, error),
+    };
+    let _mutation_claim = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(
+        admission.claims,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => return replay_failure_for_all(entry, error),
+    };
+    let plan = tui_file_picker::PastePlan {
+        mode: logical_plan.mode,
+        mappings: admission.admitted_mappings,
     };
 
     let expected_sources = match entry
@@ -5707,6 +5773,69 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
+    fn browse_create_respects_prospective_namespace_claims_before_creation() {
+        use crate::concurrency::{
+            ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+        };
+
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+
+        let file = temp.path().join("claimed.txt");
+        let file_claim = PathClaim::resolve_with_semantics(
+            &file,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("prospective file claim");
+        let file_guard = MutationClaimGuard::acquire_ephemeral(vec![file_claim])
+            .expect("hold prospective file claim");
+        assert!(!commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "claimed.txt",
+            &tx,
+        ));
+        assert!(!file.exists(), "Busy must be reported before New File creation");
+        drop(file_guard);
+
+        let folder = temp.path().join("claimed-folder");
+        let descendant = folder.join("future.flac");
+        let descendant_claim = PathClaim::resolve_with_semantics(
+            &descendant,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("prospective descendant claim");
+        let folder_guard = MutationClaimGuard::acquire_ephemeral(vec![descendant_claim])
+            .expect("hold prospective descendant claim");
+        assert!(!commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::Folder,
+            "claimed-folder",
+            &tx,
+        ));
+        assert!(!folder.exists(), "Subtree Busy must be reported before New Folder creation");
+        drop(folder_guard);
+
+        assert!(commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "disjoint.txt",
+            &tx,
+        ));
+        assert!(temp.path().join("disjoint.txt").is_file());
+    }
+
+    #[test]
     fn browse_create_refuses_overwrite_dot_components_and_path_separators() {
         let (tx, _rx) = channel();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6121,16 +6250,20 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                     &app.convert.metadata,
                 );
                 match super::presets::save_preset_with_db(&preset, &app.db) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         app.preset
                             .set_active_preset_path(name.clone(), super::presets::preset_file_path(&name));
                         app.preset.modified = false;
                         app.preset.naming_input = None;
                         app.preset.overlay_open = false;
+                        let warning = outcome.index_warning().map(|error| {
+                            format!(" | SQLite index update failed; startup repair will retry: {error}")
+                        }).unwrap_or_default();
                         app.set_status(format!(
-                            "Saved preset: {} | {}",
+                            "Saved preset: {} | {}{}",
                             name,
-                            preset.resolved_semantics_summary()
+                            preset.resolved_semantics_summary(),
+                            warning
                         ));
                     }
                     Err(e) => {
@@ -6218,10 +6351,13 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                         );
                         preset.name = new_name;
                         match super::presets::save_preset_with_db(&preset, &app.db) {
-                            Ok(_) => {
+                            Ok(outcome) => {
                                 let saved_name = preset.name.clone();
                                 app.preset.overlay_list = super::presets::list_presets();
-                                app.set_status(format!("Duplicated: {} → {}", name, saved_name));
+                                let warning = outcome.index_warning().map(|error| {
+                                    format!(" | SQLite index update failed; startup repair will retry: {error}")
+                                }).unwrap_or_default();
+                                app.set_status(format!("Duplicated: {} → {}{}", name, saved_name, warning));
                             }
                             Err(e) => app.set_status(format!("Duplicate failed: {}", e)),
                         }
@@ -6239,7 +6375,7 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                 .cloned()
             {
                 match super::presets::delete_preset_with_db(&name, &app.db) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         // If we deleted the active preset, clear it
                         if app.preset.active_preset.as_deref() == Some(&name) {
                             app.preset.clear_active_preset();
@@ -6251,7 +6387,10 @@ fn handle_preset_overlay_key(app: &mut AppState, key: KeyEvent) {
                         {
                             app.preset.overlay_selected = app.preset.overlay_list.len() - 1;
                         }
-                        app.set_status(format!("Deleted preset: {}", name));
+                        let warning = outcome.index_warning().map(|error| {
+                            format!(" | SQLite index update failed; startup repair will retry: {error}")
+                        }).unwrap_or_default();
+                        app.set_status(format!("Deleted preset: {}{}", name, warning));
                     }
                     Err(e) => app.set_status(format!("Delete failed: {}", e)),
                 }
@@ -12075,44 +12214,110 @@ pub(super) fn metadata_editor_save(
                     )));
                 },
             );
-            let mut results = if sidecar_only_save {
+            // One metadata-editor Save owns the complete member/sidecar
+            // mutation set before the first carrier is changed. Exact claims
+            // remain narrow; nested backend writers reuse this live authority.
+            let mut mutation_paths = if sidecar_only_save {
                 Vec::new()
             } else {
-                crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+                crate::tui::probe::metadata_editor_mutation_paths_for_batch(
                     &paths,
                     &entries_snap,
                     &deleted,
                     &save_block_reasons,
-                    Some(progress),
-                    Some(byte_progress),
-                    Some(cancel.clone()),
                     &forced_deletes,
-                    verification,
                 )
             };
-            if let Some(plan) = cue_sidecar_writeback {
-                if let Some(sidecar_result) =
-                    cue_sidecar_writeback_result_after_successful_image_save(plan, &results)
-                {
-                    results.push(sidecar_result);
+            if let Some(plan) = cue_sidecar_writeback.as_ref() {
+                if plan.preflight_error.is_none() {
+                    mutation_paths.push(plan.cue_path.clone());
                 }
             }
-            let all_carriers_saved = paths.iter().all(|path| {
-                results.iter().any(|result| {
-                    result.path == *path
-                        && matches!(
-                            &result.outcome,
-                            crate::tui::app::MetadataEditorWriteOutcome::Saved
-                                | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
-                        )
-                })
-            });
-            let refreshed_entries = if reread_after_embedded_cuesheet_delete && all_carriers_saved {
-                Some(crate::tui::probe::read_all_tags_merged(&paths))
-            } else {
-                None
+            let admission = match crate::tui::probe::admit_metadata_mutation_paths(
+                &mutation_paths,
+                "metadata-editor save",
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let failed = paths
+                        .iter()
+                        .cloned()
+                        .map(|path| crate::tui::app::MetadataEditorWriteResult {
+                            path,
+                            outcome: crate::tui::app::MetadataEditorWriteOutcome::Failed {
+                                reason: error.clone(),
+                            },
+                        })
+                        .collect();
+                    return (failed, None);
+                }
             };
-            (results, refreshed_entries)
+            let admitted_paths = paths
+                .iter()
+                .map(|path| {
+                    admission
+                        .admitted_path(path)
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|_| path.clone())
+                })
+                .collect::<Vec<_>>();
+            let admitted_cue_plan = cue_sidecar_writeback.map(|mut plan| {
+                if let Ok(path) = admission.admitted_path(&plan.cue_path) {
+                    plan.cue_path = path.to_path_buf();
+                }
+                if let Ok(path) = admission.admitted_path(&plan.audio_path) {
+                    plan.audio_path = path.to_path_buf();
+                }
+                for path in &mut plan.required_audio_paths {
+                    if let Ok(admitted) = admission.admitted_path(path) {
+                        *path = admitted.to_path_buf();
+                    }
+                }
+                plan
+            });
+            admission.run(|| {
+                let mut results = if sidecar_only_save {
+                    Vec::new()
+                } else {
+                    crate::tui::probe::apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
+                        &admitted_paths,
+                        &entries_snap,
+                        &deleted,
+                        &save_block_reasons,
+                        Some(progress),
+                        Some(byte_progress),
+                        Some(cancel.clone()),
+                        &forced_deletes,
+                        verification,
+                    )
+                };
+                if let Some(plan) = admitted_cue_plan {
+                    if let Some(sidecar_result) =
+                        cue_sidecar_writeback_result_after_successful_image_save(plan, &results)
+                    {
+                        results.push(sidecar_result);
+                    }
+                }
+                for result in &mut results {
+                    result.path = admission.logical_path(&result.path);
+                }
+                let all_carriers_saved = paths.iter().all(|path| {
+                    results.iter().any(|result| {
+                        result.path == *path
+                            && matches!(
+                                &result.outcome,
+                                crate::tui::app::MetadataEditorWriteOutcome::Saved
+                                    | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+                            )
+                    })
+                });
+                let refreshed_entries = if reread_after_embedded_cuesheet_delete && all_carriers_saved {
+                    Some(crate::tui::probe::read_all_tags_merged(&admitted_paths))
+                } else {
+                    None
+                };
+                (results, refreshed_entries)
+            })
         })
         .await
         .unwrap_or_else(|e| {
@@ -12805,26 +13010,56 @@ fn metadata_editor_start_replaygain_scan(
     let worker_paths = paths.clone();
     let tool_paths = app.manager.config.tool_paths.clone();
     tokio::spawn(async move {
-        let cmd = metadata_replaygain_tool_command(mode, prevent_clipping, &worker_paths);
+        use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
-        let result = match crate::convert::pipeline::tool::ToolRunner::run(&runner, cmd, &cancel).await {
-            Ok(_) => tokio::task::spawn_blocking({
-                let worker_paths = worker_paths.clone();
-                move || {
-                    if mode == crate::tui::app::MetadataReplayGainScanMode::Track {
-                        crate::convert::replaygain::remove_stale_album_tags(&worker_paths)
-                            .map_err(|error| format!(
-                                "ReplayGain track scan succeeded, but stale album-tag cleanup failed: {error}"
-                            ))?;
+        let claims = worker_paths
+            .iter()
+            .map(|path| PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact))
+            .collect::<Result<Vec<_>, _>>();
+        let result = match claims.and_then(MutationClaimGuard::acquire_ephemeral) {
+            Err(error) => Err(format!("ReplayGain mutation admission failed: {error}")),
+            Ok(claim) => match claim.lease().duplicate_lifetime_file() {
+                Err(error) => Err(format!("ReplayGain supervision lease duplication failed: {error}")),
+                Ok(lifetime) => {
+                    let admitted_paths = claim
+                        .claims()
+                        .iter()
+                        .map(|path_claim| path_claim.identity.resolved_io_path.clone())
+                        .collect::<Vec<_>>();
+                    let cmd = metadata_replaygain_tool_command(
+                        mode,
+                        prevent_clipping,
+                        &admitted_paths,
+                    );
+                    let tool_result = crate::concurrency::with_additional_supervision_lifetime_files(
+                        vec![lifetime],
+                        crate::convert::pipeline::tool::ToolRunner::run(&runner, cmd, &cancel),
+                    )
+                    .await;
+                    match tool_result {
+                        Ok(_) => tokio::task::spawn_blocking({
+                            let admitted_paths = admitted_paths.clone();
+                            move || {
+                                if mode == crate::tui::app::MetadataReplayGainScanMode::Track {
+                                    crate::convert::replaygain::remove_stale_album_tags(&admitted_paths)
+                                        .map_err(|error| format!(
+                                            "ReplayGain track scan succeeded, but stale album-tag cleanup failed: {error}"
+                                        ))?;
+                                }
+                                super::probe::read_all_tags_merged_with_metadata(&admitted_paths)
+                                    .map(|read| read.metadata)
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|err| Err(format!(
+                            "ReplayGain tag post-processing task failed: {err}"
+                        ))),
+                        Err(err) => Err(format!("loudgain failed: {err}")),
                     }
-                    super::probe::read_all_tags_merged_with_metadata(&worker_paths)
-                        .map(|read| read.metadata)
                 }
-            })
-            .await
-            .unwrap_or_else(|err| Err(format!("ReplayGain tag post-processing task failed: {err}"))),
-            Err(err) => Err(format!("loudgain failed: {err}")),
+            },
         };
         let _ = tx
             .send(AppMessage::MetadataEditorReplayGainComplete {
@@ -12949,15 +13184,9 @@ pub(crate) fn metadata_editor_open_tag_blocks_file_picker(
             title: "Get tags from file".to_string(),
             theme: file_picker_theme_from_theme(&app.theme),
             selection_mode: tui_file_picker::FilePickerSelectionMode::Files,
-            operation_policy: tui_file_picker::FileOperationPolicy {
-                allow_new_file: false,
-                allow_new_folder: false,
-                allow_cut: false,
-                allow_copy: false,
-                allow_paste: false,
-                allow_delete: false,
-                ..tui_file_picker::FileOperationPolicy::default()
-            },
+            operation_policy: tui_file_picker::FileOperationPolicy::selection_only(
+                app.file_task_verbose_degrade_notices,
+            ),
             ..tui_file_picker::FilePickerConfig::default()
         },
     ));
@@ -13021,15 +13250,9 @@ fn metadata_editor_open_tag_transfer_picker_scoped(
             title: title.to_string(),
             theme: file_picker_theme_from_theme(&app.theme),
             selection_mode: tui_file_picker::FilePickerSelectionMode::FilesOrDirectories,
-            operation_policy: tui_file_picker::FileOperationPolicy {
-                allow_new_file: false,
-                allow_new_folder: false,
-                allow_cut: false,
-                allow_copy: false,
-                allow_paste: false,
-                allow_delete: false,
-                ..tui_file_picker::FileOperationPolicy::default()
-            },
+            operation_policy: tui_file_picker::FileOperationPolicy::selection_only(
+                app.file_task_verbose_degrade_notices,
+            ),
             ..tui_file_picker::FilePickerConfig::default()
         },
     ));
@@ -13087,10 +13310,7 @@ fn metadata_editor_open_artwork_picker(app: &mut AppState, state: &mut Box<super
 fn artwork_file_picker_policy(
     verbose_degrade_notices: bool,
 ) -> tui_file_picker::FileOperationPolicy {
-    tui_file_picker::FileOperationPolicy {
-        verbose_degrade_notices,
-        ..tui_file_picker::FileOperationPolicy::default()
-    }
+    tui_file_picker::FileOperationPolicy::selection_only(verbose_degrade_notices)
 }
 
 pub(crate) fn file_picker_theme_from_theme(theme: &super::theme::Theme) -> tui_file_picker::FilePickerTheme {
@@ -24288,6 +24508,19 @@ fn write_extracted_cuesheet_sidecar(
 ) -> Result<String, String> {
     use std::io::Write as _;
 
+    let claim = crate::concurrency::PathClaim::resolve(
+        cue_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let admitted_cue_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "CUE extraction admission produced no path claim".to_string())?;
+    let cue_path = admitted_cue_path.as_path();
+
     let parent = cue_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -30566,6 +30799,20 @@ pub fn save_dvda_metabase(
     state: &super::app::MetadataEditorState,
     metabase_path: &std::path::Path,
 ) -> Result<SacdSaveKind, String> {
+    let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+        metabase_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let admitted_metabase_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "DVD-Audio metabase admission produced no path claim".to_string())?;
+    let metabase_path = admitted_metabase_path.as_path();
+
     let source_path = state.active_surface()
         .paths
         .first()
@@ -31612,28 +31859,32 @@ fn is_path_writable(path: &std::path::Path) -> bool {
     std::fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
-/// Probe whether a directory accepts new files. Used by the mint-on-
-/// save path: when an SACD ISO has no sidecar yet, we still need to
-/// know whether we'd be able to write one. `is_path_writable` is
-/// file-oriented (opens the path for write) and fails for non-
-/// existent files; this is the directory-oriented complement.
-///
-/// Implementation: try to create a uniquely-named temp file in the
-/// directory, then immediately remove it. Both calls succeeding is
-/// the writability signal.
+/// Non-mutating eligibility check for mint-on-save sidecars. Directory
+/// permissions can change immediately after any preflight, so actual save is
+/// authoritative and reports permission/I/O failure under its existing shared
+/// mutation admission. Opening an editor must remain read-only.
 pub(super) fn is_dir_writable(dir: &std::path::Path) -> bool {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let probe = dir.join(format!(".tonepoet-write-probe-{}.tmp", nanos));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
+    std::fs::metadata(dir)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod sidecar_editor_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn directory_eligibility_is_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("sentinel");
+        std::fs::write(&sentinel, b"keep").expect("sentinel");
+        let before = std::fs::read_dir(temp.path()).expect("before").count();
+
+        assert!(is_dir_writable(temp.path()));
+
+        let after = std::fs::read_dir(temp.path()).expect("after").count();
+        assert_eq!(before, after, "editor eligibility must not create a write probe");
+        assert_eq!(std::fs::read(&sentinel).expect("sentinel retained"), b"keep");
     }
 }
 
@@ -31825,6 +32076,20 @@ pub fn save_sacd_sidecar(
     state: &super::app::MetadataEditorState,
     sidecar_path: &std::path::Path,
 ) -> Result<SacdSaveOutcome, String> {
+    let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+        sidecar_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let admitted_sidecar_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "SACD sidecar admission produced no path claim".to_string())?;
+    let sidecar_path = admitted_sidecar_path.as_path();
+
     let (mut sidecar, kind) = if sidecar_path.exists() {
         let s = super::sacd_sidecar::parse_sidecar(sidecar_path)
             .map_err(|e| format!("re-read sidecar: {}", e))?;
@@ -33005,61 +33270,103 @@ fn run_invalid_ape_repair_batch(
     tx: mpsc::Sender<AppMessage>,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
     let total = targets.len();
-    let mut results = Vec::with_capacity(total);
-    for (offset, (path, expected_keys)) in targets.into_iter().enumerate() {
-        let file_index = offset + 1;
-        let progress_tx = tx.clone();
-        let progress: super::probe::InvalidApeRepairProgressCallback =
-            std::sync::Arc::new(move |path, update| {
-                let _ = progress_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
-                    session_id,
-                    save_generation: generation,
-                    detail: invalid_ape_repair_progress_detail(
-                        file_index,
-                        total,
+    let mutation_paths = targets
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let admission = match super::probe::admit_metadata_mutation_paths(
+        &mutation_paths,
+        "invalid APE metadata repair batch",
+    ) {
+        Ok(admission) => admission,
+        Err(reason) => {
+            return targets
+                .into_iter()
+                .map(|(path, _)| {
+                    crate::tui::app::MetadataEditorWriteResult::invalid_ape_repair(
                         path,
-                        update,
-                    ),
-                });
-            });
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::probe::remove_invalid_ape_items_atomic(
-                &path,
-                &expected_keys,
-                verification,
-                Some(&cancel),
-                Some(&progress),
-            )
-        })) {
-            Ok(outcome) => invalid_ape_repair_outcome_to_write_result(outcome),
-            Err(payload) => {
-                let detail = payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                crate::tui::app::MetadataEditorWriteResult::invalid_ape_repair(
-                    path.clone(),
-                    crate::tui::app::MetadataInvalidApeRepairOutcome::CommitStateUnknown {
-                        reason: format!(
-                            "repair worker panicked while processing '{}': {detail}",
-                            path.display()
+                        crate::tui::app::MetadataInvalidApeRepairOutcome::NotModified {
+                            reason: format!(
+                                "metadata repair blocked before mutation by shared admission: {reason}"
+                            ),
+                        },
+                    )
+                })
+                .collect();
+        }
+    };
+    let admitted_targets = targets
+        .into_iter()
+        .map(|(logical_path, expected_keys)| {
+            let admitted_path = admission
+                .admitted_path(&logical_path)
+                .unwrap_or(logical_path.as_path())
+                .to_path_buf();
+            (logical_path, admitted_path, expected_keys)
+        })
+        .collect::<Vec<_>>();
+
+    admission.run(|| {
+        let mut results = Vec::with_capacity(total);
+        for (offset, (logical_path, admitted_path, expected_keys)) in
+            admitted_targets.into_iter().enumerate()
+        {
+            let file_index = offset + 1;
+            let progress_tx = tx.clone();
+            let progress_path = logical_path.clone();
+            let progress: super::probe::InvalidApeRepairProgressCallback =
+                std::sync::Arc::new(move |_path, update| {
+                    let _ = progress_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
+                        session_id,
+                        save_generation: generation,
+                        detail: invalid_ape_repair_progress_detail(
+                            file_index,
+                            total,
+                            &progress_path,
+                            update,
                         ),
-                    },
+                    });
+                });
+            let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::probe::remove_invalid_ape_items_atomic(
+                    &admitted_path,
+                    &expected_keys,
+                    verification,
+                    Some(&cancel),
+                    Some(&progress),
                 )
-            }
-        };
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        let _ = tx.blocking_send(AppMessage::StatusMessage(format!(
-            "APE repair {file_index}/{total}: {file_name} {}",
-            invalid_ape_repair_result_label(&result)
-        )));
-        results.push(result);
-    }
-    results
+            })) {
+                Ok(outcome) => invalid_ape_repair_outcome_to_write_result(outcome),
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    crate::tui::app::MetadataEditorWriteResult::invalid_ape_repair(
+                        logical_path.clone(),
+                        crate::tui::app::MetadataInvalidApeRepairOutcome::CommitStateUnknown {
+                            reason: format!(
+                                "repair worker panicked while processing '{}': {detail}",
+                                logical_path.display()
+                            ),
+                        },
+                    )
+                }
+            };
+            result.path = logical_path.clone();
+            let file_name = logical_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| logical_path.display().to_string());
+            let _ = tx.blocking_send(AppMessage::StatusMessage(format!(
+                "APE repair {file_index}/{total}: {file_name} {}",
+                invalid_ape_repair_result_label(&result)
+            )));
+            results.push(result);
+        }
+        results
+    })
 }
 
 pub(super) fn start_invalid_ape_repair(
@@ -33236,69 +33543,82 @@ pub(super) fn start_tag_maintenance(
                 return Err(format!("{}: selection contains no audio files", kind.label()));
             }
 
-            let total = paths.len();
-            let mut results = Vec::with_capacity(total);
-            for (index, path) in paths.iter().enumerate() {
-                let detail = format!(
-                    "{} {}/{}: {}",
-                    kind.progress_verb(),
-                    index + 1,
-                    total,
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string())
-                );
-                if let (Some(session_id), Some(save_generation)) =
-                    (session_id, save_generation)
+            let admission = super::probe::admit_metadata_mutation_paths(
+                &paths,
+                "tag-maintenance batch",
+            )?;
+            let admitted_paths = paths
+                .iter()
+                .map(|path| admission.admitted_path(path).map(std::path::Path::to_path_buf))
+                .collect::<Result<Vec<_>, _>>()?;
+            admission.run(|| {
+                let total = paths.len();
+                let mut results = Vec::with_capacity(total);
+                for (index, (logical_path, admitted_path)) in
+                    paths.iter().zip(admitted_paths.iter()).enumerate()
                 {
-                    let _ = worker_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
-                        session_id,
-                        save_generation,
-                        detail,
-                    });
-                } else {
-                    let _ = worker_tx.blocking_send(AppMessage::StatusMessage(detail));
+                    let detail = format!(
+                        "{} {}/{}: {}",
+                        kind.progress_verb(),
+                        index + 1,
+                        total,
+                        logical_path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| logical_path.display().to_string())
+                    );
+                    if let (Some(session_id), Some(save_generation)) =
+                        (session_id, save_generation)
+                    {
+                        let _ = worker_tx.blocking_send(AppMessage::MetadataEditorWriteProgress {
+                            session_id,
+                            save_generation,
+                            detail,
+                        });
+                    } else {
+                        let _ = worker_tx.blocking_send(AppMessage::StatusMessage(detail));
+                    }
+
+                    let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        super::probe::run_tag_maintenance(
+                            admitted_path,
+                            kind,
+                            verification,
+                            worker_cancel.as_ref(),
+                        )
+                    })) {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            let detail = payload
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            super::probe::TagMaintenanceFileResult {
+                                path: admitted_path.clone(),
+                                changed: false,
+                                changes: Vec::new(),
+                                durability_warnings: Vec::new(),
+                                error: Some(format!(
+                                    "{} worker panicked while processing '{}': {detail}",
+                                    kind.label(),
+                                    logical_path.display()
+                                )),
+                                cancelled: false,
+                                commit_state_unknown: true,
+                            }
+                        }
+                    };
+                    result.path = logical_path.clone();
+                    results.push(result);
                 }
 
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    super::probe::run_tag_maintenance(
-                        path,
-                        kind,
-                        verification,
-                        worker_cancel.as_ref(),
-                    )
-                })) {
-                    Ok(result) => result,
-                    Err(payload) => {
-                        let detail = payload
-                            .downcast_ref::<&str>()
-                            .map(|message| (*message).to_string())
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "non-string panic payload".to_string());
-                        super::probe::TagMaintenanceFileResult {
-                            path: path.clone(),
-                            changed: false,
-                            changes: Vec::new(),
-                            durability_warnings: Vec::new(),
-                            error: Some(format!(
-                                "{} worker panicked while processing '{}': {detail}",
-                                kind.label(),
-                                path.display()
-                            )),
-                            cancelled: false,
-                            commit_state_unknown: true,
-                        }
-                    }
+                let refreshed_entries = if editor_attached {
+                    Some(super::probe::read_all_tags_merged(&admitted_paths))
+                } else {
+                    None
                 };
-                results.push(result);
-            }
-
-            let refreshed_entries = if editor_attached {
-                Some(super::probe::read_all_tags_merged(&paths))
-            } else {
-                None
-            };
-            Ok((results, refreshed_entries))
+                Ok((results, refreshed_entries))
+            })
         })
         .await;
 
@@ -39777,7 +40097,10 @@ pub(super) fn maybe_start_next_file_transfer(
     {
         return;
     }
-    let Some(queued) = app.file_transfers.queued.pop_front() else {
+    // Crash recovery is review/defer state, not an automatic execution source.
+    // Only explicit Resume moves one reviewed recovery into the runnable queue.
+    let queued = app.file_transfers.queued.pop_front();
+    let Some(queued) = queued else {
         app.file_transfers.keep_minimized_across_jobs = false;
         app.sync_file_transfer_queue_surfaces();
         return;
@@ -39882,13 +40205,34 @@ pub(super) fn cancel_queued_file_transfer(
     queue_id: u64,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    if let Some(index) = app
+        .file_transfers
+        .recovery_queued
+        .iter()
+        .position(|job| job.queue_id == queue_id)
+    {
+        let Some(deferred) = app.file_transfers.recovery_queued.remove(index) else {
+            app.set_status("Recovery entry was already removed");
+            return;
+        };
+        app.sync_file_transfer_queue_surfaces();
+        app.set_status(format!(
+            "Deferred interrupted {} of {} item{}; its durable journal and RecoveryReserved claims remain unchanged",
+            if deferred.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut { "move" } else { "copy" },
+            deferred.clipboard.paths().len(),
+            if deferred.clipboard.paths().len() == 1 { "" } else { "s" },
+        ));
+        maybe_start_next_file_transfer(app, tx);
+        return;
+    }
+
     let Some(index) = app
         .file_transfers
         .queued
         .iter()
         .position(|job| job.queue_id == queue_id)
     else {
-        app.set_status("Queued transfer was already started or removed");
+        app.set_status("Queued transfer was already started, deferred, or removed");
         return;
     };
     let Some(removed) = app.file_transfers.queued.remove(index) else {
@@ -39903,6 +40247,63 @@ pub(super) fn cancel_queued_file_transfer(
         removed.destination_dir.display()
     ));
     maybe_start_next_file_transfer(app, tx);
+}
+
+/// Explicitly promote one reviewed crash-recovery entry into the runnable
+/// queue. This is the only production transition from startup recovery review
+/// into execution; the existing dispatch path then reacquires the exact journal
+/// lease and shared path admission before the helper starts.
+pub(super) fn resume_file_transfer_recovery(
+    app: &mut AppState,
+    queue_id: Option<u64>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let index = match queue_id {
+        Some(queue_id) => app
+            .file_transfers
+            .recovery_queued
+            .iter()
+            .position(|job| job.queue_id == queue_id),
+        None => (!app.file_transfers.recovery_queued.is_empty()).then_some(0),
+    };
+    let Some(index) = index else {
+        app.set_status("No matching interrupted file operation is awaiting recovery review");
+        return;
+    };
+    let Some(recovery) = app.file_transfers.recovery_queued.remove(index) else {
+        app.set_status("Recovery entry was already removed");
+        return;
+    };
+    let queue_id = recovery.queue_id;
+    let count = recovery.clipboard.paths().len();
+    app.file_transfers.queued.push_front(recovery);
+    app.sync_file_transfer_queue_surfaces();
+    app.set_status(format!(
+        "Resume approved for recovery #{queue_id} ({count} item{}); exact journal ownership and path admission will be reacquired before execution",
+        if count == 1 { "" } else { "s" },
+    ));
+    maybe_start_next_file_transfer(app, tx);
+}
+
+pub(super) fn defer_file_transfer_recovery(
+    app: &mut AppState,
+    queue_id: Option<u64>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let selected = match queue_id {
+        Some(queue_id) => app
+            .file_transfers
+            .recovery_queued
+            .iter()
+            .find(|job| job.queue_id == queue_id)
+            .map(|job| job.queue_id),
+        None => app.file_transfers.recovery_queued.front().map(|job| job.queue_id),
+    };
+    let Some(queue_id) = selected else {
+        app.set_status("No matching interrupted file operation is awaiting recovery review");
+        return;
+    };
+    cancel_queued_file_transfer(app, queue_id, tx);
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -40303,6 +40704,11 @@ fn remove_derived_private_artifact(
 
 struct FileTaskWorker {
     job: FileTaskJob,
+    /// Filesystem-authoritative endpoints captured at journal admission. The
+    /// job itself deliberately retains the user's lexical mappings for UI and
+    /// retry identity.
+    execution_mappings: Vec<tui_file_picker::PasteMapping>,
+    execution_destination_root: std::path::PathBuf,
     sink: FileTaskEventSink,
     journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
     controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
@@ -40404,7 +40810,29 @@ impl FileTaskWorker {
         controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
         journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
     ) -> Self {
+        let execution_mappings = file_task_job_mappings(&job);
+        let execution_destination_root = std::path::PathBuf::from(job.dest.trim());
+        Self::new_with_sink_and_admitted_paths(
+            job,
+            sink,
+            controls,
+            journal,
+            execution_mappings,
+            execution_destination_root,
+        )
+    }
+
+    fn new_with_sink_and_admitted_paths(
+        job: FileTaskJob,
+        sink: FileTaskEventSink,
+        controls: std::sync::mpsc::Receiver<super::app::FileTaskControl>,
+        journal: Option<super::file_task_runtime::FileTaskJournalHandle>,
+        execution_mappings: Vec<tui_file_picker::PasteMapping>,
+        execution_destination_root: std::path::PathBuf,
+    ) -> Self {
         let now = std::time::Instant::now();
+        let logical_mappings = file_task_job_mappings(&job);
+        debug_assert_eq!(logical_mappings.len(), execution_mappings.len());
         let root_results = job
             .sources
             .iter()
@@ -40430,7 +40858,19 @@ impl FileTaskWorker {
         let move_recovery_by_source = job
             .clipboard_retry_plan
             .as_ref()
-            .map(|retry| retry.recovery_by_source.clone())
+            .map(|retry| {
+                logical_mappings
+                    .iter()
+                    .zip(&execution_mappings)
+                    .filter_map(|(logical, admitted)| {
+                        retry
+                            .recovery_by_source
+                            .get(&logical.source)
+                            .cloned()
+                            .map(|proof| (admitted.source.clone(), proof))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let apply_all_policy = match job.conflict_policy {
             Some(tui_file_picker::ConflictPolicyPreset::Overwrite) => {
@@ -40441,6 +40881,8 @@ impl FileTaskWorker {
         };
         Self {
             job,
+            execution_mappings,
+            execution_destination_root,
             sink,
             journal,
             controls,
@@ -40480,6 +40922,61 @@ impl FileTaskWorker {
             #[cfg(test)]
             forced_cleanup_control_after_deleted_entries: None,
         }
+    }
+
+    fn logical_mapping_for_execution_source(
+        &self,
+        source: &std::path::Path,
+    ) -> Option<tui_file_picker::PasteMapping> {
+        let logical = file_task_job_mappings(&self.job);
+        self.execution_mappings
+            .iter()
+            .position(|mapping| mapping.source == source)
+            .and_then(|index| logical.get(index))
+            .cloned()
+    }
+
+    fn execution_mapping_for_logical_source(
+        &self,
+        source: &std::path::Path,
+    ) -> Option<tui_file_picker::PasteMapping> {
+        let logical = file_task_job_mappings(&self.job);
+        logical
+            .iter()
+            .position(|mapping| mapping.source == source)
+            .and_then(|index| self.execution_mappings.get(index))
+            .cloned()
+    }
+
+    fn retain_execution_sources_excluding(
+        &mut self,
+        excluded: &std::collections::BTreeSet<std::path::PathBuf>,
+    ) {
+        let logical = file_task_job_mappings(&self.job);
+        let admitted = self.execution_mappings.clone();
+        let keep = admitted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mapping)| (!excluded.contains(&mapping.source)).then_some(index))
+            .collect::<Vec<_>>();
+
+        self.job.sources = keep
+            .iter()
+            .filter_map(|index| logical.get(*index))
+            .map(|mapping| mapping.source.clone())
+            .collect();
+        if self.job.root_targets.is_some() {
+            self.job.root_targets = Some(
+                keep.iter()
+                    .filter_map(|index| logical.get(*index))
+                    .map(|mapping| mapping.destination.clone())
+                    .collect(),
+            );
+        }
+        self.execution_mappings = keep
+            .into_iter()
+            .filter_map(|index| admitted.get(index).cloned())
+            .collect();
     }
 
     fn run(mut self) {
@@ -40591,7 +41088,17 @@ impl FileTaskWorker {
                     .to_string(),
             );
         }
-        let identities = capture_file_task_endpoint_identities(&self.job, &record.mappings)?;
+        let admitted_mappings = record.admitted_mappings_for(&record.mappings)?;
+        let destination_root = record
+            .admitted_destination_root
+            .as_deref()
+            .ok_or_else(|| {
+                "file-operation journal has no durable admitted destination root".to_string()
+            })?;
+        let identities = capture_file_task_endpoint_identities(
+            &admitted_mappings,
+            destination_root,
+        )?;
         journal
             .record_endpoint_identities(&identities)
             .map_err(|error| format!("durably record file-operation endpoints: {error}"))
@@ -41253,7 +41760,7 @@ impl FileTaskWorker {
         if artifact_generations.is_empty() {
             artifact_generations.push(record.generation);
         }
-        let journal_mappings = record.mappings.clone();
+        let journal_mappings = record.admitted_mappings_for(&record.mappings)?;
         let mut endpoint_cache = FileTaskEndpointVerificationCache::new(&record);
 
         for artifact in record.temp_artifacts.iter().cloned() {
@@ -41399,10 +41906,9 @@ impl FileTaskWorker {
         if !self.job.is_move {
             if has_deferred_work {
                 let active_sources = self
-                    .job
-                    .sources
+                    .execution_mappings
                     .iter()
-                    .cloned()
+                    .map(|mapping| mapping.source.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 let mut unavailable_sources = std::collections::BTreeSet::new();
                 for mapping in journal_mappings
@@ -41426,26 +41932,7 @@ impl FileTaskWorker {
                     }
                 }
                 if !unavailable_sources.is_empty() {
-                    let mut retained_sources = Vec::new();
-                    let mut retained_targets = Vec::new();
-                    for (index, source) in self.job.sources.iter().enumerate() {
-                        if unavailable_sources.contains(source) {
-                            continue;
-                        }
-                        retained_sources.push(source.clone());
-                        if let Some(target) = self
-                            .job
-                            .root_targets
-                            .as_ref()
-                            .and_then(|targets| targets.get(index))
-                        {
-                            retained_targets.push(target.clone());
-                        }
-                    }
-                    self.job.sources = retained_sources;
-                    if self.job.root_targets.is_some() {
-                        self.job.root_targets = Some(retained_targets);
-                    }
+                    self.retain_execution_sources_excluding(&unavailable_sources);
                 }
             }
             return Ok(());
@@ -41466,13 +41953,14 @@ impl FileTaskWorker {
             .collect::<std::collections::BTreeMap<_, _>>();
 
         for result in self.root_results.clone() {
-            let source = result.source;
-            let destination = record
-                .mappings
-                .iter()
-                .find(|mapping| mapping.source == source)
-                .map(|mapping| mapping.destination.clone())
-                .unwrap_or_else(|| result.destination.clone());
+            let logical_source = result.source;
+            let Some(execution_mapping) = self
+                .execution_mapping_for_logical_source(&logical_source)
+            else {
+                continue;
+            };
+            let source = execution_mapping.source;
+            let destination = execution_mapping.destination;
             if let Err(error) = endpoint_cache.source(&source) {
                 let committed = quarantines_by_source
                     .get(&source)
@@ -41598,16 +42086,13 @@ impl FileTaskWorker {
             let Some(retry) = retry.as_ref() else {
                 continue;
             };
-            let Some(proof) = retry.recovery_by_source.get(&source).cloned() else {
+            let Some(proof) = retry.recovery_by_source.get(&logical_source).cloned() else {
                 continue;
             };
-            let destination = retry
-                .plan
-                .mappings
-                .iter()
-                .find(|mapping| mapping.source == source)
-                .map(|mapping| mapping.destination.clone())
-                .unwrap_or(result.destination);
+            let destination = self
+                .execution_mapping_for_logical_source(&logical_source)
+                .map(|mapping| mapping.destination)
+                .unwrap_or(destination);
 
             if let Some(artifact) = quarantines_by_source.get(&source) {
                 if quarantine_present {
@@ -41856,26 +42341,7 @@ impl FileTaskWorker {
         }
 
         if !terminal_sources.is_empty() {
-            let mut retained_sources = Vec::new();
-            let mut retained_targets = Vec::new();
-            for (index, source) in self.job.sources.iter().enumerate() {
-                if terminal_sources.contains(source) {
-                    continue;
-                }
-                retained_sources.push(source.clone());
-                if let Some(target) = self
-                    .job
-                    .root_targets
-                    .as_ref()
-                    .and_then(|targets| targets.get(index))
-                {
-                    retained_targets.push(target.clone());
-                }
-            }
-            self.job.sources = retained_sources;
-            if self.job.root_targets.is_some() {
-                self.job.root_targets = Some(retained_targets);
-            }
+            self.retain_execution_sources_excluding(&terminal_sources);
         }
         Ok(())
     }
@@ -41886,14 +42352,18 @@ impl FileTaskWorker {
         if self.stop_after_committed_cleanup {
             return Ok(FileTaskStep::Completed);
         }
-        let dest_dir = std::path::PathBuf::from(self.job.dest.trim());
+        let dest_dir = self.execution_destination_root.clone();
 
         // Copy jobs build their bounded recursive plan before mutation. Move
         // jobs capture only each selected root initially so a successful native
         // rename remains O(1) in tree size; a recursive plan is built lazily and
         // still before mutation only when rename genuinely falls back to copy.
         // Both forms emit Preparing snapshots and honor host controls.
-        let sources = self.job.sources.clone();
+        let sources = self
+            .execution_mappings
+            .iter()
+            .map(|mapping| mapping.source.clone())
+            .collect::<Vec<_>>();
         let plan = match self.build_file_task_plan_progress(&sources, &dest_dir)? {
             FileTaskPlanBuildStep::Ready(plan) => plan,
             FileTaskPlanBuildStep::Aborted => return Ok(FileTaskStep::Aborted),
@@ -42097,7 +42567,13 @@ impl FileTaskWorker {
         );
 
         for (index, source) in sources.iter().enumerate() {
-            let target = if let Some(targets) = self.job.root_targets.as_ref() {
+            let target = if let Some(mapping) = self
+                .execution_mappings
+                .iter()
+                .find(|mapping| mapping.source == *source)
+            {
+                mapping.destination.clone()
+            } else if let Some(targets) = self.job.root_targets.as_ref() {
                 targets
                     .get(index)
                     .cloned()
@@ -43362,8 +43838,12 @@ impl FileTaskWorker {
             destination_manifest: destination_manifest.clone(),
         };
         if let Some(journal) = &self.journal {
+            let logical_source = self
+                .logical_mapping_for_execution_source(source)
+                .map(|mapping| mapping.source)
+                .unwrap_or_else(|| source.to_path_buf());
             journal
-                .record_move_recovery_proof(source, &recovery_proof)
+                .record_move_recovery_proof(&logical_source, &recovery_proof)
                 .map_err(|error| {
                     format!(
                         "durably record verified destination authority before source cleanup: {error}"
@@ -44919,6 +45399,10 @@ impl FileTaskWorker {
         disposition: tui_file_picker::FileTaskRootDisposition,
         message: Option<String>,
     ) {
+        let logical_source = self
+            .logical_mapping_for_execution_source(source)
+            .map(|mapping| mapping.source)
+            .unwrap_or_else(|| source.to_path_buf());
         let completed = self.completed_proofs_by_source.remove(source);
         let undo_disposition = if disposition.is_completed() {
             self.undo_disposition_by_source
@@ -44935,7 +45419,11 @@ impl FileTaskWorker {
         } else {
             (destination.to_path_buf(), None)
         };
-        if let Some(result) = self.root_results.iter_mut().find(|result| result.source == source) {
+        if let Some(result) = self
+            .root_results
+            .iter_mut()
+            .find(|result| result.source == logical_source)
+        {
             result.destination = authoritative_destination;
             result.disposition = disposition;
             result.message = message;
@@ -44944,7 +45432,7 @@ impl FileTaskWorker {
         }
         self.roots_since_journal_checkpoint =
             self.roots_since_journal_checkpoint.saturating_add(1);
-        self.dirty_journal_roots.insert(source.to_path_buf());
+        self.dirty_journal_roots.insert(logical_source);
         if self.roots_since_journal_checkpoint >= FILE_TASK_ROOTS_PER_JOURNAL_CHECKPOINT {
             self.checkpoint_journal(
                 super::file_task_runtime::DurableFileTaskLifecycle::Running,
@@ -45007,7 +45495,11 @@ impl FileTaskWorker {
         let mut retry = seed.retain_sources(&retry_sources)?;
         retry.recovery_by_source.clear();
         for mapping in &retry.plan.mappings {
-            if let Some(proof) = self.move_recovery_by_source.get(&mapping.source) {
+            let execution_source = self
+                .execution_mapping_for_logical_source(&mapping.source)
+                .map(|mapping| mapping.source)
+                .unwrap_or_else(|| mapping.source.clone());
+            if let Some(proof) = self.move_recovery_by_source.get(&execution_source) {
                 retry
                     .recovery_by_source
                     .insert(mapping.source.clone(), proof.clone());
@@ -45252,14 +45744,33 @@ fn supervise_file_task_process(
             return;
         }
     };
-    let mut child = match Command::new(executable)
-        .arg("__file-task-worker")
-        .arg("--journal")
-        .arg(journal.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    #[cfg(unix)]
+    let lease_fd = match journal.lease_fd() {
+        Ok(fd) => fd,
+        Err(error) => {
+            emit_supervisor_start_failure(&tx, &job, &mappings, error);
+            return;
+        }
+    };
+    let mut command = Command::new(executable);
+    command.arg("__file-task-worker").arg("--journal").arg(journal.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.arg("--lease-fd").arg(lease_fd.to_string());
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(lease_fd, libc::F_GETFD);
+                if flags < 0 { return Err(std::io::Error::last_os_error()); }
+                if libc::fcntl(lease_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match command.spawn()
     {
         Ok(child) => child,
         Err(error) => {
@@ -45454,7 +45965,11 @@ fn supervise_file_task_process(
                         retry_plan,
                     },
                 );
-                reap_file_task_child(child);
+                // The helper shares the close-only JournalOperation OFD. Wait
+                // for that holder to exit before lifecycle-owned descriptor
+                // retirement; no holder ever calls LOCK_UN.
+                let _ = child.wait();
+                let _ = journal.retire_terminal_clean();
                 return;
             }
             Ok(Err(error)) => {
@@ -45589,7 +46104,10 @@ fn best_effort_cleanup_abandoned_generation(
     let generations = [journal.generation()];
     let mut shallow_scan_roots = std::collections::BTreeSet::new();
     let mut recursive_scan_roots = std::collections::BTreeSet::new();
-    for mapping in &record.mappings {
+    let Ok(admitted_mappings) = record.admitted_mappings_for(&record.mappings) else {
+        return;
+    };
+    for mapping in &admitted_mappings {
         if endpoint_cache.destination(&mapping.destination).is_err() {
             continue;
         }
@@ -45723,7 +46241,11 @@ fn summarize_abandoned_file_task(
             record
                 .quarantine_artifacts
                 .iter()
-                .map(|artifact| (artifact.original_source.clone(), artifact.state))
+                .filter_map(|artifact| {
+                    record
+                        .logical_source_for_admitted(&artifact.original_source)
+                        .map(|source| (source, artifact.state))
+                })
                 .collect::<std::collections::BTreeMap<_, _>>()
         })
         .unwrap_or_default();
@@ -45920,20 +46442,37 @@ fn emit_forced_abandon_completion(
 }
 
 /// Entry point for the hidden helper-process CLI command.
-pub fn run_internal_file_task_worker(journal_path: &std::path::Path) -> anyhow::Result<()> {
+pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i32) -> anyhow::Result<()> {
     use std::io::BufRead as _;
 
-    let journal = super::file_task_runtime::FileTaskJournalHandle::open(journal_path.to_path_buf())
-        .map_err(anyhow::Error::msg)?;
+    #[cfg(unix)]
+    let journal = unsafe {
+        super::file_task_runtime::FileTaskJournalHandle::open_with_inherited_lease(
+            journal_path.to_path_buf(), lease_fd,
+        )
+    }.map_err(anyhow::Error::msg)?;
+    #[cfg(not(unix))]
+    let journal = {
+        let _ = lease_fd;
+        return Err(anyhow::anyhow!("file-task persistent lease handoff requires Unix descriptor inheritance"));
+    };
     let record = journal.load().map_err(anyhow::Error::msg)?;
     if journal.is_abandoned() {
         return Ok(());
     }
-    let job: FileTaskJob = serde_json::from_value(record.job)
+    let job: FileTaskJob = serde_json::from_value(record.job.clone())
         .map_err(|error| anyhow::anyhow!("decode file-task job: {error}"))?;
     if job.job_id != journal.job_id() || job.generation != journal.generation() {
         return Err(anyhow::anyhow!("file-task helper journal identity mismatch"));
     }
+    let requested_mappings = file_task_job_mappings(&job);
+    let admitted_mappings = record
+        .admitted_mappings_for(&requested_mappings)
+        .map_err(anyhow::Error::msg)?;
+    let admitted_destination_root = record
+        .admitted_destination_root
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("file-task journal has no durable admitted destination root"))?;
 
     let (control_tx, control_rx) = std::sync::mpsc::channel();
     let _ = std::thread::Builder::new()
@@ -45963,7 +46502,15 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path) -> anyhow::
         super::file_task_runtime::DurableFileTaskLifecycle::Running,
         "helper executing",
     );
-    FileTaskWorker::new_with_sink(job, sink, control_rx, Some(journal)).run();
+    FileTaskWorker::new_with_sink_and_admitted_paths(
+        job,
+        sink,
+        control_rx,
+        Some(journal),
+        admitted_mappings,
+        admitted_destination_root,
+    )
+    .run();
     Ok(())
 }
 
@@ -47091,8 +47638,8 @@ fn capture_file_task_endpoint_identity(
 }
 
 fn capture_file_task_endpoint_identities(
-    job: &FileTaskJob,
     mappings: &[tui_file_picker::PasteMapping],
+    destination_root: &std::path::Path,
 ) -> Result<Vec<super::file_task_runtime::DurableEndpointIdentity>, String> {
     let mut identities = Vec::with_capacity(mappings.len().saturating_add(1));
     for mapping in mappings {
@@ -47107,11 +47654,10 @@ fn capture_file_task_endpoint_identities(
             anchor_start,
         )?);
     }
-    let destination_root = std::path::PathBuf::from(job.dest.trim());
     identities.push(capture_file_task_endpoint_identity(
         super::file_task_runtime::DurableEndpointRole::Destination,
-        &destination_root,
-        &destination_root,
+        destination_root,
+        destination_root,
     )?);
     Ok(identities)
 }
@@ -48798,6 +49344,27 @@ mod file_operation_safety_tests {
     };
     use std::fs;
 
+    struct TestConcurrencyEnvironment {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestConcurrencyEnvironment {
+        fn install(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("TONEPOET_CONCURRENCY_DIR");
+            std::env::set_var("TONEPOET_CONCURRENCY_DIR", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestConcurrencyEnvironment {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("TONEPOET_CONCURRENCY_DIR", previous),
+                None => std::env::remove_var("TONEPOET_CONCURRENCY_DIR"),
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct FixedEndpointIdentityProvider {
         current: super::super::file_task_runtime::DurableEndpointVolumeIdentity,
@@ -49373,6 +49940,326 @@ mod file_operation_safety_tests {
             err.contains("stat target"),
             "unexpected verification error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_admitted_copy_stays_on_original_tree_after_display_alias_rebind() {
+        use crate::concurrency::{
+            ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+        };
+        use std::os::unix::fs::symlink;
+
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let _concurrency_environment =
+            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
+        let source = temp.path().join("source.flac");
+        let real_a = temp.path().join("real-a");
+        let real_b = temp.path().join("real-b");
+        let alias = temp.path().join("alias");
+        let logical_destination = alias.join("new.flac");
+        fs::write(&source, b"admitted audio").expect("source");
+        fs::create_dir(&real_a).expect("real-a");
+        fs::create_dir(&real_b).expect("real-b");
+        symlink(&real_a, &alias).expect("alias -> real-a");
+
+        let job = FileTaskJob {
+            session_id: 901,
+            job_id: uuid::Uuid::new_v4().to_string(),
+            generation: 1,
+            journal_path: None,
+            stall_timeout_secs: 8,
+            sources: vec![source.clone()],
+            dest: alias.to_string_lossy().into_owned(),
+            force: false,
+            is_move: false,
+            conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+            root_targets: Some(vec![logical_destination.clone()]),
+            clipboard_retry_plan: None,
+            verbose_degrade_notices: false,
+            verification: tui_file_picker::VerificationMode::Standard,
+        };
+        let logical_mappings = file_task_job_mappings(&job);
+        let journal = super::super::file_task_runtime::FileTaskJournalHandle::create(
+            job.job_id.clone(),
+            job.generation,
+            job.session_id,
+            job.is_move,
+            job.verification,
+            job.stall_timeout_secs,
+            logical_mappings.clone(),
+            None,
+            serde_json::to_value(&job).expect("serialize job"),
+        )
+        .expect("admit file task");
+        let record = journal.load().expect("load admitted record");
+        let admitted_mappings = record
+            .admitted_mappings_for(&logical_mappings)
+            .expect("durable admitted mappings");
+        assert_eq!(
+            admitted_mappings[0].destination,
+            real_a.join("new.flac"),
+            "admission must pin the destination below the original referent"
+        );
+
+        let replacement_claim = PathClaim::resolve_with_semantics(
+            &alias,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("alias replacement claim");
+        MutationClaimGuard::acquire_ephemeral(vec![replacement_claim])
+            .expect_err("protocol-aware alias replacement must be Busy while task owns dependency");
+
+        // Simulate an external process outside Tonepoet's registry. The active
+        // task must not consult this lexical alias again after admission.
+        fs::remove_file(&alias).expect("remove display alias");
+        symlink(&real_b, &alias).expect("alias -> real-b");
+
+        let admitted_destination_root = record
+            .admitted_destination_root
+            .clone()
+            .expect("durable admitted destination root");
+        assert_eq!(admitted_destination_root, real_a);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = FileTaskWorker::new_with_sink_and_admitted_paths(
+            job,
+            FileTaskEventSink::App(tx),
+            control_rx,
+            Some(journal),
+            admitted_mappings,
+            admitted_destination_root,
+        );
+        assert_eq!(
+            worker.run_inner().expect("copy through durable admitted paths"),
+            FileTaskStep::Completed
+        );
+        assert_eq!(
+            fs::read(real_a.join("new.flac")).expect("original admitted destination"),
+            b"admitted audio"
+        );
+        assert!(
+            !real_b.join("new.flac").exists(),
+            "external alias rebinding must not redirect already-admitted I/O"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_worker_reuses_original_admitted_destination_after_alias_rebind() {
+        use std::os::unix::fs::symlink;
+
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let _concurrency_environment =
+            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
+        let source = temp.path().join("source.flac");
+        let real_a = temp.path().join("real-a");
+        let real_b = temp.path().join("real-b");
+        let alias = temp.path().join("alias");
+        fs::write(&source, b"resume audio").expect("source");
+        fs::create_dir(&real_a).expect("real-a");
+        fs::create_dir(&real_b).expect("real-b");
+        symlink(&real_a, &alias).expect("alias -> real-a");
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let mut job = FileTaskJob {
+            session_id: 911,
+            job_id: job_id.clone(),
+            generation: 1,
+            journal_path: None,
+            stall_timeout_secs: 8,
+            sources: vec![source.clone()],
+            dest: alias.to_string_lossy().into_owned(),
+            force: false,
+            is_move: false,
+            conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+            root_targets: Some(vec![alias.join("resumed.flac")]),
+            clipboard_retry_plan: None,
+            verbose_degrade_notices: false,
+            verification: tui_file_picker::VerificationMode::Standard,
+        };
+        let mappings = file_task_job_mappings(&job);
+        let first = super::super::file_task_runtime::FileTaskJournalHandle::create(
+            job_id,
+            1,
+            job.session_id,
+            false,
+            job.verification,
+            job.stall_timeout_secs,
+            mappings.clone(),
+            None,
+            serde_json::to_value(&job).expect("serialize first job"),
+        )
+        .expect("initial admission");
+        let journal_path = first.path().to_path_buf();
+        assert_eq!(
+            first.load().expect("first record").admitted_mappings[0].destination,
+            real_a.join("resumed.flac")
+        );
+        drop(first);
+
+        fs::remove_file(&alias).expect("remove old alias");
+        symlink(&real_b, &alias).expect("alias -> real-b");
+        job.generation = 2;
+        job.session_id = 912;
+        let resumed = super::super::file_task_runtime::FileTaskJournalHandle::resume(
+            journal_path,
+            job.generation,
+            job.session_id,
+            false,
+            job.verification,
+            job.stall_timeout_secs,
+            mappings.clone(),
+            None,
+            serde_json::to_value(&job).expect("serialize resumed job"),
+        )
+        .expect("explicit resume");
+        let record = resumed.load().expect("resumed record");
+        let admitted_mappings = record
+            .admitted_mappings_for(&mappings)
+            .expect("resumed admitted mappings");
+        let admitted_destination_root = record
+            .admitted_destination_root
+            .clone()
+            .expect("resumed destination root");
+        assert_eq!(admitted_mappings[0].destination, real_a.join("resumed.flac"));
+        assert_eq!(admitted_destination_root, real_a);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut worker = FileTaskWorker::new_with_sink_and_admitted_paths(
+            job,
+            FileTaskEventSink::App(tx),
+            control_rx,
+            Some(resumed),
+            admitted_mappings,
+            admitted_destination_root,
+        );
+        assert_eq!(
+            worker.run_inner().expect("resumed copy"),
+            FileTaskStep::Completed
+        );
+        assert_eq!(
+            fs::read(real_a.join("resumed.flac")).expect("original target after resume"),
+            b"resume audio"
+        );
+        assert!(
+            !real_b.join("resumed.flac").exists(),
+            "resume must not recompute the current alias target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_admitted_symlink_root_copy_and_move_preserve_link_object() {
+        use std::os::unix::fs::symlink;
+
+        let _environment_lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _journal_environment =
+            TestFileTaskJournalEnvironment::install(&temp.path().join("journals"));
+        let _concurrency_environment =
+            TestConcurrencyEnvironment::install(&temp.path().join("claims"));
+
+        for is_move in [false, true] {
+            let case = if is_move { "move" } else { "copy" };
+            let case_dir = temp.path().join(case);
+            let destination_dir = case_dir.join("destination");
+            fs::create_dir_all(&destination_dir).expect("destination dir");
+            let referent = case_dir.join("real.flac");
+            let source_link = case_dir.join("selected-link.flac");
+            let destination_link = destination_dir.join("selected-link.flac");
+            fs::write(&referent, b"referent stays put").expect("referent");
+            symlink(&referent, &source_link).expect("source symlink");
+            let original_link_target = fs::read_link(&source_link).expect("read source link");
+
+            let job = FileTaskJob {
+                session_id: if is_move { 903 } else { 902 },
+                job_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                journal_path: None,
+                stall_timeout_secs: 8,
+                sources: vec![source_link.clone()],
+                dest: destination_dir.to_string_lossy().into_owned(),
+                force: false,
+                is_move,
+                conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Skip),
+                root_targets: Some(vec![destination_link.clone()]),
+                clipboard_retry_plan: None,
+                verbose_degrade_notices: false,
+                verification: tui_file_picker::VerificationMode::Standard,
+            };
+            let logical_mappings = file_task_job_mappings(&job);
+            let journal = super::super::file_task_runtime::FileTaskJournalHandle::create(
+                job.job_id.clone(),
+                job.generation,
+                job.session_id,
+                job.is_move,
+                job.verification,
+                job.stall_timeout_secs,
+                logical_mappings.clone(),
+                None,
+                serde_json::to_value(&job).expect("serialize job"),
+            )
+            .expect("admit symlink-root file task");
+            let record = journal.load().expect("load admitted record");
+            let admitted_mappings = record
+                .admitted_mappings_for(&logical_mappings)
+                .expect("durable admitted mappings");
+            assert_eq!(admitted_mappings[0].source, source_link);
+            assert!(
+                fs::symlink_metadata(&admitted_mappings[0].source)
+                    .expect("admitted source metadata")
+                    .file_type()
+                    .is_symlink(),
+                "admission must protect the selected symlink entry, not its referent"
+            );
+            let admitted_destination_root = record
+                .admitted_destination_root
+                .clone()
+                .expect("admitted destination root");
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let (_control_tx, control_rx) = std::sync::mpsc::channel();
+            let mut worker = FileTaskWorker::new_with_sink_and_admitted_paths(
+                job,
+                FileTaskEventSink::App(tx),
+                control_rx,
+                Some(journal),
+                admitted_mappings,
+                admitted_destination_root,
+            );
+            assert_eq!(
+                worker.run_inner().expect("symlink-root file task"),
+                FileTaskStep::Completed
+            );
+
+            assert_eq!(
+                fs::read_link(&destination_link).expect("destination remains symlink"),
+                original_link_target
+            );
+            assert_eq!(fs::read(&referent).expect("referent preserved"), b"referent stays put");
+            if is_move {
+                assert!(
+                    fs::symlink_metadata(&source_link).is_err(),
+                    "move removes the symlink directory entry"
+                );
+            } else {
+                assert!(
+                    fs::symlink_metadata(&source_link)
+                        .expect("copy retains source link")
+                        .file_type()
+                        .is_symlink()
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -50969,13 +51856,37 @@ pub(super) fn commit_browse_create(
         }
     };
     let target = dir.join(name);
+    let scope = match kind {
+        BrowseCreateKind::File => crate::concurrency::ClaimScope::Exact,
+        BrowseCreateKind::Folder => crate::concurrency::ClaimScope::Subtree,
+    };
+    let claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+        &target,
+        crate::concurrency::ClaimMode::Write,
+        scope,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            app.set_status(format!("create: admission failed: {error}"));
+            return false;
+        }
+    };
+    let admitted_target = claim.identity.resolved_io_path.clone();
+    let _mutation_claim = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim]) {
+        Ok(guard) => guard,
+        Err(error) => {
+            app.set_status(format!("create: busy: {error}"));
+            return false;
+        }
+    };
     let result = match kind {
         BrowseCreateKind::File => std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&target)
+            .open(&admitted_target)
             .map(|_| ()),
-        BrowseCreateKind::Folder => std::fs::create_dir(&target),
+        BrowseCreateKind::Folder => std::fs::create_dir(&admitted_target),
     };
     match result {
         Ok(()) => {
@@ -52215,6 +53126,7 @@ struct PermanentDeleteSummary {
     deleted: usize,
     already_missing: usize,
     errors: usize,
+    busy: bool,
 }
 
 fn path_component_count(path: &std::path::Path) -> usize {
@@ -52241,7 +53153,9 @@ fn has_unstable_path_components(path: &std::path::Path) -> bool {
     })
 }
 
-fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
+fn permanent_delete_claim(
+    path: &std::path::Path,
+) -> std::io::Result<Option<crate::concurrency::PathClaim>> {
     if path.as_os_str().is_empty()
         || is_filesystem_root(path)
         || has_unstable_path_components(path)
@@ -52254,10 +53168,31 @@ fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
 
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let file_type = metadata.file_type();
+    let scope = if file_type.is_dir() && !file_type.is_symlink() {
+        crate::concurrency::ClaimScope::Subtree
+    } else {
+        crate::concurrency::ClaimScope::Exact
+    };
+    crate::concurrency::PathClaim::resolve_with_semantics(
+        path,
+        crate::concurrency::ClaimMode::Write,
+        scope,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )
+    .map(Some)
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+}
+
+fn delete_path_permanently_admitted(path: &std::path::Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err),
     };
-
     let file_type = metadata.file_type();
     if file_type.is_dir() && !file_type.is_symlink() {
         std::fs::remove_dir_all(path)?;
@@ -52265,6 +53200,16 @@ fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
         std::fs::remove_file(path)?;
     }
     Ok(true)
+}
+
+fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
+    let Some(claim) = permanent_delete_claim(path)? else {
+        return Ok(false);
+    };
+    let admitted = claim.identity.resolved_io_path.clone();
+    let _guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error))?;
+    delete_path_permanently_admitted(&admitted)
 }
 
 fn permanently_delete_paths(paths: &[std::path::PathBuf]) -> PermanentDeleteSummary {
@@ -52277,13 +53222,46 @@ fn permanently_delete_paths(paths: &[std::path::PathBuf]) -> PermanentDeleteSumm
             .then_with(|| left.cmp(right))
     });
 
+    // Resolve the complete selected mutation set before deleting the first
+    // entry. NamespaceObject preserves symlink deletion semantics; real
+    // directories claim Subtree so descendant users conflict.
     let mut summary = PermanentDeleteSummary::default();
-    for path in ordered {
-        match delete_path_permanently(&path) {
+    let mut claims = Vec::new();
+    let mut admitted = Vec::new();
+    for path in &ordered {
+        match permanent_delete_claim(path) {
+            Ok(Some(claim)) => {
+                admitted.push((path.clone(), claim.identity.resolved_io_path.clone()));
+                claims.push(claim);
+            }
+            Ok(None) => summary.already_missing += 1,
+            Err(error) => {
+                log::warn!("delete admission: {}: {}", path.display(), error);
+                summary.errors += 1;
+                return summary;
+            }
+        }
+    }
+    if claims.is_empty() {
+        return summary;
+    }
+
+    let _guard = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(claims) {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!("delete admission busy; no selected path was changed: {error}");
+            summary.errors += 1;
+            summary.busy = true;
+            return summary;
+        }
+    };
+
+    for (logical, admitted_path) in admitted {
+        match delete_path_permanently_admitted(&admitted_path) {
             Ok(true) => summary.deleted += 1,
             Ok(false) => summary.already_missing += 1,
             Err(err) => {
-                log::warn!("delete: {}: {}", path.display(), err);
+                log::warn!("delete: {}: {}", logical.display(), err);
                 summary.errors += 1;
             }
         }
@@ -52319,6 +53297,124 @@ mod permanent_delete_tests {
 
         assert_eq!(delete_path_permanently(&dir).expect("delete dir"), true);
         assert!(!dir.exists(), "directory tree should be permanently removed");
+    }
+
+    #[test]
+    fn permanent_delete_batch_is_busy_before_first_delete_when_any_member_is_claimed() {
+        use crate::concurrency::{
+            ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a.flac");
+        let b = temp.path().join("b.flac");
+        std::fs::write(&a, b"a").expect("fixture a");
+        std::fs::write(&b, b"b").expect("fixture b");
+        let b_claim = PathClaim::resolve_with_semantics(
+            &b,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("claim b");
+        let _guard = MutationClaimGuard::acquire_ephemeral(vec![b_claim]).expect("hold b");
+
+        let summary = permanently_delete_paths(&[a.clone(), b.clone()]);
+        assert!(summary.busy, "overlapping delete batch must report Busy");
+        assert_eq!(summary.deleted, 0);
+        assert!(a.exists(), "A must remain when B prevents whole-batch admission");
+        assert!(b.exists(), "claimed B must remain");
+    }
+
+    #[test]
+    fn permanent_directory_delete_conflicts_with_descendant_read() {
+        use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        let track = album.join("track.flac");
+        std::fs::create_dir(&album).expect("album");
+        std::fs::write(&track, b"audio").expect("track");
+        let read_claim = PathClaim::resolve(&track, ClaimMode::Read, ClaimScope::Exact)
+            .expect("descendant read claim");
+        let _guard = MutationClaimGuard::acquire_ephemeral(vec![read_claim])
+            .expect("hold descendant read");
+
+        let summary = permanently_delete_paths(std::slice::from_ref(&album));
+        assert!(summary.busy);
+        assert!(album.exists());
+        assert!(track.exists());
+    }
+
+    #[test]
+    fn permanent_delete_is_blocked_by_recovery_reserved_claim() {
+        use crate::concurrency::{
+            ClaimMode, ClaimScope, LeaseFamily, MutationClaimGuard, PathClaim,
+            PathResolutionSemantics,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("recoverable.flac");
+        std::fs::write(&path, b"audio").expect("fixture");
+        let claim = PathClaim::resolve_with_semantics(
+            &path,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("recovery claim");
+        let family = LeaseFamily::JournalOperation { job_id: uuid::Uuid::new_v4() };
+        let durable = MutationClaimGuard::acquire(family.clone(), vec![claim])
+            .expect("publish durable file-operation claim");
+        let descriptor = durable.lease().descriptor_path().to_path_buf();
+        drop(durable);
+
+        let summary = permanently_delete_paths(std::slice::from_ref(&path));
+        assert!(summary.busy, "RecoveryReserved path must block permanent delete");
+        assert!(path.exists(), "recovery-reserved file must remain untouched");
+
+        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)
+            .expect("retire test recovery reservation");
+    }
+
+    #[test]
+    fn permanent_delete_of_disjoint_paths_still_proceeds() {
+        use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a.flac");
+        let b = temp.path().join("b.flac");
+        let unrelated = temp.path().join("other.flac");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        std::fs::write(&unrelated, b"other").unwrap();
+        let unrelated_claim = PathClaim::resolve(&unrelated, ClaimMode::Read, ClaimScope::Exact)
+            .expect("unrelated claim");
+        let _unrelated_guard = MutationClaimGuard::acquire_ephemeral(vec![unrelated_claim])
+            .expect("hold unrelated claim");
+
+        let summary = permanently_delete_paths(&[a.clone(), b.clone()]);
+        assert_eq!(summary.deleted, 2);
+        assert!(!summary.busy);
+        assert!(!a.exists() && !b.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_delete_removes_symlink_entry_without_touching_referent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("real.flac");
+        let link = temp.path().join("link.flac");
+        std::fs::write(&referent, b"audio").expect("referent");
+        symlink(&referent, &link).expect("symlink");
+
+        let summary = permanently_delete_paths(std::slice::from_ref(&link));
+        assert_eq!(summary.deleted, 1);
+        assert!(std::fs::symlink_metadata(&link).is_err(), "symlink entry must be removed");
+        assert_eq!(std::fs::read(&referent).unwrap(), b"audio");
     }
 
     #[test]
@@ -52762,15 +53858,17 @@ fn execute_confirm_action(
                 &app.convert.metadata,
             );
             match super::presets::save_preset_to_path_with_db(&preset, path, &app.db) {
-                Ok(()) => {
+                Ok(outcome) => {
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
                     app.active_overlay = ActiveOverlay::None;
-                    app.set_status(format!(
-                        "Saved preset: {} | {}",
-                        path.display(),
-                        preset.resolved_semantics_summary()
-                    ));
+                    if let Some(warning) = outcome.index_warning() {
+                        app.set_status(format!("Saved preset: {}; SQLite index update failed and will be repaired on startup: {warning}", path.display()));
+                    } else {
+                        app.set_status(format!(
+                            "Saved preset: {} | {}", path.display(), preset.resolved_semantics_summary()
+                        ));
+                    }
                 }
                 Err(e) => {
                     app.active_overlay = ActiveOverlay::None;
@@ -52796,7 +53894,9 @@ fn execute_confirm_action(
             if summary.already_missing > 0 {
                 parts.push(format!("{} already gone", summary.already_missing));
             }
-            if summary.errors > 0 {
+            if summary.busy {
+                parts.push("busy; no deletion admitted".to_string());
+            } else if summary.errors > 0 {
                 parts.push(format!("{} errors", summary.errors));
             }
             let status = parts.join(", ");
@@ -83854,6 +84954,114 @@ mod round4_undo_replay_tests {
     }
 
     #[test]
+    fn copy_undo_foreign_claim_rejects_complete_set_before_first_detach() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-copy-undo-shared-admission",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        fn mapping(
+            dir: &std::path::Path,
+            stem: &str,
+        ) -> FileOperationUndoMapping {
+            let source = dir.join(format!("source-{stem}.flac"));
+            let destination = dir.join(format!("copy-{stem}.flac"));
+            std::fs::write(&source, format!("source-{stem}")).expect("source fixture");
+            let source_manifest = tui_file_picker::capture_manifest(&source)
+                .expect("source manifest");
+            std::fs::copy(&source, &destination).expect("copy fixture");
+            let destination_manifest = source_manifest
+                .capture_verified_copy_at(&destination)
+                .expect("destination manifest");
+            FileOperationUndoMapping {
+                source,
+                destination,
+                source_proof: None,
+                destination_proof: Some(tui_file_picker::FileTaskRootProof {
+                    source_manifest,
+                    destination_manifest,
+                }),
+            }
+        }
+
+        let first = mapping(temp.path(), "a");
+        let second = mapping(temp.path(), "b");
+        let first_destination = first.destination.clone();
+        let second_destination = second.destination.clone();
+        let entry = FileOperationUndoEntry {
+            id: 902,
+            kind: FileOperationUndoKind::Copy,
+            rename_base_dir: None,
+            mappings: vec![first, second],
+        };
+
+        let foreign = crate::concurrency::PathClaim::resolve(
+            &second_destination,
+            crate::concurrency::ClaimMode::Read,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("foreign read claim");
+        let _foreign_guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![foreign])
+            .expect("foreign claim");
+
+        let result = execute_file_operation_replay_worker(
+            &entry,
+            true,
+            tui_file_picker::FileOperationPolicy::default(),
+        );
+
+        assert!(result.completed.is_empty());
+        assert_eq!(result.failed.len(), 2, "Busy must reject the whole replay set");
+        assert!(first_destination.exists(), "first root must not be detached before Busy");
+        assert!(second_destination.exists(), "claimed root must remain untouched");
+    }
+
+    #[test]
+    fn move_undo_foreign_claim_is_busy_before_namespace_replay() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-move-undo-shared-admission",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("before.flac");
+        let destination = temp.path().join("after.flac");
+        std::fs::write(&destination, b"moved bytes").expect("committed move fixture");
+        let proof = proof_at_verification(
+            &destination,
+            tui_file_picker::VerificationMode::Standard,
+        );
+        let entry = FileOperationUndoEntry {
+            id: 903,
+            kind: FileOperationUndoKind::Move,
+            rename_base_dir: None,
+            mappings: vec![FileOperationUndoMapping {
+                source: source.clone(),
+                destination: destination.clone(),
+                source_proof: None,
+                destination_proof: Some(proof),
+            }],
+        };
+
+        let foreign = crate::concurrency::PathClaim::resolve(
+            &destination,
+            crate::concurrency::ClaimMode::Read,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("foreign read claim");
+        let _foreign_guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![foreign])
+            .expect("foreign claim");
+
+        let result = execute_file_operation_replay_worker(
+            &entry,
+            true,
+            tui_file_picker::FileOperationPolicy::default(),
+        );
+        assert!(result.completed.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(destination.exists(), "current move root must remain untouched on Busy");
+        assert!(!source.exists(), "undo destination must not be created before admission");
+    }
+
+    #[test]
     fn committed_without_proof_is_terminal_and_is_not_requeued() {
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-round4-terminal-replay-authority",
@@ -83996,6 +85204,59 @@ mod file_transfer_queue_state_tests {
             .file_transfers
             .pending_by_session
             .contains_key(&active_session_id));
+    }
+
+    #[test]
+    fn reviewed_recovery_never_auto_dispatches_and_resume_is_explicit() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-file-transfer-recovery-review",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&destination).expect("destination");
+        let source = temp.path().join("interrupted.flac");
+        std::fs::write(&source, b"source").expect("source");
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping {
+                source: source.clone(),
+                destination: destination.join("interrupted.flac"),
+            }],
+        };
+        let journal = temp.path().join("v2").join("recovery.jsonl");
+        let mut retry = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        retry.recovery_journal_path = Some(journal);
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.test_file_task_dispatches = Some(Vec::new());
+        app.file_transfers.recovery_queued.push_back(QueuedFileTransfer {
+            queue_id: 77,
+            clipboard,
+            clipboard_owner_generation: None,
+            destination_dir: destination,
+            enqueue_plan: plan,
+            retry_plan: Some(retry),
+            recovered: true,
+        });
+        let (tx, _rx) = mpsc::channel(8);
+
+        for _ in 0..4 {
+            maybe_start_next_file_transfer(&mut app, &tx);
+        }
+        assert_eq!(app.file_transfers.recovery_queued.len(), 1);
+        assert!(app.file_transfers.queued.is_empty());
+        assert!(app.file_transfers.active_session_id.is_none());
+        assert!(app.test_file_task_dispatches.as_ref().unwrap().is_empty());
+
+        resume_file_transfer_recovery(&mut app, Some(77), &tx);
+        assert!(app.file_transfers.recovery_queued.is_empty());
+        assert!(app.file_transfers.active_session_id.is_some());
+        assert_eq!(app.test_file_task_dispatches.as_ref().unwrap().len(), 1);
+        assert_eq!(app.test_file_task_dispatches.as_ref().unwrap()[0].1, vec![source]);
     }
 
     #[test]

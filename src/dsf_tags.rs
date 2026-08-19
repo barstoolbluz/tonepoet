@@ -860,15 +860,55 @@ fn reject_symlinked_write_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_dsf_write_lock(
-    path: &Path,
-) -> Result<(crate::config::StoreFileLock, PathBuf), String> {
-    crate::config::StoreFileLock::acquire_for_path(path).map_err(|error| {
+struct DsfWriteLock {
+    _store_lock: crate::config::StoreFileLock,
+    _mutation_claim: Option<crate::concurrency::MutationClaimGuard>,
+}
+
+fn acquire_dsf_write_lock(path: &Path) -> Result<(DsfWriteLock, PathBuf), String> {
+    use crate::concurrency::{ClaimMode, ClaimScope, PathClaim, PathResolutionSemantics};
+
+    let claim = PathClaim::resolve_with_semantics(
+        path,
+        ClaimMode::Write,
+        ClaimScope::Exact,
+        PathResolutionSemantics::NamespaceObject,
+    )
+    .map_err(|error| {
         format!(
-            "acquire bounded DSF metadata-write lock for '{}': {error}",
+            "resolve DSF metadata-write authority for '{}': {error}",
             path.display()
         )
-    })
+    })?;
+    let resolved = claim.identity.resolved_io_path.clone();
+    let mutation_claim = if crate::concurrency::current_mutation_authority_covers(&claim)? {
+        None
+    } else {
+        Some(
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim]).map_err(
+                |error| {
+                    format!(
+                        "acquire DSF metadata-write authority for '{}': {error}",
+                        path.display()
+                    )
+                },
+            )?,
+        )
+    };
+    let (store_lock, _store_resolved) = crate::config::StoreFileLock::acquire_for_path(&resolved)
+        .map_err(|error| {
+            format!(
+                "acquire bounded DSF metadata-write lock for '{}': {error}",
+                path.display()
+            )
+        })?;
+    Ok((
+        DsfWriteLock {
+            _store_lock: store_lock,
+            _mutation_claim: mutation_claim,
+        },
+        resolved,
+    ))
 }
 
 fn read_dsf_header_patch(

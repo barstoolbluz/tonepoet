@@ -48,10 +48,6 @@ pub struct PresetManager {
 impl PresetManager {
     pub fn new() -> io::Result<Self> {
         let presets_dir = Self::get_presets_directory()?;
-
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&presets_dir)?;
-
         Ok(Self { presets_dir })
     }
 
@@ -70,16 +66,7 @@ impl PresetManager {
         }
     }
 
-    pub fn save_preset(&self, preset: &ConversionPreset) -> io::Result<()> {
-        let filename = format!("{}.toml", preset.name);
-        let file_path = self.presets_dir.join(&filename);
 
-        let toml_str =
-            toml::to_string_pretty(preset).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        fs::write(file_path, toml_str)?;
-
-        Ok(())
-    }
 
     #[allow(dead_code)]
     pub fn load_preset(&self, name: &str) -> io::Result<ConversionPreset> {
@@ -113,15 +100,7 @@ impl PresetManager {
         Ok(presets)
     }
 
-    #[allow(dead_code)]
-    pub fn delete_preset(&self, name: &str) -> io::Result<()> {
-        let filename = format!("{}.toml", name);
-        let file_path = self.presets_dir.join(&filename);
 
-        fs::remove_file(file_path)?;
-
-        Ok(())
-    }
 
     pub fn preset_exists(&self, name: &str) -> bool {
         let filename = format!("{}.toml", name);

@@ -58,7 +58,10 @@ pub use source_guard::{
     FilesystemSemantics, RenameSourceProof, RenameVerification, Sha256, SourceEntryProof,
     SourceIdentity, SourceKind, SourceManifest, SourceSnapshot, VerifiedRemoval,
     PreparedVerifiedRemoval, InterruptedRemovalRecovery, prepare_verified_removal,
+    discover_interrupted_verified_removal_restore_targets,
+    recover_interrupted_verified_removal_restore_target,
     recover_interrupted_verified_removals, recover_interrupted_verified_removals_once,
+    InterruptedRemovalRestoreTarget,
     verify_committed_rename, verify_renamed_destination,
 };
 pub use search::FileSearchResult;
@@ -74,7 +77,8 @@ pub use state::{
     FilePickerClipboard, FilePickerClipboardMode, FilePickerConfig, FilePickerCreateKind,
     FilePickerEntry, FilePickerError, FilePickerFocus, FilePickerHitAction,
     FilePickerMenuAction, FilePickerSelectionMode, FilePickerSortKey, FilePickerState, FilePickerTabInfo,
-    duplicate_files_in_place, execute_exact_paste_plan, plan_filesystem_paste_for_dispatch,
+    duplicate_files_in_place, execute_duplicate_plan, execute_exact_paste_plan,
+    plan_duplicate_files_in_place, plan_filesystem_paste_for_dispatch,
     execute_exact_paste_plan_with_proofs,
     execute_exact_paste_plan_with_proofs_and_expected_sources,
     paste_filesystem_clipboard,

@@ -1,9 +1,11 @@
 //! Process-tree supervision for conversion action scripts.
 //!
-//! The public runner always executes the script through a fresh copy of the
-//! tonepoet executable.  Keeping the supervisor in a dedicated process avoids
-//! changing process-global subreaper state in the conversion worker and gives
-//! timeout/cancellation ownership to a process which has no unrelated children.
+//! External work always executes behind a tonepoet-controlled containment process.
+//! Queue conversions reuse one long-lived supervisor per active item and fork
+//! command-specific containment workers beneath it; non-queue callers may use a
+//! fresh dedicated helper. Keeping containment out of the TUI/worker process avoids
+//! changing process-global subreaper state there and gives timeout/cancellation
+//! ownership to a process which has no unrelated children.
 //!
 //! Linux prefers a delegated cgroup-v2 leaf and also makes the dedicated
 //! helper a child subreaper.  A minimal hidden launcher joins the retained
@@ -27,7 +29,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -42,6 +44,12 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 const SUPERVISOR_RESULT_SCHEMA: u32 = 3;
 const LIFECYCLE_EVENT_SCHEMA: u32 = 1;
 const INTERNAL_SUBCOMMAND: &str = "__action-script-supervisor";
+const INTERNAL_ITEM_SUPERVISOR_SUBCOMMAND: &str = "__execution-item-supervisor";
+const ITEM_REQUEST_RUN: u8 = b'R';
+const ITEM_REQUEST_LEASE: u8 = b'L';
+const ITEM_REQUEST_SHUTDOWN: u8 = b'S';
+const ITEM_REQUEST_ACK: u8 = b'A';
+const ITEM_MAX_FDS: usize = 8;
 const INTERNAL_LAUNCHER_SUBCOMMAND: &str = "__action-script-launcher";
 const MAX_LAUNCH_SPEC_BYTES: usize = 1024 * 1024;
 const LAUNCHER_READY: u8 = b'R';
@@ -250,6 +258,17 @@ pub struct SupervisedCommand {
     /// Test/embedding override for the trusted Tonepoet helper binary.
     /// Production callers leave this as `None`, which resolves to `current_exe()`.
     pub helper_executable: Option<PathBuf>,
+    /// Tonepoet-owned lifetime descriptors retained only by the trusted supervisor.
+    /// They are made inheritable for the supervisor handoff and immediately
+    /// restored to CLOEXEC there, so launchers and third-party programs never
+    /// become ownership anchors.
+    pub retained_lifetime_files: Vec<Arc<File>>,
+    /// Optional trusted pipe/file endpoints for supervised internal pipelines.
+    /// They are installed on the tonepoet supervisor process, then inherited as
+    /// ordinary stdio by the contained child. They are not ownership leases.
+    pub stdin_file: Option<Arc<File>>,
+    pub stdout_file: Option<Arc<File>>,
+    pub stderr_file: Option<Arc<File>>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,11 +545,31 @@ where
         .arg("--script-fd")
         .arg(script_fd.to_string())
         .arg("--working-directory-fd")
-        .arg(working_directory_fd.to_string())
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(working_directory_fd.to_string());
+    let retained_lifetime_fds: Vec<RawFd> = invocation
+        .retained_lifetime_files
+        .iter()
+        .map(|file| file.as_raw_fd())
+        .collect();
+    for fd in &retained_lifetime_fds {
+        command.arg("--retained-lifetime-fd").arg(fd.to_string());
+    }
+    command.env_clear();
+    if let Some(file) = invocation.stdin_file.as_ref() {
+        command.stdin(Stdio::from(file.try_clone()?));
+    } else {
+        command.stdin(Stdio::null());
+    }
+    if let Some(file) = invocation.stdout_file.as_ref() {
+        command.stdout(Stdio::from(file.try_clone()?));
+    } else {
+        command.stdout(Stdio::piped());
+    }
+    if let Some(file) = invocation.stderr_file.as_ref() {
+        command.stderr(Stdio::from(file.try_clone()?));
+    } else {
+        command.stderr(Stdio::piped());
+    }
     unsafe {
         command.pre_exec(move || {
             clear_close_on_exec(runtime_fd)?;
@@ -538,6 +577,9 @@ where
             clear_close_on_exec(event_fd)?;
             clear_close_on_exec(script_fd)?;
             clear_close_on_exec(working_directory_fd)?;
+            for fd in &retained_lifetime_fds {
+                clear_close_on_exec(*fd)?;
+            }
             Ok(())
         });
     }
@@ -545,29 +587,42 @@ where
     drop(control_child);
     drop(event_child);
 
-    let stdout = helper.stdout.take().ok_or_else(|| {
-        ScriptSupervisorError::Protocol("supervisor stdout pipe is unavailable".to_string())
-    })?;
-    let stderr = helper.stderr.take().ok_or_else(|| {
-        ScriptSupervisorError::Protocol("supervisor stderr pipe is unavailable".to_string())
-    })?;
+    let stderr = helper.stderr.take();
     let output_stop = Arc::new(AtomicBool::new(false));
-    let stdout_reader = match spawn_tail_reader(stdout, Arc::clone(&output_stop)) {
-        Ok(reader) => reader,
-        Err(error) => {
+    let stdout_reader = match helper.stdout.take() {
+        Some(stdout) => Some(match spawn_tail_reader(stdout, Arc::clone(&output_stop)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = send_control(&mut control_parent, CONTROL_CANCEL);
+                let _ = helper.wait();
+                return Err(error);
+            }
+        }),
+        None if invocation.stdout_file.is_some() => None,
+        None => {
             let _ = send_control(&mut control_parent, CONTROL_CANCEL);
             let _ = helper.wait();
-            return Err(error);
+            return Err(ScriptSupervisorError::Protocol("supervisor stdout pipe is unavailable".to_string()));
         }
     };
-    let stderr_reader = match spawn_tail_reader(stderr, Arc::clone(&output_stop)) {
-        Ok(reader) => reader,
-        Err(error) => {
+    let stderr_reader = match stderr {
+        Some(stderr) => Some(match spawn_tail_reader(stderr, Arc::clone(&output_stop)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = send_control(&mut control_parent, CONTROL_CANCEL);
+                let _ = helper.wait();
+                output_stop.store(true, Ordering::Release);
+                if let Some(reader) = stdout_reader { let _ = join_tail_reader(reader, "stdout"); }
+                return Err(error);
+            }
+        }),
+        None if invocation.stderr_file.is_some() => None,
+        None => {
             let _ = send_control(&mut control_parent, CONTROL_CANCEL);
             let _ = helper.wait();
             output_stop.store(true, Ordering::Release);
-            let _ = join_tail_reader(stdout_reader, "stdout");
-            return Err(error);
+            let _ = join_optional_tail_reader(stdout_reader, "stdout");
+            return Err(ScriptSupervisorError::Protocol("supervisor stderr pipe is unavailable".to_string()));
         }
     };
 
@@ -582,8 +637,8 @@ where
                 let _ = send_control(&mut control_parent, CONTROL_CANCEL);
                 let _ = helper.wait();
                 output_stop.store(true, Ordering::Release);
-                let _ = join_tail_reader(stdout_reader, "stdout");
-                let _ = join_tail_reader(stderr_reader, "stderr");
+                let _ = join_optional_tail_reader(stdout_reader, "stdout");
+                let _ = join_optional_tail_reader(stderr_reader, "stderr");
                 return Err(ScriptSupervisorError::Protocol(
                     "script supervisor emitted an unsupported lifecycle event".to_string(),
                 ));
@@ -621,8 +676,8 @@ where
                     let _ = send_control(&mut control_parent, CONTROL_CANCEL);
                     let _ = helper.wait();
                     output_stop.store(true, Ordering::Release);
-                    let _ = join_tail_reader(stdout_reader, "stdout");
-                    let _ = join_tail_reader(stderr_reader, "stderr");
+                    let _ = join_optional_tail_reader(stdout_reader, "stdout");
+                    let _ = join_optional_tail_reader(stderr_reader, "stderr");
                     return Err(error);
                 }
             }
@@ -662,8 +717,8 @@ where
     // Do not let an unobservable platform escape keep inherited output pipes
     // open forever after the authenticated supervisor has terminated.
     output_stop.store(true, Ordering::Release);
-    let stdout_capture = join_tail_reader(stdout_reader, "stdout")?;
-    let stderr_capture = join_tail_reader(stderr_reader, "stderr")?;
+    let stdout_capture = join_optional_tail_reader(stdout_reader, "stdout")?;
+    let stderr_capture = join_optional_tail_reader(stderr_reader, "stderr")?;
     let output_capture = OutputCaptureSummary {
         stdout: stdout_capture.terminal,
         stderr: stderr_capture.terminal,
@@ -700,6 +755,586 @@ where
         ScriptSupervisorError::Protocol(
             "script supervisor result omitted the script wait status".to_string(),
         )
+    })?;
+    Ok(SupervisedOutcome {
+        status: ExitStatus::from_raw(raw_wait_status),
+        stdout_tail: stdout_capture.bytes,
+        stderr_tail: stderr_capture.bytes,
+        timed_out: result.timed_out,
+        cancelled: result.cancelled,
+        script_released: result.script_released,
+        descriptor,
+        containment_empty: result.containment_empty,
+        background_descendants: result.background_descendants,
+        output_capture,
+    })
+}
+
+
+/// Long-lived tonepoet-owned execution supervisor for one active queue item.
+/// The dedicated process is the only cross-command holder of QueueExecution,
+/// ExecutionClaim and ExecutionStaging lease duplicates. Individual contained
+/// commands run in forked backend workers inside this supervisor process; those
+/// workers never become ownership anchors and third-party programs never
+/// receive the coordination descriptors.
+#[derive(Clone)]
+pub struct ItemExecutionSupervisorClient {
+    request: Arc<Mutex<UnixStream>>,
+    child: Arc<Mutex<Option<Child>>>,
+    supervisor_pid: u32,
+}
+
+impl std::fmt::Debug for ItemExecutionSupervisorClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ItemExecutionSupervisorClient").finish_non_exhaustive()
+    }
+}
+
+impl ItemExecutionSupervisorClient {
+    pub fn start(initial_lifetime_files: &[Arc<File>]) -> Result<Self, ScriptSupervisorError> {
+        let (parent, child_stream) = UnixStream::pair()?;
+        let request_fd = child_stream.as_raw_fd();
+        let helper = match std::env::var_os("TONEPOET_SCRIPT_SUPERVISOR_HELPER") {
+            Some(path) => PathBuf::from(path),
+            None => std::env::current_exe().map_err(|error| {
+                ScriptSupervisorError::Internal(format!(
+                    "cannot locate current executable for item supervision: {error}"
+                ))
+            })?,
+        };
+        let retained_fds = initial_lifetime_files
+            .iter()
+            .map(|file| file.as_raw_fd())
+            .collect::<Vec<_>>();
+        let mut command = Command::new(helper);
+        command
+            .arg(INTERNAL_ITEM_SUPERVISOR_SUBCOMMAND)
+            .arg("--request-fd")
+            .arg(request_fd.to_string())
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for fd in &retained_fds {
+            command.arg("--retained-lifetime-fd").arg(fd.to_string());
+        }
+        unsafe {
+            command.pre_exec(move || {
+                clear_close_on_exec(request_fd)?;
+                for fd in &retained_fds {
+                    clear_close_on_exec(*fd)?;
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        let supervisor_pid = child.id();
+        drop(child_stream);
+        Ok(Self {
+            request: Arc::new(Mutex::new(parent)),
+            child: Arc::new(Mutex::new(Some(child))),
+            supervisor_pid,
+        })
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.supervisor_pid
+    }
+
+    /// Transfer one later-acquired execution/path/staging lease to the item
+    /// supervisor and wait for its acknowledgement. The caller must not release
+    /// a dependent external command before this returns successfully.
+    pub fn handoff_lifetime_file(&self, file: &File) -> Result<(), ScriptSupervisorError> {
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| ScriptSupervisorError::Internal("item supervisor request lock poisoned".to_string()))?;
+        send_item_request(&request, ITEM_REQUEST_LEASE, &[file.as_raw_fd()])?;
+        read_item_ack(&mut request)
+    }
+
+    fn submit_run(&self, fds: &[RawFd]) -> Result<(), ScriptSupervisorError> {
+        if fds.len() != ITEM_MAX_FDS {
+            return Err(ScriptSupervisorError::Protocol(format!(
+                "item supervisor run request supplied {} descriptors; expected {ITEM_MAX_FDS}",
+                fds.len()
+            )));
+        }
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| ScriptSupervisorError::Internal("item supervisor request lock poisoned".to_string()))?;
+        send_item_request(&request, ITEM_REQUEST_RUN, fds)?;
+        read_item_ack(&mut request)
+    }
+
+    pub fn shutdown(&self) -> Result<(), ScriptSupervisorError> {
+        {
+            let mut request = self
+                .request
+                .lock()
+                .map_err(|_| ScriptSupervisorError::Internal("item supervisor request lock poisoned".to_string()))?;
+            send_item_request(&request, ITEM_REQUEST_SHUTDOWN, &[])?;
+            read_item_ack(&mut request)?;
+        }
+        if let Some(mut child) = self
+            .child
+            .lock()
+            .map_err(|_| ScriptSupervisorError::Internal("item supervisor child lock poisoned".to_string()))?
+            .take()
+        {
+            let status = child.wait()?;
+            if !status.success() {
+                return Err(ScriptSupervisorError::Internal(format!(
+                    "item execution supervisor exited as {status}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_item_ack(stream: &mut UnixStream) -> Result<(), ScriptSupervisorError> {
+    let mut ack = [0_u8; 1];
+    stream.read_exact(&mut ack)?;
+    if ack[0] != ITEM_REQUEST_ACK {
+        return Err(ScriptSupervisorError::Protocol(
+            "item execution supervisor returned an invalid acknowledgement".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn send_item_request(stream: &UnixStream, tag: u8, fds: &[RawFd]) -> io::Result<()> {
+    if fds.len() > ITEM_MAX_FDS {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many item-supervisor descriptors"));
+    }
+    let mut byte = [tag];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let control_len = if fds.is_empty() {
+        0
+    } else {
+        unsafe { libc::CMSG_SPACE((fds.len() * std::mem::size_of::<RawFd>()) as _) as usize }
+    };
+    let mut control = vec![0_u8; control_len];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len();
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(io::Error::new(io::ErrorKind::Other, "cannot allocate SCM_RIGHTS header"));
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN((fds.len() * std::mem::size_of::<RawFd>()) as _) as usize;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                fds.len() * std::mem::size_of::<RawFd>(),
+            );
+        }
+    }
+    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
+    if sent == 1 { Ok(()) } else if sent < 0 { Err(io::Error::last_os_error()) } else {
+        Err(io::Error::new(io::ErrorKind::WriteZero, "short item-supervisor request write"))
+    }
+}
+
+fn receive_item_request(stream: &UnixStream) -> io::Result<Option<(u8, Vec<File>)>> {
+    let mut tag = [0_u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: tag.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let control_len = unsafe {
+        libc::CMSG_SPACE((ITEM_MAX_FDS * std::mem::size_of::<RawFd>()) as _) as usize
+    };
+    let mut control = vec![0_u8; control_len];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    if received == 0 {
+        return Ok(None);
+    }
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if received != 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid item-supervisor request frame"));
+    }
+    let mut files = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let base = libc::CMSG_LEN(0) as usize;
+                let bytes = (*cmsg).cmsg_len.saturating_sub(base);
+                if bytes % std::mem::size_of::<RawFd>() != 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "misaligned SCM_RIGHTS payload"));
+                }
+                let count = bytes / std::mem::size_of::<RawFd>();
+                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                for index in 0..count {
+                    let fd = *data.add(index);
+                    set_close_on_exec(fd)?;
+                    files.push(File::from_raw_fd(fd));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok(Some((tag[0], files)))
+}
+
+fn create_pipe_files() -> io::Result<(File, File)> {
+    let mut fds = [-1_i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(error) = set_close_on_exec(fds[0]).and_then(|_| set_close_on_exec(fds[1])) {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(error);
+    }
+    unsafe { Ok((File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))) }
+}
+
+/// Hidden long-lived per-item supervisor entry point. It stays single-threaded
+/// so a per-command `fork` can safely create an isolated containment backend
+/// worker with command-specific cwd/stdin/stdout/stderr while this parent keeps
+/// all lifetime lease descriptors. No third-party process receives those fds.
+pub fn run_internal_execution_item_supervisor(
+    request_fd: RawFd,
+    retained_lifetime_fds: &[RawFd],
+) -> Result<(), ScriptSupervisorError> {
+    if request_fd < 0 {
+        return Err(ScriptSupervisorError::Protocol("invalid item supervisor request descriptor".to_string()));
+    }
+    let request = unsafe { UnixStream::from_raw_fd(request_fd) };
+    set_close_on_exec(request.as_raw_fd())?;
+    let mut lifetime_files = Vec::with_capacity(retained_lifetime_fds.len());
+    for fd in retained_lifetime_fds {
+        if *fd < 0 {
+            return Err(ScriptSupervisorError::Protocol("invalid item supervisor lifetime descriptor".to_string()));
+        }
+        let file = unsafe { File::from_raw_fd(*fd) };
+        set_close_on_exec(file.as_raw_fd())?;
+        lifetime_files.push(file);
+    }
+    let mut workers = BTreeSet::<libc::pid_t>::new();
+    let mut shutting_down = false;
+    loop {
+        reap_item_workers(&mut workers)?;
+        if shutting_down {
+            if workers.is_empty() {
+                return Ok(());
+            }
+            thread::sleep(CONTROL_POLL_INTERVAL);
+            continue;
+        }
+        let mut pollfd = libc::pollfd {
+            fd: request.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(error.into());
+        }
+        if ready == 0 { continue; }
+        let request_frame = receive_item_request(&request)?;
+        let Some((tag, mut files)) = request_frame else {
+            shutting_down = true;
+            continue;
+        };
+        match tag {
+            ITEM_REQUEST_LEASE => {
+                if files.len() != 1 {
+                    return Err(ScriptSupervisorError::Protocol("lease handoff must contain exactly one fd".to_string()));
+                }
+                lifetime_files.push(files.remove(0));
+                (&request).write_all(&[ITEM_REQUEST_ACK])?;
+            }
+            ITEM_REQUEST_RUN => {
+                if files.len() != ITEM_MAX_FDS {
+                    return Err(ScriptSupervisorError::Protocol(format!(
+                        "run handoff contained {} fds; expected {ITEM_MAX_FDS}", files.len()
+                    )));
+                }
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                if pid == 0 {
+                    // The item supervisor, not this backend worker, owns the
+                    // persistent lifetime descriptors. Close inherited copies
+                    // before any launcher or target process is created.
+                    unsafe { libc::close(request.as_raw_fd()); }
+                    for file in &lifetime_files {
+                        unsafe { libc::close(file.as_raw_fd()); }
+                    }
+                    let raw = files.iter().map(|file| file.as_raw_fd()).collect::<Vec<_>>();
+                    // `run_internal_supervisor` takes ownership of several raw
+                    // descriptors with `File::from_raw_fd`. The fork child exits
+                    // via `_exit`, but forgetting this container also makes the
+                    // single-owner intent explicit and avoids duplicate File
+                    // ownership during backend execution.
+                    std::mem::forget(files);
+                    let status = run_item_backend_worker(&raw);
+                    unsafe { libc::_exit(if status.is_ok() { 0 } else { 70 }); }
+                }
+                workers.insert(pid);
+                drop(files);
+                (&request).write_all(&[ITEM_REQUEST_ACK])?;
+            }
+            ITEM_REQUEST_SHUTDOWN => {
+                if !files.is_empty() {
+                    return Err(ScriptSupervisorError::Protocol("shutdown request carried unexpected fds".to_string()));
+                }
+                (&request).write_all(&[ITEM_REQUEST_ACK])?;
+                shutting_down = true;
+            }
+            _ => return Err(ScriptSupervisorError::Protocol("unknown item supervisor request".to_string())),
+        }
+    }
+}
+
+fn run_item_backend_worker(raw: &[RawFd]) -> Result<(), ScriptSupervisorError> {
+    if raw.len() != ITEM_MAX_FDS {
+        return Err(ScriptSupervisorError::Protocol("invalid backend worker fd set".to_string()));
+    }
+    for (source, target) in [(raw[5], 0), (raw[6], 1), (raw[7], 2)] {
+        if source != target && unsafe { libc::dup2(source, target) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        clear_close_on_exec(target)?;
+    }
+    run_internal_supervisor(raw[0], raw[1], raw[2], raw[3], raw[4], &[])
+}
+
+fn reap_item_workers(workers: &mut BTreeSet<libc::pid_t>) -> io::Result<()> {
+    let pids = workers.iter().copied().collect::<Vec<_>>();
+    for pid in pids {
+        let mut status = 0_i32;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result == pid || (result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+            workers.remove(&pid);
+        } else if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
+        }
+    }
+    Ok(())
+}
+
+/// Run one contained command through an already-live item supervisor. The
+/// parent continues to own lifecycle persistence/exec-gate acknowledgement;
+/// only the process creation moves behind the persistent item supervisor.
+pub fn run_supervised_via_item_supervisor<F, E>(
+    invocation: &SupervisedCommand,
+    item_supervisor: &ItemExecutionSupervisorClient,
+    is_cancelled: F,
+    mut on_event: E,
+) -> Result<SupervisedOutcome, ScriptSupervisorError>
+where
+    F: Fn() -> bool,
+    E: FnMut(&ScriptLifecycleEvent) -> Result<(), ScriptSupervisorError>,
+{
+    if !valid_token(&invocation.token) {
+        return Err(ScriptSupervisorError::Protocol("invalid script containment token".to_string()));
+    }
+    let runtime_directory = open_private_runtime_directory(
+        &invocation.runtime_directory,
+        invocation.runtime_identity,
+    )?;
+    let runtime_fd = runtime_directory.as_raw_fd();
+    let spec = SupervisorSpec {
+        schema_version: SUPERVISOR_RESULT_SCHEMA,
+        token: invocation.token.clone(),
+        runtime_identity: invocation.runtime_identity,
+        containment_preference: invocation.containment_preference,
+        script: invocation.script.clone(),
+        args: invocation.args.clone(),
+        working_directory: invocation.working_directory.clone(),
+        environment: invocation.environment.clone(),
+        timeout_millis: duration_millis_u64(invocation.timeout),
+    };
+    write_private_json_new_at(runtime_fd, SPEC_FILE_NAME, &spec)?;
+    sync_directory(runtime_fd)?;
+
+    let (mut control_parent, control_child) = UnixStream::pair()?;
+    let (mut event_parent, event_child) = UnixStream::pair()?;
+    set_nonblocking(event_parent.as_raw_fd())?;
+
+    if !invocation.script_file.metadata()?.is_file() {
+        return Err(ScriptSupervisorError::Protocol("retained reviewed executable descriptor is not a regular file".to_string()));
+    }
+    if !invocation.working_directory_file.metadata()?.is_dir() {
+        return Err(ScriptSupervisorError::Protocol("retained working-directory descriptor is not a directory".to_string()));
+    }
+
+    let stdin_owned = match invocation.stdin_file.as_ref() {
+        Some(file) => file.try_clone()?,
+        None => OpenOptions::new().read(true).open("/dev/null")?,
+    };
+    let (stdout_reader_file, stdout_send) = match invocation.stdout_file.as_ref() {
+        Some(file) => (None, file.try_clone()?),
+        None => {
+            let (read, write) = create_pipe_files()?;
+            (Some(read), write)
+        }
+    };
+    let (stderr_reader_file, stderr_send) = match invocation.stderr_file.as_ref() {
+        Some(file) => (None, file.try_clone()?),
+        None => {
+            let (read, write) = create_pipe_files()?;
+            (Some(read), write)
+        }
+    };
+    let run_fds = [
+        runtime_fd,
+        control_child.as_raw_fd(),
+        event_child.as_raw_fd(),
+        invocation.script_file.as_raw_fd(),
+        invocation.working_directory_file.as_raw_fd(),
+        stdin_owned.as_raw_fd(),
+        stdout_send.as_raw_fd(),
+        stderr_send.as_raw_fd(),
+    ];
+    item_supervisor.submit_run(&run_fds)?;
+    drop(control_child);
+    drop(event_child);
+    drop(stdin_owned);
+    drop(stdout_send);
+    drop(stderr_send);
+
+    let output_stop = Arc::new(AtomicBool::new(false));
+    let stdout_reader = match stdout_reader_file {
+        Some(reader) => Some(spawn_tail_reader(reader, Arc::clone(&output_stop))?),
+        None => None,
+    };
+    let stderr_reader = match stderr_reader_file {
+        Some(reader) => Some(spawn_tail_reader(reader, Arc::clone(&output_stop))?),
+        None => None,
+    };
+
+    let started = Instant::now();
+    let hard_completion_deadline = invocation.timeout + TERM_GRACE + KILL_GRACE + Duration::from_secs(5);
+    let mut control_sent = false;
+    let mut event_reader = EventFrameReader::default();
+    let mut observed_descriptor: Option<ContainmentDescriptor> = None;
+    loop {
+        for event in event_reader.read_available(&mut event_parent)? {
+            if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
+                let _ = event_parent.write_all(&[EVENT_ABORT]);
+                let _ = send_control(&mut control_parent, CONTROL_CANCEL);
+                return Err(ScriptSupervisorError::Protocol("item supervisor emitted an unsupported lifecycle event".to_string()));
+            }
+            if let ScriptLifecycleEvent::ContainmentPrepared { descriptor, .. } = &event {
+                validate_descriptor(descriptor, &invocation.token)?;
+                if observed_descriptor.replace(descriptor.clone()).is_some() {
+                    let _ = event_parent.write_all(&[EVENT_ABORT]);
+                    return Err(ScriptSupervisorError::Protocol("item supervisor emitted multiple containment descriptors".to_string()));
+                }
+            }
+            match on_event(&event) {
+                Ok(()) => {
+                    if matches!(event, ScriptLifecycleEvent::ContainmentPrepared { .. }) && !control_sent {
+                        if is_cancelled() {
+                            send_control(&mut control_parent, CONTROL_CANCEL)?;
+                            control_sent = true;
+                        } else if started.elapsed() >= invocation.timeout {
+                            send_control(&mut control_parent, CONTROL_TIMEOUT)?;
+                            control_sent = true;
+                        }
+                    }
+                    event_parent.write_all(&[EVENT_ACK])?;
+                }
+                Err(error) => {
+                    let _ = event_parent.write_all(&[EVENT_ABORT]);
+                    let _ = send_control(&mut control_parent, CONTROL_CANCEL);
+                    return Err(error);
+                }
+            }
+        }
+        if entry_exists_no_follow_at(runtime_fd, RESULT_FILE_NAME)? {
+            break;
+        }
+        if !control_sent && is_cancelled() {
+            send_control(&mut control_parent, CONTROL_CANCEL)?;
+            control_sent = true;
+        } else if !control_sent && started.elapsed() >= invocation.timeout {
+            send_control(&mut control_parent, CONTROL_TIMEOUT)?;
+            control_sent = true;
+        }
+        if started.elapsed() >= hard_completion_deadline {
+            output_stop.store(true, Ordering::Release);
+            return Err(ScriptSupervisorError::Internal(
+                "item supervisor backend did not publish a terminal containment result within the bounded recovery window".to_string(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(control_parent);
+
+    let drain_deadline = Instant::now() + TAIL_DRAIN_GRACE;
+    while Instant::now() < drain_deadline {
+        let events = event_reader.read_available(&mut event_parent)?;
+        if events.is_empty() {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        for event in events {
+            if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
+                return Err(ScriptSupervisorError::Protocol("item supervisor emitted an unsupported lifecycle event".to_string()));
+            }
+            on_event(&event)?;
+            let _ = event_parent.write_all(&[EVENT_ACK]);
+        }
+    }
+
+    output_stop.store(true, Ordering::Release);
+    let stdout_capture = join_optional_tail_reader(stdout_reader, "stdout")?;
+    let stderr_capture = join_optional_tail_reader(stderr_reader, "stderr")?;
+    let output_capture = OutputCaptureSummary {
+        stdout: stdout_capture.terminal,
+        stderr: stderr_capture.terminal,
+    };
+    on_event(&ScriptLifecycleEvent::OutputCaptureCompleted {
+        schema_version: LIFECYCLE_EVENT_SCHEMA,
+        summary: output_capture.clone(),
+    })?;
+
+    let result: SupervisorResult = read_json_no_follow_at(runtime_fd, RESULT_FILE_NAME)?;
+    validate_supervisor_result(&result, &invocation.token)?;
+    if let Some(error) = result.internal_error {
+        return Err(ScriptSupervisorError::Internal(error));
+    }
+    let descriptor = result.descriptor.ok_or_else(|| {
+        ScriptSupervisorError::Protocol("item supervisor result omitted the containment descriptor".to_string())
+    })?;
+    validate_descriptor(&descriptor, &invocation.token)?;
+    if let Some(observed) = observed_descriptor {
+        if observed != descriptor {
+            return Err(ScriptSupervisorError::Protocol("item supervisor result changed the prepared containment identity".to_string()));
+        }
+    }
+    let raw_wait_status = result.raw_wait_status.ok_or_else(|| {
+        ScriptSupervisorError::Protocol("item supervisor result omitted the script wait status".to_string())
     })?;
     Ok(SupervisedOutcome {
         status: ExitStatus::from_raw(raw_wait_status),
@@ -968,6 +1603,7 @@ pub fn run_internal_supervisor(
     event_fd: RawFd,
     script_fd: RawFd,
     working_directory_fd: RawFd,
+    retained_lifetime_fds: &[RawFd],
 ) -> Result<(), ScriptSupervisorError> {
     if runtime_fd < 0 || script_fd < 0 || working_directory_fd < 0 {
         return Err(ScriptSupervisorError::Protocol(
@@ -1017,6 +1653,24 @@ pub fn run_internal_supervisor(
     set_close_on_exec(event_fd)?;
     set_close_on_exec(script_file.as_raw_fd())?;
     set_close_on_exec(working_directory.as_raw_fd())?;
+    // Reconstitute tonepoet-only lifetime holders.  Keeping these File values
+    // alive makes a shared OFD lease survive the originating UI/session.
+    // CLOEXEC is restored before any launcher is spawned, deliberately proving
+    // that arbitrary external programs can close every inherited non-stdio FD
+    // without releasing tonepoet ownership.
+    let mut retained_lifetime_files = Vec::with_capacity(retained_lifetime_fds.len());
+    for fd in retained_lifetime_fds {
+        if *fd < 0 {
+            return Err(ScriptSupervisorError::Protocol(
+                "invalid retained lifetime descriptor".to_string(),
+            ));
+        }
+        // SAFETY: this hidden helper exclusively owns each fd inherited for
+        // lifetime retention from its tonepoet parent.
+        let file = unsafe { File::from_raw_fd(*fd) };
+        set_close_on_exec(file.as_raw_fd())?;
+        retained_lifetime_files.push(file);
+    }
     let mut spec: SupervisorSpec =
         read_json_no_follow_at(runtime_directory.as_raw_fd(), SPEC_FILE_NAME)?;
     if spec.schema_version != SUPERVISOR_RESULT_SCHEMA || !valid_token(&spec.token) {
@@ -1441,6 +2095,16 @@ fn join_tail_reader(
         .join()
         .map_err(|_| ScriptSupervisorError::Internal(format!("{stream} reader panicked")))?
         .map_err(ScriptSupervisorError::Io)
+}
+
+fn join_optional_tail_reader(
+    reader: Option<thread::JoinHandle<io::Result<TailCapture>>>,
+    stream: &str,
+) -> Result<TailCapture, ScriptSupervisorError> {
+    match reader {
+        Some(reader) => join_tail_reader(reader, stream),
+        None => Ok(TailCapture { bytes: Vec::new(), terminal: OutputCaptureTerminal::Complete }),
+    }
 }
 
 #[derive(Default)]
@@ -4436,6 +5100,41 @@ mod tests {
     #[test]
     fn timeout_conversion_saturates_instead_of_wrapping() {
         assert_eq!(duration_millis_u64(Duration::from_millis(9)), 9);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn item_supervisor_fd_transfer_is_cloexec_and_survives_sender_drop() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempfile().unwrap();
+        let mut original = temp;
+        original.write_all(b"lease-anchor").unwrap();
+        original.seek(SeekFrom::Start(0)).unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+
+        send_item_request(&sender, ITEM_REQUEST_LEASE, &[original.as_raw_fd()]).unwrap();
+        let (tag, mut files) = receive_item_request(&receiver)
+            .unwrap()
+            .expect("one item-supervisor request");
+        assert_eq!(tag, ITEM_REQUEST_LEASE);
+        assert_eq!(files.len(), 1);
+
+        let received = files.pop().unwrap();
+        let fd_flags = unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) };
+        assert!(fd_flags >= 0);
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+
+        // The received descriptor is an independent reference to the same open
+        // file description. Dropping the sender's File cannot invalidate the
+        // supervisor's lifetime hold.
+        drop(original);
+        let mut received = received;
+        received.seek(SeekFrom::Start(0)).unwrap();
+        let mut body = String::new();
+        received.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "lease-anchor");
     }
 
     #[test]

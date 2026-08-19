@@ -1742,6 +1742,9 @@ pub async fn repair_album(
     expected_crcs: &[u32],
     tx: mpsc::Sender<AppMessage>,
 ) -> Result<String, String> {
+    let (_mutation_claim, admitted_paths) =
+        super::accuraterip::acquire_repair_mutation_claims(paths)?;
+    let paths = admitted_paths.as_slice();
     let n = paths.len();
     if n == 0 {
         return Err("No tracks to repair".to_string());
@@ -1841,7 +1844,10 @@ pub async fn repair_album(
 
     // 6. Encode each track to a temp directory.
     let pid = std::process::id();
-    let tmp_dir = PathBuf::from(format!("/tmp/tonepoet-ctdb-repair-{}", pid));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "tonepoet-ctdb-repair-{pid}-{}",
+        uuid::Uuid::new_v4().simple(),
+    ));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
     let _ = tx
@@ -1976,6 +1982,15 @@ pub async fn repair_single_image(
     expected_crcs: &[u32],
     tx: mpsc::Sender<AppMessage>,
 ) -> Result<String, String> {
+    let (_mutation_claim, admitted_paths) = super::accuraterip::acquire_repair_mutation_claims(
+        std::slice::from_ref(&info.audio_path),
+    )?;
+    let mut admitted_info = info.clone();
+    admitted_info.audio_path = admitted_paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| "single-image repair admission produced no audio path".to_string())?;
+    let info = &admitted_info;
     let n = info.track_boundaries.len();
     if n == 0 {
         return Err("Single-image CUE has no tracks".to_string());
@@ -2064,7 +2079,10 @@ pub async fn repair_single_image(
 
     // 6. Encode the repaired audio as a single file in /tmp.
     let pid = std::process::id();
-    let tmp_dir = PathBuf::from(format!("/tmp/tonepoet-ctdb-repair-{}", pid));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "tonepoet-ctdb-repair-{pid}-{}",
+        uuid::Uuid::new_v4().simple(),
+    ));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
     let filename = info

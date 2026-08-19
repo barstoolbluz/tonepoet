@@ -3456,11 +3456,13 @@ async fn convert_tracks_with_reporter_with_tool_paths(
 fn real_tool_runner_with_optional_version_cache(
     tool_paths: HashMap<String, PathBuf>,
     version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    item_id: &str,
 ) -> RealToolRunner {
-    match version_cache {
+    let runner = match version_cache {
         Some(version_cache) => RealToolRunner::with_version_cache(tool_paths, version_cache),
         None => RealToolRunner::new(tool_paths),
-    }
+    };
+    runner.with_execution_item(item_id.to_string())
 }
 
 async fn convert_one_track_work(
@@ -20781,6 +20783,8 @@ fn conversion_log_tool_name(binary: ToolBinary) -> Option<&'static str> {
         ToolBinary::Wvunpack => Some("wvunpack"),
         ToolBinary::Wvtag => Some("wvtag"),
         ToolBinary::AtomicParsley => Some("AtomicParsley"),
+        ToolBinary::Tar => Some("tar"),
+        ToolBinary::Rar => Some("rar"),
     }
 }
 
@@ -28618,11 +28622,157 @@ async fn execute_post_actions_stage(
     .await
 }
 
+
+fn register_execution_claims(
+    req: &PipelineRequest,
+    family: crate::concurrency::LeaseFamily,
+    claims: Vec<crate::concurrency::PathClaim>,
+    coordination_group: Option<String>,
+) -> Result<(), String> {
+    if crate::concurrency::runtime_execution_id(&req.item_id).is_none() {
+        return Ok(());
+    }
+    let lease = crate::concurrency::MutationClaimGuard::acquire_grouped(
+        family, claims, coordination_group
+    )?.into_lease();
+    crate::concurrency::register_runtime_supplemental_lease(&req.item_id, Arc::new(lease))
+}
+
+fn admit_initial_conversion_claims(req: &mut PipelineRequest) -> Result<(), String> {
+    let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) else {
+        return Ok(());
+    };
+    // Resolve the mutable namespace aliases before taking registry authority.
+    // The claims retain the lexical namespace identities, while the request is
+    // rebound to the admitted resolved I/O identities for every later stage.
+    let source_scope = if std::fs::metadata(&req.container).is_ok_and(|metadata| metadata.is_dir()) {
+        crate::concurrency::ClaimScope::Subtree
+    } else {
+        crate::concurrency::ClaimScope::Exact
+    };
+    let source = crate::concurrency::PathClaim::resolve(
+        &req.container,
+        crate::concurrency::ClaimMode::Read,
+        source_scope,
+    )?;
+    let output_namespace = crate::concurrency::PathClaim::resolve(
+        &req.output_root,
+        crate::concurrency::ClaimMode::Read,
+        crate::concurrency::ClaimScope::Exact,
+    )?;
+    let admitted_source = source.identity.resolved_io_path.clone();
+    let admitted_output_root = output_namespace.identity.resolved_io_path.clone();
+    register_execution_claims(
+        req,
+        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id },
+        vec![source, output_namespace],
+        None,
+    )?;
+    req.container = admitted_source;
+    req.output_root = admitted_output_root;
+    Ok(())
+}
+
+fn planner_output_coordination_group(req: &PipelineRequest) -> Option<String> {
+    req.album_batch
+        .as_ref()
+        .map(|batch| format!("album-batch:{}", batch.conversion_log_batch_id))
+}
+
+/// If the dispatcher already carries planner-authoritative album output
+/// identity, admit that namespace before any pre-action can mutate it. Returns
+/// the admitted resolved identity so ordinary planning can prove it did not
+/// silently redirect the destination later.
+fn admit_planner_resolved_output_claim(req: &mut PipelineRequest) -> Result<Option<PathBuf>, String> {
+    let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) else {
+        return Ok(None);
+    };
+    let Some(batch) = req
+        .album_batch
+        .as_ref()
+        .filter(|batch| batch.album_output_dir_is_planner_resolved)
+    else {
+        return Ok(None);
+    };
+    let output = crate::concurrency::PathClaim::resolve(
+        &batch.album_output_dir,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Subtree,
+    )?;
+    let admitted = output.identity.resolved_io_path.clone();
+    let coordination_group = planner_output_coordination_group(req);
+    register_execution_claims(
+        req,
+        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id },
+        vec![output],
+        coordination_group,
+    )?;
+    if let Some(batch) = req.album_batch.as_mut() {
+        batch.album_output_dir = admitted.clone();
+    }
+    Ok(Some(admitted))
+}
+
+fn admit_planned_output_claim(
+    req: &PipelineRequest,
+    plan: &AlbumPlan,
+    already_admitted: Option<&Path>,
+) -> Result<(), String> {
+    let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) else {
+        return Ok(());
+    };
+    let output = crate::concurrency::PathClaim::resolve(
+        &plan.album_dir,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Subtree,
+    )?;
+    if let Some(admitted) = already_admitted {
+        if output.identity.resolved_io_path != admitted {
+            return Err(format!(
+                "output planning redirected planner-authoritative album namespace from '{}' to '{}'",
+                admitted.display(),
+                output.identity.resolved_io_path.display(),
+            ));
+        }
+        return Ok(());
+    }
+    // Independent single-file siblings in one dispatcher-authored album batch
+    // intentionally co-hold the album output claim. The run-unique batch id is
+    // written into each sibling's own durable ExecutionClaim descriptor, so a
+    // crash leaves every participant independently RecoveryReserved.
+    let coordination_group = planner_output_coordination_group(req);
+    register_execution_claims(
+        req,
+        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id },
+        vec![output],
+        coordination_group,
+    )
+}
+
 /// Run validation, staging setup, source materialization, and output planning.
 /// Track conversion is intentionally not performed here; the caller submits
 /// each ready track as an independent shared-pool work unit.
 pub async fn prepare_pipeline_item_for_scheduler(
     req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> ScheduledMaterialization {
+    let mut req = req;
+    let item_id = req.item_id.clone();
+    if crate::concurrency::runtime_execution_id(&item_id).is_some() {
+        crate::concurrency::with_runtime_execution_scope(
+            item_id,
+            prepare_pipeline_item_for_scheduler_scoped_inner(req, runner, reporter, cancel, tool_paths),
+        ).await
+    } else {
+        prepare_pipeline_item_for_scheduler_scoped_inner(req, runner, reporter, cancel, tool_paths).await
+    }
+}
+
+async fn prepare_pipeline_item_for_scheduler_scoped_inner(
+    mut req: PipelineRequest,
     runner: &dyn ToolRunner,
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
@@ -28664,6 +28814,28 @@ pub async fn prepare_pipeline_item_for_scheduler(
             finalize_report(&req, reporter, source, plan, None, published, outcome).await,
         );
     }
+
+    if let Err(error) = admit_initial_conversion_claims(&mut req) {
+        let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(format!("concurrency admission failed: {error}")));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::MaterializeFailed };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(&req, &outcome);
+        return ScheduledMaterialization::Finished(finalize_report(&req, reporter, source, plan, None, published, outcome).await);
+    }
+
+    let admitted_planner_output = match admit_planner_resolved_output_claim(&mut req) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            emit_stage_started(reporter, &item_id, PipelineStage::PreActions).await;
+            let record = stage_record(PipelineStage::PreActions, StageOutcome::Failed(format!("output concurrency admission failed before pre-actions: {error}")));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions) };
+            let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(&req, &outcome);
+            return ScheduledMaterialization::Finished(finalize_report(&req, reporter, source, plan, None, published, outcome).await);
+        }
+    };
 
     if let Err(error) = preflight_album_conversion_tools(&req, runner) {
         emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
@@ -28892,6 +29064,15 @@ pub async fn prepare_pipeline_item_for_scheduler(
         }
     };
 
+    if let Err(error) = admit_planned_output_claim(&req, &album_plan, admitted_planner_output.as_deref()) {
+        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output concurrency admission failed: {error}")));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::PlanFailed };
+        let published = publish_terminal_conversion_log_fragment_if_needed(&req, Some(&prepared), None, &outcome, staging, Some(runner));
+        return ScheduledMaterialization::Finished(finalize_report(&req, reporter, Some(prepared), Some(album_plan), None, published, outcome).await);
+    }
+
     if let super::rerun::RerunDecision::Skip {
         manifest,
         manifest_path,
@@ -29047,7 +29228,7 @@ pub async fn encode_track_for_scheduler_with_tool_limits_and_version_cache(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledTrackOutput, String> {
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req.item_id);
     convert_one_track_work(
         track_index,
         track,
@@ -29141,7 +29322,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     cancel: CancellationToken,
 ) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache, &req.item_id);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
     match realize_track_with_tool_limits_and_stats(
@@ -29209,7 +29390,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
     version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
     reporter: &dyn PipelineReporter,
 ) -> Result<ScheduledTrackOutput, String> {
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &realized.req.item_id);
     let staged_path = staged_audio_path(
         &realized.convert_root,
         &realized.final_path,
@@ -29928,6 +30109,30 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
+    let mut req = req;
+    let item_id = req.item_id.clone();
+    if crate::concurrency::runtime_execution_id(&item_id).is_some() {
+        crate::concurrency::with_runtime_execution_scope(
+            item_id,
+            run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
+                req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
+            ),
+        ).await
+    } else {
+        run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
+            req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
+        ).await
+    }
+}
+
+async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> PipelineReport {
     let scratch_retry_root = req.scratch_staging.as_ref().map(|scratch| scratch.root().to_path_buf());
     let retry_on_disk = scratch_retry_root.is_some();
     let disk_retry_req = retry_on_disk.then(|| request_without_scratch_staging(&req));
@@ -29974,7 +30179,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
 }
 
 async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
-    req: PipelineRequest,
+    mut req: PipelineRequest,
     runner: &dyn ToolRunner,
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
@@ -30023,6 +30228,28 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         );
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
+
+    if let Err(error) = admit_initial_conversion_claims(&mut req) {
+        let record = stage_record(PipelineStage::Materialize, StageOutcome::Failed(format!("concurrency admission failed: {error}")));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::MaterializeFailed };
+        let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(&req, &outcome);
+        return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+    }
+
+    let admitted_planner_output = match admit_planner_resolved_output_claim(&mut req) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            emit_stage_started(reporter, &item_id, PipelineStage::PreActions).await;
+            let record = stage_record(PipelineStage::PreActions, StageOutcome::Failed(format!("output concurrency admission failed before pre-actions: {error}")));
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::RequiredStageFailure(PipelineStage::PreActions) };
+            let published = publish_pre_materialization_conversion_log_fragment_without_existing_staging(&req, &outcome);
+            return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
+        }
+    };
 
     if let Err(error) = preflight_album_conversion_tools(&req, runner) {
         emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
@@ -30285,6 +30512,15 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             return finalize_report(&req, reporter, source, plan, artifacts, published, outcome)
                 .await;
         }
+    }
+
+    if let Err(error) = admit_planned_output_claim(&req, plan.as_ref().expect("plan present"), admitted_planner_output.as_deref()) {
+        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output concurrency admission failed: {error}")));
+        emit_stage_finished(reporter, &item_id, record.clone()).await;
+        stages.push(record);
+        let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::PlanFailed };
+        published = publish_terminal_conversion_log_fragment_if_needed(&req, source.as_ref(), artifacts.as_ref(), &outcome, staging, Some(runner));
+        return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
     }
 
     if let super::rerun::RerunDecision::Skip {
@@ -42901,13 +43137,29 @@ fn prepare_materialization_attempt(
     selection: StagingParentSelection,
 ) -> Result<MaterializationAttempt, MaterializeError> {
     let staging_parent = selection.parent.clone();
-    fs::create_dir_all(&staging_parent).map_err(MaterializeError::Io)?;
-    let run_lock = acquire_run_lock(&staging_parent, &req.job_id, &req.item_id)?;
     let staging_root = staging_parent.join(format!(
         "{}-{}",
         sanitize_component(&req.job_id),
         sanitize_component(&req.item_id)
     ));
+    // Resolve/admit staging ownership before creating or deleting anything in
+    // that item-specific tree.  Resolution uses the deepest existing ancestor,
+    // so the parent itself need not exist yet.
+    if let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) {
+        let claim = crate::concurrency::PathClaim::resolve(
+            &staging_root,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Subtree,
+        ).map_err(MaterializeError::Parse)?;
+        register_execution_claims(
+            req,
+            crate::concurrency::LeaseFamily::ExecutionStaging { execution_id },
+            vec![claim],
+            None,
+        ).map_err(MaterializeError::Parse)?;
+    }
+    fs::create_dir_all(&staging_parent).map_err(MaterializeError::Io)?;
+    let run_lock = acquire_run_lock(&staging_parent, &req.job_id, &req.item_id)?;
     let _ = delete_stale_staging_dir(&staging_root);
     let used_scratch = selection.is_scratch();
     let staging = selection.into_staging_dir(staging_root, req.job_id.clone());

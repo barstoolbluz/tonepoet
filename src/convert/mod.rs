@@ -1229,11 +1229,27 @@ impl ConversionManager {
         Ok(expansion.paths)
     }
 
-    /// Start processing the conversion queue
+    /// Start processing the conversion queue.
+    ///
+    /// This legacy manager entry point cannot establish the durable queue
+    /// execution authority required by the concurrent-session protocol.
+    /// Production callers must publish queue intent/execution through the DB
+    /// coordination path before releasing conversion work.
+    #[deprecated(note = "does not establish durable concurrent-session execution authority; use the coordinated application queue path")]
     pub async fn start_processing(&mut self) -> ConversionResult<()> {
-        // This method is deprecated - use the new shared queue approach in main.rs
-        let mut queue = self.queue.write().await;
-        self.processor.process_queue(&mut *queue).await
+        #[cfg(not(test))]
+        {
+            return Err(ConversionError::ValidationError(
+                "legacy ConversionManager::start_processing is disabled because it cannot establish durable concurrent-session execution authority"
+                    .to_string(),
+            ));
+        }
+
+        #[cfg(test)]
+        {
+            let mut queue = self.queue.write().await;
+            self.processor.process_queue(&mut *queue).await
+        }
     }
 
     /// Get current progress
