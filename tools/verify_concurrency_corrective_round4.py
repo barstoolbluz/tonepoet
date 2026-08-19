@@ -255,11 +255,20 @@ def main() -> int:
         "cancelled_at_last_progress",
         "stream cancellation emits tool-specific stopping status before final progress",
     )
+    owner_recovery = section(
+        source_guard,
+        "fn owner_token_blocks_recovery",
+        "fn legacy_recovery_journal_binding",
+    )
     require(
-        "fn owner_token_blocks_recovery" in source_guard
-        and "is_active_removal_journal(journal_path)" in source_guard
+        "owner_token_is_live(token)" in owner_recovery
+        and "is_active_removal_journal" not in owner_recovery
         and source_guard.count("owner_token_blocks_recovery(") >= 4,
-        "verified-removal recovery uses explicit local registration and foreign owner tokens",
+        "verified-removal recovery defers for every live durable process identity",
+    )
+    require(
+        "live_current_process_owner_defers_recovery_even_without_registry_entry" in source_guard,
+        "verified-removal recovery covers current-process liveness after registry deactivation",
     )
     require(
         "pragma_update(None, \"user_version\", 24)" in recent,

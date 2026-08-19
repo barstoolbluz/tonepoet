@@ -673,7 +673,12 @@ where
         }
     };
 
-    let started = Instant::now();
+    // `invocation.timeout` is a user-code runtime budget, not a supervisor
+    // setup budget. The containment backends already start the same timeout
+    // after releasing the reviewed script. Mirror that boundary in the parent
+    // so full-system load cannot turn slow containment setup into a timeout
+    // that kills the launcher before user code has ever run.
+    let mut user_code_started: Option<Instant> = None;
     let mut control_sent = false;
     let mut event_reader = EventFrameReader::default();
     let mut observed_descriptor: Option<ContainmentDescriptor> = None;
@@ -702,19 +707,19 @@ where
             match on_event(&event) {
                 Ok(()) => {
                     // Containment preparation is the final exec gate. Persist
-                    // it first, then queue cancellation/timeout before ACK so
-                    // the helper cannot release user code in the cancellation
-                    // race between callback completion and the next poll.
+                    // it first, then queue cancellation before ACK so the
+                    // helper cannot release user code in the cancellation race
+                    // between callback completion and the next poll. Timeout
+                    // deliberately starts only after UserCodeReleased.
                     if matches!(event, ScriptLifecycleEvent::ContainmentPrepared { .. })
                         && !control_sent
+                        && is_cancelled()
                     {
-                        if is_cancelled() {
-                            send_control(&mut control_parent, CONTROL_CANCEL)?;
-                            control_sent = true;
-                        } else if started.elapsed() >= invocation.timeout {
-                            send_control(&mut control_parent, CONTROL_TIMEOUT)?;
-                            control_sent = true;
-                        }
+                        send_control(&mut control_parent, CONTROL_CANCEL)?;
+                        control_sent = true;
+                    }
+                    if matches!(event, ScriptLifecycleEvent::UserCodeReleased { .. }) {
+                        user_code_started.get_or_insert_with(Instant::now);
                     }
                     event_parent.write_all(&[EVENT_ACK])?;
                 }
@@ -735,7 +740,10 @@ where
         if !control_sent && is_cancelled() {
             send_control(&mut control_parent, CONTROL_CANCEL)?;
             control_sent = true;
-        } else if !control_sent && started.elapsed() >= invocation.timeout {
+        } else if !control_sent
+            && user_code_started
+                .is_some_and(|started| started.elapsed() >= invocation.timeout)
+        {
             send_control(&mut control_parent, CONTROL_TIMEOUT)?;
             control_sent = true;
         }
@@ -1272,8 +1280,9 @@ where
         None => None,
     };
 
-    let started = Instant::now();
-    let hard_completion_deadline = invocation.timeout + TERM_GRACE + KILL_GRACE + Duration::from_secs(5);
+    let supervisor_started = Instant::now();
+    let mut user_code_started: Option<Instant> = None;
+    let terminal_grace = TERM_GRACE + KILL_GRACE + Duration::from_secs(5);
     let mut control_sent = false;
     let mut event_reader = EventFrameReader::default();
     let mut observed_descriptor: Option<ContainmentDescriptor> = None;
@@ -1293,14 +1302,15 @@ where
             }
             match on_event(&event) {
                 Ok(()) => {
-                    if matches!(event, ScriptLifecycleEvent::ContainmentPrepared { .. }) && !control_sent {
-                        if is_cancelled() {
-                            send_control(&mut control_parent, CONTROL_CANCEL)?;
-                            control_sent = true;
-                        } else if started.elapsed() >= invocation.timeout {
-                            send_control(&mut control_parent, CONTROL_TIMEOUT)?;
-                            control_sent = true;
-                        }
+                    if matches!(event, ScriptLifecycleEvent::ContainmentPrepared { .. })
+                        && !control_sent
+                        && is_cancelled()
+                    {
+                        send_control(&mut control_parent, CONTROL_CANCEL)?;
+                        control_sent = true;
+                    }
+                    if matches!(event, ScriptLifecycleEvent::UserCodeReleased { .. }) {
+                        user_code_started.get_or_insert_with(Instant::now);
                     }
                     event_parent.write_all(&[EVENT_ACK])?;
                 }
@@ -1317,11 +1327,21 @@ where
         if !control_sent && is_cancelled() {
             send_control(&mut control_parent, CONTROL_CANCEL)?;
             control_sent = true;
-        } else if !control_sent && started.elapsed() >= invocation.timeout {
+        } else if !control_sent
+            && user_code_started
+                .is_some_and(|started| started.elapsed() >= invocation.timeout)
+        {
             send_control(&mut control_parent, CONTROL_TIMEOUT)?;
             control_sent = true;
         }
-        if started.elapsed() >= hard_completion_deadline {
+        let terminal_window_exhausted = match user_code_started {
+            Some(started) => started.elapsed() >= invocation.timeout + terminal_grace,
+            // A helper that never reaches UserCodeReleased still gets a hard
+            // protocol bound; this is intentionally independent of the
+            // command's runtime timeout.
+            None => supervisor_started.elapsed() >= LIFECYCLE_IO_TIMEOUT,
+        };
+        if terminal_window_exhausted {
             output_stop.store(true, Ordering::Release);
             return Err(ScriptSupervisorError::Internal(
                 "item supervisor backend did not publish a terminal containment result within the bounded recovery window".to_string(),

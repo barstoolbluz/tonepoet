@@ -1546,6 +1546,7 @@ mod tests {
 
     #[test]
     fn transfer_route_is_positional_for_n_to_n_and_fails_n_to_m_before_io() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("positional transfer tempdir");
         let first = temp.path().join("01.dsf");
         let second = temp.path().join("02.dsf");

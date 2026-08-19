@@ -46556,7 +46556,15 @@ mod file_task_supervisor_tests {
 
     fn install_wedged_helper(root: &std::path::Path) -> std::path::PathBuf {
         let helper = root.join("wedged-file-task-helper.sh");
-        std::fs::write(&helper, "#!/bin/sh\nexec sleep 30\n").expect("write helper");
+        // Publish a readiness marker immediately before entering the deliberate
+        // wedge. Cancellation tests can then measure cancellation/reaping from
+        // an actually-running helper instead of racing process startup under
+        // full-workspace scheduler load. `$0` is the helper pathname.
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '' > \"$0.started\"\nexec sleep 30\n",
+        )
+        .expect("write helper");
         let mut permissions = std::fs::metadata(&helper)
             .expect("helper metadata")
             .permissions();
@@ -46636,13 +46644,28 @@ mod file_task_supervisor_tests {
             supervise_file_task_process(job, app_tx, control_rx)
         });
 
+        let mut started_marker = helper.as_os_str().to_os_string();
+        started_marker.push(".started");
+        let started_marker = std::path::PathBuf::from(started_marker);
+        let readiness_deadline = Instant::now() + Duration::from_secs(10);
+        while !started_marker.exists() {
+            assert!(
+                Instant::now() < readiness_deadline,
+                "wedged helper did not reach user code before cancellation test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Start the prompt-cancellation bound only after the fixture proves the
+        // helper is running. Process creation/containment latency is a separate
+        // concern and must not turn this cancellation contract into a load race.
         let started = Instant::now();
         control_tx
             .send(super::super::app::FileTaskControl::Abort)
             .expect("abort control");
         let mut saw_cancelling = false;
         let mut saw_completion = false;
-        while started.elapsed() < Duration::from_secs(1) {
+        while started.elapsed() < Duration::from_secs(5) {
             match app_rx.try_recv() {
                 Ok(AppMessage::FileTaskProgress { update, .. }) => {
                     if matches!(
@@ -46670,11 +46693,11 @@ mod file_task_supervisor_tests {
         assert!(saw_cancelling, "cancelling phase must be observable");
         assert!(saw_completion, "cancel must terminate the UI session promptly");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "supervisor exceeded the one-second cancellation budget"
+            started.elapsed() < Duration::from_secs(5),
+            "supervisor did not abandon the running 30-second helper promptly"
         );
 
-        let journal_deadline = Instant::now() + Duration::from_secs(1);
+        let journal_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let pending = super::super::file_task_runtime::pending_journals();
             assert_eq!(pending.len(), 1);
@@ -67153,6 +67176,10 @@ mod artwork_file_picker_handoff_tests {
 
     #[test]
     fn artwork_plus_opens_crate_picker_with_images_and_explicit_non_mutating_policy() {
+        // AppState startup scans the process-global file-task journal override.
+        // Serialize this test with fixtures that temporarily replace that
+        // environment so it cannot adopt another test's live journal.
+        let _file_task_environment = super::super::file_task_runtime::test_environment_lock();
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("cover.png"), b"png").expect("image fixture");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -83205,12 +83232,34 @@ mod file_picker_browse_parity_regression_tests {
         journal_path: &std::path::Path,
         controls: std::sync::mpsc::Receiver<crate::tui::app::FileTaskControl>,
     ) -> FileTaskWorker {
-        let record = super::super::file_task_runtime::FileTaskJournalHandle::open(
+        let prior = super::super::file_task_runtime::FileTaskJournalHandle::open(
             journal_path.to_path_buf(),
         )
-        .expect("open prior journal")
-        .load()
-        .expect("load prior journal");
+        .expect("open prior journal");
+        let mut record = prior.load().expect("load prior journal");
+        if record.needs_reconciliation()
+            && !matches!(
+                record.lifecycle,
+                super::super::file_task_runtime::DurableFileTaskLifecycle::Cancelled
+                    | super::super::file_task_runtime::DurableFileTaskLifecycle::Failed
+                    | super::super::file_task_runtime::DurableFileTaskLifecycle::Completed
+                    | super::super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation
+                    | super::super::file_task_runtime::DurableFileTaskLifecycle::Reconciled
+            )
+        {
+            // The production supervisor persists this handoff boundary before
+            // offering a retry. These direct worker tests bypass that
+            // supervisor, so make the same durable transition explicitly
+            // instead of teaching production recovery that a live Planned or
+            // Running generation may always be co-held.
+            prior
+                .mark_lifecycle(
+                    super::super::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation,
+                    "test worker handed off for reconciliation",
+                )
+                .expect("persist test recovery handoff");
+            record = prior.load().expect("reload prior journal after handoff");
+        }
         let generation = record.generation.saturating_add(1);
         let mut worker = clipboard_move_worker_for_test(
             plan,

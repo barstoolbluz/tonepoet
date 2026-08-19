@@ -350,7 +350,19 @@ impl DurableFileTaskRecord {
         let quarantine_sources = self
             .quarantine_artifacts
             .iter()
-            .filter_map(|artifact| self.logical_source_for_admitted(&artifact.original_source))
+            .filter_map(|artifact| {
+                // Current helpers record admitted source paths, while older
+                // and synthetic/recovery journals may contain the logical
+                // source spelling. Accept either representation, but only
+                // when it maps to this journal's immutable mapping set.
+                self.logical_source_for_admitted(&artifact.original_source)
+                    .or_else(|| {
+                        self.mappings
+                            .iter()
+                            .find(|mapping| mapping.source == artifact.original_source)
+                            .map(|mapping| mapping.source.clone())
+                    })
+            })
             .collect::<std::collections::BTreeSet<_>>();
         self.mappings
             .iter()

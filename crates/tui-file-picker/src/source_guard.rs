@@ -4721,16 +4721,15 @@ fn owner_token_is_live(token: &str) -> bool {
 
 /// Return whether an owner identity must defer recovery of this journal.
 ///
-/// A journal registered in `ACTIVE_REMOVAL_JOURNALS` is the process-local
-/// liveness authority. Once the operation deliberately deactivates that
-/// registration, treating this process's still-live PID as a veto makes an
-/// explicit recovery handoff impossible. Foreign-process identities continue
-/// to use the process-start token and therefore remain fail-closed against a
-/// genuinely live peer.
-fn owner_token_blocks_recovery(journal_path: &Path, token: &str) -> bool {
-    if owner_token_pid(token) == Some(std::process::id()) {
-        return is_active_removal_journal(journal_path);
-    }
+/// The durable process-start identity is the liveness authority. The
+/// process-local active-journal registry closes publication races, but absence
+/// from that registry is not evidence that a `VerifiedRemoval` carrying the
+/// journal has ceased to exist: explicit deactivation can precede the guard's
+/// drop. Treat current-process owners exactly like foreign owners and defer
+/// while the recorded process instance is live. Tests that model restart use
+/// a stale durable process identity (or an explicit internal recovery seam);
+/// production never converts registry absence into ownership authority.
+fn owner_token_blocks_recovery(_journal_path: &Path, token: &str) -> bool {
     owner_token_is_live(token)
 }
 
@@ -7423,6 +7422,50 @@ mod verified_removal_tests {
         (source_manifest, destination_manifest)
     }
 
+    fn rewrite_removal_journal_with_stale_owner(removal: &VerifiedRemoval) {
+        let journal = removal.journal.as_ref().expect("journal").path.clone();
+        let payload = fs::read_to_string(&journal).expect("read recovery journal");
+        // Preserve the platform-specific token shape and change only the
+        // process-start identity. This models a restart with PID reuse without
+        // relying on a neighbouring PID being unused or on another platform's
+        // token discriminator.
+        let current = current_process_owner_token();
+        let mut fields = current.split(':').map(str::to_string).collect::<Vec<_>>();
+        let start_identity = fields.last_mut().expect("owner start-identity field");
+        let stale_number = start_identity
+            .parse::<u128>()
+            .unwrap_or_default()
+            .wrapping_add(1);
+        *start_identity = stale_number.to_string();
+        let stale_token = fields.join(":");
+        let binding = recovery_journal_binding(
+            &stale_token,
+            removal.original.file_name().expect("original component"),
+            removal
+                .quarantine_root
+                .file_name()
+                .expect("quarantine component"),
+            removal.cleanup_manifest.verification(),
+            removal.cleanup_manifest.recovery_commitment(),
+        );
+        let stale_owner = encode_hex(stale_token.as_bytes());
+        let rewritten = payload
+            .lines()
+            .map(|line| {
+                if line.starts_with("owner=") {
+                    format!("owner={stale_owner}")
+                } else if line.starts_with("binding=") {
+                    format!("binding={}", binding.to_hex())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&journal, rewritten).expect("rewrite recovery journal owner");
+    }
+
     #[test]
     fn standard_recovery_journal_reconstructs_identity_authority() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -7473,6 +7516,10 @@ mod verified_removal_tests {
         .expect("prepare verified removal");
         let quarantine = removal.quarantine_root().to_path_buf();
         let journal = removal.journal.as_ref().expect("journal").path.clone();
+        // Public recovery must never treat a merely deactivated current-process
+        // journal as abandoned. Simulate the actual startup/restart condition
+        // by making the durable owner identity stale before discovery.
+        rewrite_removal_journal_with_stale_owner(&removal);
         removal.journal.as_ref().expect("journal").deactivate();
         std::mem::forget(removal);
 

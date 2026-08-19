@@ -794,9 +794,20 @@ mod tests {
         let cmd = sh_command("echo progress >&2; exec sleep 5", 10);
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let progress_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let wait_for_progress = std::sync::Arc::clone(&progress_seen);
+        let cancel_task = tokio::spawn(async move {
+            let ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_progress.notified(),
+            )
+            .await
+            .map_err(|_| "streaming child did not publish measured progress before readiness deadline")
+            .map(|_| ());
+            // Always release the child even when readiness fails so a failed
+            // regression never leaves the fixture sleeping until command timeout.
             cancel2.cancel();
+            ready
         });
 
         let err = run_streaming_tool_with_probe_at_path(
@@ -807,6 +818,7 @@ mod tests {
             None,
             |source, line| {
                 if source == StreamSource::Stderr && line == "progress" {
+                    progress_seen.notify_one();
                     Some(ProbeUpdate::measured(
                         0.37,
                         "ffmpeg-progress".to_string(),
@@ -820,6 +832,10 @@ mod tests {
         .await
         .expect_err("should cancel");
 
+        cancel_task
+            .await
+            .expect("progress readiness task must not panic")
+            .expect("streaming progress must be observed before cancellation");
         assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
         let messages = progress_messages(&reporter);
         assert!(messages

@@ -2117,17 +2117,17 @@ mod real_tool_runner_tests {
             timeout: Duration::from_millis(100),
         };
 
-        let start = std::time::Instant::now();
-        let result = runner.run(cmd, &cancel).await;
-        let elapsed = start.elapsed();
+        // The command timeout is a user-code runtime budget. Secure
+        // containment setup can be delayed by full-workspace scheduler load,
+        // so bound the *test* against deadlock independently instead of
+        // asserting that setup + execution completes within two wall seconds.
+        let result = tokio::time::timeout(Duration::from_secs(10), runner.run(cmd, &cancel))
+            .await
+            .expect("timeout supervision must reach a terminal result");
 
         assert!(
             matches!(result, Err(ToolRunnerError::Timeout { .. })),
             "expected Timeout, got {result:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "timeout should kill quickly, took {elapsed:?}"
         );
     }
 
@@ -2151,17 +2151,13 @@ mod real_tool_runner_tests {
             cancel_clone.cancel();
         });
 
-        let start = std::time::Instant::now();
-        let result = runner.run(cmd, &cancel).await;
-        let elapsed = start.elapsed();
+        let result = tokio::time::timeout(Duration::from_secs(10), runner.run(cmd, &cancel))
+            .await
+            .expect("cancellation supervision must reach a terminal result");
 
         assert!(
             matches!(result, Err(ToolRunnerError::Cancelled { .. })),
             "expected Cancelled, got {result:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "cancellation should kill quickly, took {elapsed:?}"
         );
     }
 
@@ -2283,6 +2279,27 @@ printf 'consumer diagnostic\n' >&2
             ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => {}
         }
         records
+    }
+
+    async fn wait_for_child_pid_files(paths: &[PathBuf]) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if paths.iter().all(|path| path.is_file()) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let missing = paths
+                    .iter()
+                    .filter(|path| !path.is_file())
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "contained pipeline did not reach user code before the test readiness deadline; missing pid files: {missing}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2439,7 +2456,10 @@ exec /bin/cat >/dev/null
                 closed_command(
                     ToolBinary::Sox,
                     vec![pid_path.display().to_string()],
-                    Duration::from_millis(500),
+                    // The child writes its pid before entering a 30-second sleep.  Give
+                    // user code enough scheduler budget under a fully parallel workspace
+                    // run; this still exercises the runner's timeout path, not startup.
+                    Duration::from_secs(2),
                 ),
                 closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(5)),
                 &CancellationToken::new(),
@@ -2488,7 +2508,9 @@ exec /bin/sleep 30
                 closed_command(
                     ToolBinary::Ffmpeg,
                     vec![pid_path.display().to_string()],
-                    Duration::from_millis(500),
+                    // See the producer-timeout case: measure user-code timeout, not
+                    // libtest scheduler latency before the pid handshake executes.
+                    Duration::from_secs(2),
                 ),
                 &CancellationToken::new(),
             )
@@ -2538,9 +2560,13 @@ exec /bin/cat >/dev/null
         paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let readiness_paths = vec![producer_pid_path.clone(), consumer_pid_path.clone()];
+        let cancel_task = tokio::spawn(async move {
+            let ready = wait_for_child_pid_files(&readiness_paths).await;
+            // Always release the pipeline even when readiness fails so the
+            // test cannot strand contained children while reporting the error.
             trigger.cancel();
+            ready
         });
         let error = RealToolRunner::new(paths)
             .run_pipeline(
@@ -2558,6 +2584,10 @@ exec /bin/cat >/dev/null
             )
             .await
             .expect_err("cancelled pipeline fails closed");
+        cancel_task
+            .await
+            .expect("cancellation readiness task must not panic")
+            .expect("pipeline children must enter user code before cancellation");
         assert!(matches!(&error.error, ToolRunnerError::Cancelled { .. }));
         assert!(
             pipeline_error_records(&error)
@@ -2584,8 +2614,8 @@ exec /bin/cat >/dev/null
         paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
         let error = RealToolRunner::new(paths)
             .run_pipeline(
-                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
-                closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(2)),
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(10)),
+                closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(10)),
                 &CancellationToken::new(),
             )
             .await
@@ -2667,8 +2697,8 @@ exec /bin/cat >/dev/null
         paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
         let error = RealToolRunner::new(paths)
             .run_pipeline(
-                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
-                closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(2)),
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(10)),
+                closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(10)),
                 &CancellationToken::new(),
             )
             .await

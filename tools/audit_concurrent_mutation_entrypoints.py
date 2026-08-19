@@ -638,6 +638,11 @@ def main() -> int:
         "src/tui/probe.rs",
         "write_metadata_field_transactional_with_control_at_verification",
     )
+    single_metadata_admission = function_body(
+        "src/tui/probe.rs",
+        "with_single_metadata_path_admission",
+    )
+    flac_common_write = function_body("src/tui/probe.rs", "acquire_common_write_claim")
     dsf_lock = function_body("src/dsf_tags.rs", "acquire_dsf_write_lock")
     ape_lock = function_body("src/tui/probe.rs", "acquire_ape_metadata_write_lock")
     store_lock = function_body("src/config.rs", "acquire")
@@ -658,11 +663,22 @@ def main() -> int:
         and contains_all(tag_transfer, ["metadata_mutation_paths", "admit_metadata_mutation_paths", "admission.run"])
         and contains_all(invalid_ape_batch, ["mutation_paths", "admit_metadata_mutation_paths", "admission.run"])
         and contains_all(replaygain_scan, ["worker_paths", "MutationClaimGuard::acquire_ephemeral", "admitted_paths", "ToolRunner::run"])
-        and contains_all(inline_metadata, ["admit_single_metadata_path", "admission.run"])
+        and contains_all(inline_metadata, ["with_single_metadata_path_admission"])
+        and contains_all(single_metadata_admission, [
+            "MetadataPersistenceRoute::NativeFlacVorbis",
+            "PathResolutionSemantics::NamespaceObject",
+            "admit_single_metadata_path",
+            "admission.run",
+        ])
+        and contains_all(flac_common_write, [
+            "lock_set.insert(canonical_path.clone())",
+            "current_mutation_authority_covers(&required_claim)",
+            "MutationClaimGuard::acquire_ephemeral",
+        ])
         and contains_all(dsf_lock, ["PathResolutionSemantics::NamespaceObject", "current_mutation_authority_covers", "MutationClaimGuard::acquire_ephemeral", "StoreFileLock::acquire_for_path"])
         and contains_all(ape_lock, ["PathResolutionSemantics::NamespaceObject", "current_mutation_authority_covers", "MutationClaimGuard::acquire_ephemeral", "StoreFileLock::acquire_for_path"])
         and "MutationClaimGuard" not in store_lock,
-        "metadata editor/inline/artwork/maintenance/transfer/repair/ReplayGain must admit complete WRITE sets; native DSF/APEv2 recovery keeps explicit shared authority while generic StoreFileLock remains store-local",
+        "metadata editor/inline/artwork/maintenance/transfer/repair/ReplayGain must admit complete WRITE sets; native FLAC keeps native-lock-first shared authority, native DSF/APEv2 recovery keeps explicit shared authority, and generic StoreFileLock remains store-local",
     )
 
     # Automatic action phases: one complete phase admission before the action loop;

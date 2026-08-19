@@ -469,6 +469,13 @@ pub fn preflight_archive_repackage_capability(
     tool_paths: &HashMap<String, PathBuf>,
 ) -> Result<(), String> {
     let format = repackage_archive_format(original_archive)?;
+    require_repackage_format_tool_available(format, tool_paths)
+}
+
+fn require_repackage_format_tool_available(
+    format: RepackageArchiveFormat,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
     match format {
         RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
             require_repackage_tool_available(
@@ -556,6 +563,14 @@ pub async fn repackage_archive_with_progress_and_cancel<F>(
 where
     F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
 {
+    // Fail before staging traversal or any child-process work when the target
+    // format cannot be created. This keeps the direct save path aligned with
+    // the UI preflight and preserves actionable tool-resolution errors even
+    // when ToolRunner intentionally redacts spawn details.
+    check_repackage_cancelled(cancel)?;
+    let format = repackage_archive_format(original_archive)?;
+    require_repackage_format_tool_available(format, tool_paths)?;
+
     let archive_label = original_archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -581,7 +596,6 @@ where
         None,
     ));
 
-    let format = repackage_archive_format(original_archive)?;
     let parent = original_archive
         .parent()
         .ok_or_else(|| format!("archive has no parent directory: {}", original_archive.display()))?;

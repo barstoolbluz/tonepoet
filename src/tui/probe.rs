@@ -1165,8 +1165,7 @@ mod flac_metadata_writer {
             if self.reentrant {
                 return None;
             }
-            self.release_process_claim();
-            match std::fs::remove_file(&self.lock_path) {
+            let warning = match std::fs::remove_file(&self.lock_path) {
                 Ok(()) => post_commit_parent_sync_warning(&self.lock_path, context),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(format!(
                     "FLAC native write for '{}' committed, but common write lock '{}' was already absent during cleanup. The file mutation is complete; this may indicate an external cleanup race, so later recovery/read guards should be allowed to verify the file before further writes.",
@@ -1178,7 +1177,18 @@ mod flac_metadata_writer {
                     self.canonical_path.display(),
                     self.lock_path.display()
                 )),
-            }
+            };
+            // Teardown is the reverse of admission. Keep the process-local
+            // reservation authoritative while native lock cleanup can block or
+            // yield, so another thread still observes the established native
+            // FLAC contention error rather than falling through to the broader
+            // shared mutation claim. Keep the shared claim until native lock
+            // cleanup is complete so cross-process exclusion also remains
+            // continuous. Only then retire shared authority and finally make
+            // the local writer slot available to the next same-process writer.
+            self._mutation_claim.take();
+            self.release_process_claim();
+            warning
         }
 
         fn release_best_effort(&mut self) {
@@ -1189,7 +1199,6 @@ mod flac_metadata_writer {
             if self.reentrant {
                 return;
             }
-            self.release_process_claim();
             match std::fs::remove_file(&self.lock_path) {
                 Ok(()) => {
                     let _ = sync_parent_dir(&self.lock_path, "FLAC common write lock removal");
@@ -1197,6 +1206,8 @@ mod flac_metadata_writer {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => {}
             }
+            self._mutation_claim.take();
+            self.release_process_claim();
         }
     }
 
@@ -6109,11 +6120,9 @@ pub fn write_metadata_field_transactional_with_control_at_verification(
     >,
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, String> {
-    let admission = admit_single_metadata_path(path, "inline metadata edit")?;
-    let admitted_path = admission.admitted_path(path)?.to_path_buf();
-    admission.run(|| {
+    with_single_metadata_path_admission(path, "inline metadata edit", |admitted_path| {
         write_metadata_field_transactional_with_control_at_verification_admitted(
-            &admitted_path,
+            admitted_path,
             field,
             value,
             cancel,
@@ -10797,6 +10806,40 @@ fn admit_single_metadata_path(
     admit_metadata_mutation_paths(&[path.to_path_buf()], operation)
 }
 
+/// Run one metadata mutation under the shared admission protocol.
+///
+/// Native FLAC is the one deliberate exception to taking an *outer* ephemeral
+/// claim here: its writer already owns the shared `MutationClaimGuard` and its
+/// long-standing common-write lock, in that order. Taking the generic claim
+/// first inverts that authority stack and lets a competing same-process FLAC
+/// writer fail at the generic registry instead of the native contention gate.
+/// We still resolve the exact namespace object here, then let the native FLAC
+/// writer acquire both local and cross-session authority atomically. Batch
+/// callers that already hold a scoped claim remain covered by that authority.
+fn with_single_metadata_path_admission<T>(
+    path: &std::path::Path,
+    operation: &str,
+    action: impl FnOnce(&std::path::Path) -> Result<T, String>,
+) -> Result<T, String> {
+    if matches!(
+        crate::metadata_persistence::metadata_persistence_route_for_path(path),
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+    ) {
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .map_err(|error| format!("{operation} admission for '{}': {error}", path.display()))?;
+        return action(&claim.identity.resolved_io_path);
+    }
+
+    let admission = admit_single_metadata_path(path, operation)?;
+    let admitted_path = admission.admitted_path(path)?.to_path_buf();
+    admission.run(|| action(&admitted_path))
+}
+
 /// Write a batch of tag changes to an audio file.
 /// Each entry in `changes` is (ItemKey, Option<new_value>).
 /// `None` means delete the tag. Empty string also deletes.
@@ -11008,31 +11051,26 @@ fn write_editor_tag_changes_with_cancel_report_classified_at_verification(
     >,
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
-    let admission = admit_single_metadata_path(path, "metadata editor write")
-        .map_err(MetadataWriteFailure::Failed)?;
-    let admitted_path = admission
-        .admitted_path(path)
-        .map_err(MetadataWriteFailure::Failed)?
-        .to_path_buf();
-    admission.run(|| {
     let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
-    write_editor_tag_changes_with_cancel_report_at_verification(
-        &admitted_path,
-        changes,
-        operation_cancel.as_ref(),
-        byte_progress,
-        verification,
-    )
-    .map(|mut report| {
-        report
-            .durability_warnings
-            .extend(repeated_instance_loss_warnings(path, changes));
-        report
-            .durability_warnings
-            .extend(unrepresentable_container_warnings(path, changes));
-        report.durability_warnings.sort();
-        report.durability_warnings.dedup();
-        report
+    with_single_metadata_path_admission(path, "metadata editor write", |admitted_path| {
+        write_editor_tag_changes_with_cancel_report_at_verification(
+            admitted_path,
+            changes,
+            operation_cancel.as_ref(),
+            byte_progress,
+            verification,
+        )
+        .map(|mut report| {
+            report
+                .durability_warnings
+                .extend(repeated_instance_loss_warnings(path, changes));
+            report
+                .durability_warnings
+                .extend(unrepresentable_container_warnings(path, changes));
+            report.durability_warnings.sort();
+            report.durability_warnings.dedup();
+            report
+        })
     })
     .map_err(|message| {
         if operation_cancel
@@ -11044,8 +11082,8 @@ fn write_editor_tag_changes_with_cancel_report_classified_at_verification(
             MetadataWriteFailure::Failed(message)
         }
     })
-    })
 }
+
 fn write_editor_tag_changes_with_cancel_report_at_verification(
     path: &std::path::Path,
     changes: &[EditorTagChange],
@@ -11204,31 +11242,25 @@ fn write_all_tags_with_cancel_report_classified_at_verification(
     >,
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
-    let admission = admit_single_metadata_path(path, "metadata write")
-        .map_err(MetadataWriteFailure::Failed)?;
-    let admitted_path = admission
-        .admitted_path(path)
-        .map_err(MetadataWriteFailure::Failed)?
-        .to_path_buf();
-    admission.run(|| {
-        let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
+    with_single_metadata_path_admission(path, "metadata write", |admitted_path| {
         write_all_tags_with_cancel_report_at_verification(
-            &admitted_path,
+            admitted_path,
             changes,
             operation_cancel.as_ref(),
             byte_progress,
             verification,
         )
-        .map_err(|message| {
-            if operation_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.observation_count() > 0)
-            {
-                MetadataWriteFailure::Cancelled(message)
-            } else {
-                MetadataWriteFailure::Failed(message)
-            }
-        })
+    })
+    .map_err(|message| {
+        if operation_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.observation_count() > 0)
+        {
+            MetadataWriteFailure::Cancelled(message)
+        } else {
+            MetadataWriteFailure::Failed(message)
+        }
     })
 }
 
@@ -18820,16 +18852,28 @@ mod tests {
         );
     }
 
-    fn isolated_metadata_journal_home(
-        prefix: &str,
-    ) -> crate::tui::test_support::XdgConfigHomeGuard {
-        let guard = crate::tui::test_support::XdgConfigHomeGuard::new(prefix);
+    struct IsolatedMetadataJournalHomeGuard {
+        _coordination: crate::concurrency::ScopedTestCoordinationRootGuard,
+        _xdg: crate::tui::test_support::XdgConfigHomeGuard,
+    }
+
+    fn isolated_metadata_journal_home(prefix: &str) -> IsolatedMetadataJournalHomeGuard {
+        // Metadata writes now participate in the shared cross-session claim
+        // registry as well as the DB journal. Keep both process-visible test
+        // roots under the same established lock order (coordination -> XDG) so
+        // a libtest worker can never borrow another test's temporary registry
+        // while that registry is being torn down.
+        let coordination = crate::concurrency::scoped_test_coordination_root();
+        let xdg = crate::tui::test_support::XdgConfigHomeGuard::new(prefix);
         assert_eq!(
             crate::db::db_path(),
-            guard.path().join("data").join("tonepoet").join("tonepoet.db"),
+            xdg.path().join("data").join("tonepoet").join("tonepoet.db"),
             "metadata editor test must resolve its journal inside the per-test XDG data home",
         );
-        guard
+        IsolatedMetadataJournalHomeGuard {
+            _coordination: coordination,
+            _xdg: xdg,
+        }
     }
 
     fn native_ape_physical_text_values(
@@ -22441,8 +22485,8 @@ mod tests {
             temp.path(),
             move |_| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-            || {
+                },
+                || {
                 write_all_tags(
                     &path,
                     &[
@@ -24048,6 +24092,7 @@ mod tests {
 
     #[test]
     fn ape_numbering_capability_matches_production_round_trip() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-ape-numbering-round-trip",
         );
@@ -24244,6 +24289,7 @@ mod tests {
 
     #[test]
     fn ape_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-ape-numbering-alias-conflicts",
         );
@@ -24258,6 +24304,7 @@ mod tests {
 
     #[test]
     fn mp4_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         assert_typed_numbering_conflicts_fail_closed(
             "aliases.m4a",
             MP4_NUMBERING_FIXTURE,
@@ -24269,6 +24316,7 @@ mod tests {
 
     #[test]
     fn mp4_numbering_pairs_round_trip_without_free_form_atoms() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use lofty::tag::Accessor;
 
         let (_temp, path) = copy_numbering_fixture("numbering.m4a", MP4_NUMBERING_FIXTURE);
@@ -26104,6 +26152,7 @@ mod tests {
 
     #[test]
     fn id3v23_prefixed_flac_native_in_place_and_overflow_writes_preserve_prefix_and_audio() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
 
         let padded = temp.path().join("prefixed-padded.flac");
@@ -28279,8 +28328,158 @@ mod tests {
         );
     }
 
+    fn assert_flac_cleanup_preserves_native_contention<F>(
+        scope: &std::path::Path,
+        path: &std::path::Path,
+        cleanup_context: &'static str,
+        writer_a: F,
+    ) where
+        F: FnOnce(std::path::PathBuf) -> Result<(), String> + Send + 'static,
+    {
+        let (cleanup_entered_tx, cleanup_entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let cleanup_release_rx = std::sync::Arc::new(std::sync::Mutex::new(cleanup_release_rx));
+        let cleanup_release_rx_for_hook = std::sync::Arc::clone(&cleanup_release_rx);
+        let path_for_writer = path.to_path_buf();
+
+        let (writer_a_result, competing_result, native_lock_removed) =
+            flac_metadata_writer::test_with_parent_dir_sync_hook(
+                scope,
+                move |_parent, context| {
+                    if context != cleanup_context {
+                        return None;
+                    }
+                    if let Err(err) = cleanup_entered_tx.send(()) {
+                        return Some(Err(format!("signal FLAC cleanup parent-sync hook: {err}")));
+                    }
+                    let release_rx = match cleanup_release_rx_for_hook.lock() {
+                        Ok(release_rx) => release_rx,
+                        Err(_) => {
+                            return Some(Err(
+                                "FLAC cleanup release channel mutex poisoned".to_string(),
+                            ));
+                        }
+                    };
+                    match release_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(()) => Some(Ok(())),
+                        Err(err) => Some(Err(format!("wait for FLAC cleanup release: {err}"))),
+                    }
+                },
+                || {
+                    let writer_a = std::thread::spawn(move || writer_a(path_for_writer));
+                    if let Err(wait_err) =
+                        cleanup_entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+                    {
+                        let _ = cleanup_release_tx.send(());
+                        let writer_a_result = writer_a
+                            .join()
+                            .expect("writer A should not panic while entering FLAC cleanup");
+                        panic!(
+                            "writer A never reached the FLAC cleanup parent-sync hook: {wait_err}; writer result: {writer_a_result:?}"
+                        );
+                    }
+
+                    let native_lock_removed =
+                        !flac_metadata_writer::test_write_lock_path(path).exists();
+                    let path_for_competing = path.to_path_buf();
+                    let competing_result = std::thread::spawn(move || {
+                        write_all_tags(
+                            &path_for_competing,
+                            &[(
+                                lofty::tag::ItemKey::TrackTitle,
+                                Some("CompetingDuringCleanup".to_string()),
+                            )],
+                        )
+                    })
+                    .join()
+                    .expect("competing FLAC writer should not panic");
+
+                    cleanup_release_tx
+                        .send(())
+                        .expect("release writer A from FLAC cleanup parent-sync hook");
+                    let writer_a_result = writer_a
+                        .join()
+                        .expect("writer A should not panic while completing FLAC cleanup");
+                    (writer_a_result, competing_result, native_lock_removed)
+                },
+            );
+
+        writer_a_result.expect("writer A should complete after cleanup is released");
+        assert!(
+            native_lock_removed,
+            "regression must suspend after native FLAC lock-file removal to exercise the teardown window"
+        );
+        let competing_err = competing_result.expect_err(
+            "writer B must not enter the native FLAC writer while writer A is cleaning up",
+        );
+        assert!(
+            competing_err.contains("already in progress") || competing_err.contains("write lock"),
+            "writer B should report established native FLAC contention during cleanup: {competing_err}"
+        );
+        assert!(
+            !competing_err.contains("filesystem mutation conflicts with live owner")
+                && !competing_err.contains("overlaps"),
+            "writer B must not fall through to shared-claim self-conflict during cleanup: {competing_err}"
+        );
+
+        write_all_tags(
+            path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("AfterCleanup".to_string()))],
+        )
+        .expect("writer C should proceed after both FLAC cleanup authorities retire");
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(path, "TITLE")
+                .expect("read title after cleanup contention regression"),
+            vec!["AfterCleanup".to_string()],
+            "successful post-cleanup write proves both FLAC authorities retired"
+        );
+    }
+
+    #[test]
+    fn common_write_cleanup_keeps_process_reservation_until_shared_claim_retires() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("common-cleanup-order.flac");
+        let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
+
+        assert_flac_cleanup_preserves_native_contention(
+            temp.path(),
+            &path,
+            "FLAC common write lock removal after tag write",
+            |path| {
+                write_all_tags(
+                    &path,
+                    &[(lofty::tag::ItemKey::TrackTitle, Some("WriterA".to_string()))],
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn common_write_drop_cleanup_keeps_process_reservation_until_shared_claim_retires() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("common-drop-cleanup-order.flac");
+        let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
+
+        assert_flac_cleanup_preserves_native_contention(
+            temp.path(),
+            &path,
+            "FLAC common write lock removal",
+            |path| {
+                let claim = flac_metadata_writer::acquire_native_write_claim(
+                    &path,
+                    "test drop cleanup ordering",
+                )?;
+                drop(claim);
+                Ok(())
+            },
+        );
+    }
+
     #[test]
     fn active_common_write_lock_blocks_reads_and_competing_native_writes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("common-active.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -30572,6 +30771,7 @@ mod tests {
 
     #[test]
     fn active_artwork_common_claim_blocks_tag_write_from_another_thread() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-common-blocks-tags.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
