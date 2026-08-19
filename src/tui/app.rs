@@ -15475,41 +15475,45 @@ mod app_startup_options_tests {
     }
 
     #[test]
-    fn v23_startup_error_is_propagated_without_in_memory_fallback() {
+    fn quiescent_v23_startup_activates_v24_without_in_memory_fallback_or_env_gate() {
         let _serial = crate::tui::file_task_runtime::test_environment_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let db_path = temp.path().join("tonepoet.db");
         let journals = temp.path().join("journals");
         std::fs::create_dir_all(&journals).expect("journal dir");
         let prior_journal = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
-        let prior_confirm = std::env::var_os("TONEPOET_CONFIRM_V24_UPGRADE");
         std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", &journals);
-        std::env::remove_var("TONEPOET_CONFIRM_V24_UPGRADE");
+        // Build a complete current schema first, then reconstruct the v23
+        // queue authority exactly enough to exercise the real v23 -> v24
+        // activation boundary rather than relying on a version-only stub.
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        drop(crate::db::Database::open_path(&db_path).expect("initialize current database"));
         {
-            let conn = rusqlite::Connection::open(&db_path).expect("create v23 db");
-            conn.pragma_update(None, "user_version", 23).expect("stamp v23");
+            let conn = rusqlite::Connection::open(&db_path).expect("open database for v23 fixture");
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP VIEW conversion_queue;
+                 DROP TABLE conversion_queue_v24;
+                 DROP TABLE conversion_queue_executions;
+                 DROP TABLE conversion_queue_scopes;
+                 DROP TABLE concurrency_protocol_epoch;
+                 ALTER TABLE conversion_queue_v23_frozen RENAME TO conversion_queue;
+                 PRAGMA user_version = 23;",
+            )
+            .expect("reconstruct complete v23 fixture");
         }
         let options = AppStartupOptions::default().with_database_path(&db_path);
-        let error = match AppState::try_new_with_startup_options(
-            TonepoetConfig::default(),
-            options,
-        ) {
-            Ok(_) => panic!("v23 activation refusal must propagate to the caller"),
-            Err(error) => error,
-        };
-        assert!(error.contains("requires explicit confirmation"), "unexpected error: {error}");
-        let conn = rusqlite::Connection::open(&db_path).expect("reopen refused v23 db");
+        let app = AppState::try_new_with_startup_options(TonepoetConfig::default(), options)
+            .expect("quiescent v23 startup should activate v24 without external confirmation");
+        drop(app);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen activated v24 db");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("read refused schema version");
-        assert_eq!(version, 23, "refused startup must not activate v24");
+            .expect("read activated schema version");
+        assert_eq!(version, 24, "quiescent startup must durably activate v24");
         match prior_journal {
             Some(value) => std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", value),
             None => std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR"),
-        }
-        match prior_confirm {
-            Some(value) => std::env::set_var("TONEPOET_CONFIRM_V24_UPGRADE", value),
-            None => std::env::remove_var("TONEPOET_CONFIRM_V24_UPGRADE"),
         }
     }
 }

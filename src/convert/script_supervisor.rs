@@ -2636,7 +2636,12 @@ fn spawn_launcher(
     }
     command
         .env_clear()
-        .stdin(Stdio::null())
+        // The parent supervisor has already installed the invocation's exact
+        // stdin policy: ordinary commands receive /dev/null, while pipeline
+        // consumers receive their retained pipe endpoint. Inherit that
+        // sanitized descriptor instead of unconditionally replacing it with
+        // /dev/null at the containment boundary.
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     unsafe {

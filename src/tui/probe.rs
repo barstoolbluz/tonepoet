@@ -3258,27 +3258,49 @@ mod flac_metadata_writer {
             ClaimScope::Exact,
             crate::concurrency::PathResolutionSemantics::NamespaceObject,
         )?;
-        let mutation_claim = if crate::concurrency::current_mutation_authority_covers(&required_claim)? {
-            None
-        } else {
-            Some(
-                MutationClaimGuard::acquire_ephemeral(vec![required_claim.clone()])
-                    .map_err(|error| format!("cannot start metadata {operation} for '{}': {error}", path.display()))?,
-            )
-        };
         let lock_set = COMMON_WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         {
+            // Reserve the process-local FLAC writer slot before asking the
+            // cross-process registry for authority. This keeps same-process
+            // contention on the long-standing native write-lock contract even
+            // when two threads arrive between the registry scan and local-lock
+            // publication. The reservation is rolled back on every admission
+            // failure below, so it cannot outlive unsuccessful shared claims.
             let mut lock_set = lock_set
                 .lock()
                 .map_err(|_| format!("acquire FLAC common write lock for '{}': process-local lock table is poisoned", path.display()))?;
-            if lock_set.contains(&canonical_path) {
+            if !lock_set.insert(canonical_path.clone()) {
                 return Err(format!(
                     "cannot start native FLAC {operation} for '{}': another metadata/artwork mutation for the same FLAC is already in progress in this process",
                     path.display()
                 ));
             }
-            lock_set.insert(canonical_path.clone());
         }
+        let already_authorized = match crate::concurrency::current_mutation_authority_covers(&required_claim) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                if let Ok(mut lock_set) = lock_set.lock() {
+                    lock_set.remove(&canonical_path);
+                }
+                return Err(error);
+            }
+        };
+        let mutation_claim = if already_authorized {
+            None
+        } else {
+            match MutationClaimGuard::acquire_ephemeral(vec![required_claim.clone()]) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    if let Ok(mut lock_set) = lock_set.lock() {
+                        lock_set.remove(&canonical_path);
+                    }
+                    return Err(format!(
+                        "cannot start metadata {operation} for '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        };
 
         let result = acquire_common_write_claim_on_disk(
             path,

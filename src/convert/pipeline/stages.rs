@@ -3381,7 +3381,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 convert_track_message("Starting", track_index + 1, total_tracks, &track, Some(final_path.as_path())),
             )
             .await;
-        let output = convert_one_track_work(
+        let output = Box::pin(convert_one_track_work(
             track_index,
             track.clone(),
             final_path,
@@ -3394,7 +3394,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             cancel.clone(),
             tool_concurrency_limits.clone(),
             reporter,
-        )
+        ))
         .await
         .unwrap_or_else(|err| ScheduledTrackOutput {
             index: track_index,
@@ -3482,7 +3482,7 @@ async fn convert_one_track_work(
     let staging = StagingDir::borrowed(staging_root, staging_job);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
-    let realized = match realize_track_with_tool_limits_and_stats(
+    let realized = match Box::pin(realize_track_with_tool_limits_and_stats(
         &track.source_ref,
         Some(&track),
         &req,
@@ -3491,7 +3491,7 @@ async fn convert_one_track_work(
         &cancel,
         tool_concurrency_limits.clone(),
         Some(&mut progress_tracker),
-    )
+    ))
     .await
     {
         Ok(realized) => realized,
@@ -3517,7 +3517,7 @@ async fn convert_one_track_work(
     }
 
     let bytes_in = file_len(&realized_input);
-    let executed = execute_planned_track_conversion(
+    let executed = Box::pin(execute_planned_track_conversion(
         &req,
         &track,
         &realized_input,
@@ -3530,7 +3530,7 @@ async fn convert_one_track_work(
         &mut progress_tracker,
         0.0,
         1.0,
-    )
+    ))
     .await;
 
     match executed {
@@ -30081,7 +30081,10 @@ pub async fn run_pipeline_item(
     cancel: &CancellationToken,
 ) -> PipelineReport {
     let tool_paths: HashMap<String, PathBuf> = HashMap::new();
-    run_pipeline_item_with_tool_paths(req, runner, reporter, cancel, &tool_paths).await
+    Box::pin(run_pipeline_item_with_tool_paths(
+        req, runner, reporter, cancel, &tool_paths,
+    ))
+    .await
 }
 
 pub async fn run_pipeline_item_with_tool_paths(
@@ -30091,14 +30094,14 @@ pub async fn run_pipeline_item_with_tool_paths(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
 ) -> PipelineReport {
-    run_pipeline_item_with_tool_paths_and_tool_limits(
+    Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits(
         req,
         runner,
         reporter,
         cancel,
         tool_paths,
         None,
-    )
+    ))
     .await
 }
 
@@ -30115,14 +30118,14 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     if crate::concurrency::runtime_execution_id(&item_id).is_some() {
         crate::concurrency::with_runtime_execution_scope(
             item_id,
-            run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
+            Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
                 req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
-            ),
+            )),
         ).await
     } else {
-        run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
+        Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
             req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
-        ).await
+        )).await
     }
 }
 
@@ -30139,14 +30142,14 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
     let disk_retry_req = retry_on_disk.then(|| request_without_scratch_staging(&req));
     let item_id = req.item_id.clone();
 
-    let report = run_pipeline_item_with_tool_paths_and_tool_limits_once(
+    let report = Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_once(
         req,
         runner,
         reporter,
         cancel,
         tool_paths,
         tool_concurrency_limits.clone(),
-    )
+    ))
     .await;
 
     let Some(disk_req) = disk_retry_req else {
@@ -30168,14 +30171,14 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
         disk_staging_parent_for(&disk_req).display(),
         original_error,
     );
-    run_pipeline_item_with_tool_paths_and_tool_limits_once(
+    Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_once(
         disk_req,
         runner,
         reporter,
         cancel,
         tool_paths,
         tool_concurrency_limits,
-    )
+    ))
     .await
 }
 
@@ -30590,7 +30593,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
-    let converted = convert_tracks_with_reporter_with_tool_paths(
+    let converted = Box::pin(convert_tracks_with_reporter_with_tool_paths(
         source.as_ref().expect("source present"),
         plan.as_ref().expect("plan present"),
         &req,
@@ -30600,7 +30603,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         Some(reporter),
         tool_paths,
         tool_concurrency_limits.clone(),
-    )
+    ))
     .await;
     emit_stage_finished(reporter, &item_id, converted.record.clone()).await;
     stages.push(converted.record.clone());

@@ -830,14 +830,12 @@ impl Database {
                 before.join("; ")
             ));
         }
-        if std::env::var_os("TONEPOET_CONFIRM_V24_UPGRADE").as_deref() != Some(std::ffi::OsStr::new("1")) {
-            return Err(
-                "concurrency protocol v24 activation requires explicit confirmation that all tonepoet v0.4.8 sessions are closed; rerun this start with TONEPOET_CONFIRM_V24_UPGRADE=1 after closing older sessions"
-                    .to_string(),
-            );
-        }
-        // Confirmation is not authority by itself: recheck observable signals
-        // immediately before the schema boundary.
+        // The serialized activation lock plus the live-signal probes are the
+        // authority boundary. Requiring a separate environment acknowledgement
+        // here makes a demonstrably quiescent, ordinary single-session upgrade
+        // unusable without adding safety: an acknowledgement cannot prevent a
+        // peer from appearing after it is supplied. Recheck under the same
+        // activation lock immediately before crossing the schema boundary.
         let after = self.observable_legacy_live_signals()?;
         if !after.is_empty() {
             return Err(format!(
@@ -3488,7 +3486,10 @@ impl Database {
         // Empty startup is read-only with respect to queue ownership. This is
         // important for bounded durable history and keeps browsing-only
         // sessions off the coordination/SQLite write path.
-        if !self.has_queue_items()? {
+        if !self
+            .has_queue_items()
+            .map_err(|error| format!("queue load prepare: {error}"))?
+        {
             return Ok(QueueLoadOutcome { items: Vec::new(), degradation: None });
         }
         let scope_id = self.ensure_queue_scope()?.scope_id;

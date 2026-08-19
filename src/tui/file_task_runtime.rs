@@ -465,13 +465,40 @@ struct JournalRecoveryLease {
 }
 
 impl JournalRecoveryLease {
-    fn acquire(path: &Path, family: &LeaseFamily) -> Result<Self, String> {
-        Ok(Self { lease: Arc::new(PersistentLease::acquire_existing_recovery(path, family)?) })
+    fn acquire(
+        path: &Path,
+        family: &LeaseFamily,
+        allow_local_handoff: bool,
+    ) -> Result<Self, String> {
+        let lease = if allow_local_handoff {
+            PersistentLease::acquire_existing_recovery_with_local_handoff(path, family)?
+        } else {
+            PersistentLease::acquire_existing_recovery(path, family)?
+        };
+        Ok(Self { lease: Arc::new(lease) })
     }
 
     fn holder(&self) -> Arc<PersistentLease> {
         Arc::clone(&self.lease)
     }
+}
+
+fn permits_same_process_recovery_handoff(
+    journal_path: &Path,
+    record: &DurableFileTaskRecord,
+) -> bool {
+    let root = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    if abandon_marker_path(root, &record.job_id, record.generation).exists() {
+        return true;
+    }
+    matches!(
+        record.lifecycle,
+        DurableFileTaskLifecycle::Cancelled
+            | DurableFileTaskLifecycle::Failed
+            | DurableFileTaskLifecycle::Completed
+            | DurableFileTaskLifecycle::AwaitingReconciliation
+            | DurableFileTaskLifecycle::Reconciled
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -585,7 +612,11 @@ impl FileTaskJournalHandle {
         let descriptor_path = previous.lease_descriptor.clone()
             .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten())
             .ok_or_else(|| "legacy or incomplete file-operation journal has no protocol-v2 ownership descriptor; automatic recovery is refused".to_string())?;
-        let recovery = JournalRecoveryLease::acquire(&descriptor_path, &family)?;
+        let recovery = JournalRecoveryLease::acquire(
+            &descriptor_path,
+            &family,
+            permits_same_process_recovery_handoff(&path, &previous),
+        )?;
         let record = resume_record_locked(
             &recovery,
             &path,
@@ -1395,14 +1426,9 @@ pub fn nonterminal_legacy_journals() -> Vec<LegacyFileTaskJournalInventoryEntry>
 /// scanner namespace; dropping the local holder then leaves RecoveryReserved
 /// authority for the ordinary explicit recovery review.
 pub fn adopt_legacy_journal(journal_path: &Path) -> Result<PathBuf, String> {
-    if std::env::var_os("TONEPOET_CONFIRM_V24_UPGRADE").as_deref()
-        != Some(std::ffi::OsStr::new("1"))
-    {
-        return Err(
-            "legacy file-operation adoption requires TONEPOET_CONFIRM_V24_UPGRADE=1 after all v0.4.8 sessions have been closed"
-                .to_string(),
-        );
-    }
+    // Invoking the dedicated adoption API/CLI is itself the explicit operator
+    // action. Safety comes from proving that no observable peer can still own
+    // v0.4.8 mutation state, not from a second environment-variable ritual.
     let peer_signals = crate::db::observable_tonepoet_peer_processes();
     if !peer_signals.is_empty() {
         return Err(format!(
@@ -1551,7 +1577,12 @@ pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
                         }
                     }
                 };
-                match crate::concurrency::descriptor_availability(&descriptor) {
+                let availability = if permits_same_process_recovery_handoff(&path, &record) {
+                    crate::concurrency::descriptor_recovery_availability_with_local_handoff(&descriptor)
+                } else {
+                    crate::concurrency::descriptor_availability(&descriptor)
+                };
+                match availability {
                     Ok((_family, crate::concurrency::ClaimAvailability::Live)) => {
                         log::debug!("file-operation journal {} remains live-owned; omit from recovery", path.display());
                         None

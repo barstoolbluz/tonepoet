@@ -148,13 +148,115 @@ pub enum PathResolutionSemantics {
     NamespaceObject,
 }
 
+mod lossless_path_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum EncodedPath<'a> {
+        Utf8(&'a str),
+        #[cfg(unix)]
+        UnixBytes { unix_bytes: &'a [u8] },
+        #[cfg(windows)]
+        WindowsWide { windows_wide: Vec<u16> },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DecodedPath {
+        Utf8(String),
+        #[cfg(unix)]
+        UnixBytes { unix_bytes: Vec<u8> },
+        #[cfg(windows)]
+        WindowsWide { windows_wide: Vec<u16> },
+    }
+
+    fn encode(path: &Path) -> EncodedPath<'_> {
+        if let Some(text) = path.to_str() {
+            return EncodedPath::Utf8(text);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return EncodedPath::UnixBytes {
+                unix_bytes: path.as_os_str().as_bytes(),
+            };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            return EncodedPath::WindowsWide {
+                windows_wide: path.as_os_str().encode_wide().collect(),
+            };
+        }
+        #[allow(unreachable_code)]
+        EncodedPath::Utf8("")
+    }
+
+    fn decode<E: serde::de::Error>(encoded: DecodedPath) -> Result<PathBuf, E> {
+        match encoded {
+            DecodedPath::Utf8(text) => Ok(PathBuf::from(text)),
+            #[cfg(unix)]
+            DecodedPath::UnixBytes { unix_bytes } => {
+                use std::os::unix::ffi::OsStringExt;
+                Ok(PathBuf::from(std::ffi::OsString::from_vec(unix_bytes)))
+            }
+            #[cfg(windows)]
+            DecodedPath::WindowsWide { windows_wide } => {
+                use std::os::windows::ffi::OsStringExt;
+                Ok(PathBuf::from(std::ffi::OsString::from_wide(&windows_wide)))
+            }
+        }
+    }
+
+    pub fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        encode(path).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        decode(DecodedPath::deserialize(deserializer)?)
+    }
+
+    pub fn serialize_vec<S>(paths: &Vec<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        paths.iter().map(|path| encode(path)).collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize_vec<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<DecodedPath>::deserialize(deserializer)?
+            .into_iter()
+            .map(decode)
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPathIdentity {
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize",
+        deserialize_with = "lossless_path_serde::deserialize"
+    )]
     pub original: PathBuf,
     /// Absolute lexical namespace identity before symlink traversal.  This is
     /// carried alongside the resolved I/O identity so replacing/renaming a
     /// symlink or directory entry cannot silently rebind admitted work.
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "lossless_path_serde::serialize",
+        deserialize_with = "lossless_path_serde::deserialize"
+    )]
     pub namespace_path: PathBuf,
     /// Exact namespace objects whose binding was followed while resolving the
     /// admitted I/O path. Each key has its parent stabilized through preceding
@@ -162,10 +264,26 @@ pub struct ResolvedPathIdentity {
     /// parent spellings compare as the same dependency object. Replacing one
     /// of these aliases requires WRITE and must conflict with this claim's
     /// implicit READ dependency.
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "lossless_path_serde::serialize_vec",
+        deserialize_with = "lossless_path_serde::deserialize_vec"
+    )]
     pub namespace_dependencies: Vec<PathBuf>,
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize",
+        deserialize_with = "lossless_path_serde::deserialize"
+    )]
     pub resolved_io_path: PathBuf,
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize",
+        deserialize_with = "lossless_path_serde::deserialize"
+    )]
     pub canonical_existing_ancestor: PathBuf,
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize",
+        deserialize_with = "lossless_path_serde::deserialize"
+    )]
     pub suffix: PathBuf,
     #[serde(default)]
     pub dev: Option<u64>,
@@ -651,11 +769,75 @@ struct LeaseDescriptor {
 }
 
 pub struct PersistentLease {
-    file: File,
+    file: Arc<File>,
     descriptor_path: PathBuf,
     descriptor_id: Uuid,
     family: LeaseFamily,
     claims: Arc<[PathClaim]>,
+}
+
+/// Process-local view of descriptor handles created by this process. Weak
+/// references deliberately do not extend lease lifetime; they only let a
+/// recovery path co-hold the exact already-locked open-file description when
+/// the durable lifecycle itself has explicitly become recoverable before the
+/// creating handle is dropped (notably deterministic in-process recovery
+/// tests and same-process handoff). Foreign owners can never enter this path.
+fn local_persistent_lease_files() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<File>>> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Weak<File>>>> = OnceLock::new();
+    FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_local_persistent_lease(path: &Path, file: &Arc<File>) {
+    local_persistent_lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), Arc::downgrade(file));
+}
+
+fn unregister_local_persistent_lease(path: &Path, file: &Arc<File>) {
+    let mut files = local_persistent_lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let remove = match files.get(path).and_then(std::sync::Weak::upgrade) {
+        // `registered` is one temporary strong reference and `file` is this
+        // lease's reference. A count of two therefore means this is the last
+        // process-local co-holder of the registered open-file description.
+        Some(registered) => Arc::ptr_eq(&registered, file) && Arc::strong_count(&registered) == 2,
+        None => true,
+    };
+    if remove {
+        files.remove(path);
+    }
+}
+
+fn local_persistent_lease_file(path: &Path) -> Option<Arc<File>> {
+    let mut files = local_persistent_lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = files.get(path).and_then(std::sync::Weak::upgrade);
+    if file.is_none() {
+        files.remove(path);
+    }
+    file
+}
+
+fn current_process_coheld_descriptor(
+    path: &Path,
+    descriptor: &LeaseDescriptor,
+) -> Result<Option<Arc<File>>, String> {
+    // Same-process co-holding exists solely for durable file-task journal
+    // recovery. Keep every other lease family on the ordinary exclusive-lock
+    // path so this narrow handoff cannot grow into a generic local bypass.
+    if !matches!(&descriptor.family, LeaseFamily::JournalOperation { .. })
+        || descriptor.owner != OwnerProcessIdentity::current()
+    {
+        return Ok(None);
+    }
+    let Some(file) = local_persistent_lease_file(path) else {
+        return Ok(None);
+    };
+    verify_coordination_path_binding(&file, path, "process-local persistent lease")?;
+    Ok(Some(file))
 }
 
 /// Removes a coordination pathname owned by this creation attempt on ordinary
@@ -1142,6 +1324,10 @@ impl PersistentLease {
         // was rebound while publication cleanup was in progress.
         verify_coordination_path_binding(&file, &path, "published persistent lease")?;
         final_cleanup.disarm();
+        let file = Arc::new(file);
+        if matches!(&family, LeaseFamily::JournalOperation { .. }) {
+            register_local_persistent_lease(&path, &file);
+        }
         Ok(Self {
             file,
             descriptor_path: path,
@@ -1154,11 +1340,87 @@ impl PersistentLease {
     /// Acquire durable recovery authority using the global lock order.
     /// Classification may happen lock-free beforehand, but any transition from
     /// RecoveryReserved to a live recovery owner must take registry -> descriptor.
-    pub fn acquire_existing_recovery(path: &Path, expected_family: &LeaseFamily) -> Result<Self, String> {
+    /// This ordinary entry point remains strict: any locked descriptor is live.
+    pub fn acquire_existing_recovery(
+        path: &Path,
+        expected_family: &LeaseFamily,
+    ) -> Result<Self, String> {
+        Self::acquire_existing_recovery_internal(path, expected_family, false)
+    }
+
+    /// Recover a durable lifecycle after the owning subsystem has durably
+    /// established that a same-process handle is only a stale handoff holder.
+    /// Foreign-process owners remain live and cannot enter this path.
+    pub fn acquire_existing_recovery_with_local_handoff(
+        path: &Path,
+        expected_family: &LeaseFamily,
+    ) -> Result<Self, String> {
+        Self::acquire_existing_recovery_internal(path, expected_family, true)
+    }
+
+    fn acquire_existing_recovery_internal(
+        path: &Path,
+        expected_family: &LeaseFamily,
+        allow_local_handoff: bool,
+    ) -> Result<Self, String> {
         let root = coordination_root();
         create_private_dir(&root)?;
         let _registry = RegistryLock::acquire(&root)?;
-        Self::acquire_existing(path, expected_family)
+        let mut opened = open_existing_descriptor(path)
+            .map_err(|e| format!("open persistent lease {}: {e}", path.display()))?;
+        match opened.try_lock_exclusive() {
+            Ok(()) => {
+                let descriptor = read_descriptor_from(&mut opened, path)?;
+                if &descriptor.family != expected_family {
+                    return Err(format!(
+                        "persistent lease family mismatch for {}: expected {:?}, found {:?}",
+                        path.display(), expected_family, descriptor.family
+                    ));
+                }
+                let file = Arc::new(opened);
+                if matches!(&descriptor.family, LeaseFamily::JournalOperation { .. })
+                    && descriptor.owner == OwnerProcessIdentity::current()
+                {
+                    register_local_persistent_lease(path, &file);
+                }
+                return Ok(Self {
+                    file,
+                    descriptor_path: path.to_path_buf(),
+                    descriptor_id: descriptor.descriptor_id,
+                    family: descriptor.family,
+                    claims: descriptor.claims.into(),
+                });
+            }
+            Err(error) if is_lock_contended(&error) => {}
+            Err(error) => {
+                return Err(format!("lock persistent lease {}: {error}", path.display()));
+            }
+        }
+
+        let descriptor = read_descriptor_from(&mut opened, path)?;
+        if &descriptor.family != expected_family {
+            return Err(format!(
+                "persistent lease family mismatch for {}: expected {:?}, found {:?}",
+                path.display(), expected_family, descriptor.family
+            ));
+        }
+        if !allow_local_handoff {
+            return Err(format!("persistent lease is live-owned: {}", path.display()));
+        }
+
+        // The caller has already proven a durable same-process handoff state.
+        // Co-hold only the exact locally-created locked OFD; never unlock,
+        // duplicate by pathname, or bypass a foreign owner's descriptor.
+        let Some(file) = current_process_coheld_descriptor(path, &descriptor)? else {
+            return Err(format!("persistent lease is live-owned: {}", path.display()));
+        };
+        Ok(Self {
+            file,
+            descriptor_path: path.to_path_buf(),
+            descriptor_id: descriptor.descriptor_id,
+            family: descriptor.family,
+            claims: descriptor.claims.into(),
+        })
     }
 
     pub fn acquire_existing(path: &Path, expected_family: &LeaseFamily) -> Result<Self, String> {
@@ -1179,7 +1441,7 @@ impl PersistentLease {
             ));
         }
         Ok(Self {
-            file,
+            file: Arc::new(file),
             descriptor_path: path.to_path_buf(),
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
@@ -1221,7 +1483,7 @@ impl PersistentLease {
             return Err(format!("inherited persistent lease family mismatch for {}", descriptor_path.display()));
         }
         Ok(Self {
-            file,
+            file: Arc::new(file),
             descriptor_path,
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
@@ -1230,8 +1492,17 @@ impl PersistentLease {
     }
 }
 
-// Intentionally no Drop implementation. Dropping `File` closes only this
-// descriptor. In particular there is no FileExt::unlock and no unlink here.
+impl Drop for PersistentLease {
+    fn drop(&mut self) {
+        // This is bookkeeping only: pruning the weak process-local co-hold
+        // index neither unlocks nor unlinks authority. Only JournalOperation
+        // descriptors participate, so ordinary ephemeral/queue leases pay no
+        // recovery-index synchronization cost on drop.
+        if matches!(&self.family, LeaseFamily::JournalOperation { .. }) {
+            unregister_local_persistent_lease(&self.descriptor_path, &self.file);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct MutationClaimGuard {
@@ -1397,6 +1668,36 @@ pub fn descriptor_availability(path: &Path) -> Result<(LeaseFamily, ClaimAvailab
         Err(error) if is_lock_contended(&error) => {
             let descriptor = read_descriptor_from(&mut file, path)?;
             Ok((descriptor.family.clone(), ClaimAvailability::Live))
+        }
+        Err(error) => Err(format!("probe persistent lease {}: {error}", path.display())),
+    }
+}
+
+/// Classify a descriptor after the owning subsystem has durably established
+/// a same-process recovery handoff. A foreign owner remains `Live`; only the
+/// exact locally-created locked OFD can be treated by its post-owner lifecycle
+/// semantics. Ordinary admission must continue to use `descriptor_availability`.
+pub fn descriptor_recovery_availability_with_local_handoff(
+    path: &Path,
+) -> Result<(LeaseFamily, ClaimAvailability), String> {
+    let mut file = open_existing_descriptor(path)
+        .map_err(|e| format!("open persistent lease {}: {e}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let descriptor = read_descriptor_from(&mut file, path)?;
+            Ok((
+                descriptor.family.clone(),
+                classify_availability(&descriptor.family, false),
+            ))
+        }
+        Err(error) if is_lock_contended(&error) => {
+            let descriptor = read_descriptor_from(&mut file, path)?;
+            let availability = if current_process_coheld_descriptor(path, &descriptor)?.is_some() {
+                classify_availability(&descriptor.family, false)
+            } else {
+                ClaimAvailability::Live
+            };
+            Ok((descriptor.family.clone(), availability))
         }
         Err(error) => Err(format!("probe persistent lease {}: {error}", path.display())),
     }
@@ -3144,6 +3445,93 @@ mod tests {
             let error = PersistentLease::acquire_existing(&path, &family).unwrap_err();
             assert!(error.contains("open persistent lease"));
         });
+    }
+
+    #[test]
+    fn same_process_recovery_coholds_exact_descriptor_without_weakening_strict_acquire() {
+        with_root(|_| {
+            let family = LeaseFamily::JournalOperation {
+                job_id: Uuid::new_v4(),
+            };
+            let lease = PersistentLease::create(family.clone(), &[])
+                .expect("create durable lease");
+            let path = lease.descriptor_path().to_path_buf();
+            let descriptor_id = lease.descriptor_id();
+
+            assert_eq!(
+                descriptor_availability(&path).expect("ordinary availability").1,
+                ClaimAvailability::Live,
+                "generic admission must continue to see the live local owner"
+            );
+            assert_eq!(
+                descriptor_recovery_availability_with_local_handoff(&path)
+                    .expect("recovery handoff availability")
+                    .1,
+                ClaimAvailability::RecoveryReserved,
+                "explicit recovery discovery may co-hold its own exact descriptor"
+            );
+
+            let strict_recovery_error = PersistentLease::acquire_existing_recovery(&path, &family)
+                .expect_err("ordinary recovery must still reject a live local holder");
+            assert!(
+                strict_recovery_error.contains("live-owned"),
+                "unexpected error: {strict_recovery_error}"
+            );
+            let recovery = PersistentLease::acquire_existing_recovery_with_local_handoff(&path, &family)
+                .expect("explicit same-process handoff should co-hold exact locked descriptor");
+            assert_eq!(recovery.descriptor_id(), descriptor_id);
+            let strict_error = PersistentLease::acquire_existing(&path, &family)
+                .expect_err("strict lifecycle acquisition must still reject a live holder");
+            assert!(strict_error.contains("live-owned"), "unexpected error: {strict_error}");
+
+            drop(recovery);
+            drop(lease);
+            let reclaimed = PersistentLease::acquire_existing_recovery(&path, &family)
+                .expect("dead local owner should be acquired normally");
+            assert_eq!(reclaimed.descriptor_id(), descriptor_id);
+            drop(reclaimed);
+            assert!(
+                local_persistent_lease_file(&path).is_none(),
+                "dropping the last local holder must prune the weak co-hold index"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_claim_json_round_trips_non_utf8_losslessly_and_keeps_utf8_wire_compatible() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let non_utf8 = dir
+            .path()
+            .join(OsString::from_vec(b"track-\xff.dsf".to_vec()));
+        std::fs::write(&non_utf8, b"fixture").expect("non-UTF fixture");
+        let claim = PathClaim::resolve_with_semantics(
+            &non_utf8,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("resolve non-UTF claim");
+        let encoded = serde_json::to_value(&claim).expect("serialize non-UTF claim");
+        assert!(
+            encoded["identity"]["original"].get("unix_bytes").is_some(),
+            "non-UTF Unix paths must use the lossless byte representation"
+        );
+        let decoded: PathClaim = serde_json::from_value(encoded).expect("deserialize non-UTF claim");
+        assert_eq!(decoded, claim);
+
+        let utf8 = dir.path().join("ordinary.dsf");
+        std::fs::write(&utf8, b"fixture").expect("UTF-8 fixture");
+        let utf8_claim = PathClaim::resolve(&utf8, ClaimMode::Write, ClaimScope::Exact)
+            .expect("resolve UTF-8 claim");
+        let utf8_json = serde_json::to_value(&utf8_claim).expect("serialize UTF-8 claim");
+        assert!(
+            utf8_json["identity"]["original"].is_string(),
+            "schema-v1 descriptors must keep their existing JSON string encoding for UTF-8 paths"
+        );
     }
 
 }

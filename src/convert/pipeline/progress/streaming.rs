@@ -267,6 +267,7 @@ where
                 command.stdout_tail = stdout_tail;
                 command.stderr_tail = stderr_tail;
                 if let Some(tracker) = tracker.as_deref_mut() {
+                    tracker.cancel_requested_for_tool(cmd.binary.default_name()).await;
                     tracker.cancelled_at_last_progress().await;
                 }
                 Err(ToolRunnerError::Cancelled { command })

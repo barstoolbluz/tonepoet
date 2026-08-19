@@ -4719,6 +4719,21 @@ fn owner_token_is_live(token: &str) -> bool {
     process_owner_token(pid).is_some_and(|current| current == token)
 }
 
+/// Return whether an owner identity must defer recovery of this journal.
+///
+/// A journal registered in `ACTIVE_REMOVAL_JOURNALS` is the process-local
+/// liveness authority. Once the operation deliberately deactivates that
+/// registration, treating this process's still-live PID as a veto makes an
+/// explicit recovery handoff impossible. Foreign-process identities continue
+/// to use the process-start token and therefore remain fail-closed against a
+/// genuinely live peer.
+fn owner_token_blocks_recovery(journal_path: &Path, token: &str) -> bool {
+    if owner_token_pid(token) == Some(std::process::id()) {
+        return is_active_removal_journal(journal_path);
+    }
+    owner_token_is_live(token)
+}
+
 fn legacy_recovery_journal_binding(
     owner_token: &str,
     original_name: &std::ffi::OsStr,
@@ -5172,7 +5187,7 @@ fn recover_interrupted_verified_removals_internal(
                 continue;
             }
         };
-        if !ignore_live_owner && owner_token_is_live(&record.owner_token) {
+        if !ignore_live_owner && owner_token_blocks_recovery(&journal_path, &record.owner_token) {
             report.deferred.push(journal_path);
             continue;
         }
@@ -5306,7 +5321,7 @@ pub fn discover_interrupted_verified_removal_restore_targets(
         let Ok(record) = parse_journal_payload(&payload) else {
             continue;
         };
-        if owner_token_is_live(&record.owner_token)
+        if owner_token_blocks_recovery(&journal_path, &record.owner_token)
             || record.quarantine_name != expected_quarantine_name
             || record.original_name == record.quarantine_name
         {
@@ -5348,7 +5363,7 @@ pub fn recover_interrupted_verified_removal_restore_target(
     }
     let payload = read_regular_recovery_journal(&admitted_journal)?;
     let record = parse_journal_payload(&payload)?;
-    if owner_token_is_live(&record.owner_token) {
+    if owner_token_blocks_recovery(&admitted_journal, &record.owner_token) {
         return Err(format!("copy-undo recovery journal owner is still live: {}", admitted_journal.display()));
     }
     if record.quarantine_name != expected_quarantine_name
