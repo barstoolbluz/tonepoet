@@ -1074,6 +1074,12 @@ pub fn save_preset(preset: &TuiPreset) -> Result<(), String> {
 
 /// Save a preset to an explicit path returned by a file picker.
 pub fn save_preset_to_path(preset: &TuiPreset, path: &Path) -> Result<(), String> {
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(path)
+        .map_err(|e| format!("Failed to lock preset '{}': {e}", path.display()))?;
+    save_preset_to_path_locked(preset, &resolved)
+}
+
+fn save_preset_to_path_locked(preset: &TuiPreset, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create preset directory '{}': {}", parent.display(), e))?;
@@ -1123,19 +1129,55 @@ pub fn find_unique_preset_name(base: &str, existing: &[String]) -> String {
 
 /// Delete a preset by name
 pub fn delete_preset(name: &str) -> Result<(), String> {
-    let dir = presets_dir();
-    let path = dir.join(format!("{}.toml", name));
-
-    fs::remove_file(&path).map_err(|e| format!("Failed to delete preset '{}': {}", name, e))?;
-
+    let path = preset_file_path(name);
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(&path)
+        .map_err(|e| format!("Failed to lock preset '{}': {e}", name))?;
+    fs::remove_file(&resolved).map_err(|e| format!("Failed to delete preset '{}': {}", name, e))?;
+    if let Some(parent) = resolved.parent() {
+        fs::File::open(parent).and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("Failed to sync preset directory '{}': {e}", parent.display()))?;
+    }
     Ok(())
 }
 
-/// Save a preset to both TOML and SQLite.
-pub fn save_preset_with_db(preset: &TuiPreset, db: &crate::db::Database) -> Result<(), String> {
-    save_preset(preset)?;
-    store_preset_in_db(preset, db);
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresetCommitOutcome {
+    Committed,
+    CommittedWithIndexWarning(String),
+}
+
+impl PresetCommitOutcome {
+    pub fn index_warning(&self) -> Option<&str> {
+        match self {
+            Self::Committed => None,
+            Self::CommittedWithIndexWarning(error) => Some(error.as_str()),
+        }
+    }
+}
+
+/// Save a preset to both TOML and SQLite. The TOML file is the durable
+/// source of truth; an index failure after publication is reported as a
+/// committed result with a warning so callers never pretend the TOML rolled
+/// back. Startup repair converges the SQLite index later.
+pub fn save_preset_with_db(
+    preset: &TuiPreset,
+    db: &crate::db::Database,
+) -> Result<PresetCommitOutcome, String> {
+    let path = preset_file_path(&preset.name);
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(&path)
+        .map_err(|e| format!("Failed to lock preset '{}': {e}", preset.name))?;
+    save_preset_to_path_locked(preset, &resolved)?;
+    match store_preset_in_db(preset, db) {
+        Ok(()) => Ok(PresetCommitOutcome::Committed),
+        Err(error) => {
+            log::warn!(
+                "preset '{}' committed to TOML but SQLite index update failed: {}",
+                preset.name,
+                error
+            );
+            Ok(PresetCommitOutcome::CommittedWithIndexWarning(error))
+        }
+    }
 }
 
 /// Save a preset to an explicit path and index it in SQLite under the file stem.
@@ -1143,14 +1185,24 @@ pub fn save_preset_to_path_with_db(
     preset: &TuiPreset,
     path: &Path,
     db: &crate::db::Database,
-) -> Result<(), String> {
-    save_preset_to_path(preset, path)?;
-    store_preset_in_db(preset, db);
-    Ok(())
+) -> Result<PresetCommitOutcome, String> {
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(path)
+        .map_err(|e| format!("Failed to lock preset '{}': {e}", path.display()))?;
+    save_preset_to_path_locked(preset, &resolved)?;
+    match store_preset_in_db(preset, db) {
+        Ok(()) => Ok(PresetCommitOutcome::Committed),
+        Err(error) => {
+            log::warn!(
+                "preset '{}' committed to TOML at {} but SQLite index update failed: {}",
+                preset.name, resolved.display(), error
+            );
+            Ok(PresetCommitOutcome::CommittedWithIndexWarning(error))
+        }
+    }
 }
 
-fn store_preset_in_db(preset: &TuiPreset, db: &crate::db::Database) {
-    let _ = db.store_preset(
+fn store_preset_in_db(preset: &TuiPreset, db: &crate::db::Database) -> Result<(), String> {
+    db.store_preset(
         &preset.name,
         &preset.format,
         preset.description.as_deref(),
@@ -1161,38 +1213,61 @@ fn store_preset_in_db(preset: &TuiPreset, db: &crate::db::Database) {
         Some(&preset.folder_template),
         Some(&preset.filename_template),
         Some(&preset.merge),
-    );
+    )
 }
 
 /// Delete a preset from both TOML and SQLite.
-pub fn delete_preset_with_db(name: &str, db: &crate::db::Database) -> Result<(), String> {
-    delete_preset(name)?;
-    let _ = db.delete_preset(name);
-    Ok(())
+pub fn delete_preset_with_db(
+    name: &str,
+    db: &crate::db::Database,
+) -> Result<PresetCommitOutcome, String> {
+    let path = preset_file_path(name);
+    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(&path)
+        .map_err(|e| format!("Failed to lock preset '{}': {e}", name))?;
+    match fs::remove_file(&resolved) {
+        Ok(()) => {
+            if let Some(parent) = resolved.parent() {
+                fs::File::open(parent).and_then(|directory| directory.sync_all())
+                    .map_err(|e| format!("Failed to sync preset directory '{}': {e}", parent.display()))?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Failed to delete preset '{}': {e}", name)),
+    }
+    match db.delete_preset(name) {
+        Ok(()) => Ok(PresetCommitOutcome::Committed),
+        Err(error) => {
+            log::warn!(
+                "preset '{}' removed from TOML but SQLite index update failed: {}",
+                name,
+                error
+            );
+            Ok(PresetCommitOutcome::CommittedWithIndexWarning(error))
+        }
+    }
 }
 
 /// Sync TOML presets into the SQLite database. Imports any TOML
 /// presets not already in the DB (handles first-run and externally-
 /// added presets like manual file copies or syncs from another machine).
 pub fn import_presets_to_db(db: &crate::db::Database) {
-    let db_names = db.list_preset_names();
-    for name in list_presets() {
-        if db_names.iter().any(|n| n == &name) {
-            continue; // Already in DB.
+    // TOML is the source of truth. Refresh every present row (not only missing
+    // rows) and remove DB-only rows. Each same-name file/index pair is protected
+    // by the same per-preset store lock used by interactive save/delete.
+    let file_names = list_presets();
+    let file_set = file_names.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    for name in &file_names {
+        let path = preset_file_path(name);
+        let Ok((_lock, resolved)) = crate::config::StoreFileLock::acquire_for_path(&path) else { continue };
+        if let Ok(preset) = load_preset_from_path(&resolved) {
+            let _ = store_preset_in_db(&preset, db);
         }
-        if let Ok(preset) = load_preset(&name) {
-            let _ = db.store_preset(
-                &preset.name,
-                &preset.format,
-                preset.description.as_deref(),
-                Some(preset.sample_rate),
-                Some(&preset.bit_depth),
-                Some(&preset.dither),
-                Some(&preset.replaygain),
-                Some(&preset.folder_template),
-                Some(&preset.filename_template),
-                Some(&preset.merge),
-            );
+    }
+    for name in db.list_preset_names() {
+        if file_set.contains(&name) { continue; }
+        let path = preset_file_path(&name);
+        if let Ok((_lock, _)) = crate::config::StoreFileLock::acquire_for_path(&path) {
+            let _ = db.delete_preset(&name);
         }
     }
 }
@@ -1387,6 +1462,46 @@ fn parse_merge(s: &str) -> Option<MergeMode> {
 #[cfg(test)]
 mod companion_preset_tests {
     use super::*;
+
+    fn current_test_preset(name: &str) -> TuiPreset {
+        TuiPreset::from_pill_state(
+            name,
+            &FormatState::new(),
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        )
+    }
+
+    #[test]
+    fn toml_save_commit_survives_sqlite_index_failure_as_warning() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-preset-index-warning-save",
+        );
+        let db = crate::db::Database::open_memory().expect("db");
+        db.install_preset_index_failure_for_tests().expect("failure trigger");
+        let preset = current_test_preset("index-warning-save");
+
+        let outcome = save_preset_with_db(&preset, &db).expect("TOML commit remains success");
+        assert!(matches!(outcome, PresetCommitOutcome::CommittedWithIndexWarning(_)));
+        assert!(preset_file_path(&preset.name).exists());
+        assert_eq!(load_preset(&preset.name).expect("load committed TOML").name, preset.name);
+    }
+
+    #[test]
+    fn toml_delete_commit_survives_sqlite_index_failure_as_warning() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-preset-index-warning-delete",
+        );
+        let db = crate::db::Database::open_memory().expect("db");
+        let preset = current_test_preset("index-warning-delete");
+        save_preset_with_db(&preset, &db).expect("seed preset");
+        assert!(preset_file_path(&preset.name).exists());
+        db.install_preset_index_failure_for_tests().expect("failure trigger");
+
+        let outcome = delete_preset_with_db(&preset.name, &db).expect("TOML delete remains success");
+        assert!(matches!(outcome, PresetCommitOutcome::CommittedWithIndexWarning(_)));
+        assert!(!preset_file_path(&preset.name).exists());
+    }
 
     #[test]
     fn legacy_v3_preset_requires_explicit_reference_target_reconfirmation() {

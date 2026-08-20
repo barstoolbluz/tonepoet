@@ -1265,4 +1265,30 @@ mod tests {
         assert_eq!(resolved.musicbrainz_release_track_id, None);
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_metabase_publish_replaces_final_symlink_not_referent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("master.xml");
+        let link = temp.path().join("disc.xml");
+        std::fs::write(&referent, b"referent sentinel").expect("referent");
+        let before = std::fs::read(&referent).unwrap();
+        symlink(&referent, &link).expect("symlink");
+        let metabase = DvdaMetabase {
+            store_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            tracks: vec![DvdaMetabaseTrack {
+                id: "1.1.1".to_string(),
+                meta: BTreeMap::from([("TITLE".to_string(), "Track".to_string())]),
+            }],
+        };
+
+        write_metabase(&metabase, &link).expect("write metabase through lexical sidecar entry");
+        assert_eq!(std::fs::read(&referent).unwrap(), before);
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(parse_metabase(&link).unwrap(), metabase);
+    }
+
 }

@@ -29,7 +29,7 @@ use crate::convert::cap_fs::{
 };
 use crate::convert::script_supervisor::{
     cleanup_supervised, current_host_boot_identity, local_process_start_identity,
-    recover_supervised_with_observer, run_supervised, ContainmentConfidence,
+    recover_supervised_with_observer, run_supervised, run_supervised_via_item_supervisor, ContainmentConfidence,
     ContainmentDescriptor, ContainmentPreference, OutputCaptureSummary,
     OutputCaptureTerminal,
     RuntimeDirectoryIdentity, ScriptLifecycleEvent, ScriptRecoveryOutcome, ScriptRecoveryRequest, SupervisedCommand, TerminationReason,
@@ -635,6 +635,289 @@ pub enum PlannedOperation {
         runtime_directory: PathBuf,
         containment_token: String,
     },
+}
+
+/// Resolve the shared cross-session mutation admission set for concrete action
+/// plans. Action journals/capabilities remain the transaction authority; these
+/// claims only make other tonepoet mutation subsystems observe the same paths.
+pub fn shared_path_claims_for_action_plans(
+    plans: &[ActionPlan],
+    context: &ActionContext,
+) -> Result<Vec<crate::concurrency::PathClaim>, ActionError> {
+    use crate::concurrency::{ClaimMode, ClaimScope, PathClaim};
+    fn scope(path: &Path) -> ClaimScope {
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            ClaimScope::Subtree
+        } else {
+            ClaimScope::Exact
+        }
+    }
+    let mut claims = Vec::new();
+    let mut has_script = false;
+    for plan in plans {
+        for operation in &plan.operations {
+            let mut add = |path: &Path, mode: ClaimMode, claim_scope: ClaimScope| -> Result<(), ActionError> {
+                claims.push(PathClaim::resolve(path, mode, claim_scope).map_err(ActionError::Conflict)?);
+                Ok(())
+            };
+            match operation {
+                PlannedOperation::Rename { source, destination, .. } => {
+                    add(source, ClaimMode::Write, scope(source))?;
+                    add(destination, ClaimMode::Write, scope(destination))?;
+                }
+                PlannedOperation::Copy { source, destination, .. } => {
+                    add(source, ClaimMode::Read, scope(source))?;
+                    add(destination, ClaimMode::Write, scope(destination))?;
+                }
+                PlannedOperation::RepairCopyMetadata { source, destination, .. } => {
+                    add(source, ClaimMode::Read, scope(source))?;
+                    add(destination, ClaimMode::Write, scope(destination))?;
+                }
+                PlannedOperation::Move { source, destination, .. } => {
+                    add(source, ClaimMode::Write, scope(source))?;
+                    add(destination, ClaimMode::Write, scope(destination))?;
+                }
+                PlannedOperation::Delete { target, .. } => {
+                    add(target, ClaimMode::Write, scope(target))?;
+                }
+                PlannedOperation::CreateDirectory { path } => {
+                    add(path, ClaimMode::Write, ClaimScope::Subtree)?;
+                }
+                PlannedOperation::RunScript { .. } => has_script = true,
+            }
+        }
+    }
+    if has_script {
+        // Arbitrary script side effects outside tonepoet's known output roots
+        // are intentionally not guessed. The two namespaces explicitly handed
+        // to the script are, however, admitted before the exec gate can open.
+        claims.push(PathClaim::resolve(
+            &context.album_dir,
+            ClaimMode::Write,
+            ClaimScope::Subtree,
+        ).map_err(ActionError::Conflict)?);
+        claims.push(PathClaim::resolve(
+            &context.output_root,
+            ClaimMode::Write,
+            ClaimScope::Subtree,
+        ).map_err(ActionError::Conflict)?);
+    }
+    Ok(claims)
+}
+
+fn configured_target_phase_claims(
+    spec: &TargetSpec,
+    context: &ActionContext,
+    mode: crate::concurrency::ClaimMode,
+) -> Result<Vec<crate::concurrency::PathClaim>, ActionError> {
+    use crate::concurrency::{ClaimScope, PathClaim};
+
+    validate_target_patterns(spec)?;
+    if spec.target.iter().any(|pattern| contains_wildcard(pattern)) {
+        return Ok(vec![PathClaim::resolve(
+            &context.subject_dir,
+            mode,
+            ClaimScope::Subtree,
+        )
+        .map_err(ActionError::Conflict)?]);
+    }
+
+    let mut claims = Vec::new();
+    for pattern in &spec.target {
+        let relative = checked_relative_target(pattern)?;
+        let path = context.subject_dir.join(relative);
+        let scope = if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            ClaimScope::Subtree
+        } else {
+            ClaimScope::Exact
+        };
+        claims.push(PathClaim::resolve(&path, mode, scope).map_err(ActionError::Conflict)?);
+    }
+    Ok(claims)
+}
+
+/// Derive the complete cross-session capability for one configured automatic
+/// action phase without enumerating wildcard matches or eagerly planning every
+/// leaf operation. Destination configuration already supplies the stable roots
+/// needed for atomic admission.
+fn shared_path_claims_for_configured_action_phase(
+    pipeline: &ActionPipeline,
+    context: &ActionContext,
+) -> Result<Vec<crate::concurrency::PathClaim>, ActionError> {
+    use crate::concurrency::{ClaimMode, ClaimScope, PathClaim};
+
+    let mut claims = Vec::new();
+    for action in pipeline.for_phase(context.phase) {
+        validate_phase_action(action, context)?;
+        match action {
+            ConversionAction::Rename(action) => {
+                validate_target_patterns(&action.targeting)?;
+                if action.targeting.target.iter().any(|pattern| contains_wildcard(pattern)) {
+                    // A wildcard rename can select any descendant and always
+                    // publishes its renamed entry back into the same subject tree.
+                    claims.push(
+                        PathClaim::resolve(&context.subject_dir, ClaimMode::Write, ClaimScope::Subtree)
+                            .map_err(ActionError::Conflict)?,
+                    );
+                } else {
+                    for pattern in &action.targeting.target {
+                        let source = context.subject_dir.join(checked_relative_target(pattern)?);
+                        let is_directory =
+                            std::fs::metadata(&source).is_ok_and(|metadata| metadata.is_dir());
+                        let scope = if is_directory {
+                            ClaimScope::Subtree
+                        } else {
+                            ClaimScope::Exact
+                        };
+                        let destination =
+                            rename_destination_for_kind(action, context, &source, is_directory)?;
+                        claims.push(
+                            PathClaim::resolve(&source, ClaimMode::Write, scope)
+                                .map_err(ActionError::Conflict)?,
+                        );
+                        claims.push(
+                            PathClaim::resolve(&destination, ClaimMode::Write, scope)
+                                .map_err(ActionError::Conflict)?,
+                        );
+                    }
+                }
+            }
+            ConversionAction::Copy(action) => {
+                claims.extend(configured_target_phase_claims(
+                    &action.targeting,
+                    context,
+                    ClaimMode::Read,
+                )?);
+                let destination =
+                    render_action_path(&action.destination, context, &context.subject_dir)?;
+                claims.push(
+                    PathClaim::resolve(&destination, ClaimMode::Write, ClaimScope::Subtree)
+                        .map_err(ActionError::Conflict)?,
+                );
+            }
+            ConversionAction::Move(action) => {
+                claims.extend(configured_target_phase_claims(
+                    &action.targeting,
+                    context,
+                    ClaimMode::Write,
+                )?);
+                let destination =
+                    render_action_path(&action.destination, context, &context.subject_dir)?;
+                claims.push(
+                    PathClaim::resolve(&destination, ClaimMode::Write, ClaimScope::Subtree)
+                        .map_err(ActionError::Conflict)?,
+                );
+            }
+            ConversionAction::Delete(action) => {
+                claims.extend(configured_target_phase_claims(
+                    &action.targeting,
+                    context,
+                    ClaimMode::Write,
+                )?);
+            }
+            ConversionAction::CreateFolder(action) => {
+                let path = render_action_path(&action.path, context, &context.subject_dir)?;
+                claims.push(
+                    PathClaim::resolve(&path, ClaimMode::Write, ClaimScope::Subtree)
+                        .map_err(ActionError::Conflict)?,
+                );
+            }
+            ConversionAction::Runscript(_) => {
+                // User code can have arbitrary effects; only claim the managed
+                // Tonepoet namespaces explicitly exposed to the script.
+                claims.push(
+                    PathClaim::resolve(&context.album_dir, ClaimMode::Write, ClaimScope::Subtree)
+                        .map_err(ActionError::Conflict)?,
+                );
+                claims.push(
+                    PathClaim::resolve(&context.output_root, ClaimMode::Write, ClaimScope::Subtree)
+                        .map_err(ActionError::Conflict)?,
+                );
+            }
+        }
+    }
+    Ok(claims)
+}
+
+fn remove_covered_phase_claims(
+    candidates: Vec<crate::concurrency::PathClaim>,
+    already_held: &[crate::concurrency::PathClaim],
+) -> Vec<crate::concurrency::PathClaim> {
+    let mut retained: Vec<crate::concurrency::PathClaim> = Vec::new();
+    for candidate in candidates {
+        if already_held.iter().any(|claim| claim.covers(&candidate))
+            || retained.iter().any(|claim| claim.covers(&candidate))
+        {
+            continue;
+        }
+        retained.retain(|claim| !candidate.covers(claim));
+        retained.push(candidate);
+    }
+    retained
+}
+
+/// Atomically admit the complete configured mutation set for an automatic
+/// conversion action phase. The lease is registered before the phase loop, so
+/// the item supervisor receives it before any mutation-capable script/tool can
+/// cross its execution gate. Manual reviewed `:actions-run` invocations keep
+/// their existing outer EphemeralMutation admission and do not use this path.
+fn admit_conversion_action_phase_claims(
+    pipeline: &ActionPipeline,
+    context: &ActionContext,
+    prepared_explicit: bool,
+) -> Result<(), ActionError> {
+    if prepared_explicit {
+        return Ok(());
+    }
+    let Some(item_id) = crate::concurrency::current_execution_item() else {
+        return Ok(());
+    };
+    let Some(execution_id) = crate::concurrency::runtime_execution_id(&item_id) else {
+        return Err(ActionError::Conflict(format!(
+            "conversion action lost QueueExecution authority for item {item_id}"
+        )));
+    };
+    let already_held =
+        crate::concurrency::runtime_execution_claims(&item_id).map_err(ActionError::Conflict)?;
+    let claims = remove_covered_phase_claims(
+        shared_path_claims_for_configured_action_phase(pipeline, context)?,
+        &already_held,
+    );
+    if claims.is_empty() {
+        return Ok(());
+    }
+    let lease = crate::concurrency::MutationClaimGuard::acquire(
+        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id },
+        claims,
+    )
+    .map_err(ActionError::Conflict)?
+    .into_lease();
+    crate::concurrency::register_runtime_supplemental_lease(&item_id, Arc::new(lease))
+        .map_err(ActionError::Conflict)
+}
+
+fn assert_conversion_action_plan_is_admitted(
+    plan: &ActionPlan,
+    context: &ActionContext,
+    prepared_explicit: bool,
+) -> Result<(), ActionError> {
+    if prepared_explicit {
+        return Ok(());
+    }
+    let Some(item_id) = crate::concurrency::current_execution_item() else {
+        return Ok(());
+    };
+    let admitted =
+        crate::concurrency::runtime_execution_claims(&item_id).map_err(ActionError::Conflict)?;
+    for required in shared_path_claims_for_action_plans(std::slice::from_ref(plan), context)? {
+        if !admitted.iter().any(|claim| claim.covers(&required)) {
+            return Err(ActionError::Contradiction(format!(
+                "automatic action plan escaped phase mutation capability: {}",
+                required.identity.original.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Human-readable dry-run lines for one planned action: one line per
@@ -1827,8 +2110,13 @@ impl ActionScriptRunner for ProcessGroupScriptRunner {
                     .to_string(),
             ));
         }
-        let outcome = run_supervised(
-            &SupervisedCommand {
+        let execution_item = crate::concurrency::current_execution_item();
+        let item_supervisor = execution_item
+            .as_deref()
+            .map(crate::concurrency::runtime_item_supervisor)
+            .transpose()
+            .map_err(ActionError::InvalidJournal)?;
+        let command = SupervisedCommand {
                 token: invocation.containment_token.clone(),
                 runtime_directory: invocation.runtime_directory.clone(),
                 script: invocation.script.clone(),
@@ -1858,15 +2146,51 @@ impl ActionScriptRunner for ProcessGroupScriptRunner {
                 })?,
                 containment_preference: ContainmentPreference::Auto,
                 helper_executable: None,
-            },
-            || cancellation.is_cancelled(),
-            |event| observer(event).map_err(|error| {
+                retained_lifetime_files: if item_supervisor.is_some() {
+                    Vec::new()
+                } else {
+                    crate::concurrency::current_supervision_lifetime_files()
+                        .map_err(ActionError::InvalidJournal)?
+                },
+                stdin_file: None,
+                stdout_file: None,
+                stderr_file: None,
+            };
+        let containment_token = command.token.clone();
+        let containment_runtime = command.runtime_directory.clone();
+        let mut lifecycle = |event: &ScriptLifecycleEvent| {
+            if let Some(item_id) = execution_item.as_deref() {
+                match event {
+                    ScriptLifecycleEvent::ContainmentPrepared { descriptor, .. } => {
+                        crate::concurrency::record_execution_containment(
+                            item_id, &containment_token, &containment_runtime, descriptor
+                        ).map_err(crate::convert::script_supervisor::ScriptSupervisorError::Internal)?;
+                    }
+                    ScriptLifecycleEvent::UserCodeReleased { .. } => {
+                        crate::concurrency::mark_execution_containment_released(item_id, &containment_token)
+                            .map_err(crate::convert::script_supervisor::ScriptSupervisorError::Internal)?;
+                    }
+                    _ => {}
+                }
+            }
+            observer(event).map_err(|error| {
                 crate::convert::script_supervisor::ScriptSupervisorError::Internal(
                     format!("durable script lifecycle update failed: {error}"),
                 )
-            }),
-        )
+            })
+        };
+        let outcome = match item_supervisor.as_ref() {
+            Some(supervisor) => run_supervised_via_item_supervisor(
+                &command, supervisor, || cancellation.is_cancelled(), &mut lifecycle
+            ),
+            None => run_supervised(&command, || cancellation.is_cancelled(), &mut lifecycle),
+        }
         .map_err(|error| ActionError::Script(error.to_string()))?;
+        if outcome.containment_empty {
+            if let Some(item_id) = execution_item.as_deref() {
+                let _ = crate::concurrency::clear_execution_containment(item_id, &containment_token);
+            }
+        }
         if let Some(warning) = outcome.descriptor.warning.as_deref() {
             log::warn!(
                 "conversion action script containment used {}: {}",
@@ -8811,6 +9135,11 @@ impl<'a> ActionEngine<'a> {
         // branch rebuilds the definitive report from the settled journal.
         let _ = report_from_journal(&journal)?;
 
+        // Automatic conversion actions join the shared registry once for the
+        // complete configured phase before the first user-library mutation.
+        // Control-plane journal reconciliation above does not mutate user data.
+        admit_conversion_action_phase_claims(pipeline, context, prepared.is_some())?;
+
         for action_index in 0..journal.actions.len() {
             if journal.actions[action_index].state.terminal() {
                 continue;
@@ -8947,6 +9276,10 @@ impl<'a> ActionEngine<'a> {
                 journal.actions[action_index].state = JournalActionState::NoOp;
                 store.persist(&mut journal)?;
                 continue;
+            }
+
+            if let Some(plan) = journal.actions[action_index].plan.as_ref() {
+                assert_conversion_action_plan_is_admitted(plan, context, prepared.is_some())?;
             }
 
             if cancellation.is_cancelled()
@@ -17102,6 +17435,235 @@ mod conversion_actions_tests {
             target: patterns.iter().map(|value| (*value).to_string()).collect(),
             ..TargetSpec::default()
         }
+    }
+
+    fn copy_action(destination: PathBuf) -> ConversionAction {
+        ConversionAction::Copy(CopyAction {
+            targeting: targeting(&["track.flac"]),
+            destination,
+        })
+    }
+
+    #[test]
+    fn automatic_post_phase_claims_admit_opposite_order_destinations_atomically() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let fixture = Fixture::new();
+        fs::write(fixture.album_dir.join("track.flac"), b"track").unwrap();
+        let x = fixture._temp.path().join("external-x");
+        let y = fixture._temp.path().join("external-y");
+        let z = fixture._temp.path().join("external-z");
+        let w = fixture._temp.path().join("external-w");
+        let context = fixture.context(ActionPhase::Post);
+
+        let first = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(x.clone()), copy_action(y.clone())],
+        };
+        let opposite = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(y.clone()), copy_action(x.clone())],
+        };
+        let disjoint = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(z.clone()), copy_action(w.clone())],
+        };
+
+        let first_claims = remove_covered_phase_claims(
+            shared_path_claims_for_configured_action_phase(&first, &context).unwrap(),
+            &[],
+        );
+        let _first_guard =
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(first_claims).unwrap();
+
+        let opposite_claims = remove_covered_phase_claims(
+            shared_path_claims_for_configured_action_phase(&opposite, &context).unwrap(),
+            &[],
+        );
+        let error = crate::concurrency::MutationClaimGuard::acquire_ephemeral(opposite_claims)
+            .expect_err("opposite X/Y phase must lose before any action mutation");
+        assert!(error.contains("live owner"));
+        assert!(!x.exists());
+        assert!(!y.exists());
+
+        let disjoint_claims = remove_covered_phase_claims(
+            shared_path_claims_for_configured_action_phase(&disjoint, &context).unwrap(),
+            &[],
+        );
+        let _disjoint_guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(disjoint_claims)
+            .expect("disjoint action destinations must remain concurrent");
+    }
+
+    #[test]
+    fn automatic_phase_admission_registers_one_complete_execution_claim_before_actions() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let fixture = Fixture::new();
+        fs::write(fixture.album_dir.join("track.flac"), b"track").unwrap();
+        let x = fixture._temp.path().join("runtime-x");
+        let y = fixture._temp.path().join("runtime-y");
+        let context = fixture.context(ActionPhase::Post);
+        let first = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(x.clone()), copy_action(y.clone())],
+        };
+        let opposite = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(y.clone()), copy_action(x.clone())],
+        };
+        let z = fixture._temp.path().join("runtime-z");
+        let w = fixture._temp.path().join("runtime-w");
+        let disjoint = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![copy_action(z), copy_action(w)],
+        };
+
+        let first_item = format!("action-phase-first-{}", uuid::Uuid::new_v4());
+        let first_execution = uuid::Uuid::new_v4();
+        let first_queue = Arc::new(
+            crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::QueueExecution {
+                    execution_id: first_execution,
+                },
+                &[],
+            )
+            .unwrap(),
+        );
+        let first_queue_path = first_queue.descriptor_path().to_path_buf();
+        crate::concurrency::register_runtime_execution(
+            &first_item,
+            first_execution,
+            Arc::clone(&first_queue),
+            None,
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::concurrency::with_runtime_execution_scope(
+            first_item.clone(),
+            async { admit_conversion_action_phase_claims(&first, &context, false) },
+        ))
+        .unwrap();
+
+        let held = crate::concurrency::runtime_execution_claims(&first_item).unwrap();
+        for required in shared_path_claims_for_configured_action_phase(&first, &context).unwrap() {
+            assert!(held.iter().any(|claim| claim.covers(&required)));
+        }
+
+        let second_item = format!("action-phase-second-{}", uuid::Uuid::new_v4());
+        let second_execution = uuid::Uuid::new_v4();
+        let second_queue = Arc::new(
+            crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::QueueExecution {
+                    execution_id: second_execution,
+                },
+                &[],
+            )
+            .unwrap(),
+        );
+        let second_queue_path = second_queue.descriptor_path().to_path_buf();
+        crate::concurrency::register_runtime_execution(
+            &second_item,
+            second_execution,
+            Arc::clone(&second_queue),
+            None,
+        )
+        .unwrap();
+        let error = runtime
+            .block_on(crate::concurrency::with_runtime_execution_scope(
+                second_item.clone(),
+                async { admit_conversion_action_phase_claims(&opposite, &context, false) },
+            ))
+            .expect_err("opposite runtime phase must lose complete admission");
+        assert!(error.to_string().contains("live owner"));
+        assert!(!x.exists());
+        assert!(!y.exists());
+
+        runtime
+            .block_on(crate::concurrency::with_runtime_execution_scope(
+                second_item.clone(),
+                async { admit_conversion_action_phase_claims(&disjoint, &context, false) },
+            ))
+            .expect("disjoint runtime action phase must remain concurrent");
+
+        crate::concurrency::unregister_runtime_execution(&second_item);
+        crate::concurrency::unregister_runtime_execution(&first_item);
+        drop(second_queue);
+        drop(first_queue);
+        let _ = std::fs::remove_file(second_queue_path);
+        let _ = std::fs::remove_file(first_queue_path);
+    }
+
+    #[test]
+    fn automatic_pre_phase_claims_admit_complete_create_folder_set() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let fixture = Fixture::new();
+        let x = fixture._temp.path().join("pre-x");
+        let y = fixture._temp.path().join("pre-y");
+        let mut context = fixture.context(ActionPhase::Pre);
+        context.source_is_directory = true;
+        let first = ActionPipeline {
+            pre: vec![
+                ConversionAction::CreateFolder(CreateFolderAction {
+                    path: x.clone(),
+                    continue_on_error: false,
+                }),
+                ConversionAction::CreateFolder(CreateFolderAction {
+                    path: y.clone(),
+                    continue_on_error: false,
+                }),
+            ],
+            post: Vec::new(),
+        };
+        let opposite = ActionPipeline {
+            pre: vec![
+                ConversionAction::CreateFolder(CreateFolderAction {
+                    path: y.clone(),
+                    continue_on_error: false,
+                }),
+                ConversionAction::CreateFolder(CreateFolderAction {
+                    path: x.clone(),
+                    continue_on_error: false,
+                }),
+            ],
+            post: Vec::new(),
+        };
+        let _first_guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(
+            shared_path_claims_for_configured_action_phase(&first, &context).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::concurrency::MutationClaimGuard::acquire_ephemeral(
+            shared_path_claims_for_configured_action_phase(&opposite, &context).unwrap(),
+        )
+        .is_err());
+        assert!(!x.exists());
+        assert!(!y.exists());
+    }
+
+    #[test]
+    fn phase_claims_already_inside_album_write_capability_are_not_republished() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let fixture = Fixture::new();
+        let context = fixture.context(ActionPhase::Post);
+        let pipeline = ActionPipeline {
+            pre: Vec::new(),
+            post: vec![ConversionAction::CreateFolder(CreateFolderAction {
+                path: PathBuf::from("Artwork"),
+                continue_on_error: false,
+            })],
+        };
+        let album_claim = crate::concurrency::PathClaim::resolve(
+            &fixture.album_dir,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Subtree,
+        )
+        .unwrap();
+        let retained = remove_covered_phase_claims(
+            shared_path_claims_for_configured_action_phase(&pipeline, &context).unwrap(),
+            &[album_claim],
+        );
+        assert!(retained.is_empty());
     }
 
     fn engine<'a>(runner: &'a dyn ActionScriptRunner) -> ActionEngine<'a> {

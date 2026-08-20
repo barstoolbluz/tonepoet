@@ -3305,36 +3305,8 @@ fn draw_navigation(f: &mut Frame, ctx: &WizardRenderCtx, area: Rect, wizard: &Si
         }
     }
 
-    // Save as Preset button (only on confirmation page) - position 0
-    if wizard.current_step == 3 {
-        let save_preset_area = Rect::new(area.x + x_offset, area.y + 1, button_width, 1);
-
-        let save_preset_style = if wizard.focused_nav_button == Some(ButtonId::SavePreset) {
-            Style::default()
-                .fg(ctx.theme.selected_fg)
-                .bg(ctx.theme.focus_bg)
-                .add_modifier(Modifier::BOLD) // focused primary action
-        } else if wizard.hovered_button == Some(ButtonId::SavePreset) {
-            Style::default()
-                .fg(ctx.theme.selected_fg)
-                .bg(ctx.theme.hover_bg)
-                .add_modifier(Modifier::BOLD) // hovered primary action
-        } else {
-            Style::default()
-                .fg(ctx.theme.selected_fg)
-                .bg(ctx.theme.selected_bg) // selected primary action
-        };
-
-        let save_preset = Paragraph::new(" Save as Preset ")
-            .style(save_preset_style)
-            .alignment(Alignment::Center);
-        f.render_widget(save_preset, save_preset_area);
-
-        // Only register mouse area if help is not shown
-        if !help_is_shown {
-            mouse_areas.add(save_preset_area, ButtonId::SavePreset);
-        }
-    }
+    // Legacy wizard preset persistence is intentionally disabled.
+    // The main Tonepoet preset manager owns save/delete/duplicate consistency.
 
     // Back button - position 1 (always reserve space, even if not shown)
     if wizard.current_step > 0 {
@@ -3627,7 +3599,7 @@ fn draw_popup(
 ) {
     // Calculate popup dimensions based on type
     let (width, height, title) = match &popup_state.popup_type {
-        PopupType::PresetName => (60, 8, " Save as Preset "),
+        PopupType::PresetName => (60, 8, " Presets "),
         PopupType::TextInput { field } => {
             let title = match field {
                 EditingField::CopyFiles => " File Extensions ",

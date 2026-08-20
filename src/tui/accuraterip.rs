@@ -1674,13 +1674,15 @@ pub async fn batch_verify(
         });
     }
 
-    // Generate report file.
+    // Generate report file. Verification is already complete; publication is
+    // deliberately nonfatal, but it still participates in shared live mutation
+    // admission so another session/file operation cannot race the report write.
     let report = format_batch_report(&albums, scan_dir);
     let report_path = scan_dir.join("accuraterip-report.txt");
-    let report_path = match std::fs::write(&report_path, &report) {
-        Ok(()) => Some(report_path),
-        Err(e) => {
-            log::warn!("Failed to write AR batch report: {}", e);
+    let report_path = match publish_batch_report_with_claim(&report_path, &report) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            log::warn!("AccurateRip verification completed, but report publication was skipped: {error}");
             None
         }
     };
@@ -1690,6 +1692,53 @@ pub async fn batch_verify(
         scan_dir: scan_dir.to_path_buf(),
         report_path,
     })
+}
+
+fn publish_batch_report_with_claim(path: &Path, report: &str) -> Result<PathBuf, String> {
+    let claim = crate::concurrency::PathClaim::resolve(
+        path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+    )?;
+    let admitted_path = claim.identity.resolved_io_path.clone();
+    let _mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    std::fs::write(&admitted_path, report)
+        .map_err(|error| format!("write AccurateRip batch report {}: {error}", admitted_path.display()))?;
+    Ok(admitted_path)
+}
+
+#[cfg(test)]
+mod batch_report_claim_tests {
+    use super::publish_batch_report_with_claim;
+    use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
+    #[test]
+    fn report_publication_is_busy_before_write_and_disjoint_report_still_runs() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let contested = temp.path().join("accuraterip-report.txt");
+        let disjoint_dir = temp.path().join("other");
+        std::fs::create_dir(&disjoint_dir).unwrap();
+        let disjoint = disjoint_dir.join("accuraterip-report.txt");
+
+        let competing =
+            PathClaim::resolve(&contested, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        let competing_guard = MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let error = publish_batch_report_with_claim(&contested, "verified\n")
+            .expect_err("same report destination must be busy");
+        assert!(error.contains("live owner"), "unexpected busy error: {error}");
+        assert!(!contested.exists(), "busy report admission must happen before publication");
+
+        publish_batch_report_with_claim(&disjoint, "verified elsewhere\n")
+            .expect("different report directory must remain concurrent");
+        assert_eq!(std::fs::read_to_string(&disjoint).unwrap(), "verified elsewhere\n");
+
+        drop(competing_guard);
+        publish_batch_report_with_claim(&contested, "verified\n")
+            .expect("released report destination must be retryable");
+        assert_eq!(std::fs::read_to_string(&contested).unwrap(), "verified\n");
+    }
 }
 
 /// Format a text report from batch verification results.
@@ -2096,6 +2145,60 @@ pub fn detect_uniform_offset(result: &ArVerifyResult) -> Option<i32> {
     common_offset
 }
 
+fn acquire_repair_claims_with_semantics(
+    paths: &[PathBuf],
+    semantics: crate::concurrency::PathResolutionSemantics,
+) -> Result<(crate::concurrency::MutationClaimGuard, Vec<PathBuf>), String> {
+    let mut claims = Vec::with_capacity(paths.len().saturating_mul(2));
+    let mut admitted_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let original_claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            semantics,
+        )?;
+        let admitted = original_claim.identity.resolved_io_path.clone();
+        let extension = admitted
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let backup = admitted.with_extension(format!("{extension}.bak"));
+        claims.push(original_claim);
+        claims.push(crate::concurrency::PathClaim::resolve_with_semantics(
+            &backup,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            semantics,
+        )?);
+        admitted_paths.push(admitted);
+    }
+    let guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(claims)?;
+    Ok((guard, admitted_paths))
+}
+
+/// Copy-based CTDB repair intentionally follows final symlinks, matching
+/// std::fs::copy(target) semantics.
+pub(super) fn acquire_repair_mutation_claims(
+    paths: &[PathBuf],
+) -> Result<(crate::concurrency::MutationClaimGuard, Vec<PathBuf>), String> {
+    acquire_repair_claims_with_semantics(
+        paths,
+        crate::concurrency::PathResolutionSemantics::FollowReferent,
+    )
+}
+
+/// AccurateRip offset correction renames each original entry to .bak before
+/// installing corrected data, so admission preserves the final namespace entry.
+fn acquire_offset_correction_mutation_claims(
+    paths: &[PathBuf],
+) -> Result<(crate::concurrency::MutationClaimGuard, Vec<PathBuf>), String> {
+    acquire_repair_claims_with_semantics(
+        paths,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )
+}
+
 /// Apply offset correction to a set of tracks.
 ///
 /// Decodes each track, shifts the audio by `-offset` samples (correcting
@@ -2110,6 +2213,8 @@ pub async fn apply_offset_correction(
     offset: i32,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) -> Result<String, String> {
+    let (_mutation_claim, admitted_paths) = acquire_offset_correction_mutation_claims(paths)?;
+    let paths = admitted_paths.as_slice();
     if offset == 0 {
         return Err("Offset is already 0 — no correction needed".into());
     }
@@ -2119,7 +2224,11 @@ pub async fn apply_offset_correction(
     let sample_shift = abs_offset * 2; // i16 values (stereo pairs)
 
     // Create temp directory.
-    let tmp_dir = std::env::temp_dir().join(format!("tonepoet-offset-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "tonepoet-offset-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple(),
+    ));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
     // Run the pipeline; clean up temp dir regardless of outcome.
@@ -2324,30 +2433,44 @@ async fn offset_correction_inner(
         ))
         .await;
 
-    // Phase A: create backups.
-    let mut backed_up: Vec<(PathBuf, PathBuf)> = Vec::new(); // (original, backup)
-    for orig in paths.iter() {
+    install_offset_corrected_tracks(paths, &corrected_paths)?;
+
+    Ok(format!(
+        "Offset corrected: {} tracks shifted by {:+} samples, all verified at offset +0",
+        n, -offset,
+    ))
+}
+
+fn install_offset_corrected_tracks(
+    originals: &[PathBuf],
+    corrected_paths: &[PathBuf],
+) -> Result<(), String> {
+    if originals.len() != corrected_paths.len() {
+        return Err("internal error: corrected track count does not match original track count".into());
+    }
+
+    // Phase A: move each admitted original namespace entry to its backup.
+    let mut backed_up: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for orig in originals {
         let bak = orig.with_extension(format!(
             "{}.bak",
             orig.extension().and_then(|e| e.to_str()).unwrap_or("flac"),
         ));
         if let Err(e) = std::fs::rename(orig, &bak) {
-            // Restore any backups we already made.
-            for (o, b) in &backed_up {
-                let _ = std::fs::rename(b, o);
+            for (original, backup) in &backed_up {
+                let _ = std::fs::rename(backup, original);
             }
             return Err(format!("Failed to back up {}: {}", orig.display(), e));
         }
         backed_up.push((orig.clone(), bak));
     }
 
-    // Phase B: copy corrected files over originals.
-    for (i, (orig, _bak)) in backed_up.iter().enumerate() {
-        let corrected = &corrected_paths[i];
+    // Phase B: install corrected data at the same admitted lexical entries.
+    for (index, (orig, _bak)) in backed_up.iter().enumerate() {
+        let corrected = &corrected_paths[index];
         if let Err(e) = std::fs::copy(corrected, orig) {
-            // Restore ALL backups — undo everything.
-            for (o, b) in &backed_up {
-                let _ = std::fs::rename(b, o);
+            for (original, backup) in &backed_up {
+                let _ = std::fs::rename(backup, original);
             }
             return Err(format!(
                 "Failed to write corrected {}: {}. All originals restored.",
@@ -2357,15 +2480,11 @@ async fn offset_correction_inner(
         }
     }
 
-    // Phase C: remove backups (all copies succeeded).
+    // Phase C: retire backups after every corrected file is installed.
     for (_orig, bak) in &backed_up {
         let _ = std::fs::remove_file(bak);
     }
-
-    Ok(format!(
-        "Offset corrected: {} tracks shifted by {:+} samples, all verified at offset +0",
-        n, -offset,
-    ))
+    Ok(())
 }
 
 /// Check if a command exists on the PATH.
@@ -2550,7 +2669,7 @@ async fn copy_metadata_metaflac(src: &Path, dst: &Path) -> Result<(), String> {
     let tmp_pic = std::env::temp_dir().join(format!(
         "tonepoet-pic-{}-{}.bin",
         std::process::id(),
-        src.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4().simple(),
     ));
     let pic_export = TokioCommand::new("metaflac")
         .arg(format!("--export-picture-to={}", tmp_pic.display()))
@@ -2740,5 +2859,43 @@ mod cue_reference_resolution_tests {
             CueFileReferenceResolution::Resolved(image.clone())
         );
         assert_eq!(resolve_cue_file_reference(dir, "album.wav"), Some(image));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod repair_path_semantics_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn offset_correction_preserves_final_namespace_entry_but_copy_repair_follows_referent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("real.flac");
+        let link = temp.path().join("track.flac");
+        std::fs::write(&referent, b"audio").expect("referent");
+        symlink(&referent, &link).expect("symlink");
+
+        let (offset_guard, offset_paths) =
+            acquire_offset_correction_mutation_claims(std::slice::from_ref(&link))
+                .expect("offset-correction claims");
+        assert_eq!(offset_paths, vec![link.clone()]);
+        drop(offset_guard);
+
+        let (copy_guard, copy_paths) = acquire_repair_mutation_claims(std::slice::from_ref(&link))
+            .expect("copy-repair claims");
+        assert_eq!(copy_paths, vec![referent.canonicalize().expect("canonical referent")]);
+        drop(copy_guard);
+
+        let corrected = temp.path().join("corrected.flac");
+        std::fs::write(&corrected, b"corrected audio").expect("corrected fixture");
+        install_offset_corrected_tracks(std::slice::from_ref(&link), std::slice::from_ref(&corrected))
+            .expect("namespace-object offset install");
+        assert_eq!(std::fs::read(&referent).unwrap(), b"audio");
+        assert_eq!(std::fs::read(&link).unwrap(), b"corrected audio");
+        assert!(
+            !std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "offset correction must replace the lexical track entry"
+        );
     }
 }

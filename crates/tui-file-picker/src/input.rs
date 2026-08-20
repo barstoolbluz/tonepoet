@@ -108,6 +108,12 @@ impl FilePickerState {
         if self.handle_paste_task_key(key) {
             return FilePickerAction::None;
         }
+        if self.host_mutation_in_flight() {
+            self.set_error(FilePickerError::OperationDisabled(
+                "host-managed filesystem operation is still running",
+            ));
+            return FilePickerAction::None;
+        }
 
         // Tab commands live above pane-local dispatch so their byobu-safe
         // chords are consistent in Tree and Files focus. Ctrl+W deliberately
@@ -353,6 +359,12 @@ impl FilePickerState {
             area
         };
         if self.handle_paste_task_mouse(mouse, progress_area) {
+            return FilePickerAction::None;
+        }
+        if self.host_mutation_in_flight() {
+            self.set_error(FilePickerError::OperationDisabled(
+                "host-managed filesystem operation is still running",
+            ));
             return FilePickerAction::None;
         }
 
@@ -1557,6 +1569,19 @@ impl FilePickerState {
                 }
                 FilePickerMenuAction::Delete if !self.file_operation_policy().allow_delete => {
                     FilePickerError::OperationDisabled("delete")
+                }
+                FilePickerMenuAction::Rename if !self.file_operation_policy().allow_rename => {
+                    FilePickerError::OperationDisabled("rename")
+                }
+                FilePickerMenuAction::Duplicate if !self.file_operation_policy().allow_duplicate => {
+                    FilePickerError::OperationDisabled("duplicate")
+                }
+                FilePickerMenuAction::RenameTitleCase
+                | FilePickerMenuAction::RenameUppercase
+                | FilePickerMenuAction::RenameLowercase
+                    if !self.file_operation_policy().allow_rename =>
+                {
+                    FilePickerError::OperationDisabled("rename")
                 }
                 FilePickerMenuAction::Paste => FilePickerError::ClipboardEmpty,
                 _ => FilePickerError::NoSelection,

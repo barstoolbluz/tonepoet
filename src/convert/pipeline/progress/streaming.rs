@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -19,9 +18,8 @@ use super::heartbeat::DEFAULT_HEARTBEAT_INTERVAL;
 use super::operation::OperationProgressTracker;
 use crate::convert::pipeline::errors::ToolRunnerError;
 use crate::convert::pipeline::tool::{
-    apply_command_environment, resolve_command_launch_path, terminate_and_reap_child,
-    CommandRecord, ProcessExit, ToolBinary, ToolCommand, ToolOutput, TOOL_OUTPUT_TAIL_BYTES,
-    TOOL_TERMINATION_TIMEOUT,
+    resolve_command_launch_path, ToolBinary, ToolCommand, ToolOutput,
+    TOOL_OUTPUT_TAIL_BYTES, TOOL_TERMINATION_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +146,8 @@ where
     let binary_path = resolve_command_launch_path(
         resolve_binary_with_tool_paths(cmd.binary, tool_paths),
         cmd.environment_policy,
-    );
+    )
+    .map_err(ToolRunnerError::Io)?;
     run_streaming_tool_with_probe_at_path(binary_path, cmd, cancel, tracker, heartbeat, parse_line)
         .await
 }
@@ -164,195 +163,130 @@ pub(crate) async fn run_streaming_tool_with_probe_at_path<F>(
 where
     F: FnMut(StreamSource, &str) -> Option<ProbeUpdate>,
 {
-    let start = Instant::now();
-    let mut proc = tokio::process::Command::new(&binary_path);
-    proc.args(&cmd.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        use std::sync::Arc;
+        use crate::convert::pipeline::tool::RealToolRunner;
 
-    if let Some(ref cwd) = cmd.cwd {
-        proc.current_dir(cwd);
-    }
-
-    apply_command_environment(&mut proc, &cmd);
-
-    let mut child = proc.spawn().map_err(|_io| {
-        let elapsed = start.elapsed();
-        ToolRunnerError::Spawn {
-            command: build_record(&cmd, None, "", "", elapsed),
+        // Live progress uses ordinary CLOEXEC stdio pipes. The command itself
+        // still executes under the trusted tonepoet supervisor, which alone
+        // retains QueueExecution/path/staging lease OFDs.
+        #[allow(unsafe_code)] // raw pipe2 + from_raw_fd for lease-lifetime fd inheritance into the worker
+        fn pipe_pair() -> Result<(std::fs::File, Arc<std::fs::File>), ToolRunnerError> {
+            let mut fds = [-1_i32; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(ToolRunnerError::Io(std::io::Error::last_os_error()));
+            }
+            // SAFETY: pipe2 returned two newly-owned descriptors.
+            let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+            let write = Arc::new(unsafe { std::fs::File::from_raw_fd(fds[1]) });
+            Ok((read, write))
         }
-    })?;
 
-    let (line_tx, mut line_rx) = mpsc::channel::<StreamLine>(32);
-    let stdout_task = child
-        .stdout
-        .take()
-        .map(|reader| spawn_stream_reader(StreamSource::Stdout, reader, line_tx.clone()));
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|reader| spawn_stream_reader(StreamSource::Stderr, reader, line_tx.clone()));
-    drop(line_tx);
+        let (stdout_read, stdout_write) = pipe_pair()?;
+        let (stderr_read, stderr_write) = pipe_pair()?;
+        let (line_tx, mut line_rx) = mpsc::channel::<StreamLine>(32);
+        let stdout_task = Some(spawn_stream_reader(
+            StreamSource::Stdout,
+            tokio::fs::File::from_std(stdout_read),
+            line_tx.clone(),
+        ));
+        let stderr_task = Some(spawn_stream_reader(
+            StreamSource::Stderr,
+            tokio::fs::File::from_std(stderr_read),
+            line_tx.clone(),
+        ));
+        drop(line_tx);
 
-    let timeout_sleep = time::sleep(cmd.timeout);
-    tokio::pin!(timeout_sleep);
+        let heartbeat_interval = heartbeat
+            .as_ref()
+            .map(|heartbeat| heartbeat.interval)
+            .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
+        let mut heartbeat_ticks =
+            time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
 
-    let heartbeat_interval = heartbeat
-        .as_ref()
-        .map(|heartbeat| heartbeat.interval)
-        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
-    let mut heartbeat_ticks =
-        time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
+        let runner = RealToolRunner::new(HashMap::new());
+        let run_future = runner.run_supervised_with_stdio(
+            cmd.clone(),
+            binary_path,
+            cancel,
+            None,
+            Some(stdout_write),
+            Some(stderr_write),
+        );
+        tokio::pin!(run_future);
 
-    let mut wait_failure_termination = None;
-    let wait_result = loop {
-        tokio::select! {
-            status = child.wait() => {
-                break match status {
-                    Ok(status) => Ok(status),
-                    Err(error) => {
-                        wait_failure_termination = Some(
-                            terminate_and_reap_child(
-                                &mut child,
-                                "streaming tool child after wait failure",
-                            )
-                            .await,
-                        );
-                        Err(error)
+        let result = loop {
+            tokio::select! {
+                result = &mut run_future => break result,
+                Some(line) = line_rx.recv() => {
+                    apply_line(&mut tracker, &mut parse_line, line).await;
+                }
+                _ = heartbeat_ticks.tick(), if heartbeat.is_some() => {
+                    if let (Some(heartbeat), Some(tracker)) = (heartbeat.as_ref(), tracker.as_deref_mut()) {
+                        tracker
+                            .unknown_alive_with_key(&heartbeat.material_key, &heartbeat.message)
+                            .await;
                     }
-                };
+                }
             }
-            _ = &mut timeout_sleep => {
-                let termination = terminate_and_reap_child(&mut child, "streaming tool child").await;
-                let elapsed = start.elapsed();
-                let (stdout_tail, stderr_tail) = collect_tails_while_draining(
-                    stdout_task,
-                    stderr_task,
-                    &mut line_rx,
-                    &mut tracker,
-                    &mut parse_line,
-                )
-                .await;
-                return match termination {
-                    Ok(status) => Err(ToolRunnerError::Timeout {
-                        elapsed,
-                        command: build_record(
-                            &cmd,
-                            Some(map_exit_status(status)),
-                            &stdout_tail,
-                            &stderr_tail,
-                            elapsed,
-                        ),
-                    }),
-                    Err(message) => Err(ToolRunnerError::Termination {
-                        message,
-                        command: build_record(
-                            &cmd,
-                            None,
-                            &stdout_tail,
-                            &stderr_tail,
-                            elapsed,
-                        ),
-                    }),
-                };
+        };
+
+        let (stdout_tail, stderr_tail) = collect_tails_while_draining(
+            stdout_task,
+            stderr_task,
+            &mut line_rx,
+            &mut tracker,
+            &mut parse_line,
+        )
+        .await;
+
+        // The supervisor cannot capture custom-pipe tails itself. Preserve the
+        // public streaming runner contract by installing the locally captured
+        // bounded tails into both success and structured error records.
+        match result {
+            Ok(mut output) => {
+                output.stdout_tail = stdout_tail.clone();
+                output.stderr_tail = stderr_tail.clone();
+                output.command.stdout_tail = stdout_tail;
+                output.command.stderr_tail = stderr_tail;
+                Ok(output)
             }
-            _ = cancel.cancelled() => {
+            Err(ToolRunnerError::NonZeroExit { exit, mut command, .. }) => {
+                command.stdout_tail = stdout_tail;
+                command.stderr_tail = stderr_tail.clone();
+                Err(ToolRunnerError::NonZeroExit { exit, stderr_tail, command })
+            }
+            Err(ToolRunnerError::Timeout { elapsed, mut command }) => {
+                command.stdout_tail = stdout_tail;
+                command.stderr_tail = stderr_tail;
+                Err(ToolRunnerError::Timeout { elapsed, command })
+            }
+            Err(ToolRunnerError::Cancelled { mut command }) => {
+                command.stdout_tail = stdout_tail;
+                command.stderr_tail = stderr_tail;
                 if let Some(tracker) = tracker.as_deref_mut() {
                     tracker.cancel_requested_for_tool(cmd.binary.default_name()).await;
-                }
-                let termination = terminate_and_reap_child(&mut child, "streaming tool child").await;
-                let elapsed = start.elapsed();
-                let (stdout_tail, stderr_tail) = collect_tails_while_draining(
-                    stdout_task,
-                    stderr_task,
-                    &mut line_rx,
-                    &mut tracker,
-                    &mut parse_line,
-                )
-                .await;
-                if let Some(tracker) = tracker.as_deref_mut() {
                     tracker.cancelled_at_last_progress().await;
                 }
-                return match termination {
-                    Ok(status) => Err(ToolRunnerError::Cancelled {
-                        command: build_record(
-                            &cmd,
-                            Some(map_exit_status(status)),
-                            &stdout_tail,
-                            &stderr_tail,
-                            elapsed,
-                        ),
-                    }),
-                    Err(message) => Err(ToolRunnerError::Termination {
-                        message,
-                        command: build_record(
-                            &cmd,
-                            None,
-                            &stdout_tail,
-                            &stderr_tail,
-                            elapsed,
-                        ),
-                    }),
-                };
+                Err(ToolRunnerError::Cancelled { command })
             }
-            Some(line) = line_rx.recv() => {
-                apply_line(&mut tracker, &mut parse_line, line).await;
+            Err(ToolRunnerError::Termination { message, mut command }) => {
+                command.stdout_tail = stdout_tail;
+                command.stderr_tail = stderr_tail;
+                Err(ToolRunnerError::Termination { message, command })
             }
-            _ = heartbeat_ticks.tick(), if heartbeat.is_some() => {
-                if let (Some(heartbeat), Some(tracker)) = (heartbeat.as_ref(), tracker.as_deref_mut()) {
-                    tracker
-                        .unknown_alive_with_key(&heartbeat.material_key, &heartbeat.message)
-                        .await;
-                }
-            }
+            Err(other) => Err(other),
         }
-    };
-
-    let elapsed = start.elapsed();
-    // The child can exit before the select loop receives the last queued line.
-    // Keep draining progress lines while waiting for reader tasks to finish;
-    // otherwise a fast, chatty process can fill the bounded channel and block a
-    // reader task, which would make tail collection wait forever.
-    let (stdout_tail, stderr_tail) = collect_tails_while_draining(
-        stdout_task,
-        stderr_task,
-        &mut line_rx,
-        &mut tracker,
-        &mut parse_line,
-    )
-    .await;
-
-    match wait_result {
-        Ok(status) => {
-            let exit = map_exit_status(status);
-            let record = build_record(&cmd, Some(exit), &stdout_tail, &stderr_tail, elapsed);
-            if status.success() {
-                Ok(ToolOutput {
-                    exit,
-                    stdout_tail,
-                    stderr_tail,
-                    elapsed,
-                    command: record,
-                })
-            } else {
-                Err(ToolRunnerError::NonZeroExit {
-                    exit,
-                    stderr_tail,
-                    command: record,
-                })
-            }
-        }
-        Err(io_err) => match wait_failure_termination
-            .expect("wait failure records terminalization outcome")
-        {
-            Ok(_status) => Err(ToolRunnerError::Io(io_err)),
-            Err(message) => Err(ToolRunnerError::Termination {
-                message: format!("wait failed: {io_err}; {message}"),
-                command: build_record(&cmd, None, &stdout_tail, &stderr_tail, elapsed),
-            }),
-        },
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (binary_path, cmd, cancel, tracker, heartbeat, parse_line);
+        Err(ToolRunnerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "streaming mutation-capable tools require tonepoet supervision on this platform",
+        )))
     }
 }
 
@@ -588,44 +522,6 @@ impl TailBuffer {
     fn into_string(self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
-}
-
-fn build_record(
-    cmd: &ToolCommand,
-    exit: Option<ProcessExit>,
-    stdout_tail: &str,
-    stderr_tail: &str,
-    elapsed: Duration,
-) -> CommandRecord {
-    CommandRecord {
-        environment_policy: cmd.environment_policy,
-        environment: cmd.sanitized_environment(),
-        binary: cmd.binary,
-        sanitized_args: cmd.sanitized_args(),
-        cwd: cmd.cwd.clone(),
-        env_keys: cmd.env_keys(),
-        exit,
-        stdout_tail: stdout_tail.to_string(),
-        stderr_tail: stderr_tail.to_string(),
-        elapsed,
-        description: None,
-    }
-}
-
-fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
-    if let Some(code) = status.code() {
-        return ProcessExit::Code(code);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return ProcessExit::Signal(sig);
-        }
-    }
-
-    ProcessExit::Unknown
 }
 
 #[cfg(test)]
@@ -898,9 +794,20 @@ mod tests {
         let cmd = sh_command("echo progress >&2; exec sleep 5", 10);
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let progress_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let wait_for_progress = std::sync::Arc::clone(&progress_seen);
+        let cancel_task = tokio::spawn(async move {
+            let ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_progress.notified(),
+            )
+            .await
+            .map_err(|_| "streaming child did not publish measured progress before readiness deadline")
+            .map(|_| ());
+            // Always release the child even when readiness fails so a failed
+            // regression never leaves the fixture sleeping until command timeout.
             cancel2.cancel();
+            ready
         });
 
         let err = run_streaming_tool_with_probe_at_path(
@@ -911,6 +818,7 @@ mod tests {
             None,
             |source, line| {
                 if source == StreamSource::Stderr && line == "progress" {
+                    progress_seen.notify_one();
                     Some(ProbeUpdate::measured(
                         0.37,
                         "ffmpeg-progress".to_string(),
@@ -924,6 +832,10 @@ mod tests {
         .await
         .expect_err("should cancel");
 
+        cancel_task
+            .await
+            .expect("progress readiness task must not panic")
+            .expect("streaming progress must be observed before cancellation");
         assert!(matches!(err, ToolRunnerError::Cancelled { .. }));
         let messages = progress_messages(&reporter);
         assert!(messages

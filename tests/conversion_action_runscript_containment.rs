@@ -79,6 +79,10 @@ impl Fixture {
             runtime_identity: self.runtime_identity,
             containment_preference: ContainmentPreference::Auto,
             helper_executable: Some(PathBuf::from(env!("CARGO_BIN_EXE_tonepoet"))),
+            retained_lifetime_files: Vec::new(),
+            stdin_file: None,
+            stdout_file: None,
+            stderr_file: None,
         }
     }
 }
@@ -460,6 +464,10 @@ fn application_crash_driver() {
         },
         containment_preference: ContainmentPreference::Auto,
         helper_executable: Some(PathBuf::from(env!("CARGO_BIN_EXE_tonepoet"))),
+        retained_lifetime_files: Vec::new(),
+        stdin_file: None,
+        stdout_file: None,
+        stderr_file: None,
     };
     let result = run_supervised(
         &command,

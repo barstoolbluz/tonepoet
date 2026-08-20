@@ -48,6 +48,16 @@ enum Commands {
         script_fd: i32,
         #[arg(long)]
         working_directory_fd: i32,
+        #[arg(long = "retained-lifetime-fd")]
+        retained_lifetime_fds: Vec<i32>,
+    },
+    /// Internal long-lived execution supervisor for one active conversion item.
+    #[command(name = "__execution-item-supervisor", hide = true)]
+    InternalExecutionItemSupervisor {
+        #[arg(long)]
+        request_fd: i32,
+        #[arg(long = "retained-lifetime-fd")]
+        retained_lifetime_fds: Vec<i32>,
     },
     /// Internal exec-gated launcher used by the script supervisor.
     #[command(name = "__action-script-launcher", hide = true)]
@@ -59,11 +69,23 @@ enum Commands {
         #[arg(long)]
         script_fd: i32,
     },
+    /// List top-level v0.4.8 file-operation journals that need explicit upgrade handling.
+    #[command(name = "legacy-file-recovery-list")]
+    LegacyFileRecoveryList,
+    /// Adopt one nonterminal top-level v0.4.8 journal into protocol-v2 recovery review.
+    #[command(name = "legacy-file-recovery-adopt")]
+    LegacyFileRecoveryAdopt {
+        /// Top-level legacy .jsonl path shown by legacy-file-recovery-list.
+        journal: PathBuf,
+    },
     /// Internal isolated worker for cancellable Browse copy/move jobs.
     #[command(name = "__file-task-worker", hide = true)]
     InternalFileTaskWorker {
         #[arg(long)]
         journal: PathBuf,
+        /// Inherited close-only JournalOperation lease held by tonepoet.
+        #[arg(long)]
+        lease_fd: i32,
     },
     /// Convert audio files, directories, or archives
     Convert {
@@ -356,6 +378,7 @@ fn main() -> anyhow::Result<()> {
         event_fd,
         script_fd,
         working_directory_fd,
+        retained_lifetime_fds,
     } = &cli.command
     {
         tonepoet::convert::script_supervisor::run_internal_supervisor(
@@ -364,6 +387,18 @@ fn main() -> anyhow::Result<()> {
             *event_fd,
             *script_fd,
             *working_directory_fd,
+            retained_lifetime_fds,
+        )?;
+        return Ok(());
+    }
+    if let Commands::InternalExecutionItemSupervisor {
+        request_fd,
+        retained_lifetime_fds,
+    } = &cli.command
+    {
+        tonepoet::convert::script_supervisor::run_internal_execution_item_supervisor(
+            *request_fd,
+            retained_lifetime_fds,
         )?;
         return Ok(());
     }
@@ -387,8 +422,38 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if let Commands::InternalFileTaskWorker { journal } = &cli.command {
-        tonepoet::tui::keybindings::run_internal_file_task_worker(journal)?;
+    if let Commands::LegacyFileRecoveryList = &cli.command {
+        let inventory = tonepoet::tui::file_task_runtime::legacy_journal_inventory();
+        if inventory.is_empty() {
+            println!("No top-level v0.4.8 file-operation journals found.");
+        } else {
+            for entry in inventory {
+                match entry.record {
+                    Some(record) => {
+                        let state = if entry.terminal_clean { "terminal-clean" } else { "nonterminal/review-required" };
+                        println!("{}: {} {}", entry.journal_path.display(), if record.is_move { "move" } else { "copy" }, state);
+                        for mapping in &record.mappings {
+                            println!("  {} -> {}", mapping.source.display(), mapping.destination.display());
+                        }
+                    }
+                    None => println!(
+                        "{}: ambiguous/unreadable: {}",
+                        entry.journal_path.display(),
+                        entry.classification_error.as_deref().unwrap_or("unknown parse error")
+                    ),
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let Commands::LegacyFileRecoveryAdopt { journal } = &cli.command {
+        let adopted = tonepoet::tui::file_task_runtime::adopt_legacy_journal(journal)
+            .map_err(anyhow::Error::msg)?;
+        println!("Adopted legacy journal into protocol-v2 recovery review: {}", adopted.display());
+        return Ok(());
+    }
+    if let Commands::InternalFileTaskWorker { journal, lease_fd } = &cli.command {
+        tonepoet::tui::keybindings::run_internal_file_task_worker(journal, *lease_fd)?;
         return Ok(());
     }
 
@@ -512,8 +577,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::InternalActionScriptSupervisor { .. }
+        | Commands::InternalExecutionItemSupervisor { .. }
         | Commands::InternalActionScriptLauncher { .. }
-        | Commands::InternalFileTaskWorker { .. } => unreachable!(),
+        | Commands::InternalFileTaskWorker { .. }
+        | Commands::LegacyFileRecoveryList
+        | Commands::LegacyFileRecoveryAdopt { .. } => unreachable!(),
         Commands::Tui { paths } => {
             run_tui(config, paths).await?;
         }
@@ -1574,6 +1642,45 @@ async fn run_convert(
         }
     }
 
+    // CLI conversion is a mutation-capable session just like the TUI. Publish
+    // a crash fence for the selected run before scheduling, then let the
+    // processor create one QueueExecution immediately before each initial work
+    // unit is admitted. Pending siblings stay pending rather than being pinned
+    // by an unrelated active execution.
+    let queue_db = tonepoet::db::Database::open()
+        .map_err(|error| anyhow::anyhow!("could not open durable conversion queue: {error}"))?;
+    {
+        let q = queue.read().await;
+        let mut durable_items = q
+            .all_items()
+            .into_iter()
+            .map(|item| item.clone())
+            .collect::<Vec<_>>();
+        for item in &mut durable_items {
+            if matches!(item.status, ConversionStatus::Queued) {
+                item.status = ConversionStatus::Interrupted;
+                item.started_at = None;
+                item.completed_at = None;
+                item.active_tracks.clear();
+                item.closed_track_epochs.clear();
+            }
+        }
+        let refs = durable_items.iter().collect::<Vec<_>>();
+        let report = queue_db
+            .sync_queue(&refs)
+            .map_err(|error| anyhow::anyhow!("could not publish CLI run crash fence: {error}"))?;
+        manager.retire_queue_secret_references_after_persistence(
+            &report.retire_references,
+            &report.live_references,
+        );
+    }
+    let execution_coordinator = queue_db
+        .queue_execution_coordinator()
+        .map_err(|error| anyhow::anyhow!("could not create CLI execution coordinator: {error}"))?;
+    processor.set_execution_acquisition_hook(move |item_id| {
+        execution_coordinator.begin_processing(item_id)
+    });
+
     // Spawn progress display task
     let mut progress_rx_owned = progress_rx;
     let progress_handle = tokio::spawn(async move {
@@ -1638,6 +1745,25 @@ async fn run_convert(
         .process_queue_with_progress(queue.clone(), None)
         .await;
 
+    // Publish terminal/remaining state while this process still owns the
+    // execution descriptors. This retires completed execution authority only
+    // after the SQLite row stops referencing it. On an early processor error,
+    // any still-Processing row deliberately remains durable for startup
+    // recovery rather than being guessed safe here.
+    let terminal_sync = {
+        let q = queue.read().await;
+        let refs = q.all_items();
+        queue_db
+            .sync_queue(&refs)
+            .map(|report| {
+                manager.retire_queue_secret_references_after_persistence(
+                    &report.retire_references,
+                    &report.live_references,
+                );
+            })
+            .map_err(|error| anyhow::anyhow!("could not publish CLI terminal queue state: {error}"))
+    };
+
     // Drop the processor (and its progress_tx sender) so the progress display
     // task's recv() loop terminates instead of blocking forever.  The manager
     // remains alive through summary printing and then drops, cleaning any
@@ -1665,7 +1791,16 @@ async fn run_convert(
         }
     }
 
-    result.map_err(|e| anyhow::anyhow!("{}", e))
+    match (result, terminal_sync) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(process_error), Ok(())) => Err(anyhow::anyhow!("{}", process_error)),
+        (Ok(()), Err(sync_error)) => Err(sync_error),
+        (Err(process_error), Err(sync_error)) => Err(anyhow::anyhow!(
+            "conversion failed: {}; durable terminal-state publication also failed: {}",
+            process_error,
+            sync_error
+        )),
+    }
 }
 
 /// Everything the CLI convert scan decided to queue, plus user-facing
@@ -2508,7 +2643,7 @@ fn run_config(show: bool, reset: bool, path: bool, config: &TonepoetConfig) -> a
     if reset {
         let mut default_config = TonepoetConfig::default();
         default_config.clear_archive_password();
-        let outcome = default_config.save_with_outcome()?;
+        let outcome = default_config.replace_entire_config_with_outcome()?;
         println!("Configuration reset to defaults.");
         if let Some(warning) = outcome.warning() {
             eprintln!("Warning: {warning}");
@@ -2539,6 +2674,12 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     use tonepoet::tui::app::AppState;
     use tonepoet::tui::event_loop::run_app;
 
+    // Open the production database and complete/validate the concurrency
+    // protocol activation gate before terminal mode or any mutation-capable
+    // startup activity begins. In particular, never replace a refused v23 ->
+    // v24 activation with an unrelated in-memory database.
+    let mut app = AppState::try_new(config).map_err(anyhow::Error::msg)?;
+
     install_terminal_restore_panic_hook();
     tonepoet::tui::external_editor::scavenge_stale_embedded_cuesheet_edit_dirs();
 
@@ -2554,9 +2695,6 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    // Create app state
-    let mut app = AppState::new(config);
 
     // Crash recovery: check for interrupted metadata writes from a previous session.
     let recovered = app.db.recover_stale_metadata_writes();

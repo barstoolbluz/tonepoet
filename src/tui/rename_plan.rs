@@ -300,6 +300,46 @@ fn execute_plan_with_proofs_internal(
         }
     }
 
+    // Bulk rename, undo, and redo all funnel through this entrypoint. Publish
+    // the entire source/destination mutation set atomically before manifest
+    // capture or workspace creation so every competing Tonepoet subsystem sees
+    // one transaction-sized admission boundary.
+    struct AdmittedRenamePaths {
+        source: PathBuf,
+        destination: PathBuf,
+    }
+    let mut claims = Vec::with_capacity(pending_indices.len() * 2);
+    let mut admitted_paths = Vec::with_capacity(pending_indices.len());
+    for &index in &pending_indices {
+        let source = plan.ops[index].source.clone();
+        let destination = plan.base_dir.join(&plan.ops[index].target_relative);
+        let scope = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_dir() => crate::concurrency::ClaimScope::Subtree,
+            _ => crate::concurrency::ClaimScope::Exact,
+        };
+        let source_claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            &source,
+            crate::concurrency::ClaimMode::Write,
+            scope,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )?;
+        let destination_claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            &destination,
+            crate::concurrency::ClaimMode::Write,
+            scope,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )?;
+        admitted_paths.push(AdmittedRenamePaths {
+            source: source_claim.identity.resolved_io_path.clone(),
+            destination: destination_claim.identity.resolved_io_path.clone(),
+        });
+        claims.push(source_claim);
+        claims.push(destination_claim);
+    }
+    let _mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(claims)?;
+    let admitted_base_dir = crate::concurrency::ResolvedPathIdentity::resolve(&plan.base_dir)?
+        .resolved_io_path;
+
     struct PreimageAuthority {
         index: usize,
         source: PathBuf,
@@ -311,8 +351,8 @@ fn execute_plan_with_proofs_internal(
 
     let mut authorities = Vec::with_capacity(pending_indices.len());
     for (proof_index, &index) in pending_indices.iter().enumerate() {
-        let source = plan.ops[index].source.clone();
-        let destination = plan.base_dir.join(&plan.ops[index].target_relative);
+        let source = admitted_paths[proof_index].source.clone();
+        let destination = admitted_paths[proof_index].destination.clone();
         let manifest = tui_file_picker::capture_manifest_with_mode(&source, verification).map_err(|error| {
             format!(
                 "could not capture authoritative rename preimage for {}: {error}",
@@ -360,14 +400,14 @@ fn execute_plan_with_proofs_internal(
     }
 
     let transaction = plan_rename_transaction(
-        &plan.base_dir,
-        pending_indices.iter().map(|&index| RenameIntent {
-            source: plan.ops[index].source.clone(),
-            destination: plan.base_dir.join(&plan.ops[index].target_relative),
+        &admitted_base_dir,
+        admitted_paths.iter().map(|paths| RenameIntent {
+            source: paths.source.clone(),
+            destination: paths.destination.clone(),
         }),
     )?;
 
-    let workspace = create_unique_rename_workspace(&plan.base_dir)?;
+    let workspace = create_unique_rename_workspace(&admitted_base_dir)?;
     let result = execute_shared_transaction(&transaction, &workspace);
     let cleanup_result = std::fs::remove_dir(&workspace);
     match result {
@@ -696,6 +736,7 @@ mod live_mount_repro {
     #[test]
     #[ignore]
     fn directory_rename_on_live_mount() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let Some(base) = std::env::var_os("TONEPOET_REPRO_DIR") else {
             eprintln!("TONEPOET_REPRO_DIR not set; skipping");
             return;
@@ -747,6 +788,196 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn shared_claim_blocks_bulk_rename_before_namespace_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = tmp_dir();
+        let source = dir.join("track.flac");
+        let destination = dir.join("01 - track.flac");
+        fs::write(&source, b"track").unwrap();
+        let competing = crate::concurrency::PathClaim::resolve(
+            &source,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .unwrap();
+        let _competing_guard =
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(source.clone(), "01 - track.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        let error = execute_plan(&mut plan).expect_err("rename must lose shared admission");
+        assert!(error.contains("live owner"));
+        assert!(source.exists());
+        assert!(!destination.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_rename_subtree_claim_conflicts_with_descendant_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = tmp_dir();
+        let source = dir.join("Album");
+        let child = source.join("track.flac");
+        let destination = dir.join("Renamed");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(&child, b"track").unwrap();
+        let competing = crate::concurrency::PathClaim::resolve(
+            &child,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .unwrap();
+        let _competing_guard =
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(source.clone(), "Renamed".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        assert!(execute_plan(&mut plan).is_err());
+        assert!(source.exists());
+        assert!(child.exists());
+        assert!(!destination.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disjoint_bulk_rename_remains_concurrent_with_unrelated_claim() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = tmp_dir();
+        let source = dir.join("track.flac");
+        let unrelated = dir.join("unrelated.flac");
+        fs::write(&source, b"track").unwrap();
+        fs::write(&unrelated, b"other").unwrap();
+        let competing = crate::concurrency::PathClaim::resolve(
+            &unrelated,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .unwrap();
+        let _competing_guard =
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(source.clone(), "renamed.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        assert_eq!(execute_plan(&mut plan).unwrap(), 1);
+        assert!(dir.join("renamed.flac").exists());
+        assert!(unrelated.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transactional_rename_moves_directory_symlink_entry_not_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp_dir();
+        let real = dir.join("AlbumReal");
+        let link = dir.join("AlbumLink");
+        let renamed = dir.join("RenamedLink");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("track.flac"), b"track").unwrap();
+        symlink(&real, &link).unwrap();
+        let before = fs::read_link(&link).unwrap();
+
+        let mut plan = RenamePlan::new(
+            dir.clone(),
+            vec![(link.clone(), "RenamedLink".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        assert_eq!(execute_plan(&mut plan).unwrap(), 1);
+
+        assert!(real.is_dir(), "the real album directory must not move");
+        assert!(fs::symlink_metadata(&link).is_err(), "old link entry must be gone");
+        assert!(fs::symlink_metadata(&renamed).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&renamed).unwrap(), before);
+        assert_eq!(renamed.canonicalize().unwrap(), real.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transactional_rename_moves_file_symlink_entry_not_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp_dir();
+        let real = dir.join("track-real.flac");
+        let link = dir.join("track-link.flac");
+        let renamed = dir.join("TRACK-LINK.flac");
+        fs::write(&real, b"audio").unwrap();
+        symlink(&real, &link).unwrap();
+        let before = fs::read_link(&link).unwrap();
+
+        let mut rename = RenamePlan::new(
+            dir.clone(),
+            vec![(link.clone(), "TRACK-LINK.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut rename), 0);
+        assert_eq!(execute_plan(&mut rename).unwrap(), 1);
+        assert_eq!(fs::read(&real).unwrap(), b"audio");
+        assert!(fs::symlink_metadata(&renamed).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&renamed).unwrap(), before);
+
+        // Undo/redo use this same transactional entrypoint. Exercise the same
+        // replay direction twice so a later regression cannot move the
+        // referent on either leg.
+        let mut undo = RenamePlan::new(
+            dir.clone(),
+            vec![(renamed.clone(), "track-link.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut undo), 0);
+        assert_eq!(execute_plan(&mut undo).unwrap(), 1);
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"audio");
+
+        let mut redo = RenamePlan::new(
+            dir.clone(),
+            vec![(link.clone(), "TRACK-LINK.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut redo), 0);
+        assert_eq!(execute_plan(&mut redo).unwrap(), 1);
+        assert!(fs::symlink_metadata(&renamed).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"audio");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transactional_rename_stabilizes_symlinked_parent_without_following_final_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp_dir();
+        let real_parent = dir.join("LibraryReal");
+        let parent_alias = dir.join("LibraryAlias");
+        let referent = dir.join("referent.flac");
+        fs::create_dir_all(&real_parent).unwrap();
+        fs::write(&referent, b"audio").unwrap();
+        symlink(&real_parent, &parent_alias).unwrap();
+        let selected = parent_alias.join("track-link.flac");
+        symlink(&referent, &selected).unwrap();
+
+        let mut plan = RenamePlan::new(
+            parent_alias.clone(),
+            vec![(selected.clone(), "renamed-link.flac".to_string())],
+        );
+        assert_eq!(validate_plan(&mut plan), 0);
+        assert_eq!(execute_plan(&mut plan).unwrap(), 1);
+
+        let actual = real_parent.join("renamed-link.flac");
+        assert!(fs::symlink_metadata(&actual).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&referent).unwrap(), b"audio");
+        assert!(fs::symlink_metadata(real_parent.join("track-link.flac")).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -915,6 +1146,7 @@ mod tests {
 
     #[test]
     fn standard_directory_rename_and_replay_proofs_remain_digest_free() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = tmp_dir();
         let source = dir.join("album");
         fs::create_dir(&source).expect("album");

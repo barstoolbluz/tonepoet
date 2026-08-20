@@ -538,6 +538,8 @@ pub fn create_cue_sidecar_from_cuesheet(
     cue_path: &Path,
     replacement_cuesheet: &str,
 ) -> Result<CueSidecarWritebackOutcome, String> {
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    let cue_path = admitted_cue_path.as_path();
     validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, false)?;
     let desired = explicit_cue_metadata(replacement_cuesheet);
     if desired.tracks.is_empty() {
@@ -587,6 +589,8 @@ pub fn replace_invalid_cue_sidecar_from_cuesheet_if_unchanged(
     replacement_cuesheet: &str,
     expected_original: &[u8],
 ) -> Result<CueSidecarWritebackOutcome, String> {
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    let cue_path = admitted_cue_path.as_path();
     validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, false)?;
     let desired = explicit_cue_metadata(replacement_cuesheet);
     if desired.tracks.is_empty() {
@@ -647,6 +651,11 @@ fn rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode<F>(
 where
     F: FnOnce(&[u8], &str) -> Result<(), String>,
 {
+    // Claim before reading the baseline so the read/compose/compare/atomic
+    // replacement is one admitted mutation, not a TOCTOU window between an
+    // unprotected read and a protected rename.
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    let cue_path = admitted_cue_path.as_path();
     let raw = std::fs::read(cue_path)
         .map_err(|e| format!("failed to read sidecar CUE '{}': {}", cue_path.display(), e))?;
     let decoded = decode_cue_bytes_with_context_for_write(&raw, cue_path.parent())?;
@@ -699,6 +708,24 @@ where
 
     atomic_replace_if_unchanged(cue_path, &bytes, Some(&raw))?;
     Ok(encoding_outcome)
+}
+
+fn acquire_cue_sidecar_write_claim(
+    cue_path: &Path,
+) -> Result<(Option<crate::concurrency::MutationClaimGuard>, PathBuf), String> {
+    let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+        cue_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    )?;
+    let admitted_path = claim.identity.resolved_io_path.clone();
+    let guard = if crate::concurrency::current_mutation_authority_covers(&claim)? {
+        None
+    } else {
+        Some(crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?)
+    };
+    Ok((guard, admitted_path))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2815,6 +2842,7 @@ mod tests {
 
     #[test]
     fn validated_sidecar_rewrite_refuses_a_change_after_snapshot_validation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_compare_and_rewrite");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -2851,6 +2879,7 @@ mod tests {
 
     #[test]
     fn create_sidecar_is_atomic_create_only_and_never_overwrites() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_create_only");
         let cue_path = dir.join("album.cue");
         let replacement = concat!(
@@ -2889,6 +2918,7 @@ mod tests {
 
     #[test]
     fn invalid_sidecar_replacement_refuses_read_only_placeholder_without_mutation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("invalid_sidecar_readonly");
         let cue_path = dir.join("album.cue");
         let invalid = b"not a cue\n";
@@ -2922,6 +2952,7 @@ mod tests {
 
     #[test]
     fn sidecar_writeback_rewrites_utf8_metadata_only_as_golden_bytes_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_golden");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3016,6 +3047,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_utf8_bom_album_insertion_keeps_bom_at_byte_zero_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_bom_insert");
         let cue_path = dir.join("album.cue");
         let original_body = "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old\"\n    INDEX 01 00:00:00\n";
@@ -3086,6 +3118,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn authoritative_sidecar_writeback_sets_and_deletes_owned_fields_on_byte_span_path() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("authoritative_sidecar_byte_span");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3181,6 +3214,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn authoritative_sidecar_writeback_deletes_isrc_and_fields_on_utf8_bom_reencode_path() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("authoritative_sidecar_utf8_bom");
         let cue_path = dir.join("album.cue");
         let body = concat!(
@@ -3221,6 +3255,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_refuses_double_quotes_in_quoted_metadata_without_changing_sidecar() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_quote_refusal");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"Old\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old One\"\n    INDEX 01 00:00:00\n";
@@ -3237,6 +3272,7 @@ FILE \"different-generated-name.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_rewrites_shift_jis_metadata_only_as_golden_bytes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_sjis_golden");
         let cue_path = dir.join("album.cue");
         let original = concat!(
@@ -3325,6 +3361,7 @@ FILE \"generated.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_falls_back_to_utf8_when_legacy_encoding_cannot_represent_text() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_fallback");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"日本\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"日本一\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"日本二\"\n    INDEX 01 01:00:00\n";
@@ -3353,6 +3390,7 @@ FILE \"generated.flac\" FLAC\n\
 
     #[test]
     fn sidecar_writeback_read_only_sidecar_is_left_unchanged() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_readonly");
         let cue_path = dir.join("album.cue");
         let original = "TITLE \"Old\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Old One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Old Two\"\n    INDEX 01 01:00:00\n";
@@ -3838,6 +3876,7 @@ mod writeback_end_to_end_tests {
     /// structure byte-preserved, and a second save is a no-op.
     #[test]
     fn editor_corrected_album_writes_back_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !tool_ok("ffmpeg") || !tool_ok("metaflac") {
             eprintln!("skipping: ffmpeg or metaflac unavailable");
             return;
@@ -3872,5 +3911,37 @@ mod writeback_end_to_end_tests {
             .expect("second save succeeds");
         eprintln!("second outcome: {second:?}");
         assert_eq!(std::fs::read(&sidecar).expect("final"), after, "re-save is a byte no-op");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod atomic_namespace_symlink_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn atomic_cue_replacement_replaces_final_namespace_entry_not_referent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("master.cue");
+        let sidecar = temp.path().join("album.cue");
+        std::fs::write(&referent, b"original referent").expect("referent");
+        symlink(&referent, &sidecar).expect("sidecar symlink");
+        let expected = std::fs::read(&sidecar).expect("read through sidecar");
+
+        let (_claim, admitted) = acquire_cue_sidecar_write_claim(&sidecar)
+            .expect("namespace-object CUE admission");
+        assert_eq!(admitted, sidecar, "final CUE symlink must remain the admitted namespace entry");
+        atomic_replace_if_unchanged(&admitted, b"replacement cue", Some(&expected))
+            .expect("atomic CUE replacement");
+
+        assert_eq!(std::fs::read(&referent).unwrap(), b"original referent");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"replacement cue");
+        assert!(
+            !std::fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "atomic publication should replace the lexical symlink entry with the new sidecar"
+        );
     }
 }

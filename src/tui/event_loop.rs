@@ -1462,14 +1462,16 @@ fn reduce_file_picker_complete(
                 &app.convert.metadata,
             );
             match super::presets::save_preset_to_path_with_db(&preset, &path, &app.db) {
-                Ok(()) => {
+                Ok(outcome) => {
                     app.preset.set_active_preset_path(name.clone(), path.clone());
                     app.preset.modified = false;
-                    app.set_status(format!(
-                        "Saved preset: {} | {}",
-                        path.display(),
-                        preset.resolved_semantics_summary()
-                    ));
+                    if let Some(warning) = outcome.index_warning() {
+                        app.set_status(format!("Saved preset: {}; SQLite index update failed and will be repaired on startup: {warning}", path.display()));
+                    } else {
+                        app.set_status(format!(
+                            "Saved preset: {} | {}", path.display(), preset.resolved_semantics_summary()
+                        ));
+                    }
                 }
                 Err(e) => app.set_status(format!("Save failed: {}", e)),
             }
@@ -1703,10 +1705,11 @@ fn reduce_file_task_progress(
         app.set_status(status);
     }
     let defer_clipboard_refresh = terminal
-        && app
+        && (app
             .file_transfers
             .pending_by_session
-            .contains_key(&session_id);
+            .contains_key(&session_id)
+            || app.artwork_picker_file_tasks.contains_key(&session_id));
     if refresh_after_terminal && !defer_clipboard_refresh {
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
@@ -1759,6 +1762,124 @@ fn terminal_update_from_completion_report(
             totals,
         }
     }
+}
+
+fn reconcile_artwork_picker_file_task(
+    app: &mut AppState,
+    pending: super::app::ArtworkPickerFileTask,
+    report: &tui_file_picker::FileTaskCompletionReport,
+    worker_retry_plan: Option<super::browse::BrowsePasteRetryPlan>,
+) -> bool {
+    let picker_session_id = pending.picker_session_id;
+    let (completed_sources, completed_destinations, remaining_sources, is_move) =
+        match &pending.request {
+            tui_file_picker::FilePickerHostMutationRequest::Paste { clipboard, .. } => {
+                let mut completed_sources = Vec::new();
+                let mut completed_destinations = Vec::new();
+                let mut remaining_sources = Vec::new();
+                for mapping in &pending.plan.mappings {
+                    let completed = report
+                        .roots
+                        .iter()
+                        .find(|root| root.source == mapping.source)
+                        .is_some_and(|root| root.disposition.is_completed());
+                    if completed {
+                        completed_sources.push(mapping.source.clone());
+                        completed_destinations.push(mapping.destination.clone());
+                    } else {
+                        remaining_sources.push(mapping.source.clone());
+                    }
+                }
+                (
+                    completed_sources,
+                    completed_destinations,
+                    remaining_sources,
+                    clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut,
+                )
+            }
+            _ => (Vec::new(), Vec::new(), Vec::new(), false),
+        };
+
+    // The progress reducer deliberately defers generic Browse refresh while a
+    // hosted artwork transfer is pending. Reuse the normal nonblocking Browse
+    // completion refresh here so a picker-owned paste cannot leave another
+    // Tonepoet surface displaying stale source/destination rows.
+    let destination_refreshed_tabs =
+        refresh_browse_destination_views_after_file_task(app, &completed_destinations);
+    if is_move && !completed_sources.is_empty() {
+        refresh_browse_source_views_after_move(
+            app,
+            &completed_sources,
+            &destination_refreshed_tabs,
+        );
+    }
+    app.artwork_picker_paste_retries.remove(&picker_session_id);
+    if !remaining_sources.is_empty() {
+        if let Some(retry) = worker_retry_plan
+            .as_ref()
+            .and_then(|retry| retry.retain_sources(&remaining_sources))
+        {
+            app.artwork_picker_paste_retries
+                .insert(picker_session_id, retry);
+        }
+    }
+
+    fn reconcile_editor(
+        editor: &mut Box<super::app::MetadataEditorState>,
+        picker_session_id: u64,
+        request: &tui_file_picker::FilePickerHostMutationRequest,
+        plan: &tui_file_picker::PastePlan,
+        report: &tui_file_picker::FileTaskCompletionReport,
+    ) -> bool {
+        let Some(session) = editor
+            .file_picker
+            .as_mut()
+            .filter(|session| session.session_id == picker_session_id)
+        else {
+            return false;
+        };
+        let _ = session
+            .picker
+            .complete_host_paste(request.clone(), plan, report);
+        true
+    }
+
+    if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(editor) = app.pending_metadata_editor.as_mut() {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.file_task_preempted_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.pending_editor_context_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    if let Some(ActiveOverlay::MetadataEditor(editor)) =
+        app.queued_quit_preempted_overlay.as_deref_mut()
+    {
+        if reconcile_editor(editor, picker_session_id, &pending.request, &pending.plan, report) {
+            return true;
+        }
+    }
+    // No live picker can consume an in-memory exact retry token for this
+    // session anymore. The durable file-task journal remains authoritative
+    // for crash/startup recovery, so do not retain dead-session UI state.
+    app.artwork_picker_paste_retries.remove(&picker_session_id);
+    false
 }
 
 fn reduce_file_task_complete(
@@ -1874,6 +1995,36 @@ fn reduce_file_task_complete(
         app.active_overlay = ActiveOverlay::None;
     }
 
+    if let Some(pending_artwork) = app.artwork_picker_file_tasks.remove(&session_id) {
+        let reconciled = reconcile_artwork_picker_file_task(
+            app,
+            pending_artwork,
+            &report,
+            worker_retry_plan,
+        );
+        let requires_attention = !report_finished_cleanly
+            || undo_record_warning.is_some()
+            || !reconciled;
+        if let Some(warning) = undo_record_warning {
+            app.set_status(format!(
+                "artwork-picker file task completed, but undo was not retained: {warning}"
+            ));
+        } else if !reconciled {
+            app.set_status(concat!(
+                "artwork-picker file task completed after its picker closed; ",
+                "filesystem result retained in task history",
+            ));
+        } else if report_finished_cleanly {
+            app.set_status("Artwork picker file operation completed");
+        } else {
+            app.set_status("Artwork picker file operation completed with retryable or warning roots");
+        }
+        if app.file_transfers.active_session_id == Some(session_id) {
+            finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+        }
+        return;
+    }
+
     let Some(pending) = app.file_transfers.pending_by_session.remove(&session_id) else {
         let requires_attention = !report_finished_cleanly || undo_record_warning.is_some();
         if let Some(warning) = undo_record_warning {
@@ -1901,16 +2052,18 @@ fn reduce_file_task_complete(
         .and_then(|retry| retry.recovery_journal_path.as_ref())
         .is_some();
 
-    for (index, source) in pending.clipboard.paths().iter().enumerate() {
-        let expected_destination = pending
-            .plan
-            .mappings
-            .get(index)
-            .map(|mapping| &mapping.destination);
-        let root = report.roots.iter().find(|root| {
-            root.source == *source
-                && expected_destination.is_some_and(|destination| root.destination == *destination)
-        });
+    for source in pending.clipboard.paths().iter() {
+        // The worker keeps the clipboard/source identity lexical but reports
+        // the authoritative admitted destination used for filesystem I/O. A
+        // followed destination alias can therefore make the terminal
+        // destination differ from the original display mapping. Top-level
+        // clipboard sources are unique, so reconcile by that stable logical
+        // source identity rather than re-resolving or comparing the mutable
+        // destination alias.
+        let root = report
+            .roots
+            .iter()
+            .find(|root| root.source == *source);
         // The isolated helper owns all filesystem verification and attaches
         // operation-time proofs to completed roots. The TUI reducer must not
         // re-stat a source or destination: either pathname may be a wedged
@@ -2875,6 +3028,51 @@ pub(super) fn start_browse_archive_repackage_overwrite(
     start_browse_archive_repackage_inner(app, context, tx, true);
 }
 
+fn acquire_browse_archive_mutation_claim(
+    claim: crate::concurrency::PathClaim,
+) -> Result<crate::concurrency::MutationClaimGuard, String> {
+    crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])
+}
+
+#[cfg(test)]
+mod browse_archive_mutation_claim_tests {
+    use super::acquire_browse_archive_mutation_claim;
+    use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
+
+    #[test]
+    fn same_archive_save_is_busy_while_disjoint_archive_remains_admissible() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let contested = temp.path().join("album.zip");
+        let disjoint = temp.path().join("other.zip");
+        std::fs::write(&contested, b"archive-a").unwrap();
+        std::fs::write(&disjoint, b"archive-b").unwrap();
+
+        let competing =
+            PathClaim::resolve(&contested, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        let competing_guard = MutationClaimGuard::acquire_ephemeral(vec![competing]).unwrap();
+
+        let same_claim =
+            PathClaim::resolve(&contested, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        let error = acquire_browse_archive_mutation_claim(same_claim)
+            .expect_err("same archive must be busy before repackaging starts");
+        assert!(error.contains("live owner"), "unexpected busy error: {error}");
+        assert_eq!(std::fs::read(&contested).unwrap(), b"archive-a");
+
+        let disjoint_claim =
+            PathClaim::resolve(&disjoint, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        let disjoint_guard = acquire_browse_archive_mutation_claim(disjoint_claim)
+            .expect("different archives must remain concurrent");
+        drop(disjoint_guard);
+
+        drop(competing_guard);
+        let retry_claim =
+            PathClaim::resolve(&contested, ClaimMode::Write, ClaimScope::Exact).unwrap();
+        acquire_browse_archive_mutation_claim(retry_claim)
+            .expect("archive claim must release after the live owner finishes");
+    }
+}
+
 fn start_browse_archive_repackage_inner(
     app: &mut AppState,
     context: super::app::ArchiveMetadataEditContext,
@@ -2910,25 +3108,55 @@ fn start_browse_archive_repackage_inner(
         }
     }
 
-    let archive_path = context.archive_path.clone();
+    // The archive itself is the shared user-library mutation boundary. Admit
+    // it before the final baseline recheck so another session cannot pass the
+    // same check and install a competing replacement. Keep the live guard in
+    // the worker through temporary creation, verification, install, and cleanup.
+    let archive_claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+        &context.archive_path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            app.set_status(format!(
+                "archive save admission failed; staged edits were preserved: {error}"
+            ));
+            return;
+        }
+    };
+    let logical_archive_path = context.archive_path.clone();
+    let admitted_archive_path = archive_claim.identity.resolved_io_path.clone();
+    let archive_mutation_claim = match acquire_browse_archive_mutation_claim(archive_claim) {
+        Ok(guard) => guard,
+        Err(error) => {
+            app.set_status(format!(
+                "archive save busy; staged edits were preserved: {error}"
+            ));
+            return;
+        }
+    };
     let staging_dir = context.staging_dir.clone();
     let tool_paths = app.manager.config.tool_paths.clone();
     let tx = tx.clone();
-    // Mutation is now in progress. Bump the archive probe epoch immediately
+    // Mutation is now admitted. Bump the archive probe epoch immediately
     // so any archive-entry probe that was launched against the pre-edit
     // archive is rejected even if it completes before the final success path
     // clears cache/pending state.
-    app.browse.bump_archive_probe_epoch_for(&archive_path);
+    app.browse.bump_archive_probe_epoch_for(&logical_archive_path);
     if matches!(context.owner, super::app::ArchiveMetadataEditOwner::Browse)
         && !overwrite_external_change
     {
-        match context.archive_conflict() {
+        let mut admitted_context = context.clone();
+        admitted_context.archive_path = admitted_archive_path.clone();
+        match admitted_context.archive_conflict() {
             Ok(false) => {}
             Ok(true) => {
                 app.active_overlay = super::app::ActiveOverlay::Confirmation {
                     message: format!(
                         "Archive was modified externally: {}\n\nY overwrites it with your staged edits. D discards your staged edits. N/Esc keeps the staged edits for later retry. Mouse Cancel opens an explicit discard confirmation.",
-                        archive_path.display()
+                        logical_archive_path.display()
                     ),
                     action: super::app::ConfirmAction::ArchiveExternalConflict { context },
                 };
@@ -2939,7 +3167,7 @@ fn start_browse_archive_repackage_inner(
                 app.active_overlay = super::app::ActiveOverlay::Confirmation {
                     message: format!(
                         "Could not verify whether the archive changed externally: {}\n\nY attempts the save anyway. D discards your staged edits. N/Esc keeps the staged edits for later retry. Mouse Cancel opens an explicit discard confirmation.\n\n{}",
-                        archive_path.display(),
+                        logical_archive_path.display(),
                         err
                     ),
                     action: super::app::ConfirmAction::ArchiveExternalConflict { context },
@@ -2949,10 +3177,10 @@ fn start_browse_archive_repackage_inner(
             }
         }
     }
-    let archive_label = archive_path
+    let archive_label = logical_archive_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| archive_path.display().to_string());
+        .unwrap_or_else(|| logical_archive_path.display().to_string());
     let (control_tx, control_rx) = std::sync::mpsc::channel();
     let mut progress = tui_file_picker::FileTaskProgressState::new(
         tui_file_picker::FileTaskKind::Archive,
@@ -2960,13 +3188,13 @@ fn start_browse_archive_repackage_inner(
         super::keybindings::file_picker_theme_from_theme(&app.theme),
     );
     progress.set_scope(tui_file_picker::FileTaskScope {
-        source_root: Some(archive_path.clone()),
+        source_root: Some(logical_archive_path.clone()),
         source_summary: archive_label.clone(),
-        destination: archive_path
+        destination: logical_archive_path
             .parent()
             .map(|parent| parent.to_path_buf())
-            .or_else(|| Some(archive_path.clone())),
-        destination_summary: archive_path
+            .or_else(|| Some(logical_archive_path.clone())),
+        destination_summary: logical_archive_path
             .parent()
             .map(|parent| parent.display().to_string()),
     });
@@ -2979,6 +3207,7 @@ fn start_browse_archive_repackage_inner(
     app.set_status(format!("Saving archive changes: {archive_label}"));
 
     tokio::spawn(async move {
+        let _archive_mutation_claim = archive_mutation_claim;
         let cancel = tokio_util::sync::CancellationToken::new();
         let control_done = tokio_util::sync::CancellationToken::new();
         let cancel_from_controls = cancel.clone();
@@ -3005,11 +3234,11 @@ fn start_browse_archive_repackage_inner(
         });
 
         let progress_tx = tx.clone();
-        let archive_for_progress = archive_path.clone();
+        let archive_for_progress = logical_archive_path.clone();
         let staging_for_progress = staging_dir.clone();
         let result = crate::convert::pipeline::materializer_archive::repackage_archive_with_progress_and_cancel(
             &staging_dir,
-            &archive_path,
+            &admitted_archive_path,
             &tool_paths,
             &cancel,
             move |snapshot| {
@@ -3026,7 +3255,7 @@ fn start_browse_archive_repackage_inner(
         let _ = control_task.await;
         let _ = tx
             .send(AppMessage::ArchiveRepackageResult {
-                archive_path,
+                archive_path: logical_archive_path,
                 staging_dir,
                 progress_session_id,
                 result,
@@ -16001,6 +16230,8 @@ mod artwork_file_picker_completion_tests {
                 allow_copy: false,
                 allow_paste: false,
                 allow_delete: false,
+                allow_rename: false,
+                allow_duplicate: false,
                 symlink_copy: tui_file_picker::SymlinkCopyPolicy::Reject,
                 cross_device_cut: tui_file_picker::CrossDeviceCutPolicy::Reject,
                 delete: tui_file_picker::DeletePolicy::FilesAndEmptyDirectories,

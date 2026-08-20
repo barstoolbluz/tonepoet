@@ -566,7 +566,7 @@ mod tests {
         let path = temp.path().join("missing-recent-table.db");
         {
             let conn = rusqlite::Connection::open(&path).expect("raw database");
-            conn.pragma_update(None, "user_version", 23)
+            conn.pragma_update(None, "user_version", 24)
                 .expect("stamp current version without tables");
         }
         // A current-version database intentionally bypasses migration DDL, so

@@ -106,6 +106,18 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     let editor_str = detect_editor()?;
     let (program, args) = split_command(&editor_str);
 
+    let claim = crate::concurrency::PathClaim::resolve(
+        path,
+        crate::concurrency::ClaimMode::Write,
+        crate::concurrency::ClaimScope::Exact,
+    )?;
+    let mutation_claim = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])?;
+    let admitted_path = mutation_claim
+        .claims()
+        .first()
+        .map(|claim| claim.identity.resolved_io_path.clone())
+        .ok_or_else(|| "editor mutation admission produced no path claim".to_string())?;
+
     let mut terminal_restore = TuiRestoreGuard::suspend();
 
     // Run the editor, blocking until it exits. The terminal restore guard
@@ -114,14 +126,147 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     // subprocess stdin-nulling convention (see the sentinel test
     // tests/subprocess_stdin_convention.rs): the user's $EDITOR needs the
     // terminal — DELIBERATE stdin inheritance.
-    let status = Command::new(program)
-        .args(&args)
-        .arg(path)
-        .status()
-        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let status = run_supervised_interactive_editor(program, &args, &admitted_path, mutation_claim)
+            .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
+        terminal_restore.restore_now();
+        Ok(status.success())
+    }
 
-    terminal_restore.restore_now();
-    Ok(status.success())
+    // Tonepoet's durable process-tree supervisor currently has production
+    // backends only on Linux and macOS. Refuse a mutation-capable external
+    // editor elsewhere rather than letting a third-party process outlive the
+    // only holder of the WRITE claim. The restore guard runs on this return.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _mutation_claim = mutation_claim;
+        Err(format!(
+            "failed to run {}: durable external-editor supervision is unavailable on this platform",
+            editor_str
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_supervised_interactive_editor(
+    program: &str,
+    args: &[&str],
+    path: &Path,
+    mutation_claim: crate::concurrency::MutationClaimGuard,
+) -> Result<std::process::ExitStatus, String> {
+    use crate::convert::script_supervisor::{
+        run_supervised, ContainmentPreference, RuntimeDirectoryIdentity, SupervisedCommand,
+    };
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::sync::Arc;
+
+    let binary_path = resolve_editor_program(program)?;
+    let binary_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&binary_path)
+        .map_err(|error| format!("open exact editor executable {}: {error}", binary_path.display()))?;
+    if !binary_file
+        .metadata()
+        .map_err(|error| format!("stat editor executable {}: {error}", binary_path.display()))?
+        .is_file()
+    {
+        return Err(format!("editor executable is not a regular file: {}", binary_path.display()));
+    }
+
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("resolve editor working directory: {error}"))?;
+    let cwd_file = std::fs::File::open(&cwd)
+        .map_err(|error| format!("open editor working directory {}: {error}", cwd.display()))?;
+
+    let runtime_base = std::env::temp_dir().join("tonepoet-interactive-editor-supervisor");
+    std::fs::create_dir_all(&runtime_base)
+        .map_err(|error| format!("create editor supervisor root: {error}"))?;
+    std::fs::set_permissions(&runtime_base, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect editor supervisor root: {error}"))?;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let runtime_directory = runtime_base.join(&token);
+    std::fs::create_dir(&runtime_directory)
+        .map_err(|error| format!("create editor supervisor runtime: {error}"))?;
+    std::fs::set_permissions(&runtime_directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("protect editor supervisor runtime: {error}"))?;
+    let runtime_meta = std::fs::metadata(&runtime_directory)
+        .map_err(|error| format!("stat editor supervisor runtime: {error}"))?;
+
+    // Attach the contained editor to the controlling terminal while the TUI is
+    // suspended. The tonepoet helper receives these only as ordinary stdio;
+    // the mutation lease is a separate supervisor-retained CLOEXEC descriptor.
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| format!("open controlling terminal for editor: {error}"))?;
+    let stdin_file = Arc::new(tty.try_clone().map_err(|error| format!("clone editor stdin: {error}"))?);
+    let stdout_file = Arc::new(tty.try_clone().map_err(|error| format!("clone editor stdout: {error}"))?);
+    let stderr_file = Arc::new(tty);
+
+    let path_arg = path
+        .to_str()
+        .ok_or_else(|| format!("cannot safely supervise editor for non-UTF-8 path: {}", path.display()))?;
+    let mut invocation_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    invocation_args.push(path_arg.to_string());
+    let lease = Arc::new(mutation_claim.into_lease());
+    let retained = lease
+        .duplicate_lifetime_file()
+        .map_err(|error| format!("duplicate editor mutation lease: {error}"))?;
+    let invocation = SupervisedCommand {
+        token,
+        runtime_directory: runtime_directory.clone(),
+        script_file: Arc::new(binary_file),
+        working_directory_file: Arc::new(cwd_file),
+        script: binary_path,
+        args: invocation_args,
+        working_directory: cwd,
+        environment: std::env::vars().collect(),
+        // Interactive editors have no useful application timeout. Process-tree
+        // termination still follows cancellation/parent-loss containment.
+        timeout: std::time::Duration::from_secs(365 * 24 * 60 * 60),
+        runtime_identity: RuntimeDirectoryIdentity {
+            device: runtime_meta.dev(),
+            inode: runtime_meta.ino(),
+        },
+        containment_preference: ContainmentPreference::Auto,
+        helper_executable: None,
+        retained_lifetime_files: vec![retained],
+        stdin_file: Some(stdin_file),
+        stdout_file: Some(stdout_file),
+        stderr_file: Some(stderr_file),
+    };
+
+    let outcome = run_supervised(&invocation, || false, |_event| Ok(()))
+        .map_err(|error| error.to_string());
+    // Keep the parent-side claim holder alive until the helper has settled the
+    // complete contained process tree. The helper's duplicate is the authority
+    // if this parent dies first.
+    drop(lease);
+    if outcome.as_ref().is_ok_and(|result| result.containment_empty) {
+        let _ = std::fs::remove_dir_all(&runtime_directory);
+    }
+    outcome.map(|result| result.status)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_editor_program(program: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(program);
+    let candidate = if path.is_absolute() || path.components().count() > 1 {
+        path
+    } else {
+        let search = std::env::var_os("PATH")
+            .ok_or_else(|| format!("PATH is unset while resolving editor '{program}'"))?;
+        std::env::split_paths(&search)
+            .map(|directory| directory.join(&path))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| format!("editor executable not found on PATH: {program}"))?
+    };
+    std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("canonicalize editor executable {}: {error}", candidate.display()))
 }
 
 /// Open a file in read-only view mode.
@@ -301,7 +446,8 @@ mod tests {
             .next()
             .expect("open_in_editor body");
         assert!(editor_fn.contains("TuiRestoreGuard::suspend()"));
-        assert!(editor_fn.contains(".map_err(|e| format!(\"failed to run {}: {}\", editor_str, e))?"));
+        assert!(editor_fn.contains("run_supervised_interactive_editor"));
+        assert!(editor_fn.contains("durable external-editor supervision is unavailable"));
         assert!(editor_fn.contains("terminal_restore.restore_now();"));
 
         let viewer_fn = source

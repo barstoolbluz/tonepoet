@@ -150,6 +150,94 @@ pub fn resolve_aggregate_metadata_target(
 }
 
 impl TransferCarrier {
+    fn metadata_mutation_paths(&self, out: &mut Vec<std::path::PathBuf>) {
+        match self {
+            Self::Files { paths } => out.extend(paths.iter().cloned()),
+            Self::SidecarCue {
+                cue_path,
+                track_audio_paths,
+                write_method,
+                ..
+            } => {
+                if matches!(write_method, SidecarCueWriteMethod::PerFileAndSidecar) {
+                    out.extend(track_audio_paths.iter().cloned());
+                }
+                out.push(cue_path.clone());
+            }
+            Self::EmbeddedCue { image_path, .. } => out.push(image_path.clone()),
+            Self::EmbeddedCues { carriers } => {
+                out.extend(carriers.iter().map(|carrier| carrier.image_path.clone()));
+            }
+            Self::Aggregate { carriers } => {
+                for carrier in carriers {
+                    carrier.metadata_mutation_paths(out);
+                }
+            }
+        }
+    }
+
+    fn with_admitted_metadata_paths(
+        &self,
+        admission: &super::probe::MetadataMutationAdmission,
+    ) -> Self {
+        let map = |path: &std::path::PathBuf| {
+            admission
+                .admitted_path(path)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|_| path.clone())
+        };
+        match self {
+            Self::Files { paths } => Self::Files {
+                paths: paths.iter().map(map).collect(),
+            },
+            Self::SidecarCue {
+                cue_path,
+                image_paths,
+                track_audio_paths,
+                role,
+                write_method,
+                cue_text,
+                sheet,
+            } => Self::SidecarCue {
+                cue_path: map(cue_path),
+                image_paths: image_paths.iter().map(map).collect(),
+                track_audio_paths: track_audio_paths.iter().map(map).collect(),
+                role: *role,
+                write_method: write_method.clone(),
+                cue_text: cue_text.clone(),
+                sheet: sheet.clone(),
+            },
+            Self::EmbeddedCue {
+                image_path,
+                cue_text,
+                sheet,
+                multi_file_read_only,
+            } => Self::EmbeddedCue {
+                image_path: map(image_path),
+                cue_text: cue_text.clone(),
+                sheet: sheet.clone(),
+                multi_file_read_only: *multi_file_read_only,
+            },
+            Self::EmbeddedCues { carriers } => Self::EmbeddedCues {
+                carriers: carriers
+                    .iter()
+                    .map(|carrier| EmbeddedCueCarrier {
+                        image_path: map(&carrier.image_path),
+                        cue_text: carrier.cue_text.clone(),
+                        sheet: carrier.sheet.clone(),
+                        multi_file_read_only: carrier.multi_file_read_only,
+                    })
+                    .collect(),
+            },
+            Self::Aggregate { carriers } => Self::Aggregate {
+                carriers: carriers
+                    .iter()
+                    .map(|carrier| carrier.with_admitted_metadata_paths(admission))
+                    .collect(),
+            },
+        }
+    }
+
     pub(crate) fn dimension(&self) -> TransferDimension {
         match self {
             Self::Files { paths } => TransferDimension::Files(paths.len()),
@@ -1458,6 +1546,7 @@ mod tests {
 
     #[test]
     fn transfer_route_is_positional_for_n_to_n_and_fails_n_to_m_before_io() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("positional transfer tempdir");
         let first = temp.path().join("01.dsf");
         let second = temp.path().join("02.dsf");
@@ -2029,6 +2118,7 @@ mod tests {
 
     #[test]
     fn sidecar_cue_transfer_route_preserves_structure_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let cue = temp.path().join("album.cue");
@@ -2202,6 +2292,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn unsupported_carrier_sidecar_write_blocks_audio_and_commits_only_cue() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("01.dff");
         let second = temp.path().join("02.dff");
@@ -2289,6 +2380,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_flac_cue_transfer_round_trips_and_is_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let original = concat!(
@@ -2381,6 +2473,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_wavpack_cue_transfer_uses_existing_metadata_writer() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-embedded-wavpack-cue-transfer",
         );
@@ -2442,6 +2535,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn embedded_cue_set_transfer_writes_each_carrier_without_crossing_sheet_boundaries() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let mut carriers = Vec::new();
         for (name, first_track) in [("disc-1.flac", 1_u32), ("disc-2.flac", 1_u32)] {
@@ -2700,6 +2794,7 @@ FILE "side-b.dff" WAVE
 
     #[test]
     fn metadata_sidecar_member_failure_leaves_sidecar_byte_identical() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("multi-FILE transfer tempdir");
         let first = temp.path().join("01.flac");
         let second = temp.path().join("02.flac");
@@ -5170,7 +5265,7 @@ fn execute_tag_transfer_to_aggregate(
                 progress(operation_offset + completed, total_operations, path);
             }
         };
-        let child = execute_tag_transfer_from_entries_to_carrier(
+        let child = execute_tag_transfer_from_entries_to_carrier_admitted(
             &segment_entries,
             segment_dimension,
             segment_track_numbers,
@@ -5519,6 +5614,56 @@ fn execute_tag_transfer_to_cue(
 }
 
 pub(crate) fn execute_tag_transfer_from_entries_to_carrier(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    source_track_numbers: Option<&[u32]>,
+    target: &TransferCarrier,
+    scope: super::app::TagTransferScope,
+    verification: tui_file_picker::VerificationMode,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    let mut mutation_paths = Vec::new();
+    target.metadata_mutation_paths(&mut mutation_paths);
+    let admission = super::probe::admit_metadata_mutation_paths(
+        &mutation_paths,
+        "tag-transfer operation",
+    )?;
+    let admitted_target = target.with_admitted_metadata_paths(&admission);
+    let mapped_progress = |done: usize, total: usize, path: &std::path::Path| {
+        if let Some(progress) = progress {
+            let logical = admission.logical_path(path);
+            progress(done, total, &logical);
+        }
+    };
+    admission.run(|| {
+        let mut report = execute_tag_transfer_from_entries_to_carrier_admitted(
+            source_entries,
+            source_dimension,
+            source_track_numbers,
+            &admitted_target,
+            scope,
+            verification,
+            cancel,
+            Some(&mapped_progress),
+        )?;
+        for path in &mut report.target_paths {
+            *path = admission.logical_path(path);
+        }
+        for path in &mut report.written_paths {
+            *path = admission.logical_path(path);
+        }
+        for (path, _) in &mut report.failed {
+            *path = admission.logical_path(path);
+        }
+        for (path, _) in &mut report.blocked {
+            *path = admission.logical_path(path);
+        }
+        Ok(report)
+    })
+}
+
+fn execute_tag_transfer_from_entries_to_carrier_admitted(
     source_entries: &[TagEntry],
     source_dimension: TransferDimension,
     source_track_numbers: Option<&[u32]>,

@@ -6233,6 +6233,19 @@ impl QueuedFileTransfer {
     }
 }
 
+/// Correlation state for a paste initiated by the metadata artwork picker but
+/// executed by Tonepoet's hardened file-task worker. The picker session id is
+/// stable even if the progress overlay temporarily preempts the editor.
+#[derive(Debug, Clone)]
+pub struct ArtworkPickerFileTask {
+    pub picker_session_id: u64,
+    pub request: tui_file_picker::FilePickerHostMutationRequest,
+    /// Host-owned exact plan frozen after filesystem-aware destination
+    /// planning and before worker dispatch. The picker request intentionally
+    /// carries only UI intent, so no picker-owned filesystem probe is needed.
+    pub plan: tui_file_picker::PastePlan,
+}
+
 /// App-side serial scheduler and per-job reconciliation registry for Browse
 /// copy/move transfers. The worker layer remains one-helper-per-job; this state
 /// only decides which queued snapshot owns the single active slot.
@@ -6240,6 +6253,11 @@ impl QueuedFileTransfer {
 pub struct FileTransferQueueState {
     pub active_session_id: Option<u64>,
     pub queued: VecDeque<QueuedFileTransfer>,
+    /// Durable crash recoveries discovered at startup. Kept distinct from the
+    /// ordinary user queue so discovery never silently changes normal queue
+    /// ownership semantics. The scheduler admits these only through the exact
+    /// journal-resume path.
+    pub recovery_queued: VecDeque<QueuedFileTransfer>,
     pub(crate) pending_by_session: BTreeMap<u64, crate::tui::browse::PendingClipboardPaste>,
     pub keep_minimized_across_jobs: bool,
     pub blocked_for_attention: bool,
@@ -6248,12 +6266,18 @@ pub struct FileTransferQueueState {
 impl FileTransferQueueState {
     #[must_use]
     pub fn queued_summaries(&self) -> Vec<tui_file_picker::QueuedFileTaskSummary> {
-        self.queued.iter().map(QueuedFileTransfer::summary).collect()
+        self.queued
+            .iter()
+            .chain(self.recovery_queued.iter())
+            .map(QueuedFileTransfer::summary)
+            .collect()
     }
 
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.active_session_id.is_some() || !self.queued.is_empty()
+        self.active_session_id.is_some()
+            || !self.queued.is_empty()
+            || !self.recovery_queued.is_empty()
     }
 }
 
@@ -10753,6 +10777,7 @@ mod keychain_state_retry_tests {
 
     #[test]
     fn failed_load_is_retried_and_recovers_after_backend_unlock() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let mut state = KeychainState::default();
         let first = state.ensure_loaded_with(|| Err("secret service is locked".to_string()));
 
@@ -11372,6 +11397,15 @@ pub struct AppState {
     /// Serial Browse transfer scheduler plus per-session reconciliation state.
     pub file_transfers: FileTransferQueueState,
 
+    /// Host-managed artwork-picker paste jobs keyed by file-task session id.
+    /// These use the same worker/admission path as Browse but reconcile their
+    /// logical clipboard and selection back into the embedded picker.
+    pub artwork_picker_file_tasks: BTreeMap<u64, ArtworkPickerFileTask>,
+
+    /// Exact durable retry authority retained by the hosted worker for an
+    /// incomplete artwork-picker cut/paste, keyed by picker session id.
+    pub artwork_picker_paste_retries: BTreeMap<u64, crate::tui::browse::BrowsePasteRetryPlan>,
+
     /// Overlay displaced by the explicit queued-transfer loss confirmation.
     /// Cancelling quit restores it byte-for-byte, including a live transfer's
     /// control sender and any conflict state.
@@ -11982,7 +12016,9 @@ struct OpenedAppDatabase {
     owned_database_dir: AppOwnedDatabaseDir,
 }
 
-fn open_app_startup_database(startup_options: &AppStartupOptions) -> OpenedAppDatabase {
+fn open_app_startup_database(
+    startup_options: &AppStartupOptions,
+) -> Result<OpenedAppDatabase, String> {
     let opened = match &startup_options.database_source {
         AppDatabaseSource::Production => crate::db::Database::open()
             .map(|db| OpenedAppDatabase { db, owned_database_dir: AppOwnedDatabaseDir::none() }),
@@ -11993,22 +12029,9 @@ fn open_app_startup_database(startup_options: &AppStartupOptions) -> OpenedAppDa
         AppDatabaseSource::IsolatedTempFile => open_isolated_app_database(),
     };
 
-    match opened {
-        Ok(opened) => {
-            opened.db.prune_search_tag_cache(30);
-            opened
-        }
-        Err(err) => {
-            log::warn!("failed to open SQLite database ({err}); falling back to in-memory DB");
-            let db = crate::db::Database::open_memory().unwrap_or_else(|memory_err| {
-                panic!("failed to open fallback in-memory SQLite database: {memory_err}")
-            });
-            OpenedAppDatabase {
-                db,
-                owned_database_dir: AppOwnedDatabaseDir::none(),
-            }
-        }
-    }
+    let opened = opened?;
+    opened.db.prune_search_tag_cache(30);
+    Ok(opened)
 }
 
 fn open_isolated_app_database() -> Result<OpenedAppDatabase, String> {
@@ -12093,20 +12116,39 @@ fn app_state_default_startup_options() -> AppStartupOptions {
 
 impl AppState {
     pub fn new(config: TonepoetConfig) -> Self {
-        Self::new_with_startup_options(config, app_state_default_startup_options())
+        Self::try_new(config).unwrap_or_else(|error| {
+            panic!("failed to construct AppState with the default startup database: {error}")
+        })
+    }
+
+    /// Fallible production constructor. The normal TUI uses this before
+    /// entering raw/alternate-screen mode so a v24 activation refusal (or any
+    /// other production database-open failure) cannot be converted into an
+    /// unrelated in-memory mutation domain.
+    pub fn try_new(config: TonepoetConfig) -> Result<Self, String> {
+        Self::try_new_with_startup_options(config, app_state_default_startup_options())
     }
 
     pub fn new_with_startup_options(
         config: TonepoetConfig,
         startup_options: AppStartupOptions,
     ) -> Self {
-        let opened = open_app_startup_database(&startup_options);
-        Self::new_with_open_database(
+        Self::try_new_with_startup_options(config, startup_options).unwrap_or_else(|error| {
+            panic!("failed to construct AppState with the requested startup database: {error}")
+        })
+    }
+
+    pub fn try_new_with_startup_options(
+        config: TonepoetConfig,
+        startup_options: AppStartupOptions,
+    ) -> Result<Self, String> {
+        let opened = open_app_startup_database(&startup_options)?;
+        Ok(Self::new_with_open_database(
             config,
             startup_options,
             opened.db,
             opened.owned_database_dir,
-        )
+        ))
     }
 
     /// Construct AppState with an already-open database. This is the most direct
@@ -12413,7 +12455,7 @@ impl AppState {
                         // producer violates that contract.
                         continue;
                     };
-                    file_transfers.queued.push_back(QueuedFileTransfer {
+                    file_transfers.recovery_queued.push_back(QueuedFileTransfer {
                         queue_id: next_file_transfer_queue_id(),
                         clipboard: recovery.clipboard,
                         clipboard_owner_generation: (index == 0)
@@ -12433,7 +12475,7 @@ impl AppState {
                     )
                 };
                 let recovery_status = format!(
-                    "file-operation recovery: {} interrupted job(s); queued {} exact journal reconciliation job(s), newest first ({} deferred temp artifact(s), {} source quarantine(s)); journals remain authoritative{}",
+                    "file-operation recovery: {} interrupted job(s); {} exact journal reconciliation job(s) await explicit review (use :recovery-resume [id] or :recovery-defer [id]); {} deferred temp artifact(s), {} source quarantine(s); journals remain authoritative{}",
                     total_pending_jobs,
                     queued_recoveries,
                     total_temp,
@@ -12508,6 +12550,8 @@ impl AppState {
             minimized_file_task_progress: None,
             file_task_preempted_overlay: None,
             file_transfers,
+            artwork_picker_file_tasks: BTreeMap::new(),
+            artwork_picker_paste_retries: BTreeMap::new(),
             queued_quit_preempted_overlay: None,
             quit_with_queued_file_transfers_confirmed: false,
             file_operation_undo: FileOperationUndoJournal::default(),
@@ -13258,9 +13302,14 @@ impl AppState {
             .filter(|item| matches!(&item.status, crate::convert::ConversionStatus::Queued))
             .map(|item| (item.id.clone(), item.queued_at.clone()))
             .collect::<std::collections::HashMap<_, _>>();
-        if ready_items.is_empty() || !self.config.conversion.persist_queue {
+        if ready_items.is_empty() {
             return Ok(ready_items);
         }
+        // Even when the user disables persistence of idle/pending queue rows,
+        // an about-to-run mutation needs a durable crash fence. These
+        // Interrupted rows are transient execution-safety state;
+        // `persist_queue_state` removes non-active rows again when ordinary
+        // queue persistence is disabled.
 
         let mut durable_items = q
             .all_items()
@@ -13295,17 +13344,30 @@ impl AppState {
     /// succeed before proceeding. Ordinary UI mutations use `save_queue`,
     /// which reports degradation without changing their existing call shape.
     pub(crate) fn persist_queue_state(&self) -> Result<(), String> {
-        if !self.config.conversion.persist_queue {
-            return Ok(());
-        }
-
         let report = {
             let q = self
                 .manager
                 .queue
                 .try_read()
                 .map_err(|_| "queue is busy".to_string())?;
-            let items: Vec<&crate::convert::ConversionItem> = q.all_items();
+            let all_items = q.all_items();
+            let items: Vec<&crate::convert::ConversionItem> = if self.config.conversion.persist_queue {
+                all_items
+            } else {
+                // Queue persistence preference controls idle intent, not the
+                // crash-safety protocol. Keep only unresolved active/recovery
+                // rows; terminal and never-started rows are deleted by this
+                // same scoped transaction after their execution authority is
+                // no longer needed.
+                all_items
+                    .into_iter()
+                    .filter(|item| matches!(
+                        item.status,
+                        crate::convert::ConversionStatus::Processing { .. }
+                            | crate::convert::ConversionStatus::Interrupted
+                    ))
+                    .collect()
+            };
             self.db.sync_queue(&items)?
         };
 
@@ -15435,6 +15497,49 @@ mod app_startup_options_tests {
             "explicit file-backed test DB should persist across AppState instances"
         );
     }
+
+    #[test]
+    fn quiescent_v23_startup_activates_v24_without_in_memory_fallback_or_env_gate() {
+        let _serial = crate::tui::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db_path = temp.path().join("tonepoet.db");
+        let journals = temp.path().join("journals");
+        std::fs::create_dir_all(&journals).expect("journal dir");
+        let prior_journal = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", &journals);
+        // Build a complete current schema first, then reconstruct the v23
+        // queue authority exactly enough to exercise the real v23 -> v24
+        // activation boundary rather than relying on a version-only stub.
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        drop(crate::db::Database::open_path(&db_path).expect("initialize current database"));
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open database for v23 fixture");
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP VIEW conversion_queue;
+                 DROP TABLE conversion_queue_v24;
+                 DROP TABLE conversion_queue_executions;
+                 DROP TABLE conversion_queue_scopes;
+                 DROP TABLE concurrency_protocol_epoch;
+                 ALTER TABLE conversion_queue_v23_frozen RENAME TO conversion_queue;
+                 PRAGMA user_version = 23;",
+            )
+            .expect("reconstruct complete v23 fixture");
+        }
+        let options = AppStartupOptions::default().with_database_path(&db_path);
+        let app = AppState::try_new_with_startup_options(TonepoetConfig::default(), options)
+            .expect("quiescent v23 startup should activate v24 without external confirmation");
+        drop(app);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen activated v24 db");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read activated schema version");
+        assert_eq!(version, 24, "quiescent startup must durably activate v24");
+        match prior_journal {
+            Some(value) => std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", value),
+            None => std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -15443,6 +15548,7 @@ mod queue_persistence_boundary_tests {
 
     #[test]
     fn run_acquisition_is_durable_as_interrupted_without_mutating_live_queued_state() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         // new_for_test disables persist_queue (to avoid the legacy real-JSON
         // fallback), but this test exercises the durable acquisition write,
         // which is gated on persist_queue. The database is an isolated temp DB

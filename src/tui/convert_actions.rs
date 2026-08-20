@@ -629,6 +629,27 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
 
+    let execution_coordinator = match app.db.queue_execution_coordinator() {
+        Ok(coordinator) => Some(coordinator),
+        Err(error) => {
+            #[cfg(test)]
+            {
+                log::debug!(
+                    "test conversion run continuing without file-backed execution coordinator: {error}"
+                );
+                None
+            }
+            #[cfg(not(test))]
+            {
+                log::error!(
+                    "conversion run not started because execution coordination failed: {error}"
+                );
+                app.set_status(format!("Conversion not started: {error}"));
+                return;
+            }
+        }
+    };
+
     app.processing_active = true;
     let cancel_token = app
         .manager
@@ -647,6 +668,11 @@ pub fn start_processing(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     tokio::spawn(async move {
         let mut processor = crate::convert::ConversionProcessor::new(processor_config);
         processor.set_cancel_token(cancel_token);
+        if let Some(coordinator) = execution_coordinator {
+            processor.set_execution_acquisition_hook(move |item_id| {
+                coordinator.begin_processing(item_id)
+            });
+        }
 
         // Bridge progress broadcasts and lifecycle events to the TUI event loop.
         let (progress_tx, progress_rx) = tokio::sync::broadcast::channel::<ProgressUpdate>(256);

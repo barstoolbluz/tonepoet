@@ -19,6 +19,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+
+use crate::concurrency::{ClaimMode, ClaimScope, LeaseFamily, MutationClaimGuard, OwnerProcessIdentity, PathClaim, PathResolutionSemantics, PersistentLease};
 
 use super::browse::{BrowseMoveRecoveryProof, BrowsePasteRetryPlan};
 
@@ -230,6 +233,15 @@ pub struct DurableFileTaskRecord {
     pub verification: tui_file_picker::VerificationMode,
     pub stall_timeout_secs: u64,
     pub mappings: Vec<tui_file_picker::PasteMapping>,
+    /// Filesystem-authoritative endpoints resolved when the operation first
+    /// entered the shared mutation registry. These are deliberately separate
+    /// from `mappings`, which remain the user's lexical/display/retry identity.
+    #[serde(default)]
+    pub admitted_mappings: Vec<tui_file_picker::PasteMapping>,
+    /// Resolved destination directory used for endpoint capture, root
+    /// creation, and later recovery without re-resolving a mutable alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_destination_root: Option<PathBuf>,
     pub job: serde_json::Value,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
     pub roots: Vec<tui_file_picker::FileTaskRootResult>,
@@ -250,9 +262,71 @@ pub struct DurableFileTaskRecord {
     pub native_rename_intents: Vec<DurableNativeRenameIntent>,
     pub last_status: Option<String>,
     pub abandoned_reason: Option<String>,
+    /// Strong origin identity for protocol-v2 ownership diagnostics and reboot/PID-reuse handling.
+    #[serde(default)]
+    pub origin_owner: Option<OwnerProcessIdentity>,
+    /// Final-family lease descriptor. Its family is also encoded in the pathname.
+    #[serde(default)]
+    pub lease_descriptor: Option<PathBuf>,
+    /// Fully resolved admission claims captured before registry acquisition.
+    #[serde(default)]
+    pub path_claims: Vec<PathClaim>,
+    /// Upgrade-only diagnostic link to an adopted v0.4.8 top-level journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_journal_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_job_id: Option<String>,
 }
 
 impl DurableFileTaskRecord {
+    pub fn admitted_mappings_for(
+        &self,
+        requested: &[tui_file_picker::PasteMapping],
+    ) -> Result<Vec<tui_file_picker::PasteMapping>, String> {
+        if self.mappings.len() != self.admitted_mappings.len() {
+            return Err(
+                "file-operation journal has no complete durable admitted mapping set"
+                    .to_string(),
+            );
+        }
+        requested
+            .iter()
+            .map(|mapping| {
+                self.mappings
+                    .iter()
+                    .position(|known| known == mapping)
+                    .and_then(|index| self.admitted_mappings.get(index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "file-operation journal has no admitted mapping for {} -> {}",
+                            mapping.source.display(),
+                            mapping.destination.display()
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub fn logical_source_for_admitted(&self, admitted: &Path) -> Option<PathBuf> {
+        self.admitted_mappings
+            .iter()
+            .position(|mapping| mapping.source == admitted)
+            .and_then(|index| self.mappings.get(index))
+            .map(|mapping| mapping.source.clone())
+            .or_else(|| {
+                self.admitted_mappings
+                    .is_empty()
+                    .then(|| {
+                        self.mappings
+                            .iter()
+                            .find(|mapping| mapping.source == admitted)
+                            .map(|mapping| mapping.source.clone())
+                    })
+                    .flatten()
+            })
+    }
+
     pub fn pending_mappings(&self) -> Vec<tui_file_picker::PasteMapping> {
         self.mappings
             .iter()
@@ -276,7 +350,19 @@ impl DurableFileTaskRecord {
         let quarantine_sources = self
             .quarantine_artifacts
             .iter()
-            .map(|artifact| artifact.original_source.clone())
+            .filter_map(|artifact| {
+                // Current helpers record admitted source paths, while older
+                // and synthetic/recovery journals may contain the logical
+                // source spelling. Accept either representation, but only
+                // when it maps to this journal's immutable mapping set.
+                self.logical_source_for_admitted(&artifact.original_source)
+                    .or_else(|| {
+                        self.mappings
+                            .iter()
+                            .find(|mapping| mapping.source == artifact.original_source)
+                            .map(|mapping| mapping.source.clone())
+                    })
+            })
             .collect::<std::collections::BTreeSet<_>>();
         self.mappings
             .iter()
@@ -385,12 +471,55 @@ impl DurableFileTaskJournalEntry {
     }
 }
 
+#[derive(Debug)]
+struct JournalRecoveryLease {
+    lease: Arc<PersistentLease>,
+}
+
+impl JournalRecoveryLease {
+    fn acquire(
+        path: &Path,
+        family: &LeaseFamily,
+        allow_local_handoff: bool,
+    ) -> Result<Self, String> {
+        let lease = if allow_local_handoff {
+            PersistentLease::acquire_existing_recovery_with_local_handoff(path, family)?
+        } else {
+            PersistentLease::acquire_existing_recovery(path, family)?
+        };
+        Ok(Self { lease: Arc::new(lease) })
+    }
+
+    fn holder(&self) -> Arc<PersistentLease> {
+        Arc::clone(&self.lease)
+    }
+}
+
+fn permits_same_process_recovery_handoff(
+    journal_path: &Path,
+    record: &DurableFileTaskRecord,
+) -> bool {
+    let root = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    if abandon_marker_path(root, &record.job_id, record.generation).exists() {
+        return true;
+    }
+    matches!(
+        record.lifecycle,
+        DurableFileTaskLifecycle::Cancelled
+            | DurableFileTaskLifecycle::Failed
+            | DurableFileTaskLifecycle::Completed
+            | DurableFileTaskLifecycle::AwaitingReconciliation
+            | DurableFileTaskLifecycle::Reconciled
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct FileTaskJournalHandle {
     path: PathBuf,
     abandon_marker: PathBuf,
     job_id: String,
     generation: u64,
+    lease: Option<Arc<PersistentLease>>,
 }
 
 impl FileTaskJournalHandle {
@@ -415,6 +544,11 @@ impl FileTaskJournalHandle {
         let path = root.join(format!("{job_id}.jsonl"));
         let abandon_marker = abandon_marker_path(&root, &job_id, generation);
         let now = unix_ms();
+        let FileTaskPathAdmission {
+            claims,
+            admitted_mappings,
+        } = file_task_path_admission(is_move, &mappings)?;
+        let admitted_destination_root = file_task_destination_root_from_job(&job, &mappings)?;
         let record = DurableFileTaskRecord {
             schema: FILE_TASK_JOURNAL_SCHEMA,
             job_id: job_id.clone(),
@@ -427,6 +561,8 @@ impl FileTaskJournalHandle {
             verification,
             stall_timeout_secs: stall_timeout_secs.max(1),
             mappings,
+            admitted_mappings,
+            admitted_destination_root: Some(admitted_destination_root),
             job,
             retry_plan,
             roots: Vec::new(),
@@ -438,13 +574,35 @@ impl FileTaskJournalHandle {
             native_rename_intents: Vec::new(),
             last_status: Some("planned".to_string()),
             abandoned_reason: None,
+            origin_owner: Some(OwnerProcessIdentity::current()),
+            lease_descriptor: None,
+            path_claims: Vec::new(),
+            legacy_journal_path: None,
+            legacy_job_id: None,
         };
-        create_record(&path, &record)?;
+        let job_uuid = uuid::Uuid::parse_str(&job_id)
+            .map_err(|error| format!("invalid file-operation job UUID {job_id}: {error}"))?;
+        let guard = MutationClaimGuard::acquire(
+            LeaseFamily::JournalOperation { job_id: job_uuid },
+            claims.clone(),
+        )?;
+        let lease = Arc::new(guard.into_lease());
+        let mut record = record;
+        record.path_claims = claims.clone();
+        record.lease_descriptor = Some(lease.descriptor_path().to_path_buf());
+        if let Err(error) = create_record(&path, &record) {
+            let descriptor = lease.descriptor_path().to_path_buf();
+            let family = lease.family().clone();
+            drop(lease);
+            let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family);
+            return Err(error);
+        }
         Ok(Self {
             path,
             abandon_marker,
             job_id,
             generation,
+            lease: Some(lease),
         })
     }
 
@@ -459,7 +617,20 @@ impl FileTaskJournalHandle {
         retry_plan: Option<BrowsePasteRetryPlan>,
         job: serde_json::Value,
     ) -> Result<Self, String> {
+        let previous = load_record(&path)?;
+        let job_uuid = uuid::Uuid::parse_str(&previous.job_id)
+            .map_err(|error| format!("invalid file-operation job UUID {}: {error}", previous.job_id))?;
+        let family = LeaseFamily::JournalOperation { job_id: job_uuid };
+        let descriptor_path = previous.lease_descriptor.clone()
+            .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten())
+            .ok_or_else(|| "legacy or incomplete file-operation journal has no protocol-v2 ownership descriptor; automatic recovery is refused".to_string())?;
+        let recovery = JournalRecoveryLease::acquire(
+            &descriptor_path,
+            &family,
+            permits_same_process_recovery_handoff(&path, &previous),
+        )?;
         let record = resume_record_locked(
+            &recovery,
             &path,
             generation,
             session_id,
@@ -477,6 +648,7 @@ impl FileTaskJournalHandle {
             abandon_marker,
             job_id: record.job_id,
             generation,
+            lease: Some(recovery.holder()),
         })
     }
 
@@ -489,8 +661,58 @@ impl FileTaskJournalHandle {
             abandon_marker,
             job_id: record.job_id,
             generation: record.generation,
+            lease: None,
         })
     }
+
+    #[cfg(unix)]
+    pub unsafe fn open_with_inherited_lease(path: PathBuf, lease_fd: std::os::fd::RawFd) -> Result<Self, String> {
+        let record = load_record(&path)?;
+        let job_uuid = uuid::Uuid::parse_str(&record.job_id)
+            .map_err(|error| format!("invalid file-operation job UUID {}: {error}", record.job_id))?;
+        let family = LeaseFamily::JournalOperation { job_id: job_uuid };
+        let descriptor_path = record.lease_descriptor.clone()
+            .ok_or_else(|| "file-operation journal is missing its ownership descriptor reference".to_string())?;
+        let lease = Arc::new(PersistentLease::from_inherited_fd(lease_fd, descriptor_path, family)?);
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        let abandon_marker = abandon_marker_path(root, &record.job_id, record.generation);
+        Ok(Self { path, abandon_marker, job_id: record.job_id, generation: record.generation, lease: Some(lease) })
+    }
+
+    #[cfg(unix)]
+    pub fn lease_fd(&self) -> Result<std::os::fd::RawFd, String> {
+        self.lease.as_ref().map(|lease| lease.inherited_fd())
+            .ok_or_else(|| "file-operation journal handle has no ownership lease".to_string())
+    }
+
+    /// Retire a journal and its durable descriptor only after a clean terminal
+    /// checkpoint and after all helper/supervisor holders have exited.
+    pub fn retire_terminal_clean(self) -> Result<bool, String> {
+        let record = self.load()?;
+        let clean = matches!(record.lifecycle, DurableFileTaskLifecycle::Completed | DurableFileTaskLifecycle::Reconciled)
+            && record.pending_mappings().is_empty()
+            && record.temp_artifacts.is_empty()
+            && record.quarantine_artifacts.is_empty()
+            && record.native_rename_intents.is_empty();
+        if !clean { return Ok(false); }
+        let job_id = uuid::Uuid::parse_str(&record.job_id)
+            .map_err(|e| format!("terminal journal has invalid job UUID: {e}"))?;
+        let descriptor = record.lease_descriptor.clone()
+            .or_else(|| crate::concurrency::find_family_descriptor(&LeaseFamily::JournalOperation { job_id }).ok().flatten());
+        fs::remove_file(&self.path)
+            .map_err(|e| format!("remove terminal file-operation journal {}: {e}", self.path.display()))?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent).and_then(|dir| dir.sync_all())
+                .map_err(|e| format!("sync terminal journal directory {}: {e}", parent.display()))?;
+        }
+        let family = LeaseFamily::JournalOperation { job_id };
+        drop(self);
+        if let Some(descriptor) = descriptor {
+            crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)?;
+        }
+        Ok(true)
+    }
+
 
     pub fn path(&self) -> &Path {
         &self.path
@@ -1158,7 +1380,173 @@ fn apply_journal_entry(
     Ok(())
 }
 
+
+#[derive(Debug, Clone)]
+pub struct LegacyFileTaskJournalInventoryEntry {
+    pub journal_path: PathBuf,
+    pub record: Option<DurableFileTaskRecord>,
+    pub terminal_clean: bool,
+    pub classification_error: Option<String>,
+}
+
+/// Scan only the top-level v0.4.8 namespace. Protocol-v2 journals below `v2/`
+/// remain invisible to old binaries and are intentionally excluded here.
+pub fn legacy_journal_inventory() -> Vec<LegacyFileTaskJournalInventoryEntry> {
+    let root = file_task_journal_base_dir();
+    let Ok(entries) = fs::read_dir(&root) else { return Vec::new() };
+    let mut inventory = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.parent() == Some(root.as_path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|journal_path| match load_record(&journal_path) {
+            Ok(record) => {
+                let terminal_clean = !record.needs_reconciliation();
+                Some(LegacyFileTaskJournalInventoryEntry {
+                    journal_path,
+                    record: Some(record),
+                    terminal_clean,
+                    classification_error: None,
+                })
+            }
+            Err(error) => {
+                // An unreadable top-level journal is ambiguous, not terminal.
+                log::warn!("cannot classify legacy file-operation journal {}: {error}", journal_path.display());
+                Some(LegacyFileTaskJournalInventoryEntry {
+                    journal_path,
+                    record: None,
+                    terminal_clean: false,
+                    classification_error: Some(error),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    inventory.sort_by(|left, right| left.journal_path.cmp(&right.journal_path));
+    inventory
+}
+
+pub fn nonterminal_legacy_journals() -> Vec<LegacyFileTaskJournalInventoryEntry> {
+    legacy_journal_inventory()
+        .into_iter()
+        .filter(|entry| !entry.terminal_clean)
+        .collect()
+}
+
+/// Explicitly convert one ownerless v0.4.8 nonterminal journal into the v2
+/// recovery model. This never resumes work. The new final-family descriptor and
+/// v2 snapshot are durable before the top-level legacy file leaves the old
+/// scanner namespace; dropping the local holder then leaves RecoveryReserved
+/// authority for the ordinary explicit recovery review.
+pub fn adopt_legacy_journal(journal_path: &Path) -> Result<PathBuf, String> {
+    // Invoking the dedicated adoption API/CLI is itself the explicit operator
+    // action. Safety comes from proving that no observable peer can still own
+    // v0.4.8 mutation state, not from a second environment-variable ritual.
+    let peer_signals = crate::db::observable_tonepoet_peer_processes();
+    if !peer_signals.is_empty() {
+        return Err(format!(
+            "legacy file-operation adoption is blocked while another tonepoet process is observable: {}",
+            peer_signals.join("; ")
+        ));
+    }
+    let root = file_task_journal_base_dir();
+    let parent = journal_path.parent().ok_or_else(|| "legacy journal has no parent".to_string())?;
+    if parent != root || journal_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return Err(format!(
+            "legacy adoption accepts only top-level file-operation journals under {}",
+            root.display()
+        ));
+    }
+    let mut record = load_record(journal_path)?;
+    if !record.needs_reconciliation() {
+        return Err(format!(
+            "legacy journal {} is terminal-clean and does not require adoption",
+            journal_path.display()
+        ));
+    }
+
+    // Idempotent retry after a v2 snapshot became durable but before the legacy
+    // rename completed: locate the snapshot by its diagnostic origin link.
+    if let Ok(entries) = fs::read_dir(file_task_journal_dir()) {
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") { continue; }
+            if let Ok(existing) = load_record(&path) {
+                if existing.legacy_journal_path.as_deref() == Some(journal_path) {
+                    archive_adopted_legacy_journal(journal_path)?;
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    let legacy_job_id = record.job_id.clone();
+    let job_id = uuid::Uuid::new_v4();
+    let FileTaskPathAdmission {
+        claims,
+        admitted_mappings,
+    } = file_task_path_admission(record.is_move, &record.mappings)?;
+    let admitted_destination_root = file_task_destination_root_from_job(&record.job, &record.mappings)?;
+    let guard = MutationClaimGuard::acquire_legacy_journal_adoption(
+        LeaseFamily::JournalOperation { job_id },
+        claims.clone(),
+        journal_path,
+    )?;
+    let descriptor_path = guard.lease().descriptor_path().to_path_buf();
+    let v2_root = file_task_journal_dir();
+    fs::create_dir_all(&v2_root)
+        .map_err(|error| format!("create protocol-v2 journal directory {}: {error}", v2_root.display()))?;
+    let v2_path = v2_root.join(format!("{job_id}.jsonl"));
+    record.schema = FILE_TASK_JOURNAL_SCHEMA;
+    record.job_id = job_id.to_string();
+    record.origin_owner = Some(OwnerProcessIdentity::current());
+    record.lease_descriptor = Some(descriptor_path);
+    record.path_claims = claims;
+    record.admitted_mappings = admitted_mappings;
+    record.admitted_destination_root = Some(admitted_destination_root);
+    record.legacy_journal_path = Some(journal_path.to_path_buf());
+    record.legacy_job_id = Some(legacy_job_id);
+    record.updated_unix_ms = unix_ms();
+    create_record(&v2_path, &record)?;
+    archive_adopted_legacy_journal(journal_path)?;
+    drop(guard);
+    Ok(v2_path)
+}
+
+fn archive_adopted_legacy_journal(journal_path: &Path) -> Result<(), String> {
+    if !journal_path.exists() { return Ok(()) }
+    let root = file_task_journal_base_dir();
+    let archive = root.join("legacy-adopted");
+    fs::create_dir_all(&archive)
+        .map_err(|error| format!("create legacy adoption archive {}: {error}", archive.display()))?;
+    let name = journal_path.file_name().ok_or_else(|| "legacy journal has no filename".to_string())?;
+    let mut destination = archive.join(name);
+    if destination.exists() {
+        destination = archive.join(format!("{}-{}", unix_ms(), name.to_string_lossy()));
+    }
+    fs::rename(journal_path, &destination).map_err(|error| format!(
+        "move adopted legacy journal {} out of v0.4.8 scanner namespace: {error}",
+        journal_path.display()
+    ))?;
+    sync_directory_best_effort(&root);
+    sync_directory_best_effort(&archive);
+    Ok(())
+}
+
+pub fn cleanup_setup_orphan_journal_descriptors() {
+    let probe = LeaseFamily::JournalOperation { job_id: uuid::Uuid::nil() };
+    let Ok(hints) = crate::concurrency::lifecycle_descriptor_hints(&probe) else { return };
+    let journal_root = file_task_journal_dir();
+    for (job_id, descriptor) in hints {
+        let journal = journal_root.join(format!("{job_id}.jsonl"));
+        if journal.exists() { continue; }
+        let family = LeaseFamily::JournalOperation { job_id };
+        // Absence of the final journal pathname proves only setup never committed;
+        // live holders still veto retirement inside the lifecycle helper.
+        let _ = crate::concurrency::retire_setup_orphan_by_path_identity(&descriptor, &family);
+    }
+}
+
 pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
+    cleanup_setup_orphan_journal_descriptors();
     let root = file_task_journal_dir();
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();
@@ -1168,16 +1556,66 @@ pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|path| match load_record(&path) {
-            Ok(record) => Some((path, record)),
+            Ok(record) if record.needs_reconciliation() => {
+                let Ok(job_id) = uuid::Uuid::parse_str(&record.job_id) else {
+                    log::warn!("legacy file-operation journal {} has no protocol-v2 UUID; automatic recovery is disabled", path.display());
+                    return None;
+                };
+                let family = LeaseFamily::JournalOperation { job_id };
+                let descriptor = record.lease_descriptor.clone()
+                    .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
+                let descriptor = match descriptor {
+                    Some(descriptor) => descriptor,
+                    None => {
+                        let current = OwnerProcessIdentity::current();
+                        let prior_boot = record.origin_owner
+                            .map(|owner| owner.boot_id_hash != 0 && current.boot_id_hash != 0 && owner.boot_id_hash != current.boot_id_hash)
+                            .unwrap_or(false);
+                        if prior_boot && !record.path_claims.is_empty() {
+                            match MutationClaimGuard::acquire(family.clone(), record.path_claims.clone()) {
+                                Ok(guard) => {
+                                    let descriptor = guard.lease().descriptor_path().to_path_buf();
+                                    drop(guard); // final-family descriptor remains RecoveryReserved
+                                    descriptor
+                                }
+                                Err(error) => {
+                                    log::warn!("could not reconstruct prior-boot recovery reservation for {}: {error}", path.display());
+                                    return None;
+                                }
+                            }
+                        } else {
+                            log::warn!("file-operation journal {} is missing its same-boot ownership descriptor; fail closed for manual recovery", path.display());
+                            return None;
+                        }
+                    }
+                };
+                let availability = if permits_same_process_recovery_handoff(&path, &record) {
+                    crate::concurrency::descriptor_recovery_availability_with_local_handoff(&descriptor)
+                } else {
+                    crate::concurrency::descriptor_availability(&descriptor)
+                };
+                match availability {
+                    Ok((_family, crate::concurrency::ClaimAvailability::Live)) => {
+                        log::debug!("file-operation journal {} remains live-owned; omit from recovery", path.display());
+                        None
+                    }
+                    Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved)) => Some((path, record)),
+                    Ok((_family, crate::concurrency::ClaimAvailability::ReclaimableEphemeral)) => {
+                        log::warn!("file-operation journal {} referenced a non-durable descriptor family; fail closed", path.display());
+                        None
+                    }
+                    Err(error) => {
+                        log::warn!("could not classify file-operation ownership for {}: {error}", path.display());
+                        None
+                    }
+                }
+            }
+            Ok(_) => None,
             Err(error) => {
-                log::warn!(
-                    "ignoring unreadable file-operation journal {}: {error}",
-                    path.display()
-                );
+                log::warn!("ignoring unreadable file-operation journal {}: {error}", path.display());
                 None
             }
         })
-        .filter(|(_, record)| record.needs_reconciliation())
         .collect::<Vec<_>>();
     pending.sort_by_key(|(_, record)| record.updated_unix_ms);
     pending
@@ -1306,14 +1744,175 @@ pub(crate) fn test_environment_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub fn file_task_journal_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR") {
-        return PathBuf::from(path);
+pub(crate) struct FileTaskPathAdmission {
+    pub(crate) claims: Vec<PathClaim>,
+    pub(crate) admitted_mappings: Vec<tui_file_picker::PasteMapping>,
+}
+
+pub(crate) fn file_task_path_admission(
+    is_move: bool,
+    mappings: &[tui_file_picker::PasteMapping],
+) -> Result<FileTaskPathAdmission, String> {
+    let mut claims = Vec::with_capacity(mappings.len() * 2);
+    let mut admitted_mappings = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let (source_semantics, scope) = match std::fs::symlink_metadata(&mapping.source) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                (PathResolutionSemantics::NamespaceObject, ClaimScope::Exact)
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                (PathResolutionSemantics::FollowReferent, ClaimScope::Subtree)
+            }
+            Ok(_) => (PathResolutionSemantics::FollowReferent, ClaimScope::Exact),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (PathResolutionSemantics::FollowReferent, ClaimScope::Subtree)
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect file-operation source {} before admission: {error}",
+                    mapping.source.display()
+                ))
+            }
+        };
+        let source_claim = PathClaim::resolve_with_semantics(
+            &mapping.source,
+            if is_move { ClaimMode::Write } else { ClaimMode::Read },
+            scope,
+            source_semantics,
+        )?;
+        // Root destinations are namespace entries. Intermediate aliases are
+        // followed and recorded as dependencies, while an existing final
+        // symlink remains the entry the copy/move conflict engine can replace.
+        let destination_claim = PathClaim::resolve_with_semantics(
+            &mapping.destination,
+            ClaimMode::Write,
+            scope,
+            PathResolutionSemantics::NamespaceObject,
+        )?;
+        admitted_mappings.push(tui_file_picker::PasteMapping {
+            source: source_claim.identity.resolved_io_path.clone(),
+            destination: destination_claim.identity.resolved_io_path.clone(),
+        });
+        claims.push(source_claim);
+        claims.push(destination_claim);
     }
-    crate::config::TonepoetConfig::config_path()
-        .parent()
-        .map(|parent| parent.join("file-operation-journal"))
-        .unwrap_or_else(|| PathBuf::from(".tonepoet-file-operation-journal"))
+    Ok(FileTaskPathAdmission {
+        claims,
+        admitted_mappings,
+    })
+}
+
+fn file_task_destination_root_from_job(
+    job: &serde_json::Value,
+    mappings: &[tui_file_picker::PasteMapping],
+) -> Result<PathBuf, String> {
+    let fallback = mappings
+        .first()
+        .and_then(|mapping| mapping.destination.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let destination = job
+        .get("dest")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new)
+        .unwrap_or(fallback);
+    Ok(crate::concurrency::ResolvedPathIdentity::resolve(destination)?
+        .resolved_io_path)
+}
+
+fn admitted_mappings_from_durable_claims(
+    mappings: &[tui_file_picker::PasteMapping],
+    claims: &[PathClaim],
+) -> Result<Vec<tui_file_picker::PasteMapping>, String> {
+    if claims.len() != mappings.len().saturating_mul(2) {
+        return Err(
+            "file-operation journal predates durable admitted mappings and its claim set cannot reconstruct them"
+                .to_string(),
+        );
+    }
+    let mut admitted = Vec::with_capacity(mappings.len());
+    for (index, pair) in claims.chunks_exact(2).enumerate() {
+        // Old protocol-v2 records that traversed an alias cannot prove whether
+        // the final source component was a symlink object or a followed
+        // referent. Refuse to manufacture a new meaning during recovery.
+        if pair.iter().any(|claim| {
+            claim.identity.namespace_path != claim.identity.resolved_io_path
+                && claim.identity.namespace_dependencies.is_empty()
+        }) {
+            return Err(format!(
+                "file-operation journal mapping {} predates durable alias-dependency/admitted-path semantics; explicit recovery cannot safely reinterpret its symlink binding",
+                index + 1
+            ));
+        }
+        admitted.push(tui_file_picker::PasteMapping {
+            source: pair[0].identity.resolved_io_path.clone(),
+            destination: pair[1].identity.resolved_io_path.clone(),
+        });
+    }
+    Ok(admitted)
+}
+
+fn admitted_destination_root_from_mappings(
+    job: &serde_json::Value,
+    logical: &[tui_file_picker::PasteMapping],
+    admitted: &[tui_file_picker::PasteMapping],
+) -> Result<PathBuf, String> {
+    let original_root = PathBuf::from(
+        job.get("dest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "serialized file-task job has no destination root".to_string())?,
+    );
+    for (logical_mapping, admitted_mapping) in logical.iter().zip(admitted) {
+        if let Ok(relative) = logical_mapping.destination.strip_prefix(&original_root) {
+            let mut root = admitted_mapping.destination.clone();
+            for _ in relative.components() {
+                if !root.pop() {
+                    break;
+                }
+            }
+            return Ok(root);
+        }
+    }
+    Err("file-operation journal cannot reconstruct its admitted destination root".to_string())
+}
+
+fn ensure_durable_admitted_file_task_state(
+    record: &mut DurableFileTaskRecord,
+) -> Result<(), String> {
+    if record.admitted_mappings.is_empty() {
+        record.admitted_mappings =
+            admitted_mappings_from_durable_claims(&record.mappings, &record.path_claims)?;
+    }
+    if record.admitted_mappings.len() != record.mappings.len() {
+        return Err(
+            "file-operation journal has a partial durable admitted mapping set".to_string(),
+        );
+    }
+    if record.admitted_destination_root.is_none() {
+        record.admitted_destination_root = Some(admitted_destination_root_from_mappings(
+            &record.job,
+            &record.mappings,
+            &record.admitted_mappings,
+        )?);
+    }
+    Ok(())
+}
+
+pub fn file_task_journal_base_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR") {
+        PathBuf::from(path)
+    } else {
+        crate::config::TonepoetConfig::config_path()
+            .parent()
+            .map(|parent| parent.join("file-operation-journal"))
+            .unwrap_or_else(|| PathBuf::from(".tonepoet-file-operation-journal"))
+    }
+}
+
+pub fn file_task_journal_dir() -> PathBuf {
+    // v0.4.8 scans only top-level *.jsonl. Protocol-v2 journals live below a
+    // subdirectory so an older concurrently-running binary cannot seize them.
+    file_task_journal_base_dir().join("v2")
 }
 
 fn abandon_marker_path(root: &Path, job_id: &str, generation: u64) -> PathBuf {
@@ -1366,6 +1965,7 @@ fn merge_resume_retry_plan(
 }
 
 fn resume_record_locked(
+    _recovery: &JournalRecoveryLease,
     path: &Path,
     generation: u64,
     session_id: u64,
@@ -1386,6 +1986,7 @@ fn resume_record_locked(
     let result = (|| {
         let (mut previous, valid_len) = scan_record_file(&mut file, path)?;
         repair_torn_tail(&mut file, path, valid_len)?;
+        ensure_durable_admitted_file_task_state(&mut previous)?;
         if generation <= previous.generation {
             return Err(format!(
                 "file-operation journal generation must increase (previous {}, requested {})",
@@ -1671,12 +2272,19 @@ fn sync_directory_best_effort(_path: &Path) {}
 mod tests {
     use super::*;
 
-    struct JournalDirGuard;
+    struct JournalDirGuard {
+        _concurrency: crate::concurrency::ScopedTestCoordinationRootGuard,
+    }
 
     impl JournalDirGuard {
         fn install(path: &Path) -> Self {
+            let concurrency = crate::concurrency::install_scoped_test_coordination_root(
+                &path.join("claims"),
+            );
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
-            Self
+            Self {
+                _concurrency: concurrency,
+            }
         }
     }
 
@@ -1702,6 +2310,192 @@ mod tests {
             recovery_by_source: std::collections::BTreeMap::new(),
             recovery_journal_path: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_task_admission_tracks_destination_alias_dependency_and_blocks_rebind() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _environment = JournalDirGuard::install(temp.path());
+        let source = temp.path().join("source.flac");
+        let real_a = temp.path().join("real-a");
+        let real_b = temp.path().join("real-b");
+        let alias = temp.path().join("alias");
+        fs::write(&source, b"audio").unwrap();
+        fs::create_dir_all(&real_a).unwrap();
+        fs::create_dir_all(&real_b).unwrap();
+        symlink(&real_a, &alias).unwrap();
+        let mapping = tui_file_picker::PasteMapping {
+            source: source.clone(),
+            destination: alias.join("new.flac"),
+        };
+
+        let admission = file_task_path_admission(false, std::slice::from_ref(&mapping)).unwrap();
+        assert_eq!(admission.admitted_mappings[0].destination, real_a.join("new.flac"));
+        assert_eq!(
+            admission.claims[1].identity.namespace_dependencies,
+            vec![alias.clone()]
+        );
+
+        let guard = MutationClaimGuard::acquire_ephemeral(admission.claims).unwrap();
+        let replacement = PathClaim::resolve_with_semantics(
+            &alias,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .unwrap();
+        let error = MutationClaimGuard::acquire_ephemeral(vec![replacement])
+            .expect_err("protocol-aware alias replacement must lose admission");
+        assert!(error.contains("live owner"));
+
+        let disjoint = PathClaim::resolve(
+            &real_b.join("other.flac"),
+            ClaimMode::Write,
+            ClaimScope::Exact,
+        )
+        .unwrap();
+        let disjoint_guard = MutationClaimGuard::acquire_ephemeral(vec![disjoint]).unwrap();
+        drop(disjoint_guard);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_task_destination_admission_preserves_symlink_then_parent_dir_semantics() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let library = temp.path().join("library");
+        let real = temp.path().join("real");
+        let album = real.join("Album");
+        let real_other = real.join("Other");
+        let lexical_other = library.join("Other");
+        let source = temp.path().join("source.flac");
+        fs::create_dir_all(&album).unwrap();
+        fs::create_dir_all(&real_other).unwrap();
+        fs::create_dir_all(&lexical_other).unwrap();
+        fs::write(&source, b"audio").unwrap();
+        let current = library.join("current");
+        symlink(&album, &current).unwrap();
+
+        let mapping = tui_file_picker::PasteMapping {
+            source,
+            destination: current.join("../Other/new.flac"),
+        };
+        let admission = file_task_path_admission(false, std::slice::from_ref(&mapping)).unwrap();
+        assert_eq!(
+            admission.admitted_mappings[0].destination,
+            real_other.join("new.flac")
+        );
+        assert_ne!(
+            admission.admitted_mappings[0].destination,
+            lexical_other.join("new.flac")
+        );
+        assert_eq!(
+            admission.claims[1].identity.namespace_dependencies,
+            vec![current]
+        );
+
+        fs::write(&admission.admitted_mappings[0].destination, b"copied").unwrap();
+        assert_eq!(fs::read(real_other.join("new.flac")).unwrap(), b"copied");
+        assert!(!lexical_other.join("new.flac").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_task_symlink_source_admission_protects_namespace_object_for_copy_and_move() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("referent.flac");
+        let source_link = temp.path().join("source-link.flac");
+        fs::write(&referent, b"audio").unwrap();
+        symlink(&referent, &source_link).unwrap();
+        let mapping = tui_file_picker::PasteMapping {
+            source: source_link.clone(),
+            destination: temp.path().join("copy-link.flac"),
+        };
+
+        for is_move in [false, true] {
+            let admission = file_task_path_admission(is_move, std::slice::from_ref(&mapping)).unwrap();
+            let source_claim = &admission.claims[0];
+            assert_eq!(source_claim.scope, ClaimScope::Exact);
+            assert_eq!(
+                source_claim.mode,
+                if is_move { ClaimMode::Write } else { ClaimMode::Read }
+            );
+            assert_eq!(admission.admitted_mappings[0].source, source_link);
+            assert_ne!(admission.admitted_mappings[0].source, referent.canonicalize().unwrap());
+            assert!(fs::symlink_metadata(&admission.admitted_mappings[0].source)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_file_task_reuses_durable_admitted_destination_after_alias_rebind() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _environment = JournalDirGuard::install(temp.path());
+        let source = temp.path().join("source.flac");
+        let real_a = temp.path().join("real-a");
+        let real_b = temp.path().join("real-b");
+        let alias = temp.path().join("alias");
+        fs::write(&source, b"audio").unwrap();
+        fs::create_dir_all(&real_a).unwrap();
+        fs::create_dir_all(&real_b).unwrap();
+        symlink(&real_a, &alias).unwrap();
+        let mapping = tui_file_picker::PasteMapping {
+            source,
+            destination: alias.join("new.flac"),
+        };
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let job = serde_json::json!({"dest": alias.to_string_lossy()});
+        let first = FileTaskJournalHandle::create(
+            job_id,
+            1,
+            11,
+            false,
+            tui_file_picker::VerificationMode::Standard,
+            8,
+            vec![mapping.clone()],
+            None,
+            job.clone(),
+        )
+        .unwrap();
+        let journal_path = first.path().to_path_buf();
+        let first_record = first.load().unwrap();
+        assert_eq!(first_record.admitted_mappings[0].destination, real_a.join("new.flac"));
+        drop(first);
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&real_b, &alias).unwrap();
+
+        let resumed = FileTaskJournalHandle::resume(
+            journal_path,
+            2,
+            12,
+            false,
+            tui_file_picker::VerificationMode::Standard,
+            8,
+            vec![mapping],
+            None,
+            job,
+        )
+        .unwrap();
+        let resumed_record = resumed.load().unwrap();
+        assert_eq!(resumed_record.admitted_mappings[0].destination, real_a.join("new.flac"));
+        assert_eq!(resumed_record.admitted_destination_root.as_deref(), Some(real_a.as_path()));
     }
 
     #[test]

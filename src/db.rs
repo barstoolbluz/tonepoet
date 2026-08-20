@@ -4,11 +4,11 @@
 //! WAL mode enabled for crash safety. Schema versioned via PRAGMA
 //! user_version with forward migrations on open.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 23;
+const CURRENT_VERSION: u32 = 24;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -90,6 +90,179 @@ const MB_SEARCH_CACHE_EVICT_TARGET: usize = (MB_SEARCH_CACHE_MAX_ROWS * 90) / 10
 /// Core database wrapper. Owns a single SQLite connection.
 pub struct Database {
     conn: Connection,
+    queue_scope: std::sync::OnceLock<QueueScopeRuntime>,
+    execution_leases: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::concurrency::PersistentLease>>>>,
+}
+
+struct QueueScopeRuntime {
+    scope_id: uuid::Uuid,
+    _lease: crate::concurrency::PersistentLease,
+}
+
+/// Thread-safe execution-start capability detached from the UI-owned SQLite
+/// connection. Each transition opens a short-lived connection, while the
+/// originating `Database` continues to own the queue-scope lease and shares
+/// the resulting QueueExecution lease map for later terminal retirement.
+#[derive(Clone)]
+pub struct QueueExecutionCoordinator {
+    database_path: PathBuf,
+    scope_id: uuid::Uuid,
+    execution_leases: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::concurrency::PersistentLease>>>>,
+    transition_lock: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+impl QueueExecutionCoordinator {
+    /// Atomically establish active execution authority for one already-persisted
+    /// queue item. The final-family descriptor is born before the Processing
+    /// commit; runtime routing is published only after that commit succeeds.
+    pub fn begin_processing(&self, item_id: &str) -> Result<(), String> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .map_err(|_| "queue execution transition lock poisoned".to_string())?;
+
+        if let Some(existing) = self
+            .execution_leases
+            .lock()
+            .map_err(|_| "conversion execution lease map poisoned".to_string())?
+            .get(item_id)
+            .cloned()
+        {
+            let execution_id = match existing.family() {
+                crate::concurrency::LeaseFamily::QueueExecution { execution_id } => *execution_id,
+                _ => return Err("internal execution lease family mismatch".to_string()),
+            };
+            crate::concurrency::register_runtime_execution(
+                item_id,
+                execution_id,
+                existing,
+                Some(self.database_path.clone()),
+            )?;
+            return Ok(());
+        }
+
+        // Descriptor creation uses the registry internally and completes before
+        // SQLite is opened/locked. No DB transaction is ever nested under the
+        // shared registry critical section.
+        let execution_id = uuid::Uuid::new_v4();
+        let lease = crate::concurrency::PersistentLease::create(
+            crate::concurrency::LeaseFamily::QueueExecution { execution_id },
+            &[],
+        )?;
+        let descriptor_path = lease.descriptor_path().to_string_lossy().into_owned();
+        let origin_identity = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
+            .map_err(|error| format!("serialize queue execution origin identity: {error}"))?;
+
+        let mut conn = Connection::open(&self.database_path)
+            .map_err(|error| format!("open queue execution database {}: {error}", self.database_path.display()))?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)
+            .map_err(|error| format!("set queue execution busy timeout: {error}"))?;
+
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("queue execution begin transaction: {error}"))?;
+        let row = tx
+            .query_row(
+                "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                params![self.scope_id.to_string(), item_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("queue execution load item '{item_id}': {error}"))?
+            .ok_or_else(|| format!("queue execution item '{item_id}' is not durably owned by this session"))?;
+        if let Some(existing_execution) = row.1 {
+            return Err(format!(
+                "queue execution item '{item_id}' already references execution {existing_execution} without a matching live coordinator lease"
+            ));
+        }
+
+        let mut persisted_item: crate::convert::ConversionItem = serde_json::from_str(&row.0)
+            .map_err(|error| format!("decode durable queue item '{item_id}' before execution: {error}"))?;
+        if !matches!(
+            persisted_item.status,
+            crate::convert::ConversionStatus::Queued | crate::convert::ConversionStatus::Interrupted
+        ) {
+            return Err(format!(
+                "queue execution item '{item_id}' has invalid pre-execution durable status {:?}",
+                persisted_item.status
+            ));
+        }
+        persisted_item.status = crate::convert::ConversionStatus::Processing {
+            progress: 0.0,
+            message: Some(format!("Starting conversion to {}", persisted_item.output_format)),
+            file_progress: None,
+            phase: Some(crate::convert::ConversionPhase::Extracting),
+            phase_progress: Some(0.0),
+        };
+        if persisted_item.started_at.is_none() {
+            persisted_item.started_at = Some(chrono::Utc::now());
+        }
+        persisted_item.completed_at = None;
+        let item_json = serde_json::to_string(&persisted_item)
+            .map_err(|error| format!("encode Processing queue item '{item_id}': {error}"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let changed = tx.execute(
+            "UPDATE conversion_queue_v24 SET item_json=?1, execution_id=?2 WHERE owner_scope=?3 AND id=?4 AND execution_id IS NULL",
+            params![item_json, execution_id.to_string(), self.scope_id.to_string(), item_id],
+        ).map_err(|error| format!("queue execution publish Processing row '{item_id}': {error}"))?;
+        if changed != 1 {
+            return Err(format!("queue execution row changed concurrently for '{item_id}'"));
+        }
+        tx.execute(
+            "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
+             VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)",
+            params![
+                execution_id.to_string(),
+                self.scope_id.to_string(),
+                item_id,
+                descriptor_path,
+                origin_identity,
+                now,
+            ],
+        ).map_err(|error| format!("queue execution insert '{item_id}': {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("queue execution commit '{item_id}': {error}"))?;
+
+        let lease = std::sync::Arc::new(lease);
+        self.execution_leases
+            .lock()
+            .map_err(|_| "conversion execution lease map poisoned".to_string())?
+            .insert(item_id.to_string(), std::sync::Arc::clone(&lease));
+        crate::concurrency::register_runtime_execution(
+            item_id,
+            execution_id,
+            lease,
+            Some(self.database_path.clone()),
+        )?;
+        Ok(())
+    }
+}
+
+struct DeadQueueRow {
+    id: String,
+    item_json: String,
+    position: i64,
+    execution_id: Option<String>,
+}
+
+struct DeadQueueScopeRecovery {
+    scope_id: uuid::Uuid,
+    scope_text: String,
+    scope_order: i64,
+    descriptor_path: PathBuf,
+    descriptor_reconstructed: bool,
+    recovery_lease: crate::concurrency::PersistentLease,
+    rows: Vec<DeadQueueRow>,
+}
+
+struct DeadExecutionRecovery {
+    execution_id: String,
+    descriptor_path: PathBuf,
+    descriptor_reconstructed: bool,
+    recoverable: bool,
+    recovery_lease: crate::concurrency::PersistentLease,
+    cleanup_requests: Vec<crate::convert::script_supervisor::ScriptRecoveryRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +393,34 @@ fn looks_like_test_archive_session_artifact(
     archive_is_tempfile_fixture || archive_is_missing_nix_shell_temp
 }
 
+pub fn observable_tonepoet_peer_processes() -> Vec<String> {
+    let mut signals = Vec::new();
+    #[cfg(unix)]
+    {
+        // A Cargo harness must be hermetic with respect to a developer's live
+        // TUI and sibling test binaries. Production activation retains the
+        // conservative peer check below.
+        if crate::concurrency::running_under_cargo_test_harness() {
+            return signals;
+        }
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.filter_map(Result::ok) {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue; };
+                if pid == std::process::id() { continue; }
+                let exe = entry.path().join("exe");
+                let Ok(target) = std::fs::read_link(&exe) else { continue; };
+                let name = target.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+                if name == "tonepoet" || name.starts_with("tonepoet-") {
+                    signals.push(format!("another tonepoet executable is running as PID {pid}"));
+                }
+            }
+        }
+    }
+    signals.sort();
+    signals.dedup();
+    signals
+}
+
 impl Database {
     /// Open (or create) the production database, run migrations, and enable the
     /// same durability/performance pragmas used by ordinary application starts.
@@ -264,7 +465,7 @@ impl Database {
                 .map_err(|e| format!("busy_timeout pragma failed: {}", e))?;
             if Self::file_backed_database_is_initialized(&conn)? {
                 Self::configure_file_backed_connection(&conn)?;
-                return Ok(Self { conn });
+                return Ok(Self { conn, queue_scope: std::sync::OnceLock::new(), execution_leases: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) });
             }
         }
         drop(shared_init);
@@ -435,7 +636,7 @@ impl Database {
             }
         }
 
-        let mut db = Self { conn };
+        let mut db = Self { conn, queue_scope: std::sync::OnceLock::new(), execution_leases: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) };
         db.migrate()?;
         Ok(db)
     }
@@ -446,6 +647,7 @@ impl Database {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("read user_version: {}", e))?;
+        let initial_version = version;
 
         if version > CURRENT_VERSION {
             return Err(format!(
@@ -547,8 +749,100 @@ impl Database {
         }
         if version < 23 {
             self.run_migration_step(23, Self::migrate_v23)?;
+            version = 23;
+        }
+        if version < 24 {
+            let _upgrade_lock = if initial_version == 23 {
+                self.acquire_v24_upgrade_lock()?
+            } else {
+                None
+            };
+            self.require_v24_activation_confirmation(initial_version)?;
+            self.run_migration_step(24, Self::migrate_v24)?;
         }
 
+        Ok(())
+    }
+
+    fn acquire_v24_upgrade_lock(&self) -> Result<Option<DatabaseOpenInitFileLock>, String> {
+        let path: String = self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0)
+        ).map_err(|e| format!("resolve database path for v24 activation lock: {e}"))?;
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let db = PathBuf::from(path);
+        let lock_path = db.with_file_name("concurrency-protocol-upgrade.lock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&lock_path)
+            .map_err(|e| format!("open concurrency protocol upgrade lock {}: {e}", lock_path.display()))?;
+        let started = std::time::Instant::now();
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Some(DatabaseOpenInitFileLock(file))),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if Self::is_file_lock_contention(&error) => {
+                    if started.elapsed() >= DB_OPEN_INIT_LOCK_WAIT_LIMIT {
+                        return Err(format!("timed out waiting for concurrency protocol activation lock {}", lock_path.display()));
+                    }
+                    std::thread::sleep(DB_OPEN_INIT_LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(format!("lock concurrency protocol activation {}: {error}", lock_path.display())),
+            }
+        }
+    }
+
+    fn observable_legacy_live_signals(&self) -> Result<Vec<String>, String> {
+        let mut signals = Vec::new();
+        let processing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conversion_queue WHERE item_json LIKE '%\"Processing\"%' OR item_json LIKE '%\"processing\"%'",
+            [], |row| row.get(0)
+        ).unwrap_or(0);
+        if processing > 0 {
+            signals.push(format!("legacy conversion queue contains {processing} Processing row(s)"));
+        }
+
+        let legacy = crate::tui::file_task_runtime::nonterminal_legacy_journals();
+        if !legacy.is_empty() {
+            let ambiguous = legacy.iter().filter(|entry| entry.classification_error.is_some()).count();
+            let nonterminal = legacy.len().saturating_sub(ambiguous);
+            signals.push(format!(
+                "legacy top-level file-operation journal ambiguity: {nonterminal} nonterminal, {ambiguous} unreadable/unclassifiable"
+            ));
+        }
+
+        signals.extend(observable_tonepoet_peer_processes());
+        signals.sort();
+        signals.dedup();
+        Ok(signals)
+    }
+
+    fn require_v24_activation_confirmation(&self, initial_version: u32) -> Result<(), String> {
+        // A brand-new database has no pre-protocol process that can already be
+        // mutating its state. Only an already-v23 database crosses the mixed-
+        // version compatibility boundary.
+        if initial_version != 23 {
+            return Ok(());
+        }
+        let before = self.observable_legacy_live_signals()?;
+        if !before.is_empty() {
+            return Err(format!(
+                "concurrency protocol v24 activation is blocked until older sessions/work are resolved: {}",
+                before.join("; ")
+            ));
+        }
+        // The serialized activation lock plus the live-signal probes are the
+        // authority boundary. Requiring a separate environment acknowledgement
+        // here makes a demonstrably quiescent, ordinary single-session upgrade
+        // unusable without adding safety: an acknowledgement cannot prevent a
+        // peer from appearing after it is supplied. Recheck under the same
+        // activation lock immediately before crossing the schema boundary.
+        let after = self.observable_legacy_live_signals()?;
+        if !after.is_empty() {
+            return Err(format!(
+                "concurrency protocol v24 activation recheck found legacy-live ambiguity: {}",
+                after.join("; ")
+            ));
+        }
         Ok(())
     }
 
@@ -1516,6 +1810,57 @@ impl Database {
         Ok(())
     }
 
+    /// v24: scoped concurrent queue authority. The v23 table is frozen and
+    /// the historical name becomes a read-only view so already-open old SQL
+    /// cannot delete or overwrite scoped rows.
+    fn migrate_v24(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "ALTER TABLE conversion_queue RENAME TO conversion_queue_v23_frozen;
+             CREATE VIEW conversion_queue AS
+                 SELECT id, item_json, position FROM conversion_queue_v23_frozen;
+             CREATE TABLE conversion_queue_scopes (
+                 scope_order     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 scope_uuid      TEXT NOT NULL UNIQUE,
+                 descriptor_path TEXT NOT NULL,
+                 origin_identity TEXT NOT NULL,
+                 created_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE conversion_queue_v24 (
+                 owner_scope  TEXT NOT NULL,
+                 id           TEXT NOT NULL UNIQUE,
+                 item_json    TEXT NOT NULL,
+                 position     INTEGER NOT NULL,
+                 execution_id TEXT,
+                 PRIMARY KEY(owner_scope, id),
+                 FOREIGN KEY(owner_scope) REFERENCES conversion_queue_scopes(scope_uuid) ON DELETE CASCADE
+             );
+             CREATE INDEX conversion_queue_v24_scope_position
+                 ON conversion_queue_v24(owner_scope, position);
+             CREATE TABLE conversion_queue_executions (
+                 execution_id      TEXT PRIMARY KEY,
+                 owner_scope       TEXT NOT NULL,
+                 item_id           TEXT NOT NULL UNIQUE,
+                 descriptor_path   TEXT NOT NULL,
+                 origin_identity   TEXT NOT NULL,
+                 state             TEXT NOT NULL CHECK(state IN ('provisioned','processing','interrupted','terminal','manual_recovery')),
+                 external_released INTEGER NOT NULL DEFAULT 0 CHECK(external_released IN (0,1)),
+                 containment_json  TEXT,
+                 created_unix_ms   INTEGER NOT NULL,
+                 updated_unix_ms   INTEGER NOT NULL,
+                 FOREIGN KEY(owner_scope) REFERENCES conversion_queue_scopes(scope_uuid)
+             );
+             CREATE TABLE IF NOT EXISTS concurrency_protocol_epoch (
+                 id INTEGER PRIMARY KEY CHECK(id=1),
+                 protocol_version INTEGER NOT NULL,
+                 activated_unix_ms INTEGER NOT NULL,
+                 legacy_queue_adopted INTEGER NOT NULL DEFAULT 0 CHECK(legacy_queue_adopted IN (0,1))
+             );
+             INSERT OR REPLACE INTO concurrency_protocol_epoch(id, protocol_version, activated_unix_ms, legacy_queue_adopted)
+                 VALUES(1, 24, CAST(strftime('%s','now') AS INTEGER) * 1000, 0);"
+        ).map_err(|e| format!("v24 migration failed: {e}"))?;
+        Ok(())
+    }
+
     /// Look up cached AR results for a file. Returns None if not cached
     /// or stale (mtime/size changed).
     pub fn get_cached_ar(
@@ -2233,14 +2578,10 @@ impl Database {
             .collect::<Vec<_>>();
 
         for item in &mut persisted_items {
-            if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
-                item.status = crate::convert::ConversionStatus::Interrupted;
-                item.started_at = None;
-                item.completed_at = None;
-            } else if matches!(item.status, crate::convert::ConversionStatus::Interrupted) {
+            if matches!(item.status, crate::convert::ConversionStatus::Interrupted) {
                 // Interrupted work is a durable intent state, never a resumable
-                // worker checkpoint. Keep timestamps/progress from implying a
-                // mid-tool invocation can continue after restart.
+                // worker checkpoint. Processing itself remains durable in v24;
+                // only execution recovery may transition it to Interrupted.
                 item.started_at = None;
                 item.completed_at = None;
             }
@@ -2301,6 +2642,514 @@ impl Database {
         references
     }
 
+    fn cleanup_v24_setup_orphans(&self) {
+        // Snapshot lifecycle pathname hints, prove backing-row absence with no
+        // registry lock held, then ask lifecycle-owned retirement to revalidate
+        // and remove only an unlocked descriptor. Malformed descriptor bodies
+        // are therefore repairable without teaching generic claim GC to delete
+        // durable reservations.
+        let namespaces = [
+            crate::concurrency::LeaseFamily::QueueScope { scope_id: uuid::Uuid::nil() },
+            crate::concurrency::LeaseFamily::QueueExecution { execution_id: uuid::Uuid::nil() },
+            crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: uuid::Uuid::nil() },
+            crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: uuid::Uuid::nil() },
+        ];
+        for namespace in namespaces {
+            let Ok(hints) = crate::concurrency::lifecycle_descriptor_hints(&namespace) else { continue };
+            for (id, path) in hints {
+                let backed = match &namespace {
+                    crate::concurrency::LeaseFamily::QueueScope { .. } => self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM conversion_queue_scopes WHERE scope_uuid=?1)",
+                        [id.to_string()], |row| row.get::<_, i64>(0)
+                    ).unwrap_or(1) != 0,
+                    _ => self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM conversion_queue_executions WHERE execution_id=?1)",
+                        [id.to_string()], |row| row.get::<_, i64>(0)
+                    ).unwrap_or(1) != 0,
+                };
+                if backed { continue; }
+                let family = match &namespace {
+                    crate::concurrency::LeaseFamily::QueueScope { .. } => crate::concurrency::LeaseFamily::QueueScope { scope_id: id },
+                    crate::concurrency::LeaseFamily::QueueExecution { .. } => crate::concurrency::LeaseFamily::QueueExecution { execution_id: id },
+                    crate::concurrency::LeaseFamily::ExecutionClaim { .. } => crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: id },
+                    crate::concurrency::LeaseFamily::ExecutionStaging { .. } => crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: id },
+                    crate::concurrency::LeaseFamily::JournalOperation { .. } | crate::concurrency::LeaseFamily::EphemeralMutation { .. } => continue,
+                };
+                let _ = crate::concurrency::retire_setup_orphan_by_path_identity(&path, &family);
+            }
+        }
+    }
+
+    fn ensure_queue_scope(&self) -> Result<&QueueScopeRuntime, String> {
+        self.cleanup_v24_setup_orphans();
+        if let Some(scope) = self.queue_scope.get() {
+            return Ok(scope);
+        }
+        let scope_id = uuid::Uuid::new_v4();
+        let lease = crate::concurrency::PersistentLease::create(
+            crate::concurrency::LeaseFamily::QueueScope { scope_id },
+            &[],
+        )?;
+        let descriptor_path = lease.descriptor_path().to_string_lossy().into_owned();
+        let now = chrono::Utc::now().timestamp_millis();
+        let tx = self.conn.unchecked_transaction()
+            .map_err(|e| format!("queue scope tx begin: {e}"))?;
+        let origin_identity = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
+            .map_err(|e| format!("serialize queue scope origin identity: {e}"))?;
+        tx.execute(
+            "INSERT INTO conversion_queue_scopes(scope_uuid, descriptor_path, origin_identity, created_unix_ms) VALUES(?1, ?2, ?3, ?4)",
+            params![scope_id.to_string(), descriptor_path, origin_identity, now],
+        ).map_err(|e| format!("queue scope insert: {e}"))?;
+        // First protocol-aware scope adopts frozen v23 intent exactly once.
+        // The v23 authority is immutable after activation: retaining it is
+        // required both for mixed-version read safety and global secret
+        // reachability.  The epoch bit prevents re-import after v24 drains.
+        let legacy_adopted: i64 = tx.query_row(
+            "SELECT legacy_queue_adopted FROM concurrency_protocol_epoch WHERE id=1",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("queue v24 legacy-adoption state: {e}"))?;
+        if legacy_adopted == 0 {
+            tx.execute(
+                "INSERT INTO conversion_queue_v24(owner_scope, id, item_json, position)
+                 SELECT ?1, id, item_json, position FROM conversion_queue_v23_frozen ORDER BY position, id",
+                [scope_id.to_string()],
+            ).map_err(|e| format!("adopt frozen v23 queue: {e}"))?;
+            tx.execute(
+                "UPDATE concurrency_protocol_epoch SET legacy_queue_adopted=1 WHERE id=1",
+                [],
+            ).map_err(|e| format!("mark frozen v23 queue adopted: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("queue scope tx commit: {e}"))?;
+        let runtime = QueueScopeRuntime { scope_id, _lease: lease };
+        let _ = self.queue_scope.set(runtime);
+        self.queue_scope.get().ok_or_else(|| "queue scope initialization race".to_string())
+    }
+
+    /// Create a thread-safe active-execution transition capability for the
+    /// current queue scope. The `Database` must remain alive for the run so its
+    /// QueueScope lease continues to distinguish session intent from execution
+    /// ownership.
+    pub fn queue_execution_coordinator(&self) -> Result<QueueExecutionCoordinator, String> {
+        let scope_id = self.ensure_queue_scope()?.scope_id;
+        let database_path = self
+            .conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "durable queue execution requires a file-backed SQLite database".to_string())?;
+        Ok(QueueExecutionCoordinator {
+            database_path,
+            scope_id,
+            execution_leases: std::sync::Arc::clone(&self.execution_leases),
+            transition_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        })
+    }
+
+    fn recover_dead_queue_scopes(&self, current_scope: uuid::Uuid) -> Result<(), String> {
+        fn prior_boot(origin_json: &str) -> bool {
+            let Ok(origin) = serde_json::from_str::<crate::concurrency::OwnerProcessIdentity>(origin_json) else {
+                return false;
+            };
+            let current = crate::concurrency::OwnerProcessIdentity::current();
+            origin.boot_id_hash != 0
+                && current.boot_id_hash != 0
+                && origin.boot_id_hash != current.boot_id_hash
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_uuid, descriptor_path, origin_identity, scope_order
+             FROM conversion_queue_scopes
+             WHERE scope_uuid <> ?1
+             ORDER BY scope_order ASC, scope_uuid ASC",
+        ).map_err(|e| format!("queue dead-scope prepare: {e}"))?;
+        let scope_rows = stmt.query_map([current_scope.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        }).map_err(|e| format!("queue dead-scope query: {e}"))?
+          .collect::<Result<Vec<_>, _>>()
+          .map_err(|e| format!("queue dead-scope decode: {e}"))?;
+        drop(stmt);
+
+        // Acquire every currently recoverable dead-scope authority in the same
+        // deterministic order used for merge.  If a peer wins one of these
+        // races, abandon this pass entirely rather than recovering a later
+        // scope first and making ordering scheduler-dependent.
+        let mut scopes = Vec::<DeadQueueScopeRecovery>::new();
+        for (scope_text, descriptor_text, origin_identity, scope_order) in scope_rows {
+            let Ok(scope_id) = uuid::Uuid::parse_str(&scope_text) else {
+                log::error!("queue scope id is malformed; leaving it reserved: {scope_text}");
+                continue;
+            };
+            let family = crate::concurrency::LeaseFamily::QueueScope { scope_id };
+            let mut descriptor_path = PathBuf::from(&descriptor_text);
+            let mut descriptor_reconstructed = false;
+
+            let recovery_lease = if descriptor_path.exists() {
+                match crate::concurrency::descriptor_availability(&descriptor_path) {
+                    Ok((_family, crate::concurrency::ClaimAvailability::Live)) => continue,
+                    Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved)) => {}
+                    Ok((_family, crate::concurrency::ClaimAvailability::ReclaimableEphemeral)) => {
+                        log::error!("durable queue scope classified ephemeral; leaving it untouched: {scope_text}");
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!("queue scope {scope_text} ownership is ambiguous; leaving it untouched: {error}");
+                        continue;
+                    }
+                }
+                match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
+                    Ok(lease) => lease,
+                    Err(error) if error.contains("live-owned") => return Ok(()),
+                    Err(error) => {
+                        log::warn!("queue scope {scope_text} recovery lease acquisition failed closed: {error}");
+                        continue;
+                    }
+                }
+            } else {
+                if !prior_boot(&origin_identity) {
+                    log::warn!("same-boot queue scope descriptor is missing; fail closed for {scope_text}");
+                    continue;
+                }
+                match crate::concurrency::PersistentLease::create(family.clone(), &[]) {
+                    Ok(lease) => {
+                        descriptor_path = lease.descriptor_path().to_path_buf();
+                        descriptor_reconstructed = true;
+                        lease
+                    }
+                    Err(error) if error.contains("lifecycle already has a descriptor") => {
+                        let Some(existing) = crate::concurrency::find_family_descriptor(&family)? else {
+                            return Ok(());
+                        };
+                        descriptor_path = existing;
+                        match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
+                            Ok(lease) => lease,
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("prior-boot queue scope reconstruction failed closed for {scope_text}: {error}");
+                        continue;
+                    }
+                }
+            };
+
+            let mut rows_stmt = self.conn.prepare(
+                "SELECT id, item_json, position, execution_id
+                 FROM conversion_queue_v24
+                 WHERE owner_scope=?1
+                 ORDER BY position ASC, id ASC",
+            ).map_err(|e| format!("queue dead-scope rows prepare: {e}"))?;
+            let rows = rows_stmt.query_map([&scope_text], |row| {
+                Ok(DeadQueueRow {
+                    id: row.get(0)?,
+                    item_json: row.get(1)?,
+                    position: row.get(2)?,
+                    execution_id: row.get(3)?,
+                })
+            }).map_err(|e| format!("queue dead-scope rows query: {e}"))?
+              .collect::<Result<Vec<_>, _>>()
+              .map_err(|e| format!("queue dead-scope rows decode: {e}"))?;
+            drop(rows_stmt);
+
+            scopes.push(DeadQueueScopeRecovery {
+                scope_id,
+                scope_text,
+                scope_order,
+                descriptor_path,
+                descriptor_reconstructed,
+                recovery_lease,
+                rows,
+            });
+        }
+
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        scopes.sort_by(|left, right| {
+            (left.scope_order, left.scope_id).cmp(&(right.scope_order, right.scope_id))
+        });
+
+        // Resolve Processing containment before beginning the adoption
+        // transaction.  This can block, signal a process tree, and read durable
+        // supervisor state; none of it belongs inside SQLite or the registry.
+        let mut executions = std::collections::HashMap::<String, DeadExecutionRecovery>::new();
+        for scope in &scopes {
+            for row in &scope.rows {
+                let Some(execution_id) = row.execution_id.as_ref() else { continue };
+                if executions.contains_key(execution_id) { continue; }
+                let execution = self.conn.query_row(
+                    "SELECT descriptor_path, origin_identity, external_released, containment_json
+                     FROM conversion_queue_executions
+                     WHERE execution_id=?1 AND item_id=?2",
+                    params![execution_id, row.id],
+                    |sql_row| Ok((
+                        sql_row.get::<_, String>(0)?,
+                        sql_row.get::<_, String>(1)?,
+                        sql_row.get::<_, i64>(2)? != 0,
+                        sql_row.get::<_, Option<String>>(3)?,
+                    )),
+                );
+                let Ok((descriptor_text, origin_identity, external_released, containment_json)) = execution else {
+                    continue;
+                };
+                let Ok(execution_uuid) = uuid::Uuid::parse_str(execution_id) else { continue };
+                let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id: execution_uuid };
+                let mut descriptor_path = PathBuf::from(&descriptor_text);
+                let mut descriptor_reconstructed = false;
+
+                let recovery_lease = if descriptor_path.exists() {
+                    if !matches!(
+                        crate::concurrency::descriptor_availability(&descriptor_path),
+                        Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved))
+                    ) {
+                        continue;
+                    }
+                    match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
+                        Ok(lease) => lease,
+                        Err(_) => continue,
+                    }
+                } else {
+                    if !prior_boot(&origin_identity) {
+                        log::warn!("same-boot queue execution descriptor is missing; fail closed for {execution_id}");
+                        continue;
+                    }
+                    match crate::concurrency::PersistentLease::create(family.clone(), &[]) {
+                        Ok(lease) => {
+                            descriptor_path = lease.descriptor_path().to_path_buf();
+                            descriptor_reconstructed = true;
+                            lease
+                        }
+                        Err(error) if error.contains("lifecycle already has a descriptor") => {
+                            let Some(existing) = crate::concurrency::find_family_descriptor(&family)? else { continue };
+                            descriptor_path = existing;
+                            match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
+                                Ok(lease) => lease,
+                                Err(_) => continue,
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("prior-boot queue execution reconstruction failed closed for {execution_id}: {error}");
+                            continue;
+                        }
+                    }
+                };
+
+                // A persisted containment descriptor is authoritative even while
+                // `external_released` is still false. The backend may have crossed
+                // its exec gate and crashed before the UserCodeReleased event was
+                // durably recorded. Never retire RecoveryReserved execution/path
+                // claims merely because that boolean is false; positively prove
+                // every recorded containment empty first.
+                let mut recoverable = false;
+                let mut cleanup_requests = Vec::new();
+                match containment_json.as_deref() {
+                    Some(json) => {
+                        let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+                            executions.insert(execution_id.clone(), DeadExecutionRecovery {
+                                execution_id: execution_id.clone(), descriptor_path, descriptor_reconstructed,
+                                recoverable, recovery_lease, cleanup_requests,
+                            });
+                            continue;
+                        };
+                        if values.is_empty() {
+                            // No contained command was released. A stale true bit
+                            // without a descriptor is ambiguous and fails closed.
+                            recoverable = !external_released;
+                        } else {
+                            let mut all_resolved = true;
+                            for value in values {
+                                let Some(token) = value.get("token").and_then(|v| v.as_str()).map(str::to_string) else { all_resolved = false; break };
+                                let Some(runtime_directory) = value.get("runtime_directory").and_then(|v| v.as_str()).map(PathBuf::from) else { all_resolved = false; break };
+                                let Some(descriptor_value) = value.get("descriptor") else { all_resolved = false; break };
+                                let Ok(containment_descriptor) = serde_json::from_value::<crate::convert::script_supervisor::ContainmentDescriptor>(descriptor_value.clone()) else { all_resolved = false; break };
+                                let request = crate::convert::script_supervisor::ScriptRecoveryRequest {
+                                    token,
+                                    runtime_directory,
+                                    descriptor: containment_descriptor,
+                                };
+                                match crate::convert::script_supervisor::recover_supervised(&request) {
+                                    Ok(crate::convert::script_supervisor::ScriptRecoveryOutcome::ExecutionNeverReleased)
+                                    | Ok(crate::convert::script_supervisor::ScriptRecoveryOutcome::ContainmentAlreadyEmpty)
+                                    | Ok(crate::convert::script_supervisor::ScriptRecoveryOutcome::ContainmentTerminated) => cleanup_requests.push(request),
+                                    Ok(crate::convert::script_supervisor::ScriptRecoveryOutcome::ManualRecoveryRequired(reason)) => {
+                                        log::warn!("dead queue execution {execution_id} remains RecoveryReserved: {reason}");
+                                        all_resolved = false;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        log::warn!("dead queue execution {execution_id} containment recovery failed closed: {error}");
+                                        all_resolved = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            recoverable = all_resolved;
+                        }
+                    }
+                    None => {
+                        // Before any external release there is no descendant to
+                        // recover. Once released, absence of a descriptor is
+                        // ambiguous and the execution remains reserved.
+                        recoverable = !external_released;
+                    }
+                }
+
+                executions.insert(execution_id.clone(), DeadExecutionRecovery {
+                    execution_id: execution_id.clone(),
+                    descriptor_path,
+                    descriptor_reconstructed,
+                    recoverable,
+                    recovery_lease,
+                    cleanup_requests,
+                });
+            }
+        }
+
+        let current_origin = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
+            .map_err(|e| format!("serialize recovery origin identity: {e}"))?;
+        let tx = self.conn.unchecked_transaction()
+            .map_err(|e| format!("queue dead-scope recovery tx begin: {e}"))?;
+        let mut append_position: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position)+1, 0) FROM conversion_queue_v24 WHERE owner_scope=?1",
+            [current_scope.to_string()],
+            |row| row.get(0),
+        ).map_err(|e| format!("queue dead-scope append position: {e}"))?;
+
+        for scope in &scopes {
+            if scope.descriptor_reconstructed {
+                tx.execute(
+                    "UPDATE conversion_queue_scopes SET descriptor_path=?1, origin_identity=?2 WHERE scope_uuid=?3",
+                    params![scope.descriptor_path.to_string_lossy(), &current_origin, scope.scope_text],
+                ).map_err(|e| format!("publish reconstructed queue scope descriptor: {e}"))?;
+            }
+        }
+        for execution in executions.values() {
+            if execution.descriptor_reconstructed {
+                tx.execute(
+                    "UPDATE conversion_queue_executions SET descriptor_path=?1, origin_identity=?2, updated_unix_ms=?3 WHERE execution_id=?4",
+                    params![
+                        execution.descriptor_path.to_string_lossy(),
+                        &current_origin,
+                        chrono::Utc::now().timestamp_millis(),
+                        execution.execution_id,
+                    ],
+                ).map_err(|e| format!("publish reconstructed queue execution descriptor: {e}"))?;
+            }
+        }
+
+        let mut emptied_scopes = std::collections::HashSet::<uuid::Uuid>::new();
+        let mut transitioned_executions = std::collections::HashSet::<String>::new();
+        for scope in &scopes {
+            for row in &scope.rows {
+                let item = match serde_json::from_str::<crate::convert::ConversionItem>(&row.item_json) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        log::error!("dead queue scope row {} is malformed; retaining reservation: {error}", row.id);
+                        continue;
+                    }
+                };
+                if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
+                    let Some(execution_id) = row.execution_id.as_ref() else { continue };
+                    let Some(execution) = executions.get(execution_id) else { continue };
+                    if !execution.recoverable { continue; }
+                    let mut interrupted = item.clone();
+                    interrupted.status = crate::convert::ConversionStatus::Interrupted;
+                    interrupted.started_at = None;
+                    interrupted.completed_at = None;
+                    let interrupted_json = serde_json::to_string(&interrupted)
+                        .map_err(|e| format!("serialize recovered interrupted item: {e}"))?;
+                    tx.execute(
+                        "UPDATE conversion_queue_v24
+                         SET owner_scope=?1, position=?2, item_json=?3, execution_id=NULL
+                         WHERE id=?4 AND owner_scope=?5",
+                        params![current_scope.to_string(), append_position, interrupted_json, row.id, scope.scope_text],
+                    ).map_err(|e| format!("recover dead Processing row: {e}"))?;
+                    tx.execute(
+                        "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
+                        [execution_id],
+                    ).map_err(|e| format!("retire recovered execution row: {e}"))?;
+                    transitioned_executions.insert(execution_id.clone());
+                    append_position += 1;
+                } else {
+                    tx.execute(
+                        "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2
+                         WHERE id=?3 AND owner_scope=?4",
+                        params![current_scope.to_string(), append_position, row.id, scope.scope_text],
+                    ).map_err(|e| format!("adopt dead queue row: {e}"))?;
+                    append_position += 1;
+                }
+            }
+            let remaining: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM conversion_queue_v24 WHERE owner_scope=?1",
+                [&scope.scope_text],
+                |row| row.get(0),
+            ).map_err(|e| format!("queue dead-scope remaining count: {e}"))?;
+            if remaining == 0 {
+                tx.execute(
+                    "DELETE FROM conversion_queue_scopes WHERE scope_uuid=?1",
+                    [&scope.scope_text],
+                ).map_err(|e| format!("queue dead-scope retire row: {e}"))?;
+                emptied_scopes.insert(scope.scope_id);
+            }
+        }
+        tx.commit().map_err(|e| format!("queue dead-scope recovery tx commit: {e}"))?;
+
+        // The DB transition is now authoritative. Release our recovery OFDs,
+        // then lifecycle-retire descriptors on fresh OFDs in registry order.
+        for (execution_id, execution) in executions {
+            let DeadExecutionRecovery {
+                descriptor_path,
+                recovery_lease,
+                cleanup_requests,
+                ..
+            } = execution;
+            drop(recovery_lease);
+            if transitioned_executions.contains(&execution_id) {
+                if let Ok(execution_uuid) = uuid::Uuid::parse_str(&execution_id) {
+                    let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id: execution_uuid };
+                    let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor_path, &family);
+                    for namespace in [
+                        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: uuid::Uuid::nil() },
+                        crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: uuid::Uuid::nil() },
+                    ] {
+                        if let Ok(hints) = crate::concurrency::lifecycle_descriptor_hints(&namespace) {
+                            for (id, path) in hints.into_iter().filter(|(id, _)| *id == execution_uuid) {
+                                let family = match namespace {
+                                    crate::concurrency::LeaseFamily::ExecutionClaim { .. } => crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: id },
+                                    _ => crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: id },
+                                };
+                                let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&path, &family);
+                            }
+                        }
+                    }
+                }
+                for request in cleanup_requests {
+                    let _ = crate::convert::script_supervisor::cleanup_supervised(&request);
+                    let _ = std::fs::remove_dir_all(&request.runtime_directory);
+                }
+            }
+        }
+        for scope in scopes {
+            let DeadQueueScopeRecovery {
+                scope_id,
+                descriptor_path,
+                recovery_lease,
+                ..
+            } = scope;
+            drop(recovery_lease);
+            if emptied_scopes.contains(&scope_id) {
+                let family = crate::concurrency::LeaseFamily::QueueScope { scope_id };
+                let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor_path, &family);
+            }
+        }
+        Ok(())
+    }
+
     /// Incrementally reconcile SQLite with the current durable queue intent.
     ///
     /// The method serializes the desired snapshot to detect changes, but only
@@ -2315,96 +3164,218 @@ impl Database {
         &self,
         items: &[&crate::convert::ConversionItem],
     ) -> Result<QueueSyncReport, String> {
-        let (persisted_items, persist_report) =
-            Self::prepare_queue_items_for_persistence(items)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        // Do not create a durable queue scope merely because an empty session
+        // reconciled an empty in-memory queue. A scope enters SQLite only when
+        // there is durable intent to publish/adopt, or after this process has
+        // already owned durable rows.
+        if items.is_empty() && self.queue_scope.get().is_none() && !self.has_queue_items()? {
+            return Ok(QueueSyncReport::default());
+        }
+        let scope_id = self.ensure_queue_scope()?.scope_id;
+        let (persisted_items, persist_report) = Self::prepare_queue_items_for_persistence(items)?;
+
+        // QueueExecution is final-family from birth and exists before the
+        // Processing row can commit. Runtime ownership lives in this Database
+        // (the TUI scope); the execution supervisor handoff extends it across
+        // TUI death for external work.
+        let mut execution_for_item = std::collections::HashMap::<String, (String, String)>::new();
+        {
+            let mut leases = self.execution_leases.lock()
+                .map_err(|_| "conversion execution lease map poisoned".to_string())?;
+            for item in &persisted_items {
+                if !matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
+                    continue;
+                }
+                if let Some(lease) = leases.get(&item.id) {
+                    let execution_id = match lease.family() {
+                        crate::concurrency::LeaseFamily::QueueExecution { execution_id } => *execution_id,
+                        _ => return Err("internal execution lease family mismatch".to_string()),
+                    };
+                    execution_for_item.insert(
+                        item.id.clone(),
+                        (execution_id.to_string(), lease.descriptor_path().to_string_lossy().into_owned()),
+                    );
+                    continue;
+                }
+                let execution_id = uuid::Uuid::new_v4();
+                let lease = crate::concurrency::PersistentLease::create(
+                    crate::concurrency::LeaseFamily::QueueExecution { execution_id }, &[]
+                )?;
+                execution_for_item.insert(
+                    item.id.clone(),
+                    (execution_id.to_string(), lease.descriptor_path().to_string_lossy().into_owned()),
+                );
+                leases.insert(item.id.clone(), std::sync::Arc::new(lease));
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()
             .map_err(|e| format!("queue tx begin: {e}"))?;
-
-        let mut statement = tx
-            .prepare("SELECT id, item_json, position FROM conversion_queue")
-            .map_err(|e| format!("queue reconcile prepare existing rows: {e}"))?;
-        let existing_rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| format!("queue reconcile query existing rows: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("queue reconcile decode existing row: {e}"))?;
+        let mut statement = tx.prepare(
+            "SELECT id, item_json, position, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1"
+        ).map_err(|e| format!("queue reconcile prepare existing rows: {e}"))?;
+        let existing_rows = statement.query_map([scope_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?))
+        }).map_err(|e| format!("queue reconcile query existing rows: {e}"))?
+          .collect::<Result<Vec<_>, _>>()
+          .map_err(|e| format!("queue reconcile decode existing row: {e}"))?;
         drop(statement);
-
-        let mut existing = existing_rows
-            .into_iter()
-            .map(|(id, json, position)| (id, (json, position)))
-            .collect::<std::collections::HashMap<_, _>>();
+        let mut existing = existing_rows.into_iter()
+            .map(|(id,json,pos,exec)| (id,(json,pos,exec)))
+            .collect::<std::collections::HashMap<_,_>>();
         let mut report = QueueSyncReport::default();
+        let mut retire_execution_ids = Vec::<(String, String)>::new();
 
         for (position, item) in persisted_items.iter().enumerate() {
-            let json = serde_json::to_string(item)
-                .map_err(|e| format!("queue item serialize: {e}"))?;
+            let foreign_scope: Option<String> = tx.query_row(
+                "SELECT owner_scope FROM conversion_queue_v24 WHERE id=?1 AND owner_scope<>?2",
+                params![item.id, scope_id.to_string()], |row| row.get(0)
+            ).optional().map_err(|e| format!("queue foreign-id collision probe: {e}"))?;
+            if let Some(owner) = foreign_scope {
+                return Err(format!("queue item id '{}' is already owned by independent live/recoverable scope {}", item.id, owner));
+            }
+            let json = serde_json::to_string(item).map_err(|e| format!("queue item serialize: {e}"))?;
+            let desired_execution = execution_for_item.get(&item.id).map(|(id,_)| id.clone());
             match existing.remove(&item.id) {
-                Some((old_json, old_position)) => {
+                Some((old_json, old_position, old_execution)) => {
                     let old_reference = Self::persisted_queue_reference(&old_json);
                     if old_reference.as_deref() != item.archive_password_ref.as_deref() {
-                        if let Some(reference) = old_reference {
-                            report.retire_references.push(reference);
+                        if let Some(reference) = old_reference { report.retire_references.push(reference); }
+                    }
+                    if old_execution != desired_execution {
+                        if let Some(old) = old_execution.clone() {
+                            if let Ok(path) = tx.query_row(
+                                "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1", [&old], |row| row.get::<_,String>(0)
+                            ) { retire_execution_ids.push((old.clone(), path)); }
                         }
                     }
-                    if old_json != json || old_position != position as i64 {
+                    if old_json != json || old_position != position as i64 || old_execution != desired_execution {
                         tx.execute(
-                            "INSERT INTO conversion_queue (id, item_json, position)
-                             VALUES (?1, ?2, ?3)
-                             ON CONFLICT(id) DO UPDATE SET
-                                item_json = excluded.item_json,
-                                position = excluded.position",
-                            params![item.id, json, position as i64],
-                        )
-                        .map_err(|e| format!("queue item upsert: {e}"))?;
+                            "UPDATE conversion_queue_v24 SET item_json=?1, position=?2, execution_id=?3 WHERE owner_scope=?4 AND id=?5",
+                            params![json, position as i64, desired_execution, scope_id.to_string(), item.id]
+                        ).map_err(|e| format!("queue item update: {e}"))?;
                         report.rows_written += 1;
                     }
                 }
                 None => {
                     tx.execute(
-                        "INSERT INTO conversion_queue (id, item_json, position)
-                         VALUES (?1, ?2, ?3)",
-                        params![item.id, json, position as i64],
-                    )
-                    .map_err(|e| format!("queue item insert: {e}"))?;
+                        "INSERT INTO conversion_queue_v24(owner_scope,id,item_json,position,execution_id) VALUES(?1,?2,?3,?4,?5)",
+                        params![scope_id.to_string(), item.id, json, position as i64, desired_execution]
+                    ).map_err(|e| format!("queue item insert: {e}"))?;
                     report.rows_written += 1;
+                }
+            }
+            if let Some((execution_id, descriptor_path)) = execution_for_item.get(&item.id) {
+                let now = chrono::Utc::now().timestamp_millis();
+                tx.execute(
+                    "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
+                     VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)
+                     ON CONFLICT(execution_id) DO UPDATE SET state='processing', updated_unix_ms=excluded.updated_unix_ms",
+                    params![
+                        execution_id,
+                        scope_id.to_string(),
+                        item.id,
+                        descriptor_path,
+                        serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
+                            .map_err(|e| format!("serialize queue execution origin identity: {e}"))?,
+                        now
+                    ]
+                ).map_err(|e| format!("queue execution upsert: {e}"))?;
+            }
+        }
+
+        for (id, (old_json, _, old_execution)) in existing {
+            if let Some(reference) = Self::persisted_queue_reference(&old_json) { report.retire_references.push(reference); }
+            if let Some(execution_id) = old_execution {
+                if let Ok(path) = tx.query_row(
+                    "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1", [&execution_id], |row| row.get::<_,String>(0)
+                ) { retire_execution_ids.push((execution_id.clone(), path)); }
+                tx.execute("DELETE FROM conversion_queue_executions WHERE execution_id=?1", [&execution_id])
+                    .map_err(|e| format!("queue execution delete: {e}"))?;
+            }
+            tx.execute("DELETE FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2", params![scope_id.to_string(), id])
+                .map_err(|e| format!("queue item delete: {e}"))?;
+            report.rows_deleted += 1;
+        }
+        for (execution_id, _) in &retire_execution_ids {
+            tx.execute("DELETE FROM conversion_queue_executions WHERE execution_id=?1", [execution_id])
+                .map_err(|e| format!("queue stale execution delete: {e}"))?;
+        }
+        // Decide durable secret reachability in the same transaction that
+        // changes queue authority.  Secret-store deletion happens only after
+        // commit, using this transactionally consistent snapshot.
+        let global_live = Self::queue_secret_refs_on(&tx)?;
+        tx.commit().map_err(|e| format!("queue tx commit: {e}"))?;
+
+        // Publish process-local routing only after the descriptor and Processing
+        // row are committed. The DB/descriptor pair remains authoritative.
+        {
+            let leases = self.execution_leases.lock()
+                .map_err(|_| "conversion execution lease map poisoned".to_string())?;
+            let database_path = self.conn.path().map(PathBuf::from);
+            for item in &persisted_items {
+                if let Some((execution_id, _)) = execution_for_item.get(&item.id) {
+                    if let (Ok(id), Some(lease)) = (uuid::Uuid::parse_str(execution_id), leases.get(&item.id)) {
+                        crate::concurrency::register_runtime_execution(
+                            &item.id, id, std::sync::Arc::clone(lease), database_path.clone()
+                        )?;
+                    }
                 }
             }
         }
 
-        for (id, (old_json, _)) in existing {
-            if let Some(reference) = Self::persisted_queue_reference(&old_json) {
-                report.retire_references.push(reference);
+        // Descriptor removal is lifecycle-owned and occurs only after the DB no
+        // longer references it. Drop our holder first; retirement then takes a
+        // new OFD under registry->descriptor ordering.
+        if !retire_execution_ids.is_empty() {
+            let mut leases = self.execution_leases.lock()
+                .map_err(|_| "conversion execution lease map poisoned".to_string())?;
+            for (execution_id, descriptor_path) in retire_execution_ids {
+                let item_key = leases.iter().find_map(|(item_id, lease)| match lease.family() {
+                    crate::concurrency::LeaseFamily::QueueExecution { execution_id: id } if id.to_string() == execution_id => Some(item_id.clone()),
+                    _ => None,
+                });
+                if let Some(item_key) = item_key {
+                    crate::concurrency::unregister_runtime_execution(&item_key);
+                    leases.remove(&item_key);
+                }
+                if let Ok(id) = uuid::Uuid::parse_str(&execution_id) {
+                    let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id: id };
+                    let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(Path::new(&descriptor_path), &family);
+                }
             }
-            tx.execute("DELETE FROM conversion_queue WHERE id = ?1", [&id])
-                .map_err(|e| format!("queue item delete: {e}"))?;
-            report.rows_deleted += 1;
         }
 
-        tx.commit().map_err(|e| format!("queue tx commit: {e}"))?;
-
         let mut immediately_retirable = persist_report.retire_references;
-        Self::dedup_unreferenced_queue_secret_refs(
-            &mut immediately_retirable,
-            &persisted_items,
-        );
-        crate::convert::queue::retire_queue_owned_secret_references(
-            &immediately_retirable,
-        );
-        Self::dedup_unreferenced_queue_secret_refs(
-            &mut report.retire_references,
-            &persisted_items,
-        );
-        report.live_references = Self::durable_queue_secret_refs(&persisted_items);
+        immediately_retirable.extend(report.retire_references.iter().cloned());
+        immediately_retirable.retain(|reference| !global_live.contains(reference));
+        immediately_retirable.sort();
+        immediately_retirable.dedup();
+        crate::convert::queue::retire_queue_owned_secret_references(&immediately_retirable);
+        report.retire_references.retain(|reference| !global_live.contains(reference));
+        report.retire_references.sort();
+        report.retire_references.dedup();
+        report.live_references = global_live.into_iter().collect();
         Ok(report)
+    }
+
+    fn queue_secret_refs_on(conn: &Connection) -> Result<std::collections::HashSet<String>, String> {
+        let mut refs = std::collections::HashSet::new();
+        for table in ["conversion_queue_v24", "conversion_queue_v23_frozen"] {
+            let sql = format!("SELECT item_json FROM {table}");
+            let mut stmt = conn.prepare(&sql).map_err(|e| format!("queue secret reachability prepare {table}: {e}"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("queue secret reachability query {table}: {e}"))?;
+            for row in rows {
+                let json = row.map_err(|e| format!("queue secret reachability decode {table}: {e}"))?;
+                if let Some(reference) = Self::persisted_queue_reference(&json) { refs.insert(reference); }
+            }
+        }
+        Ok(refs)
+    }
+
+    fn global_queue_secret_refs(&self) -> Result<std::collections::HashSet<String>, String> {
+        Self::queue_secret_refs_on(&self.conn)
     }
 
     /// Full-snapshot publication retained for imports, repair tooling, and
@@ -2413,59 +3384,9 @@ impl Database {
         &self,
         items: &[&crate::convert::ConversionItem],
     ) -> Result<QueueSyncReport, String> {
-        let (persisted_items, persist_report) =
-            Self::prepare_queue_items_for_persistence(items)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("queue snapshot tx begin: {e}"))?;
-
-        let mut old_statement = tx
-            .prepare("SELECT item_json FROM conversion_queue")
-            .map_err(|e| format!("queue snapshot read old refs: {e}"))?;
-        let old_json = old_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("queue snapshot query old refs: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("queue snapshot decode old row: {e}"))?;
-        drop(old_statement);
-        let old_row_count = old_json.len();
-        let mut retire_references = old_json
-            .iter()
-            .filter_map(|json| Self::persisted_queue_reference(json))
-            .collect::<Vec<_>>();
-
-        tx.execute("DELETE FROM conversion_queue", [])
-            .map_err(|e| format!("queue snapshot clear: {e}"))?;
-        for (position, item) in persisted_items.iter().enumerate() {
-            let json = serde_json::to_string(item)
-                .map_err(|e| format!("queue item serialize: {e}"))?;
-            tx.execute(
-                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, ?3)",
-                params![item.id, json, position as i64],
-            )
-            .map_err(|e| format!("queue snapshot insert: {e}"))?;
-        }
-        tx.commit()
-            .map_err(|e| format!("queue snapshot tx commit: {e}"))?;
-        let mut immediately_retirable = persist_report.retire_references;
-        Self::dedup_unreferenced_queue_secret_refs(
-            &mut immediately_retirable,
-            &persisted_items,
-        );
-        crate::convert::queue::retire_queue_owned_secret_references(
-            &immediately_retirable,
-        );
-        Self::dedup_unreferenced_queue_secret_refs(
-            &mut retire_references,
-            &persisted_items,
-        );
-        Ok(QueueSyncReport {
-            rows_written: persisted_items.len(),
-            rows_deleted: old_row_count,
-            retire_references,
-            live_references: Self::durable_queue_secret_refs(&persisted_items),
-        })
+        // In v24 a "snapshot" is intentionally scope-local. There is no API
+        // that authorizes one session to replace another live session's queue.
+        self.sync_queue(items)
     }
 
     pub fn queue_legacy_import_done(&self) -> Result<bool, String> {
@@ -2479,6 +3400,7 @@ impl Database {
         items: &[crate::convert::ConversionItem],
         retire_after_import: &[String],
     ) -> Result<LegacyImportPublication, String> {
+        let scope_id = self.ensure_queue_scope()?.scope_id;
         // Fast no-op before secret preparation. The transaction below still
         // rechecks the marker to close a concurrent-start race, but ordinary
         // restarts must not touch secret storage once import is complete.
@@ -2500,8 +3422,8 @@ impl Database {
 
         let existing: i64 = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversion_queue LIMIT 1)",
-                [],
+                "SELECT EXISTS(SELECT 1 FROM conversion_queue_v24 WHERE owner_scope=?1 LIMIT 1)",
+                [scope_id.to_string()],
                 |row| row.get(0),
             )
             .map_err(|e| format!("queue legacy import probe existing rows: {e}"))?;
@@ -2537,8 +3459,8 @@ impl Database {
             let json = serde_json::to_string(item)
                 .map_err(|e| format!("queue legacy import serialize: {e}"))?;
             tx.execute(
-                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, ?3)",
-                params![item.id, json, position as i64],
+                "INSERT INTO conversion_queue_v24 (owner_scope, id, item_json, position) VALUES (?1, ?2, ?3, ?4)",
+                params![scope_id.to_string(), item.id, json, position as i64],
             )
             .map_err(|e| format!("queue legacy import insert: {e}"))?;
         }
@@ -2561,94 +3483,58 @@ impl Database {
     /// failures are returned to the caller; malformed individual rows are
     /// salvaged by omission and reconciled transactionally afterward.
     pub fn load_queue_items(&self) -> Result<QueueLoadOutcome, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, item_json FROM conversion_queue ORDER BY position ASC, id ASC",
-            )
-            .map_err(|e| format!("queue load prepare: {e}"))?;
-
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| format!("queue load query: {e}"))?;
-
+        // Empty startup is read-only with respect to queue ownership. This is
+        // important for bounded durable history and keeps browsing-only
+        // sessions off the coordination/SQLite write path.
+        if !self
+            .has_queue_items()
+            .map_err(|error| format!("queue load prepare: {error}"))?
+        {
+            return Ok(QueueLoadOutcome { items: Vec::new(), degradation: None });
+        }
+        let scope_id = self.ensure_queue_scope()?.scope_id;
+        self.recover_dead_queue_scopes(scope_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, item_json FROM conversion_queue_v24 WHERE owner_scope=?1 ORDER BY position ASC, id ASC"
+        ).map_err(|e| format!("queue load prepare: {e}"))?;
+        let mut rows = stmt.query([scope_id.to_string()]).map_err(|e| format!("queue load query: {e}"))?;
         let mut maintenance_needed = false;
         let mut retire_after_maintenance = Vec::new();
         let mut items = Vec::<crate::convert::ConversionItem>::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("queue load step: {e}"))?
-        {
+        while let Some(row) = rows.next().map_err(|e| format!("queue load step: {e}"))? {
             let id = match row.get::<_, String>(0) {
                 Ok(id) => id,
-                Err(error) => {
-                    maintenance_needed = true;
-                    log::error!(
-                        "Discarding persisted SQLite queue row with unreadable id: {error}"
-                    );
-                    continue;
-                }
+                Err(error) => { maintenance_needed = true; log::error!("Discarding persisted SQLite queue row with unreadable id: {error}"); continue; }
             };
             let json = match row.get::<_, String>(1) {
                 Ok(json) => json,
-                Err(error) => {
-                    maintenance_needed = true;
-                    log::error!(
-                        "Discarding persisted SQLite queue row '{id}' with unreadable payload: {error}"
-                    );
-                    continue;
-                }
+                Err(error) => { maintenance_needed = true; log::error!("Discarding persisted SQLite queue row '{id}' with unreadable payload: {error}"); continue; }
             };
             match serde_json::from_str::<crate::convert::ConversionItem>(&json) {
                 Ok(mut item) => {
                     if item.id != id {
                         maintenance_needed = true;
-                        log::error!(
-                            "Discarding persisted SQLite queue row whose primary key '{}' disagrees with payload id '{}'",
-                            id,
-                            item.id
-                        );
-                        if let Some(reference) = item.archive_password_ref.take() {
-                            retire_after_maintenance.push(reference);
-                        }
+                        log::error!("Discarding persisted SQLite queue row whose primary key '{}' disagrees with payload id '{}'", id, item.id);
+                        if let Some(reference) = item.archive_password_ref.take() { retire_after_maintenance.push(reference); }
                         continue;
                     }
-                    if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
-                        item.status = crate::convert::ConversionStatus::Interrupted;
-                        item.started_at = None;
-                        item.completed_at = None;
+                    // Processing rows are never rewritten merely because this
+                    // connection observed them. Dead-scope execution recovery
+                    // above is the only authority that can make Interrupted.
+                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path) {
                         maintenance_needed = true;
-                    }
-                    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
-                        &item.input_path,
-                    ) {
-                        maintenance_needed = true;
-                        if let Some(reference) = item.archive_password_ref.take() {
-                            retire_after_maintenance.push(reference);
-                        }
-                        log::warn!(
-                            "Discarding synthetic CUE artifact from persisted SQLite queue: {:?}",
-                            item.input_path
-                        );
+                        if let Some(reference) = item.archive_password_ref.take() { retire_after_maintenance.push(reference); }
+                        log::warn!("Discarding synthetic CUE artifact from persisted SQLite queue: {:?}", item.input_path);
                         continue;
                     }
                     items.push(item);
                 }
-                Err(error) => {
-                    maintenance_needed = true;
-                    log::error!(
-                        "Discarding malformed persisted SQLite queue row '{}': {}",
-                        id,
-                        error
-                    );
-                }
+                Err(error) => { maintenance_needed = true; log::error!("Discarding malformed persisted SQLite queue row '{}': {}", id, error); }
             }
         }
         drop(rows);
         drop(stmt);
-
-        let secret_report =
-            crate::convert::queue::restore_archive_passwords_after_load(&mut items);
+        let secret_report = crate::convert::queue::restore_archive_passwords_after_load(&mut items);
         maintenance_needed |= secret_report.rewrite_required;
         let mut degradation = None;
         if maintenance_needed {
@@ -2657,14 +3543,12 @@ impl Database {
                 Ok(sync_report) => {
                     retire_after_maintenance.extend(secret_report.retire_references);
                     retire_after_maintenance.extend(sync_report.retire_references);
-                    crate::convert::queue::retire_queue_owned_secret_references(
-                        &retire_after_maintenance,
-                    );
+                    let global_live = self.global_queue_secret_refs()?;
+                    retire_after_maintenance.retain(|reference| !global_live.contains(reference));
+                    crate::convert::queue::retire_queue_owned_secret_references(&retire_after_maintenance);
                 }
                 Err(error) => {
-                    let message = format!(
-                        "SQLite queue rows were loaded and sanitized in memory, but the maintenance publication failed: {error}"
-                    );
+                    let message = format!("SQLite queue rows were loaded and sanitized in memory, but the maintenance publication failed: {error}");
                     log::error!("{message}");
                     degradation = Some(message);
                 }
@@ -2678,7 +3562,7 @@ impl Database {
     pub fn has_queue_items(&self) -> Result<bool, String> {
         self.conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversion_queue LIMIT 1)",
+                "SELECT EXISTS(SELECT 1 FROM conversion_queue_v24 LIMIT 1) OR EXISTS(SELECT 1 FROM conversion_queue_v23_frozen LIMIT 1)",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -2841,6 +3725,20 @@ impl Database {
             .execute("DELETE FROM presets WHERE name = ?1", params![name])
             .map_err(|e| format!("preset delete: {}", e))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_preset_index_failure_for_tests(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER tonepoet_test_fail_preset_insert
+                 BEFORE INSERT ON presets
+                 BEGIN SELECT RAISE(FAIL, 'forced preset index insert failure'); END;
+                 CREATE TEMP TRIGGER tonepoet_test_fail_preset_delete
+                 BEFORE DELETE ON presets
+                 BEGIN SELECT RAISE(FAIL, 'forced preset index delete failure'); END;",
+            )
+            .map_err(|e| format!("install preset index failure trigger: {e}"))
     }
 
     /// Check if the presets table has any entries.
@@ -3559,13 +4457,46 @@ impl Database {
                         continue;
                     }
 
-                    if let Err(error) = Self::copy_backup_over(&original, &backup) {
+                    let (recovery_claim, recovery_guard) = match Self::admit_stale_metadata_restore(&original) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            messages.push(format!(
+                                "RECOVERY DEFERRED for {}: shared mutation admission is unavailable: {}. Backup at: {}",
+                                entry.file_path, error, entry.backup_path
+                            ));
+                            continue;
+                        }
+                    };
+                    let admitted_original = recovery_claim.identity.resolved_io_path.clone();
+                    let admitted_backup = match crate::concurrency::ResolvedPathIdentity::resolve_with_semantics(
+                        &backup,
+                        crate::concurrency::PathResolutionSemantics::NamespaceObject,
+                    ) {
+                        Ok(identity) => identity.resolved_io_path,
+                        Err(error) => {
+                            messages.push(format!(
+                                "RECOVERY FAILED for {}: could not stabilize rollback marker '{}': {}",
+                                entry.file_path, entry.backup_path, error
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = Self::copy_backup_over_admitted(
+                        &original,
+                        &admitted_original,
+                        &admitted_backup,
+                    ) {
                         messages.push(format!(
                             "RECOVERY FAILED for {}: {}. Backup at: {}",
                             entry.file_path, error, entry.backup_path
                         ));
                         continue;
                     }
+                    // The shared capability is required through user-file
+                    // publication and parent-directory synchronization only.
+                    // Journal-state/marker cleanup below does not rewrite the
+                    // recovered media file.
+                    drop(recovery_guard);
                     if let Err(error) =
                         self.set_metadata_write_state(&entry.file_path, METADATA_STATE_ROLLED_BACK)
                     {
@@ -3575,7 +4506,7 @@ impl Database {
                         ));
                         continue;
                     }
-                    if let Err(error) = Self::remove_backup_marker(&backup) {
+                    if let Err(error) = Self::remove_backup_marker(&admitted_backup) {
                         messages.push(format!(
                             "RECOVERY INCOMPLETE for {}: original bytes were restored, but rollback marker cleanup failed: {}",
                             entry.file_path, error
@@ -3622,6 +4553,26 @@ impl Database {
         messages
     }
 
+    fn admit_stale_metadata_restore(
+        original: &std::path::Path,
+    ) -> Result<(
+        crate::concurrency::PathClaim,
+        Option<crate::concurrency::MutationClaimGuard>,
+    ), String> {
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            original,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::FollowReferent,
+        )?;
+        let guard = if crate::concurrency::current_mutation_authority_covers(&claim)? {
+            None
+        } else {
+            Some(crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim.clone()])?)
+        };
+        Ok((claim, guard))
+    }
+
     /// Backup path: same directory, `.tonepoet-bak` suffix.
     pub fn backup_path_for(original: &std::path::Path) -> std::path::PathBuf {
         Self::backup_path(original)
@@ -3654,15 +4605,29 @@ impl Database {
         original: &std::path::Path,
         backup: &std::path::Path,
     ) -> Result<(), String> {
-        // Read and validate the marker FIRST, and only replace the
+        let target = crate::config::resolve_config_save_target(original).map_err(|error| {
+            format!(
+                "restore '{}' from rollback marker '{}': resolve destination authority: {error}",
+                original.display(),
+                backup.display()
+            )
+        })?;
+        Self::copy_backup_over_admitted(original, &target, backup)
+    }
+
+    fn copy_backup_over_admitted(
+        original_display: &std::path::Path,
+        admitted_target: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), String> {
+        // Read and validate the marker FIRST, and only replace the admitted
         // destination with an atomic rename of a fully-written temp file.
-        // Truncating the destination in place before the copy meant a bad
-        // marker (directory, symlink, unreadable) destroyed the very bytes
-        // this restore exists to recover.
+        // The caller that performs stale recovery pins parent aliases before
+        // entering here; this helper never re-resolves the display pathname.
         let restore_error = |detail: String| {
             format!(
                 "restore '{}' from rollback marker '{}': {detail}",
-                original.display(),
+                original_display.display(),
                 backup.display()
             )
         };
@@ -3680,8 +4645,7 @@ impl Database {
             return Err(restore_error("marker is not a regular file".to_string()));
         }
         let marker_len = marker_metadata.len();
-        let target = crate::config::resolve_config_save_target(original)
-            .map_err(|error| restore_error(format!("resolve destination authority: {error}")))?;
+        let target = admitted_target.to_path_buf();
         let target_metadata = std::fs::metadata(&target)
             .map_err(|error| restore_error(format!("inspect destination mode: {error}")))?;
         if !target_metadata.is_file() {
@@ -4720,6 +5684,10 @@ mod tests {
     const CROSS_PROCESS_DB_GATE_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_GATE";
     const CROSS_PROCESS_DB_CHILD_ID_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_CHILD_ID";
     const CROSS_PROCESS_DB_SUCCESS_DIR_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_SUCCESS_DIR";
+    const QUEUE_SCOPE_PROCESS_DB_ENV: &str = "TONEPOET_QUEUE_SCOPE_PROCESS_DB";
+    const QUEUE_SCOPE_PROCESS_ID_ENV: &str = "TONEPOET_QUEUE_SCOPE_PROCESS_ID";
+    const QUEUE_SCOPE_PROCESS_READY_ENV: &str = "TONEPOET_QUEUE_SCOPE_PROCESS_READY";
+    const QUEUE_SCOPE_PROCESS_RELEASE_ENV: &str = "TONEPOET_QUEUE_SCOPE_PROCESS_RELEASE";
 
     #[test]
     fn cross_process_database_open_child() {
@@ -4786,6 +5754,7 @@ mod tests {
 
     #[test]
     fn concurrent_processes_open_and_write_one_wal_database() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         const CHILD_COUNT: usize = 6;
         let temp = tempfile::tempdir().expect("cross-process database tempdir");
         let db_path = temp.path().join("tonepoet.db");
@@ -4804,6 +5773,8 @@ mod tests {
                 .env(CROSS_PROCESS_DB_GATE_ENV, &gate)
                 .env(CROSS_PROCESS_DB_CHILD_ID_ENV, child_id.to_string())
                 .env(CROSS_PROCESS_DB_SUCCESS_DIR_ENV, &success_dir)
+                .env("TONEPOET_CONCURRENCY_DIR", crate::concurrency::coordination_root())
+                .env("TONEPOET_TEST_CONCURRENCY_DIR_INHERIT", "1")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -4897,6 +5868,211 @@ mod tests {
             Some("TEXT"),
             "pre-existing incompatible column must remain untouched"
         );
+    }
+
+    #[test]
+    fn v24_freezes_v23_queue_and_rejects_legacy_name_dml() {
+        let conn = Connection::open_in_memory().expect("mixed-version sqlite fixture");
+        create_v23_prerequisite_tables(&conn);
+        conn.execute(
+            "INSERT INTO conversion_queue(id, item_json) VALUES('legacy-a', '{}')",
+            [],
+        ).expect("seed legacy queue row");
+        Database::migrate_v23(&conn).expect("migrate fixture to v23");
+        Database::migrate_v24(&conn).expect("activate v24 schema");
+
+        let visible: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM conversion_queue ORDER BY position, id").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(visible, vec!["legacy-a".to_string()]);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM conversion_queue_v23_frozen", [], |row| row.get::<_, i64>(0)).unwrap(),
+            1,
+            "activation must retain frozen legacy authority"
+        );
+        assert!(conn.execute(
+            "INSERT INTO conversion_queue(id, item_json, position) VALUES('old-writer', '{}', 1)",
+            [],
+        ).is_err(), "old-name INSERT must fail after activation");
+        assert!(conn.execute("DELETE FROM conversion_queue WHERE id='legacy-a'", []).is_err(),
+            "old-name DELETE must fail after activation");
+    }
+
+    #[test]
+    fn empty_queue_session_creates_no_durable_scope_history() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("empty queue tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open v24 database");
+
+        let loaded = db.load_queue_items().expect("empty queue load");
+        assert!(loaded.items.is_empty());
+        db.sync_queue(&[]).expect("empty queue sync");
+
+        let scopes: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM conversion_queue_scopes",
+            [],
+            |row| row.get(0),
+        ).expect("count queue scopes");
+        let rows: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM conversion_queue_v24",
+            [],
+            |row| row.get(0),
+        ).expect("count queue rows");
+        assert_eq!(scopes, 0, "browsing/empty sessions must not create durable queue scopes");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn execution_coordinator_activates_only_the_selected_item() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("execution coordinator tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open v24 database");
+        let first = queue_item(
+            "exec-a",
+            "/music/exec-a.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        let second = queue_item(
+            "exec-b",
+            "/music/exec-b.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db.sync_queue(&[&first, &second])
+            .expect("persist crash-fence rows");
+
+        let coordinator = db
+            .queue_execution_coordinator()
+            .expect("create execution coordinator");
+        coordinator
+            .begin_processing(&first.id)
+            .expect("activate selected item");
+
+        let scope = db.ensure_queue_scope().expect("queue scope").scope_id.to_string();
+        let first_row: (String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                params![scope, first.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read activated item");
+        let second_row: (String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                params![scope, second.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read untouched item");
+
+        assert!(first_row.0.contains("Processing"));
+        assert!(first_row.1.is_some(), "selected item must own QueueExecution");
+        assert!(second_row.0.contains("Interrupted"));
+        assert!(second_row.1.is_none(), "unselected item must not acquire QueueExecution");
+        assert!(crate::concurrency::runtime_execution_id(&first.id).is_some());
+        assert!(crate::concurrency::runtime_execution_id(&second.id).is_none());
+
+        db.sync_queue(&[&second])
+            .expect("retire selected execution after test");
+        assert!(crate::concurrency::runtime_execution_id(&first.id).is_none());
+    }
+
+    #[test]
+    fn concurrent_queue_scope_process_child() {
+        let Some(db_path) = std::env::var_os(QUEUE_SCOPE_PROCESS_DB_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let id = std::env::var(QUEUE_SCOPE_PROCESS_ID_ENV).expect("queue child id");
+        let ready = PathBuf::from(std::env::var_os(QUEUE_SCOPE_PROCESS_READY_ENV).expect("queue child ready"));
+        let release = PathBuf::from(std::env::var_os(QUEUE_SCOPE_PROCESS_RELEASE_ENV).expect("queue child release"));
+        let db = Database::open_path(&db_path).expect("queue child opens v24 database");
+        let item = queue_item(&id, &format!("/music/{id}.flac"), crate::convert::ConversionStatus::Paused);
+        db.sync_queue(&[&item]).expect("queue child publishes its own scope");
+        std::fs::write(&ready, id.as_bytes()).expect("queue child ready marker");
+        let started = std::time::Instant::now();
+        while !release.exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(15), "queue child release timeout");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // `db` (and therefore its QueueScope lease) deliberately lives until
+        // after the parent has proved both independent rows coexist.
+        drop(db);
+    }
+
+    #[test]
+    fn concurrent_queue_scopes_preserve_rows_and_recover_in_scope_order() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("queue process tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        // Activate v24 before children start so this test exercises scoped
+        // concurrency rather than migration arbitration.
+        drop(Database::open_path(&db_path).expect("initialize v24 database"));
+        let current_exe = std::env::current_exe().expect("test executable");
+        let mut children = Vec::new();
+        for id in ["child-a", "child-b"] {
+            let ready = temp.path().join(format!("{id}.ready"));
+            let release = temp.path().join(format!("{id}.release"));
+            let child = std::process::Command::new(&current_exe)
+                .arg("--exact")
+                .arg("db::tests::concurrent_queue_scope_process_child")
+                .arg("--nocapture")
+                .env(QUEUE_SCOPE_PROCESS_DB_ENV, &db_path)
+                .env(QUEUE_SCOPE_PROCESS_ID_ENV, id)
+                .env(QUEUE_SCOPE_PROCESS_READY_ENV, &ready)
+                .env(QUEUE_SCOPE_PROCESS_RELEASE_ENV, &release)
+                .env("TONEPOET_CONCURRENCY_DIR", crate::concurrency::coordination_root())
+                .env("TONEPOET_TEST_CONCURRENCY_DIR_INHERIT", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap_or_else(|error| panic!("spawn queue child {id}: {error}"));
+            children.push((id.to_string(), ready, release, child));
+        }
+        for (_, ready, _, _) in &children {
+            let started = std::time::Instant::now();
+            while !ready.exists() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(15), "ready timeout {}", ready.display());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let db = Database::open_path(&db_path).expect("parent open");
+        let live_rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM conversion_queue_v24", [], |row| row.get(0)).unwrap();
+        let live_scopes: i64 = db.conn.query_row("SELECT COUNT(*) FROM conversion_queue_scopes", [], |row| row.get(0)).unwrap();
+        assert_eq!(live_rows, 2, "independent live queue rows must not overwrite each other");
+        assert_eq!(live_scopes, 2, "each live child owns a distinct scope");
+
+        let mut order_stmt = db.conn.prepare(
+            "SELECT q.id FROM conversion_queue_scopes s JOIN conversion_queue_v24 q ON q.owner_scope=s.scope_uuid ORDER BY s.scope_order, q.position, q.id"
+        ).unwrap();
+        let expected_children = order_stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        drop(order_stmt);
+        assert_eq!(expected_children.len(), 2);
+
+        let parent = queue_item("parent", "/music/parent.flac", crate::convert::ConversionStatus::Paused);
+        db.sync_queue(&[&parent]).expect("parent publishes independent scope");
+        let after_parent: i64 = db.conn.query_row("SELECT COUNT(*) FROM conversion_queue_v24", [], |row| row.get(0)).unwrap();
+        assert_eq!(after_parent, 3);
+
+        for (_, _, release, _) in &children {
+            std::fs::write(release, b"go").expect("release queue child");
+        }
+        for (id, _, _, child) in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "queue child {id} failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        let recovered = db.load_queue_items().expect("recover dead scopes").items;
+        let mut expected = vec!["parent".to_string()];
+        expected.extend(expected_children);
+        assert_eq!(recovered.into_iter().map(|item| item.id).collect::<Vec<_>>(), expected);
+        let one_scope: i64 = db.conn.query_row("SELECT COUNT(*) FROM conversion_queue_scopes", [], |row| row.get(0)).unwrap();
+        assert_eq!(one_scope, 1, "fully adopted dead scopes retire after recovery commit");
     }
 
     #[test]
@@ -5128,6 +6304,7 @@ mod tests {
 
     #[test]
     fn v23_migrates_queue_order_and_initializes_existing_authority_markers() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tonepoet.db");
         {
@@ -5163,7 +6340,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read migrated version");
-        assert_eq!(version, 23);
+        assert_eq!(version, CURRENT_VERSION);
 
         let positions = {
             let mut statement = db
@@ -5247,6 +6424,7 @@ mod tests {
 
     #[test]
     fn v23_empty_authorities_import_once_then_mark_done() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tonepoet.db");
         {
@@ -5466,6 +6644,7 @@ mod tests {
 
     #[test]
     fn queue_sync_round_trips_order_and_only_writes_changed_rows() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let mut items = vec![
             queue_item("A", "/music/a.flac", crate::convert::ConversionStatus::Paused),
@@ -5501,19 +6680,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_processing_is_persisted_as_interrupted_without_stale_progress() {
+    fn live_scope_processing_round_trips_without_restart_reclassification() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
-        let mut completed = queue_item(
-            "A",
-            "/music/a.flac",
-            crate::convert::ConversionStatus::Completed {
-                output_path: PathBuf::from("/out/a.flac"),
-                log_path: None,
-                warning_count: 0,
-            },
-        );
-        completed.completed_at = Some(chrono::Utc::now());
-        let mut processing_b = queue_item(
+        let mut processing = queue_item(
             "B",
             "/music/b.flac",
             crate::convert::ConversionStatus::Processing {
@@ -5524,8 +6694,8 @@ mod tests {
                 phase_progress: Some(0.75),
             },
         );
-        processing_b.started_at = Some(chrono::Utc::now());
-        processing_b.active_tracks.insert(
+        processing.started_at = Some(chrono::Utc::now());
+        processing.active_tracks.insert(
             4,
             crate::convert::queue::TrackProgress {
                 track_label: "Track 5".to_string(),
@@ -5534,53 +6704,25 @@ mod tests {
                 epoch: 99,
             },
         );
-        let mut processing_c = queue_item(
-            "C",
-            "/music/c.flac",
-            crate::convert::ConversionStatus::Processing {
-                progress: 12.0,
-                message: Some("decoding".to_string()),
-                file_progress: None,
-                phase: None,
-                phase_progress: None,
-            },
-        );
-        processing_c.started_at = Some(chrono::Utc::now());
-        let items = vec![completed, processing_b, processing_c];
 
-        db.sync_queue(&items.iter().collect::<Vec<_>>())
-            .expect("persist processing snapshot");
-        let loaded = db.load_queue_items().expect("reload queue").items;
-        assert_eq!(
-            loaded.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
-            vec!["A", "B", "C"]
-        );
-        for item in &loaded[1..] {
-            assert_eq!(item.status, crate::convert::ConversionStatus::Interrupted);
-            assert!(item.can_retry());
-            assert!(item.started_at.is_none());
-            assert!(item.completed_at.is_none());
-            assert!(item.active_tracks.is_empty());
-            assert!(item.closed_track_epochs.is_empty());
-        }
+        db.sync_queue(&[&processing]).expect("persist live processing snapshot");
+        let loaded = db.load_queue_items().expect("reload live scope queue").items;
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].status, crate::convert::ConversionStatus::Processing { .. }));
+        assert!(loaded[0].started_at.is_some());
 
-        let raw_b: String = db
-            .conn
-            .query_row(
-                "SELECT item_json FROM conversion_queue WHERE id = 'B'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read persisted B");
-        let value: serde_json::Value = serde_json::from_str(&raw_b).expect("decode persisted B");
-        assert_eq!(value.get("status"), Some(&serde_json::Value::String("Interrupted".into())));
-        assert!(value.get("active_tracks").is_none());
-        assert!(value.get("closed_track_epochs").is_none());
-        assert!(value.get("started_at").is_some_and(serde_json::Value::is_null));
+        let scope = db.ensure_queue_scope().expect("scope").scope_id.to_string();
+        let raw: String = db.conn.query_row(
+            "SELECT item_json FROM conversion_queue_v24 WHERE owner_scope=?1 AND id='B'",
+            [scope],
+            |row| row.get(0),
+        ).expect("read scoped Processing row");
+        assert!(raw.contains("Processing"));
     }
 
     #[test]
     fn queue_cancelled_partial_and_offline_dotdot_names_survive_restart() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let cancelled = queue_item(
             "cancelled",
@@ -5614,9 +6756,10 @@ mod tests {
 
     #[test]
     fn queue_whole_query_failure_is_distinct_from_empty() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         db.conn
-            .execute("DROP TABLE conversion_queue", [])
+            .execute("DROP TABLE conversion_queue_v24", [])
             .expect("drop queue table");
         let error = db
             .load_queue_items()
@@ -5625,7 +6768,8 @@ mod tests {
     }
 
     #[test]
-    fn queue_maintenance_transaction_failure_surfaces_without_hiding_loaded_work() {
+    fn live_processing_queue_row_is_not_rewritten_by_load() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("database");
         let processing = queue_item(
             "processing",
@@ -5638,53 +6782,28 @@ mod tests {
                 phase_progress: Some(0.42),
             },
         );
-        let json = serde_json::to_string(&processing).expect("serialize processing row");
-        db.conn
-            .execute(
-                "INSERT INTO conversion_queue (id, item_json, position) VALUES (?1, ?2, 0)",
-                params![processing.id, json],
-            )
-            .expect("seed legacy processing row");
-        db.conn
-            .execute_batch(
-                "CREATE TRIGGER reject_queue_maintenance
-                 BEFORE UPDATE ON conversion_queue
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected maintenance failure');
-                 END;",
-            )
-            .expect("install maintenance failure trigger");
+        db.sync_queue(&[&processing]).expect("persist live processing row");
 
-        let outcome = db
-            .load_queue_items()
-            .expect("authoritative rows should still load");
+        let outcome = db.load_queue_items().expect("load current live scope");
         assert_eq!(outcome.items.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             outcome.items[0].status,
-            crate::convert::ConversionStatus::Interrupted
-        );
-        assert!(outcome.items[0].can_retry());
-        assert!(
-            outcome
-                .degradation
-                .as_deref()
-                .is_some_and(|message| message.contains("maintenance publication failed")),
-            "the failed reconciliation transaction must be surfaced to startup"
-        );
+            crate::convert::ConversionStatus::Processing { .. }
+        ));
+        assert!(outcome.degradation.is_none());
 
-        let raw: String = db
-            .conn
-            .query_row(
-                "SELECT item_json FROM conversion_queue WHERE id = 'processing'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read unchanged durable row");
+        let scope = db.ensure_queue_scope().expect("scope").scope_id.to_string();
+        let raw: String = db.conn.query_row(
+            "SELECT item_json FROM conversion_queue_v24 WHERE owner_scope=?1 AND id='processing'",
+            [scope],
+            |row| row.get(0),
+        ).expect("read live durable row");
         assert!(raw.contains("Processing"));
     }
 
     #[test]
     fn retryable_terminal_queue_row_keeps_secret_reference_across_reload() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let db = Database::open_memory().expect("database");
         let mut failed = queue_item(
@@ -5714,6 +6833,7 @@ mod tests {
 
     #[test]
     fn failed_queue_publication_never_retires_the_only_secret_reference() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _backend = crate::secret_store::enable_insecure_test_backend();
         let db = Database::open_memory().expect("database");
         let mut item = queue_item(
@@ -5734,7 +6854,7 @@ mod tests {
             warning_count: 0,
         };
         db.conn
-            .execute("DROP TABLE conversion_queue", [])
+            .execute("DROP TABLE conversion_queue_v24", [])
             .expect("force queue publication failure");
         assert!(db.sync_queue(&[&item]).is_err());
         assert_eq!(
@@ -5975,6 +7095,7 @@ mod tests {
 
     #[test]
     fn committed_cleanup_failure_preserves_new_bytes_during_later_recovery() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6025,6 +7146,7 @@ mod tests {
 
     #[test]
     fn committed_journal_delete_failure_preserves_new_bytes_and_recovery_never_restores() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6074,6 +7196,7 @@ mod tests {
 
     #[test]
     fn rolled_back_journal_delete_failure_retains_terminal_state_without_reapplying_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6125,6 +7248,7 @@ mod tests {
 
     #[test]
     fn allocating_recovery_retires_marker_without_replacing_destination() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6152,6 +7276,7 @@ mod tests {
 
     #[test]
     fn rolled_back_terminal_recovery_never_reapplies_stale_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6228,6 +7353,7 @@ mod tests {
 
     #[test]
     fn stale_metadata_recovery_restores_exact_bytes_and_clears_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6247,7 +7373,136 @@ mod tests {
     }
 
     #[test]
+    fn stale_prepared_metadata_recovery_defers_while_conversion_read_claim_is_live() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.opus");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated bytes").expect("write destination");
+        std::fs::write(&backup, b"original bytes").expect("write rollback marker");
+        db.begin_metadata_write(&original.display().to_string(), &backup.display().to_string())
+            .expect("begin prepared journal");
+
+        let competing = crate::concurrency::PathClaim::resolve(
+            &original,
+            crate::concurrency::ClaimMode::Read,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("conversion read claim");
+        let live = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing])
+            .expect("hold competing conversion read");
+
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("RECOVERY DEFERRED"));
+        assert_eq!(std::fs::read(&original).expect("destination unchanged"), b"partially mutated bytes");
+        assert!(backup.exists(), "busy recovery must retain rollback marker");
+        let entries = db.metadata_journal_entries().expect("read retained journal");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, METADATA_STATE_PREPARED);
+
+        drop(live);
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("Recovered:"));
+        assert_eq!(std::fs::read(&original).expect("read restored destination"), b"original bytes");
+        assert!(!backup.exists());
+        assert!(db.metadata_journal_entries().expect("journal retired").is_empty());
+    }
+
+    #[test]
+    fn stale_prepared_metadata_recovery_defers_while_file_operation_write_claim_is_live() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let db = Database::open_memory().expect("memory database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original = temp.path().join("track.mp3");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&original, b"partially mutated bytes").expect("write destination");
+        std::fs::write(&backup, b"original bytes").expect("write rollback marker");
+        db.begin_metadata_write(&original.display().to_string(), &backup.display().to_string())
+            .expect("begin prepared journal");
+
+        let competing = crate::concurrency::PathClaim::resolve_with_semantics(
+            &original,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("file-operation write claim");
+        let live = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing])
+            .expect("hold competing file-operation write");
+
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("RECOVERY DEFERRED"));
+        assert_eq!(std::fs::read(&original).expect("destination unchanged"), b"partially mutated bytes");
+        assert!(backup.exists());
+        assert_eq!(
+            db.metadata_journal_entries().expect("journal remains")[0].state,
+            METADATA_STATE_PREPARED,
+        );
+
+        drop(live);
+        let messages = db.recover_stale_metadata_writes();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(std::fs::read(&original).expect("read restored destination"), b"original bytes");
+        assert!(!backup.exists());
+        assert!(db.metadata_journal_entries().expect("journal retired").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_stale_restore_stays_on_original_parent_target_after_external_alias_rebind() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_a = temp.path().join("real-a");
+        let real_b = temp.path().join("real-b");
+        std::fs::create_dir_all(&real_a).expect("create real-a");
+        std::fs::create_dir_all(&real_b).expect("create real-b");
+        let alias = temp.path().join("current");
+        symlink(&real_a, &alias).expect("create alias");
+        let original = alias.join("track.opus");
+        let real_a_file = real_a.join("track.opus");
+        let real_b_file = real_b.join("track.opus");
+        std::fs::write(&real_a_file, b"mutated-a").expect("write real-a destination");
+        std::fs::write(&real_b_file, b"must-stay-b").expect("write real-b destination");
+        let backup = Database::backup_path_for(&original);
+        std::fs::write(&backup, b"saved-original-a").expect("write rollback marker through alias");
+
+        let (claim, guard) = Database::admit_stale_metadata_restore(&original)
+            .expect("admit restore before external rebind");
+        let admitted_backup = crate::concurrency::ResolvedPathIdentity::resolve_with_semantics(
+            &backup,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("stabilize rollback marker")
+        .resolved_io_path;
+        assert_eq!(claim.identity.resolved_io_path, real_a_file);
+        assert!(admitted_backup.starts_with(&real_a));
+
+        // Simulate an actor outside the Tonepoet registry. Protocol-aware peers
+        // would be blocked by the parent-alias READ dependency.
+        std::fs::remove_file(&alias).expect("remove alias out of protocol");
+        symlink(&real_b, &alias).expect("rebind alias out of protocol");
+
+        Database::copy_backup_over_admitted(
+            &original,
+            &claim.identity.resolved_io_path,
+            &admitted_backup,
+        )
+        .expect("restore admitted target");
+        drop(guard);
+
+        assert_eq!(std::fs::read(&real_a_file).expect("read real-a"), b"saved-original-a");
+        assert_eq!(std::fs::read(&real_b_file).expect("read real-b"), b"must-stay-b");
+    }
+
+    #[test]
     fn stale_metadata_recovery_failure_retains_journal_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");
@@ -6283,6 +7538,7 @@ mod tests {
 
     #[test]
     fn stale_metadata_recovery_missing_marker_reports_failure_and_retains_blocking_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let db = Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("track.opus");

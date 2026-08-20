@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Once;
+use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics};
 
 /// Audio stream information from probing
 #[derive(Debug, Clone)]
@@ -860,6 +861,7 @@ fn preemphasis_metadata_check(
 
 mod flac_metadata_writer {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, OwnerProcessIdentity, PathClaim};
     use std::path::{Path, PathBuf};
 
     #[cfg(unix)]
@@ -1115,15 +1117,24 @@ mod flac_metadata_writer {
         claim_token: u64,
         active: bool,
         reentrant: bool,
+        // Cross-session mutation admission is held for the same lifetime as
+        // the existing metadata write authority. Reentrant nested writes rely
+        // on the outer guard instead of reacquiring it.
+        _mutation_claim: Option<MutationClaimGuard>,
     }
 
     impl FlacWriteClaim {
         fn reentrant(lock_path: PathBuf, canonical_path: PathBuf, claim_token: u64) -> Self {
-            Self { lock_path, canonical_path, claim_token, active: true, reentrant: true }
+            Self { lock_path, canonical_path, claim_token, active: true, reentrant: true, _mutation_claim: None }
         }
 
-        fn acquired(lock_path: PathBuf, canonical_path: PathBuf, claim_token: u64) -> Self {
-            Self { lock_path, canonical_path, claim_token, active: true, reentrant: false }
+        fn acquired(
+            lock_path: PathBuf,
+            canonical_path: PathBuf,
+            claim_token: u64,
+            mutation_claim: Option<MutationClaimGuard>,
+        ) -> Self {
+            Self { lock_path, canonical_path, claim_token, active: true, reentrant: false, _mutation_claim: mutation_claim }
         }
 
         fn claim_token(&self) -> u64 {
@@ -1154,8 +1165,7 @@ mod flac_metadata_writer {
             if self.reentrant {
                 return None;
             }
-            self.release_process_claim();
-            match std::fs::remove_file(&self.lock_path) {
+            let warning = match std::fs::remove_file(&self.lock_path) {
                 Ok(()) => post_commit_parent_sync_warning(&self.lock_path, context),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(format!(
                     "FLAC native write for '{}' committed, but common write lock '{}' was already absent during cleanup. The file mutation is complete; this may indicate an external cleanup race, so later recovery/read guards should be allowed to verify the file before further writes.",
@@ -1167,7 +1177,18 @@ mod flac_metadata_writer {
                     self.canonical_path.display(),
                     self.lock_path.display()
                 )),
-            }
+            };
+            // Teardown is the reverse of admission. Keep the process-local
+            // reservation authoritative while native lock cleanup can block or
+            // yield, so another thread still observes the established native
+            // FLAC contention error rather than falling through to the broader
+            // shared mutation claim. Keep the shared claim until native lock
+            // cleanup is complete so cross-process exclusion also remains
+            // continuous. Only then retire shared authority and finally make
+            // the local writer slot available to the next same-process writer.
+            self._mutation_claim.take();
+            self.release_process_claim();
+            warning
         }
 
         fn release_best_effort(&mut self) {
@@ -1178,7 +1199,6 @@ mod flac_metadata_writer {
             if self.reentrant {
                 return;
             }
-            self.release_process_claim();
             match std::fs::remove_file(&self.lock_path) {
                 Ok(()) => {
                     let _ = sync_parent_dir(&self.lock_path, "FLAC common write lock removal");
@@ -1186,6 +1206,8 @@ mod flac_metadata_writer {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => {}
             }
+            self._mutation_claim.take();
+            self.release_process_claim();
         }
     }
 
@@ -3241,21 +3263,64 @@ mod flac_metadata_writer {
         if let Some(claim_token) = current_common_write_claim_token_for_canonical(&canonical_path) {
             return Ok(FlacWriteClaim::reentrant(lock_path, canonical_path, claim_token));
         }
+        let required_claim = PathClaim::resolve_with_semantics(
+            path,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )?;
         let lock_set = COMMON_WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         {
+            // Reserve the process-local FLAC writer slot before asking the
+            // cross-process registry for authority. This keeps same-process
+            // contention on the long-standing native write-lock contract even
+            // when two threads arrive between the registry scan and local-lock
+            // publication. The reservation is rolled back on every admission
+            // failure below, so it cannot outlive unsuccessful shared claims.
             let mut lock_set = lock_set
                 .lock()
                 .map_err(|_| format!("acquire FLAC common write lock for '{}': process-local lock table is poisoned", path.display()))?;
-            if lock_set.contains(&canonical_path) {
+            if !lock_set.insert(canonical_path.clone()) {
                 return Err(format!(
                     "cannot start native FLAC {operation} for '{}': another metadata/artwork mutation for the same FLAC is already in progress in this process",
                     path.display()
                 ));
             }
-            lock_set.insert(canonical_path.clone());
         }
+        let already_authorized = match crate::concurrency::current_mutation_authority_covers(&required_claim) {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                if let Ok(mut lock_set) = lock_set.lock() {
+                    lock_set.remove(&canonical_path);
+                }
+                return Err(error);
+            }
+        };
+        let mutation_claim = if already_authorized {
+            None
+        } else {
+            match MutationClaimGuard::acquire_ephemeral(vec![required_claim.clone()]) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    if let Ok(mut lock_set) = lock_set.lock() {
+                        lock_set.remove(&canonical_path);
+                    }
+                    return Err(format!(
+                        "cannot start metadata {operation} for '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        };
 
-        let result = acquire_common_write_claim_on_disk(path, &lock_path, operation, &canonical_path);
+        let result = acquire_common_write_claim_on_disk(
+            path,
+            &lock_path,
+            operation,
+            &canonical_path,
+            mutation_claim,
+            &required_claim,
+        );
         match result {
             Ok(claim) => Ok(claim),
             Err(err) => {
@@ -3272,6 +3337,8 @@ mod flac_metadata_writer {
         lock_path: &Path,
         operation: &str,
         canonical_path: &Path,
+        mutation_claim: Option<MutationClaimGuard>,
+        required_claim: &PathClaim,
     ) -> Result<FlacWriteClaim, String> {
         let mut retried_after_stale_recovery = false;
         loop {
@@ -3282,7 +3349,7 @@ mod flac_metadata_writer {
                         canonical_path: canonical_path.to_path_buf(),
                         claim_token,
                     }));
-                    return Ok(FlacWriteClaim::acquired(lock_path.to_path_buf(), canonical_path.to_path_buf(), claim_token));
+                    return Ok(FlacWriteClaim::acquired(lock_path.to_path_buf(), canonical_path.to_path_buf(), claim_token, mutation_claim));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     if retried_after_stale_recovery {
@@ -3293,7 +3360,15 @@ mod flac_metadata_writer {
                         ));
                     }
                     retried_after_stale_recovery = true;
-                    match recover_common_write_lock(path)? {
+                    let recovery = if mutation_claim.is_some() {
+                        crate::concurrency::with_scoped_mutation_claims(
+                            std::slice::from_ref(required_claim),
+                            || recover_common_write_lock(path),
+                        )
+                    } else {
+                        recover_common_write_lock(path)
+                    }?;
+                    match recovery {
                         MetadataJournalRecovery::NoJournal | MetadataJournalRecovery::RecoveredOrCleaned => continue,
                         MetadataJournalRecovery::ActiveOwner => {
                             return Err(format!(
@@ -3416,7 +3491,7 @@ mod flac_metadata_writer {
             MetadataJournalRecovery::ActiveOwner => return Ok(MetadataJournalRecovery::ActiveOwner),
             MetadataJournalRecovery::NoJournal | MetadataJournalRecovery::RecoveredOrCleaned => {}
         }
-        match recover_artwork_rollback_journal_for_claim(path)? {
+        match recover_artwork_rollback_journal_for_common_lock_recovery(path)? {
             MetadataJournalRecovery::ActiveOwner => return Ok(MetadataJournalRecovery::ActiveOwner),
             MetadataJournalRecovery::NoJournal | MetadataJournalRecovery::RecoveredOrCleaned => {}
         }
@@ -3553,10 +3628,27 @@ mod flac_metadata_writer {
     }
 
     fn recover_artwork_rollback_journal_for_claim(path: &Path) -> Result<MetadataJournalRecovery, String> {
-        recover_artwork_rollback_journal_for_claim_with_token(path).map(|(status, _claim_token)| status)
+        recover_artwork_rollback_journal_for_claim_with_token_internal(path, false)
+            .map(|(status, _claim_token)| status)
     }
 
-    fn recover_artwork_rollback_journal_for_claim_with_token(path: &Path) -> Result<(MetadataJournalRecovery, Option<u64>), String> {
+    fn recover_artwork_rollback_journal_for_common_lock_recovery(
+        path: &Path,
+    ) -> Result<MetadataJournalRecovery, String> {
+        recover_artwork_rollback_journal_for_claim_with_token_internal(path, true)
+            .map(|(status, _claim_token)| status)
+    }
+
+    fn recover_artwork_rollback_journal_for_claim_with_token(
+        path: &Path,
+    ) -> Result<(MetadataJournalRecovery, Option<u64>), String> {
+        recover_artwork_rollback_journal_for_claim_with_token_internal(path, false)
+    }
+
+    fn recover_artwork_rollback_journal_for_claim_with_token_internal(
+        path: &Path,
+        recovering_stale_common_lock: bool,
+    ) -> Result<(MetadataJournalRecovery, Option<u64>), String> {
         let journal = artwork_rollback_journal_path(path);
         if !journal.exists() {
             return Ok((MetadataJournalRecovery::NoJournal, None));
@@ -3570,7 +3662,7 @@ mod flac_metadata_writer {
         if record.owner.appears_active() {
             return Ok((MetadataJournalRecovery::ActiveOwner, (record.claim_token != 0).then_some(record.claim_token)));
         }
-        recover_artwork_rollback_journal(path)?;
+        recover_artwork_rollback_journal_internal(path, recovering_stale_common_lock)?;
         Ok((MetadataJournalRecovery::RecoveredOrCleaned, None))
     }
 
@@ -3706,57 +3798,8 @@ mod flac_metadata_writer {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct OwnerProcessIdentity {
-        pid: u64,
-        start_ticks: u64,
-        boot_id_hash: u64,
-        process_token: u64,
-    }
-
-    fn push_owner_identity(out: &mut Vec<u8>, owner: OwnerProcessIdentity) {
-        push_le_u64(out, owner.pid);
-        push_le_u64(out, owner.start_ticks);
-        push_le_u64(out, owner.boot_id_hash);
-        push_le_u64(out, owner.process_token);
-    }
-
-    impl OwnerProcessIdentity {
-        fn current() -> Self {
-            let pid = std::process::id();
-            Self {
-                pid: pid as u64,
-                start_ticks: process_start_ticks(pid).unwrap_or(0),
-                boot_id_hash: boot_id_hash().unwrap_or(0),
-                process_token: process_instance_token(),
-            }
-        }
-
-        fn appears_active(self) -> bool {
-            if self.pid == 0 {
-                return false;
-            }
-            let Ok(pid) = u32::try_from(self.pid) else {
-                return false;
-            };
-            if pid == std::process::id()
-                && self.process_token != 0
-                && self.process_token == process_instance_token()
-            {
-                return true;
-            }
-            if self.start_ticks == 0 || self.boot_id_hash == 0 {
-                return false;
-            }
-            let Some(current_boot) = boot_id_hash() else {
-                return false;
-            };
-            if current_boot != self.boot_id_hash {
-                return false;
-            }
-            process_start_ticks(pid) == Some(self.start_ticks)
-        }
-    }
+    // Strong owner identity is shared with the cross-session lease protocol;
+    // the metadata lock keeps its existing wire layout and liveness behavior.
 
     fn new_claim_token() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -4031,6 +4074,13 @@ mod flac_metadata_writer {
     }
 
     fn recover_artwork_rollback_journal(path: &Path) -> Result<(), String> {
+        recover_artwork_rollback_journal_internal(path, false)
+    }
+
+    fn recover_artwork_rollback_journal_internal(
+        path: &Path,
+        recovering_stale_common_lock: bool,
+    ) -> Result<(), String> {
         let journal = artwork_rollback_journal_path(path);
         if !journal.exists() {
             return Ok(());
@@ -4050,19 +4100,63 @@ mod flac_metadata_writer {
         let current = match read_flac_metadata(path) {
             Ok(current) => current,
             Err(parse_err) => {
-                let Some(audio_start) = record.recovery_audio_start_for_unparseable_current(&current_file_meta) else {
+                let Some(_pre_admission_audio_start) =
+                    record.recovery_audio_start_for_unparseable_current(&current_file_meta)
+                else {
                     return Err(format!(
                         "refusing FLAC artwork rollback recovery for '{}': current metadata cannot be parsed and the file no longer matches a journaled recoverable identity: {parse_err}",
                         path.display()
                     ));
                 };
+                let recovery_authority = acquire_flac_recovery_mutation_authority(
+                    path,
+                    "artwork rollback restore",
+                )?;
+                let admitted_path = recovery_authority.admitted_path.clone();
+                validate_artwork_rollback_target_path(&admitted_path, &record)?;
+                let admitted_file_meta = std::fs::metadata(&admitted_path).map_err(|err| {
+                    format!(
+                        "stat FLAC after shared artwork-recovery admission '{}': {err}",
+                        admitted_path.display()
+                    )
+                })?;
+                let Some(audio_start) =
+                    record.recovery_audio_start_for_unparseable_current(&admitted_file_meta)
+                else {
+                    return Err(format!(
+                        "refusing FLAC artwork rollback recovery for '{}': file identity changed while shared mutation admission was being acquired",
+                        admitted_path.display()
+                    ));
+                };
+                // If the file became parseable before admission, restart on
+                // the parsed recovery path while retaining the admitted shared
+                // authority. In stale-common-lock recovery that parsed path
+                // must not recursively acquire the lock it is already retiring.
+                if read_flac_metadata(&admitted_path).is_ok() {
+                    let recovery_claim = recovery_authority.claim.clone();
+                    return crate::concurrency::with_scoped_mutation_claims(
+                        std::slice::from_ref(&recovery_claim),
+                        || recover_artwork_rollback_journal_internal(
+                            &admitted_path,
+                            recovering_stale_common_lock,
+                        ),
+                    );
+                }
                 let snapshot = FlacMetadataSnapshot {
                     stream_offset: record.stream_offset,
                     audio_start: record.audio_start,
                     raw_metadata_region: record.raw_metadata_region.clone(),
                 };
-                restore_metadata_snapshot_from_audio_start(path, &snapshot, audio_start)?;
-                remove_artwork_rollback_journal(path)?;
+                let recovery_claim = recovery_authority.claim.clone();
+                crate::concurrency::with_scoped_mutation_claims(
+                    std::slice::from_ref(&recovery_claim),
+                    || restore_metadata_snapshot_from_audio_start(
+                        &admitted_path,
+                        &snapshot,
+                        audio_start,
+                    ),
+                )?;
+                remove_artwork_rollback_journal(&admitted_path)?;
                 return Ok(());
             }
         };
@@ -4095,6 +4189,74 @@ mod flac_metadata_writer {
                 "refusing FLAC artwork rollback recovery for '{}': current file no longer matches either the journaled original metadata or the intended artwork mutation",
                 path.display()
             ));
+        }
+
+        if recovering_stale_common_lock {
+            // The stale disk common-lock has already been proven ownerless.
+            // Acquire/reuse only the shared path capability here and restore
+            // directly; recursively acquiring the common lock would re-enter
+            // the very stale lock this branch is retiring.
+            let recovery_authority = acquire_flac_recovery_mutation_authority(
+                path,
+                "artwork rollback restore",
+            )?;
+            let admitted_path = recovery_authority.admitted_path.clone();
+            validate_artwork_rollback_target_path(&admitted_path, &record)?;
+            let admitted_file_meta = std::fs::metadata(&admitted_path).map_err(|err| {
+                format!(
+                    "stat FLAC after shared artwork-recovery admission '{}': {err}",
+                    admitted_path.display()
+                )
+            })?;
+            let admitted_current = read_flac_metadata(&admitted_path).map_err(|err| {
+                format!(
+                    "re-read FLAC metadata after shared artwork-recovery admission '{}': {err}",
+                    admitted_path.display()
+                )
+            })?;
+            if admitted_current.stream_offset != record.stream_offset {
+                return Err(format!(
+                    "refusing FLAC artwork rollback recovery for '{}': FLAC stream offset changed from {} to {} after shared admission",
+                    admitted_path.display(),
+                    record.stream_offset,
+                    admitted_current.stream_offset,
+                ));
+            }
+            let admitted_len = admitted_current.raw_metadata_region.len() as u64;
+            let admitted_checksum = checksum64(&admitted_current.raw_metadata_region);
+            if admitted_len == record.metadata_len
+                && admitted_checksum == record.metadata_checksum
+                && admitted_current.raw_metadata_region == record.raw_metadata_region
+            {
+                remove_artwork_rollback_journal(&admitted_path)?;
+                return Ok(());
+            }
+            if !record.matches_intended_current(
+                &admitted_file_meta,
+                admitted_len,
+                admitted_checksum,
+            ) {
+                return Err(format!(
+                    "refusing FLAC artwork rollback recovery for '{}': file identity changed while shared mutation admission was being acquired",
+                    admitted_path.display()
+                ));
+            }
+            let snapshot = FlacMetadataSnapshot {
+                stream_offset: record.stream_offset,
+                audio_start: record.audio_start,
+                raw_metadata_region: record.raw_metadata_region.clone(),
+            };
+            let recovery_claim = recovery_authority.claim.clone();
+            crate::concurrency::with_scoped_mutation_claims(
+                std::slice::from_ref(&recovery_claim),
+                || restore_metadata_snapshot_from_audio_start(
+                    &admitted_path,
+                    &snapshot,
+                    admitted_current.audio_start,
+                ),
+            )?;
+            remove_artwork_rollback_journal(&admitted_path)?;
+            return Ok(());
         }
 
         let snapshot = FlacMetadataSnapshot {
@@ -4429,6 +4591,41 @@ mod flac_metadata_writer {
         journal.with_extension(format!("artwork-rollback.tmp.{}.{nanos}", std::process::id()))
     }
 
+    struct FlacRecoveryMutationAuthority {
+        claim: PathClaim,
+        admitted_path: PathBuf,
+        _guard: Option<MutationClaimGuard>,
+    }
+
+    fn acquire_flac_recovery_mutation_authority(
+        path: &Path,
+        operation: &str,
+    ) -> Result<FlacRecoveryMutationAuthority, String> {
+        let claim = PathClaim::resolve_with_semantics(
+            path,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::FollowReferent,
+        )?;
+        let already_held = current_common_write_claim_token(path).is_some()
+            || crate::concurrency::current_mutation_authority_covers(&claim)?;
+        let guard = if already_held {
+            None
+        } else {
+            Some(MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).map_err(|error| {
+                format!(
+                    "FLAC {operation} deferred for '{}': shared mutation admission is busy: {error}",
+                    path.display()
+                )
+            })?)
+        };
+        Ok(FlacRecoveryMutationAuthority {
+            admitted_path: claim.identity.resolved_io_path.clone(),
+            claim,
+            _guard: guard,
+        })
+    }
+
     fn recover_metadata_journal_for_read_path(path: &Path) -> Result<(), String> {
         recover_metadata_journal(path)?;
         if let Some(target) = canonical_target_for_symlink_read(path) {
@@ -4556,8 +4753,54 @@ mod flac_metadata_writer {
             }
         }
 
-        overwrite_metadata_region(path, record.stream_offset, &record.raw_metadata_region)?;
-        remove_metadata_journal(path)?;
+        let recovery_authority = acquire_flac_recovery_mutation_authority(
+            path,
+            "metadata-journal restore",
+        )?;
+        let admitted_path = recovery_authority.admitted_path.clone();
+        // The decision to restore can be made from a pre-admission snapshot,
+        // but publication must be tied to the file identity that was actually
+        // admitted. Revalidate after admission before touching user bytes.
+        validate_journal_target(&admitted_path, &record)?;
+        match read_flac_metadata(&admitted_path) {
+            Ok(current) => {
+                if current.stream_offset != record.stream_offset {
+                    return Err(format!(
+                        "refusing FLAC journal recovery for '{}': FLAC stream offset changed from {} to {} after shared admission",
+                        admitted_path.display(),
+                        record.stream_offset,
+                        current.stream_offset,
+                    ));
+                }
+                let current_len = current.raw_metadata_region.len() as u64;
+                let current_checksum = checksum64(&current.raw_metadata_region);
+                if current_len == record.metadata_len && current_checksum == record.metadata_checksum {
+                    remove_metadata_journal(&admitted_path)?;
+                    return Ok(MetadataJournalRecovery::RecoveredOrCleaned);
+                }
+                if let Some((intended_len, intended_checksum)) = record.intended_metadata_identity() {
+                    if current_len == intended_len && current_checksum == intended_checksum {
+                        remove_metadata_journal(&admitted_path)?;
+                        return Ok(MetadataJournalRecovery::RecoveredOrCleaned);
+                    }
+                }
+            }
+            Err(_) => {
+                // A torn metadata region may remain unparsable. The target
+                // identity/length check above and overwrite_metadata_region's
+                // FLAC-magic check are the existing recovery proof.
+            }
+        }
+        let recovery_claim = recovery_authority.claim.clone();
+        crate::concurrency::with_scoped_mutation_claims(
+            std::slice::from_ref(&recovery_claim),
+            || overwrite_metadata_region(
+                &admitted_path,
+                record.stream_offset,
+                &record.raw_metadata_region,
+            ),
+        )?;
+        remove_metadata_journal(&admitted_path)?;
         Ok(MetadataJournalRecovery::RecoveredOrCleaned)
     }
 
@@ -4944,6 +5187,15 @@ mod flac_metadata_writer {
 
     fn push_le_u64(out: &mut Vec<u8>, value: u64) {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    // Serialize an owner identity into the write-lock body in the exact order
+    // the parser reads it back (pid, start_ticks, boot_id_hash, process_token).
+    fn push_owner_identity(out: &mut Vec<u8>, owner: OwnerProcessIdentity) {
+        push_le_u64(out, owner.pid);
+        push_le_u64(out, owner.start_ticks);
+        push_le_u64(out, owner.boot_id_hash);
+        push_le_u64(out, owner.process_token);
     }
 
     fn push_le_i64(out: &mut Vec<u8>, value: i64) {
@@ -5868,6 +6120,28 @@ pub fn write_metadata_field_transactional_with_control_at_verification(
     >,
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, String> {
+    with_single_metadata_path_admission(path, "inline metadata edit", |admitted_path| {
+        write_metadata_field_transactional_with_control_at_verification_admitted(
+            admitted_path,
+            field,
+            value,
+            cancel,
+            byte_progress,
+            verification,
+        )
+    })
+}
+
+fn write_metadata_field_transactional_with_control_at_verification_admitted(
+    path: &Path,
+    field: MetadataField,
+    value: &str,
+    cancel: Option<&MetadataWriteCancelFlag>,
+    byte_progress: Option<
+        &(dyn Fn(&std::path::Path, crate::dsf_tags::DsfWriteProgress) + Send + Sync),
+    >,
+    verification: tui_file_picker::VerificationMode,
+) -> Result<MetadataWriteCommitReport, String> {
     let change = metadata_field_change(field, value)
         .map_err(|error| format!("write failed before mutation: {error}"))?;
     let route = crate::metadata_persistence::metadata_persistence_route_for_path(path);
@@ -6081,6 +6355,7 @@ pub(crate) fn unified_cue_row_shape(
 #[cfg(test)]
 #[test]
 fn unified_cue_row_shape_contract_is_semantic_when_dimensions_are_equal() {
+    let _coordination = crate::concurrency::scoped_test_coordination_root();
     use UnifiedCueAxis::{File, Presentation, Track};
 
     let equal_dimensions = UnifiedCueDimensions {
@@ -9585,7 +9860,7 @@ pub fn apply_audio_tag_changes_with_save_blocks_progress_and_forced_deletes_at_v
             originals: originals.clone(),
         })
         .collect::<Vec<_>>();
-    apply_metadata_editor_tag_changes_internal(
+    apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
         paths,
         &normalized,
         deleted,
@@ -9625,6 +9900,41 @@ pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_fo
     )
 }
 
+pub(crate) fn metadata_editor_mutation_paths_for_batch(
+    paths: &[std::path::PathBuf],
+    entries_snap: &[MetadataEditorTagSnapshot],
+    deleted: &[usize],
+    save_block_reasons: &[Option<String>],
+    forced_deletes: &[(usize, lofty::tag::ItemKey)],
+) -> Vec<std::path::PathBuf> {
+    paths
+        .iter()
+        .enumerate()
+        .filter_map(|(file_idx, path)| {
+            if save_block_reasons
+                .get(file_idx)
+                .and_then(|reason| reason.as_ref())
+                .is_some_and(|reason| !reason.trim().is_empty())
+            {
+                return None;
+            }
+            let entry_change = entries_snap.iter().enumerate().any(|(entry_idx, entry)| {
+                if entry.row_scope == RowScope::Track {
+                    return false;
+                }
+                deleted.contains(&entry_idx)
+                    || (file_idx < entry.values.len()
+                        && file_idx < entry.originals.len()
+                        && entry.values[file_idx] != entry.originals[file_idx])
+            });
+            let forced_delete = forced_deletes
+                .iter()
+                .any(|(target_idx, _)| *target_idx == file_idx);
+            (entry_change || forced_delete).then(|| path.clone())
+        })
+        .collect()
+}
+
 pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_forced_deletes_at_verification(
     paths: &[std::path::PathBuf],
     entries_snap: &[MetadataEditorTagSnapshot],
@@ -9636,17 +9946,49 @@ pub(crate) fn apply_metadata_editor_tag_changes_with_save_blocks_progress_and_fo
     forced_deletes: &[(usize, lofty::tag::ItemKey)],
     verification: tui_file_picker::VerificationMode,
 ) -> Vec<crate::tui::app::MetadataEditorWriteResult> {
-    apply_metadata_editor_tag_changes_internal(
+    let mutation_paths = metadata_editor_mutation_paths_for_batch(
         paths,
         entries_snap,
         deleted,
         save_block_reasons,
-        progress,
-        byte_progress,
-        cancel,
         forced_deletes,
-        verification,
-    )
+    );
+    let admission = match admit_metadata_mutation_paths(&mutation_paths, "metadata-editor member batch") {
+        Ok(admission) => admission,
+        Err(error) => {
+            return paths
+                .iter()
+                .cloned()
+                .map(|path| crate::tui::app::MetadataEditorWriteResult::failed(path, error.clone()))
+                .collect();
+        }
+    };
+    let admitted_paths = paths
+        .iter()
+        .map(|path| {
+            admission
+                .admitted_path(path)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|_| path.clone())
+        })
+        .collect::<Vec<_>>();
+    admission.run(|| {
+        let mut results = apply_metadata_editor_tag_changes_internal(
+            &admitted_paths,
+            entries_snap,
+            deleted,
+            save_block_reasons,
+            progress,
+            byte_progress,
+            cancel,
+            forced_deletes,
+            verification,
+        );
+        for result in &mut results {
+            result.path = admission.logical_path(&result.path);
+        }
+        results
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -10205,6 +10547,11 @@ fn apply_metadata_editor_tag_changes_internal(
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, crate::tui::app::MetadataEditorWriteResult)>::with_capacity(total)));
     let cancel = std::sync::Arc::new(cancel);
+    // The complete metadata mutation set is admitted by the caller on this
+    // blocking thread. Transfer that capability explicitly to the bounded
+    // worker threads so backend writers do not attempt per-file registry
+    // admission against their own outer batch guard.
+    let inherited_mutation_claims = crate::concurrency::current_scoped_mutation_claims();
 
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -10214,7 +10561,10 @@ fn apply_metadata_editor_tag_changes_internal(
             let progress = progress.clone();
             let byte_progress = byte_progress.clone();
             let cancel = std::sync::Arc::clone(&cancel);
-            scope.spawn(move || loop {
+            let inherited_mutation_claims = inherited_mutation_claims.clone();
+            scope.spawn(move || crate::concurrency::with_scoped_mutation_claims(
+                &inherited_mutation_claims,
+                || loop {
                 if cancel.as_ref().as_ref().is_some_and(|flag| flag.is_cancelled()) {
                     break;
                 }
@@ -10262,7 +10612,8 @@ fn apply_metadata_editor_tag_changes_internal(
                     .lock()
                     .expect("metadata write result set poisoned")
                     .push((write.original_index, result));
-            });
+                },
+            ));
         }
     });
 
@@ -10372,6 +10723,121 @@ fn reject_unsupported_dff_metadata_batch(
         reject_unsupported_dff_metadata_write(path, operation)?;
     }
     Ok(())
+}
+
+/// Live shared admission for one user-requested metadata mutation set. Backend
+/// writers retain their existing local locks/journals; this outer guard makes
+/// the complete set visible to other tonepoet sessions before the first write.
+/// NamespaceObject preserves the existing refusal of final symlink metadata
+/// targets while still pinning/dependency-tracking aliases in parent components.
+pub(crate) struct MetadataMutationAdmission {
+    claims: Vec<crate::concurrency::PathClaim>,
+    logical_to_admitted: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    _guard: Option<crate::concurrency::MutationClaimGuard>,
+}
+
+impl MetadataMutationAdmission {
+    pub(crate) fn admitted_path(&self, logical: &std::path::Path) -> Result<&std::path::Path, String> {
+        self.logical_to_admitted
+            .iter()
+            .find_map(|(candidate, admitted)| (candidate == logical).then_some(admitted.as_path()))
+            .ok_or_else(|| format!("metadata admission has no path for '{}'", logical.display()))
+    }
+
+    pub(crate) fn logical_path(&self, admitted: &std::path::Path) -> std::path::PathBuf {
+        self.logical_to_admitted
+            .iter()
+            .find_map(|(logical, candidate)| (candidate == admitted).then_some(logical.clone()))
+            .unwrap_or_else(|| admitted.to_path_buf())
+    }
+
+    pub(crate) fn run<T>(&self, operation: impl FnOnce() -> T) -> T {
+        crate::concurrency::with_scoped_mutation_claims(&self.claims, operation)
+    }
+}
+
+pub(crate) fn admit_metadata_mutation_paths(
+    paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Result<MetadataMutationAdmission, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut claims = Vec::new();
+    let mut logical_to_admitted = Vec::new();
+    for logical in paths {
+        if !seen.insert(logical.clone()) {
+            continue;
+        }
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            logical,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .map_err(|error| format!("{operation} admission for '{}': {error}", logical.display()))?;
+        logical_to_admitted.push((logical.clone(), claim.identity.resolved_io_path.clone()));
+        claims.push(claim);
+    }
+
+    let mut uncovered = Vec::new();
+    for claim in &claims {
+        if !crate::concurrency::current_mutation_authority_covers(claim)? {
+            uncovered.push(claim.clone());
+        }
+    }
+    let guard = if uncovered.is_empty() {
+        None
+    } else {
+        Some(
+            crate::concurrency::MutationClaimGuard::acquire_ephemeral(uncovered)
+                .map_err(|error| format!("{operation} busy: {error}"))?,
+        )
+    };
+    Ok(MetadataMutationAdmission {
+        claims,
+        logical_to_admitted,
+        _guard: guard,
+    })
+}
+
+fn admit_single_metadata_path(
+    path: &std::path::Path,
+    operation: &str,
+) -> Result<MetadataMutationAdmission, String> {
+    admit_metadata_mutation_paths(&[path.to_path_buf()], operation)
+}
+
+/// Run one metadata mutation under the shared admission protocol.
+///
+/// Native FLAC is the one deliberate exception to taking an *outer* ephemeral
+/// claim here: its writer already owns the shared `MutationClaimGuard` and its
+/// long-standing common-write lock, in that order. Taking the generic claim
+/// first inverts that authority stack and lets a competing same-process FLAC
+/// writer fail at the generic registry instead of the native contention gate.
+/// We still resolve the exact namespace object here, then let the native FLAC
+/// writer acquire both local and cross-session authority atomically. Batch
+/// callers that already hold a scoped claim remain covered by that authority.
+fn with_single_metadata_path_admission<T>(
+    path: &std::path::Path,
+    operation: &str,
+    action: impl FnOnce(&std::path::Path) -> Result<T, String>,
+) -> Result<T, String> {
+    if matches!(
+        crate::metadata_persistence::metadata_persistence_route_for_path(path),
+        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+    ) {
+        let claim = crate::concurrency::PathClaim::resolve_with_semantics(
+            path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        )
+        .map_err(|error| format!("{operation} admission for '{}': {error}", path.display()))?;
+        return action(&claim.identity.resolved_io_path);
+    }
+
+    let admission = admit_single_metadata_path(path, operation)?;
+    let admitted_path = admission.admitted_path(path)?.to_path_buf();
+    admission.run(|| action(&admitted_path))
 }
 
 /// Write a batch of tag changes to an audio file.
@@ -10586,23 +11052,25 @@ fn write_editor_tag_changes_with_cancel_report_classified_at_verification(
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
     let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
-    write_editor_tag_changes_with_cancel_report_at_verification(
-        path,
-        changes,
-        operation_cancel.as_ref(),
-        byte_progress,
-        verification,
-    )
-    .map(|mut report| {
-        report
-            .durability_warnings
-            .extend(repeated_instance_loss_warnings(path, changes));
-        report
-            .durability_warnings
-            .extend(unrepresentable_container_warnings(path, changes));
-        report.durability_warnings.sort();
-        report.durability_warnings.dedup();
-        report
+    with_single_metadata_path_admission(path, "metadata editor write", |admitted_path| {
+        write_editor_tag_changes_with_cancel_report_at_verification(
+            admitted_path,
+            changes,
+            operation_cancel.as_ref(),
+            byte_progress,
+            verification,
+        )
+        .map(|mut report| {
+            report
+                .durability_warnings
+                .extend(repeated_instance_loss_warnings(path, changes));
+            report
+                .durability_warnings
+                .extend(unrepresentable_container_warnings(path, changes));
+            report.durability_warnings.sort();
+            report.durability_warnings.dedup();
+            report
+        })
     })
     .map_err(|message| {
         if operation_cancel
@@ -10775,23 +11243,25 @@ fn write_all_tags_with_cancel_report_classified_at_verification(
     verification: tui_file_picker::VerificationMode,
 ) -> Result<MetadataWriteCommitReport, MetadataWriteFailure> {
     let operation_cancel = cancel.map(MetadataWriteCancelFlag::operation_scope);
-    write_all_tags_with_cancel_report_at_verification(
-        path,
-        changes,
-        operation_cancel.as_ref(),
-        byte_progress,
-        verification,
-    )
+    with_single_metadata_path_admission(path, "metadata write", |admitted_path| {
+        write_all_tags_with_cancel_report_at_verification(
+            admitted_path,
+            changes,
+            operation_cancel.as_ref(),
+            byte_progress,
+            verification,
+        )
+    })
     .map_err(|message| {
-            if operation_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.observation_count() > 0)
-            {
-                MetadataWriteFailure::Cancelled(message)
-            } else {
-                MetadataWriteFailure::Failed(message)
-            }
-        })
+        if operation_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.observation_count() > 0)
+        {
+            MetadataWriteFailure::Cancelled(message)
+        } else {
+            MetadataWriteFailure::Failed(message)
+        }
+    })
 }
 
 pub(crate) fn write_all_tags_for_transfer_at_verification(
@@ -12159,6 +12629,48 @@ fn recover_ape_tail_journal_locked(
     }
 }
 
+struct ApeMetadataWriteLock {
+    _store_lock: crate::config::StoreFileLock,
+    _mutation_claim: Option<MutationClaimGuard>,
+}
+
+fn acquire_ape_metadata_write_lock(
+    path: &std::path::Path,
+    operation: &str,
+) -> Result<(ApeMetadataWriteLock, std::path::PathBuf), String> {
+    let claim = PathClaim::resolve_with_semantics(
+        path,
+        ClaimMode::Write,
+        ClaimScope::Exact,
+        PathResolutionSemantics::NamespaceObject,
+    )
+    .map_err(|error| format!("resolve {operation} authority for '{}': {error}", path.display()))?;
+    let resolved = claim.identity.resolved_io_path.clone();
+    let mutation_claim = if crate::concurrency::current_mutation_authority_covers(&claim)? {
+        None
+    } else {
+        Some(
+            MutationClaimGuard::acquire_ephemeral(vec![claim]).map_err(|error| {
+                format!("acquire {operation} authority for '{}': {error}", path.display())
+            })?,
+        )
+    };
+    let (store_lock, _store_resolved) = crate::config::StoreFileLock::acquire_for_path(&resolved)
+        .map_err(|error| {
+            format!(
+                "acquire bounded {operation} lock for '{}': {error}",
+                path.display()
+            )
+        })?;
+    Ok((
+        ApeMetadataWriteLock {
+            _store_lock: store_lock,
+            _mutation_claim: mutation_claim,
+        },
+        resolved,
+    ))
+}
+
 fn recover_ape_tail_before_read(path: &std::path::Path) -> Result<(), String> {
     if !is_native_ape_tail_carrier(path) {
         return Ok(());
@@ -12177,13 +12689,8 @@ fn recover_ape_tail_before_read(path: &std::path::Path) -> Result<(), String> {
         }
         canonical
     };
-    let (_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(&recovery_target)
-        .map_err(|error| {
-            format!(
-                "acquire APEv2 recovery lock for '{}': {error}",
-                recovery_target.display()
-            )
-        })?;
+    let (_lock, resolved) =
+        acquire_ape_metadata_write_lock(&recovery_target, "APEv2 recovery")?;
     if let Some(warning) = recover_ape_tail_journal_locked(&resolved, &|_| {})? {
         log::warn!("{warning}");
     }
@@ -12213,7 +12720,7 @@ fn recover_stale_ape_tail_journals_in_dir(dir: &std::path::Path) -> Vec<String> 
         if !journal.exists() {
             continue;
         }
-        match crate::config::StoreFileLock::acquire_for_path(&path) {
+        match acquire_ape_metadata_write_lock(&path, "APEv2 recovery") {
             Ok((_lock, resolved)) => match recover_ape_tail_journal_locked(&resolved, &|_| {}) {
                 Ok(Some(warning)) => messages.push(warning),
                 Ok(None) => messages.push(format!(
@@ -12312,12 +12819,8 @@ fn write_all_tags_native_ape_tail_values(
         }
     };
     check_metadata_write_cancel(cancel, "before acquiring APEv2 metadata-write authority")?;
-    let (_write_lock, resolved) = crate::config::StoreFileLock::acquire_for_path(path).map_err(|error| {
-        format!(
-            "acquire bounded APEv2 metadata-write lock for '{}': {error}",
-            path.display()
-        )
-    })?;
+    let (_write_lock, resolved) =
+        acquire_ape_metadata_write_lock(path, "APEv2 metadata-write")?;
     let path = resolved.as_path();
     if let Some(warning) = recover_ape_tail_journal_locked(path, &report_progress)? {
         log::warn!("{warning}");
@@ -16770,18 +17273,25 @@ pub fn write_artwork_to_files_with_cancel(
         .map_err(|e| format!("read artwork '{}': {}", image_path.display(), e))?;
     let mime_type = image_mime_type(image_path, &image_bytes)?;
     let mime_label = mime_type_to_string(&mime_type);
-    let mut metadata_cache = read_artwork_metadata_cache(paths)?;
-    let artwork_info = artwork_info_from_image(picture_type, &mime_label, &image_bytes);
-    let commit = apply_artwork_batch(paths, cancel, |path| {
-        write_artwork_one_file(path, &image_bytes, &mime_type, &mime_label, picture_type, cancel)
-    })?;
-    Ok(ArtworkWriteBatchResult {
-        metadata: project_artwork_metadata_from_cache(
-            paths,
-            &mut metadata_cache,
-            ArtworkProjection::Replace(artwork_info),
-        ),
-        durability_warnings: commit.committed_warnings,
+    let admission = admit_metadata_mutation_paths(paths, "artwork batch")?;
+    let admitted_paths = paths
+        .iter()
+        .map(|path| admission.admitted_path(path).map(std::path::Path::to_path_buf))
+        .collect::<Result<Vec<_>, _>>()?;
+    admission.run(|| {
+        let mut metadata_cache = read_artwork_metadata_cache(&admitted_paths)?;
+        let artwork_info = artwork_info_from_image(picture_type, &mime_label, &image_bytes);
+        let commit = apply_artwork_batch(&admitted_paths, cancel, |path| {
+            write_artwork_one_file(path, &image_bytes, &mime_type, &mime_label, picture_type, cancel)
+        })?;
+        Ok(ArtworkWriteBatchResult {
+            metadata: project_artwork_metadata_from_cache(
+                &admitted_paths,
+                &mut metadata_cache,
+                ArtworkProjection::Replace(artwork_info),
+            ),
+            durability_warnings: commit.committed_warnings,
+        })
     })
 }
 
@@ -16800,15 +17310,24 @@ pub fn remove_artwork_from_files_with_cancel(
 ) -> Result<ArtworkWriteBatchResult, String> {
     check_metadata_write_cancel(cancel, "before reading artwork metadata")?;
     reject_unsupported_dff_metadata_batch(paths, "artwork removal")?;
-    let mut metadata_cache = read_artwork_metadata_cache(paths)?;
-    let commit = apply_artwork_batch(paths, cancel, |path| remove_artwork_one_file(path, picture_type, cancel))?;
-    Ok(ArtworkWriteBatchResult {
-        metadata: project_artwork_metadata_from_cache(
-            paths,
-            &mut metadata_cache,
-            ArtworkProjection::Remove(picture_type),
-        ),
-        durability_warnings: commit.committed_warnings,
+    let admission = admit_metadata_mutation_paths(paths, "artwork removal batch")?;
+    let admitted_paths = paths
+        .iter()
+        .map(|path| admission.admitted_path(path).map(std::path::Path::to_path_buf))
+        .collect::<Result<Vec<_>, _>>()?;
+    admission.run(|| {
+        let mut metadata_cache = read_artwork_metadata_cache(&admitted_paths)?;
+        let commit = apply_artwork_batch(&admitted_paths, cancel, |path| {
+            remove_artwork_one_file(path, picture_type, cancel)
+        })?;
+        Ok(ArtworkWriteBatchResult {
+            metadata: project_artwork_metadata_from_cache(
+                &admitted_paths,
+                &mut metadata_cache,
+                ArtworkProjection::Remove(picture_type),
+            ),
+            durability_warnings: commit.committed_warnings,
+        })
     })
 }
 
@@ -18333,16 +18852,28 @@ mod tests {
         );
     }
 
-    fn isolated_metadata_journal_home(
-        prefix: &str,
-    ) -> crate::tui::test_support::XdgConfigHomeGuard {
-        let guard = crate::tui::test_support::XdgConfigHomeGuard::new(prefix);
+    struct IsolatedMetadataJournalHomeGuard {
+        _coordination: crate::concurrency::ScopedTestCoordinationRootGuard,
+        _xdg: crate::tui::test_support::XdgConfigHomeGuard,
+    }
+
+    fn isolated_metadata_journal_home(prefix: &str) -> IsolatedMetadataJournalHomeGuard {
+        // Metadata writes now participate in the shared cross-session claim
+        // registry as well as the DB journal. Keep both process-visible test
+        // roots under the same established lock order (coordination -> XDG) so
+        // a libtest worker can never borrow another test's temporary registry
+        // while that registry is being torn down.
+        let coordination = crate::concurrency::scoped_test_coordination_root();
+        let xdg = crate::tui::test_support::XdgConfigHomeGuard::new(prefix);
         assert_eq!(
             crate::db::db_path(),
-            guard.path().join("data").join("tonepoet").join("tonepoet.db"),
+            xdg.path().join("data").join("tonepoet").join("tonepoet.db"),
             "metadata editor test must resolve its journal inside the per-test XDG data home",
         );
-        guard
+        IsolatedMetadataJournalHomeGuard {
+            _coordination: coordination,
+            _xdg: xdg,
+        }
     }
 
     fn native_ape_physical_text_values(
@@ -21954,8 +22485,8 @@ mod tests {
             temp.path(),
             move |_| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-            || {
+                },
+                || {
                 write_all_tags(
                     &path,
                     &[
@@ -22323,6 +22854,7 @@ mod tests {
 
     #[test]
     fn musepack_reads_renamed_wavpack_and_refuses_mutation_before_transaction() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-musepack-read-only",
         );
@@ -23560,6 +24092,7 @@ mod tests {
 
     #[test]
     fn ape_numbering_capability_matches_production_round_trip() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-ape-numbering-round-trip",
         );
@@ -23756,6 +24289,7 @@ mod tests {
 
     #[test]
     fn ape_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-ape-numbering-alias-conflicts",
         );
@@ -23770,6 +24304,7 @@ mod tests {
 
     #[test]
     fn mp4_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         assert_typed_numbering_conflicts_fail_closed(
             "aliases.m4a",
             MP4_NUMBERING_FIXTURE,
@@ -23781,6 +24316,7 @@ mod tests {
 
     #[test]
     fn mp4_numbering_pairs_round_trip_without_free_form_atoms() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use lofty::tag::Accessor;
 
         let (_temp, path) = copy_numbering_fixture("numbering.m4a", MP4_NUMBERING_FIXTURE);
@@ -25616,6 +26152,7 @@ mod tests {
 
     #[test]
     fn id3v23_prefixed_flac_native_in_place_and_overflow_writes_preserve_prefix_and_audio() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
 
         let padded = temp.path().join("prefixed-padded.flac");
@@ -26171,6 +26708,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_standard_metadata_production_route_refuses_hardlinks() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-windows-hardlink",
         );
@@ -26338,6 +26876,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_write_is_end_to_end_semantic_and_budget_pinned() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-e2e",
         );
@@ -26434,6 +26973,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_bounded_memory_route_is_semantic_and_budget_pinned() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-bounded-e2e",
         );
@@ -26537,6 +27077,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_noop_refuses_armed_journal_before_success() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-noop-journal",
         );
@@ -26595,6 +27136,7 @@ mod tests {
 
     #[test]
     fn standard_generic_metadata_noop_refuses_stale_legacy_backup_before_success() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-standard-metadata-noop-backup",
         );
@@ -27506,6 +28048,232 @@ mod tests {
 
 
     #[test]
+    fn stale_flac_metadata_recovery_defers_under_live_shared_read_and_write_claims() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        for (label, mode) in [
+            ("conversion-read", crate::concurrency::ClaimMode::Read),
+            ("file-operation-write", crate::concurrency::ClaimMode::Write),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join(format!("recovery-busy-{label}.flac"));
+            write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+            let before = std::fs::read(&path).expect("read original");
+            flac_metadata_writer::test_write_current_metadata_journal(&path)
+                .expect("write stale metadata journal");
+            corrupt_synthetic_flac_metadata_header(&path);
+            let torn = std::fs::read(&path).expect("read torn bytes");
+            let journal = flac_metadata_writer::test_journal_path(&path);
+
+            let competing = crate::concurrency::PathClaim::resolve(
+                &path,
+                mode,
+                crate::concurrency::ClaimScope::Exact,
+            )
+            .expect("resolve competing claim");
+            let live = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing])
+                .expect("hold competing shared claim");
+
+            let messages = recover_stale_flac_metadata_journals_in_dir(temp.path());
+            assert!(
+                messages.iter().any(|message| {
+                    message.contains("shared mutation admission is busy")
+                        || message.contains("deferred")
+                }),
+                "startup recovery should report deferred shared admission: {messages:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read after deferred startup recovery"),
+                torn,
+                "busy startup recovery must not rewrite FLAC bytes"
+            );
+            assert!(journal.exists(), "busy startup recovery must retain journal");
+
+            let read_error = recover_flac_metadata_before_read(&path)
+                .expect_err("read-triggered recovery must defer while claim is live");
+            assert!(
+                read_error.contains("shared mutation admission is busy")
+                    || read_error.contains("deferred"),
+                "read-triggered recovery should report shared admission: {read_error}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read after deferred read recovery"),
+                torn,
+            );
+            assert!(journal.exists(), "busy read recovery must retain journal");
+
+            drop(live);
+            recover_flac_metadata_before_read(&path)
+                .expect("recovery should succeed after competing claim is released");
+            assert_eq!(std::fs::read(&path).expect("read recovered FLAC"), before);
+            assert!(!journal.exists(), "successful recovery removes journal");
+        }
+    }
+
+    #[test]
+    fn native_flac_write_reuses_its_shared_authority_for_stale_journal_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("writer-reuses-recovery-authority.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        flac_metadata_writer::test_write_current_metadata_journal(&path)
+            .expect("write stale metadata journal");
+        corrupt_synthetic_flac_metadata_header(&path);
+        let journal = flac_metadata_writer::test_journal_path(&path);
+
+        write_all_tags(
+            &path,
+            &[(
+                lofty::tag::ItemKey::TrackTitle,
+                Some("Recovered then written".to_string()),
+            )],
+        )
+        .expect("native write should recover under its already-held authority");
+
+        assert!(!journal.exists());
+        let tags = read_all_tags(&path).expect("read tags after native write");
+        assert!(tags.iter().any(|entry| {
+            entry.display_key == "TITLE" && entry.value == "Recovered then written"
+        }));
+    }
+
+    #[test]
+    fn unparseable_artwork_rollback_defers_under_live_shared_claim() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("artwork-recovery-busy.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        let before = std::fs::read(&path).expect("read original");
+        let png = tiny_png();
+        let (snapshot, intended_metadata_region) = flac_metadata_writer::preview_picture_write(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+        )
+        .expect("preview artwork write");
+        let rollback = flac_metadata_writer::begin_artwork_rollback_journal_with_intended(
+            &path,
+            &snapshot,
+            &intended_metadata_region,
+        )
+        .expect("create artwork rollback journal");
+        flac_metadata_writer::write_picture_block(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+            None,
+        )
+        .expect("apply intended artwork mutation");
+        flac_metadata_writer::test_mark_artwork_rollback_journal_stale(&path)
+            .expect("mark artwork rollback stale");
+        let rollback_path = rollback.path.clone();
+        drop(rollback);
+        corrupt_synthetic_flac_metadata_header(&path);
+        let torn = std::fs::read(&path).expect("read torn artwork state");
+
+        let competing = crate::concurrency::PathClaim::resolve(
+            &path,
+            crate::concurrency::ClaimMode::Read,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("resolve competing conversion read");
+        let live = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing])
+            .expect("hold competing conversion read");
+
+        let messages = recover_stale_flac_metadata_journals_in_dir(temp.path());
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("shared mutation admission is busy")
+                    || message.contains("deferred")
+            }),
+            "startup artwork recovery should report deferred shared admission: {messages:?}"
+        );
+        assert_eq!(std::fs::read(&path).expect("read after busy startup rollback"), torn);
+        assert!(rollback_path.exists(), "busy startup rollback must retain recovery artifact");
+
+        let error = recover_flac_metadata_before_read(&path)
+            .expect_err("unparseable artwork rollback must defer while claim is live");
+        assert!(
+            error.contains("shared mutation admission is busy") || error.contains("deferred"),
+            "unexpected recovery error: {error}"
+        );
+        assert_eq!(std::fs::read(&path).expect("read after busy rollback"), torn);
+        assert!(rollback_path.exists(), "busy rollback must retain recovery artifact");
+
+        drop(live);
+        recover_flac_metadata_before_read(&path)
+            .expect("artwork rollback should recover after claim release");
+        assert_eq!(std::fs::read(&path).expect("read recovered artwork FLAC"), before);
+        assert!(!rollback_path.exists());
+    }
+
+    #[test]
+    fn parsed_artwork_rollback_recovers_while_retiring_stale_common_write_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("artwork-stale-common-lock.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
+        let before = std::fs::read(&path).expect("read original");
+        let png = tiny_png();
+        let (snapshot, intended_metadata_region) = flac_metadata_writer::preview_picture_write(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+        )
+        .expect("preview artwork write");
+        let rollback = flac_metadata_writer::begin_artwork_rollback_journal_with_intended(
+            &path,
+            &snapshot,
+            &intended_metadata_region,
+        )
+        .expect("create artwork rollback journal");
+        flac_metadata_writer::write_picture_block(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            "image/png",
+            &png,
+            None,
+        )
+        .expect("apply intended artwork mutation");
+        flac_metadata_writer::test_mark_artwork_rollback_journal_stale(&path)
+            .expect("mark artwork rollback stale");
+        let rollback_path = rollback.path.clone();
+        drop(rollback);
+        flac_metadata_writer::test_write_stale_common_write_lock(&path)
+            .expect("create stale common write lock");
+        let lock_path = flac_metadata_writer::test_write_lock_path(&path);
+
+        recover_flac_metadata_before_read(&path)
+            .expect("stale common-lock recovery must not recursively reacquire itself");
+
+        assert_eq!(std::fs::read(&path).expect("read recovered FLAC"), before);
+        assert!(!rollback_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn ordinary_flac_read_with_no_recovery_artifact_is_claim_free() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("claim-free-read.flac");
+        write_synthetic_flac(&path, &[("TITLE", "Readable")], 4096, 4096);
+        let competing = crate::concurrency::PathClaim::resolve(
+            &path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("resolve simulated external write");
+        let live = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing])
+            .expect("hold simulated external write");
+
+        recover_flac_metadata_before_read(&path)
+            .expect("no-artifact pre-read recovery must not acquire a mutation claim");
+        let tags = read_all_tags(&path).expect("ordinary read stays claim-free");
+        assert!(tags.iter().any(|entry| entry.display_key == "TITLE"));
+        drop(live);
+    }
+
+    #[test]
     fn active_metadata_journal_is_not_consumed_when_current_metadata_is_original() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("active-original.flac");
@@ -27560,8 +28328,158 @@ mod tests {
         );
     }
 
+    fn assert_flac_cleanup_preserves_native_contention<F>(
+        scope: &std::path::Path,
+        path: &std::path::Path,
+        cleanup_context: &'static str,
+        writer_a: F,
+    ) where
+        F: FnOnce(std::path::PathBuf) -> Result<(), String> + Send + 'static,
+    {
+        let (cleanup_entered_tx, cleanup_entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let cleanup_release_rx = std::sync::Arc::new(std::sync::Mutex::new(cleanup_release_rx));
+        let cleanup_release_rx_for_hook = std::sync::Arc::clone(&cleanup_release_rx);
+        let path_for_writer = path.to_path_buf();
+
+        let (writer_a_result, competing_result, native_lock_removed) =
+            flac_metadata_writer::test_with_parent_dir_sync_hook(
+                scope,
+                move |_parent, context| {
+                    if context != cleanup_context {
+                        return None;
+                    }
+                    if let Err(err) = cleanup_entered_tx.send(()) {
+                        return Some(Err(format!("signal FLAC cleanup parent-sync hook: {err}")));
+                    }
+                    let release_rx = match cleanup_release_rx_for_hook.lock() {
+                        Ok(release_rx) => release_rx,
+                        Err(_) => {
+                            return Some(Err(
+                                "FLAC cleanup release channel mutex poisoned".to_string(),
+                            ));
+                        }
+                    };
+                    match release_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(()) => Some(Ok(())),
+                        Err(err) => Some(Err(format!("wait for FLAC cleanup release: {err}"))),
+                    }
+                },
+                || {
+                    let writer_a = std::thread::spawn(move || writer_a(path_for_writer));
+                    if let Err(wait_err) =
+                        cleanup_entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+                    {
+                        let _ = cleanup_release_tx.send(());
+                        let writer_a_result = writer_a
+                            .join()
+                            .expect("writer A should not panic while entering FLAC cleanup");
+                        panic!(
+                            "writer A never reached the FLAC cleanup parent-sync hook: {wait_err}; writer result: {writer_a_result:?}"
+                        );
+                    }
+
+                    let native_lock_removed =
+                        !flac_metadata_writer::test_write_lock_path(path).exists();
+                    let path_for_competing = path.to_path_buf();
+                    let competing_result = std::thread::spawn(move || {
+                        write_all_tags(
+                            &path_for_competing,
+                            &[(
+                                lofty::tag::ItemKey::TrackTitle,
+                                Some("CompetingDuringCleanup".to_string()),
+                            )],
+                        )
+                    })
+                    .join()
+                    .expect("competing FLAC writer should not panic");
+
+                    cleanup_release_tx
+                        .send(())
+                        .expect("release writer A from FLAC cleanup parent-sync hook");
+                    let writer_a_result = writer_a
+                        .join()
+                        .expect("writer A should not panic while completing FLAC cleanup");
+                    (writer_a_result, competing_result, native_lock_removed)
+                },
+            );
+
+        writer_a_result.expect("writer A should complete after cleanup is released");
+        assert!(
+            native_lock_removed,
+            "regression must suspend after native FLAC lock-file removal to exercise the teardown window"
+        );
+        let competing_err = competing_result.expect_err(
+            "writer B must not enter the native FLAC writer while writer A is cleaning up",
+        );
+        assert!(
+            competing_err.contains("already in progress") || competing_err.contains("write lock"),
+            "writer B should report established native FLAC contention during cleanup: {competing_err}"
+        );
+        assert!(
+            !competing_err.contains("filesystem mutation conflicts with live owner")
+                && !competing_err.contains("overlaps"),
+            "writer B must not fall through to shared-claim self-conflict during cleanup: {competing_err}"
+        );
+
+        write_all_tags(
+            path,
+            &[(lofty::tag::ItemKey::TrackTitle, Some("AfterCleanup".to_string()))],
+        )
+        .expect("writer C should proceed after both FLAC cleanup authorities retire");
+        assert_eq!(
+            flac_metadata_writer::test_vorbis_field_values(path, "TITLE")
+                .expect("read title after cleanup contention regression"),
+            vec!["AfterCleanup".to_string()],
+            "successful post-cleanup write proves both FLAC authorities retired"
+        );
+    }
+
+    #[test]
+    fn common_write_cleanup_keeps_process_reservation_until_shared_claim_retires() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("common-cleanup-order.flac");
+        let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
+
+        assert_flac_cleanup_preserves_native_contention(
+            temp.path(),
+            &path,
+            "FLAC common write lock removal after tag write",
+            |path| {
+                write_all_tags(
+                    &path,
+                    &[(lofty::tag::ItemKey::TrackTitle, Some("WriterA".to_string()))],
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn common_write_drop_cleanup_keeps_process_reservation_until_shared_claim_retires() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("common-drop-cleanup-order.flac");
+        let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
+
+        assert_flac_cleanup_preserves_native_contention(
+            temp.path(),
+            &path,
+            "FLAC common write lock removal",
+            |path| {
+                let claim = flac_metadata_writer::acquire_native_write_claim(
+                    &path,
+                    "test drop cleanup ordering",
+                )?;
+                drop(claim);
+                Ok(())
+            },
+        );
+    }
+
     #[test]
     fn active_common_write_lock_blocks_reads_and_competing_native_writes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("common-active.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -29853,6 +30771,7 @@ mod tests {
 
     #[test]
     fn active_artwork_common_claim_blocks_tag_write_from_another_thread() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-common-blocks-tags.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -29952,6 +30871,7 @@ mod live_metadata_perf_harness {
     #[test]
     #[ignore]
     fn live_metadata_edit_perf() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let Some(fixture) = std::env::var_os("TONEPOET_METADATA_PERF_FILE") else {
             eprintln!("TONEPOET_METADATA_PERF_FILE not set; skipping");
             return;
@@ -30183,6 +31103,7 @@ mod cue_sidecar_contract_tests {
 
     #[test]
     fn cue_sidecar_representability_is_key_based_and_shared() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         for key in [
             "CUESHEET",
             "TITLE",
@@ -30201,5 +31122,144 @@ mod cue_sidecar_contract_tests {
         assert!(!cue_sidecar_representable_key("COMMENT"));
         assert!(!cue_sidecar_standard_owned_key("CUESHEET"));
         assert!(cue_sidecar_standard_owned_key("ALBUM"));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_metadata_admission_tests {
+    use super::*;
+    use crate::concurrency::{
+        ClaimMode, ClaimScope, MutationClaimGuard, PathClaim, PathResolutionSemantics,
+    };
+
+    #[test]
+    fn complete_metadata_batch_admission_is_atomic_and_cross_subsystem_visible() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let x = temp.path().join("x.mp3");
+        let y = temp.path().join("y.m4a");
+        let z = temp.path().join("z.mp3");
+        let w = temp.path().join("w.m4a");
+        for path in [&x, &y, &z, &w] {
+            std::fs::write(path, b"fixture").expect("fixture");
+        }
+
+        let first = admit_metadata_mutation_paths(&[x.clone(), y.clone()], "metadata batch A")
+            .expect("first complete batch must admit");
+        let crossed = match admit_metadata_mutation_paths(&[y.clone(), x.clone()], "metadata batch B") {
+            Ok(_) => panic!("opposite-order overlapping batch must be busy before either write"),
+            Err(error) => error,
+        };
+        assert!(crossed.contains("busy"), "unexpected crossed-batch error: {crossed}");
+
+        let disjoint = admit_metadata_mutation_paths(&[z.clone(), w.clone()], "metadata batch C")
+            .expect("disjoint metadata batch must remain concurrent");
+        drop(disjoint);
+        drop(first);
+
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&cue, b"FILE \"x.flac\" WAVE\n").expect("cue fixture");
+        let cue_claim = PathClaim::resolve_with_semantics(
+            &cue,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("cue write claim");
+        let cue_guard = MutationClaimGuard::acquire_ephemeral(vec![cue_claim])
+            .expect("hold cue sidecar");
+        let member_before = std::fs::read(&x).unwrap();
+        let member_and_sidecar = match admit_metadata_mutation_paths(
+            &[x.clone(), cue.clone()],
+            "member plus CUE metadata save",
+        ) {
+            Ok(_) => panic!("CUE conflict must reject the complete metadata set before mutation"),
+            Err(error) => error,
+        };
+        assert!(member_and_sidecar.contains("busy"));
+        assert_eq!(std::fs::read(&x).unwrap(), member_before);
+        drop(cue_guard);
+
+        let conversion_read = PathClaim::resolve(
+            &x,
+            ClaimMode::Read,
+            ClaimScope::Exact,
+        )
+        .expect("conversion read claim");
+        let conversion_guard = MutationClaimGuard::acquire_ephemeral(vec![conversion_read])
+            .expect("hold simulated conversion READ");
+        let error = match admit_metadata_mutation_paths(std::slice::from_ref(&x), "metadata edit") {
+            Ok(_) => panic!("metadata WRITE must conflict with conversion READ"),
+            Err(error) => error,
+        };
+        assert!(error.contains("busy"), "unexpected conversion conflict: {error}");
+        drop(conversion_guard);
+
+        let move_write = PathClaim::resolve_with_semantics(
+            &x,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("move write claim");
+        let move_guard = MutationClaimGuard::acquire_ephemeral(vec![move_write])
+            .expect("hold simulated move WRITE");
+        let error = match admit_metadata_mutation_paths(std::slice::from_ref(&x), "metadata edit") {
+            Ok(_) => panic!("metadata WRITE must conflict with file move WRITE"),
+            Err(error) => error,
+        };
+        assert!(error.contains("busy"), "unexpected move conflict: {error}");
+        drop(move_guard);
+    }
+
+    #[test]
+    fn existing_outer_metadata_authority_is_reused_without_nested_registry_admission() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("track.mp3");
+        std::fs::write(&path, b"fixture").expect("fixture");
+        let outer_claim = PathClaim::resolve_with_semantics(
+            &path,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )
+        .expect("outer metadata claim");
+        let _outer_guard = MutationClaimGuard::acquire_ephemeral(vec![outer_claim.clone()])
+            .expect("hold outer metadata authority");
+
+        crate::concurrency::with_scoped_mutation_claims(std::slice::from_ref(&outer_claim), || {
+            let nested = admit_metadata_mutation_paths(
+                std::slice::from_ref(&path),
+                "nested metadata writer",
+            )
+            .expect("covered nested writer must reuse outer authority");
+            assert!(
+                nested._guard.is_none(),
+                "covered metadata writer must not publish a redundant ephemeral claim"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_admission_keeps_final_symlink_visible_to_existing_refusal_policy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let referent = temp.path().join("real.mp3");
+        let link = temp.path().join("link.mp3");
+        std::fs::write(&referent, b"referent").expect("referent");
+        symlink(&referent, &link).expect("symlink");
+
+        let admission = admit_metadata_mutation_paths(std::slice::from_ref(&link), "metadata edit")
+            .expect("namespace-object admission");
+        let admitted = admission.admitted_path(&link).expect("admitted path");
+        assert_eq!(admitted, link.as_path(), "final symlink must not be canonicalized away");
+        let error = GenericMetadataReplacementSnapshot::capture(admitted)
+            .expect_err("journal-free replacement must still reject a final symlink");
+        assert!(error.contains("symlink"));
+        assert_eq!(std::fs::read(&referent).unwrap(), b"referent");
     }
 }
