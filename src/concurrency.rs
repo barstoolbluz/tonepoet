@@ -1,9 +1,11 @@
 //! Cross-process concurrency primitives for independent tonepoet sessions.
 //!
 //! Persistent leases deliberately differ from the repository's short-lived
-//! local file locks: a persistent lease is close-only, never explicitly
+//! local file locks: `PersistentLease::drop` is close-only, never explicitly
 //! unlocks a possibly-shared open-file description, and never unlinks its
-//! descriptor from `Drop`.
+//! descriptor. Ordinary `MutationClaimGuard` teardown may retire an unexported
+//! ephemeral descriptor immediately before that close; detached/exported
+//! authority keeps the persistent close-only/lazy-retirement contract.
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -774,6 +776,14 @@ pub struct PersistentLease {
     descriptor_id: Uuid,
     family: LeaseFamily,
     claims: Arc<[PathClaim]>,
+    // A fork may transiently duplicate any CLOEXEC fd until the child reaches
+    // exec; that accidental co-holder is not transferable mutation authority.
+    // An explicit lifetime-file export is different: it may intentionally
+    // outlive this Rust lease and is part of the cross-process authority
+    // protocol. Once one has ever been handed out, guard teardown must leave
+    // descriptor retirement to the ordinary lock-aware scanner rather than
+    // hiding a still-live exported OFD.
+    lifetime_file_exported: std::sync::atomic::AtomicBool,
 }
 
 /// Process-local view of descriptor handles created by this process. Weak
@@ -1334,6 +1344,7 @@ impl PersistentLease {
             descriptor_id,
             family,
             claims: retained_claims,
+            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1389,6 +1400,7 @@ impl PersistentLease {
                     descriptor_id: descriptor.descriptor_id,
                     family: descriptor.family,
                     claims: descriptor.claims.into(),
+                    lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
                 });
             }
             Err(error) if is_lock_contended(&error) => {}
@@ -1420,6 +1432,7 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
+            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1446,6 +1459,7 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
+            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1455,18 +1469,91 @@ impl PersistentLease {
     pub fn claims(&self) -> &[PathClaim] { &self.claims }
 
     /// Duplicate the descriptor while preserving the same underlying open-file
-    /// description.  The duplicate is close-only and is suitable for handoff to
+    /// description. The duplicate is close-only and is suitable for handoff to
     /// a trusted tonepoet supervisor; no caller receives an unlock primitive.
+    ///
+    /// Record successful export before returning it. An exported descriptor may
+    /// intentionally outlive a `MutationClaimGuard`, so guard teardown must not
+    /// unlink the public descriptor while that duplicate can still hold `flock`.
     pub fn duplicate_lifetime_file(&self) -> Result<Arc<File>, String> {
-        self.file
-            .try_clone()
-            .map(Arc::new)
-            .map_err(|e| format!("duplicate persistent lease {}: {e}", self.descriptor_path.display()))
+        let duplicate = self.file.try_clone().map_err(|e| {
+            format!(
+                "duplicate persistent lease {}: {e}",
+                self.descriptor_path.display()
+            )
+        })?;
+        self.lifetime_file_exported
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(Arc::new(duplicate))
+    }
+
+    /// End the public lifetime of an ordinary ephemeral guard before its file
+    /// descriptor closes. This turns guard teardown into an explicit state
+    /// transition instead of asking a later admission to discover and reclaim
+    /// an unlocked stale descriptor. It also prevents a transient fork-time
+    /// CLOEXEC duplicate from extending public mutation authority after the
+    /// lexical guard has ended but before the child reaches exec.
+    ///
+    /// A lease that has exported a lifetime fd is deliberately excluded: the
+    /// exported fd is real authority and may still be live after the guard is
+    /// gone. In that case the existing scanner remains responsible for lazy
+    /// retirement after the final holder closes.
+    fn retire_ephemeral_descriptor_on_guard_drop(&self) {
+        if !matches!(&self.family, LeaseFamily::EphemeralMutation { .. })
+            || self
+                .lifetime_file_exported
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        // Never remove a pathname merely because its UUID matches. Prove that
+        // the public path still names this exact open descriptor first. The
+        // Unix verifier compares dev/ino; same-file supplies the equivalent
+        // file-identity check on other platforms.
+        #[cfg(unix)]
+        if verify_coordination_path_binding(
+            self.file.as_ref(),
+            &self.descriptor_path,
+            "ephemeral guard retirement",
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let Ok(held_file) = self.file.try_clone() else {
+                return;
+            };
+            let Ok(held) = same_file::Handle::from_file(held_file) else {
+                return;
+            };
+            let Ok(current) = same_file::Handle::from_path(&self.descriptor_path) else {
+                return;
+            };
+            if held != current {
+                return;
+            }
+        }
+
+        // Ephemeral descriptors carry no post-crash recovery authority, so a
+        // directory fsync would buy nothing here. Removal is best-effort in a
+        // destructor: if it fails, closing the lease still makes the descriptor
+        // ReclaimableEphemeral and the established scanner path repairs it.
+        let _ = std::fs::remove_file(&self.descriptor_path);
     }
 
     #[cfg(unix)]
     pub fn inherited_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
+        // Returning a raw fd explicitly exposes authority outside this lease's
+        // lexical ownership. Treat it exactly like duplicate_lifetime_file so
+        // guard Drop can never hide a descriptor a caller may deliberately
+        // arrange to survive in another process.
+        self.lifetime_file_exported
+            .store(true, std::sync::atomic::Ordering::Release);
         self.file.as_raw_fd()
     }
 
@@ -1488,6 +1575,7 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
+            lifetime_file_exported: std::sync::atomic::AtomicBool::new(true),
         })
     }
 }
@@ -1506,7 +1594,11 @@ impl Drop for PersistentLease {
 
 #[derive(Debug)]
 pub struct MutationClaimGuard {
-    lease: PersistentLease,
+    // `Option` lets `into_lease` explicitly transfer authority even though this
+    // wrapper has a Drop implementation. Ordinary drop keeps the lease present
+    // long enough to retire its ephemeral descriptor before the locked file is
+    // closed by field destruction.
+    lease: Option<PersistentLease>,
     claims: std::sync::Arc<[PathClaim]>,
 }
 
@@ -1583,12 +1675,32 @@ impl MutationClaimGuard {
             coordination_group,
             true,
         )?;
-        Ok(Self { lease, claims: claims.into() })
+        Ok(Self {
+            lease: Some(lease),
+            claims: claims.into(),
+        })
     }
 
     pub fn claims(&self) -> &[PathClaim] { &self.claims }
-    pub fn lease(&self) -> &PersistentLease { &self.lease }
-    pub fn into_lease(self) -> PersistentLease { self.lease }
+    pub fn lease(&self) -> &PersistentLease {
+        self.lease
+            .as_ref()
+            .expect("MutationClaimGuard lease is present until authority transfer")
+    }
+
+    pub fn into_lease(mut self) -> PersistentLease {
+        self.lease
+            .take()
+            .expect("MutationClaimGuard lease can be transferred only once")
+    }
+}
+
+impl Drop for MutationClaimGuard {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.as_ref() {
+            lease.retire_ephemeral_descriptor_on_guard_drop();
+        }
+    }
 }
 
 
@@ -1735,7 +1847,7 @@ fn first_conflict<'a>(requested: &'a [PathClaim], existing: &'a [PathClaim]) -> 
 }
 
 fn classify_descriptor(path: &Path) -> Result<Option<(ClaimAvailability, LeaseFamily, Vec<PathClaim>, Option<String>)>, String> {
-    let mut file = match open_existing_descriptor(path) {
+    let file = match open_existing_descriptor(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("open coordination descriptor {}: {error}", path.display())),
@@ -1745,12 +1857,28 @@ fn classify_descriptor(path: &Path) -> Result<Option<(ClaimAvailability, LeaseFa
         Err(error) if is_lock_contended(&error) => true,
         Err(error) => return Err(format!("probe coordination descriptor {}: {error}", path.display())),
     };
+    classify_opened_descriptor(file, path, lock_state)
+}
+
+/// Finish classification after the scanner has opened and lock-probed a
+/// descriptor. Ordinary ephemeral guard teardown may intentionally unpublish
+/// that descriptor without taking the registry lock. If the pathname vanishes
+/// during this window, the already-open inode no longer represents published
+/// authority and must not participate in admission.
+fn classify_opened_descriptor(
+    mut file: File,
+    path: &Path,
+    lock_state: bool,
+) -> Result<Option<(ClaimAvailability, LeaseFamily, Vec<PathClaim>, Option<String>)>, String> {
     if !lock_state && reclaim_empty_descriptor_from_locked_file(&file, path)? {
         return Ok(None);
     }
     let descriptor = match read_descriptor_from(&mut file, path) {
         Ok(descriptor) => descriptor,
         Err(error) => {
+            if ephemeral_descriptor_unpublished_during_classification(path)? {
+                return Ok(None);
+            }
             if !lock_state
                 && reclaim_invalid_ephemeral_descriptor_from_locked_file(&file, path)?
             {
@@ -1765,6 +1893,25 @@ fn classify_descriptor(path: &Path) -> Result<Option<(ClaimAvailability, LeaseFa
     };
     let availability = classify_availability(&descriptor.family, lock_state);
     Ok(Some((availability, descriptor.family, descriptor.claims, descriptor.coordination_group)))
+}
+
+/// A missing pathname is special only for structurally valid ephemeral
+/// descriptors. Round-7 lexical retirement can remove such a pathname after a
+/// scanner has opened the inode but before it verifies the binding. Durable
+/// families, published rebinds, malformed live descriptors, and all other I/O
+/// failures keep their existing fail-closed behavior.
+fn ephemeral_descriptor_unpublished_during_classification(path: &Path) -> Result<bool, String> {
+    if !structurally_ephemeral_descriptor_path(path) {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "recheck ephemeral coordination descriptor publication {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn same_execution_lifecycle(left: &LeaseFamily, right: &LeaseFamily) -> bool {
@@ -2743,6 +2890,27 @@ mod tests {
         f(dir.path())
     }
 
+    fn reacquire_after_intentional_ephemeral_authority_closes(
+        claim: PathClaim,
+        context: &str,
+    ) -> MutationClaimGuard {
+        // An explicitly exported or detached fd can itself be inherited by an
+        // unrelated concurrent fork. Its public descriptor must stay visible
+        // while any such kernel co-holder exists, so final-close reclamation is
+        // intentionally eventual rather than lexical. Bound the wait so the
+        // regression tolerates only that pre-exec window, never a real leak.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]) {
+                Ok(guard) => return guard,
+                Err(error) if error.contains("live owner") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("{context}: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn scoped_test_coordination_root_is_visible_to_spawned_worker_thread() {
         let scope = scoped_test_coordination_root();
@@ -2989,6 +3157,400 @@ mod tests {
             let path = lease.descriptor_path().to_path_buf();
             drop(lease);
             assert!(path.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_treats_opened_unpublished_ephemeral_descriptor_as_absent() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("scanner-race.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let scanner = open_existing_descriptor(&descriptor).unwrap();
+            let lock_error = scanner
+                .try_lock_exclusive()
+                .expect_err("scanner probe must observe the live guard flock");
+            assert!(
+                is_lock_contended(&lock_error),
+                "scanner probe must fail specifically because the descriptor is locked: {lock_error}"
+            );
+
+            // Deterministic form of the registry-lock/unlink interleaving: the
+            // scanner already owns an fd and has observed lock contention, then
+            // ordinary lexical teardown unpublishes the pathname lock-free.
+            drop(guard);
+            assert!(
+                !descriptor.exists(),
+                "ordinary lexical teardown must unpublish the ephemeral descriptor"
+            );
+
+            let classified = classify_opened_descriptor(scanner, &descriptor, true)
+                .expect("open-but-unpublished ephemeral descriptor must not become ENOENT admission failure");
+            assert!(
+                classified.is_none(),
+                "an unpublished ephemeral inode no longer participates in mutation admission"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_keeps_published_ephemeral_rebind_fail_closed() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("scanner-rebind.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let scanner = open_existing_descriptor(&descriptor).unwrap();
+            let lock_error = scanner
+                .try_lock_exclusive()
+                .expect_err("scanner probe must observe the live guard flock");
+            assert!(is_lock_contended(&lock_error));
+
+            let displaced = descriptor.with_extension("lease.displaced-for-scanner");
+            std::fs::rename(&descriptor, &displaced).unwrap();
+            std::fs::write(&descriptor, b"replacement descriptor pathname").unwrap();
+
+            let error = classify_opened_descriptor(scanner, &descriptor, true).unwrap_err();
+            assert!(
+                error.contains("fail closed") && error.contains("pathname rebound after open"),
+                "a still-published rebound path must remain a fail-closed classification error: {error}"
+            );
+            drop(guard);
+            assert_eq!(
+                std::fs::read(&descriptor).unwrap(),
+                b"replacement descriptor pathname",
+                "neither scanner classification nor guard teardown may unlink a rebound pathname"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_keeps_disappeared_durable_descriptor_fail_closed() {
+        with_root(|_| {
+            let lease = PersistentLease::create(
+                LeaseFamily::JournalOperation { job_id: Uuid::new_v4() },
+                &[],
+            )
+            .unwrap();
+            let descriptor = lease.descriptor_path().to_path_buf();
+            let scanner = open_existing_descriptor(&descriptor).unwrap();
+            let lock_error = scanner
+                .try_lock_exclusive()
+                .expect_err("scanner probe must observe durable live authority");
+            assert!(is_lock_contended(&lock_error));
+
+            std::fs::remove_file(&descriptor).unwrap();
+            let error = classify_opened_descriptor(scanner, &descriptor, true).unwrap_err();
+            assert!(
+                error.contains("fail closed")
+                    && error.contains("lstat persistent lease pathname"),
+                "durable descriptor disappearance must not be reinterpreted as ephemeral retirement: {error}"
+            );
+            drop(lease);
+        });
+    }
+
+    #[test]
+    fn ordinary_ephemeral_guard_drop_retires_descriptor_before_reacquire() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("metadata.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            assert!(descriptor.exists(), "live guard must publish its descriptor");
+
+            drop(guard);
+            assert!(
+                !descriptor.exists(),
+                "ordinary ephemeral guard drop must retire its descriptor synchronously"
+            );
+
+            let replacement = MutationClaimGuard::acquire_ephemeral(vec![claim])
+                .expect("same-path admission immediately after guard drop must be deterministic");
+            let replacement_descriptor = replacement.lease().descriptor_path().to_path_buf();
+            assert!(replacement_descriptor.exists());
+            drop(replacement);
+            assert!(
+                !replacement_descriptor.exists(),
+                "replacement guard must use the same eager retirement path"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_inherited_cloexec_ephemeral_fd_cannot_block_next_guard() {
+        use std::os::fd::AsRawFd;
+
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("fork-race.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            // Read the private fd directly: inherited_fd() is an intentional
+            // export API and therefore correctly disables eager retirement.
+            let fd_flags = unsafe { libc::fcntl(guard.lease().file.as_raw_fd(), libc::F_GETFD) };
+            assert!(fd_flags >= 0, "inspect ephemeral lease fd flags");
+            assert_ne!(
+                fd_flags & libc::FD_CLOEXEC,
+                0,
+                "regression requires the production CLOEXEC lease fd"
+            );
+
+            // CLOEXEC does not prevent fork-time descriptor inheritance; it
+            // closes the inherited fd only when the child reaches exec. Hold a
+            // fork child before exec so it deterministically co-holds the
+            // guard's flock after the parent-side File is dropped. The child
+            // executes only async-signal-safe libc calls after fork.
+            let mut ready = [-1; 2];
+            let mut release = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+            assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(release[1]);
+                    let ready_byte = [b'R'];
+                    if libc::write(ready[1], ready_byte.as_ptr().cast(), 1) != 1 {
+                        libc::_exit(101);
+                    }
+                    let mut release_byte = [0u8; 1];
+                    if libc::read(release[0], release_byte.as_mut_ptr().cast(), 1) != 1 {
+                        libc::_exit(102);
+                    }
+                    libc::_exit(0);
+                }
+            }
+            if child < 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
+                    libc::close(release[0]);
+                    libc::close(release[1]);
+                }
+                panic!("fork test child: {}", std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::close(ready[1]);
+                libc::close(release[0]);
+            }
+            let mut ready_byte = [0u8; 1];
+            let ready_result = unsafe { libc::read(ready[0], ready_byte.as_mut_ptr().cast(), 1) };
+            unsafe { libc::close(ready[0]) };
+
+            let mut descriptor_retired = false;
+            let mut replacement = None;
+            if ready_result == 1 {
+                drop(guard);
+                descriptor_retired = !descriptor.exists();
+                replacement = Some(MutationClaimGuard::acquire_ephemeral(vec![claim]));
+            } else {
+                // The child still owns the inherited descriptor. End lexical
+                // authority before cleanup, but do not try the substantive
+                // assertion path when synchronization itself failed.
+                drop(guard);
+            }
+
+            // Release and reap the fork child before any assertion below can
+            // panic; otherwise a failed test could strand a pre-exec child.
+            let release_byte = [b'X'];
+            let signalled =
+                unsafe { libc::write(release[1], release_byte.as_ptr().cast(), 1) == 1 };
+            unsafe { libc::close(release[1]) };
+            let mut status = 0;
+            let waited = loop {
+                let result = unsafe { libc::waitpid(child, &mut status, 0) };
+                if result >= 0
+                    || std::io::Error::last_os_error().kind()
+                        != std::io::ErrorKind::Interrupted
+                {
+                    break result;
+                }
+            };
+
+            assert_eq!(
+                ready_result, 1,
+                "fork child must confirm inherited-fd hold"
+            );
+            assert!(signalled, "release fork child");
+            assert_eq!(waited, child, "reap fork child");
+            assert!(libc::WIFEXITED(status), "fork child must exit normally");
+            assert_eq!(libc::WEXITSTATUS(status), 0, "fork child exit status");
+            assert!(
+                descriptor_retired,
+                "ordinary guard teardown must retire public authority even while an accidental fork duplicate still co-holds the old inode"
+            );
+            let replacement = replacement
+                .expect("fork synchronization must produce a replacement attempt")
+                .expect(
+                    "fork-time CLOEXEC inheritance must not create a same-path self-overlap after guard teardown",
+                );
+            drop(replacement);
+        });
+    }
+
+    #[test]
+    fn exported_ephemeral_lifetime_keeps_descriptor_visible_until_final_holder_closes() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("supervised.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let exported = guard
+                .lease()
+                .duplicate_lifetime_file()
+                .expect("export close-only lifetime fd");
+            drop(guard);
+
+            assert!(
+                descriptor.exists(),
+                "guard teardown must not hide authority held by an exported lifetime fd"
+            );
+            let error = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap_err();
+            assert!(
+                error.contains("live owner"),
+                "exported lifetime fd must continue excluding overlap: {error}"
+            );
+
+            drop(exported);
+            let replacement = reacquire_after_intentional_ephemeral_authority_closes(
+                claim,
+                "scanner must reclaim the exported descriptor after its final holder closes",
+            );
+            assert!(
+                !descriptor.exists(),
+                "lazy reclamation must remove the retired exported descriptor"
+            );
+            drop(replacement);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_inherited_fd_export_keeps_descriptor_visible_until_duplicate_closes() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("raw-export.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let raw = guard.lease().inherited_fd();
+            let exported = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(exported >= 0, "duplicate raw inherited lease fd");
+            drop(guard);
+
+            let descriptor_visible = descriptor.exists();
+            let competing = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]);
+            let blocked_by_live_export = match competing {
+                Err(error) => error.contains("live owner"),
+                Ok(unexpected) => {
+                    drop(unexpected);
+                    false
+                }
+            };
+
+            unsafe { libc::close(exported) };
+            let replacement = reacquire_after_intentional_ephemeral_authority_closes(
+                claim,
+                "scanner must reclaim raw-export descriptor after duplicate closes",
+            );
+
+            assert!(
+                descriptor_visible,
+                "raw inherited-fd export must disable eager descriptor retirement"
+            );
+            assert!(
+                blocked_by_live_export,
+                "raw inherited-fd export must preserve live overlap exclusion"
+            );
+            assert!(
+                !descriptor.exists(),
+                "scanner must retire the raw-export descriptor after its duplicate closes"
+            );
+            drop(replacement);
+        });
+    }
+
+    #[test]
+    fn into_lease_preserves_detached_ephemeral_authority() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("detached.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let lease = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()])
+                .unwrap()
+                .into_lease();
+            let descriptor = lease.descriptor_path().to_path_buf();
+            assert!(descriptor.exists());
+
+            let error = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]).unwrap_err();
+            assert!(
+                error.contains("live owner"),
+                "detached lease must remain externally visible: {error}"
+            );
+
+            drop(lease);
+            assert!(
+                descriptor.exists(),
+                "raw PersistentLease drop keeps the existing close-only/lazy retirement contract"
+            );
+            let replacement = reacquire_after_intentional_ephemeral_authority_closes(
+                claim,
+                "scanner must reclaim a closed detached ephemeral lease",
+            );
+            assert!(!descriptor.exists());
+            drop(replacement);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_guard_retirement_never_unlinks_a_rebound_descriptor_path() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("rebound.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let displaced = descriptor.with_extension("lease.displaced");
+            std::fs::rename(&descriptor, &displaced).unwrap();
+            std::fs::write(&descriptor, b"replacement owned by another actor").unwrap();
+
+            drop(guard);
+            assert_eq!(
+                std::fs::read(&descriptor).unwrap(),
+                b"replacement owned by another actor",
+                "guard retirement must prove pathname identity before unlinking"
+            );
+
+            std::fs::remove_file(&descriptor).unwrap();
+            std::fs::remove_file(&displaced).unwrap();
         });
     }
 
