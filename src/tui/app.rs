@@ -7699,9 +7699,11 @@ pub struct PresentationTab {
     /// upgrade, but save-time routing still follows this retained identity
     /// instead of rediscovering or guessing another source.
     pub cue_source: Option<MetadataCueSource>,
-    /// True only for a cue-less, untaggable album whose editable metadata
-    /// surface is staged in memory. Opening or browsing never creates the
-    /// sidecar; the first explicit save materializes `cue_source` atomically.
+    /// True only when policy selected a sidecar authority whose target did not
+    /// exist when the editor opened (for example, a coherent single-image CUE
+    /// album or a cue-less untaggable album staged in memory). Opening and
+    /// browsing remain I/O-free; the first explicit save materializes
+    /// `cue_source` with create-only semantics.
     pub pending_sidecar_cue_creation: bool,
     /// Unified multi-surface CUE state. Used by grouped sidecar albums and by
     /// selected sets of independent embedded-CUE carriers.
@@ -9497,26 +9499,13 @@ fn attach_write_issue(tab: &mut PresentationTab, idx: usize, issue: MetadataIssu
     file.issues.push(issue);
 }
 
-fn native_multi_file_sidecar_authority(tab: &PresentationTab) -> bool {
-    tab.paths.len() > 1
-        && tab.cue_album_synthetic_sheet.is_some()
-        && matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)))
-}
-
-fn untaggable_sidecar_authority(tab: &PresentationTab) -> bool {
+/// True when policy resolution selected a sidecar as the authoritative CUE
+/// representation for a synthetic album surface. This identity is retained on
+/// the presentation specifically so save routing and post-save reduction do
+/// not re-derive authority from carrier count or taggability.
+pub(super) fn dedicated_cue_sidecar_authority(tab: &PresentationTab) -> bool {
     tab.cue_album_synthetic_sheet.is_some()
         && matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)))
-        && !tab.technical_details.files.is_empty()
-        && tab.technical_details.files.iter().all(|file| {
-            matches!(
-                &file.file_facts.read_state,
-                FileReadState::Unsupported { .. }
-            )
-        })
-}
-
-fn dedicated_cue_sidecar_authority(tab: &PresentationTab) -> bool {
-    native_multi_file_sidecar_authority(tab) || untaggable_sidecar_authority(tab)
 }
 
 fn cue_sidecar_representable_entry(entry: &crate::tui::probe::TagEntry) -> bool {
@@ -9774,7 +9763,7 @@ fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
     }
 
     let path_count = tab.paths.len();
-    let sidecar_authority = native_multi_file_sidecar_authority(tab);
+    let sidecar_authority = dedicated_cue_sidecar_authority(tab);
     let has_file_details = tab.technical_details.files.len() == path_count;
     let writable = |idx: usize, tab: &PresentationTab| -> bool {
         if !has_file_details {
