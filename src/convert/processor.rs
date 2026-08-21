@@ -2246,8 +2246,13 @@ impl ConversionProcessor {
             if let Some(queue_item) = q.find_item_mut(&item_id) {
                 queue_item.active_tracks.clear();
                 queue_item.closed_track_epochs.clear();
+                let interrupted = matches!(&final_status, ConversionStatus::Interrupted);
                 queue_item.status = final_status;
-                queue_item.completed_at = Some(chrono::Utc::now());
+                queue_item.completed_at = if interrupted {
+                    None
+                } else {
+                    Some(chrono::Utc::now())
+                };
             }
         }
 
@@ -2618,15 +2623,15 @@ impl SubmissionPump {
                     if let Err(error) = acquisition {
                         queue_item.status = ConversionStatus::Interrupted;
                         queue_item.started_at = None;
+                        queue_item.completed_at = None;
                         drop(queue_guard);
-                        pool.metrics().record_job_failed();
-                        terminal.insert(
-                            item_id.clone(),
-                            ConversionStatus::Failed {
-                                error: format!("durable execution acquisition failed: {error}"),
-                                log_path: None,
-                            },
+                        log::warn!(
+                            "durable execution acquisition interrupted for retry: item_id={item_id}: {error}"
                         );
+                        // Acquisition failure occurs before any worker unit is
+                        // submitted. Preserve the item as retryable Interrupted
+                        // work; do not overwrite it with a terminal Failed row.
+                        terminal.insert(item_id.clone(), ConversionStatus::Interrupted);
                         continue;
                     }
                     drop(queue_guard);
@@ -4179,6 +4184,62 @@ mod tests {
         item.input_path = request.container.clone();
         item.pipeline_request = Some(request);
         item
+    }
+
+    #[tokio::test]
+    async fn durable_acquisition_failure_preserves_retryable_interrupted_outcome() {
+        let temp = tempfile::tempdir().expect("acquisition failure tempdir");
+        let request = pipeline_request_for_processor_limit_test(temp.path());
+        std::fs::write(&request.container, b"synthetic input")
+            .expect("create acquisition fixture input");
+        let mut item = conversion_item_with_pipeline_request("acquisition-retry-item", request);
+        item.status = ConversionStatus::Queued;
+
+        let queue = {
+            let mut queue = ConversionQueue::new();
+            queue.items_mut().push_back(item.clone());
+            Arc::new(tokio::sync::RwLock::new(queue))
+        };
+        let hook: ExecutionAcquisitionHook = Arc::new(|_| {
+            Err("synthetic SQLite busy retry exhaustion".to_string())
+        });
+        let (progress_tx, _progress_rx) = broadcast::channel(16);
+        let metrics = Arc::new(SchedulerMetrics::default());
+
+        let outcomes = run_queue_with_shared_orchestrator(
+            vec![item.clone()],
+            Arc::clone(&queue),
+            Some(hook),
+            progress_tx,
+            None,
+            None,
+            HashMap::new(),
+            1,
+            PoolLimits::default(),
+            Arc::clone(&metrics),
+            Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, item.id);
+        assert!(matches!(&outcomes[0].1, ConversionStatus::Interrupted));
+        assert_eq!(
+            metrics.snapshot().jobs_failed,
+            0,
+            "pre-submit acquisition exhaustion is recoverable, not a failed conversion"
+        );
+
+        let mut queue = queue.write().await;
+        let persisted = queue
+            .find_item_mut(&item.id)
+            .expect("acquisition fixture remains in the active queue");
+        assert!(matches!(&persisted.status, ConversionStatus::Interrupted));
+        assert!(persisted.started_at.is_none());
+        assert!(persisted.completed_at.is_none());
     }
 
     #[test]

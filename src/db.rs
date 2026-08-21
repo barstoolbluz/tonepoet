@@ -153,76 +153,126 @@ impl QueueExecutionCoordinator {
         let origin_identity = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
             .map_err(|error| format!("serialize queue execution origin identity: {error}"))?;
 
-        let mut conn = Connection::open(&self.database_path)
+        let conn = Connection::open(&self.database_path)
             .map_err(|error| format!("open queue execution database {}: {error}", self.database_path.display()))?;
         conn.busy_timeout(DB_BUSY_TIMEOUT)
             .map_err(|error| format!("set queue execution busy timeout: {error}"))?;
 
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("queue execution begin transaction: {error}"))?;
-        let row = tx
-            .query_row(
-                "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
-                params![self.scope_id.to_string(), item_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        let publish_result = run_queue_immediate_transaction(&conn, "queue execution", |tx| {
+            let row = tx
+                .query_row(
+                    "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                    params![self.scope_id.to_string(), item_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    QueueTransactionError::sqlite(
+                        format!("queue execution load item '{item_id}'"),
+                        error,
+                    )
+                })?
+                .ok_or_else(|| {
+                    QueueTransactionError::other(format!(
+                        "queue execution item '{item_id}' is not durably owned by this session"
+                    ))
+                })?;
+            if let Some(existing_execution) = row.1 {
+                return Err(QueueTransactionError::other(format!(
+                    "queue execution item '{item_id}' already references execution {existing_execution} without a matching live coordinator lease"
+                )));
+            }
+
+            let mut persisted_item: crate::convert::ConversionItem = serde_json::from_str(&row.0)
+                .map_err(|error| {
+                    QueueTransactionError::other(format!(
+                        "decode durable queue item '{item_id}' before execution: {error}"
+                    ))
+                })?;
+            if !matches!(
+                persisted_item.status,
+                crate::convert::ConversionStatus::Queued | crate::convert::ConversionStatus::Interrupted
+            ) {
+                return Err(QueueTransactionError::other(format!(
+                    "queue execution item '{item_id}' has invalid pre-execution durable status {:?}",
+                    persisted_item.status
+                )));
+            }
+            persisted_item.status = crate::convert::ConversionStatus::Processing {
+                progress: 0.0,
+                message: Some(format!("Starting conversion to {}", persisted_item.output_format)),
+                file_progress: None,
+                phase: Some(crate::convert::ConversionPhase::Extracting),
+                phase_progress: Some(0.0),
+            };
+            if persisted_item.started_at.is_none() {
+                persisted_item.started_at = Some(chrono::Utc::now());
+            }
+            persisted_item.completed_at = None;
+            let item_json = serde_json::to_string(&persisted_item)
+                .map_err(|error| {
+                    QueueTransactionError::other(format!(
+                        "encode Processing queue item '{item_id}': {error}"
+                    ))
+                })?;
+            let now = chrono::Utc::now().timestamp_millis();
+
+            let changed = tx
+                .execute(
+                    "UPDATE conversion_queue_v24 SET item_json=?1, execution_id=?2 WHERE owner_scope=?3 AND id=?4 AND execution_id IS NULL",
+                    params![item_json, execution_id.to_string(), self.scope_id.to_string(), item_id],
+                )
+                .map_err(|error| {
+                    QueueTransactionError::sqlite(
+                        format!("queue execution publish Processing row '{item_id}'"),
+                        error,
+                    )
+                })?;
+            if changed != 1 {
+                return Err(QueueTransactionError::other(format!(
+                    "queue execution row changed concurrently for '{item_id}'"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
+                 VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)",
+                params![
+                    execution_id.to_string(),
+                    self.scope_id.to_string(),
+                    item_id,
+                    &descriptor_path,
+                    &origin_identity,
+                    now,
+                ],
             )
-            .optional()
-            .map_err(|error| format!("queue execution load item '{item_id}': {error}"))?
-            .ok_or_else(|| format!("queue execution item '{item_id}' is not durably owned by this session"))?;
-        if let Some(existing_execution) = row.1 {
-            return Err(format!(
-                "queue execution item '{item_id}' already references execution {existing_execution} without a matching live coordinator lease"
-            ));
+            .map_err(|error| {
+                QueueTransactionError::sqlite(
+                    format!("queue execution insert '{item_id}'"),
+                    error,
+                )
+            })?;
+            Ok(())
+        });
+        if let Err(error) = publish_result {
+            // No SQLite authority references this descriptor unless the
+            // transaction committed. On any pre-commit failure, release the
+            // one lease created for this acquisition and retire its pathname
+            // so retry exhaustion or a genuine CAS loss cannot accumulate
+            // stale QueueExecution descriptors.
+            drop(lease);
+            let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id };
+            if let Err(cleanup_error) =
+                crate::concurrency::retire_descriptor_after_lifecycle_release(
+                    Path::new(&descriptor_path),
+                    &family,
+                )
+            {
+                log::warn!(
+                    "queue execution acquisition failed for '{item_id}' and descriptor retirement was incomplete: {cleanup_error}"
+                );
+            }
+            return Err(error);
         }
-
-        let mut persisted_item: crate::convert::ConversionItem = serde_json::from_str(&row.0)
-            .map_err(|error| format!("decode durable queue item '{item_id}' before execution: {error}"))?;
-        if !matches!(
-            persisted_item.status,
-            crate::convert::ConversionStatus::Queued | crate::convert::ConversionStatus::Interrupted
-        ) {
-            return Err(format!(
-                "queue execution item '{item_id}' has invalid pre-execution durable status {:?}",
-                persisted_item.status
-            ));
-        }
-        persisted_item.status = crate::convert::ConversionStatus::Processing {
-            progress: 0.0,
-            message: Some(format!("Starting conversion to {}", persisted_item.output_format)),
-            file_progress: None,
-            phase: Some(crate::convert::ConversionPhase::Extracting),
-            phase_progress: Some(0.0),
-        };
-        if persisted_item.started_at.is_none() {
-            persisted_item.started_at = Some(chrono::Utc::now());
-        }
-        persisted_item.completed_at = None;
-        let item_json = serde_json::to_string(&persisted_item)
-            .map_err(|error| format!("encode Processing queue item '{item_id}': {error}"))?;
-        let now = chrono::Utc::now().timestamp_millis();
-
-        let changed = tx.execute(
-            "UPDATE conversion_queue_v24 SET item_json=?1, execution_id=?2 WHERE owner_scope=?3 AND id=?4 AND execution_id IS NULL",
-            params![item_json, execution_id.to_string(), self.scope_id.to_string(), item_id],
-        ).map_err(|error| format!("queue execution publish Processing row '{item_id}': {error}"))?;
-        if changed != 1 {
-            return Err(format!("queue execution row changed concurrently for '{item_id}'"));
-        }
-        tx.execute(
-            "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
-             VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)",
-            params![
-                execution_id.to_string(),
-                self.scope_id.to_string(),
-                item_id,
-                descriptor_path,
-                origin_identity,
-                now,
-            ],
-        ).map_err(|error| format!("queue execution insert '{item_id}': {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("queue execution commit '{item_id}': {error}"))?;
 
         let lease = std::sync::Arc::new(lease);
         self.execution_leases
@@ -330,8 +380,160 @@ enum DatabasePragmaProfile {
 }
 
 const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const QUEUE_TRANSACTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+const QUEUE_TRANSACTION_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+const QUEUE_TRANSACTION_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const DB_OPEN_INIT_LOCK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 const DB_OPEN_INIT_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[derive(Debug)]
+struct QueueTransactionError {
+    message: String,
+    busy: bool,
+}
+
+impl QueueTransactionError {
+    fn sqlite(context: impl AsRef<str>, error: rusqlite::Error) -> Self {
+        let busy = matches!(
+            &error,
+            rusqlite::Error::SqliteFailure(sqlite_error, _)
+                if sqlite_error.code == rusqlite::ErrorCode::DatabaseBusy
+        );
+        Self {
+            message: format!("{}: {error}", context.as_ref()),
+            busy,
+        }
+    }
+
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            busy: false,
+        }
+    }
+}
+
+/// Execute one short queue-authority read/modify/write transaction. `IMMEDIATE`
+/// reserves SQLite's writer slot before the first read, eliminating WAL
+/// read-snapshot upgrade failures. A bounded restart loop covers genuine
+/// `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` contention without hot polling.
+///
+/// Callers must create any external lease/descriptor authority before entering
+/// this helper and capture it by reference. The closure may be run more than
+/// once, so it must contain only rollback-safe SQLite work and pure computation.
+fn run_queue_immediate_transaction<T, F>(
+    conn: &Connection,
+    operation: &str,
+    mut body: F,
+) -> Result<T, String>
+where
+    F: FnMut(&rusqlite::Transaction<'_>) -> Result<T, QueueTransactionError>,
+{
+    let started = std::time::Instant::now();
+    let mut attempts = 0usize;
+    let mut backoff = QUEUE_TRANSACTION_RETRY_INITIAL_BACKOFF;
+    let mut last_busy = None::<String>;
+
+    let result = loop {
+        let remaining = QUEUE_TRANSACTION_RETRY_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let detail = last_busy.unwrap_or_else(|| "SQLite remained busy".to_string());
+            break Err(format!(
+                "{detail} ({operation}: SQLite busy retry budget exhausted after {attempts} attempt(s), {} ms)",
+                started.elapsed().as_millis()
+            ));
+        }
+
+        // Keep the whole operation inside one explicit wall-clock budget rather
+        // than allowing every restart to consume a fresh five-second timeout.
+        if let Err(error) = conn.busy_timeout(std::cmp::min(DB_BUSY_TIMEOUT, remaining)) {
+            break Err(format!("{operation}: set bounded busy timeout: {error}"));
+        }
+        attempts += 1;
+
+        let tx = match rusqlite::Transaction::new_unchecked(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+        ) {
+            Ok(tx) => tx,
+            Err(error) => {
+                let error = QueueTransactionError::sqlite(
+                    format!("{operation} transaction begin"),
+                    error,
+                );
+                if !error.busy {
+                    break Err(error.message);
+                }
+                last_busy = Some(error.message);
+                let remaining = QUEUE_TRANSACTION_RETRY_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    continue;
+                }
+                let sleep_for = std::cmp::min(backoff, remaining);
+                std::thread::sleep(sleep_for);
+                backoff = std::cmp::min(
+                    backoff.saturating_mul(2),
+                    QUEUE_TRANSACTION_RETRY_MAX_BACKOFF,
+                );
+                continue;
+            }
+        };
+
+        let attempt_result = match body(&tx) {
+            Ok(value) => tx
+                .commit()
+                .map(|()| value)
+                .map_err(|error| {
+                    QueueTransactionError::sqlite(
+                        format!("{operation} transaction commit"),
+                        error,
+                    )
+                }),
+            Err(error) => {
+                // Dropping the transaction rolls back this attempt before a
+                // restart. No external lifecycle work is allowed in `body`.
+                drop(tx);
+                Err(error)
+            }
+        };
+
+        match attempt_result {
+            Ok(value) => break Ok(value),
+            Err(error) if !error.busy => break Err(error.message),
+            Err(error) => {
+                last_busy = Some(error.message);
+                let remaining = QUEUE_TRANSACTION_RETRY_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    continue;
+                }
+                let sleep_for = std::cmp::min(backoff, remaining);
+                std::thread::sleep(sleep_for);
+                backoff = std::cmp::min(
+                    backoff.saturating_mul(2),
+                    QUEUE_TRANSACTION_RETRY_MAX_BACKOFF,
+                );
+            }
+        }
+    };
+
+    match conn.busy_timeout(DB_BUSY_TIMEOUT) {
+        Ok(()) => result,
+        Err(restore_error) => match result {
+            // Never report a committed transaction as failed merely because
+            // restoring the connection's future wait policy failed. That would
+            // make callers retry an operation that is already durable.
+            Ok(value) => {
+                log::error!(
+                    "{operation}: committed queue transaction but could not restore busy timeout: {restore_error}"
+                );
+                Ok(value)
+            }
+            Err(error) => Err(format!(
+                "{error}; {operation}: restore busy timeout: {restore_error}"
+            )),
+        },
+    }
+}
 
 struct DatabaseOpenInitFileLock(std::fs::File);
 
@@ -2692,35 +2894,59 @@ impl Database {
         )?;
         let descriptor_path = lease.descriptor_path().to_string_lossy().into_owned();
         let now = chrono::Utc::now().timestamp_millis();
-        let tx = self.conn.unchecked_transaction()
-            .map_err(|e| format!("queue scope tx begin: {e}"))?;
         let origin_identity = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
             .map_err(|e| format!("serialize queue scope origin identity: {e}"))?;
-        tx.execute(
-            "INSERT INTO conversion_queue_scopes(scope_uuid, descriptor_path, origin_identity, created_unix_ms) VALUES(?1, ?2, ?3, ?4)",
-            params![scope_id.to_string(), descriptor_path, origin_identity, now],
-        ).map_err(|e| format!("queue scope insert: {e}"))?;
-        // First protocol-aware scope adopts frozen v23 intent exactly once.
-        // The v23 authority is immutable after activation: retaining it is
-        // required both for mixed-version read safety and global secret
-        // reachability.  The epoch bit prevents re-import after v24 drains.
-        let legacy_adopted: i64 = tx.query_row(
-            "SELECT legacy_queue_adopted FROM concurrency_protocol_epoch WHERE id=1",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| format!("queue v24 legacy-adoption state: {e}"))?;
-        if legacy_adopted == 0 {
+        let scope_publish = run_queue_immediate_transaction(&self.conn, "queue scope", |tx| {
             tx.execute(
-                "INSERT INTO conversion_queue_v24(owner_scope, id, item_json, position)
-                 SELECT ?1, id, item_json, position FROM conversion_queue_v23_frozen ORDER BY position, id",
-                [scope_id.to_string()],
-            ).map_err(|e| format!("adopt frozen v23 queue: {e}"))?;
-            tx.execute(
-                "UPDATE concurrency_protocol_epoch SET legacy_queue_adopted=1 WHERE id=1",
-                [],
-            ).map_err(|e| format!("mark frozen v23 queue adopted: {e}"))?;
+                "INSERT INTO conversion_queue_scopes(scope_uuid, descriptor_path, origin_identity, created_unix_ms) VALUES(?1, ?2, ?3, ?4)",
+                params![scope_id.to_string(), &descriptor_path, &origin_identity, now],
+            )
+            .map_err(|e| QueueTransactionError::sqlite("queue scope insert", e))?;
+            // First protocol-aware scope adopts frozen v23 intent exactly once.
+            // The v23 authority is immutable after activation: retaining it is
+            // required both for mixed-version read safety and global secret
+            // reachability. The epoch bit prevents re-import after v24 drains.
+            let legacy_adopted: i64 = tx
+                .query_row(
+                    "SELECT legacy_queue_adopted FROM concurrency_protocol_epoch WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    QueueTransactionError::sqlite("queue v24 legacy-adoption state", e)
+                })?;
+            if legacy_adopted == 0 {
+                tx.execute(
+                    "INSERT INTO conversion_queue_v24(owner_scope, id, item_json, position)
+                     SELECT ?1, id, item_json, position FROM conversion_queue_v23_frozen ORDER BY position, id",
+                    [scope_id.to_string()],
+                )
+                .map_err(|e| QueueTransactionError::sqlite("adopt frozen v23 queue", e))?;
+                tx.execute(
+                    "UPDATE concurrency_protocol_epoch SET legacy_queue_adopted=1 WHERE id=1",
+                    [],
+                )
+                .map_err(|e| {
+                    QueueTransactionError::sqlite("mark frozen v23 queue adopted", e)
+                })?;
+            }
+            Ok(())
+        });
+        if let Err(error) = scope_publish {
+            drop(lease);
+            let family = crate::concurrency::LeaseFamily::QueueScope { scope_id };
+            if let Err(cleanup_error) =
+                crate::concurrency::retire_descriptor_after_lifecycle_release(
+                    Path::new(&descriptor_path),
+                    &family,
+                )
+            {
+                log::warn!(
+                    "queue scope publication failed and descriptor retirement was incomplete: {cleanup_error}"
+                );
+            }
+            return Err(error);
         }
-        tx.commit().map_err(|e| format!("queue scope tx commit: {e}"))?;
         let runtime = QueueScopeRuntime { scope_id, _lease: lease };
         let _ = self.queue_scope.set(runtime);
         self.queue_scope.get().ok_or_else(|| "queue scope initialization race".to_string())
@@ -3012,92 +3238,145 @@ impl Database {
 
         let current_origin = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
             .map_err(|e| format!("serialize recovery origin identity: {e}"))?;
-        let tx = self.conn.unchecked_transaction()
-            .map_err(|e| format!("queue dead-scope recovery tx begin: {e}"))?;
-        let mut append_position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position)+1, 0) FROM conversion_queue_v24 WHERE owner_scope=?1",
-            [current_scope.to_string()],
-            |row| row.get(0),
-        ).map_err(|e| format!("queue dead-scope append position: {e}"))?;
+        let (emptied_scopes, transitioned_executions) = run_queue_immediate_transaction(
+            &self.conn,
+            "queue dead-scope recovery",
+            |tx| {
+                let mut append_position: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(position)+1, 0) FROM conversion_queue_v24 WHERE owner_scope=?1",
+                        [current_scope.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| {
+                        QueueTransactionError::sqlite(
+                            "queue dead-scope append position",
+                            e,
+                        )
+                    })?;
 
-        for scope in &scopes {
-            if scope.descriptor_reconstructed {
-                tx.execute(
-                    "UPDATE conversion_queue_scopes SET descriptor_path=?1, origin_identity=?2 WHERE scope_uuid=?3",
-                    params![scope.descriptor_path.to_string_lossy(), &current_origin, scope.scope_text],
-                ).map_err(|e| format!("publish reconstructed queue scope descriptor: {e}"))?;
-            }
-        }
-        for execution in executions.values() {
-            if execution.descriptor_reconstructed {
-                tx.execute(
-                    "UPDATE conversion_queue_executions SET descriptor_path=?1, origin_identity=?2, updated_unix_ms=?3 WHERE execution_id=?4",
-                    params![
-                        execution.descriptor_path.to_string_lossy(),
-                        &current_origin,
-                        chrono::Utc::now().timestamp_millis(),
-                        execution.execution_id,
-                    ],
-                ).map_err(|e| format!("publish reconstructed queue execution descriptor: {e}"))?;
-            }
-        }
-
-        let mut emptied_scopes = std::collections::HashSet::<uuid::Uuid>::new();
-        let mut transitioned_executions = std::collections::HashSet::<String>::new();
-        for scope in &scopes {
-            for row in &scope.rows {
-                let item = match serde_json::from_str::<crate::convert::ConversionItem>(&row.item_json) {
-                    Ok(item) => item,
-                    Err(error) => {
-                        log::error!("dead queue scope row {} is malformed; retaining reservation: {error}", row.id);
-                        continue;
+                for scope in &scopes {
+                    if scope.descriptor_reconstructed {
+                        tx.execute(
+                            "UPDATE conversion_queue_scopes SET descriptor_path=?1, origin_identity=?2 WHERE scope_uuid=?3",
+                            params![scope.descriptor_path.to_string_lossy(), &current_origin, scope.scope_text],
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite(
+                                "publish reconstructed queue scope descriptor",
+                                e,
+                            )
+                        })?;
                     }
-                };
-                if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
-                    let Some(execution_id) = row.execution_id.as_ref() else { continue };
-                    let Some(execution) = executions.get(execution_id) else { continue };
-                    if !execution.recoverable { continue; }
-                    let mut interrupted = item.clone();
-                    interrupted.status = crate::convert::ConversionStatus::Interrupted;
-                    interrupted.started_at = None;
-                    interrupted.completed_at = None;
-                    let interrupted_json = serde_json::to_string(&interrupted)
-                        .map_err(|e| format!("serialize recovered interrupted item: {e}"))?;
-                    tx.execute(
-                        "UPDATE conversion_queue_v24
-                         SET owner_scope=?1, position=?2, item_json=?3, execution_id=NULL
-                         WHERE id=?4 AND owner_scope=?5",
-                        params![current_scope.to_string(), append_position, interrupted_json, row.id, scope.scope_text],
-                    ).map_err(|e| format!("recover dead Processing row: {e}"))?;
-                    tx.execute(
-                        "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
-                        [execution_id],
-                    ).map_err(|e| format!("retire recovered execution row: {e}"))?;
-                    transitioned_executions.insert(execution_id.clone());
-                    append_position += 1;
-                } else {
-                    tx.execute(
-                        "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2
-                         WHERE id=?3 AND owner_scope=?4",
-                        params![current_scope.to_string(), append_position, row.id, scope.scope_text],
-                    ).map_err(|e| format!("adopt dead queue row: {e}"))?;
-                    append_position += 1;
                 }
-            }
-            let remaining: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM conversion_queue_v24 WHERE owner_scope=?1",
-                [&scope.scope_text],
-                |row| row.get(0),
-            ).map_err(|e| format!("queue dead-scope remaining count: {e}"))?;
-            if remaining == 0 {
-                tx.execute(
-                    "DELETE FROM conversion_queue_scopes WHERE scope_uuid=?1",
-                    [&scope.scope_text],
-                ).map_err(|e| format!("queue dead-scope retire row: {e}"))?;
-                emptied_scopes.insert(scope.scope_id);
-            }
-        }
-        tx.commit().map_err(|e| format!("queue dead-scope recovery tx commit: {e}"))?;
+                for execution in executions.values() {
+                    if execution.descriptor_reconstructed {
+                        tx.execute(
+                            "UPDATE conversion_queue_executions SET descriptor_path=?1, origin_identity=?2, updated_unix_ms=?3 WHERE execution_id=?4",
+                            params![
+                                execution.descriptor_path.to_string_lossy(),
+                                &current_origin,
+                                chrono::Utc::now().timestamp_millis(),
+                                execution.execution_id,
+                            ],
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite(
+                                "publish reconstructed queue execution descriptor",
+                                e,
+                            )
+                        })?;
+                    }
+                }
+
+                let mut emptied_scopes = std::collections::HashSet::<uuid::Uuid>::new();
+                let mut transitioned_executions = std::collections::HashSet::<String>::new();
+                for scope in &scopes {
+                    for row in &scope.rows {
+                        let item = match serde_json::from_str::<crate::convert::ConversionItem>(&row.item_json) {
+                            Ok(item) => item,
+                            Err(error) => {
+                                log::error!("dead queue scope row {} is malformed; retaining reservation: {error}", row.id);
+                                continue;
+                            }
+                        };
+                        if matches!(item.status, crate::convert::ConversionStatus::Processing { .. }) {
+                            let Some(execution_id) = row.execution_id.as_ref() else { continue };
+                            let Some(execution) = executions.get(execution_id) else { continue };
+                            if !execution.recoverable { continue; }
+                            let mut interrupted = item.clone();
+                            interrupted.status = crate::convert::ConversionStatus::Interrupted;
+                            interrupted.started_at = None;
+                            interrupted.completed_at = None;
+                            let interrupted_json = serde_json::to_string(&interrupted)
+                                .map_err(|e| {
+                                    QueueTransactionError::other(format!(
+                                        "serialize recovered interrupted item: {e}"
+                                    ))
+                                })?;
+                            tx.execute(
+                                "UPDATE conversion_queue_v24
+                                 SET owner_scope=?1, position=?2, item_json=?3, execution_id=NULL
+                                 WHERE id=?4 AND owner_scope=?5",
+                                params![current_scope.to_string(), append_position, interrupted_json, row.id, scope.scope_text],
+                            )
+                            .map_err(|e| {
+                                QueueTransactionError::sqlite(
+                                    "recover dead Processing row",
+                                    e,
+                                )
+                            })?;
+                            tx.execute(
+                                "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
+                                [execution_id],
+                            )
+                            .map_err(|e| {
+                                QueueTransactionError::sqlite(
+                                    "retire recovered execution row",
+                                    e,
+                                )
+                            })?;
+                            transitioned_executions.insert(execution_id.clone());
+                            append_position += 1;
+                        } else {
+                            tx.execute(
+                                "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2
+                                 WHERE id=?3 AND owner_scope=?4",
+                                params![current_scope.to_string(), append_position, row.id, scope.scope_text],
+                            )
+                            .map_err(|e| {
+                                QueueTransactionError::sqlite("adopt dead queue row", e)
+                            })?;
+                            append_position += 1;
+                        }
+                    }
+                    let remaining: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM conversion_queue_v24 WHERE owner_scope=?1",
+                            [&scope.scope_text],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite(
+                                "queue dead-scope remaining count",
+                                e,
+                            )
+                        })?;
+                    if remaining == 0 {
+                        tx.execute(
+                            "DELETE FROM conversion_queue_scopes WHERE scope_uuid=?1",
+                            [&scope.scope_text],
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite("queue dead-scope retire row", e)
+                        })?;
+                        emptied_scopes.insert(scope.scope_id);
+                    }
+                }
+
+                Ok((emptied_scopes, transitioned_executions))
+            },
+        )?;
 
         // The DB transition is now authoritative. Release our recovery OFDs,
         // then lifecycle-retire descriptors on fresh OFDs in registry order.
@@ -3173,7 +3452,16 @@ impl Database {
         }
         let scope_id = self.ensure_queue_scope()?.scope_id;
         let (persisted_items, persist_report) = Self::prepare_queue_items_for_persistence(items)?;
-
+        // Retry-invariant CPU/OS work stays outside the IMMEDIATE transaction so
+        // contending sessions hold SQLite's single writer slot only for the
+        // state-dependent reads and writes that require atomicity.
+        let persisted_json = persisted_items
+            .iter()
+            .map(|item| {
+                serde_json::to_string(item)
+                    .map_err(|e| format!("queue item serialize '{}': {e}", item.id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // QueueExecution is final-family from birth and exists before the
         // Processing row can commit. Runtime ownership lives in this Database
         // (the TUI scope); the execution supervisor handoff extends it across
@@ -3208,104 +3496,195 @@ impl Database {
                 leases.insert(item.id.clone(), std::sync::Arc::new(lease));
             }
         }
+        let execution_origin_identity = if execution_for_item.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
+                .map_err(|e| format!("serialize queue execution origin identity: {e}"))?
+        };
 
-        let tx = self.conn.unchecked_transaction()
-            .map_err(|e| format!("queue tx begin: {e}"))?;
-        let mut statement = tx.prepare(
-            "SELECT id, item_json, position, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1"
-        ).map_err(|e| format!("queue reconcile prepare existing rows: {e}"))?;
-        let existing_rows = statement.query_map([scope_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?))
-        }).map_err(|e| format!("queue reconcile query existing rows: {e}"))?
-          .collect::<Result<Vec<_>, _>>()
-          .map_err(|e| format!("queue reconcile decode existing row: {e}"))?;
-        drop(statement);
-        let mut existing = existing_rows.into_iter()
-            .map(|(id,json,pos,exec)| (id,(json,pos,exec)))
-            .collect::<std::collections::HashMap<_,_>>();
-        let mut report = QueueSyncReport::default();
-        let mut retire_execution_ids = Vec::<(String, String)>::new();
+        let (mut report, retire_execution_ids, global_live) = run_queue_immediate_transaction(
+            &self.conn,
+            "queue reconcile",
+            |tx| {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT id, item_json, position, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1",
+                    )
+                    .map_err(|e| {
+                        QueueTransactionError::sqlite(
+                            "queue reconcile prepare existing rows",
+                            e,
+                        )
+                    })?;
+                let existing_rows = statement
+                    .query_map([scope_id.to_string()], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .map_err(|e| {
+                        QueueTransactionError::sqlite(
+                            "queue reconcile query existing rows",
+                            e,
+                        )
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        QueueTransactionError::sqlite(
+                            "queue reconcile decode existing row",
+                            e,
+                        )
+                    })?;
+                drop(statement);
+                let mut existing = existing_rows
+                    .into_iter()
+                    .map(|(id, json, pos, exec)| (id, (json, pos, exec)))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let mut report = QueueSyncReport::default();
+                let mut retire_execution_ids = Vec::<(String, String)>::new();
 
-        for (position, item) in persisted_items.iter().enumerate() {
-            let foreign_scope: Option<String> = tx.query_row(
-                "SELECT owner_scope FROM conversion_queue_v24 WHERE id=?1 AND owner_scope<>?2",
-                params![item.id, scope_id.to_string()], |row| row.get(0)
-            ).optional().map_err(|e| format!("queue foreign-id collision probe: {e}"))?;
-            if let Some(owner) = foreign_scope {
-                return Err(format!("queue item id '{}' is already owned by independent live/recoverable scope {}", item.id, owner));
-            }
-            let json = serde_json::to_string(item).map_err(|e| format!("queue item serialize: {e}"))?;
-            let desired_execution = execution_for_item.get(&item.id).map(|(id,_)| id.clone());
-            match existing.remove(&item.id) {
-                Some((old_json, old_position, old_execution)) => {
-                    let old_reference = Self::persisted_queue_reference(&old_json);
-                    if old_reference.as_deref() != item.archive_password_ref.as_deref() {
-                        if let Some(reference) = old_reference { report.retire_references.push(reference); }
+                for (position, (item, json)) in persisted_items
+                    .iter()
+                    .zip(persisted_json.iter())
+                    .enumerate()
+                {
+                    let foreign_scope: Option<String> = tx
+                        .query_row(
+                            "SELECT owner_scope FROM conversion_queue_v24 WHERE id=?1 AND owner_scope<>?2",
+                            params![item.id, scope_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite(
+                                "queue foreign-id collision probe",
+                                e,
+                            )
+                        })?;
+                    if let Some(owner) = foreign_scope {
+                        return Err(QueueTransactionError::other(format!(
+                            "queue item id '{}' is already owned by independent live/recoverable scope {}",
+                            item.id, owner
+                        )));
                     }
-                    if old_execution != desired_execution {
-                        if let Some(old) = old_execution.clone() {
-                            if let Ok(path) = tx.query_row(
-                                "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1", [&old], |row| row.get::<_,String>(0)
-                            ) { retire_execution_ids.push((old.clone(), path)); }
+                    let desired_execution = execution_for_item
+                        .get(&item.id)
+                        .map(|(id, _)| id.clone());
+                    match existing.remove(&item.id) {
+                        Some((old_json, old_position, old_execution)) => {
+                            let old_reference = Self::persisted_queue_reference(&old_json);
+                            if old_reference.as_deref() != item.archive_password_ref.as_deref() {
+                                if let Some(reference) = old_reference {
+                                    report.retire_references.push(reference);
+                                }
+                            }
+                            if old_execution != desired_execution {
+                                if let Some(old) = old_execution.clone() {
+                                    if let Ok(path) = tx.query_row(
+                                        "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1",
+                                        [&old],
+                                        |row| row.get::<_, String>(0),
+                                    ) {
+                                        retire_execution_ids.push((old.clone(), path));
+                                    }
+                                }
+                            }
+                            if old_json.as_str() != json.as_str()
+                                || old_position != position as i64
+                                || old_execution != desired_execution
+                            {
+                                tx.execute(
+                                    "UPDATE conversion_queue_v24 SET item_json=?1, position=?2, execution_id=?3 WHERE owner_scope=?4 AND id=?5",
+                                    params![json.as_str(), position as i64, desired_execution, scope_id.to_string(), item.id],
+                                )
+                                .map_err(|e| {
+                                    QueueTransactionError::sqlite("queue item update", e)
+                                })?;
+                                report.rows_written += 1;
+                            }
+                        }
+                        None => {
+                            tx.execute(
+                                "INSERT INTO conversion_queue_v24(owner_scope,id,item_json,position,execution_id) VALUES(?1,?2,?3,?4,?5)",
+                                params![scope_id.to_string(), item.id, json.as_str(), position as i64, desired_execution],
+                            )
+                            .map_err(|e| {
+                                QueueTransactionError::sqlite("queue item insert", e)
+                            })?;
+                            report.rows_written += 1;
                         }
                     }
-                    if old_json != json || old_position != position as i64 || old_execution != desired_execution {
+                    if let Some((execution_id, descriptor_path)) = execution_for_item.get(&item.id) {
+                        let now = chrono::Utc::now().timestamp_millis();
                         tx.execute(
-                            "UPDATE conversion_queue_v24 SET item_json=?1, position=?2, execution_id=?3 WHERE owner_scope=?4 AND id=?5",
-                            params![json, position as i64, desired_execution, scope_id.to_string(), item.id]
-                        ).map_err(|e| format!("queue item update: {e}"))?;
-                        report.rows_written += 1;
+                            "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
+                             VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)
+                             ON CONFLICT(execution_id) DO UPDATE SET state='processing', updated_unix_ms=excluded.updated_unix_ms",
+                            params![
+                                execution_id,
+                                scope_id.to_string(),
+                                item.id,
+                                descriptor_path,
+                                &execution_origin_identity,
+                                now,
+                            ],
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite("queue execution upsert", e)
+                        })?;
                     }
                 }
-                None => {
-                    tx.execute(
-                        "INSERT INTO conversion_queue_v24(owner_scope,id,item_json,position,execution_id) VALUES(?1,?2,?3,?4,?5)",
-                        params![scope_id.to_string(), item.id, json, position as i64, desired_execution]
-                    ).map_err(|e| format!("queue item insert: {e}"))?;
-                    report.rows_written += 1;
-                }
-            }
-            if let Some((execution_id, descriptor_path)) = execution_for_item.get(&item.id) {
-                let now = chrono::Utc::now().timestamp_millis();
-                tx.execute(
-                    "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms)
-                     VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)
-                     ON CONFLICT(execution_id) DO UPDATE SET state='processing', updated_unix_ms=excluded.updated_unix_ms",
-                    params![
-                        execution_id,
-                        scope_id.to_string(),
-                        item.id,
-                        descriptor_path,
-                        serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
-                            .map_err(|e| format!("serialize queue execution origin identity: {e}"))?,
-                        now
-                    ]
-                ).map_err(|e| format!("queue execution upsert: {e}"))?;
-            }
-        }
 
-        for (id, (old_json, _, old_execution)) in existing {
-            if let Some(reference) = Self::persisted_queue_reference(&old_json) { report.retire_references.push(reference); }
-            if let Some(execution_id) = old_execution {
-                if let Ok(path) = tx.query_row(
-                    "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1", [&execution_id], |row| row.get::<_,String>(0)
-                ) { retire_execution_ids.push((execution_id.clone(), path)); }
-                tx.execute("DELETE FROM conversion_queue_executions WHERE execution_id=?1", [&execution_id])
-                    .map_err(|e| format!("queue execution delete: {e}"))?;
-            }
-            tx.execute("DELETE FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2", params![scope_id.to_string(), id])
-                .map_err(|e| format!("queue item delete: {e}"))?;
-            report.rows_deleted += 1;
-        }
-        for (execution_id, _) in &retire_execution_ids {
-            tx.execute("DELETE FROM conversion_queue_executions WHERE execution_id=?1", [execution_id])
-                .map_err(|e| format!("queue stale execution delete: {e}"))?;
-        }
-        // Decide durable secret reachability in the same transaction that
-        // changes queue authority.  Secret-store deletion happens only after
-        // commit, using this transactionally consistent snapshot.
-        let global_live = Self::queue_secret_refs_on(&tx)?;
-        tx.commit().map_err(|e| format!("queue tx commit: {e}"))?;
+                for (id, (old_json, _, old_execution)) in existing {
+                    if let Some(reference) = Self::persisted_queue_reference(&old_json) {
+                        report.retire_references.push(reference);
+                    }
+                    if let Some(execution_id) = old_execution {
+                        if let Ok(path) = tx.query_row(
+                            "SELECT descriptor_path FROM conversion_queue_executions WHERE execution_id=?1",
+                            [&execution_id],
+                            |row| row.get::<_, String>(0),
+                        ) {
+                            retire_execution_ids.push((execution_id.clone(), path));
+                        }
+                        tx.execute(
+                            "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
+                            [&execution_id],
+                        )
+                        .map_err(|e| {
+                            QueueTransactionError::sqlite("queue execution delete", e)
+                        })?;
+                    }
+                    tx.execute(
+                        "DELETE FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                        params![scope_id.to_string(), id],
+                    )
+                    .map_err(|e| QueueTransactionError::sqlite("queue item delete", e))?;
+                    report.rows_deleted += 1;
+                }
+                for (execution_id, _) in &retire_execution_ids {
+                    tx.execute(
+                        "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
+                        [execution_id],
+                    )
+                    .map_err(|e| {
+                        QueueTransactionError::sqlite("queue stale execution delete", e)
+                    })?;
+                }
+                // Decide durable secret reachability in the same transaction
+                // that changes queue authority. Secret-store deletion happens
+                // only after commit, using this transactionally consistent
+                // snapshot.
+                let global_live = Self::queue_secret_refs_on(tx)
+                    .map_err(QueueTransactionError::other)?;
+
+                Ok((report, retire_execution_ids, global_live))
+            },
+        )?;
 
         // Publish process-local routing only after the descriptor and Processing
         // row are committed. The DB/descriptor pair remains authoritative.
@@ -3408,10 +3787,11 @@ impl Database {
             return Ok(LegacyImportPublication::AlreadyDone);
         }
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("queue legacy import tx begin: {e}"))?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| format!("queue legacy import tx begin: {e}"))?;
 
         let done = Self::legacy_import_flag_on(&tx, "queue_import_done")?;
         if done {
@@ -3438,18 +3818,9 @@ impl Database {
             return Ok(LegacyImportPublication::ExistingSqliteAuthority);
         }
 
-        // Claim SQLite's write reservation before secret preparation. Two app
-        // processes can observe a pending marker concurrently; the loser must
-        // fail here, before it can overwrite a stable secret reference that
-        // belongs to the winner's committed import. The update is intentionally
-        // value-preserving and remains part of the import transaction.
-        tx.execute(
-            "UPDATE legacy_json_import_state
-             SET queue_import_done = queue_import_done
-             WHERE id = ?1",
-            [LEGACY_IMPORT_STATE_ROW_ID],
-        )
-        .map_err(|e| format!("queue legacy import claim authority: {e}"))?;
+        // BEGIN IMMEDIATE owns SQLite's writer reservation before the marker
+        // and authority reads above, so no read snapshot can become stale
+        // before secret preparation or publication begins.
 
         let refs = items.iter().collect::<Vec<_>>();
         let (persisted_items, persist_report) =
@@ -5016,10 +5387,11 @@ impl Database {
         &self,
         entries: &[(String, i64)],
     ) -> Result<LegacyImportPublication, String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("recent legacy import tx begin: {e}"))?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| format!("recent legacy import tx begin: {e}"))?;
 
         let done = Self::legacy_import_flag_on(&tx, "recent_import_done")?;
         if done {
@@ -5046,16 +5418,8 @@ impl Database {
             return Ok(LegacyImportPublication::ExistingSqliteAuthority);
         }
 
-        // Claim the write reservation before reading the import payload into
-        // SQLite. This makes two simultaneous first starts deterministic: only
+        // BEGIN IMMEDIATE makes simultaneous first starts deterministic: only
         // one transaction can publish rows and advance the marker.
-        tx.execute(
-            "UPDATE legacy_json_import_state
-             SET recent_import_done = recent_import_done
-             WHERE id = ?1",
-            [LEGACY_IMPORT_STATE_ROW_ID],
-        )
-        .map_err(|e| format!("recent legacy import claim authority: {e}"))?;
 
         // Legacy recent.json is stored newest-first. Insert oldest-first so
         // rowid DESC preserves that source order when timestamps tie.
@@ -5979,6 +6343,203 @@ mod tests {
         db.sync_queue(&[&second])
             .expect("retire selected execution after test");
         assert!(crate::concurrency::runtime_execution_id(&first.id).is_none());
+    }
+
+    #[test]
+    fn queue_sync_waits_for_competing_writer_without_snapshot_upgrade_failure() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("queue sync contention tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open queue sync contention database");
+        let mut item = queue_item(
+            "sync-contention",
+            "/music/sync-contention.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db.sync_queue(&[&item]).expect("seed queue row");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let blocker_path = db_path.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_path).expect("open competing writer");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("hold competing writer reservation");
+            ready_tx.send(()).expect("publish competing writer readiness");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            conn.execute_batch("COMMIT;")
+                .expect("release competing writer reservation");
+        });
+        ready_rx.recv().expect("wait for competing writer");
+
+        item.status = crate::convert::ConversionStatus::Queued;
+        let report = db
+            .sync_queue(&[&item])
+            .expect("queue reconcile must wait for and outlive ordinary writer contention");
+        blocker.join().expect("join competing writer");
+        assert_eq!(report.rows_written, 1);
+
+        let scope = db.ensure_queue_scope().expect("queue scope").scope_id.to_string();
+        let persisted: String = db
+            .conn
+            .query_row(
+                "SELECT item_json FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                params![scope, item.id],
+                |row| row.get(0),
+            )
+            .expect("read reconciled queue row");
+        assert!(persisted.contains("Queued"));
+    }
+
+    #[test]
+    fn concurrent_distinct_execution_publishers_wait_for_one_sqlite_writer() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("execution publish contention tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db_a = Database::open_path(&db_path).expect("open first queue session");
+        let item_a = queue_item(
+            "exec-contention-a",
+            "/music/exec-contention-a.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db_a.sync_queue(&[&item_a]).expect("publish first queue item");
+        let db_b = Database::open_path(&db_path).expect("open second queue session");
+        let item_b = queue_item(
+            "exec-contention-b",
+            "/music/exec-contention-b.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db_b.sync_queue(&[&item_b]).expect("publish second queue item");
+
+        let coordinator_a = db_a
+            .queue_execution_coordinator()
+            .expect("create first execution coordinator");
+        let coordinator_b = db_b
+            .queue_execution_coordinator()
+            .expect("create second execution coordinator");
+        let scope_a = coordinator_a.scope_id.to_string();
+        let scope_b = coordinator_b.scope_id.to_string();
+        assert_ne!(scope_a, scope_b, "independent sessions must own distinct queue scopes");
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let blocker_path = db_path.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_path).expect("open competing execution writer");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("hold execution writer reservation");
+            ready_tx.send(()).expect("publish execution blocker readiness");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            conn.execute_batch("COMMIT;")
+                .expect("release execution writer reservation");
+        });
+        ready_rx.recv().expect("wait for execution blocker");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let id_a = item_a.id.clone();
+        let publisher_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            coordinator_a.begin_processing(&id_a)
+        });
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let id_b = item_b.id.clone();
+        let publisher_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            coordinator_b.begin_processing(&id_b)
+        });
+        barrier.wait();
+
+        let result_a = publisher_a.join().expect("join first execution publisher");
+        let result_b = publisher_b.join().expect("join second execution publisher");
+        blocker.join().expect("join execution blocker");
+        assert!(result_a.is_ok(), "first distinct publisher failed: {result_a:?}");
+        assert!(result_b.is_ok(), "second distinct publisher failed: {result_b:?}");
+
+        for (scope, item) in [(&scope_a, &item_a), (&scope_b, &item_b)] {
+            let (json, execution_id): (String, Option<String>) = db_a
+                .conn
+                .query_row(
+                    "SELECT item_json, execution_id FROM conversion_queue_v24 WHERE owner_scope=?1 AND id=?2",
+                    params![scope, item.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read contended execution row");
+            assert!(json.contains("Processing"));
+            assert!(execution_id.is_some(), "successful publisher must own one execution id");
+        }
+
+        db_a.sync_queue(&[]).expect("retire first contended execution");
+        db_b.sync_queue(&[]).expect("retire second contended execution");
+    }
+
+    #[test]
+    fn concurrent_same_row_execution_publish_has_exactly_one_winner() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("double claim tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open double claim database");
+        let item = queue_item(
+            "exec-double-claim",
+            "/music/exec-double-claim.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db.sync_queue(&[&item]).expect("publish double-claim fixture");
+        let scope_id = db.ensure_queue_scope().expect("double-claim scope").scope_id;
+
+        // Independent process-local maps force both contenders through SQLite,
+        // exercising the durable CAS/status guard rather than the coordinator's
+        // same-process idempotent fast path.
+        let make_coordinator = || QueueExecutionCoordinator {
+            database_path: db_path.clone(),
+            scope_id,
+            execution_leases: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            transition_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        let coordinator_a = make_coordinator();
+        let coordinator_b = make_coordinator();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let id_a = item.id.clone();
+        let claim_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            coordinator_a.begin_processing(&id_a)
+        });
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let id_b = item.id.clone();
+        let claim_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            coordinator_b.begin_processing(&id_b)
+        });
+        barrier.wait();
+
+        let result_a = claim_a.join().expect("join first same-row claimant");
+        let result_b = claim_b.join().expect("join second same-row claimant");
+        let successes = (result_a.is_ok() as usize) + (result_b.is_ok() as usize);
+        assert_eq!(successes, 1, "same row must have exactly one execution winner");
+        let loser = if result_a.is_err() { result_a } else { result_b };
+        let error = loser.expect_err("one claimant must lose the durable CAS/status guard");
+        assert!(
+            error.contains("already references execution")
+                || error.contains("row changed concurrently"),
+            "unexpected double-claim error: {error}"
+        );
+
+        let scope = scope_id.to_string();
+        let execution_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversion_queue_executions WHERE owner_scope=?1 AND item_id=?2",
+                params![scope, item.id],
+                |row| row.get(0),
+            )
+            .expect("count same-row execution authorities");
+        assert_eq!(execution_rows, 1, "one queue item must never publish two live executions");
+
+        crate::concurrency::unregister_runtime_execution(&item.id);
+        db.sync_queue(&[&item])
+            .expect("restore fixture and retire winning execution descriptor");
     }
 
     #[test]

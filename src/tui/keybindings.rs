@@ -19971,12 +19971,6 @@ enum ResolvedMetadataGroupOrigin {
     Uncovered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissingSidecarTargetPolicy {
-    ExistingOnly,
-    CreateForSingleImage,
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedEmbeddedMetadataSurface {
     surface: MetadataCueSurface,
@@ -19996,32 +19990,7 @@ struct ResolvedMetadataGroup {
     /// Parallel to `selected_surfaces` when Embedded CUE is selected. Empty for
     /// Sidecar CUE and Individual-files groups.
     embedded_multi_file_read_only: Vec<bool>,
-    /// True only when Edit Metadata resolved a sidecar target from a coherent
-    /// single-image embedded CUE because no sidecar exists yet. Materializing
-    /// the editor remains I/O-free; SAVE performs the create-only write.
-    create_sidecar_if_missing: bool,
     origin: ResolvedMetadataGroupOrigin,
-}
-
-fn creatable_sidecar_surface_from_embedded_group(
-    embedded_group: &[ResolvedEmbeddedMetadataSurface],
-) -> Option<MetadataCueSurface> {
-    let embedded = embedded_group.first()?;
-    if embedded_group.len() != 1
-        || embedded.multi_file_read_only
-        || embedded.surface.audio_paths.len() != 1
-        || !metadata_cue_surface_proves_image_content(&embedded.surface)
-    {
-        return None;
-    }
-    let audio_path = embedded.surface.audio_paths.first()?;
-    let cue_path = audio_path.with_extension("cue");
-    if cue_path.exists() {
-        return None;
-    }
-    let mut sidecar = embedded.surface.clone();
-    sidecar.cue_path = cue_path;
-    Some(sidecar)
 }
 
 fn metadata_surface_coverage_keys(
@@ -20331,46 +20300,6 @@ fn aggregate_metadata_availability<'a>(
     }
 }
 
-/// Resolve authority from representations that are actually present before
-/// considering a create-only sidecar target. A missing sidecar is not a
-/// present metadata source and therefore cannot displace a valid embedded CUE
-/// or individual-file representation merely because it could be created.
-///
-/// Create-only sidecar fallback is intentionally second-phase: it is eligible
-/// only when semantic viability leaves no present representation at all. This
-/// keeps source selection stable while retaining a narrow seam for callers
-/// that can legitimately synthesize a sidecar when no durable source exists.
-fn resolve_present_metadata_target_with_creatable_sidecar(
-    priority: &[crate::config::AggregateMetadataTarget],
-    present_availability: super::tag_interchange::AggregateMetadataAvailability,
-    creatable_sidecar: bool,
-) -> Option<(crate::config::AggregateMetadataTarget, bool)> {
-    if let Some(target) = super::tag_interchange::resolve_aggregate_metadata_target(
-        priority,
-        present_availability,
-    ) {
-        return Some((target, false));
-    }
-    if !creatable_sidecar {
-        return None;
-    }
-
-    let create_only_availability = super::tag_interchange::AggregateMetadataAvailability {
-        sidecar_cue: true,
-        ..Default::default()
-    };
-    match super::tag_interchange::resolve_aggregate_metadata_target(
-        priority,
-        create_only_availability,
-    ) {
-        Some(crate::config::AggregateMetadataTarget::SidecarCue) => Some((
-            crate::config::AggregateMetadataTarget::SidecarCue,
-            true,
-        )),
-        _ => None,
-    }
-}
-
 /// Resolve a folder into independently authoritative metadata groups.
 ///
 /// Structural sidecar admission and operation-specific embedded probing happen
@@ -20383,7 +20312,6 @@ fn resolve_directory_metadata_groups<F>(
     standalone_embedded: Vec<ResolvedEmbeddedMetadataSurface>,
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
     individual_metadata_unusable_paths: &std::collections::BTreeSet<std::path::PathBuf>,
-    missing_sidecar_policy: MissingSidecarTargetPolicy,
     mut embedded_for_admitted_surface: F,
     operation: &str,
 ) -> Result<Vec<ResolvedMetadataGroup>, String>
@@ -20486,7 +20414,6 @@ where
             selected_surfaces,
             covered_paths: individual_paths,
             embedded_multi_file_read_only,
-            create_sidecar_if_missing: false,
             origin: ResolvedMetadataGroupOrigin::AdmittedSurface,
         });
     }
@@ -20543,9 +20470,11 @@ where
         if individual_paths.is_empty() {
             continue;
         }
-        // Source selection is based only on durable representations. Avoid even
-        // probing a hypothetical sidecar path unless present-source resolution
-        // produces no viable target.
+        // This loop is entered only for a non-empty standalone embedded group,
+        // so EmbeddedCue is present by construction and SidecarCue is absent.
+        // Resolve only among representations that actually exist; synthesizing
+        // a missing sidecar here was unreachable in production and obscured the
+        // separate live cue-less/untaggable sidecar-creation path.
         let present_availability = aggregate_metadata_availability(
             &individual_paths,
             embedded_group.iter().map(|embedded| &embedded.surface),
@@ -20553,34 +20482,19 @@ where
             true,
             individual_metadata_unusable_paths,
         );
-        let present_representation = super::tag_interchange::resolve_aggregate_metadata_target(
+        let representation = super::tag_interchange::resolve_aggregate_metadata_target(
             metadata_target_priority,
             present_availability,
-        );
-        let mut creatable_sidecar = None;
-        let (representation, create_sidecar_if_missing) =
-            if let Some(representation) = present_representation {
-                (representation, false)
-            } else {
-                creatable_sidecar = (missing_sidecar_policy
-                    == MissingSidecarTargetPolicy::CreateForSingleImage)
-                    .then(|| creatable_sidecar_surface_from_embedded_group(&embedded_group))
-                    .flatten();
-                resolve_present_metadata_target_with_creatable_sidecar(
-                    metadata_target_priority,
-                    present_availability,
-                    creatable_sidecar.is_some(),
-                )
-                .ok_or_else(|| {
-                    let carrier = embedded_group
-                        .first()
-                        .map(|embedded| embedded.surface.audio_path.display().to_string())
-                        .unwrap_or_else(|| "<unknown carrier>".to_string());
-                    format!(
-                        "{operation}: embedded CUE carrier '{carrier}' has no applicable metadata representation"
-                    )
-                })?
-            };
+        )
+        .ok_or_else(|| {
+            let carrier = embedded_group
+                .first()
+                .map(|embedded| embedded.surface.audio_path.display().to_string())
+                .unwrap_or_else(|| "<unknown carrier>".to_string());
+            format!(
+                "{operation}: embedded CUE carrier '{carrier}' has no applicable metadata representation"
+            )
+        })?;
         let (selected_surfaces, embedded_multi_file_read_only) = match representation {
             crate::config::AggregateMetadataTarget::EmbeddedCue => (
                 embedded_group
@@ -20593,19 +20507,9 @@ where
                     .collect(),
             ),
             crate::config::AggregateMetadataTarget::SidecarCue => {
-                if !create_sidecar_if_missing {
-                    return Err(format!(
-                        "{operation}: selected sidecar CUE target is not present or creatable"
-                    ));
-                }
-                (
-                    vec![creatable_sidecar.ok_or_else(|| {
-                        format!(
-                            "{operation}: selected sidecar CUE target is no longer creatable"
-                        )
-                    })?],
-                    Vec::new(),
-                )
+                return Err(format!(
+                    "{operation}: internal error: standalone embedded metadata resolved an absent sidecar CUE"
+                ));
             }
             crate::config::AggregateMetadataTarget::IndividualFiles => (Vec::new(), Vec::new()),
         };
@@ -20617,7 +20521,6 @@ where
             selected_surfaces,
             covered_paths: individual_paths,
             embedded_multi_file_read_only,
-            create_sidecar_if_missing,
             origin: ResolvedMetadataGroupOrigin::EmbeddedOnly,
         });
     }
@@ -20630,7 +20533,6 @@ where
             selected_surfaces: Vec::new(),
             covered_paths: uncovered,
             embedded_multi_file_read_only: Vec::new(),
-            create_sidecar_if_missing: false,
             origin: ResolvedMetadataGroupOrigin::Uncovered,
         });
     }
@@ -20883,7 +20785,6 @@ fn classify_transfer_directory(
         standalone_embedded,
         metadata_target_priority,
         &transfer_capabilities.unsupported_paths,
-        MissingSidecarTargetPolicy::ExistingOnly,
         |surface| {
             if cancel.is_cancelled() {
                 return Err(
@@ -24121,7 +24022,6 @@ fn resolve_edit_metadata_directory_groups(
         standalone_embedded,
         metadata_target_priority,
         &metadata_capabilities.unsupported_paths,
-        MissingSidecarTargetPolicy::CreateForSingleImage,
         |surface| {
             Ok(resolved_embedded_metadata_surface_for_admitted_surface(
                 surface,
@@ -24179,62 +24079,6 @@ fn metadata_sidecar_presentation_tabs(
         }
     }
     Ok(tabs)
-}
-
-fn stage_resolved_group_sidecar_creation(
-    state: &mut super::app::MetadataEditorState,
-    group: &ResolvedMetadataGroup,
-) -> Result<(), String> {
-    if !group.create_sidecar_if_missing {
-        return Ok(());
-    }
-    if group.representation != crate::config::AggregateMetadataTarget::SidecarCue {
-        return Err(
-            "internal error: pending sidecar creation attached to a non-sidecar metadata group"
-                .to_string(),
-        );
-    }
-    let targets = group
-        .selected_surfaces
-        .iter()
-        .map(|surface| surface.cue_path.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    if targets.is_empty() {
-        return Err(
-            "internal error: pending sidecar creation has no resolved destination".to_string(),
-        );
-    }
-    if let Some(existing) = targets.iter().find(|path| path.exists()) {
-        return Err(format!(
-            "metadata: generated sidecar destination '{}' appeared before editor materialization; reopen to resolve its authority",
-            existing.display()
-        ));
-    }
-
-    let mut matched = std::collections::BTreeSet::new();
-    let mut stage_tab = |tab: &mut super::app::PresentationTab| {
-        let Some(super::app::MetadataCueSource::Sidecar(path)) = tab.cue_source.as_ref() else {
-            return;
-        };
-        if targets.contains(path) {
-            tab.pending_sidecar_cue_creation = true;
-            matched.insert(path.clone());
-        }
-    };
-    if state.model.presentation_tabs.is_empty() {
-        stage_tab(&mut state.model.file_surface);
-    } else {
-        for tab in &mut state.model.presentation_tabs {
-            stage_tab(tab);
-        }
-    }
-    if matched != targets {
-        return Err(
-            "internal error: generated sidecar target was not retained by metadata materialization"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 fn open_metadata_editor_for_resolved_groups(
@@ -24326,7 +24170,6 @@ fn open_metadata_editor_for_resolved_groups(
                 }
             }
         };
-        stage_resolved_group_sidecar_creation(&mut state, group)?;
         let presentation_count = state.presentation_tabs.len().max(1);
         app.active_overlay = ActiveOverlay::MetadataEditor(state);
         app.set_status(format!(
@@ -24367,7 +24210,6 @@ fn open_metadata_editor_for_resolved_groups(
                         0,
                         crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
                     )?;
-                    stage_resolved_group_sidecar_creation(&mut state, group)?;
                     if state.presentation_tabs.is_empty() {
                         tabs.push(state.active_surface().clone());
                     } else {
@@ -75683,7 +75525,6 @@ mod metadata_cue_source_coverage_tests {
             Vec::new(),
             &[IndividualFiles, SidecarCue, EmbeddedCue],
             &std::collections::BTreeSet::new(),
-            MissingSidecarTargetPolicy::ExistingOnly,
             |_| Ok(None),
             "metadata test",
         )
@@ -75745,7 +75586,6 @@ mod metadata_cue_source_coverage_tests {
             Vec::new(),
             &[IndividualFiles, SidecarCue, EmbeddedCue],
             &unusable,
-            MissingSidecarTargetPolicy::ExistingOnly,
             |_| Ok(None),
             "metadata test",
         )
@@ -75769,7 +75609,6 @@ mod metadata_cue_source_coverage_tests {
             Vec::new(),
             &[SidecarCue, IndividualFiles, EmbeddedCue],
             &std::collections::BTreeSet::new(),
-            MissingSidecarTargetPolicy::ExistingOnly,
             |_| Err("Transfer tags: cancelled during carrier classification".to_string()),
             "Transfer tags",
         )
@@ -75792,7 +75631,6 @@ mod metadata_cue_source_coverage_tests {
             Vec::new(),
             &[EmbeddedCue, SidecarCue, IndividualFiles],
             &std::collections::BTreeSet::new(),
-            MissingSidecarTargetPolicy::ExistingOnly,
             |_| Ok(None),
             "metadata test",
         )
@@ -75815,60 +75653,26 @@ mod metadata_cue_source_coverage_tests {
             multi_file_read_only: false,
         };
         let paths = vec![embedded_surface.audio_path.clone()];
-        let priority = [SidecarCue, EmbeddedCue, IndividualFiles];
 
+        // The directory resolver receives no create-only sidecar authority.
+        // Even with SidecarCue first in configured priority, the absent sidecar
+        // cannot displace the embedded representation that is actually present.
         let embedded_present = resolve_directory_metadata_groups(
             &paths,
             &[],
             vec![embedded],
-            &priority,
+            &[SidecarCue, EmbeddedCue, IndividualFiles],
             &std::collections::BTreeSet::new(),
-            MissingSidecarTargetPolicy::CreateForSingleImage,
             |_| Ok(None),
             "metadata test",
         )
         .expect("present embedded source must remain authoritative");
         assert_eq!(embedded_present.len(), 1);
         assert_eq!(embedded_present[0].representation, EmbeddedCue);
-        assert!(!embedded_present[0].create_sidecar_if_missing);
         assert_eq!(
             embedded_present[0].selected_surfaces[0].cue_path,
             embedded_surface.audio_path
         );
-
-        let first = std::path::PathBuf::from("/album/01.flac");
-        let second = std::path::PathBuf::from("/album/02.flac");
-        let mut presplit_surface = policy_surface();
-        presplit_surface.audio_path = first.clone();
-        presplit_surface.audio_paths = vec![first.clone(), second.clone()];
-        presplit_surface.track_audio_paths = vec![first.clone(), second.clone()];
-        let present_individual = aggregate_metadata_availability(
-            &[first, second],
-            std::slice::from_ref(&presplit_surface),
-            false,
-            false,
-            &std::collections::BTreeSet::new(),
-        );
-        assert!(present_individual.individual_files);
-        let (individual_target, create_individual_sidecar) =
-            resolve_present_metadata_target_with_creatable_sidecar(
-                &[SidecarCue, IndividualFiles, EmbeddedCue],
-                present_individual,
-                true,
-            )
-            .expect("present pre-split files must remain selectable");
-        assert_eq!(individual_target, IndividualFiles);
-        assert!(!create_individual_sidecar);
-
-        let (fallback_target, create_fallback_sidecar) =
-            resolve_present_metadata_target_with_creatable_sidecar(
-                &[IndividualFiles, SidecarCue, EmbeddedCue],
-                crate::tui::tag_interchange::AggregateMetadataAvailability::default(),
-                true,
-            )
-            .expect("create-only sidecar remains a last-resort fallback");
-        assert_eq!(fallback_target, SidecarCue);
-        assert!(create_fallback_sidecar);
     }
 
     fn embedded_candidate() -> EmbeddedCueCandidate {
