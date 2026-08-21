@@ -387,13 +387,13 @@ const DB_OPEN_INIT_LOCK_WAIT_LIMIT: std::time::Duration = std::time::Duration::f
 const DB_OPEN_INIT_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[derive(Debug)]
-struct QueueTransactionError {
+pub(crate) struct QueueTransactionError {
     message: String,
     busy: bool,
 }
 
 impl QueueTransactionError {
-    fn sqlite(context: impl AsRef<str>, error: rusqlite::Error) -> Self {
+    pub(crate) fn sqlite(context: impl AsRef<str>, error: rusqlite::Error) -> Self {
         let busy = matches!(
             &error,
             rusqlite::Error::SqliteFailure(sqlite_error, _)
@@ -405,7 +405,7 @@ impl QueueTransactionError {
         }
     }
 
-    fn other(message: impl Into<String>) -> Self {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             busy: false,
@@ -421,7 +421,7 @@ impl QueueTransactionError {
 /// Callers must create any external lease/descriptor authority before entering
 /// this helper and capture it by reference. The closure may be run more than
 /// once, so it must contain only rollback-safe SQLite work and pure computation.
-fn run_queue_immediate_transaction<T, F>(
+pub(crate) fn run_queue_immediate_transaction<T, F>(
     conn: &Connection,
     operation: &str,
     mut body: F,
@@ -6003,6 +6003,55 @@ mod tests {
         item
     }
 
+    fn run_with_competing_writer<T>(db_path: &Path, action: impl FnOnce() -> T) -> T {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let blocker_path = db_path.to_path_buf();
+        let blocker = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_path).expect("open competing writer");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("hold competing writer reservation");
+            ready_tx.send(()).expect("publish competing writer readiness");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            conn.execute_batch("COMMIT;")
+                .expect("release competing writer reservation");
+        });
+        ready_rx.recv().expect("wait for competing writer");
+        let result = action();
+        blocker.join().expect("join competing writer");
+        result
+    }
+
+    fn containment_test_descriptor(
+        token: &str,
+    ) -> crate::convert::script_supervisor::ContainmentDescriptor {
+        crate::convert::script_supervisor::ContainmentDescriptor {
+            schema_version: 1,
+            token: token.to_string(),
+            backend: crate::convert::script_supervisor::ContainmentBackend::LinuxSubreaper,
+            confidence: crate::convert::script_supervisor::ContainmentConfidence::ProcessTreeObserved,
+            host: crate::convert::script_supervisor::HostBootIdentity {
+                machine_identity: "test-machine".to_string(),
+                host_identity: "test-host".to_string(),
+                boot_identity: "test-boot".to_string(),
+            },
+            supervisor: crate::convert::script_supervisor::StableProcessIdentity {
+                pid: 100,
+                start_identity: "1000".to_string(),
+            },
+            leader: crate::convert::script_supervisor::StableProcessIdentity {
+                pid: 101,
+                start_identity: "1001".to_string(),
+            },
+            runtime_directory: crate::convert::script_supervisor::RuntimeDirectoryIdentity {
+                device: 1,
+                inode: 2,
+            },
+            cgroup: None,
+            session_id: Some(101),
+            warning: None,
+        }
+    }
+
     fn table_columns(conn: &Connection, table: &str) -> Vec<(String, String)> {
         let mut statement = conn
             .prepare(&format!("PRAGMA table_info({})", table))
@@ -6388,6 +6437,183 @@ mod tests {
             )
             .expect("read reconciled queue row");
         assert!(persisted.contains("Queued"));
+    }
+
+    #[test]
+    fn execution_containment_writes_wait_for_competing_writer_without_snapshot_upgrade_failure() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("containment contention tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open containment contention database");
+        let item = queue_item(
+            "containment-contention",
+            "/music/containment-contention.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db.sync_queue(&[&item]).expect("seed containment queue row");
+        let coordinator = db
+            .queue_execution_coordinator()
+            .expect("create containment execution coordinator");
+        coordinator
+            .begin_processing(&item.id)
+            .expect("activate containment execution");
+        let execution_id = crate::concurrency::runtime_execution_id(&item.id)
+            .expect("runtime execution id")
+            .to_string();
+
+        let token = "containment-contention-token";
+        let runtime_directory = temp.path().join("runtime");
+        std::fs::create_dir(&runtime_directory).expect("create containment runtime directory");
+        let descriptor = containment_test_descriptor(token);
+
+        run_with_competing_writer(&db_path, || {
+            crate::concurrency::record_execution_containment(
+                &item.id,
+                token,
+                &runtime_directory,
+                &descriptor,
+            )
+        })
+        .expect("containment record must wait for competing writer");
+
+        let (external_released, encoded): (i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT external_released, containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+                params![execution_id, item.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read recorded containment");
+        assert_eq!(external_released, 0);
+        let entries: Vec<serde_json::Value> = serde_json::from_str(
+            encoded.as_deref().expect("recorded containment json"),
+        )
+        .expect("decode recorded containment json");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get("token").and_then(|value| value.as_str()), Some(token));
+        assert_eq!(entries[0].get("released").and_then(|value| value.as_bool()), Some(false));
+
+        run_with_competing_writer(&db_path, || {
+            crate::concurrency::mark_execution_containment_released(&item.id, token)
+        })
+        .expect("containment release mark must wait for competing writer");
+
+        let (external_released, encoded): (i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT external_released, containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+                params![execution_id, item.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read released containment");
+        assert_eq!(external_released, 1);
+        let entries: Vec<serde_json::Value> = serde_json::from_str(
+            encoded.as_deref().expect("released containment json"),
+        )
+        .expect("decode released containment json");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get("released").and_then(|value| value.as_bool()), Some(true));
+
+        run_with_competing_writer(&db_path, || {
+            crate::concurrency::clear_execution_containment(&item.id, token)
+        })
+        .expect("containment cleanup must wait for competing writer");
+
+        let (external_released, encoded): (i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT external_released, containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+                params![execution_id, item.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read cleared containment");
+        assert_eq!(external_released, 0);
+        assert!(encoded.is_none(), "last cleared containment must restore NULL json");
+
+        db.sync_queue(&[])
+            .expect("retire containment contention execution after test");
+    }
+
+    #[test]
+    fn execution_containment_changed_row_guards_remain_terminal() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("containment changed-row tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open containment changed-row database");
+        let item = queue_item(
+            "containment-row-disappeared",
+            "/music/containment-row-disappeared.flac",
+            crate::convert::ConversionStatus::Interrupted,
+        );
+        db.sync_queue(&[&item]).expect("seed changed-row queue row");
+        let coordinator = db
+            .queue_execution_coordinator()
+            .expect("create changed-row execution coordinator");
+        coordinator
+            .begin_processing(&item.id)
+            .expect("activate changed-row execution");
+
+        let token = "containment-row-disappeared-token";
+        let runtime_directory = temp.path().join("runtime");
+        std::fs::create_dir(&runtime_directory).expect("create changed-row runtime directory");
+        let descriptor = containment_test_descriptor(token);
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER containment_test_delete_before_update
+                 BEFORE UPDATE OF containment_json ON conversion_queue_executions
+                 WHEN OLD.item_id='containment-row-disappeared'
+                 BEGIN
+                     DELETE FROM conversion_queue_executions WHERE execution_id=OLD.execution_id;
+                 END;",
+            )
+            .expect("install changed-row trigger for record");
+        let record_error = crate::concurrency::record_execution_containment(
+            &item.id,
+            token,
+            &runtime_directory,
+            &descriptor,
+        )
+        .expect_err("record changed-row guard must remain terminal");
+        assert!(
+            record_error.contains("execution containment row disappeared before release"),
+            "unexpected record changed-row error: {record_error}"
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER containment_test_delete_before_update;")
+            .expect("drop changed-row record trigger");
+
+        crate::concurrency::record_execution_containment(
+            &item.id,
+            token,
+            &runtime_directory,
+            &descriptor,
+        )
+        .expect("seed containment before mark guard");
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER containment_test_delete_before_update
+                 BEFORE UPDATE OF containment_json ON conversion_queue_executions
+                 WHEN OLD.item_id='containment-row-disappeared'
+                 BEGIN
+                     DELETE FROM conversion_queue_executions WHERE execution_id=OLD.execution_id;
+                 END;",
+            )
+            .expect("install changed-row trigger for mark");
+        let mark_error = crate::concurrency::mark_execution_containment_released(&item.id, token)
+            .expect_err("mark changed-row guard must remain terminal");
+        assert!(
+            mark_error.contains("execution containment row disappeared while marking release"),
+            "unexpected mark changed-row error: {mark_error}"
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER containment_test_delete_before_update;")
+            .expect("drop changed-row mark trigger");
+
+        crate::concurrency::clear_execution_containment(&item.id, token)
+            .expect("clear containment before changed-row cleanup");
+        db.sync_queue(&[])
+            .expect("retire changed-row execution after test");
     }
 
     #[test]

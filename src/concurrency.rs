@@ -2760,32 +2760,33 @@ pub fn record_execution_containment(
         .map_err(|e| format!("open execution containment database {}: {e}", database_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| format!("configure execution containment database: {e}"))?;
-    let tx = conn.unchecked_transaction()
-        .map_err(|e| format!("begin execution containment update: {e}"))?;
-    let current: Option<String> = tx.query_row(
-        "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
-        rusqlite::params![execution_id.to_string(), item_id],
-        |row| row.get(0),
-    ).map_err(|e| format!("read execution containment row before release: {e}"))?;
-    let mut entries = current
-        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
-        .unwrap_or_default();
-    entries.retain(|entry| entry.get("token").and_then(|v| v.as_str()) != Some(token));
-    entries.push(serde_json::json!({
-        "token": token,
-        "runtime_directory": runtime_directory,
-        "descriptor": descriptor,
-        "released": false,
-    }));
-    let changed = tx.execute(
-        "UPDATE conversion_queue_executions SET containment_json=?1, updated_unix_ms=?2 WHERE execution_id=?3 AND item_id=?4",
-        rusqlite::params![serde_json::to_string(&entries).map_err(|e| format!("serialize containment set: {e}"))?, unix_ms() as i64, execution_id.to_string(), item_id],
-    ).map_err(|e| format!("persist execution containment before release: {e}"))?;
-    if changed != 1 {
-        return Err(format!("execution containment row disappeared before release for item {item_id}"));
-    }
-    tx.commit().map_err(|e| format!("commit execution containment before release: {e}"))?;
-    Ok(())
+    crate::db::run_queue_immediate_transaction(&conn, "execution containment before release", |tx| {
+        let current: Option<String> = tx.query_row(
+            "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+            rusqlite::params![execution_id.to_string(), item_id],
+            |row| row.get(0),
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("read execution containment row before release", e))?;
+        let mut entries = current
+            .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+            .unwrap_or_default();
+        entries.retain(|entry| entry.get("token").and_then(|v| v.as_str()) != Some(token));
+        entries.push(serde_json::json!({
+            "token": token,
+            "runtime_directory": runtime_directory,
+            "descriptor": descriptor,
+            "released": false,
+        }));
+        let encoded = serde_json::to_string(&entries)
+            .map_err(|e| crate::db::QueueTransactionError::other(format!("serialize containment set: {e}")))?;
+        let changed = tx.execute(
+            "UPDATE conversion_queue_executions SET containment_json=?1, updated_unix_ms=?2 WHERE execution_id=?3 AND item_id=?4",
+            rusqlite::params![encoded, unix_ms() as i64, execution_id.to_string(), item_id],
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("persist execution containment before release", e))?;
+        if changed != 1 {
+            return Err(crate::db::QueueTransactionError::other(format!("execution containment row disappeared before release for item {item_id}")));
+        }
+        Ok(())
+    })
 }
 
 /// Mark a previously persisted containment as having crossed its exec gate.
@@ -2802,42 +2803,43 @@ pub fn mark_execution_containment_released(item_id: &str, token: &str) -> Result
         (authority.execution_id, authority.database_path.clone())
     };
     let Some(database_path) = database_path else { return Ok(()) };
-    let mut conn = rusqlite::Connection::open(&database_path)
+    let conn = rusqlite::Connection::open(&database_path)
         .map_err(|e| format!("open execution containment database {}: {e}", database_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| format!("configure execution containment database: {e}"))?;
-    let tx = conn.unchecked_transaction()
-        .map_err(|e| format!("begin execution release update: {e}"))?;
-    let current: Option<String> = tx.query_row(
-        "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
-        rusqlite::params![execution_id.to_string(), item_id],
-        |row| row.get(0),
-    ).map_err(|e| format!("read execution containment before release mark: {e}"))?;
-    let mut entries = current
-        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
-        .unwrap_or_default();
-    let mut found = false;
-    for entry in &mut entries {
-        if entry.get("token").and_then(|value| value.as_str()) == Some(token) {
-            let Some(object) = entry.as_object_mut() else {
-                return Err("execution containment entry is not an object".to_string());
-            };
-            object.insert("released".to_string(), serde_json::Value::Bool(true));
-            found = true;
+    crate::db::run_queue_immediate_transaction(&conn, "execution containment release", |tx| {
+        let current: Option<String> = tx.query_row(
+            "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+            rusqlite::params![execution_id.to_string(), item_id],
+            |row| row.get(0),
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("read execution containment before release mark", e))?;
+        let mut entries = current
+            .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+            .unwrap_or_default();
+        let mut found = false;
+        for entry in &mut entries {
+            if entry.get("token").and_then(|value| value.as_str()) == Some(token) {
+                let Some(object) = entry.as_object_mut() else {
+                    return Err(crate::db::QueueTransactionError::other("execution containment entry is not an object"));
+                };
+                object.insert("released".to_string(), serde_json::Value::Bool(true));
+                found = true;
+            }
         }
-    }
-    if !found {
-        return Err(format!("execution containment token {token} was not persisted before release"));
-    }
-    let changed = tx.execute(
-        "UPDATE conversion_queue_executions SET external_released=1, containment_json=?1, updated_unix_ms=?2 WHERE execution_id=?3 AND item_id=?4",
-        rusqlite::params![serde_json::to_string(&entries).map_err(|e| format!("serialize released containment set: {e}"))?, unix_ms() as i64, execution_id.to_string(), item_id],
-    ).map_err(|e| format!("persist execution released state: {e}"))?;
-    if changed != 1 {
-        return Err(format!("execution containment row disappeared while marking release for item {item_id}"));
-    }
-    tx.commit().map_err(|e| format!("commit execution release update: {e}"))?;
-    Ok(())
+        if !found {
+            return Err(crate::db::QueueTransactionError::other(format!("execution containment token {token} was not persisted before release")));
+        }
+        let encoded = serde_json::to_string(&entries)
+            .map_err(|e| crate::db::QueueTransactionError::other(format!("serialize released containment set: {e}")))?;
+        let changed = tx.execute(
+            "UPDATE conversion_queue_executions SET external_released=1, containment_json=?1, updated_unix_ms=?2 WHERE execution_id=?3 AND item_id=?4",
+            rusqlite::params![encoded, unix_ms() as i64, execution_id.to_string(), item_id],
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("persist execution released state", e))?;
+        if changed != 1 {
+            return Err(crate::db::QueueTransactionError::other(format!("execution containment row disappeared while marking release for item {item_id}")));
+        }
+        Ok(())
+    })
 }
 
 /// Remove one completed containment only after the supervisor has durably
@@ -2855,29 +2857,33 @@ pub fn clear_execution_containment(item_id: &str, token: &str) -> Result<(), Str
         (authority.execution_id, authority.database_path.clone())
     };
     let Some(database_path) = database_path else { return Ok(()) };
-    let mut conn = rusqlite::Connection::open(&database_path)
+    let conn = rusqlite::Connection::open(&database_path)
         .map_err(|e| format!("open execution containment database {}: {e}", database_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| format!("configure execution containment database: {e}"))?;
-    let tx = conn.unchecked_transaction()
-        .map_err(|e| format!("begin execution containment cleanup: {e}"))?;
-    let current: Option<String> = tx.query_row(
-        "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
-        rusqlite::params![execution_id.to_string(), item_id],
-        |row| row.get(0),
-    ).map_err(|e| format!("read execution containment cleanup row: {e}"))?;
-    let mut entries = current
-        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
-        .unwrap_or_default();
-    entries.retain(|entry| entry.get("token").and_then(|v| v.as_str()) != Some(token));
-    let any_released = entries.iter().any(|entry| entry.get("released").and_then(|value| value.as_bool()) == Some(true));
-    let encoded = if entries.is_empty() { None } else { Some(serde_json::to_string(&entries).map_err(|e| format!("serialize containment cleanup set: {e}"))?) };
-    tx.execute(
-        "UPDATE conversion_queue_executions SET external_released=?1, containment_json=?2, updated_unix_ms=?3 WHERE execution_id=?4 AND item_id=?5",
-        rusqlite::params![if any_released {1} else {0}, encoded, unix_ms() as i64, execution_id.to_string(), item_id],
-    ).map_err(|e| format!("persist execution containment cleanup: {e}"))?;
-    tx.commit().map_err(|e| format!("commit execution containment cleanup: {e}"))?;
-    Ok(())
+    crate::db::run_queue_immediate_transaction(&conn, "execution containment cleanup", |tx| {
+        let current: Option<String> = tx.query_row(
+            "SELECT containment_json FROM conversion_queue_executions WHERE execution_id=?1 AND item_id=?2",
+            rusqlite::params![execution_id.to_string(), item_id],
+            |row| row.get(0),
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("read execution containment cleanup row", e))?;
+        let mut entries = current
+            .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+            .unwrap_or_default();
+        entries.retain(|entry| entry.get("token").and_then(|v| v.as_str()) != Some(token));
+        let any_released = entries.iter().any(|entry| entry.get("released").and_then(|value| value.as_bool()) == Some(true));
+        let encoded = if entries.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&entries)
+                .map_err(|e| crate::db::QueueTransactionError::other(format!("serialize containment cleanup set: {e}")))?)
+        };
+        tx.execute(
+            "UPDATE conversion_queue_executions SET external_released=?1, containment_json=?2, updated_unix_ms=?3 WHERE execution_id=?4 AND item_id=?5",
+            rusqlite::params![if any_released {1} else {0}, encoded, unix_ms() as i64, execution_id.to_string(), item_id],
+        ).map_err(|e| crate::db::QueueTransactionError::sqlite("persist execution containment cleanup", e))?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
