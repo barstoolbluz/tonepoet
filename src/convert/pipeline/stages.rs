@@ -54,7 +54,10 @@ use super::actions::{
 #[cfg(all(test, target_os = "linux"))]
 use super::actions::{ScriptInvocation, ScriptOutcome};
 use super::materializer_archive::ArchiveMaterializer;
-use super::materializer_cue::{is_cue_image_candidate, CueImageMaterializer};
+use super::materializer_cue::{
+    cue_streaming_scratch_facts, is_cue_image_candidate, CueImageMaterializer,
+    CueStreamingScratchFacts,
+};
 use super::materializer_sacd::{is_sacd_iso_candidate, SacdIsoMaterializer};
 use super::materializer_dvda::{is_dvda_candidate, DvdaAudioMaterializer};
 use super::materializer_dvdv::{is_dvdv_candidate, DvdVideoMaterializer};
@@ -62,23 +65,31 @@ use super::materializer_bluray::{is_bluray_candidate, BlurayMaterializer};
 use super::dvdv_realize::realize_dvdv_track;
 use super::bluray_realize::realize_bluray_track;
 use super::materializer_single::SingleFileMaterializer;
-use super::memory_budget::{estimate_job_peak_bytes, write_staging_owner_marker, ScratchAdmissionFailureKind, ScratchReservation};
+use super::memory_budget::{
+    estimate_job_peak_bytes, estimate_streaming_cue_scratch_peak_bytes,
+    write_staging_owner_marker, ScratchAdmissionFailureKind, ScratchReservation,
+};
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
-    execute_planned_track_conversion, preflight_reference_rerun_authority,
-    reference_bound_metadata_executable, reference_metadata_toolchains_match,
-    run_tool_command_with_concurrency, verify_reference_metadata_toolchain_before_mutation,
-    verify_reference_output_after_metadata, ReferenceToolchainEvidence,
+    cleanup_cue_stream_direct_track_plan, execute_planned_track_conversion,
+    finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
+    run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
+    preflight_reference_rerun_authority, reference_bound_metadata_executable,
+    reference_metadata_toolchains_match, run_tool_command_with_concurrency,
+    verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
+    CueStreamDirectTrackPlan, ReferenceToolchainEvidence,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::{metadata_obligations_for_request, orchestrator_metadata_stage_required};
+use super::planned_adapter::{planned_command_to_tool_command, DEFAULT_PLANNED_COMMAND_TIMEOUT};
 use super::progress::{
     heartbeat, OperationProgressTracker,
 };
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{
     BoundToolExecutable, CommandRecord, EnvVar, RealToolRunner, ToolBinary, ToolCommand,
-    ToolOutput, ToolPipelineError, ToolPipelineOutput, ToolRunner,
+    ToolOutput, ToolPipelineError, ToolPipelineOutput, ToolRunner, ToolSegmentedPipelineError,
+    ToolStreamMirror, ToolStreamSegment,
 };
 use super::types::*;
 use crate::convert::cap_fs::PinnedDirectoryCapability;
@@ -1078,6 +1089,33 @@ async fn realize_track_with_tool_limits_and_stats(
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
             })
         }
+        TrackSourceRef::CueStreamSegment {
+            fallback_path,
+            decode_path,
+            start_sample,
+            samples,
+            carrier,
+            ..
+        } => {
+            let sample_rate = prepared_track
+                .and_then(PreparedTrack::scalar_sample_rate)
+                .ok_or_else(|| ConvertError::TrackValidation(
+                    "streamable CUE segment is missing its source sample rate".to_string(),
+                ))?;
+            super::materializer_cue::realize_cue_stream_segment_fallback(
+                decode_path,
+                *start_sample,
+                *samples,
+                sample_rate,
+                *carrier,
+                fallback_path,
+                runner,
+                cancel,
+            )
+            .await
+            .map(RealizedTrackInfo::without_stats)
+            .map_err(|err| ConvertError::Realize(err.to_string()))
+        }
         TrackSourceRef::CueSegmentCarrier { path, .. } => {
             if !path.exists() {
                 return Err(ConvertError::TrackValidation(format!(
@@ -1338,7 +1376,7 @@ mod cue_image_segment_command_tests {
     fn cue_segment_command_decodes_to_pcm_s32le_wav_without_stream_copy() {
         let args = cut_segment_ffmpeg_args(
             Path::new("album.flac"),
-            "atrim=start_sample=0:end_sample=44100,asetpts=PTS-STARTPTS",
+            "atrim=start_sample=0:end_sample=44100,asetpts=N/SR/TB",
             Path::new("segment.wav"),
         );
 
@@ -1361,6 +1399,61 @@ mod cue_image_segment_command_tests {
         assert!(!name.ends_with(".flac"));
     }
 
+    #[test]
+    fn streamed_cue_decoder_is_one_raw_pcm_stream_from_sample_zero() {
+        let command = cue_stream_decoder_command(
+            Path::new("album.flac"),
+            CueSegmentCarrier::PcmS32LeWav,
+        );
+
+        assert!(has_adjacent_arg(&command.args, "-i", "album.flac"));
+        assert!(has_adjacent_arg(&command.args, "-f", "s32le"));
+        assert!(has_adjacent_arg(&command.args, "-c:a", "pcm_s32le"));
+        assert_eq!(command.args.last().map(String::as_str), Some("pipe:1"));
+        assert!(!command.args.iter().any(|arg| arg == "-ss" || arg == "-af"));
+    }
+
+    #[test]
+    fn streamed_cue_byte_ranges_are_frame_exact_and_fail_closed_on_overflow() {
+        assert_eq!(
+            cue_stream_byte_range(44_100, 88_200, 2, CueSegmentCarrier::PcmS32LeWav),
+            Some((44_100 * 8, 88_200 * 8))
+        );
+        assert!(cue_stream_byte_range(
+            u64::MAX,
+            1,
+            2,
+            CueSegmentCarrier::PcmS32LeWav,
+        )
+        .is_none());
+    }
+
+
+    #[test]
+    fn source_replaygain_pcm_header_uses_exact_riff_lengths_for_small_tracks() {
+        let header = cue_stream_analysis_wav_header(44_100, 2, CueSegmentCarrier::PcmS32LeWav, 100)
+            .expect("small PCM stream header");
+        assert_eq!(&header[..4], b"RIFF");
+        assert_eq!(header.len(), 44);
+        assert_eq!(u32::from_le_bytes(header[4..8].try_into().unwrap()), 836);
+        assert_eq!(&header[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(header[40..44].try_into().unwrap()), 800);
+    }
+
+    #[test]
+    fn source_replaygain_pcm_header_switches_to_rf64_without_truncating_lengths() {
+        let samples = (u64::from(u32::MAX) / 8) + 1;
+        let header = cue_stream_analysis_wav_header(48_000, 2, CueSegmentCarrier::PcmS32LeWav, samples)
+            .expect("large PCM stream header");
+        assert_eq!(&header[..4], b"RF64");
+        assert_eq!(header.len(), 80);
+        assert_eq!(u32::from_le_bytes(header[4..8].try_into().unwrap()), u32::MAX);
+        assert_eq!(&header[12..16], b"ds64");
+        assert_eq!(u64::from_le_bytes(header[28..36].try_into().unwrap()), samples * 8);
+        assert_eq!(u64::from_le_bytes(header[36..44].try_into().unwrap()), samples);
+        assert_eq!(&header[72..76], b"data");
+        assert_eq!(u32::from_le_bytes(header[76..80].try_into().unwrap()), u32::MAX);
+    }
 
     fn has_adjacent_arg(args: &[String], left: &str, right: &str) -> bool {
         args.windows(2).any(|window| window[0] == left && window[1] == right)
@@ -1380,14 +1473,11 @@ async fn cut_segment_with_ffmpeg(
         ConvertError::TrackValidation("image segment sample range overflows".to_string())
     })?;
 
-    // Deliberately avoid input-side `-ss` here. On compressed images, ffmpeg may
-    // seek to the closest preceding seek point and then make filters count from
-    // that decoded stream, which can yield the expected length but the wrong
-    // source-aligned first sample. Absolute sample trimming is slower for late
-    // tracks, but it preserves correctness until a separately proven exact
-    // seek/copy strategy is introduced.
+    // Keep the legacy ImageSegment arm byte-for-byte aligned with the live CUE
+    // splitter's sample-timeline semantics. In particular: no input `-ss`, and
+    // reset timestamps with `N/SR/TB` after absolute sample trimming.
     let filter =
-        format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS");
+        format!("atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=N/SR/TB");
     let cmd = ToolCommand {
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffmpeg,
@@ -3166,6 +3256,19 @@ pub struct ScheduledTrackOutput {
 /// Result of an extraction/split work unit. The scheduler submits this to the
 /// same shared queue as encode work, so SACD/CUE realization and encoding are
 /// separate dependency steps instead of hidden serial work inside encoding.
+#[derive(Debug, Clone)]
+pub struct ScheduledCueStreamTrack {
+    pub index: usize,
+    pub track: PreparedTrack,
+    pub final_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct ScheduledCueStreamBatch {
+    pub outputs: Vec<ScheduledTrackOutput>,
+    pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+}
+
 #[derive(Debug)]
 pub struct ScheduledRealizedTrack {
     pub index: usize,
@@ -3347,10 +3450,9 @@ async fn convert_tracks_with_reporter_with_tool_paths(
         };
     }
 
-    // Fallback entry used by direct unit tests and legacy callers. The normal
-    // queue path uses the processor-level shared pool and calls
-    // `encode_track_for_scheduler` for each ready track. Keeping this fallback
-    // serial avoids nested worker pools and worker overcommit.
+    // Direct/legacy entry used outside the shared queue. Keep it serial to
+    // avoid nested worker pools, but give descriptive CUE segments the same
+    // one-decoder/sequential-consumer grouping as the production scheduler.
     let total_tracks = source.tracks.len();
     let total_expected_samples = total_expected_samples(source);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
@@ -3358,7 +3460,9 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     let mut artifacts = Vec::new();
     let mut completed_expected_samples = 0_u64;
 
-    for (track_index, track) in source.tracks.iter().cloned().enumerate() {
+    let mut track_index = 0_usize;
+    while track_index < total_tracks {
+        let track = source.tracks[track_index].clone();
         let Some(final_path) = planned.get(&track.id).cloned() else {
             records.push(failed_track_record(
                 &track,
@@ -3367,6 +3471,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 Vec::new(),
                 format!("missing planned output for track {}", track.id.source_ordinal),
             ));
+            track_index += 1;
             continue;
         };
         let start_fraction = convert_progress_fraction(
@@ -3378,9 +3483,102 @@ async fn convert_tracks_with_reporter_with_tool_paths(
         progress_tracker
             .estimated(
                 start_fraction,
-                convert_track_message("Starting", track_index + 1, total_tracks, &track, Some(final_path.as_path())),
+                convert_track_message(
+                    "Starting",
+                    track_index + 1,
+                    total_tracks,
+                    &track,
+                    Some(final_path.as_path()),
+                ),
             )
             .await;
+
+        if let TrackSourceRef::CueStreamSegment {
+            source_image,
+            decode_path,
+            ..
+        } = &track.source_ref
+        {
+            let source_image = source_image.clone();
+            let decode_path = decode_path.clone();
+            let mut scheduled = vec![ScheduledCueStreamTrack {
+                index: track_index,
+                track: track.clone(),
+                final_path,
+            }];
+            let mut next_index = track_index + 1;
+            while next_index < total_tracks {
+                let candidate = &source.tracks[next_index];
+                let same_image = matches!(
+                    &candidate.source_ref,
+                    TrackSourceRef::CueStreamSegment {
+                        source_image: candidate_source,
+                        decode_path: candidate_decode,
+                        ..
+                    } if candidate_source == &source_image && candidate_decode == &decode_path
+                );
+                if !same_image {
+                    break;
+                }
+                let Some(candidate_final) = planned.get(&candidate.id).cloned() else {
+                    break;
+                };
+                scheduled.push(ScheduledCueStreamTrack {
+                    index: next_index,
+                    track: candidate.clone(),
+                    final_path: candidate_final,
+                });
+                next_index += 1;
+            }
+
+            let outputs = encode_cue_stream_group_with_runner(
+                scheduled,
+                req.clone(),
+                staging.root.clone(),
+                staging.job_id.clone(),
+                convert_root.clone(),
+                tool_paths.clone(),
+                tool_concurrency_limits.clone(),
+                runner,
+                reporter,
+                cancel.clone(),
+                None,
+            )
+            .await;
+            for output in outputs {
+                let output_track = &source.tracks[output.index];
+                completed_expected_samples =
+                    advance_expected_samples(completed_expected_samples, output_track);
+                let progress = convert_progress_fraction(
+                    completed_expected_samples,
+                    total_expected_samples,
+                    output.index + 1,
+                    total_tracks,
+                );
+                progress_tracker
+                    .estimated(
+                        progress,
+                        convert_track_message(
+                            "Finished",
+                            output.index + 1,
+                            total_tracks,
+                            output_track,
+                            output
+                                .artifact
+                                .as_ref()
+                                .map(|artifact| artifact.final_path.as_path()),
+                        ),
+                    )
+                    .await;
+                if let Some(artifact) = output.artifact.clone() {
+                    artifacts.push(artifact);
+                }
+                records.push(output.record);
+            }
+            track_index = next_index;
+            continue;
+        }
+
         let output = Box::pin(convert_one_track_work(
             track_index,
             track.clone(),
@@ -3413,13 +3611,23 @@ async fn convert_tracks_with_reporter_with_tool_paths(
         progress_tracker
             .estimated(
                 progress,
-                convert_track_message("Finished", track_index + 1, total_tracks, &track, output.artifact.as_ref().map(|artifact| artifact.final_path.as_path())),
+                convert_track_message(
+                    "Finished",
+                    track_index + 1,
+                    total_tracks,
+                    &track,
+                    output
+                        .artifact
+                        .as_ref()
+                        .map(|artifact| artifact.final_path.as_path()),
+                ),
             )
             .await;
         if let Some(artifact) = output.artifact.clone() {
             artifacts.push(artifact);
         }
         records.push(output.record);
+        track_index += 1;
         if cancel.is_cancelled() {
             break;
         }
@@ -11039,12 +11247,27 @@ FILE "album.flac" WAVE
                 "{} should extract original image artwork as a sidecar",
                 case.name
             );
-            let TrackSourceRef::CueSegmentCarrier { path, carrier, .. } = &source.tracks[0].source_ref else {
-                panic!("{} should materialize a typed CUE segment carrier", case.name);
+            let TrackSourceRef::CueStreamSegment {
+                fallback_path,
+                carrier,
+                channels,
+                ..
+            } = &source.tracks[0].source_ref
+            else {
+                panic!("{} exact lossless CUE fixture should remain descriptive until Convert", case.name);
             };
             assert_eq!(*carrier, CueSegmentCarrier::PcmS32LeWav);
-            assert_eq!(path.extension().and_then(|value| value.to_str()), Some("wav"));
-            assert!(path.exists(), "{} staged PCM WAV segment should exist", case.name);
+            assert_eq!(*channels, 1, "generated sine fixture is mono");
+            assert!(
+                !fallback_path.exists(),
+                "{} must not create its lazy fallback carrier during materialization",
+                case.name
+            );
+            assert!(
+                find_extension_under(&staging.root.join("cue-segments"), "wav").is_empty(),
+                "{} streamable CUE path must not create an intermediate WAV under cue-segments",
+                case.name
+            );
             assert!(
                 find_extension_under(&staging.root.join("cue-segments"), "flac").is_empty(),
                 "{} normal CUE path must not create an intermediate FLAC under cue-segments",
@@ -13452,7 +13675,8 @@ enum ReplayGainFormatSupport {
     Unsupported { reason: String },
 }
 
-fn normalized_container_extension(req: &PipelineRequest) -> String {
+/// Canonical container extension spelling used when constructing staged paths.
+pub(super) fn normalized_container_extension(req: &PipelineRequest) -> String {
     req.container_extension
         .as_deref()
         .unwrap_or_else(|| req.settings.target_format.extension())
@@ -13616,6 +13840,60 @@ fn replaygain_policy_log_label(
             }
         },
     }
+}
+
+fn apply_cue_source_replaygain_if_eligible(
+    artifacts: &ArtifactSet,
+    source: Option<&PreparedSource>,
+    req: &PipelineRequest,
+    scan: &crate::convert::replaygain::ReplayGainSourceScan,
+) -> Option<Result<StageRecord, ReplayGainError>> {
+    let source = source?;
+    if !cue_source_replaygain_eligible(source, req) || req.merge {
+        return None;
+    }
+    let paths: Vec<PathBuf> = artifact_audio_paths(artifacts)
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect();
+    if paths.len() != source.tracks.len() || paths.len() != scan.tracks.len() {
+        return None;
+    }
+    let mode = req
+        .settings
+        .replay_gain
+        .mode
+        .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
+
+    if req.settings.replay_gain.existing_tags
+        == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
+    {
+        match all_artifacts_have_complete_replaygain(artifacts, mode) {
+            Ok(true) => {
+                return Some(Ok(StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: StageOutcome::SkippedWithReason(format!(
+                        "output audio is signal-equivalent and every output already has the complete {mode:?} ReplayGain tag set"
+                    )),
+                    dsd_dst_stats: None,
+                }));
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!(
+                "{error}; applying already-computed source-pass ReplayGain instead of trusting output tags"
+            ),
+        }
+    }
+
+    Some(
+        crate::convert::replaygain::apply_source_scan(&paths, mode, scan)
+            .map_err(ReplayGainError::Io)
+            .map(|()| StageRecord {
+                stage: PipelineStage::ReplayGain,
+                outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
+            }),
+    )
 }
 
 /// Apply ReplayGain tags via loudgain.
@@ -22555,7 +22833,8 @@ fn source_track_format_label(track: &PreparedTrack) -> String {
 fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
     let path = match source_ref {
         TrackSourceRef::StagedFile(path) => path,
-        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image,
+        TrackSourceRef::CueStreamSegment { source_image, .. }
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image,
         TrackSourceRef::ImageSegment { image, .. } => image,
         TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
         TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
@@ -23222,6 +23501,22 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
 fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
     match source_ref {
         TrackSourceRef::StagedFile(path) => format!("staged file {}", path_log_value(path)),
+        TrackSourceRef::CueStreamSegment {
+            fallback_path,
+            source_image,
+            decode_path,
+            start_sample,
+            samples,
+            carrier,
+            channels,
+            ..
+        } => format!(
+            "streamable CUE segment source {} via {} ({:?}, {channels}ch, start sample {start_sample}, {samples} samples; lazy fallback {})",
+            path_log_value(source_image),
+            path_log_value(decode_path),
+            carrier,
+            path_log_value(fallback_path)
+        ),
         TrackSourceRef::CueSegmentCarrier {
             path,
             source_image,
@@ -27663,7 +27958,8 @@ fn preserve_source_tags_for_organizational_identity(source: &mut PreparedSource)
 fn track_source_identity_path(track: &PreparedTrack) -> &Path {
     match &track.source_ref {
         TrackSourceRef::StagedFile(path) => path.as_path(),
-        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.as_path(),
+        TrackSourceRef::CueStreamSegment { source_image, .. }
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.as_path(),
         TrackSourceRef::ImageSegment { image, .. } => image.as_path(),
         TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
         TrackSourceRef::DvdaTrack { volume_source, .. } => volume_source.root_or_image().as_path(),
@@ -27693,6 +27989,7 @@ pub struct ScheduledAlbum {
     pub source: PreparedSource,
     pub plan: AlbumPlan,
     pub stages: Vec<StageRecord>,
+    pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
     action_output: Option<PipelineOutputCapability>,
     _run_lock: FileLock,
 }
@@ -27738,6 +28035,7 @@ pub(crate) fn scheduled_album_for_test(
         source,
         plan,
         stages,
+        source_replaygain: None,
         action_output: None,
         _run_lock: run_lock,
     }
@@ -29149,9 +29447,1344 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         source: prepared,
         plan: album_plan,
         stages,
+        source_replaygain: None,
         action_output,
         _run_lock,
     })
+}
+
+/// Encode one contiguous set of streamable CUE tracks that share one image.
+///
+/// The ordinary per-track planner remains authoritative. We coalesce only when
+/// every track independently plans as one source-rate/no-DSP FFmpeg encode.
+/// Otherwise the group falls back to the established per-track realization +
+/// encode path, staging at most one carrier at a time.
+async fn encode_cue_stream_group_fallback(
+    tracks: Vec<ScheduledCueStreamTrack>,
+    req: &PipelineRequest,
+    staging_root: &Path,
+    staging_job: &str,
+    convert_root: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    cancel: &CancellationToken,
+) -> Vec<ScheduledTrackOutput> {
+    let mut outputs = Vec::with_capacity(tracks.len());
+    for input in tracks {
+        if cancel.is_cancelled() {
+            outputs.push(scheduled_worker_failure_output(
+                input.index,
+                &input.track,
+                None,
+                Some(input.final_path),
+                "album cancelled before CUE fallback conversion".to_string(),
+            ));
+            continue;
+        }
+        let fallback_path = match &input.track.source_ref {
+            TrackSourceRef::CueStreamSegment { fallback_path, .. } => Some(fallback_path.clone()),
+            _ => None,
+        };
+        let result = convert_one_track_work(
+            input.index,
+            input.track.clone(),
+            input.final_path.clone(),
+            req.clone(),
+            staging_root.to_path_buf(),
+            staging_job.to_string(),
+            convert_root.to_path_buf(),
+            runner,
+            tool_paths.clone(),
+            cancel.clone(),
+            tool_concurrency_limits.clone(),
+            reporter,
+        )
+        .await;
+        // Lazy stream fallback carriers are private conversion inputs. Once
+        // this track reaches a terminal encode result, no later stage reads
+        // them; retire each immediately so fallback peak disk usage is O(1)
+        // track instead of gradually recreating the eager album footprint.
+        if let Some(path) = fallback_path {
+            let _ = fs::remove_file(path);
+        }
+        match result {
+            Ok(output) => outputs.push(output),
+            Err(error) => outputs.push(scheduled_worker_failure_output(
+                input.index,
+                &input.track,
+                None,
+                Some(input.final_path),
+                format!("CUE fallback conversion worker failed: {error}"),
+            )),
+        }
+    }
+    outputs
+}
+
+fn cue_stream_decoder_command(
+    decode_path: &Path,
+    carrier: CueSegmentCarrier,
+) -> ToolCommand {
+    ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-v".into(),
+            "error".into(),
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-i".into(),
+            decode_path.display().to_string(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-vn".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-f".into(),
+            carrier.raw_format_name().into(),
+            "-c:a".into(),
+            carrier.codec_name().into(),
+            "pipe:1".into(),
+        ],
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    }
+}
+
+fn cue_stream_consumer_command(
+    plan: &CueStreamDirectTrackPlan,
+    sample_rate: u32,
+    channels: u16,
+    carrier: CueSegmentCarrier,
+) -> Result<ToolCommand, ConvertError> {
+    let mut command = planned_command_to_tool_command(
+        &plan.planned_command,
+        DEFAULT_PLANNED_COMMAND_TIMEOUT,
+    )?;
+    let work_output = plan.work_output()?;
+    let mut args = match &plan.planned_command.tool {
+        tonepoet_pipeline::ToolIdentifier::Ffmpeg => {
+            let mut args = vec![
+                "-y".to_string(),
+                "-hide_banner".to_string(),
+                "-nostdin".to_string(),
+                "-f".to_string(),
+                carrier.raw_format_name().to_string(),
+                "-ar".to_string(),
+                sample_rate.to_string(),
+                "-ac".to_string(),
+                channels.to_string(),
+                "-i".to_string(),
+                "pipe:0".to_string(),
+                "-map".to_string(),
+                "0:a:0".to_string(),
+            ];
+            args.extend(plan.ffmpeg_output_args()?.iter().cloned());
+            args
+        }
+        tonepoet_pipeline::ToolIdentifier::Sox => {
+            if carrier != CueSegmentCarrier::PcmS32LeWav {
+                return Err(ConvertError::Backend(
+                    "direct SoX CUE streaming requires Tonepoet's raw s32 integer transport".to_string(),
+                ));
+            }
+            let mut args = vec![
+                "-S".to_string(),
+                "-D".to_string(),
+                "-t".to_string(),
+                "raw".to_string(),
+                "-e".to_string(),
+                "signed-integer".to_string(),
+                "-b".to_string(),
+                "32".to_string(),
+                "-L".to_string(),
+                "-r".to_string(),
+                sample_rate.to_string(),
+                "-c".to_string(),
+                channels.to_string(),
+                "-".to_string(),
+            ];
+            args.extend(plan.sox_output_args()?.iter().cloned());
+            args
+        }
+        other => {
+            return Err(ConvertError::Backend(format!(
+                "direct CUE stream consumer does not support planner tool {other:?}"
+            )));
+        }
+    };
+    args.push(work_output.display().to_string());
+    command.args = args;
+    command.timeout = DEFAULT_CONVERT_TIMEOUT;
+    Ok(command)
+}
+
+fn cue_stream_byte_range(
+    start_sample: u64,
+    samples: u64,
+    channels: u16,
+    carrier: CueSegmentCarrier,
+) -> Option<(u64, u64)> {
+    let bytes_per_frame = carrier
+        .bytes_per_sample()
+        .checked_mul(u64::from(channels))?;
+    let start_byte = start_sample.checked_mul(bytes_per_frame)?;
+    let byte_len = samples.checked_mul(bytes_per_frame)?;
+    (byte_len > 0).then_some((start_byte, byte_len))
+}
+
+fn cue_source_replaygain_eligible(source: &PreparedSource, req: &PipelineRequest) -> bool {
+    if req.stages.replaygain != StageRequirement::Enabled
+        || req.merge
+        || !req.settings.target_format.is_pcm_lossless()
+        || matches!(req.settings.target_format, PlannerAudioFormat::WavPack)
+            && req.settings.wavpack.hybrid
+        || !matches!(replaygain_format_support(req), ReplayGainFormatSupport::Supported)
+        || !matches!(
+            inherited_replaygain_tag_policy(Some(source), &req.settings),
+            ReplayGainInheritedTagPolicy::Trust
+        )
+    {
+        return false;
+    }
+    // A future target-channel/downmix setting must become part of the
+    // signal-equivalence predicate before this optimization may use it.
+    source.tracks.iter().all(|track| {
+        matches!(
+            &track.source_ref,
+            TrackSourceRef::CueStreamSegment { channels: 1 | 2, .. }
+        )
+    })
+}
+
+fn cue_stream_analysis_wav_header(
+    sample_rate: u32,
+    channels: u16,
+    carrier: CueSegmentCarrier,
+    samples: u64,
+) -> io::Result<Vec<u8>> {
+    if channels == 0 || sample_rate == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ReplayGain stream header requires non-zero rate and channels",
+        ));
+    }
+    let bytes_per_sample = u16::try_from(carrier.bytes_per_sample()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PCM sample width does not fit WAV")
+    })?;
+    let block_align = channels.checked_mul(bytes_per_sample).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PCM block alignment overflow")
+    })?;
+    let byte_rate = sample_rate.checked_mul(u32::from(block_align)).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PCM byte rate overflow")
+    })?;
+    let data_bytes = samples
+        .checked_mul(u64::from(block_align))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PCM data size overflow"))?;
+    let format_tag: u16 = match carrier {
+        CueSegmentCarrier::PcmS32LeWav => 1,
+        CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav => 3,
+    };
+    let bits = u16::try_from(carrier.bit_depth()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PCM bit depth does not fit WAV")
+    })?;
+
+    let mut header = Vec::with_capacity(80);
+    let riff_size = data_bytes.checked_add(36).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "RIFF size overflow")
+    })?;
+    if riff_size <= u64::from(u32::MAX) {
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(riff_size as u32).to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+    } else {
+        header.extend_from_slice(b"RF64");
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"ds64");
+        header.extend_from_slice(&28_u32.to_le_bytes());
+        let rf64_riff_size = data_bytes.checked_add(72).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "RF64 size overflow")
+        })?;
+        header.extend_from_slice(&rf64_riff_size.to_le_bytes());
+        header.extend_from_slice(&data_bytes.to_le_bytes());
+        header.extend_from_slice(&samples.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+    }
+    header.extend_from_slice(b"fmt ");
+    header.extend_from_slice(&16_u32.to_le_bytes());
+    header.extend_from_slice(&format_tag.to_le_bytes());
+    header.extend_from_slice(&channels.to_le_bytes());
+    header.extend_from_slice(&sample_rate.to_le_bytes());
+    header.extend_from_slice(&byte_rate.to_le_bytes());
+    header.extend_from_slice(&block_align.to_le_bytes());
+    header.extend_from_slice(&bits.to_le_bytes());
+    header.extend_from_slice(b"data");
+    let data_size_field = if riff_size <= u64::from(u32::MAX) {
+        u32::try_from(data_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "RIFF data size overflow")
+        })?
+    } else {
+        u32::MAX
+    };
+    header.extend_from_slice(&data_size_field.to_le_bytes());
+    Ok(header)
+}
+
+#[cfg(unix)]
+fn create_cue_replaygain_fifo(path: &Path) -> io::Result<()> {
+    use rustix::fs::{mknodat, FileType, Mode, CWD};
+    let _ = fs::remove_file(path);
+    // rustix 0.38 has no `mkfifoat`; `mknodat(FileType::Fifo, …)` is the exact
+    // equivalent (mkfifoat is just mknodat with S_IFIFO) and stays safe/no-unsafe.
+    mknodat(CWD, path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn create_cue_replaygain_fifo(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "CUE ReplayGain stream mirroring requires Unix FIFOs",
+    ))
+}
+
+fn cue_stream_groups(tracks: &[ScheduledCueStreamTrack]) -> Vec<Vec<ScheduledCueStreamTrack>> {
+    let mut groups: Vec<Vec<ScheduledCueStreamTrack>> = Vec::new();
+    for input in tracks {
+        let belongs_to_last = groups.last().and_then(|group| group.first()).is_some_and(|first| {
+            match (&first.track.source_ref, &input.track.source_ref) {
+                (
+                    TrackSourceRef::CueStreamSegment {
+                        source_image: left_source,
+                        decode_path: left_decode,
+                        carrier: left_carrier,
+                        channels: left_channels,
+                        image_samples: left_samples,
+                        ..
+                    },
+                    TrackSourceRef::CueStreamSegment {
+                        source_image: right_source,
+                        decode_path: right_decode,
+                        carrier: right_carrier,
+                        channels: right_channels,
+                        image_samples: right_samples,
+                        ..
+                    },
+                ) => {
+                    left_source == right_source
+                        && left_decode == right_decode
+                        && left_carrier == right_carrier
+                        && left_channels == right_channels
+                        && left_samples == right_samples
+                        && first.track.sample_rate == input.track.sample_rate
+                }
+                _ => false,
+            }
+        });
+        if belongs_to_last {
+            groups.last_mut().expect("group exists").push(input.clone());
+        } else {
+            groups.push(vec![input.clone()]);
+        }
+    }
+    groups
+}
+
+fn cue_stream_album_direct_preflight(
+    tracks: &[ScheduledCueStreamTrack],
+    req: &PipelineRequest,
+    convert_root: &Path,
+) -> bool {
+    for input in tracks {
+        let fallback_path = match &input.track.source_ref {
+            TrackSourceRef::CueStreamSegment { fallback_path, .. } => fallback_path,
+            _ => return false,
+        };
+        let staged_path = staged_audio_path(
+            convert_root,
+            &input.final_path,
+            &input.track.id,
+            &req.settings.target_format,
+        );
+        let planned = prepare_cue_stream_direct_track_plan(
+            req,
+            &input.track,
+            fallback_path,
+            &staged_path,
+            convert_root,
+        );
+        match planned {
+            Ok(Some(plan)) => cleanup_cue_stream_direct_track_plan(&plan),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn cue_source_replaygain_scan_command(
+    grouping: crate::convert::replaygain::LoudgainGrouping,
+    prevent_clipping: bool,
+    paths: &[PathBuf],
+    cwd: PathBuf,
+) -> ToolCommand {
+    ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        binary: ToolBinary::Loudgain,
+        args: crate::convert::replaygain::loudgain_scan_args(
+            grouping,
+            prevent_clipping,
+            paths,
+        ),
+        secret_args: vec![],
+        cwd: Some(cwd),
+        env: vec![],
+        // Source-pass analysis consumes live FIFOs behind the sequential
+        // encoders, so its healthy lifetime is the conversion work unit. Keep
+        // the ordinary post-hoc loudgain scan's shorter timeout unchanged.
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    }
+}
+
+fn cue_stream_replaygain_mirrors(
+    tracks: &[ScheduledCueStreamTrack],
+    root: &Path,
+) -> io::Result<(PathBuf, Vec<PathBuf>, BTreeMap<usize, ToolStreamMirror>)> {
+    let dir = root.join(".cue-replaygain-stream");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+
+    let build = (|| -> io::Result<(Vec<PathBuf>, BTreeMap<usize, ToolStreamMirror>)> {
+        let mut relative_paths = Vec::with_capacity(tracks.len());
+        let mut mirrors = BTreeMap::new();
+        for (ordinal, input) in tracks.iter().enumerate() {
+            let (carrier, channels, samples) = match &input.track.source_ref {
+                TrackSourceRef::CueStreamSegment {
+                    carrier,
+                    channels,
+                    samples,
+                    ..
+                } => (*carrier, *channels, *samples),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ReplayGain mirror requested for a non-stream CUE track",
+                    ))
+                }
+            };
+            let sample_rate = input.track.sample_rate.filter(|rate| *rate > 0).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUE ReplayGain track has no sample rate",
+                )
+            })?;
+            let name = format!("track-{:03}.wav", ordinal + 1);
+            let absolute = dir.join(&name);
+            create_cue_replaygain_fifo(&absolute)?;
+            relative_paths.push(PathBuf::from(name));
+            mirrors.insert(
+                input.index,
+                ToolStreamMirror {
+                    path: absolute,
+                    prefix: cue_stream_analysis_wav_header(
+                        sample_rate,
+                        channels,
+                        carrier,
+                        samples,
+                    )?,
+                },
+            );
+        }
+        Ok((relative_paths, mirrors))
+    })();
+
+    match build {
+        Ok((relative_paths, mirrors)) => Ok((dir, relative_paths, mirrors)),
+        Err(error) => {
+            // FIFOs are an optional analysis sidecar, not durable conversion
+            // state. A partial setup must leave no stale readers/writers for a
+            // fallback or retry to trip over.
+            let _ = fs::remove_dir_all(&dir);
+            Err(error)
+        }
+    }
+}
+
+pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache(
+    tracks: Vec<ScheduledCueStreamTrack>,
+    source: PreparedSource,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> ScheduledCueStreamBatch {
+    let runner = real_tool_runner_with_optional_version_cache(
+        tool_paths.clone(),
+        version_cache,
+        &req.item_id,
+    );
+    let groups = cue_stream_groups(&tracks);
+    let source_rg = cue_source_replaygain_eligible(&source, &req)
+        && runner.tool_available(ToolBinary::Loudgain)
+        && cue_stream_album_direct_preflight(&tracks, &req, &convert_root);
+
+    if !source_rg {
+        let mut outputs = Vec::with_capacity(tracks.len());
+        for group in groups {
+            outputs.extend(
+                encode_cue_stream_group_with_runner(
+                    group,
+                    req.clone(),
+                    staging_root.clone(),
+                    staging_job.clone(),
+                    convert_root.clone(),
+                    tool_paths.clone(),
+                    tool_concurrency_limits.clone(),
+                    &runner,
+                    Some(reporter),
+                    cancel.clone(),
+                    None,
+                )
+                .await,
+            );
+        }
+        return ScheduledCueStreamBatch {
+            outputs,
+            source_replaygain: None,
+        };
+    }
+
+    let (rg_dir, rg_paths, mirrors) = match cue_stream_replaygain_mirrors(&tracks, &convert_root) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "source-pass ReplayGain setup failed for job {}; using output-measured ReplayGain: {error}",
+                req.job_id
+            );
+            let mut outputs = Vec::with_capacity(tracks.len());
+            for group in groups {
+                outputs.extend(
+                    encode_cue_stream_group_with_runner(
+                        group,
+                        req.clone(),
+                        staging_root.clone(),
+                        staging_job.clone(),
+                        convert_root.clone(),
+                        tool_paths.clone(),
+                        tool_concurrency_limits.clone(),
+                        &runner,
+                        Some(reporter),
+                        cancel.clone(),
+                        None,
+                    )
+                    .await,
+                );
+            }
+            return ScheduledCueStreamBatch {
+                outputs,
+                source_replaygain: None,
+            };
+        }
+    };
+
+    let mode = req
+        .settings
+        .replay_gain
+        .mode
+        .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
+    let grouping = if matches!(
+        mode,
+        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
+    ) {
+        crate::convert::replaygain::LoudgainGrouping::Album
+    } else {
+        crate::convert::replaygain::LoudgainGrouping::Track
+    };
+    let scan_cmd = cue_source_replaygain_scan_command(
+        grouping,
+        req.settings.replay_gain.prevent_clipping,
+        &rg_paths,
+        rg_dir.clone(),
+    );
+    let rg_cancel = cancel.child_token();
+    let analysis_cancel = rg_cancel.clone();
+    let analysis_limits = tool_concurrency_limits.clone();
+    let analysis = async {
+        let result = run_tool_command_with_concurrency(
+            scan_cmd,
+            &runner,
+            &analysis_cancel,
+            analysis_limits.as_ref(),
+        )
+        .await;
+        if result.is_err() {
+            analysis_cancel.cancel();
+        }
+        result
+    };
+    let conversion_cancel = rg_cancel.clone();
+    let conversion = async {
+        let mut outputs = Vec::with_capacity(tracks.len());
+        let mut direct = true;
+        for group in groups {
+            let group_outputs = encode_cue_stream_group_with_runner(
+                group,
+                req.clone(),
+                staging_root.clone(),
+                staging_job.clone(),
+                convert_root.clone(),
+                tool_paths.clone(),
+                tool_concurrency_limits.clone(),
+                &runner,
+                Some(reporter),
+                conversion_cancel.clone(),
+                Some(&mirrors),
+            )
+            .await;
+            if group_outputs.iter().any(|output| !output.ok || output.record.realized_input.is_some()) {
+                direct = false;
+                conversion_cancel.cancel();
+            }
+            outputs.extend(group_outputs);
+            // This album-scoped work unit owns accounting for every coalesced
+            // CUE track. Even after cancellation, keep walking the remaining
+            // groups: the group encoder emits cheap terminal cancellation
+            // records without starting tools, preventing scheduler accounting
+            // from being left short of `pending.expected`.
+        }
+        (outputs, direct)
+    };
+
+    let (analysis_result, (mut outputs, direct)) = tokio::join!(analysis, conversion);
+    let _ = fs::remove_dir_all(&rg_dir);
+
+    if !direct && !cancel.is_cancelled() {
+        // A source-RG sidecar failure is an optimization failure, never an
+        // album conversion failure. Re-run through the established non-mirrored
+        // streaming/fallback path and let ReplayGain scan the outputs later.
+        outputs.clear();
+        for group in cue_stream_groups(&tracks) {
+            outputs.extend(
+                encode_cue_stream_group_with_runner(
+                    group,
+                    req.clone(),
+                    staging_root.clone(),
+                    staging_job.clone(),
+                    convert_root.clone(),
+                    tool_paths.clone(),
+                    tool_concurrency_limits.clone(),
+                    &runner,
+                    Some(reporter),
+                    cancel.clone(),
+                    None,
+                )
+                .await,
+            );
+        }
+        return ScheduledCueStreamBatch {
+            outputs,
+            source_replaygain: None,
+        };
+    }
+
+    let source_replaygain = match analysis_result {
+        Ok(output) if direct && outputs.len() == tracks.len() && outputs.iter().all(|o| o.ok) => {
+            match crate::convert::replaygain::parse_loudgain_scan_output(
+                &output.stdout_tail,
+                tracks.len(),
+                grouping,
+            ) {
+                Ok(scan) => Some(scan),
+                Err(error) => {
+                    log::warn!(
+                        "source-pass ReplayGain output could not be parsed for job {}; using output-measured ReplayGain: {error}",
+                        req.job_id
+                    );
+                    None
+                }
+            }
+        }
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!(
+                "source-pass ReplayGain failed for job {}; using output-measured ReplayGain: {error}",
+                req.job_id
+            );
+            None
+        }
+    };
+    ScheduledCueStreamBatch {
+        outputs,
+        source_replaygain,
+    }
+}
+
+pub async fn encode_cue_stream_group_for_scheduler_with_tool_limits_and_version_cache(
+    tracks: Vec<ScheduledCueStreamTrack>,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
+    reporter: &dyn PipelineReporter,
+    cancel: CancellationToken,
+) -> Vec<ScheduledTrackOutput> {
+    let runner = real_tool_runner_with_optional_version_cache(
+        tool_paths.clone(),
+        version_cache,
+        &req.item_id,
+    );
+    encode_cue_stream_group_with_runner(
+        tracks,
+        req,
+        staging_root,
+        staging_job,
+        convert_root,
+        tool_paths,
+        tool_concurrency_limits,
+        &runner,
+        Some(reporter),
+        cancel,
+        None,
+    )
+    .await
+}
+
+fn cue_stream_shared_producer_record_for_error(
+    producer: &ToolCommand,
+    error: &ToolSegmentedPipelineError,
+    track_count: usize,
+) -> CommandRecord {
+    let sanitized_args = producer.sanitized_args();
+    let matches_producer = |record: &CommandRecord| {
+        record.binary == producer.binary
+            && record.sanitized_args == sanitized_args
+            && record.cwd == producer.cwd
+    };
+    let mut record = command_from_tool_error(&error.error)
+        .filter(|record| matches_producer(record))
+        .or_else(|| {
+            error
+                .other_commands
+                .iter()
+                .find(|record| matches_producer(record))
+                .cloned()
+        })
+        .unwrap_or_else(|| CommandRecord {
+            description: None,
+            binary: producer.binary,
+            sanitized_args: sanitized_args.clone(),
+            cwd: producer.cwd.clone(),
+            environment_policy: producer.environment_policy,
+            environment: producer.sanitized_environment(),
+            env_keys: producer.env_keys(),
+            exit: None,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        });
+    record.description = Some(format!(
+        "Shared CUE image decode for {track_count} streamed track(s)"
+    ));
+    record
+}
+
+async fn finalize_cue_stream_consumer_output(
+    input: ScheduledCueStreamTrack,
+    staged_path: PathBuf,
+    plan: CueStreamDirectTrackPlan,
+    consumer_output: ToolOutput,
+    producer_record: &CommandRecord,
+    source_decode_path: &Path,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> ScheduledTrackOutput {
+    let metadata_satisfaction = plan.metadata_satisfaction;
+    let output = async {
+        finalize_cue_stream_direct_track_plan(&plan)?;
+        let bytes_out = file_len(&staged_path);
+        if bytes_out.unwrap_or(0) == 0 {
+            return Err(ConvertError::TrackValidation(format!(
+                "streaming CUE planner did not produce output: {}",
+                staged_path.display()
+            )));
+        }
+        let expected = post_encode_expected_samples_for_track(
+            &input.track,
+            source_decode_path,
+            &req.settings,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+        let validation = validate_encoded_output_with_tool_limits(
+            &staged_path,
+            expected,
+            expected_post_encode_depth_for_track(&input.track, &req.settings),
+            &req.settings.target_format,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+
+        let bytes_in = match &input.track.source_ref {
+            TrackSourceRef::CueStreamSegment {
+                samples,
+                channels,
+                carrier,
+                ..
+            } => samples
+                .checked_mul(u64::from(*channels))
+                .and_then(|value| value.checked_mul(carrier.bytes_per_sample())),
+            _ => None,
+        };
+        let mut consumer_record = consumer_output.command;
+        consumer_record.description = Some(format!(
+            "Direct encode from shared CUE PCM stream for track {}",
+            input.track.id.source_ordinal
+        ));
+        let record = TrackRecord {
+            track_id: input.track.id.clone(),
+            outcome: TrackOutcome::Ok,
+            source_ref: input.track.source_ref.clone(),
+            realized_input: None,
+            output_file: Some(staged_path.clone()),
+            commands: vec![producer_record.clone(), consumer_record],
+            bytes_in,
+            bytes_out,
+            duration: Some(consumer_output.elapsed),
+            verified_output_bit_depth: validation.measured_depth,
+            dsd_dst_stats: None,
+        };
+        let artifact = TrackArtifact {
+            reference_evidence: None,
+            planned_command_hash: plan.command_hash.clone(),
+            track_id: input.track.id.clone(),
+            staged_path: staged_path.clone(),
+            final_path: input.final_path.clone(),
+            samples: validation
+                .samples
+                .or(expected.map(|value| value.samples))
+                .or(input.track.expected_samples),
+            metadata_satisfaction: plan.metadata_satisfaction,
+            metadata_required: plan.metadata_required,
+        };
+        Ok::<_, ConvertError>((record, artifact))
+    }
+    .await;
+
+    cleanup_cue_stream_direct_track_plan(&plan);
+    match output {
+        Ok((record, artifact)) => ScheduledTrackOutput {
+            index: input.index,
+            record,
+            artifact: Some(artifact),
+            ok: true,
+            metadata_satisfaction,
+        },
+        Err(error) => ScheduledTrackOutput {
+            index: input.index,
+            record: failed_track_record(
+                &input.track,
+                None,
+                Some(staged_path),
+                vec![producer_record.clone()],
+                error.to_string(),
+            ),
+            artifact: None,
+            ok: false,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+        },
+    }
+}
+
+async fn encode_cue_stream_group_with_runner(
+    tracks: Vec<ScheduledCueStreamTrack>,
+    req: PipelineRequest,
+    staging_root: PathBuf,
+    staging_job: String,
+    convert_root: PathBuf,
+    tool_paths: HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    cancel: CancellationToken,
+    mirrors: Option<&BTreeMap<usize, ToolStreamMirror>>,
+) -> Vec<ScheduledTrackOutput> {
+    if tracks.is_empty() {
+        return Vec::new();
+    }
+
+    let first_source = match &tracks[0].track.source_ref {
+        TrackSourceRef::CueStreamSegment {
+            decode_path,
+            carrier,
+            channels,
+            image_samples,
+            source_image,
+            ..
+        } => (
+            decode_path.clone(),
+            *carrier,
+            *channels,
+            *image_samples,
+            source_image.clone(),
+        ),
+        _ => {
+            return encode_cue_stream_group_fallback(
+                tracks,
+                &req,
+                &staging_root,
+                &staging_job,
+                &convert_root,
+                &tool_paths,
+                tool_concurrency_limits,
+                runner,
+                reporter,
+                &cancel,
+            )
+            .await;
+        }
+    };
+
+    let Some(sample_rate) = tracks[0].track.sample_rate.filter(|value| *value > 0) else {
+        return encode_cue_stream_group_fallback(
+            tracks,
+            &req,
+            &staging_root,
+            &staging_job,
+            &convert_root,
+            &tool_paths,
+            tool_concurrency_limits,
+            runner,
+            reporter,
+            &cancel,
+        )
+        .await;
+    };
+
+    // One group is exactly one decoder authority. Do not merge FILE blocks,
+    // PCM representations, channel layouts, or rate facts even when their
+    // paths happen to resolve to the same inode.
+    if tracks.iter().any(|input| {
+        input.track.sample_rate != Some(sample_rate)
+            || match &input.track.source_ref {
+                TrackSourceRef::CueStreamSegment {
+                    decode_path,
+                    carrier,
+                    channels,
+                    image_samples,
+                    source_image,
+                    start_sample,
+                    samples,
+                    ..
+                } => {
+                    decode_path != &first_source.0
+                        || carrier != &first_source.1
+                        || channels != &first_source.2
+                        || image_samples != &first_source.3
+                        || source_image != &first_source.4
+                        || start_sample
+                            .checked_add(*samples)
+                            .map(|end| end > *image_samples)
+                            .unwrap_or(true)
+                }
+                _ => true,
+            }
+    }) {
+        return encode_cue_stream_group_fallback(
+            tracks,
+            &req,
+            &staging_root,
+            &staging_job,
+            &convert_root,
+            &tool_paths,
+            tool_concurrency_limits,
+            runner,
+            reporter,
+            &cancel,
+        )
+        .await;
+    }
+
+    let mut planned: Vec<(ScheduledCueStreamTrack, PathBuf, CueStreamDirectTrackPlan)> =
+        Vec::with_capacity(tracks.len());
+    for input in &tracks {
+        let fallback_path = match &input.track.source_ref {
+            TrackSourceRef::CueStreamSegment { fallback_path, .. } => fallback_path,
+            _ => unreachable!("validated above"),
+        };
+        let staged_path = staged_audio_path(
+            &convert_root,
+            &input.final_path,
+            &input.track.id,
+            &req.settings.target_format,
+        );
+        if let Some(parent) = staged_path.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                for (_, _, plan) in &planned {
+                    cleanup_cue_stream_direct_track_plan(plan);
+                }
+                return encode_cue_stream_group_fallback(
+                    tracks,
+                    &req,
+                    &staging_root,
+                    &staging_job,
+                    &convert_root,
+                    &tool_paths,
+                    tool_concurrency_limits,
+                    runner,
+                    reporter,
+                    &cancel,
+                )
+                .await;
+            }
+        }
+        match prepare_cue_stream_direct_track_plan(
+            &req,
+            &input.track,
+            fallback_path,
+            &staged_path,
+            &convert_root,
+        ) {
+            Ok(Some(plan)) => planned.push((input.clone(), staged_path, plan)),
+            Ok(None) | Err(_) => {
+                for (_, _, plan) in &planned {
+                    cleanup_cue_stream_direct_track_plan(plan);
+                }
+                return encode_cue_stream_group_fallback(
+                    tracks,
+                    &req,
+                    &staging_root,
+                    &staging_job,
+                    &convert_root,
+                    &tool_paths,
+                    tool_concurrency_limits,
+                    runner,
+                    reporter,
+                    &cancel,
+                )
+                .await;
+            }
+        }
+    }
+
+    let mut segments = Vec::with_capacity(planned.len());
+    for (input, _, plan) in &planned {
+        let (start_sample, samples) = match &input.track.source_ref {
+            TrackSourceRef::CueStreamSegment {
+                start_sample,
+                samples,
+                ..
+            } => (*start_sample, *samples),
+            _ => unreachable!("validated above"),
+        };
+        let Some((start_byte, byte_len)) = cue_stream_byte_range(
+            start_sample,
+            samples,
+            first_source.2,
+            first_source.1,
+        ) else {
+            for (_, _, plan) in &planned {
+                cleanup_cue_stream_direct_track_plan(plan);
+            }
+            return encode_cue_stream_group_fallback(
+                tracks,
+                &req,
+                &staging_root,
+                &staging_job,
+                &convert_root,
+                &tool_paths,
+                tool_concurrency_limits,
+                runner,
+                reporter,
+                &cancel,
+            )
+            .await;
+        };
+        let consumer = match cue_stream_consumer_command(
+            plan,
+            sample_rate,
+            first_source.2,
+            first_source.1,
+        ) {
+            Ok(command) => command,
+            Err(_) => {
+                for (_, _, plan) in &planned {
+                    cleanup_cue_stream_direct_track_plan(plan);
+                }
+                return encode_cue_stream_group_fallback(
+                    tracks,
+                    &req,
+                    &staging_root,
+                    &staging_job,
+                    &convert_root,
+                    &tool_paths,
+                    tool_concurrency_limits,
+                    runner,
+                    reporter,
+                    &cancel,
+                )
+                .await;
+            }
+        };
+        if let Ok(work_output) = plan.work_output() {
+            if let Some(parent) = work_output.parent() {
+                if fs::create_dir_all(parent).is_err() {
+                    for (_, _, plan) in &planned {
+                        cleanup_cue_stream_direct_track_plan(plan);
+                    }
+                    return encode_cue_stream_group_fallback(
+                        tracks,
+                        &req,
+                        &staging_root,
+                        &staging_job,
+                        &convert_root,
+                        &tool_paths,
+                        tool_concurrency_limits,
+                        runner,
+                        reporter,
+                        &cancel,
+                    )
+                    .await;
+                }
+            }
+            let _ = fs::remove_file(work_output);
+        }
+        segments.push(ToolStreamSegment {
+            start_byte,
+            byte_len,
+            consumer,
+            mirror: mirrors.and_then(|values| values.get(&input.index).cloned()),
+            stop_producer_after: false,
+        });
+    }
+
+    // Exact-PCM CueStreamSegment sources carry authoritative image_samples.
+    // If the final selected bounded segment ends before the image does, bytes
+    // after that point are unselected and the transport may stop the producer
+    // rather than decoding/discarding the rest of the image. A selection that
+    // reaches the exact image end keeps natural-EOF supervision unchanged.
+    let image_byte_len = cue_stream_byte_range(
+        0,
+        first_source.3,
+        first_source.2,
+        first_source.1,
+    )
+    .and_then(|(_, byte_len)| (byte_len > 0).then_some(byte_len));
+    if let (Some(last), Some(image_byte_len)) = (segments.last_mut(), image_byte_len) {
+        if let Some(selected_end) = last.start_byte.checked_add(last.byte_len) {
+            last.stop_producer_after = selected_end < image_byte_len;
+        }
+    }
+
+    // The producer emits exactly the carrier PCM representation that the old
+    // materializer wrote to per-track WAVs. The transport splits on whole PCM
+    // frame byte offsets and starts one encoder at a time, so decoder count is
+    // O(images) while live encoder/intermediate state remains O(1 track).
+    let producer = cue_stream_decoder_command(&first_source.0, first_source.1);
+    let producer_for_records = producer.clone();
+    let execution = run_segmented_tool_pipeline_with_concurrency(
+        producer,
+        segments,
+        runner,
+        &cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await;
+
+    let pipeline_output = match execution {
+        Ok(output) => output,
+        Err(error) => {
+            // Admission fallback is decided above, before the producer starts.
+            // Once a segmented execution has been attempted, a decoder, encoder,
+            // pipe, or filesystem failure is the real failure. Retrying the same
+            // album through large carrier WAVs is both expensive and actively
+            // harmful for failures such as disk-full or corrupt input.
+            match error {
+                SegmentedPipelineExecutionError::Admission(error) => {
+                    let message = error.to_string();
+                    let mut outputs = Vec::with_capacity(planned.len());
+                    for (input, staged_path, plan) in planned {
+                        cleanup_cue_stream_direct_track_plan(&plan);
+                        outputs.push(ScheduledTrackOutput {
+                            index: input.index,
+                            record: failed_track_record(
+                                &input.track,
+                                None,
+                                Some(staged_path),
+                                Vec::new(),
+                                message.clone(),
+                            ),
+                            artifact: None,
+                            ok: false,
+                            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                        });
+                    }
+                    return outputs;
+                }
+                SegmentedPipelineExecutionError::Tool(error) => {
+                    let preserve_completed_prefix =
+                        req.failure_policy == FailurePolicy::AllowPartialAlbum
+                            && !cancel.is_cancelled()
+                            && !error.completed_consumers.is_empty()
+                            && error.completed_consumers.len() <= planned.len();
+                    if preserve_completed_prefix {
+                        let producer_record = cue_stream_shared_producer_record_for_error(
+                            &producer_for_records,
+                            &error,
+                            planned.len(),
+                        );
+                        let mut commands = error.other_commands.clone();
+                        if let Some(command) = command_from_tool_error(&error.error) {
+                            commands.push(command);
+                        }
+                        let message = error.error.to_string();
+                        let completed_len = error.completed_consumers.len();
+                        let mut planned_iter = planned.into_iter();
+                        let mut outputs = Vec::with_capacity(completed_len + planned_iter.len());
+
+                        for consumer_output in error.completed_consumers {
+                            let Some((input, staged_path, plan)) = planned_iter.next() else {
+                                break;
+                            };
+                            outputs.push(
+                                finalize_cue_stream_consumer_output(
+                                    input,
+                                    staged_path,
+                                    plan,
+                                    consumer_output,
+                                    &producer_record,
+                                    &first_source.0,
+                                    &req,
+                                    runner,
+                                    &cancel,
+                                    tool_concurrency_limits.as_ref(),
+                                )
+                                .await,
+                            );
+                        }
+
+                        for (input, staged_path, plan) in planned_iter {
+                            cleanup_cue_stream_direct_track_plan(&plan);
+                            outputs.push(ScheduledTrackOutput {
+                                index: input.index,
+                                record: failed_track_record(
+                                    &input.track,
+                                    None,
+                                    Some(staged_path),
+                                    commands.clone(),
+                                    message.clone(),
+                                ),
+                                artifact: None,
+                                ok: false,
+                                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                            });
+                        }
+                        return outputs;
+                    }
+
+                    let mut commands = error.other_commands;
+                    if let Some(command) = command_from_tool_error(&error.error) {
+                        commands.push(command);
+                    }
+                    let message = error.error.to_string();
+                    let mut outputs = Vec::with_capacity(planned.len());
+                    for (input, staged_path, plan) in planned {
+                        cleanup_cue_stream_direct_track_plan(&plan);
+                        outputs.push(ScheduledTrackOutput {
+                            index: input.index,
+                            record: failed_track_record(
+                                &input.track,
+                                None,
+                                Some(staged_path),
+                                commands.clone(),
+                                message.clone(),
+                            ),
+                            artifact: None,
+                            ok: false,
+                            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                        });
+                    }
+                    return outputs;
+                }
+            }
+        }
+    };
+    if pipeline_output.consumers.len() != planned.len() {
+        let mut commands = vec![pipeline_output.producer.command.clone()];
+        commands.extend(
+            pipeline_output
+                .consumers
+                .iter()
+                .map(|output| output.command.clone()),
+        );
+        let message = format!(
+            "segmented CUE pipeline returned {} consumer result(s) for {} planned track(s)",
+            pipeline_output.consumers.len(),
+            planned.len()
+        );
+        let mut outputs = Vec::with_capacity(planned.len());
+        for (input, staged_path, plan) in planned {
+            cleanup_cue_stream_direct_track_plan(&plan);
+            outputs.push(ScheduledTrackOutput {
+                index: input.index,
+                record: failed_track_record(
+                    &input.track,
+                    None,
+                    Some(staged_path),
+                    commands.clone(),
+                    message.clone(),
+                ),
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+        return outputs;
+    }
+
+    let mut producer_record = pipeline_output.producer.command;
+    producer_record.description = Some(format!(
+        "Shared CUE image decode for {} streamed track(s)",
+        planned.len()
+    ));
+    let consumer_outputs = pipeline_output.consumers;
+    let mut outputs = Vec::with_capacity(planned.len());
+    for ((input, staged_path, plan), consumer_output) in
+        planned.into_iter().zip(consumer_outputs)
+    {
+        outputs.push(
+            finalize_cue_stream_consumer_output(
+                input,
+                staged_path,
+                plan,
+                consumer_output,
+                &producer_record,
+                &first_source.0,
+                &req,
+                runner,
+                &cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await,
+        );
+    }
+    outputs
 }
 
 /// Encode one planned track. The caller controls scheduling; this function only
@@ -29633,6 +31266,7 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
     let action_output = album.action_output;
+    let source_replaygain = album.source_replaygain;
     let req = album.req;
     let item_id = req.item_id.clone();
     let staging = album.staging;
@@ -29814,16 +31448,42 @@ pub async fn finish_pipeline_album_for_scheduler_with_tool_limits(
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
-        match Box::pin(apply_replaygain_with_source_and_tool_limits(
-            artifacts.as_ref().expect("artifacts present"),
-            source.as_ref(),
-            &req,
-            runner,
-            cancel,
-            tool_concurrency_limits.clone(),
-        ))
-        .await
-        {
+        let source_scan_record = source_replaygain.as_ref().and_then(|scan| {
+            apply_cue_source_replaygain_if_eligible(
+                artifacts.as_ref().expect("artifacts present"),
+                source.as_ref(),
+                &req,
+                scan,
+            )
+        });
+        let replaygain_result = match source_scan_record {
+            Some(Ok(record)) => Ok(record),
+            Some(Err(error)) => {
+                log::warn!(
+                    "source-pass ReplayGain tagging failed for job {}; rescanning encoded outputs: {error}",
+                    req.job_id
+                );
+                Box::pin(apply_replaygain_with_source_and_tool_limits(
+                    artifacts.as_ref().expect("artifacts present"),
+                    source.as_ref(),
+                    &req,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.clone(),
+                ))
+                .await
+            }
+            None => Box::pin(apply_replaygain_with_source_and_tool_limits(
+                artifacts.as_ref().expect("artifacts present"),
+                source.as_ref(),
+                &req,
+                runner,
+                cancel,
+                tool_concurrency_limits.clone(),
+            ))
+            .await,
+        };
+        match replaygain_result {
             Ok(record) => {
                 emit_stage_finished(reporter, &item_id, record.clone()).await;
                 stages.push(record);
@@ -33245,7 +34905,8 @@ fn companion_track_source_path_and_role(
 ) -> Option<(&Path, CompanionSourceRefRole)> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
-        TrackSourceRef::CueSegmentCarrier { source_image, .. } => {
+        TrackSourceRef::CueStreamSegment { source_image, .. }
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => {
             Some((source_image.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::ImageSegment { image, .. } => {
@@ -40734,7 +42395,8 @@ fn track_disc_number_from_source_ref_path(track: &PreparedTrack) -> Option<u32> 
 fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
-        TrackSourceRef::CueSegmentCarrier { .. }
+        TrackSourceRef::CueStreamSegment { .. }
+        | TrackSourceRef::CueSegmentCarrier { .. }
         | TrackSourceRef::ImageSegment { .. }
         | TrackSourceRef::SacdTrack { .. }
         | TrackSourceRef::DvdaTrack { .. }
@@ -40746,7 +42408,8 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
 fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
-        TrackSourceRef::CueSegmentCarrier { source_image, .. } => Some(source_image.as_path()),
+        TrackSourceRef::CueStreamSegment { source_image, .. }
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => Some(source_image.as_path()),
         TrackSourceRef::ImageSegment { image, .. } => Some(image.as_path()),
         TrackSourceRef::SacdTrack { iso, .. } => Some(iso.as_path()),
         TrackSourceRef::DvdaTrack { volume_source, .. } => match volume_source {
@@ -43582,6 +45245,43 @@ fn storage_exhaustion_message_looks_like(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+pub(super) fn estimate_streaming_cue_scratch_peak_for_request(
+    req: &PipelineRequest,
+    facts: &CueStreamingScratchFacts,
+) -> u64 {
+    let estimate = estimate_streaming_cue_scratch_peak_bytes(
+        facts.retained_output_upper_bound_bytes,
+        facts.max_track_transport_bytes,
+    );
+
+    // Multi-track merge keeps every encoded track artifact live while ffmpeg
+    // concat writes one additional album artifact. Reuse the already-proven
+    // aggregate output bound for that second copy rather than falling back to
+    // req.container size: the visible carrier may be a tiny .cue, and a
+    // compressed image may be far smaller than its decoded/encoded outputs.
+    // A one-track merge aliases the existing track artifact and needs no term.
+    if req.merge && facts.selected_track_count > 1 {
+        estimate.saturating_add(facts.retained_output_upper_bound_bytes)
+    } else {
+        estimate
+    }
+}
+
+fn scratch_peak_estimate_for_request(
+    req: &PipelineRequest,
+    source_kind: Option<SourceKind>,
+) -> (u64, Option<CueStreamingScratchFacts>) {
+    if source_kind == Some(SourceKind::CueImage) {
+        if let Some(facts) = cue_streaming_scratch_facts(req) {
+            return (
+                estimate_streaming_cue_scratch_peak_for_request(req, &facts),
+                Some(facts),
+            );
+        }
+    }
+    (estimate_job_peak_bytes(&req.container, source_kind), None)
+}
+
 fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
     let disk_parent = disk_staging_parent_for(req);
     let Some(scratch) = req.scratch_staging.as_ref() else {
@@ -43600,7 +45300,19 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
     }
 
     let source_kind = detect_source_kind(req).ok();
-    let estimated_bytes = estimate_job_peak_bytes(&req.container, source_kind);
+    let (estimated_bytes, cue_streaming_facts) =
+        scratch_peak_estimate_for_request(req, source_kind);
+    if let Some(facts) = cue_streaming_facts {
+        log::debug!(
+            "scratch CUE streaming preflight: job_id={}, item_id={}, selected_tracks={}, retained_output_upper_bound_bytes={}, max_track_transport_bytes={}, estimated_peak_bytes={}",
+            req.job_id,
+            req.item_id,
+            facts.selected_track_count,
+            facts.retained_output_upper_bound_bytes,
+            facts.max_track_transport_bytes,
+            estimated_bytes,
+        );
+    }
     match scratch.try_reserve(estimated_bytes) {
         Ok(reservation) => {
             let reservation = reservation.with_log_context(
@@ -44152,7 +45864,8 @@ fn build_manifest_for_album(
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| match &t.source_ref {
                         TrackSourceRef::StagedFile(p) => p.clone(),
-                        TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.clone(),
+                        TrackSourceRef::CueStreamSegment { source_image, .. }
+                        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.clone(),
                         TrackSourceRef::ImageSegment { image, .. } => image.clone(),
                         TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
                         TrackSourceRef::DvdaTrack { volume_source, .. } => {
@@ -48967,7 +50680,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     };
     use crate::convert::pipeline::tool::{
         CommandRecord, ProcessExit, RealToolRunner, StubToolRunner, ToolBinary, ToolCommand,
-        ToolOutput, ToolRunner,
+        ToolOutput, ToolRunner, ToolSegmentedPipelineError, ToolSegmentedPipelineOutput,
+        ToolStreamSegment,
     };
     use crate::convert::pipeline::errors::ToolRunnerError;
     use std::collections::{BTreeMap, HashMap};
@@ -49113,6 +50827,1349 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+    struct CueStreamRecordingRunner {
+        calls: Mutex<Vec<(ToolCommand, Vec<ToolStreamSegment>)>>,
+        reported_bits: u32,
+    }
+
+    impl Default for CueStreamRecordingRunner {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                reported_bits: 16,
+            }
+        }
+    }
+
+    impl CueStreamRecordingRunner {
+        fn with_reported_bits(reported_bits: u32) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                reported_bits,
+            }
+        }
+    }
+
+    fn successful_tool_output(command: &ToolCommand) -> ToolOutput {
+        let record = CommandRecord {
+            environment_policy: command.environment_policy,
+            environment: BTreeMap::new(),
+            description: None,
+            binary: command.binary,
+            sanitized_args: command.args.clone(),
+            cwd: command.cwd.clone(),
+            env_keys: command.env.iter().map(|entry| entry.key.clone()).collect(),
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+        };
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::from_millis(1),
+            command: record,
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for CueStreamRecordingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            if cmd.binary != ToolBinary::Ffprobe {
+                return Err(ToolRunnerError::Io(std::io::Error::other(
+                    "streaming structural test unexpectedly used a non-ffprobe ordinary runner",
+                )));
+            }
+            let mut output = successful_tool_output(&cmd);
+            let sample_fmt = if self.reported_bits <= 16 { "s16" } else { "s32" };
+            output.stdout_tail = format!(
+                r#"{{
+  "streams": [{{
+    "codec_name": "flac",
+    "sample_fmt": "{sample_fmt}",
+    "sample_rate": "44100",
+    "channels": 2,
+    "duration_ts": 44100,
+    "time_base": "1/44100",
+    "bits_per_raw_sample": "{}"
+  }}],
+  "format": {{}}
+}}"#,
+                self.reported_bits
+            );
+            output.command.stdout_tail = output.stdout_tail.clone();
+            Ok(output)
+        }
+
+        async fn run_segmented_pipeline(
+            &self,
+            producer: ToolCommand,
+            segments: Vec<ToolStreamSegment>,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolSegmentedPipelineOutput, ToolSegmentedPipelineError> {
+            self.calls
+                .lock()
+                .expect("record CUE segmented pipeline")
+                .push((producer.clone(), segments.clone()));
+            let mut consumers = Vec::with_capacity(segments.len());
+            for segment in &segments {
+                let output = PathBuf::from(
+                    segment
+                        .consumer
+                        .args
+                        .last()
+                        .expect("stream consumer has a work output"),
+                );
+                if let Some(parent) = output.parent() {
+                    std::fs::create_dir_all(parent).expect("create stream work parent");
+                }
+                std::fs::write(&output, b"encoded-flac-placeholder")
+                    .expect("materialize stream work output");
+                consumers.push(successful_tool_output(&segment.consumer));
+            }
+            Ok(ToolSegmentedPipelineOutput {
+                producer: successful_tool_output(&producer),
+                consumers,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CueStreamExecutionFailureRunner {
+        ordinary_calls: Mutex<usize>,
+        segmented_calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ToolRunner for CueStreamExecutionFailureRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            *self.ordinary_calls.lock().expect("ordinary call counter") += 1;
+            Err(ToolRunnerError::Io(std::io::Error::other(
+                "ordinary tool execution must not be used as a runtime stream retry",
+            )))
+        }
+
+        async fn run_segmented_pipeline(
+            &self,
+            _producer: ToolCommand,
+            _segments: Vec<ToolStreamSegment>,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolSegmentedPipelineOutput, ToolSegmentedPipelineError> {
+            *self.segmented_calls.lock().expect("segmented call counter") += 1;
+            Err(ToolSegmentedPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::other(
+                    "injected failure after segmented execution starts",
+                )),
+                completed_consumers: Vec::new(),
+                other_commands: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CueStreamPrefixFailureKind {
+        Consumer,
+        Producer,
+    }
+
+    struct CueStreamPrefixFailureRunner {
+        failure_kind: CueStreamPrefixFailureKind,
+        completed_count: usize,
+        segmented_calls: Mutex<usize>,
+        attempted_consumers: Mutex<usize>,
+        unexpected_non_probe_calls: Mutex<usize>,
+        partial_work_path: Mutex<Option<PathBuf>>,
+    }
+
+    impl CueStreamPrefixFailureRunner {
+        fn new(failure_kind: CueStreamPrefixFailureKind, completed_count: usize) -> Self {
+            Self {
+                failure_kind,
+                completed_count,
+                segmented_calls: Mutex::new(0),
+                attempted_consumers: Mutex::new(0),
+                unexpected_non_probe_calls: Mutex::new(0),
+                partial_work_path: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for CueStreamPrefixFailureRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            if cmd.binary != ToolBinary::Ffprobe {
+                *self
+                    .unexpected_non_probe_calls
+                    .lock()
+                    .expect("unexpected ordinary call counter") += 1;
+                return Err(ToolRunnerError::Io(std::io::Error::other(
+                    "partial-prefix test unexpectedly invoked a non-ffprobe ordinary tool",
+                )));
+            }
+            let mut output = successful_tool_output(&cmd);
+            output.stdout_tail = r#"{
+  "streams": [{
+    "codec_name": "flac",
+    "sample_fmt": "s32",
+    "sample_rate": "44100",
+    "channels": 2,
+    "duration_ts": 44100,
+    "time_base": "1/44100",
+    "bits_per_raw_sample": "24"
+  }],
+  "format": {}
+}"#
+            .to_string();
+            output.command.stdout_tail = output.stdout_tail.clone();
+            Ok(output)
+        }
+
+        async fn run_segmented_pipeline(
+            &self,
+            producer: ToolCommand,
+            segments: Vec<ToolStreamSegment>,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolSegmentedPipelineOutput, ToolSegmentedPipelineError> {
+            *self.segmented_calls.lock().expect("segmented call counter") += 1;
+            let completed_count = self.completed_count.min(segments.len());
+            let mut completed_consumers = Vec::with_capacity(completed_count);
+            for segment in segments.iter().take(completed_count) {
+                let output = PathBuf::from(
+                    segment
+                        .consumer
+                        .args
+                        .last()
+                        .expect("stream consumer has a work output"),
+                );
+                if let Some(parent) = output.parent() {
+                    std::fs::create_dir_all(parent).expect("create completed work parent");
+                }
+                std::fs::write(&output, b"encoded-flac-placeholder")
+                    .expect("materialize completed stream work output");
+                completed_consumers.push(successful_tool_output(&segment.consumer));
+            }
+
+            if let Some(segment) = segments.get(completed_count) {
+                let partial = PathBuf::from(
+                    segment
+                        .consumer
+                        .args
+                        .last()
+                        .expect("failing stream consumer has a work output"),
+                );
+                if let Some(parent) = partial.parent() {
+                    std::fs::create_dir_all(parent).expect("create failing work parent");
+                }
+                std::fs::write(&partial, b"partial-output")
+                    .expect("materialize failing partial work output");
+                *self.partial_work_path.lock().expect("partial work path") = Some(partial);
+            }
+            *self
+                .attempted_consumers
+                .lock()
+                .expect("attempted consumer counter") =
+                (completed_count + if completed_count < segments.len() { 1 } else { 0 })
+                    .min(segments.len());
+
+            match self.failure_kind {
+                CueStreamPrefixFailureKind::Consumer => {
+                    let failing = segments
+                        .get(completed_count)
+                        .expect("consumer failure requires an unreached failing segment");
+                    let mut command = successful_tool_output(&failing.consumer).command;
+                    command.exit = Some(ProcessExit::Code(9));
+                    Err(ToolSegmentedPipelineError {
+                        error: ToolRunnerError::NonZeroExit {
+                            exit: ProcessExit::Code(9),
+                            stderr_tail: "injected consumer failure".to_string(),
+                            command,
+                        },
+                        completed_consumers,
+                        other_commands: vec![successful_tool_output(&producer).command],
+                    })
+                }
+                CueStreamPrefixFailureKind::Producer => {
+                    let mut command = successful_tool_output(&producer).command;
+                    command.exit = Some(ProcessExit::Code(7));
+                    Err(ToolSegmentedPipelineError {
+                        error: ToolRunnerError::NonZeroExit {
+                            exit: ProcessExit::Code(7),
+                            stderr_tail: "injected producer failure".to_string(),
+                            command,
+                        },
+                        completed_consumers,
+                        other_commands: Vec::new(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn cue_stream_source_depth_track(
+        root: &Path,
+        source_bits: u32,
+        image_name: &str,
+    ) -> (PreparedTrack, PathBuf) {
+        let image = root.join(image_name);
+        let fallback = root.join("staging/cue-segments/track-00.wav");
+        let mut track = prepared_source(root, &[track_id(0)]).tracks.remove(0);
+        track.bit_depth = Some(source_bits);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100),
+            Some(source_bits),
+            Some(SourceAudioCoding::Pcm),
+        );
+        track.source_ref = TrackSourceRef::CueStreamSegment {
+            fallback_path: fallback.clone(),
+            source_image: image.clone(),
+            decode_path: image,
+            start_sample: 0,
+            samples: 44_100,
+            image_samples: 44_100,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+            channels: 2,
+        };
+        (track, fallback)
+    }
+
+    fn assert_only_carrier_depth_normalization(plan: &CueStreamDirectTrackPlan, sample_fmt: &str) {
+        let args = &plan.planned_command.args;
+        assert!(!args.iter().any(|arg| arg == "-filter_complex" || arg == "-ar"));
+        let filters = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-af")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filters.len(), 1, "source-depth carrier normalization is one filter");
+        let filter = filters[0];
+        assert!(filter.starts_with("aresample="), "unexpected normalization filter: {filter}");
+        assert!(filter.contains(&format!("out_sample_fmt={sample_fmt}")));
+        assert!(!filter.contains("out_sample_rate="));
+        assert!(!filter.contains("dither_method="));
+        assert!(!filter.contains(',') && !filter.contains(';'));
+    }
+
+
+    fn assert_sox_source_depth_direct_plan(
+        plan: &CueStreamDirectTrackPlan,
+        source_bits: u32,
+    ) {
+        assert_eq!(plan.planned_command.tool, tonepoet_pipeline::ToolIdentifier::Sox);
+        let args = &plan.planned_command.args;
+        assert_eq!(args.first().map(String::as_str), Some("-S"));
+        assert_eq!(args.get(1).map(String::as_str), Some("-D"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-b" && pair[1] == source_bits.to_string()),
+            "planner-approved SoX command must preserve authoritative source depth"
+        );
+        assert!(
+            !args.iter().any(|arg| matches!(arg.as_str(), "rate" | "dither" | "sinc")),
+            "carrier-only SoX admission must not contain processing effects: {args:?}"
+        );
+
+        let consumer = cue_stream_consumer_command(
+            plan,
+            44_100,
+            2,
+            CueSegmentCarrier::PcmS32LeWav,
+        )
+        .expect("SoX direct stream consumer");
+        assert_eq!(consumer.binary, ToolBinary::Sox);
+        assert_eq!(consumer.args.get(1).map(String::as_str), Some("-D"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-t" && pair[1] == "raw"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-e" && pair[1] == "signed-integer"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-b" && pair[1] == "32"));
+        assert!(
+            consumer
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-b" && pair[1] == source_bits.to_string()),
+            "stream consumer must preserve the planner-selected output depth"
+        );
+        assert!(consumer.args.iter().any(|arg| arg == "-"));
+        assert!(
+            !consumer
+                .args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "rate" | "dither" | "sinc")),
+            "adapted SoX consumer must remain effect-free: {:?}",
+            consumer.args
+        );
+    }
+
+    #[test]
+    fn cue_source_replaygain_scan_uses_conversion_lifetime_budget() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let command = cue_source_replaygain_scan_command(
+            crate::convert::replaygain::LoudgainGrouping::Album,
+            false,
+            &[PathBuf::from("track-001.wav")],
+            temp.path().to_path_buf(),
+        );
+        assert_eq!(command.timeout, DEFAULT_CONVERT_TIMEOUT);
+        assert!(
+            command.timeout > Duration::from_secs(600),
+            "live FIFO analysis must not inherit the ten-minute post-hoc scan timeout"
+        );
+    }
+
+    #[test]
+    fn cue_stream_direct_plan_preserves_24_bit_source_fast_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert/track-00.flac");
+        let plan = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("convert"),
+        )
+        .expect("24-bit source plan")
+        .expect("24-bit source must remain eligible for direct streaming");
+
+        assert_eq!(plan.planned_command.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert_only_carrier_depth_normalization(&plan, "s32");
+        let consumer = cue_stream_consumer_command(
+            &plan,
+            44_100,
+            2,
+            CueSegmentCarrier::PcmS32LeWav,
+        )
+        .expect("24-bit direct stream consumer");
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "s32le"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-i" && pair[1] == "pipe:0"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-af" && pair[1].contains("out_sample_fmt=s32")));
+        cleanup_cue_stream_direct_track_plan(&plan);
+    }
+
+    #[test]
+    fn cue_stream_direct_plan_preserves_16_bit_source_fast_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 16, "album.flac");
+        let staged = temp.path().join("convert/track-00.flac");
+
+        let plan = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("convert"),
+        )
+        .expect("16-bit source plan")
+        .expect("16-bit source must remain eligible for direct streaming");
+
+        assert_eq!(plan.planned_command.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert_only_carrier_depth_normalization(&plan, "s16");
+        cleanup_cue_stream_direct_track_plan(&plan);
+    }
+
+    #[test]
+    fn cue_stream_source_depth_wav_image_supports_common_lossless_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for (format, extension) in [
+            (tonepoet_pipeline::AudioFormat::Flac, "flac"),
+            (tonepoet_pipeline::AudioFormat::Wav, "wav"),
+            (tonepoet_pipeline::AudioFormat::Alac, "m4a"),
+        ] {
+            let mut req = request(
+                temp.path(),
+                FailurePolicy::FailAlbumOnAnyTrackFailure,
+                stage_policy(false, false, false),
+                OverwritePolicy::FailIfExists,
+            );
+            req.settings.target_format = format.clone();
+            req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+            let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.wav");
+            let staged = temp.path().join(format!("convert/track-00.{extension}"));
+            let plan = prepare_cue_stream_direct_track_plan(
+                &req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join(format!("convert-{extension}")),
+            )
+            .unwrap_or_else(|error| panic!("{format:?} source-depth plan failed: {error}"))
+            .unwrap_or_else(|| panic!("{format:?} source-depth plan must stream directly"));
+            assert_eq!(plan.planned_command.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+            assert_only_carrier_depth_normalization(&plan, "s32");
+            cleanup_cue_stream_direct_track_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn cue_stream_auto_source_depth_uses_direct_sox_for_common_lossless_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for source_bits in [16_u32, 24_u32] {
+            for (format, extension, image_name) in [
+                (tonepoet_pipeline::AudioFormat::Flac, "flac", "album.flac"),
+                (tonepoet_pipeline::AudioFormat::Wav, "wav", "album.wav"),
+                (tonepoet_pipeline::AudioFormat::Aiff, "aiff", "album.wav"),
+                (tonepoet_pipeline::AudioFormat::WavPack, "wv", "album.flac"),
+            ] {
+                let mut req = request(
+                    temp.path(),
+                    FailurePolicy::FailAlbumOnAnyTrackFailure,
+                    stage_policy(false, false, false),
+                    OverwritePolicy::FailIfExists,
+                );
+                req.settings.target_format = format.clone();
+                req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+                let (track, fallback) =
+                    cue_stream_source_depth_track(temp.path(), source_bits, image_name);
+                let staged = temp.path().join(format!(
+                    "convert-auto-{source_bits}-{extension}/track-00.{extension}"
+                ));
+                let plan = prepare_cue_stream_direct_track_plan(
+                    &req,
+                    &track,
+                    &fallback,
+                    &staged,
+                    &temp.path().join(format!("work-auto-{source_bits}-{extension}")),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("Auto {source_bits}-bit {format:?} plan failed: {error}")
+                })
+                .unwrap_or_else(|| {
+                    panic!("Auto {source_bits}-bit {format:?} must stream directly")
+                });
+                assert_sox_source_depth_direct_plan(&plan, source_bits);
+                cleanup_cue_stream_direct_track_plan(&plan);
+            }
+        }
+    }
+
+    #[test]
+    fn cue_stream_auto_alac_and_lossy_targets_remain_direct_ffmpeg() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for (format, extension) in [
+            (tonepoet_pipeline::AudioFormat::Alac, "m4a"),
+            (tonepoet_pipeline::AudioFormat::Opus, "opus"),
+            (tonepoet_pipeline::AudioFormat::Mp3, "mp3"),
+            (tonepoet_pipeline::AudioFormat::Aac, "m4a"),
+        ] {
+            let mut req = request(
+                temp.path(),
+                FailurePolicy::FailAlbumOnAnyTrackFailure,
+                stage_policy(false, false, false),
+                OverwritePolicy::FailIfExists,
+            );
+            req.settings.target_format = format.clone();
+            req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+            let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+            let staged = temp.path().join(format!("convert-auto-{extension}/track-00.{extension}"));
+            let plan = prepare_cue_stream_direct_track_plan(
+                &req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join(format!("work-auto-{extension}")),
+            )
+            .unwrap_or_else(|error| panic!("Auto {format:?} plan failed: {error}"))
+            .unwrap_or_else(|| panic!("Auto {format:?} must remain directly streamable"));
+            assert_eq!(
+                plan.planned_command.tool,
+                tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+                "{format:?} should retain its existing FFmpeg direct route under Auto"
+            );
+            cleanup_cue_stream_direct_track_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn cue_stream_real_depth_reduction_still_falls_back() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert/track-00.flac");
+
+        let plan = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("convert"),
+        )
+        .expect("explicit depth-reduction plan");
+        assert!(plan.is_none(), "24-bit source -> 16-bit target is real DSP and must fall back");
+    }
+
+    #[test]
+    fn cue_stream_resample_and_dither_still_fall_back() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert/track-00.flac");
+
+        let mut resample_req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        resample_req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        resample_req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        resample_req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        assert!(
+            prepare_cue_stream_direct_track_plan(
+                &resample_req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join("convert-resample"),
+            )
+            .expect("resample plan")
+            .is_none(),
+            "real sample-rate conversion must remain on the established fallback"
+        );
+
+        let mut dither_req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        dither_req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        dither_req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        dither_req.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        assert!(
+            prepare_cue_stream_direct_track_plan(
+                &dither_req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join("convert-dither"),
+            )
+            .expect("dither plan")
+            .is_none(),
+            "configured dither must not be mistaken for carrier-width normalization"
+        );
+    }
+
+    #[test]
+    fn cue_stream_auto_real_processing_still_falls_back() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert/track-00.flac");
+
+        let mut depth_req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        depth_req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        depth_req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+        depth_req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
+        assert!(
+            prepare_cue_stream_direct_track_plan(
+                &depth_req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join("work-auto-depth"),
+            )
+            .expect("Auto depth-reduction plan")
+            .is_none(),
+            "a real 24 -> 16 reduction must not be admitted as carrier restoration"
+        );
+
+        let mut resample_req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        resample_req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        resample_req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+        resample_req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        assert!(
+            prepare_cue_stream_direct_track_plan(
+                &resample_req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join("work-auto-resample"),
+            )
+            .expect("Auto resample plan")
+            .is_none(),
+            "Auto resampling must remain on the established fallback"
+        );
+
+        let mut dither_req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        dither_req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        dither_req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+        dither_req.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        assert!(
+            prepare_cue_stream_direct_track_plan(
+                &dither_req,
+                &track,
+                &fallback,
+                &staged,
+                &temp.path().join("work-auto-dither"),
+            )
+            .expect("Auto dither plan")
+            .is_none(),
+            "Auto dither must remain on the established fallback"
+        );
+    }
+
+    #[test]
+    fn cue_stream_wavpack_int24_uses_planner_approved_sox_stdin_consumer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert/track-00.wv");
+
+        let plan = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("convert"),
+        )
+        .expect("WavPack Int24 plan")
+        .expect("planner-approved SoX WavPack Int24 must stream directly");
+        assert_eq!(plan.planned_command.tool, tonepoet_pipeline::ToolIdentifier::Sox);
+        let consumer = cue_stream_consumer_command(
+            &plan,
+            44_100,
+            2,
+            CueSegmentCarrier::PcmS32LeWav,
+        )
+        .expect("SoX WavPack stream consumer");
+        assert_eq!(consumer.binary, ToolBinary::Sox);
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-t" && pair[1] == "raw"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-e" && pair[1] == "signed-integer"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-b" && pair[1] == "32"));
+        assert!(consumer.args.windows(2).any(|pair| pair[0] == "-b" && pair[1] == "24"));
+        assert!(consumer.args.iter().any(|arg| arg == "-"));
+        assert!(!consumer.args.iter().any(|arg| arg == "rate" || arg == "dither"));
+        cleanup_cue_stream_direct_track_plan(&plan);
+
+        req.settings.wavpack.hybrid = true;
+        let rejected = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("convert-hybrid"),
+        )
+        .expect("hybrid WavPack plan");
+        assert!(rejected.is_none(), "hybrid WavPack must not enter the lossless direct SoX path");
+    }
+
+    #[tokio::test]
+    async fn cue_stream_runtime_failure_is_not_retried_through_carrier_materialization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let scheduled = vec![ScheduledCueStreamTrack {
+            index: 0,
+            final_path: temp.path().join("out/01.flac"),
+            track,
+        }];
+        let runner = CueStreamExecutionFailureRunner::default();
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            "runtime-failure-no-retry".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 1);
+        assert!(!outputs[0].ok, "the original streaming failure must surface");
+        assert_eq!(
+            *runner.segmented_calls.lock().expect("segmented call counter"),
+            1,
+            "runtime execution gets one segmented attempt"
+        );
+        assert_eq!(
+            *runner.ordinary_calls.lock().expect("ordinary call counter"),
+            0,
+            "a started stream failure must not invoke the legacy per-track materializer/encoder"
+        );
+        assert!(
+            !fallback.exists(),
+            "no carrier WAV may be materialized as a generic execution retry"
+        );
+    }
+
+    fn cue_stream_three_track_group(
+        root: &Path,
+        source_bits: u32,
+    ) -> (Vec<ScheduledCueStreamTrack>, PathBuf) {
+        let image = root.join("album.flac");
+        std::fs::write(&image, b"source-placeholder").expect("source placeholder");
+        let track_ids = [track_id(0), track_id(1), track_id(2)];
+        let mut source = prepared_source(root, &track_ids);
+        let samples_per_track = 44_100_u64;
+        let image_samples = samples_per_track * track_ids.len() as u64;
+        let fallback_root = root.join("staging/cue-segments");
+        for (index, track) in source.tracks.iter_mut().enumerate() {
+            track.bit_depth = Some(source_bits);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(source_bits),
+                Some(SourceAudioCoding::Pcm),
+            );
+            track.source_ref = TrackSourceRef::CueStreamSegment {
+                fallback_path: fallback_root.join(format!("track-{index:02}.wav")),
+                source_image: image.clone(),
+                decode_path: image.clone(),
+                start_sample: samples_per_track * index as u64,
+                samples: samples_per_track,
+                image_samples,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+                channels: 2,
+            };
+            track.expected_samples = Some(samples_per_track);
+            track.sample_rate = Some(44_100);
+        }
+        let scheduled = source
+            .tracks
+            .into_iter()
+            .enumerate()
+            .map(|(index, track)| ScheduledCueStreamTrack {
+                index,
+                final_path: root.join(format!("out/{:02}.flac", index + 1)),
+                track,
+            })
+            .collect();
+        (scheduled, fallback_root)
+    }
+
+    #[tokio::test]
+    async fn cue_stream_allow_partial_preserves_completed_prefix_on_consumer_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::AllowPartialAlbum,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let (scheduled, fallback_root) = cue_stream_three_track_group(temp.path(), 24);
+        let runner = CueStreamPrefixFailureRunner::new(CueStreamPrefixFailureKind::Consumer, 1);
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req.clone(),
+            temp.path().join("staging"),
+            "partial-prefix-consumer".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(
+            outputs.iter().map(|output| output.ok).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        assert!(outputs[0].artifact.is_some(), "completed track keeps its artifact");
+        assert!(
+            outputs[0]
+                .artifact
+                .as_ref()
+                .expect("completed artifact")
+                .staged_path
+                .exists(),
+            "completed track is finalized normally"
+        );
+        assert_eq!(
+            *runner.segmented_calls.lock().expect("segmented call counter"),
+            1,
+            "group gets exactly one streaming attempt"
+        );
+        assert_eq!(
+            *runner
+                .attempted_consumers
+                .lock()
+                .expect("attempted consumer counter"),
+            2,
+            "third consumer is never reached after the second fails"
+        );
+        assert_eq!(
+            *runner
+                .unexpected_non_probe_calls
+                .lock()
+                .expect("unexpected ordinary call counter"),
+            0,
+            "completed-prefix validation may probe, but must not invoke carrier materialization"
+        );
+        let partial_work = runner
+            .partial_work_path
+            .lock()
+            .expect("partial work path")
+            .clone()
+            .expect("failing partial work was created");
+        assert!(!partial_work.exists(), "failed consumer partial work is cleaned");
+        assert!(
+            !fallback_root.exists()
+                || std::fs::read_dir(&fallback_root)
+                    .expect("read fallback root")
+                    .all(|entry| entry
+                        .expect("fallback entry")
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        != Some("wav")),
+            "partial policy must not trigger legacy carrier materialization"
+        );
+
+        let outcome = aggregate_album_outcome(
+            outputs.into_iter().map(|output| output.record).collect(),
+            Vec::new(),
+            FailurePolicy::AllowPartialAlbum,
+        );
+        match outcome {
+            AlbumOutcome::Partial {
+                successful, failed, ..
+            } => {
+                assert_eq!(successful.len(), 1);
+                assert_eq!(failed.len(), 2);
+            }
+            other => panic!("allow-partial streamed prefix must aggregate as Partial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cue_stream_fail_album_policy_still_discards_completed_prefix_on_group_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let (scheduled, fallback_root) = cue_stream_three_track_group(temp.path(), 24);
+        let runner = CueStreamPrefixFailureRunner::new(CueStreamPrefixFailureKind::Consumer, 1);
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            "fail-album-prefix".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|output| !output.ok));
+        assert!(outputs.iter().all(|output| output.artifact.is_none()));
+        assert_eq!(
+            *runner
+                .unexpected_non_probe_calls
+                .lock()
+                .expect("unexpected ordinary call counter"),
+            0,
+            "fail-album cleanup must not retry through ordinary/materializer tools"
+        );
+        assert!(
+            !fallback_root.exists(),
+            "fail-album streamed failure must not invoke carrier materialization"
+        );
+        let outcome = aggregate_album_outcome(
+            outputs.into_iter().map(|output| output.record).collect(),
+            Vec::new(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+        );
+        assert!(matches!(
+            outcome,
+            AlbumOutcome::Blocked {
+                reason: BlockReason::TrackFailures,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cue_stream_allow_partial_preserves_completed_prefix_on_producer_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::AllowPartialAlbum,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let (scheduled, _) = cue_stream_three_track_group(temp.path(), 24);
+        let runner = CueStreamPrefixFailureRunner::new(CueStreamPrefixFailureKind::Producer, 1);
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            "partial-prefix-producer".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outputs.iter().map(|output| output.ok).collect::<Vec<_>>(),
+            vec![true, false, false],
+            "a producer failure after track 1 must retain the completed prefix under --partial"
+        );
+        assert!(outputs[0].artifact.is_some());
+    }
+
+    #[tokio::test]
+    async fn cue_stream_prelaunch_admission_rejection_keeps_established_fallback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
+
+        let (track, _fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let scheduled = vec![ScheduledCueStreamTrack {
+            index: 0,
+            final_path: temp.path().join("out/01.flac"),
+            track,
+        }];
+        let runner = CueStreamExecutionFailureRunner::default();
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            "admission-fallback".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            *runner.segmented_calls.lock().expect("segmented call counter"),
+            0,
+            "a deterministic admission rejection must not start the shared decoder"
+        );
+        assert!(
+            *runner.ordinary_calls.lock().expect("ordinary call counter") > 0,
+            "pre-launch rejection must retain the established file-backed fallback"
+        );
+    }
+
+    async fn assert_auto_streamable_cue_group_decodes_once_without_carriers(source_bits: u32) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+
+        let image = temp.path().join("album.flac");
+        std::fs::write(&image, b"source-placeholder").expect("source placeholder");
+        let track_ids = [track_id(0), track_id(1), track_id(2)];
+        let mut source = prepared_source(temp.path(), &track_ids);
+        let samples_per_track = 44_100_u64;
+        let image_samples = samples_per_track * track_ids.len() as u64;
+        let fallback_root = temp.path().join("staging/cue-segments");
+        for (index, track) in source.tracks.iter_mut().enumerate() {
+            track.bit_depth = Some(source_bits);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(source_bits),
+                Some(SourceAudioCoding::Pcm),
+            );
+            track.source_ref = TrackSourceRef::CueStreamSegment {
+                fallback_path: fallback_root.join(format!("track-{index:02}.wav")),
+                source_image: image.clone(),
+                decode_path: image.clone(),
+                start_sample: samples_per_track * index as u64,
+                samples: samples_per_track,
+                image_samples,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+                channels: 2,
+            };
+            track.expected_samples = Some(samples_per_track);
+            track.sample_rate = Some(44_100);
+        }
+        let scheduled = source
+            .tracks
+            .into_iter()
+            .enumerate()
+            .map(|(index, track)| ScheduledCueStreamTrack {
+                index,
+                final_path: temp.path().join(format!("out/{:02}.flac", index + 1)),
+                track,
+            })
+            .collect::<Vec<_>>();
+
+        let runner = CueStreamRecordingRunner::with_reported_bits(source_bits);
+        let reporter = RecordingReporter::new();
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            format!("job-stream-auto-{source_bits}"),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            Some(&reporter),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|output| output.ok));
+        let calls = runner.calls.lock().expect("read CUE segmented calls");
+        assert_eq!(
+            calls.len(),
+            1,
+            "Auto {source_bits}-bit FLAC -> FLAC must spawn one decoder for one FILE block"
+        );
+        let (producer, segments) = &calls[0];
+        assert_eq!(producer.binary, ToolBinary::Ffmpeg);
+        let image_text = image.to_string_lossy();
+        assert!(producer
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1] == image_text.as_ref()));
+        assert_eq!(segments.len(), 3);
+        assert!(
+            !segments.last().expect("final full-album segment").stop_producer_after,
+            "a selection that reaches image_samples must keep natural EOF supervision"
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.start_byte, segment.byte_len))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, samples_per_track * 8),
+                (samples_per_track * 8, samples_per_track * 8),
+                (samples_per_track * 16, samples_per_track * 8),
+            ]
+        );
+        assert!(segments.iter().all(|segment| {
+            segment.consumer.binary == ToolBinary::Sox
+                && segment
+                    .consumer
+                    .args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-t" && pair[1] == "raw")
+                && segment.consumer.args.iter().any(|arg| arg == "-")
+                && segment
+                    .consumer
+                    .args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-b" && pair[1] == source_bits.to_string())
+        }));
+        assert!(
+            !fallback_root.exists()
+                || std::fs::read_dir(&fallback_root)
+                    .expect("read fallback root")
+                    .all(|entry| {
+                        entry
+                            .expect("fallback entry")
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            != Some("wav")
+                    }),
+            "Auto {source_bits}-bit FLAC -> FLAC must not materialize per-track carrier WAVs"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamable_cue_early_track_range_marks_only_final_selected_segment_for_producer_stop() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+
+        let image = temp.path().join("album.flac");
+        std::fs::write(&image, b"source-placeholder").expect("source placeholder");
+        let samples_per_track = 44_100_u64;
+        let image_samples = samples_per_track * 20;
+        let fallback_root = temp.path().join("staging/cue-segments");
+        let scheduled = [1_u64, 2_u64]
+            .into_iter()
+            .enumerate()
+            .map(|(selected_index, track_index)| {
+                let mut track = prepared_source(temp.path(), &[track_id(track_index as u32)])
+                    .tracks
+                    .remove(0);
+                track.bit_depth = Some(24);
+                track.source_audio = SourceAudioDescriptor::from_scalar(
+                    Some(44_100),
+                    Some(24),
+                    Some(SourceAudioCoding::Pcm),
+                );
+                track.source_ref = TrackSourceRef::CueStreamSegment {
+                    fallback_path: fallback_root.join(format!("track-{track_index:02}.wav")),
+                    source_image: image.clone(),
+                    decode_path: image.clone(),
+                    start_sample: samples_per_track * track_index,
+                    samples: samples_per_track,
+                    image_samples,
+                    carrier: CueSegmentCarrier::PcmS32LeWav,
+                    channels: 2,
+                };
+                track.expected_samples = Some(samples_per_track);
+                track.sample_rate = Some(44_100);
+                ScheduledCueStreamTrack {
+                    index: selected_index,
+                    final_path: temp
+                        .path()
+                        .join(format!("out/{:02}.flac", track_index + 1)),
+                    track,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let runner = CueStreamRecordingRunner::with_reported_bits(24);
+        let outputs = encode_cue_stream_group_with_runner(
+            scheduled,
+            req,
+            temp.path().join("staging"),
+            "early-range".to_string(),
+            temp.path().join("convert"),
+            HashMap::new(),
+            None,
+            &runner,
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert!(outputs.iter().all(|output| output.ok));
+        let calls = runner.calls.lock().expect("read segmented calls");
+        assert_eq!(calls.len(), 1, "one FILE block still uses one decoder");
+        let (_, segments) = &calls[0];
+        assert_eq!(segments.len(), 2);
+        assert!(!segments[0].stop_producer_after);
+        assert!(
+            segments[1].stop_producer_after,
+            "track-range selection ending before image_samples must stop the producer after its exact final bytes"
+        );
+        assert_eq!(
+            segments[1].start_byte + segments[1].byte_len,
+            samples_per_track * 3 * 8,
+            "final selected byte is the end of track 3, not the end of the 20-track image"
+        );
+        assert!(segments[1].start_byte + segments[1].byte_len < image_samples * 8);
+    }
+
+    #[tokio::test]
+    async fn streamable_cue_group_auto_16_bit_decodes_image_once_and_writes_no_carrier_wavs() {
+        assert_auto_streamable_cue_group_decodes_once_without_carriers(16).await;
+    }
+
+    #[tokio::test]
+    async fn streamable_cue_group_auto_24_bit_decodes_image_once_and_writes_no_carrier_wavs() {
+        assert_auto_streamable_cue_group_decodes_once_without_carriers(24).await;
+    }
+
     fn track_record(id: TrackId, ok: bool, output_file: Option<PathBuf>) -> TrackRecord {
         TrackRecord {
             track_id: id.clone(),
@@ -49222,6 +52279,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 source,
                 plan,
                 stages: Vec::new(),
+                source_replaygain: None,
                 _run_lock: run_lock,
             },
             track_ids,

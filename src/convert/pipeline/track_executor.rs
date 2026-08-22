@@ -56,7 +56,8 @@ use super::progress::{
 };
 use super::tool::{
     parse_tool_version_output, BoundToolExecutable, CommandRecord, EnvVar, ProcessExit,
-    ToolBinary, ToolCommand, ToolOutput, ToolRunner,
+    ToolBinary, ToolCommand, ToolOutput, ToolRunner, ToolSegmentedPipelineError,
+    ToolSegmentedPipelineOutput, ToolStreamSegment,
 };
 use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
 
@@ -259,6 +260,67 @@ pub struct TrackExecutionError {
     pub error: ConvertError,
     pub commands: Vec<CommandRecord>,
     message: Option<String>,
+}
+
+/// Planner-approved single-command encode used by the CUE image fan-out path.
+/// The materializer remains descriptive; this record proves that the ordinary
+/// per-track planner selected a source-rate Phase-1-compatible encode before
+/// the executor feeds byte-exact sample windows from one shared decoded PCM
+/// stream. FFmpeg is the common path; planner-approved single-step SoX PCM
+/// encodes are also admitted when the apparent processing is only restoration
+/// of the authoritative Int16/Int24 source width from the raw s32 transport.
+#[derive(Debug, Clone)]
+pub(crate) struct CueStreamDirectTrackPlan {
+    pub planned_command: PlannedCommand,
+    pub finalization: Finalization,
+    pub cleanup_paths: Vec<PathBuf>,
+    pub work_dir: PathBuf,
+    pub metadata_satisfaction: PlannedMetadataSatisfaction,
+    pub metadata_required: PlannedMetadataSatisfaction,
+    pub command_hash: Option<String>,
+}
+
+impl CueStreamDirectTrackPlan {
+    /// FFmpeg output-local arguments, excluding the standard file input/map
+    /// prefix and the terminal output path.
+    pub(crate) fn ffmpeg_output_args(&self) -> Result<&[String], ConvertError> {
+        let args = &self.planned_command.args;
+        if self.planned_command.tool != ToolIdentifier::Ffmpeg || args.len() < 8 {
+            return Err(ConvertError::Backend(
+                "streamable CUE FFmpeg plan is shorter than the canonical input/output shape".to_string(),
+            ));
+        }
+        Ok(&args[7..args.len() - 1])
+    }
+
+    /// SoX output-local arguments for an admitted direct single-step PCM
+    /// encode. The canonical planner shape is
+    /// `sox -S -D <input> <output-options> <output>`; `-D` is the planner's
+    /// narrow suppression of SoX implicit dither for synthetic carrier-width
+    /// restoration. Direct admission separately
+    /// proves that no processing effects follow the output path.
+    pub(crate) fn sox_output_args(&self) -> Result<&[String], ConvertError> {
+        let args = &self.planned_command.args;
+        if self.planned_command.tool != ToolIdentifier::Sox
+            || args.len() < 5
+            || args[0] != "-S"
+            || args[1] != "-D"
+        {
+            return Err(ConvertError::Backend(
+                "streamable CUE SoX plan is not the canonical no-implicit-dither input/output shape".to_string(),
+            ));
+        }
+        Ok(&args[3..args.len() - 1])
+    }
+
+    pub(crate) fn work_output(&self) -> Result<&Path, ConvertError> {
+        match &self.planned_command.output {
+            tonepoet_pipeline::OutputSink::Path(path) => Ok(path.as_path()),
+            _ => Err(ConvertError::Backend(
+                "streamable CUE planner command does not have a path-backed output".to_string(),
+            )),
+        }
+    }
 }
 
 impl TrackExecutionError {
@@ -705,6 +767,343 @@ fn inject_track_execution_failure(
         ))
     };
     Err(TrackExecutionError::new(error, Vec::new()))
+}
+
+fn cue_stream_ffmpeg_filter_is_only_carrier_depth_normalization(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+) -> bool {
+    use tonepoet_pipeline::{BitDepthTarget, DitherType, PcmBitDepth};
+
+    if plan_request.settings.dither_type != DitherType::None {
+        return false;
+    }
+    let target_depth = match plan_request.settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth @ (PcmBitDepth::Int16 | PcmBitDepth::Int24)) => depth,
+        _ => return false,
+    };
+    if plan_request.source.authoritative_pcm_depth() != Some(target_depth)
+        || plan_request.source.bit_depth != Some(PcmBitDepth::Int32)
+    {
+        return false;
+    }
+
+    let af_positions = command
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (arg == "-af").then_some(index))
+        .collect::<Vec<_>>();
+    if af_positions.len() != 1 {
+        return false;
+    }
+    let Some(filter) = command.args.get(af_positions[0] + 1) else {
+        return false;
+    };
+    // Compare against the exact filter the ordinary planner emits for a
+    // source-rate carrier-width normalization. Do not accept merely "similar"
+    // aresample filters: an output-rate term, dither, reordered/extra option,
+    // or future processing knob must close direct admission automatically.
+    let settings = &plan_request.settings;
+    let mut expected_options = vec![
+        "resampler=soxr".to_string(),
+        format!(
+            "precision={}",
+            tonepoet_pipeline::soxr_precision(settings.resample_quality)
+        ),
+    ];
+    let cutoff = settings
+        .soxr_resampler
+        .cutoff
+        .unwrap_or_else(|| tonepoet_pipeline::ffmpeg_cutoff(settings.nyquist_transition));
+    expected_options.push(format!("cutoff={cutoff:.3}"));
+    if settings.soxr_resampler.chebyshev {
+        expected_options.push("cheby=1".to_string());
+    }
+    if let Some(phase) = settings.soxr_resampler.phase {
+        expected_options.push(format!("phase_shift={phase}"));
+    }
+    expected_options.push(format!(
+        "out_sample_fmt={}",
+        tonepoet_pipeline::ffmpeg_sample_fmt(target_depth)
+    ));
+    filter == &format!("aresample={}", expected_options.join(":"))
+}
+
+fn cue_stream_ffmpeg_plan_is_phase1_direct(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+    realized_input: &Path,
+    planned_output: &Path,
+) -> bool {
+    let realized_input_text = realized_input.to_string_lossy();
+    let planned_output_text = planned_output.to_string_lossy();
+    let prefix = [
+        "-y",
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        &*realized_input_text,
+        "-map",
+        "0:a:0",
+    ];
+    if command.args.len() < 8
+        || command
+            .args
+            .iter()
+            .take(prefix.len())
+            .map(String::as_str)
+            .ne(prefix.into_iter())
+        || command.args.last().map(String::as_str) != Some(&*planned_output_text)
+        || command
+            .args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-filter_complex" | "-ar"))
+    {
+        return false;
+    }
+
+    let af_count = command.args.iter().filter(|arg| arg.as_str() == "-af").count();
+    af_count == 0
+        || (af_count == 1
+            && cue_stream_ffmpeg_filter_is_only_carrier_depth_normalization(
+                plan_request,
+                command,
+            ))
+}
+
+fn cue_stream_sox_plan_is_phase1_direct(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+    realized_input: &Path,
+    planned_output: &Path,
+) -> bool {
+    use tonepoet_pipeline::{AudioFormat, BitDepthTarget, DitherType, PcmBitDepth, RateTarget};
+
+    if plan_request.settings.dither_type != DitherType::None
+        || plan_request.source.bit_depth != Some(PcmBitDepth::Int32)
+    {
+        return false;
+    }
+    let authoritative_depth = match plan_request.source.authoritative_pcm_depth() {
+        Some(depth @ (PcmBitDepth::Int16 | PcmBitDepth::Int24)) => depth,
+        _ => return false,
+    };
+    if plan_request.settings.target_bit_depth != BitDepthTarget::Pcm(authoritative_depth) {
+        return false;
+    }
+    if !match plan_request.settings.target_sample_rate {
+        RateTarget::Source => true,
+        RateTarget::PcmHz(rate) => plan_request.source.sample_rate_hz == Some(rate),
+        RateTarget::Dsd(_) => false,
+    } {
+        return false;
+    }
+
+    let target_format = &plan_request.settings.target_format;
+    if !matches!(
+        target_format,
+        AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::WavPack
+    ) || (target_format == &AudioFormat::WavPack && plan_request.settings.wavpack.hybrid)
+    {
+        return false;
+    }
+
+    let input = realized_input.to_string_lossy().into_owned();
+    let output = planned_output.to_string_lossy().into_owned();
+    let mut expected = vec![
+        "-S".to_string(),
+        "-D".to_string(),
+        input,
+        "-b".to_string(),
+        authoritative_depth.bits().to_string(),
+    ];
+    match target_format {
+        AudioFormat::Flac => {
+            expected.push("-C".to_string());
+            expected.push(plan_request.settings.flac.compression_level.to_string());
+        }
+        AudioFormat::WavPack => {
+            expected.push("-C".to_string());
+            expected.push(
+                tonepoet_pipeline::wavpack_compression_level(plan_request.settings.wavpack.mode)
+                    .to_string(),
+            );
+        }
+        AudioFormat::Wav | AudioFormat::Aiff => {}
+        _ => return false,
+    }
+    expected.push(output);
+
+    // Compare against the entire ordinary planner command. `-D` is required
+    // here because the planner uses it narrowly to suppress SoX's implicit
+    // automatic dither for synthetic carrier-width restoration. This admits no
+    // trailing `rate`, explicit `dither`, `sinc`, or other effect and no extra
+    // input/output option. Real depth changes, resampling, configured dither,
+    // and future DSP additions therefore fail closed to the established path.
+    command.args == expected
+}
+
+fn cue_stream_phase1_direct_plan_for_paths(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    staged_output: &Path,
+    work_dir: PathBuf,
+) -> Result<Option<(PlanRequest, ConversionPlan)>, ConvertError> {
+    let plan_request = plan_request_for_track(
+        request,
+        track,
+        realized_input,
+        staged_output,
+        work_dir,
+    )?;
+    let plan = plan_conversion(&plan_request)
+        .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+
+    let PlanAction::Execute {
+        commands,
+        steps,
+        finalization,
+        ..
+    } = &plan.action
+    else {
+        return Ok(None);
+    };
+    if plan.reference.is_some()
+        || !steps.is_empty()
+        || commands.len() != 1
+        || finalization.is_none()
+    {
+        return Ok(None);
+    }
+    let command = &commands[0];
+    let tonepoet_pipeline::InputSource::Path(planned_input) = &command.input else {
+        return Ok(None);
+    };
+    if planned_input != realized_input {
+        return Ok(None);
+    }
+    let tonepoet_pipeline::OutputSink::Path(planned_output) = &command.output else {
+        return Ok(None);
+    };
+
+    // Phase 1 stays intentionally narrow. A 16/24-bit source carried as raw
+    // s32 may legitimately look like a depth conversion to the ordinary
+    // planner even when the requested output preserves the authoritative source
+    // width. FFmpeg is admitted only with its exact carrier-normalization
+    // aresample filter; SoX is admitted only when the complete canonical command
+    // is a single no-effect Int16/Int24 lossless encode. Real DSP remains
+    // file-backed, and the existing WavPack-hybrid/FFmpeg-Int24 fidelity guards
+    // remain planner authority rather than being bypassed here.
+    let direct = match &command.tool {
+        ToolIdentifier::Ffmpeg => cue_stream_ffmpeg_plan_is_phase1_direct(
+            &plan_request,
+            command,
+            realized_input,
+            planned_output,
+        ),
+        ToolIdentifier::Sox => cue_stream_sox_plan_is_phase1_direct(
+            &plan_request,
+            command,
+            realized_input,
+            planned_output,
+        ),
+        _ => false,
+    };
+    if !direct {
+        return Ok(None);
+    }
+
+    Ok(Some((plan_request, plan)))
+}
+
+/// Pure Phase-1 direct-admission preflight used by scratch budgeting. This is
+/// deliberately the same planner/admission logic as execution, but it creates
+/// no work directories and runs no tools. Unknown/ineligible cells fail closed.
+pub(crate) fn cue_stream_phase1_direct_plan_eligible(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    staged_output: &Path,
+    work_dir: &Path,
+) -> Result<bool, ConvertError> {
+    Ok(cue_stream_phase1_direct_plan_for_paths(
+        request,
+        track,
+        realized_input,
+        staged_output,
+        work_dir.to_path_buf(),
+    )?
+    .is_some())
+}
+
+pub(crate) fn prepare_cue_stream_direct_track_plan(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    staged_output: &Path,
+    convert_root: &Path,
+) -> Result<Option<CueStreamDirectTrackPlan>, ConvertError> {
+    let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
+    reset_track_work_dir(&work_dir)?;
+
+    let Some((plan_request, plan)) = cue_stream_phase1_direct_plan_for_paths(
+        request,
+        track,
+        realized_input,
+        staged_output,
+        work_dir.clone(),
+    )? else {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Ok(None);
+    };
+
+    let PlanAction::Execute {
+        cleanup_paths,
+        finalization,
+        ..
+    } = &plan.action
+    else {
+        unreachable!("direct-plan helper admits only execute actions");
+    };
+    let Some(finalization) = finalization.clone() else {
+        unreachable!("direct-plan helper requires finalization");
+    };
+    let command_hash = super::manifest::planned_command_hash(&plan).ok();
+    let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
+    let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
+    let command = match &plan.action {
+        PlanAction::Execute { commands, .. } => commands[0].clone(),
+        _ => unreachable!("direct-plan helper admits only execute actions"),
+    };
+
+    Ok(Some(CueStreamDirectTrackPlan {
+        planned_command: command,
+        finalization,
+        cleanup_paths: cleanup_paths.clone(),
+        work_dir,
+        metadata_satisfaction,
+        metadata_required,
+        command_hash,
+    }))
+}
+
+pub(crate) fn finalize_cue_stream_direct_track_plan(
+    plan: &CueStreamDirectTrackPlan,
+) -> Result<(), ConvertError> {
+    apply_finalization(&plan.finalization)
+}
+
+pub(crate) fn cleanup_cue_stream_direct_track_plan(plan: &CueStreamDirectTrackPlan) {
+    for path in &plan.cleanup_paths {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let _ = fs::remove_dir_all(&plan.work_dir);
 }
 
 pub async fn execute_planned_track_conversion(
@@ -8681,6 +9080,30 @@ struct ReferencePipelinePermitSet {
     // A single RAII owner makes partial acquisition cancellation-safe: any
     // already-acquired permit is dropped automatically if a later acquire fails.
     _permits: Vec<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SegmentedPipelineExecutionError {
+    Admission(ConvertError),
+    Tool(ToolSegmentedPipelineError),
+}
+
+pub(crate) async fn run_segmented_tool_pipeline_with_concurrency(
+    producer: ToolCommand,
+    segments: Vec<ToolStreamSegment>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<ToolSegmentedPipelineOutput, SegmentedPipelineExecutionError> {
+    let binaries = std::iter::once(producer.binary)
+        .chain(segments.iter().map(|segment| segment.consumer.binary));
+    let _permits = acquire_reference_pipeline_permits(binaries, limits, cancel)
+        .await
+        .map_err(SegmentedPipelineExecutionError::Admission)?;
+    runner
+        .run_segmented_pipeline(producer, segments, cancel)
+        .await
+        .map_err(SegmentedPipelineExecutionError::Tool)
 }
 
 async fn acquire_reference_pipeline_permits(

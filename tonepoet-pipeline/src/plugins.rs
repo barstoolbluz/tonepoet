@@ -1036,7 +1036,23 @@ fn build_sox_encode_pcm(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec!["-S".into(), input];
+    let carrier_width_restoration_without_dither = apply_processing
+        && context.request.settings.dither_type == DitherType::None
+        && context.request.source.bit_depth == Some(PcmBitDepth::Int32)
+        && context.request.source.authoritative_pcm_depth() == Some(target_depth)
+        && matches!(target_depth, PcmBitDepth::Int16 | PcmBitDepth::Int24);
+    let mut args = vec!["-S".into()];
+    if carrier_width_restoration_without_dither {
+        // SoX automatically inserts dither for some precision reductions (in
+        // particular s32 -> 16-bit) even when no explicit `dither` effect is
+        // present. A widened CUE carrier is not a real precision reduction:
+        // its lower bits contain no source information, and DitherType::None
+        // must remain literal. Disable only SoX's implicit dither for this
+        // source-depth restoration cell; explicit depth changes retain the
+        // established planner behavior.
+        args.push("-D".into());
+    }
+    args.push(input);
     add_sox_output_format_args(context, &mut args, target_format, target_depth);
     args.push(output);
     if apply_processing {
@@ -2902,6 +2918,94 @@ mod tests {
             "Create PCM output",
         );
         SoxPlugin.build_command(&context, &step).unwrap()
+    }
+
+    fn sox_pcm_encode_command_for_depth_case(
+        source_depth: PcmBitDepth,
+        true_source_depth: PcmBitDepth,
+        target_depth: PcmBitDepth,
+        dither_type: DitherType,
+    ) -> PlannedCommand {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(target_depth);
+        settings.dither_type = dither_type;
+        let source = SourceInfo {
+            dsd_source_kind: None,
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(source_depth),
+            true_source_depth: Some(true_source_depth),
+            source_representation: crate::source::SourceRepresentationKind::Pcm,
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("carrier.wav"),
+            output_path: PathBuf::from("output.flac"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let context = request.context();
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: None,
+                target_bit_depth: target_depth,
+                apply_processing: true,
+            },
+            InputSource::Path(PathBuf::from("carrier.wav")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "SoX carrier-width restoration regression test",
+        );
+        SoxPlugin.build_command(&context, &step).unwrap()
+    }
+
+    #[test]
+    fn sox_carrier_width_restoration_disables_only_implicit_dither() {
+        for depth in [PcmBitDepth::Int16, PcmBitDepth::Int24] {
+            let command = sox_pcm_encode_command_for_depth_case(
+                PcmBitDepth::Int32,
+                depth,
+                depth,
+                DitherType::None,
+            );
+            assert_eq!(command.args[0], "-S");
+            assert_eq!(command.args[1], "-D");
+            assert_eq!(command.args[2], "carrier.wav");
+            assert!(command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-b" && pair[1] == depth.bits().to_string()));
+            assert!(!command.args.iter().any(|arg| arg == "dither" || arg == "rate" || arg == "sinc"));
+        }
+
+        let real_reduction = sox_pcm_encode_command_for_depth_case(
+            PcmBitDepth::Int32,
+            PcmBitDepth::Int24,
+            PcmBitDepth::Int16,
+            DitherType::None,
+        );
+        assert_eq!(real_reduction.args[0], "-S");
+        assert_ne!(real_reduction.args.get(1).map(String::as_str), Some("-D"));
+
+        let configured_dither = sox_pcm_encode_command_for_depth_case(
+            PcmBitDepth::Int32,
+            PcmBitDepth::Int16,
+            PcmBitDepth::Int16,
+            DitherType::Tpdf,
+        );
+        assert_eq!(configured_dither.args[0], "-S");
+        assert_ne!(configured_dither.args.get(1).map(String::as_str), Some("-D"));
     }
 
     #[test]

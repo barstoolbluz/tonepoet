@@ -1088,6 +1088,29 @@ pub struct TrackId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackSourceRef {
     StagedFile(PathBuf),
+    /// Descriptive CUE segment that can be encoded from one shared image decode.
+    /// No per-track PCM file exists unless the conversion plan later falls back
+    /// to the legacy file-backed path (for example, resample/dither).
+    CueStreamSegment {
+        /// Deterministic private path reserved for a lazy fallback carrier.
+        /// The materializer does not create this file.
+        fallback_path: PathBuf,
+        /// User-visible/original image used for provenance and metadata policy.
+        source_image: PathBuf,
+        /// Concrete decoder input. This normally equals `source_image`; a
+        /// WavPack ffprobe fallback may point at a once-decoded whole-image WAV.
+        decode_path: PathBuf,
+        start_sample: u64,
+        samples: u64,
+        /// Exact decoded sample count for this image. Streamable descriptors are
+        /// created only when this value is authoritative.
+        image_samples: u64,
+        /// Raw PCM representation that preserves the live CUE materializer's
+        /// existing integer-widening / float-class semantics.
+        carrier: CueSegmentCarrier,
+        /// Channel count required to build an unambiguous raw/graph stream.
+        channels: u16,
+    },
     CueSegmentCarrier {
         /// Validated, sample-bounded CUE segment carrier produced by the
         /// materializer. This is an audio-only PCM WAV carrier (`pcm_s32le`
@@ -1638,6 +1661,23 @@ impl CueSegmentCarrier {
     pub const fn container_name(self) -> &'static str {
         match self {
             Self::PcmS32LeWav | Self::PcmF32LeWav | Self::PcmF64LeWav => "wav",
+        }
+    }
+
+    #[must_use]
+    pub const fn raw_format_name(self) -> &'static str {
+        match self {
+            Self::PcmS32LeWav => "s32le",
+            Self::PcmF32LeWav => "f32le",
+            Self::PcmF64LeWav => "f64le",
+        }
+    }
+
+    #[must_use]
+    pub const fn bytes_per_sample(self) -> u64 {
+        match self {
+            Self::PcmS32LeWav | Self::PcmF32LeWav => 4,
+            Self::PcmF64LeWav => 8,
         }
     }
 }

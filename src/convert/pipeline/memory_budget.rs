@@ -612,6 +612,30 @@ impl std::fmt::Display for ScratchAdmissionError {
 
 impl std::error::Error for ScratchAdmissionError {}
 
+
+/// Fixed scratch/RSS headroom for one direct-streamed CUE track. The actual
+/// kernel pipe and splitter buffers are small (64 KiB scale), but encoders,
+/// metadata/finalization, artwork growth, and format libraries need working
+/// room. Reuse the legacy CueImage 512 MiB allowance rather than inventing a
+/// smaller headroom constant; retained encoded outputs are budgeted separately.
+const CUE_STREAMING_FIXED_HEADROOM_BYTES: u64 = 512 * MIB;
+
+/// Scratch peak for a proven Phase-1 direct CUE job. Completed encoded outputs
+/// remain staged until later album stages/publish, so their conservative upper
+/// bound is retained. What disappears is the album-wide PCM-carrier term: only
+/// the largest active raw transport track plus fixed process/buffer headroom is
+/// added on top of retained outputs.
+#[must_use]
+pub(crate) fn estimate_streaming_cue_scratch_peak_bytes(
+    retained_output_upper_bound_bytes: u64,
+    max_track_transport_bytes: u64,
+) -> u64 {
+    retained_output_upper_bound_bytes
+        .saturating_add(max_track_transport_bytes)
+        .saturating_add(CUE_STREAMING_FIXED_HEADROOM_BYTES)
+        .max(CUE_STREAMING_FIXED_HEADROOM_BYTES)
+}
+
 #[must_use]
 pub fn estimate_job_peak_bytes(container: &Path, source_kind: Option<SourceKind>) -> u64 {
     let source_bytes = source_size_bytes(container).unwrap_or(DEFAULT_UNKNOWN_ESTIMATE_BYTES);
@@ -620,10 +644,17 @@ pub fn estimate_job_peak_bytes(container: &Path, source_kind: Option<SourceKind>
             .saturating_mul(3)
             .saturating_add(128 * MIB)
             .max(256 * MIB),
-        Some(SourceKind::CueImage) => source_bytes
-            .saturating_mul(2)
-            .saturating_add(512 * MIB)
-            .max(1 * GIB),
+        Some(SourceKind::CueImage) => {
+            // Conservative fallback for CUE jobs. Scratch staging selection has
+            // a separate fail-closed Phase-1 preflight that can replace the old
+            // album-carrier term with retained outputs + one active transport
+            // track. WavPack, lossy/inexact-probe, DSP, mixed, or otherwise
+            // uncertain jobs continue to use this legacy reservation unchanged.
+            source_bytes
+                .saturating_mul(2)
+                .saturating_add(512 * MIB)
+                .max(1 * GIB)
+        }
         Some(SourceKind::Archive) => source_bytes
             .saturating_mul(4)
             .saturating_add(512 * MIB)
@@ -1275,6 +1306,30 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let input = temp.path().join("input.flac");
         fs::write(&input, vec![0_u8; 1024]).expect("input");
+        assert!(estimate_job_peak_bytes(&input, Some(SourceKind::SingleFile)) >= 256 * MIB);
+        assert!(estimate_job_peak_bytes(&input, Some(SourceKind::Archive)) >= GIB);
+    }
+
+    #[test]
+    fn streaming_cue_scratch_estimate_is_one_active_track_plus_fixed_headroom() {
+        let one_minute_cd_transport = 44_100_u64 * 60 * 2 * 4;
+        assert_eq!(
+            estimate_streaming_cue_scratch_peak_bytes(one_minute_cd_transport / 2, one_minute_cd_transport),
+            one_minute_cd_transport / 2 + one_minute_cd_transport + 512 * MIB,
+        );
+        assert_eq!(
+            estimate_streaming_cue_scratch_peak_bytes(0, 0),
+            512 * MIB,
+            "streaming scratch admission must retain the established CUE process/buffer headroom",
+        );
+    }
+
+    #[test]
+    fn legacy_cue_and_unrelated_job_estimates_remain_conservative_fallbacks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        fs::write(&input, vec![0_u8; 1024]).expect("input");
+        assert!(estimate_job_peak_bytes(&input, Some(SourceKind::CueImage)) >= GIB);
         assert!(estimate_job_peak_bytes(&input, Some(SourceKind::SingleFile)) >= 256 * MIB);
         assert!(estimate_job_peak_bytes(&input, Some(SourceKind::Archive)) >= GIB);
     }

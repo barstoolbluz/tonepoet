@@ -34,6 +34,7 @@ use crate::convert::pipeline::{
     boxed_work, build_pipeline_request as raw_build_pipeline_request, detect_source_kind,
     build_pipeline_request_from_settings as raw_build_pipeline_request_from_settings,
     prepare_independent_single_file_album_batch_for_dispatch,
+    encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache,
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
     finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
@@ -44,7 +45,7 @@ use crate::convert::pipeline::{
     AlbumBatchTrackContext, AlbumCompletionTracker, BatchResolvedAlbumIdentity,
     AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, MetadataTextOverride, PipelineReport, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
-    ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
+    ScheduledCueStreamTrack, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceKind, StageOutcome, ToolBinary, ToolConcurrencyLimits,
     TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind, WorkUnit,
     source_text_tag_key_from_extra,
@@ -2291,6 +2292,11 @@ enum QueueWorkOutput {
         job_id: String,
         output: ScheduledTrackOutput,
     },
+    EncodedBatch {
+        job_id: String,
+        outputs: Vec<ScheduledTrackOutput>,
+        source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+    },
     PostProcessed {
         item_id: String,
         status: ConversionStatus,
@@ -2917,6 +2923,46 @@ async fn run_queue_with_shared_orchestrator(
                             submissions.record_backlog(pool.metrics(), &pending_albums);
                         }
                     }
+                    Ok(QueueWorkOutput::EncodedBatch { job_id, outputs, source_replaygain }) => {
+                        let mut submit_postprocess: Option<(ScheduledAlbum, Vec<ScheduledTrackOutput>)> = None;
+                        for output in outputs {
+                            if !output.ok {
+                                log::warn!("streamed track encode failed: job={job_id} track={} outcome={:?}", output.index, output.record.outcome);
+                            }
+                            pool.metrics().record_track_encode_output(output.ok);
+                            let readiness = tracker.mark_track_finished(&job_id, output.ok);
+                            if let Some(pending) = pending_albums.get_mut(&job_id) {
+                                pending.finished += 1;
+                                pending.outputs.push(output);
+                                if matches!(readiness, AlbumReadiness::Failed { .. })
+                                    && !pending.cancel_requested
+                                {
+                                    pending.job_cancel.cancel();
+                                    pending.cancel_requested = true;
+                                }
+                                if pending.finished >= pending.expected {
+                                    if let Some(mut pending) = pending_albums.remove(&job_id) {
+                                        pending.outputs.sort_by_key(|output| output.index);
+                                        if let Some(mut album) = pending.album.take() {
+                                            album.source_replaygain = source_replaygain.clone();
+                                            submit_postprocess = Some((album, pending.outputs));
+                                        }
+                                    }
+                                }
+                            } else {
+                                log::error!(
+                                    "streamed encoded track output arrived after album accounting closed: job={} track_index={}",
+                                    job_id,
+                                    output.index
+                                );
+                            }
+                        }
+                        if let Some((album, outputs)) = submit_postprocess {
+                            pool.metrics().record_jobs_queued(1);
+                            submissions.enqueue_album_postprocess(album, outputs);
+                            submissions.record_backlog(pool.metrics(), &pending_albums);
+                        }
+                    }
                     Ok(QueueWorkOutput::PostProcessed { item_id, status }) => {
                         if terminal.insert(item_id, status.clone()).is_none() {
                             record_terminal_status(&pool, &status);
@@ -3167,6 +3213,45 @@ fn next_album_source_work(
 
         let convert_root = album.convert_root();
         let _ = std::fs::create_dir_all(&convert_root);
+        if matches!(&track.source_ref, TrackSourceRef::CueStreamSegment { .. }) {
+            let mut group = vec![ScheduledCueStreamTrack {
+                index: track_index,
+                track,
+                final_path,
+            }];
+            // Coalesce contiguous descriptive CUE segments across FILE blocks.
+            // The album worker still opens one decoder per FILE/image, but this
+            // album scope lets one source-pass ReplayGain analyzer span LP sides.
+            while pending.next_source_track < album.source.tracks.len() {
+                let candidate_index = pending.next_source_track;
+                let candidate = &album.source.tracks[candidate_index];
+                if !matches!(&candidate.source_ref, TrackSourceRef::CueStreamSegment { .. }) {
+                    break;
+                }
+                let Some(candidate_final) = album.planned_final_path(&candidate.id) else {
+                    pending.next_source_track += 1;
+                    continue;
+                };
+                group.push(ScheduledCueStreamTrack {
+                    index: candidate_index,
+                    track: candidate.clone(),
+                    final_path: candidate_final,
+                });
+                pending.next_source_track += 1;
+            }
+            return Some(build_cue_stream_group_work(
+                album,
+                group,
+                convert_root,
+                tool_paths,
+                version_cache.clone(),
+                progress_tx,
+                lifecycle_tx,
+                pending.job_cancel.clone(),
+                tool_concurrency_limits.clone(),
+            ));
+        }
+
         return Some(match &track.source_ref {
             TrackSourceRef::StagedFile(_) => {
                 let kind = if album.source.kind == SourceKind::SingleFile {
@@ -3189,6 +3274,7 @@ fn next_album_source_work(
                     tool_concurrency_limits.clone(),
                 )
             }
+            TrackSourceRef::CueStreamSegment { .. } => unreachable!("handled above"),
             TrackSourceRef::CueSegmentCarrier { .. }
             | TrackSourceRef::ImageSegment { .. }
             | TrackSourceRef::SacdTrack { .. }
@@ -3210,6 +3296,67 @@ fn next_album_source_work(
                 )
             }
         });
+    }
+}
+
+fn build_cue_stream_group_work(
+    album: &ScheduledAlbum,
+    tracks: Vec<ScheduledCueStreamTrack>,
+    convert_root: PathBuf,
+    tool_paths: &HashMap<String, PathBuf>,
+    version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
+    progress_tx: &broadcast::Sender<ProgressUpdate>,
+    lifecycle_tx: Option<&mpsc::UnboundedSender<LifecycleEvent>>,
+    job_cancel: CancellationToken,
+    tool_concurrency_limits: Arc<ToolConcurrencyLimits>,
+) -> WorkUnit<QueueWorkOutput> {
+    let req = album.req.clone();
+    let source = album.source.clone();
+    let staging_root = album.staging.root.clone();
+    let staging_job = album.staging.job_id.clone();
+    let tool_paths = tool_paths.clone();
+    let progress_tx = progress_tx.clone();
+    let lifecycle_tx = lifecycle_tx.cloned();
+    let job_id = album.req.job_id.clone();
+    let item_id = album.req.item_id.clone();
+    let first_id = tracks
+        .first()
+        .map(|input| input.track.id.clone())
+        .expect("CUE stream group is never empty");
+    let last_ordinal = tracks
+        .last()
+        .map(|input| input.track.id.source_ordinal)
+        .unwrap_or(first_id.source_ordinal);
+    WorkUnit {
+        job_id: job_id.clone(),
+        unit_id: format!(
+            "cue-stream:{:04}-{:04}",
+            first_id.source_ordinal, last_ordinal
+        ),
+        kind: WorkKind::CueSplitTrack { track_id: first_id },
+        task: boxed_work(move |_worker_cancel| async move {
+            let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id, None);
+            let _guard = reporter.track_lifecycle_guard();
+            let batch = encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache(
+                tracks,
+                source,
+                req,
+                staging_root,
+                staging_job,
+                convert_root,
+                tool_paths,
+                Some(tool_concurrency_limits),
+                Some(version_cache),
+                &reporter,
+                job_cancel,
+            )
+            .await;
+            Ok(QueueWorkOutput::EncodedBatch {
+                job_id,
+                outputs: batch.outputs,
+                source_replaygain: batch.source_replaygain,
+            })
+        }),
     }
 }
 
@@ -3238,7 +3385,8 @@ fn build_realize_work(
     let item_id = album.req.item_id.clone();
     let track_id = track.id.clone();
     let kind = match &track.source_ref {
-        TrackSourceRef::CueSegmentCarrier { .. }
+        TrackSourceRef::CueStreamSegment { .. }
+        | TrackSourceRef::CueSegmentCarrier { .. }
         | TrackSourceRef::ImageSegment { .. } => WorkKind::CueSplitTrack { track_id: track_id.clone() },
         TrackSourceRef::SacdTrack { .. } => WorkKind::SacdExtractTrack { track_id: track_id.clone() },
         TrackSourceRef::DvdaTrack { .. } => WorkKind::MaterializeItem, // Phase 3: DvdaExtractTrack

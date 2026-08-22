@@ -1,16 +1,16 @@
 //! PR 8 - CUE image materializer.
 //!
-//! Parses CUE image layouts and stages each CUE track as a bounded PCM WAV
-//! carrier. Integer sources normalize to `pcm_s32le`; Float32/Float64 sources
-//! retain their sample class as `pcm_f32le`/`pcm_f64le`. The
-//! `PreparedTrack::bit_depth` field remains the original probed source-image
-//! representation so `target_bit_depth = Source` resolves to the source, not
-//! merely the carrier width. Downstream planning receives a typed
-//! `CueSegmentCarrier` fact and encodes the requested final target from that
-//! validated WAV instead of re-encoding through an intermediate FLAC carrier.
+//! Parses CUE image layouts into sample-exact descriptive segments. Lossless
+//! images with exact duration and channel facts use `CueStreamSegment`: no
+//! per-track PCM carrier is written during materialization, allowing Convert to
+//! decode an image once and fan the decoded stream into track encoders. Tracks
+//! whose source facts are insufficient for safe streaming keep the established
+//! validated `CueSegmentCarrier` fallback. Integer carriers normalize to
+//! `pcm_s32le`; Float32/Float64 retain their sample class.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::errors::{MaterializeError, SourceDetectError, ToolRunnerError};
 use super::reporter::PipelineReporter;
 use super::stages::Materializer;
+use super::track_executor::cue_stream_phase1_direct_plan_eligible;
 use super::tool::{ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 use crate::convert::classify::is_cue_sheet_path;
@@ -39,6 +40,7 @@ struct CueInput {
 #[derive(Debug, Clone)]
 struct AudioProbe {
     sample_rate: u32,
+    channels: Option<u16>,
     total_samples: u64,
     exact_samples: bool,
     /// Original source sample representation using the shared source-depth
@@ -47,6 +49,415 @@ struct AudioProbe {
     coding: SourceAudioCoding,
     codec_name: Option<String>,
     format_name: Option<String>,
+}
+
+
+/// Exact, bounded facts used only for pre-materialization scratch admission.
+/// `max_track_transport_bytes` is the largest selected track in the same raw
+/// PCM representation used by the shared CUE decoder (s32/f32/f64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CueStreamingScratchFacts {
+    pub max_track_transport_bytes: u64,
+    /// Conservative size of all completed encoded outputs that can coexist in
+    /// scratch. Lossless targets are bounded from authoritative source-depth
+    /// PCM; lossy targets also include a codec-rate envelope.
+    pub retained_output_upper_bound_bytes: u64,
+    pub selected_track_count: usize,
+}
+
+const CUE_PREFLIGHT_MAX_WAV_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+const CUE_PREFLIGHT_MAX_WAV_CHUNKS: usize = 256;
+
+fn cue_preflight_flac_probe(path: &Path) -> Option<AudioProbe> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0_u8; 42];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"fLaC" || header[4] & 0x7f != 0 {
+        return None;
+    }
+    let streaminfo_len = ((header[5] as usize) << 16)
+        | ((header[6] as usize) << 8)
+        | header[7] as usize;
+    if streaminfo_len != 34 {
+        return None;
+    }
+    let packed = u64::from_be_bytes(header[18..26].try_into().ok()?);
+    let sample_rate = ((packed >> 44) & 0x000f_ffff) as u32;
+    let channels = (((packed >> 41) & 0x7) as u16).checked_add(1)?;
+    let bits_per_sample = (((packed >> 36) & 0x1f) as u32).checked_add(1)?;
+    let total_samples = packed & 0x0000_000f_ffff_ffff;
+    if sample_rate == 0 || channels == 0 || total_samples == 0 {
+        return None;
+    }
+    Some(AudioProbe {
+        sample_rate,
+        channels: Some(channels),
+        total_samples,
+        exact_samples: true,
+        bit_depth: Some(bits_per_sample),
+        coding: SourceAudioCoding::Pcm,
+        codec_name: Some("flac".to_string()),
+        format_name: Some("flac".to_string()),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CuePreflightWavFormat {
+    channels: u16,
+    sample_rate: u32,
+    block_align: u16,
+    source_depth_descriptor: u32,
+}
+
+fn cue_preflight_parse_wav_format(bytes: &[u8]) -> Option<CuePreflightWavFormat> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let format_tag = u16::from_le_bytes(bytes[0..2].try_into().ok()?);
+    let channels = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
+    let sample_rate = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let byte_rate = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let block_align = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
+    let container_bits = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
+    if channels == 0 || sample_rate == 0 || block_align == 0 || container_bits == 0 {
+        return None;
+    }
+    let bytes_per_container_sample = u32::from(container_bits).div_ceil(8);
+    let expected_block_align = u32::from(channels).checked_mul(bytes_per_container_sample)?;
+    if u32::from(block_align) != expected_block_align
+        || byte_rate != sample_rate.checked_mul(expected_block_align)?
+    {
+        return None;
+    }
+
+    let (base_format, valid_bits) = if format_tag == 0xfffe {
+        if bytes.len() < 40 || u16::from_le_bytes(bytes[16..18].try_into().ok()?) < 22 {
+            return None;
+        }
+        let valid = u16::from_le_bytes(bytes[18..20].try_into().ok()?);
+        let subformat_tag = u16::from_le_bytes(bytes[24..26].try_into().ok()?);
+        const STANDARD_WAVE_SUBFORMAT_GUID_TAIL: [u8; 14] = [
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00,
+            0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+        ];
+        if bytes[26..40] != *STANDARD_WAVE_SUBFORMAT_GUID_TAIL.as_slice() {
+            return None;
+        }
+        let valid = if valid == 0 { container_bits } else { valid };
+        if valid > container_bits {
+            return None;
+        }
+        (u32::from(subformat_tag), valid)
+    } else {
+        (u32::from(format_tag), container_bits)
+    };
+
+    let source_depth_descriptor = match base_format {
+        1 => u32::from(valid_bits),
+        3 if valid_bits == container_bits && container_bits == 32 => 320,
+        3 if valid_bits == container_bits && container_bits == 64 => 640,
+        _ => return None,
+    };
+    Some(CuePreflightWavFormat {
+        channels,
+        sample_rate,
+        block_align,
+        source_depth_descriptor,
+    })
+}
+
+fn cue_preflight_wav_probe(path: &Path) -> Option<AudioProbe> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut riff = [0_u8; 12];
+    file.read_exact(&mut riff).ok()?;
+    let rf64 = &riff[..4] == b"RF64";
+    if (!rf64 && &riff[..4] != b"RIFF") || &riff[8..12] != b"WAVE" {
+        return None;
+    }
+
+    let mut position = 12_u64;
+    let mut chunks = 0_usize;
+    let mut format = None;
+    let mut rf64_data_size = None;
+    let mut data_size = None;
+    let mut audio_data_start = None;
+    while position.checked_add(8)? <= file_len
+        && position <= CUE_PREFLIGHT_MAX_WAV_HEADER_BYTES
+        && chunks < CUE_PREFLIGHT_MAX_WAV_CHUNKS
+    {
+        chunks += 1;
+        file.seek(SeekFrom::Start(position)).ok()?;
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let id = &chunk_header[..4];
+        let declared_size = u32::from_le_bytes(chunk_header[4..8].try_into().ok()?);
+        let data_start = position.checked_add(8)?;
+
+        if id == b"ds64" && rf64 {
+            if declared_size < 24 {
+                return None;
+            }
+            let mut ds64 = [0_u8; 24];
+            file.read_exact(&mut ds64).ok()?;
+            rf64_data_size = Some(u64::from_le_bytes(ds64[8..16].try_into().ok()?));
+        } else if id == b"fmt " {
+            if declared_size < 16 || declared_size > 4096 {
+                return None;
+            }
+            let mut fmt = vec![0_u8; declared_size as usize];
+            file.read_exact(&mut fmt).ok()?;
+            format = cue_preflight_parse_wav_format(&fmt);
+            if format.is_none() {
+                return None;
+            }
+        } else if id == b"data" {
+            data_size = if rf64 && declared_size == u32::MAX {
+                rf64_data_size
+            } else {
+                Some(u64::from(declared_size))
+            };
+            if data_size.is_none() {
+                return None;
+            }
+            audio_data_start = Some(data_start);
+            // Audio data is the end of bounded header inspection. Standard WAV
+            // places fmt/ds64 before it; fail closed instead of seeking through
+            // audio to discover malformed late metadata.
+            break;
+        }
+
+        if declared_size == u32::MAX {
+            return None;
+        }
+        position = data_start
+            .checked_add(u64::from(declared_size))?
+            .checked_add(u64::from(declared_size & 1))?;
+    }
+
+    let format = format?;
+    let data_size = data_size?;
+    let audio_data_start = audio_data_start?;
+    if audio_data_start.checked_add(data_size)? > file_len
+        || data_size == 0
+        || data_size % u64::from(format.block_align) != 0
+    {
+        return None;
+    }
+    let total_samples = data_size / u64::from(format.block_align);
+    if total_samples == 0 {
+        return None;
+    }
+    Some(AudioProbe {
+        sample_rate: format.sample_rate,
+        channels: Some(format.channels),
+        total_samples,
+        exact_samples: true,
+        bit_depth: Some(format.source_depth_descriptor),
+        coding: SourceAudioCoding::Pcm,
+        codec_name: Some(match format.source_depth_descriptor {
+            320 => "pcm_f32le",
+            640 => "pcm_f64le",
+            _ => "pcm_s32le",
+        }.to_string()),
+        format_name: Some(if rf64 { "rf64" } else { "wav" }.to_string()),
+    })
+}
+
+fn cue_preflight_exact_pcm_probe(path: &Path) -> Option<AudioProbe> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "flac" => cue_preflight_flac_probe(path),
+        "wav" | "wave" => cue_preflight_wav_probe(path),
+        // WavPack stays file-backed in Phase 1. Other formats may stream at
+        // execution after ffprobe, but scratch preflight intentionally refuses
+        // to run external probes or duplicate those format parsers.
+        _ => None,
+    }
+}
+
+fn cue_preflight_source_bytes_per_sample(depth: Option<u32>) -> Option<u64> {
+    match depth? {
+        320 => Some(4),
+        640 => Some(8),
+        bits @ 1..=64 => Some(u64::from(bits).div_ceil(8)),
+        _ => None,
+    }
+}
+
+fn cue_preflight_lossy_payload_upper_bound_bytes(
+    req: &PipelineRequest,
+    samples: u64,
+    sample_rate: u32,
+) -> Option<u64> {
+    use tonepoet_pipeline::AudioFormat;
+
+    // Use the validated codec envelope rather than the requested average rate.
+    // That stays conservative for VBR/ABR behavior without duplicating encoder
+    // rate-control details in scratch admission. Fixed-rate DTS/AC-3 use their
+    // planner constants. Lossless targets need no bitrate envelope.
+    let max_kbps = match &req.settings.target_format {
+        AudioFormat::Mp3 => 1_000_u64,
+        AudioFormat::Aac => 1_024_u64,
+        AudioFormat::Opus => 510_u64,
+        AudioFormat::Dts => 768_u64,
+        AudioFormat::Ac3 => 448_u64,
+        _ => return None,
+    };
+    let numerator = samples
+        .checked_mul(max_kbps)?
+        .checked_mul(1_000)?;
+    let denominator = u64::from(sample_rate).checked_mul(8)?;
+    Some(numerator.div_ceil(denominator))
+}
+
+/// Cheap, fail-closed scratch preflight for Phase-1 CUE streaming. It performs
+/// only CUE parsing/path resolution and bounded FLAC/WAV header reads, then asks
+/// the exact execution planner/admission predicate whether each selected image
+/// has a direct one-command stream plan. Any uncertainty returns `None`, which
+/// preserves the established conservative CueImage estimate.
+pub(crate) fn cue_streaming_scratch_facts(
+    req: &PipelineRequest,
+) -> Option<CueStreamingScratchFacts> {
+    let cue_input = resolve_cue_input(req).ok()?;
+    let track_images = resolve_track_image_paths(&cue_input).ok()?;
+    if track_images.len() != cue_input.sheet.tracks.len() {
+        return None;
+    }
+
+    let mut probes = HashMap::new();
+    for image_path in unique_existing_paths(&track_images) {
+        if is_wavpack_path(&image_path) {
+            return None;
+        }
+        let probe = cue_preflight_exact_pcm_probe(&image_path)?;
+        probes.insert(path_identity(&image_path), probe);
+    }
+    let boundaries = compute_track_boundaries_for_layout(&cue_input.sheet, &track_images, &probes).ok()?;
+    let selected = selected_track_indices(
+        cue_input.sheet.tracks.len(),
+        &req.source.track_selection,
+    ).ok()?;
+    if selected.is_empty() {
+        return None;
+    }
+    // Fabricated planner paths must use the same container-extension spelling
+    // as real execution. In particular, runtime staging strips a leading dot
+    // and normalizes case before constructing the output path.
+    let target_extension = super::stages::normalized_container_extension(req);
+    let preflight_root = Path::new("/__tonepoet_cue_stream_scratch_preflight__");
+    // CUE carrier planning always disables source-container metadata/artwork/MD5
+    // transfer before constructing the encode plan. Mirror that already-fixed
+    // execution fact up front so scratch admission does not duplicate the
+    // per-track policy-downgrade warnings merely by asking the same planner.
+    let mut preflight_request = req.clone();
+    preflight_request.settings.metadata.transfer_tags = false;
+    preflight_request.settings.metadata.preserve_artwork = false;
+    preflight_request.settings.metadata.store_source_audio_md5 = false;
+    let mut max_track_transport_bytes = 0_u64;
+    let mut retained_output_upper_bound_bytes = 0_u64;
+
+    for idx in selected.iter().copied() {
+        let image_path = track_images.get(idx)?;
+        let image_key = path_identity(image_path);
+        let probe = probes.get(&image_key)?;
+        let channels = probe.channels?;
+        let bounds = *boundaries.get(idx)?;
+        let carrier = CueSegmentCarrier::for_source_depth_descriptor(probe.bit_depth);
+        let fallback_path = preflight_root.join(format!("track-{idx:04}.wav"));
+        // Mirror real execution's separate segment-input / convert-output
+        // namespaces. The previous same-directory fabrication made WAV targets
+        // collide lexically with fallback_path before the direct-stream
+        // admission predicate could run.
+        let staged_output = preflight_root
+            .join("output")
+            .join(format!("track-{idx:04}.{target_extension}"));
+        let work_dir = preflight_root.join(format!("track-{idx:04}.work"));
+        debug_assert_ne!(fallback_path, staged_output);
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: (idx + 1) as u32,
+                disc_number: None,
+                track_number: cue_input.sheet.tracks.get(idx)?.number,
+            },
+            source_ref: TrackSourceRef::CueStreamSegment {
+                fallback_path: fallback_path.clone(),
+                source_image: image_path.clone(),
+                decode_path: image_path.clone(),
+                start_sample: bounds.start_sample,
+                samples: bounds.samples,
+                image_samples: probe.total_samples,
+                carrier,
+                channels,
+            },
+            metadata: TrackMetadata::default(),
+            expected_samples: Some(bounds.samples),
+            sample_rate: Some(probe.sample_rate),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(probe.sample_rate),
+                probe.bit_depth,
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: probe.bit_depth,
+            warnings: Vec::new(),
+        };
+        let direct_plan_eligible = match cue_stream_phase1_direct_plan_eligible(
+            &preflight_request,
+            &track,
+            &fallback_path,
+            &staged_output,
+            &work_dir,
+        ) {
+            Ok(eligible) => eligible,
+            Err(err) => {
+                log::warn!(
+                    "CUE streaming scratch preflight planner failed for track {} with fabricated paths (input={}, output={}): {err}; using conservative scratch fallback",
+                    idx + 1,
+                    fallback_path.display(),
+                    staged_output.display(),
+                );
+                return None;
+            }
+        };
+        if !direct_plan_eligible {
+            return None;
+        }
+
+        let frames_channels = bounds.samples.checked_mul(u64::from(channels))?;
+        let track_transport_bytes = frames_channels.checked_mul(carrier.bytes_per_sample())?;
+        max_track_transport_bytes = max_track_transport_bytes.max(track_transport_bytes);
+        let output_pcm_bytes = frames_channels
+            .checked_mul(cue_preflight_source_bytes_per_sample(probe.bit_depth)?)?;
+        // Lossless direct targets preserve the authoritative source depth, so
+        // source-depth PCM is a conservative base before small codec/container
+        // framing overhead. For lossy targets, a low-rate PCM source can be
+        // smaller than the configured encoded stream; take the larger of PCM
+        // and the codec's validated bitrate envelope. This keeps scratch
+        // admission fail-safe without assuming a compression ratio.
+        let encoded_payload_base = if req.settings.target_format.is_lossy() {
+            output_pcm_bytes.max(cue_preflight_lossy_payload_upper_bound_bytes(
+                req,
+                bounds.samples,
+                probe.sample_rate,
+            )?)
+        } else {
+            output_pcm_bytes
+        };
+        // Five percent plus 64 KiB per file covers ordinary lossless frame and
+        // container overhead; the separate 512 MiB fixed allowance remains for
+        // process buffers, metadata/artwork growth, and miscellaneous work.
+        let output_upper_bound = encoded_payload_base
+            .checked_add(encoded_payload_base / 20)?
+            .checked_add(64 * 1024)?;
+        retained_output_upper_bound_bytes = retained_output_upper_bound_bytes
+            .checked_add(output_upper_bound)?;
+    }
+
+    Some(CueStreamingScratchFacts {
+        max_track_transport_bytes,
+        retained_output_upper_bound_bytes,
+        selected_track_count: selected.len(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,28 +600,66 @@ impl Materializer for CueImageMaterializer {
                 ))
             })?;
             let carrier = CueSegmentCarrier::for_source_depth_descriptor(probe.bit_depth);
-            // A lossy image's header length is an estimate; its tail segment
-            // is staged open-ended and the DECODED length becomes the fact
-            // (backfilled below). All other segments stay exact.
-            let policy = if probe.coding == SourceAudioCoding::Lossy && is_image_tail {
-                SegmentLengthPolicy::LossyTail
+            // Phase-1 streaming is deliberately fail-closed: only lossless PCM
+            // images with an exact container sample count and a known channel
+            // count become descriptive stream segments. Lossy/inexact/unknown
+            // sources keep the established staged-carrier path, including the
+            // decode-determined LossyTail contract.
+            let streamable_channel_count = probe.channels.is_some();
+            let (source_ref, samples) = if probe.coding == SourceAudioCoding::Pcm
+                && probe.exact_samples
+                && streamable_channel_count
+                // Keep WavPack on its proven native/file-backed fallback until
+                // a raw `wvunpack` stdout contract is pinned by tests. FFmpeg
+                // probing/decoding of .wv is intentionally not made a new
+                // streaming authority here.
+                && !is_wavpack_path(image_path)
+            {
+                (
+                    TrackSourceRef::CueStreamSegment {
+                        fallback_path: staged_path,
+                        source_image: image_path.clone(),
+                        decode_path: decode_path.clone(),
+                        start_sample,
+                        samples,
+                        image_samples: probe.total_samples,
+                        carrier,
+                        channels: probe.channels.expect("checked above"),
+                    },
+                    samples,
+                )
             } else {
-                SegmentLengthPolicy::Exact
+                // A lossy image's header length is an estimate; its tail segment
+                // is staged open-ended and the DECODED length becomes the fact.
+                let policy = if probe.coding == SourceAudioCoding::Lossy && is_image_tail {
+                    SegmentLengthPolicy::LossyTail
+                } else {
+                    SegmentLengthPolicy::Exact
+                };
+                let staged = stage_cue_segment_as_wav(
+                    decode_path,
+                    start_sample,
+                    samples,
+                    probe.sample_rate,
+                    carrier,
+                    &staged_path,
+                    policy,
+                    runner,
+                    cancel,
+                )
+                .await?;
+                let staged_samples = staged.samples;
+                (
+                    TrackSourceRef::CueSegmentCarrier {
+                        path: staged.path,
+                        source_image: image_path.clone(),
+                        start_sample,
+                        samples: staged_samples,
+                        carrier,
+                    },
+                    staged_samples,
+                )
             };
-            let staged = stage_cue_segment_as_wav(
-                decode_path,
-                start_sample,
-                samples,
-                probe.sample_rate,
-                carrier,
-                &staged_path,
-                policy,
-                runner,
-                cancel,
-            )
-            .await?;
-            let staged_path = staged.path;
-            let samples = staged.samples;
 
             let mut metadata = cue_track_metadata(
                 cue_track,
@@ -228,13 +677,7 @@ impl Materializer for CueImageMaterializer {
                     disc_number: None,
                     track_number: track_number_plan[idx].output_number,
                 },
-                source_ref: TrackSourceRef::CueSegmentCarrier {
-                    path: staged_path,
-                    source_image: image_path.clone(),
-                    start_sample,
-                    samples,
-                    carrier,
-                },
+                source_ref,
                 metadata,
                 expected_samples: Some(samples),
                 sample_rate: Some(probe.sample_rate),
@@ -1317,7 +1760,19 @@ async fn probe_audio_image(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<AudioProbe, MaterializeError> {
-    let cmd = ToolCommand {
+    let cmd = audio_image_probe_command(path);
+
+    let output = match runner.run(cmd, cancel).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
+        Err(err) => return Err(err.into()),
+    };
+
+    parse_audio_probe_json(&output.stdout_tail)
+}
+
+fn audio_image_probe_command(path: &Path) -> ToolCommand {
+    ToolCommand {
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         binary: ToolBinary::Ffprobe,
         args: vec![
@@ -1325,9 +1780,8 @@ async fn probe_audio_image(
             "error".into(),
             "-select_streams".into(),
             "a:0".into(),
-            "-count_frames".into(),
             "-show_entries".into(),
-            "stream=codec_name,sample_fmt,sample_rate,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
+            "stream=codec_name,sample_fmt,sample_rate,channels,duration_ts,time_base,duration,bits_per_raw_sample,bits_per_sample"
                 .into(),
             "-show_entries".into(),
             "format=format_name,duration".into(),
@@ -1338,20 +1792,10 @@ async fn probe_audio_image(
         secret_args: vec![],
         cwd: None,
         env: vec![],
-        // `-count_frames` decodes the ENTIRE image to count samples, so this
-        // probe scales with image length and codec decode speed. 30s (the
-        // header-read probes' budget) is fine for FLAC/WAV images but a full
-        // Monkey's Audio (APE) CD image legitimately takes minutes.
-        timeout: Duration::from_secs(600),
-    };
-
-    let output = match runner.run(cmd, cancel).await {
-        Ok(output) => output,
-        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
-        Err(err) => return Err(err.into()),
-    };
-
-    parse_audio_probe_json(&output.stdout_tail)
+        // Header/container facts only. In particular, do not use
+        // `-count_frames`: that forces a full decode before conversion begins.
+        timeout: Duration::from_secs(30),
+    }
 }
 
 
@@ -1619,6 +2063,11 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
             "ffprobe returned no valid sample_rate".to_string(),
         ));
     }
+    let channels = stream
+        .get("channels")
+        .and_then(json_u32_from_value)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0);
     let sample_fmt = stream
         .get("sample_fmt")
         .and_then(|value| value.as_str())
@@ -1651,6 +2100,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
         if duration_ts_samples > 0 {
             return Ok(AudioProbe {
                 sample_rate,
+                channels,
                 total_samples: duration_ts_samples,
                 exact_samples: true,
                 bit_depth,
@@ -1682,6 +2132,7 @@ fn parse_audio_probe_json(json_str: &str) -> Result<AudioProbe, MaterializeError
 
     Ok(AudioProbe {
         sample_rate,
+        channels,
         total_samples,
         exact_samples: false,
         bit_depth,
@@ -1698,11 +2149,17 @@ fn samples_from_duration_ts(stream: &serde_json::Value, sample_rate: u32) -> Opt
     if den == 0 {
         return None;
     }
-    let samples = (duration_ts as u128)
+    let numerator = (duration_ts as u128)
         .checked_mul(num as u128)?
-        .checked_mul(sample_rate as u128)?
-        .checked_div(den as u128)?;
-    u64::try_from(samples).ok()
+        .checked_mul(sample_rate as u128)?;
+    let denominator = den as u128;
+    // `duration_ts` is authoritative only when its rational timestamp maps to
+    // a whole sample. Truncating a fractional result and then calling it exact
+    // would make the streaming byte boundary one sample short.
+    if numerator % denominator != 0 {
+        return None;
+    }
+    u64::try_from(numerator / denominator).ok()
 }
 
 fn parse_ratio(value: &str) -> Option<(u64, u64)> {
@@ -1974,6 +2431,31 @@ fn segment_destination_with_samples(
 struct StagedCueSegment {
     path: PathBuf,
     samples: u64,
+}
+
+pub(super) async fn realize_cue_stream_segment_fallback(
+    image: &Path,
+    start_sample: u64,
+    samples: u64,
+    sample_rate: u32,
+    carrier: CueSegmentCarrier,
+    destination: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, MaterializeError> {
+    stage_cue_segment_as_wav(
+        image,
+        start_sample,
+        samples,
+        sample_rate,
+        carrier,
+        destination,
+        SegmentLengthPolicy::Exact,
+        runner,
+        cancel,
+    )
+    .await
+    .map(|staged| staged.path)
 }
 
 async fn stage_cue_segment_as_wav(
@@ -3521,6 +4003,58 @@ mod materializer_cue_tests {
         )
     }
 
+    fn ffprobe_json_exact_with_channels(
+        sample_rate: u32,
+        total_samples: u64,
+        bit_depth: u32,
+        channels: u16,
+    ) -> String {
+        let time_base = format!("1/{sample_rate}");
+        format!(
+            r#"{{
+  "streams": [{{
+    "codec_name": "flac",
+    "sample_rate": "{sample_rate}",
+    "channels": {channels},
+    "duration_ts": {total_samples},
+    "time_base": "{time_base}",
+    "bits_per_raw_sample": "{bit_depth}"
+  }}],
+  "format": {{}}
+}}"#
+        )
+    }
+
+    #[test]
+    fn source_probe_is_header_only_and_requests_channel_count() {
+        let command = audio_image_probe_command(Path::new("album.flac"));
+        assert!(!command.args.iter().any(|arg| arg == "-count_frames"));
+        assert!(command.args.iter().any(|arg| arg.contains("channels")));
+        assert_eq!(command.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn non_integral_duration_timestamp_is_not_treated_as_exact_samples() {
+        let probe = parse_audio_probe_json(
+            r#"{
+  "streams": [{
+    "codec_name": "flac",
+    "sample_rate": "44100",
+    "channels": 2,
+    "duration_ts": 1,
+    "time_base": "1/1000",
+    "duration": "0.001",
+    "bits_per_raw_sample": "24"
+  }],
+  "format": { "duration": "0.001" }
+}"#,
+        )
+        .expect("parse inexact timestamp probe");
+
+        assert!(!probe.exact_samples);
+        assert_eq!(probe.total_samples, 44);
+    }
+
     #[test]
     fn cue_probe_preserves_float32_sample_class_for_source_resolution() {
         let probe = parse_audio_probe_json(
@@ -3842,6 +4376,538 @@ FILE "album.flac" WAVE
             container_extension: None,
             container_ffmpeg_flags: Vec::new(),
         }
+    }
+
+    fn write_preflight_flac(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u32,
+        total_samples: u64,
+    ) {
+        assert!((1..=8).contains(&channels));
+        assert!((1..=32).contains(&bits_per_sample));
+        assert!(sample_rate < (1 << 20));
+        assert!(total_samples < (1_u64 << 36));
+        let packed = (u64::from(sample_rate) << 44)
+            | (u64::from(channels - 1) << 41)
+            | (u64::from(bits_per_sample - 1) << 36)
+            | total_samples;
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        let mut streaminfo = [0_u8; 34];
+        streaminfo[0..2].copy_from_slice(&4096_u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&4096_u16.to_be_bytes());
+        streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
+        bytes.extend_from_slice(&streaminfo);
+        std::fs::write(path, bytes).expect("write preflight FLAC header");
+    }
+
+    fn write_preflight_wav(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+        total_samples: u64,
+    ) {
+        let bytes_per_sample = u64::from(bits_per_sample / 8);
+        let block_align = channels * (bits_per_sample / 8);
+        let data_size = total_samples
+            .checked_mul(u64::from(channels))
+            .and_then(|value| value.checked_mul(bytes_per_sample))
+            .expect("WAV fixture size");
+        let data_size_u32 = u32::try_from(data_size).expect("RIFF fixture stays below 4 GiB");
+        let mut header = Vec::with_capacity(44);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36_u32 + data_size_u32).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16_u32.to_le_bytes());
+        header.extend_from_slice(&1_u16.to_le_bytes());
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&sample_rate.to_le_bytes());
+        let byte_rate = sample_rate * u32::from(block_align);
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&bits_per_sample.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_size_u32.to_le_bytes());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("create sparse WAV fixture");
+        std::io::Write::write_all(&mut file, &header).expect("write WAV header");
+        file.set_len(44 + data_size).expect("size sparse WAV fixture");
+    }
+
+    fn write_preflight_wav_extensible_24_in_32(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        total_samples: u64,
+    ) {
+        let block_align = channels.checked_mul(4).expect("block align");
+        let data_size = total_samples
+            .checked_mul(u64::from(block_align))
+            .expect("WAVE extensible fixture size");
+        let data_size_u32 = u32::try_from(data_size).expect("RIFF fixture stays below 4 GiB");
+        let riff_size = 60_u32.checked_add(data_size_u32).expect("RIFF size");
+        let mut header = Vec::with_capacity(68);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&riff_size.to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&40_u32.to_le_bytes());
+        header.extend_from_slice(&0xfffe_u16.to_le_bytes());
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&sample_rate.to_le_bytes());
+        header.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&32_u16.to_le_bytes());
+        header.extend_from_slice(&22_u16.to_le_bytes());
+        header.extend_from_slice(&24_u16.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&1_u32.to_le_bytes());
+        header.extend_from_slice(&[
+            0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+        ]);
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_size_u32.to_le_bytes());
+        assert_eq!(header.len(), 68);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("create sparse WAVE extensible fixture");
+        std::io::Write::write_all(&mut file, &header).expect("write WAVE extensible header");
+        file.set_len(68 + data_size)
+            .expect("size sparse WAVE extensible fixture");
+    }
+
+    fn fixed_interval_track_cue(
+        file_name: &str,
+        track_count: usize,
+        interval_minutes: usize,
+    ) -> String {
+        let mut cue = format!("FILE \"{file_name}\" WAVE\n");
+        for index in 0..track_count {
+            let minute = index * interval_minutes;
+            cue.push_str(&format!(
+                "  TRACK {:02} AUDIO\n    INDEX 01 {:02}:00:00\n",
+                index + 1,
+                minute,
+            ));
+        }
+        cue
+    }
+
+    fn minute_track_cue(file_name: &str, track_count: usize) -> String {
+        fixed_interval_track_cue(file_name, track_count, 1)
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_uses_one_track_peak_for_auto_flac() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 44_100_u32;
+        let track_samples = u64::from(sample_rate) * 60;
+        write_preflight_flac(&image, sample_rate, 2, 24, track_samples * 12);
+        std::fs::write(&cue, minute_track_cue("album.flac", 12)).expect("write CUE");
+
+        let req = test_request(&image);
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("default Auto 24-bit FLAC -> FLAC must prove direct streaming");
+        assert_eq!(facts.selected_track_count, 12);
+        assert_eq!(
+            facts.max_track_transport_bytes,
+            track_samples * 2 * CueSegmentCarrier::PcmS32LeWav.bytes_per_sample(),
+            "scratch peak is one widened transport track, not album PCM"
+        );
+        let streaming_estimate =
+            super::super::memory_budget::estimate_streaming_cue_scratch_peak_bytes(
+                facts.retained_output_upper_bound_bytes,
+                facts.max_track_transport_bytes,
+            );
+        assert_eq!(
+            streaming_estimate,
+            facts.retained_output_upper_bound_bytes
+                + facts.max_track_transport_bytes
+                + 512 * 1024 * 1024,
+        );
+        let legacy_estimate = super::super::memory_budget::estimate_job_peak_bytes(
+            &image,
+            Some(SourceKind::CueImage),
+        );
+        assert!(
+            streaming_estimate < legacy_estimate,
+            "representative direct-streaming CUE job should reserve less scratch than the legacy album-carrier estimate: streaming={streaming_estimate}, legacy={legacy_estimate}",
+        );
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_accepts_header_exact_wav_without_reading_audio_payload() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.wav");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 96_000_u32;
+        let track_samples = u64::from(sample_rate) * 30;
+        write_preflight_wav(&image, sample_rate, 2, 24, track_samples * 4);
+        std::fs::write(&cue, minute_track_cue("album.wav", 2)).expect("write CUE");
+
+        let req = test_request(&image);
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("header-exact 24-bit WAV -> FLAC default path is direct-streamable");
+        assert_eq!(facts.selected_track_count, 2);
+        assert!(facts.max_track_transport_bytes > 0);
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_accepts_wav_container_override_for_non_wav_target() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.wav");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 96_000_u32;
+        let track_samples = u64::from(sample_rate) * 30;
+        write_preflight_wav(&image, sample_rate, 2, 24, track_samples * 4);
+        std::fs::write(&cue, minute_track_cue("album.wav", 2)).expect("write CUE");
+
+        let mut req = test_request(&image);
+        assert_ne!(
+            req.settings.target_format,
+            tonepoet_pipeline::AudioFormat::Wav,
+            "regression must exercise the WAV container override independently of AudioFormat::Wav",
+        );
+        req.container_extension = Some("wav".to_string());
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("WAV container override on a non-WAV target must prove direct streaming");
+        assert_eq!(facts.selected_track_count, 2);
+        assert!(facts.max_track_transport_bytes > 0);
+    }
+
+    #[test]
+    fn cue_streaming_scratch_multitrack_merge_adds_second_retained_output_set() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.wav");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 192_000_u32;
+        let track_samples = u64::from(sample_rate);
+        write_preflight_wav(&image, sample_rate, 2, 24, track_samples * 20);
+        let mut cue_text = "FILE \"album.wav\" WAVE\n".to_string();
+        for index in 0..20 {
+            cue_text.push_str(&format!(
+                "  TRACK {:02} AUDIO\n    INDEX 01 00:{:02}:00\n",
+                index + 1,
+                index,
+            ));
+        }
+        std::fs::write(&cue, cue_text).expect("write CUE");
+
+        let mut req = test_request(&image);
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        let non_merge_facts = cue_streaming_scratch_facts(&req)
+            .expect("24/192 WAV -> WAV Source-depth request must prove direct streaming");
+        assert_eq!(non_merge_facts.selected_track_count, 20);
+        let non_merge_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                &req,
+                &non_merge_facts,
+            );
+
+        req.merge = true;
+        let merge_facts = cue_streaming_scratch_facts(&req)
+            .expect("merge must keep the same already-proven direct streaming facts");
+        assert_eq!(merge_facts, non_merge_facts);
+        let merge_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                &req,
+                &merge_facts,
+            );
+        assert_eq!(
+            merge_estimate,
+            non_merge_estimate.saturating_add(merge_facts.retained_output_upper_bound_bytes),
+            "multi-track merge must budget a second album-sized output while the per-track artifacts remain live",
+        );
+
+        let capacity_between_peaks = non_merge_estimate
+            .saturating_add(merge_facts.retained_output_upper_bound_bytes / 2);
+        assert!(non_merge_estimate <= capacity_between_peaks);
+        assert!(
+            merge_estimate > capacity_between_peaks,
+            "scratch capacity above the normal streaming peak but below the merge peak must not admit the merge job",
+        );
+    }
+
+    #[test]
+    fn cue_streaming_scratch_flac_to_wav_merge_is_not_bounded_by_compressed_source_size() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 192_000_u32;
+        let album_samples = u64::from(sample_rate) * 2 * 60 * 60;
+        write_preflight_flac(&image, sample_rate, 2, 24, album_samples);
+        std::fs::write(&cue, fixed_interval_track_cue("album.flac", 20, 6))
+            .expect("write CUE");
+
+        let mut req = test_request(&image);
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        req.merge = true;
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("24/192 FLAC -> WAV merge must retain direct-streaming facts");
+        assert_eq!(facts.selected_track_count, 20);
+        let merge_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(&req, &facts);
+        let legacy_estimate = super::super::memory_budget::estimate_job_peak_bytes(
+            &image,
+            Some(SourceKind::CueImage),
+        );
+        let decoded_source_depth_pcm = album_samples * 2 * 3;
+
+        assert!(facts.retained_output_upper_bound_bytes >= decoded_source_depth_pcm);
+        assert!(
+            merge_estimate
+                >= facts
+                    .retained_output_upper_bound_bytes
+                    .saturating_mul(2),
+            "merge peak must contain both the retained track outputs and a second merged album output",
+        );
+        assert!(
+            legacy_estimate < facts.retained_output_upper_bound_bytes,
+            "the tiny compressed-header fixture deliberately demonstrates why source-file size is not a conservative merge bound",
+        );
+        assert!(merge_estimate > legacy_estimate);
+    }
+
+    #[test]
+    fn cue_streaming_scratch_visible_cue_merge_uses_resolved_audio_facts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 192_000_u32;
+        let album_samples = u64::from(sample_rate) * 2 * 60 * 60;
+        write_preflight_flac(&image, sample_rate, 2, 24, album_samples);
+        std::fs::write(&cue, fixed_interval_track_cue("album.flac", 20, 6))
+            .expect("write CUE");
+
+        let mut image_req = test_request(&image);
+        image_req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        image_req.merge = true;
+        let image_facts = cue_streaming_scratch_facts(&image_req)
+            .expect("audio-image request must prove streaming facts");
+
+        let mut cue_req = test_request(&cue);
+        cue_req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        cue_req.merge = true;
+        let cue_facts = cue_streaming_scratch_facts(&cue_req)
+            .expect("visible .cue request must resolve and prove the referenced audio facts");
+        assert_eq!(cue_facts, image_facts);
+
+        let cue_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                &cue_req,
+                &cue_facts,
+            );
+        let image_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                &image_req,
+                &image_facts,
+            );
+        let legacy_cue_estimate = super::super::memory_budget::estimate_job_peak_bytes(
+            &cue,
+            Some(SourceKind::CueImage),
+        );
+        assert_eq!(cue_estimate, image_estimate);
+        assert!(
+            cue_estimate > legacy_cue_estimate,
+            "visible .cue merge budgeting must be driven by resolved audio/sample facts, not the tiny text carrier's legacy 1 GiB floor",
+        );
+    }
+
+    #[test]
+    fn cue_streaming_scratch_single_selected_track_merge_has_no_second_output_term() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 44_100_u32;
+        let track_samples = u64::from(sample_rate) * 60;
+        write_preflight_flac(&image, sample_rate, 2, 24, track_samples * 3);
+        std::fs::write(&cue, minute_track_cue("album.flac", 3)).expect("write CUE");
+
+        let mut req = test_request(&image);
+        req.source.track_selection = TrackSelection::Set(std::collections::BTreeSet::from([2]));
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("single selected track must prove direct streaming facts");
+        assert_eq!(facts.selected_track_count, 1);
+        let non_merge_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(&req, &facts);
+
+        req.merge = true;
+        let merge_facts = cue_streaming_scratch_facts(&req)
+            .expect("one-track merge keeps the same direct streaming facts");
+        let merge_estimate =
+            super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                &req,
+                &merge_facts,
+            );
+        assert_eq!(merge_estimate, non_merge_estimate);
+    }
+
+    #[test]
+    fn cue_streaming_scratch_merge_term_reuses_existing_output_bound_for_lossless_and_lossy_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = test_request(&temp.path().join("album.flac"));
+        req.merge = true;
+        let facts = CueStreamingScratchFacts {
+            max_track_transport_bytes: 1_000_000,
+            retained_output_upper_bound_bytes: 7_000_000,
+            selected_track_count: 2,
+        };
+        let base = super::super::memory_budget::estimate_streaming_cue_scratch_peak_bytes(
+            facts.retained_output_upper_bound_bytes,
+            facts.max_track_transport_bytes,
+        );
+
+        for target in [
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::AudioFormat::Aac,
+        ] {
+            req.settings.target_format = target;
+            assert_eq!(
+                super::super::stages::estimate_streaming_cue_scratch_peak_for_request(
+                    &req,
+                    &facts,
+                ),
+                base.saturating_add(facts.retained_output_upper_bound_bytes),
+                "merge must reuse the already-computed encoded-output bound for both lossless and lossy direct targets",
+            );
+        }
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_accepts_wave_extensible_24_in_32() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.wav");
+        let cue = temp.path().join("album.cue");
+        let sample_rate = 192_000_u32;
+        let track_samples = u64::from(sample_rate) * 60;
+        write_preflight_wav_extensible_24_in_32(&image, sample_rate, 2, track_samples * 2);
+        std::fs::write(&cue, minute_track_cue("album.wav", 2)).expect("write CUE");
+
+        let req = test_request(&image);
+        let facts = cue_streaming_scratch_facts(&req)
+            .expect("24-valid-in-32 WAVE extensible should prove the same direct stream plan");
+        assert_eq!(facts.selected_track_count, 2);
+        assert_eq!(
+            facts.max_track_transport_bytes,
+            track_samples * 2 * CueSegmentCarrier::PcmS32LeWav.bytes_per_sample(),
+        );
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_does_not_scale_with_track_count_for_equal_track_size() {
+        fn estimate_for(track_count: usize) -> u64 {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let image = temp.path().join("album.flac");
+            let cue = temp.path().join("album.cue");
+            let sample_rate = 44_100_u32;
+            let track_samples = u64::from(sample_rate) * 60;
+            write_preflight_flac(
+                &image,
+                sample_rate,
+                2,
+                16,
+                track_samples * track_count as u64,
+            );
+            std::fs::write(&cue, minute_track_cue("album.flac", track_count)).expect("write CUE");
+            let req = test_request(&image);
+            let facts = cue_streaming_scratch_facts(&req).expect("direct streaming facts");
+            let estimate = super::super::memory_budget::estimate_streaming_cue_scratch_peak_bytes(
+                facts.retained_output_upper_bound_bytes,
+                facts.max_track_transport_bytes,
+            );
+            estimate - facts.retained_output_upper_bound_bytes
+        }
+
+        assert_eq!(
+            estimate_for(3),
+            estimate_for(12),
+            "carrier/process overhead stays O(1); only retained final outputs scale with selected album duration",
+        );
+    }
+
+    #[test]
+    fn cue_streaming_lossy_output_bound_covers_low_rate_high_bitrate_edge() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = test_request(&temp.path().join("album.flac"));
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
+        let samples = 8_000_u64 * 60;
+        let bound = cue_preflight_lossy_payload_upper_bound_bytes(&req, samples, 8_000)
+            .expect("AAC bitrate envelope");
+        let one_minute_at_max_aac = 1_024_u64 * 1_000 * 60 / 8;
+        assert!(bound >= one_minute_at_max_aac);
+        assert!(
+            bound > samples,
+            "lossy envelope must not assume low-rate mono PCM is larger than encoded output",
+        );
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_fails_closed_for_resample_or_dither() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        let samples = 44_100_u64 * 180;
+        write_preflight_flac(&image, 44_100, 2, 24, samples);
+        std::fs::write(&cue, minute_track_cue("album.flac", 3)).expect("write CUE");
+
+        let mut resample = test_request(&image);
+        resample.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        assert!(cue_streaming_scratch_facts(&resample).is_none());
+
+        let mut dither = test_request(&image);
+        dither.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        dither.settings.dither_explicit = true;
+        assert!(cue_streaming_scratch_facts(&dither).is_none());
+    }
+
+    #[test]
+    fn cue_streaming_scratch_preflight_keeps_wavpack_and_mixed_jobs_conservative() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let flac = temp.path().join("side1.flac");
+        let wavpack = temp.path().join("side2.wv");
+        write_preflight_flac(&flac, 44_100, 2, 24, 44_100 * 120);
+        std::fs::write(&wavpack, b"wv-placeholder").expect("write WavPack placeholder");
+
+        let mixed_cue = temp.path().join("side1.cue");
+        std::fs::write(
+            &mixed_cue,
+            r#"FILE "side1.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+FILE "side2.wv" WAVE
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write mixed CUE");
+        let mixed = test_request(&flac);
+        assert!(
+            cue_streaming_scratch_facts(&mixed).is_none(),
+            "one file-backed image makes the whole pre-materialization reservation conservative"
+        );
+
+        std::fs::write(
+            temp.path().join("side2.cue"),
+            r#"FILE "side2.wv" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+"#,
+        )
+        .expect("write WavPack CUE");
+        let wavpack_only = test_request(&wavpack);
+        assert!(cue_streaming_scratch_facts(&wavpack_only).is_none());
     }
 
     fn test_staging(temp: &tempfile::TempDir) -> StagingDir {
@@ -4193,6 +5259,7 @@ TRACK XX AUDIO
             path_identity(&image),
             AudioProbe {
                 sample_rate: 44_100,
+                channels: None,
                 total_samples: 30_000,
                 exact_samples: false,
                 bit_depth: None,
@@ -4604,6 +5671,13 @@ TRACK XX AUDIO
             let probe = probes
                 .get(&path_identity(&track_images[idx]))
                 .expect("track image probe exists");
+            if probe.coding == SourceAudioCoding::Pcm
+                && probe.exact_samples
+                && probe.channels.is_some()
+                && !is_wavpack_path(&track_images[idx])
+            {
+                continue;
+            }
             let staged_probe = ffprobe_json_staged_segment(probe.sample_rate, samples);
             // Each newly staged segment is probed twice: once while it is still
             // in cue-segments/.tmp/, then again after publish at the final path.
@@ -4725,11 +5799,58 @@ TRACK XX AUDIO
     }
 
     #[tokio::test]
+    async fn exact_lossless_cue_materialization_is_descriptive_and_writes_no_track_carriers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue_path = write_cue_fixture(&cue_sheet_3_track(), &["album.flac"], &temp);
+        let req = test_request(&cue_path);
+        let mut staging = test_staging(&temp);
+        let image = temp.path().join("album.flac");
+        let probe = ffprobe_json_exact_with_channels(44_100, 26_460_000, 24, 2);
+        let runner = stub_runner_with_expected_probes(vec![expected_ffprobe(&image, probe)]);
+
+        let source = CueImageMaterializer
+            .materialize(
+                &req,
+                &staging,
+                &runner,
+                None,
+                &HashMap::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("exact lossless CUE should materialize descriptively");
+        staging.disarm();
+
+        assert_eq!(source.tracks.len(), 3);
+        assert!(source.tracks.iter().all(|track| matches!(
+            &track.source_ref,
+            TrackSourceRef::CueStreamSegment { channels: 2, .. }
+        )));
+        assert!(
+            runner
+                .ffmpeg_destinations
+                .lock()
+                .expect("ffmpeg destination log")
+                .is_empty(),
+            "materialization must not spawn per-track ffmpeg cutters"
+        );
+        let cue_segment_root = staging.root.join("cue-segments");
+        let materialized_files = std::fs::read_dir(&cue_segment_root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(materialized_files, 0, "no per-track carrier WAV may exist");
+    }
+
+    #[tokio::test]
     async fn synthetic_multifile_cue_materializes_as_one_prepared_album_source() {
         let temp = tempfile::tempdir().expect("temp dir");
         let samples_per_image: u64 = 4_410_000;
-        let probe_a = ffprobe_json_exact(44100, samples_per_image, 16);
-        let probe_b = ffprobe_json_exact(44100, samples_per_image, 16);
+        let probe_a = ffprobe_json_exact_with_channels(44_100, samples_per_image, 16, 2);
+        let probe_b = ffprobe_json_exact_with_channels(44_100, samples_per_image, 16, 2);
         let cue = r#"PERFORMER "Artist"
 TITLE "Album"
 FILE "side_a.flac" WAVE
@@ -4772,6 +5893,37 @@ FILE "side_b.flac" WAVE
         );
         assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("A1"));
         assert_eq!(source.tracks[3].metadata.title.as_deref(), Some("B2"));
+        let stream_layout = source
+            .tracks
+            .iter()
+            .map(|track| match &track.source_ref {
+                TrackSourceRef::CueStreamSegment {
+                    source_image,
+                    start_sample,
+                    channels,
+                    ..
+                } => (
+                    source_image
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    *start_sample,
+                    *channels,
+                ),
+                other => panic!("exact multi-FILE fixture must remain descriptive, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stream_layout,
+            vec![
+                ("side_a.flac".to_string(), 0, 2),
+                ("side_a.flac".to_string(), 1_323_000, 2),
+                ("side_b.flac".to_string(), 0, 2),
+                ("side_b.flac".to_string(), 1_323_000, 2),
+            ],
+            "sample timeline must reset at each CUE FILE boundary"
+        );
         assert!(
             source
                 .tracks

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant as StdInstant};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{CommandEnvironmentPolicy, Sha256Digest};
@@ -204,6 +204,62 @@ pub struct ToolPipelineError {
     pub other_commands: Vec<CommandRecord>,
 }
 
+/// One byte-exact slice of a producer's stdout routed to one consumer stdin.
+/// Ranges are ordered, non-overlapping offsets in the producer byte stream.
+/// Optional byte-for-byte mirror for one stream segment. The prefix is written
+/// once before the segment bytes; this is used by the CUE ReplayGain fast path
+/// to present exact-length PCM as a WAV/RF64 stream on a FIFO without staging
+/// an audio carrier on disk.
+#[derive(Debug, Clone)]
+pub struct ToolStreamMirror {
+    pub path: PathBuf,
+    pub prefix: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolStreamSegment {
+    pub start_byte: u64,
+    pub byte_len: u64,
+    pub consumer: ToolCommand,
+    pub mirror: Option<ToolStreamMirror>,
+    /// The caller has authoritative knowledge that no bytes beyond this
+    /// bounded segment are required. After this segment transfers exactly,
+    /// stop only the producer instead of draining its unselected tail to EOF.
+    /// This is valid only on the final segment in the group.
+    pub stop_producer_after: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSegmentedPipelineOutput {
+    pub producer: ToolOutput,
+    pub consumers: Vec<ToolOutput>,
+}
+
+#[derive(Debug)]
+pub struct ToolSegmentedPipelineError {
+    pub error: ToolRunnerError,
+    /// Consumers whose exact byte range was transferred completely and whose
+    /// process exited successfully before the segmented group failed. These
+    /// outputs remain valid work products for AllowPartialAlbum callers.
+    pub completed_consumers: Vec<ToolOutput>,
+    pub other_commands: Vec<CommandRecord>,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)] // centralized form of the existing pipe2 transport allocation
+fn create_cloexec_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+
+    let mut fds = [-1_i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two newly-owned descriptors.
+    let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Ok((read_end, write_end))
+}
+
 #[cfg(unix)]
 /// A downstream failure can close the read end before arbitration observes it,
 /// making the producer's SIGPIPE a consequence rather than the root failure.
@@ -265,6 +321,23 @@ pub trait ToolRunner: Send + Sync {
     ) -> Result<ToolPipelineOutput, ToolPipelineError> {
         Err(ToolPipelineError {
             error: ToolRunnerError::UnsupportedPipeline,
+            other_commands: Vec::new(),
+        })
+    }
+
+    /// Keep one producer alive while byte-exact, ordered ranges of its stdout
+    /// are delivered to sequential consumers. This is intentionally narrower
+    /// than a general fan-out graph: at most one consumer process is alive at
+    /// a time, so resource use stays O(1) in the number of segments.
+    async fn run_segmented_pipeline(
+        &self,
+        _producer: ToolCommand,
+        _segments: Vec<ToolStreamSegment>,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolSegmentedPipelineOutput, ToolSegmentedPipelineError> {
+        Err(ToolSegmentedPipelineError {
+            error: ToolRunnerError::UnsupportedPipeline,
+            completed_consumers: Vec::new(),
             other_commands: Vec::new(),
         })
     }
@@ -1025,6 +1098,160 @@ fn executable_sha256(path: &Path) -> std::io::Result<Sha256Digest> {
     Ok(Sha256Digest(hasher.finalize().into()))
 }
 
+#[cfg(unix)]
+async fn transfer_exact_stream_bytes(
+    reader: &mut tokio::fs::File,
+    mut writer: Option<&mut tokio::fs::File>,
+    mut remaining: u64,
+    cancel: &CancellationToken,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded transfer chunk fits usize");
+        let read = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+            }
+            read = reader.read(&mut buffer[..wanted]) => read?,
+        };
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("producer ended with {remaining} requested stream bytes remaining"),
+            ));
+        }
+        if let Some(output) = writer.as_deref_mut() {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+                }
+                write = output.write_all(&buffer[..read]) => write?,
+            }
+        }
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn open_stream_mirror_writer(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> std::io::Result<tokio::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "segmented pipeline cancelled while opening stream mirror",
+            ));
+        }
+        let probe = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path);
+        match probe {
+            Ok(writer) => {
+                // A FIFO reader is present now. Keep this *same* descriptor so
+                // there is no check-then-open race if the reader exits between
+                // two opens. Clear O_NONBLOCK through rustix's safe fcntl
+                // wrapper; subsequent writes then provide normal backpressure.
+                let mut flags = rustix::fs::fcntl_getfl(&writer).map_err(std::io::Error::from)?;
+                flags.remove(rustix::fs::OFlags::NONBLOCK);
+                rustix::fs::fcntl_setfl(&writer, flags).map_err(std::io::Error::from)?;
+                return Ok(tokio::fs::File::from_std(writer));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "segmented pipeline cancelled while waiting for stream mirror reader",
+                        ));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn transfer_exact_stream_bytes_mirrored(
+    reader: &mut tokio::fs::File,
+    writer: &mut tokio::fs::File,
+    mut mirror: Option<&mut tokio::fs::File>,
+    mut remaining: u64,
+    cancel: &CancellationToken,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded transfer chunk fits usize");
+        let read = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+            }
+            read = reader.read(&mut buffer[..wanted]) => read?,
+        };
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("producer ended with {remaining} requested stream bytes remaining"),
+            ));
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+            }
+            write = writer.write_all(&buffer[..read]) => write?,
+        }
+        if let Some(output) = mirror.as_deref_mut() {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+                }
+                write = output.write_all(&buffer[..read]) => write?,
+            }
+        }
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn drain_stream_to_eof(
+    reader: &mut tokio::fs::File,
+    cancel: &CancellationToken,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+            }
+            read = reader.read(&mut buffer) => read?,
+        };
+        if read == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn command_record_from_runner_error(error: &ToolRunnerError) -> Option<CommandRecord> {
+    match error {
+        ToolRunnerError::Spawn { command }
+        | ToolRunnerError::Timeout { command, .. }
+        | ToolRunnerError::Cancelled { command }
+        | ToolRunnerError::Termination { command, .. }
+        | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
+        ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => None,
+    }
+}
+
 impl RealToolRunner {
     pub(crate) async fn run_supervised_with_stdio(
         &self,
@@ -1307,7 +1534,6 @@ impl ToolRunner for RealToolRunner {
     }
 
 
-    #[allow(unsafe_code)] // raw fd handling for lease-lifetime file inheritance into spawned tools
     async fn run_pipeline(
         &self,
         producer: ToolCommand,
@@ -1316,7 +1542,6 @@ impl ToolRunner for RealToolRunner {
     ) -> Result<ToolPipelineOutput, ToolPipelineError> {
         #[cfg(unix)]
         {
-            use std::os::fd::FromRawFd;
             if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
                 let _ = self.tool_version(producer.binary);
             }
@@ -1345,16 +1570,12 @@ impl ToolRunner for RealToolRunner {
             // supervisor, and both supervisors independently retain the same
             // QueueExecution/path/staging OFDs. A killed originating session
             // therefore cannot orphan mutation-capable producer/consumer work.
-            let mut fds = [-1_i32; 2];
-            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-                return Err(ToolPipelineError {
-                    error: ToolRunnerError::Io(std::io::Error::last_os_error()),
-                    other_commands: Vec::new(),
-                });
-            }
-            // SAFETY: pipe2 returned two newly-owned descriptors.
-            let read_end = Arc::new(unsafe { std::fs::File::from_raw_fd(fds[0]) });
-            let write_end = Arc::new(unsafe { std::fs::File::from_raw_fd(fds[1]) });
+            let (read_end, write_end) = create_cloexec_pipe().map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            })?;
+            let read_end = Arc::new(read_end);
+            let write_end = Arc::new(write_end);
 
             let pipeline_cancel = CancellationToken::new();
             let producer_future = self.run_supervised_with_stdio(
@@ -1512,6 +1733,392 @@ impl ToolRunner for RealToolRunner {
                     std::io::ErrorKind::Unsupported,
                     "supervised external pipelines require Unix descriptor handoff",
                 )),
+                other_commands: Vec::new(),
+            })
+        }
+    }
+
+    async fn run_segmented_pipeline(
+        &self,
+        producer: ToolCommand,
+        segments: Vec<ToolStreamSegment>,
+        cancel: &CancellationToken,
+    ) -> Result<ToolSegmentedPipelineOutput, ToolSegmentedPipelineError> {
+        #[cfg(unix)]
+        {
+            if segments.is_empty() {
+                return Err(ToolSegmentedPipelineError {
+                    error: ToolRunnerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "segmented pipeline requires at least one consumer range",
+                    )),
+                    completed_consumers: Vec::new(),
+                    other_commands: Vec::new(),
+                });
+            }
+
+            let mut previous_end = 0_u64;
+            for (segment_index, segment) in segments.iter().enumerate() {
+                let end = segment.start_byte.checked_add(segment.byte_len).ok_or_else(|| {
+                    ToolSegmentedPipelineError {
+                        error: ToolRunnerError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "segmented pipeline byte range overflowed u64",
+                        )),
+                        completed_consumers: Vec::new(),
+                        other_commands: Vec::new(),
+                    }
+                })?;
+                if segment.byte_len == 0 || segment.start_byte < previous_end {
+                    return Err(ToolSegmentedPipelineError {
+                        error: ToolRunnerError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "segmented pipeline ranges must be non-empty, ordered, and non-overlapping",
+                        )),
+                        completed_consumers: Vec::new(),
+                        other_commands: Vec::new(),
+                    });
+                }
+                if segment.stop_producer_after && segment_index + 1 != segments.len() {
+                    return Err(ToolSegmentedPipelineError {
+                        error: ToolRunnerError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "segmented pipeline may stop the producer only after its final segment",
+                        )),
+                        completed_consumers: Vec::new(),
+                        other_commands: Vec::new(),
+                    });
+                }
+                previous_end = end;
+            }
+
+            if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(producer.binary);
+            }
+            let producer_path = resolve_command_launch_path(
+                self.resolve_binary(producer.binary),
+                producer.environment_policy,
+            )
+            .map_err(|error| ToolSegmentedPipelineError {
+                error: ToolRunnerError::Io(error),
+                completed_consumers: Vec::new(),
+                other_commands: Vec::new(),
+            })?;
+
+            // Resolve every consumer before launching the producer. This keeps
+            // a configuration/path failure from needlessly starting a decoder.
+            let mut consumer_paths = Vec::with_capacity(segments.len());
+            for segment in &segments {
+                if segment.consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                    let _ = self.tool_version(segment.consumer.binary);
+                }
+                consumer_paths.push(
+                    resolve_command_launch_path(
+                        self.resolve_binary(segment.consumer.binary),
+                        segment.consumer.environment_policy,
+                    )
+                    .map_err(|error| ToolSegmentedPipelineError {
+                        error: ToolRunnerError::Io(error),
+                        completed_consumers: Vec::new(),
+                        other_commands: Vec::new(),
+                    })?,
+                );
+            }
+
+            let (producer_read, producer_write) = create_cloexec_pipe().map_err(|error| {
+                ToolSegmentedPipelineError {
+                    error: ToolRunnerError::Io(error),
+                    completed_consumers: Vec::new(),
+                    other_commands: Vec::new(),
+                }
+            })?;
+            let stream_cancel = cancel.child_token();
+            // Intentional end-of-selection shutdown must not cancel the splitter
+            // or a just-completed consumer. Errors/caller cancellation still flow
+            // through stream_cancel and therefore also cancel this child token.
+            let producer_cancel = stream_cancel.child_token();
+            let producer_future = self.run_supervised_with_stdio(
+                producer,
+                producer_path,
+                &producer_cancel,
+                None,
+                Some(Arc::new(producer_write)),
+                None,
+            );
+
+            struct SplitSuccess {
+                consumers: Vec<ToolOutput>,
+                producer_stopped_intentionally: bool,
+            }
+
+            struct SplitFailure {
+                error: ToolRunnerError,
+                completed_consumers: Vec<ToolOutput>,
+                other_commands: Vec<CommandRecord>,
+                consumer_primary: bool,
+            }
+
+            let splitter_future = async {
+                let result = async {
+                    let mut producer_reader = tokio::fs::File::from_std(producer_read);
+                    let mut position = 0_u64;
+                    let mut consumer_outputs = Vec::with_capacity(segments.len());
+
+                    for (segment, consumer_path) in segments.into_iter().zip(consumer_paths) {
+                        let gap = segment.start_byte - position;
+                        if gap > 0 {
+                            transfer_exact_stream_bytes(
+                                &mut producer_reader,
+                                None,
+                                gap,
+                                &stream_cancel,
+                            )
+                            .await
+                            .map_err(|error| SplitFailure {
+                                error: ToolRunnerError::Io(error),
+                                completed_consumers: consumer_outputs.clone(),
+                                other_commands: Vec::new(),
+                                consumer_primary: false,
+                            })?;
+                            position = segment.start_byte;
+                        }
+
+                        let (consumer_read, consumer_write) = create_cloexec_pipe().map_err(|error| {
+                            SplitFailure {
+                                error: ToolRunnerError::Io(error),
+                                completed_consumers: consumer_outputs.clone(),
+                                other_commands: Vec::new(),
+                                consumer_primary: false,
+                            }
+                        })?;
+                        let mut consumer_writer = tokio::fs::File::from_std(consumer_write);
+                        let stop_producer_after = segment.stop_producer_after;
+                        let mirror = segment.mirror;
+                        let consumer_future = self.run_supervised_with_stdio(
+                            segment.consumer,
+                            consumer_path,
+                            &stream_cancel,
+                            Some(Arc::new(consumer_read)),
+                            None,
+                            None,
+                        );
+                        let transfer_future = async {
+                            let mut mirror_writer = if let Some(mirror) = mirror {
+                                let mut output = open_stream_mirror_writer(
+                                    &mirror.path,
+                                    &stream_cancel,
+                                )
+                                .await?;
+                                if !mirror.prefix.is_empty() {
+                                    tokio::select! {
+                                        _ = stream_cancel.cancelled() => {
+                                            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+                                        }
+                                        write = output.write_all(&mirror.prefix) => write?,
+                                    }
+                                }
+                                Some(output)
+                            } else {
+                                None
+                            };
+                            let result = transfer_exact_stream_bytes_mirrored(
+                                &mut producer_reader,
+                                &mut consumer_writer,
+                                mirror_writer.as_mut(),
+                                segment.byte_len,
+                                &stream_cancel,
+                            )
+                            .await;
+                            drop(mirror_writer);
+                            drop(consumer_writer);
+                            if result.is_ok() && stop_producer_after {
+                                // Stop read-ahead as soon as the exact final requested
+                                // byte has left the decoder pipe. The encoder remains
+                                // supervised on the group token and must still finish
+                                // successfully before the segment is considered complete.
+                                producer_cancel.cancel();
+                            }
+                            result
+                        };
+                        let (consumer_result, transfer_result) =
+                            tokio::join!(consumer_future, transfer_future);
+
+                        match (consumer_result, transfer_result) {
+                            (Ok(output), Ok(())) => consumer_outputs.push(output),
+                            (Err(error), _) => {
+                                stream_cancel.cancel();
+                                return Err(SplitFailure {
+                                    error,
+                                    completed_consumers: consumer_outputs,
+                                    // The failing consumer lives in `error`; completed
+                                    // consumers remain full ToolOutputs for partial-mode
+                                    // finalization rather than being diagnostic-only.
+                                    other_commands: Vec::new(),
+                                    consumer_primary: true,
+                                });
+                            }
+                            (Ok(output), Err(error)) => {
+                                stream_cancel.cancel();
+                                return Err(SplitFailure {
+                                    error: ToolRunnerError::Io(error),
+                                    completed_consumers: consumer_outputs,
+                                    // A consumer is complete only when both process and
+                                    // exact-byte transfer succeed. Keep this current
+                                    // process record for diagnostics, never partial output.
+                                    other_commands: vec![output.command],
+                                    consumer_primary: false,
+                                });
+                            }
+                        }
+                        position = position.saturating_add(segment.byte_len);
+                        if stop_producer_after {
+                            // The final requested bounded byte was transferred exactly
+                            // (which already stopped producer read-ahead), and its
+                            // consumer has now completed successfully.
+                            return Ok::<_, SplitFailure>(SplitSuccess {
+                                consumers: consumer_outputs,
+                                producer_stopped_intentionally: true,
+                            });
+                        }
+                    }
+
+                    // Full-image (or otherwise EOF-significant) selection keeps the
+                    // historical behavior: consume to EOF so decoder failures in the
+                    // required stream remain observable.
+                    drain_stream_to_eof(&mut producer_reader, &stream_cancel)
+                        .await
+                        .map_err(|error| SplitFailure {
+                            error: ToolRunnerError::Io(error),
+                            completed_consumers: consumer_outputs.clone(),
+                            other_commands: Vec::new(),
+                            consumer_primary: false,
+                        })?;
+                    Ok::<_, SplitFailure>(SplitSuccess {
+                        consumers: consumer_outputs,
+                        producer_stopped_intentionally: false,
+                    })
+                }
+                .await;
+                if result.is_err() {
+                    // Any splitter-side failure must tear down the producer.
+                    // Otherwise an early local error (for example pipe
+                    // allocation) can leave the producer blocked forever on a
+                    // full stdout pipe while the outer join waits for it.
+                    stream_cancel.cancel();
+                }
+                result
+            };
+
+            let (producer_result, splitter_result) = tokio::join!(producer_future, splitter_future);
+            match (producer_result, splitter_result) {
+                (Ok(producer), Ok(split)) => Ok(ToolSegmentedPipelineOutput {
+                    producer,
+                    consumers: split.consumers,
+                }),
+                (
+                    Err(ToolRunnerError::Cancelled { command }),
+                    Ok(SplitSuccess {
+                        consumers,
+                        producer_stopped_intentionally: true,
+                    }),
+                ) if !cancel.is_cancelled() && !stream_cancel.is_cancelled() => {
+                    // The splitter delivered every required byte and then requested
+                    // producer-only shutdown. Preserve the supervised command record,
+                    // but expose this expected termination as pipeline success.
+                    let exit = command.exit.unwrap_or(ProcessExit::Unknown);
+                    let stdout_tail = command.stdout_tail.clone();
+                    let stderr_tail = command.stderr_tail.clone();
+                    let elapsed = command.elapsed;
+                    Ok(ToolSegmentedPipelineOutput {
+                        producer: ToolOutput {
+                            exit,
+                            stdout_tail,
+                            stderr_tail,
+                            elapsed,
+                            command,
+                        },
+                        consumers,
+                    })
+                }
+                (Err(error), Ok(split)) => {
+                    let other_commands = split
+                        .consumers
+                        .iter()
+                        .map(|output| output.command.clone())
+                        .collect();
+                    Err(ToolSegmentedPipelineError {
+                        error,
+                        completed_consumers: split.consumers,
+                        other_commands,
+                    })
+                }
+                (Ok(producer), Err(split)) => {
+                    let SplitFailure {
+                        error,
+                        completed_consumers,
+                        mut other_commands,
+                        ..
+                    } = split;
+                    other_commands.extend(
+                        completed_consumers
+                            .iter()
+                            .map(|output| output.command.clone()),
+                    );
+                    other_commands.push(producer.command);
+                    Err(ToolSegmentedPipelineError {
+                        error,
+                        completed_consumers,
+                        other_commands,
+                    })
+                }
+                (Err(producer_error), Err(split)) => {
+                    let split_is_primary = split.consumer_primary
+                        || consumer_failure_makes_producer_sigpipe_secondary(
+                            &producer_error,
+                            &split.error,
+                        );
+                    let SplitFailure {
+                        error: split_error,
+                        completed_consumers,
+                        mut other_commands,
+                        ..
+                    } = split;
+                    other_commands.extend(
+                        completed_consumers
+                            .iter()
+                            .map(|output| output.command.clone()),
+                    );
+                    if split_is_primary {
+                        if let Some(command) = command_record_from_runner_error(&producer_error) {
+                            other_commands.push(command);
+                        }
+                        Err(ToolSegmentedPipelineError {
+                            error: split_error,
+                            completed_consumers,
+                            other_commands,
+                        })
+                    } else {
+                        if let Some(command) = command_record_from_runner_error(&split_error) {
+                            other_commands.push(command);
+                        }
+                        Err(ToolSegmentedPipelineError {
+                            error: producer_error,
+                            completed_consumers,
+                            other_commands,
+                        })
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (producer, segments, cancel);
+            Err(ToolSegmentedPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "supervised segmented pipelines require Unix descriptor handoff",
+                )),
+                completed_consumers: Vec::new(),
                 other_commands: Vec::new(),
             })
         }
@@ -2331,6 +2938,360 @@ printf 'consumer diagnostic\n' >&2
         assert!(matches!(&error.error, ToolRunnerError::UnsupportedPipeline));
         assert!(error.other_commands.is_empty());
         assert!(runner.transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_runner_rejects_segmented_pipeline_instead_of_simulating_one() {
+        let runner = StubToolRunner::new();
+        let producer = closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(1));
+        let consumer = closed_command(ToolBinary::Ffmpeg, Vec::new(), Duration::from_secs(1));
+        let error = runner
+            .run_segmented_pipeline(
+                producer,
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 4,
+                    consumer,
+                    mirror: None,
+                    stop_producer_after: false,
+                }],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("default segmented pipeline implementation must be unsupported");
+        assert!(matches!(&error.error, ToolRunnerError::UnsupportedPipeline));
+        assert!(error.completed_consumers.is_empty());
+        assert!(error.other_commands.is_empty());
+        assert!(runner.transcript().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_splits_ordered_ranges_with_one_producer() {
+        let producer = write_executable_script(
+            "segmented-producer",
+            "#!/bin/sh\nprintf 'abcdefghijklmnop'\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-consumer",
+            "#!/bin/sh\nexec /bin/cat\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+        let output = runner
+            .run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
+                vec![
+                    ToolStreamSegment {
+                        start_byte: 2,
+                        byte_len: 4,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            Vec::new(),
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                    ToolStreamSegment {
+                        start_byte: 8,
+                        byte_len: 3,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            Vec::new(),
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                ],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("segmented pipeline succeeds");
+
+        assert_eq!(output.consumers.len(), 2);
+        assert_eq!(output.consumers[0].stdout_tail, "cdef");
+        assert_eq!(output.consumers[1].stdout_tail, "ijk");
+        assert_eq!(output.producer.command.binary, ToolBinary::Sox);
+        assert_eq!(output.producer.command.exit, Some(ProcessExit::Code(0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_intentional_final_bounded_stop_is_success_and_skips_tail() {
+        let producer = write_executable_script(
+            "segmented-early-stop-producer",
+            "#!/bin/sh\nprintf 'abcd'\nsleep 0.2\nprintf 'tail-reached' > \"$1\"\nprintf 'efghijklmnop'\n",
+        );
+        let marker = producer
+            .parent()
+            .expect("producer parent")
+            .join("tail-reached");
+        let consumer = write_executable_script(
+            "segmented-early-stop-consumer",
+            "#!/bin/sh\n/bin/cat\nsleep 1\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+
+        let output = runner
+            .run_segmented_pipeline(
+                closed_command(
+                    ToolBinary::Sox,
+                    vec![marker.to_string_lossy().into_owned()],
+                    Duration::from_secs(2),
+                ),
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 4,
+                    consumer: closed_command(
+                        ToolBinary::Ffmpeg,
+                        Vec::new(),
+                        Duration::from_secs(2),
+                    ),
+                    mirror: None,
+                    stop_producer_after: true,
+                }],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("intentional final bounded stop is pipeline success");
+
+        assert_eq!(output.consumers.len(), 1);
+        assert_eq!(output.consumers[0].stdout_tail, "abcd");
+        assert!(
+            !marker.exists(),
+            "producer must be terminated before executing unselected tail work"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_required_region_decoder_failure_still_fails_with_early_stop_enabled() {
+        let producer = write_executable_script(
+            "segmented-early-stop-short-producer",
+            "#!/bin/sh\nprintf 'ab'\nexit 7\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-early-stop-short-consumer",
+            "#!/bin/sh\nexec /bin/cat\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+
+        let error = runner
+            .run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 4,
+                    consumer: closed_command(
+                        ToolBinary::Ffmpeg,
+                        Vec::new(),
+                        Duration::from_secs(2),
+                    ),
+                    mirror: None,
+                    stop_producer_after: true,
+                }],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("producer shortfall inside required bytes must fail");
+
+        assert!(matches!(
+            error.error,
+            ToolRunnerError::NonZeroExit {
+                exit: ProcessExit::Code(7),
+                ..
+            }
+        ));
+        assert!(error.completed_consumers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_full_range_still_runs_producer_to_natural_eof() {
+        let producer = write_executable_script(
+            "segmented-full-range-producer",
+            "#!/bin/sh\nprintf 'abcd'\nprintf 'eof-reached' > \"$1\"\n",
+        );
+        let marker = producer
+            .parent()
+            .expect("producer parent")
+            .join("eof-reached");
+        let consumer = write_executable_script(
+            "segmented-full-range-consumer",
+            "#!/bin/sh\nexec /bin/cat\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+
+        let output = runner
+            .run_segmented_pipeline(
+                closed_command(
+                    ToolBinary::Sox,
+                    vec![marker.to_string_lossy().into_owned()],
+                    Duration::from_secs(2),
+                ),
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 4,
+                    consumer: closed_command(
+                        ToolBinary::Ffmpeg,
+                        Vec::new(),
+                        Duration::from_secs(2),
+                    ),
+                    mirror: None,
+                    stop_producer_after: false,
+                }],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("full-range producer reaches natural EOF");
+
+        assert_eq!(output.consumers[0].stdout_tail, "abcd");
+        assert!(marker.exists(), "full-range path must not cancel producer early");
+        assert_eq!(output.producer.command.exit, Some(ProcessExit::Code(0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_error_preserves_only_fully_completed_consumer_prefix() {
+        let producer = write_executable_script(
+            "segmented-prefix-producer",
+            "#!/bin/sh\nprintf 'abcdefghijklmnop'\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-prefix-consumer",
+            "#!/bin/sh\n/bin/cat\n[ \"${1-}\" != fail ]\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+        let error = runner
+            .run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
+                vec![
+                    ToolStreamSegment {
+                        start_byte: 0,
+                        byte_len: 4,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            vec!["ok".to_string()],
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                    ToolStreamSegment {
+                        start_byte: 4,
+                        byte_len: 4,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            vec!["fail".to_string()],
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                    ToolStreamSegment {
+                        start_byte: 8,
+                        byte_len: 4,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            vec!["unreached".to_string()],
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                ],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("second consumer must fail the segmented group");
+
+        assert!(matches!(
+            error.error,
+            ToolRunnerError::NonZeroExit {
+                exit: ProcessExit::Code(1),
+                ..
+            }
+        ));
+        assert_eq!(error.completed_consumers.len(), 1);
+        assert_eq!(error.completed_consumers[0].stdout_tail, "abcd");
+        assert_eq!(
+            error.completed_consumers[0].command.sanitized_args,
+            vec!["ok".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_producer_error_preserves_completed_consumer_prefix() {
+        let producer = write_executable_script(
+            "segmented-prefix-producer-fails",
+            "#!/bin/sh\nprintf 'abcdefgh'\nexit 7\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-prefix-consumer-cat",
+            "#!/bin/sh\nexec /bin/cat\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let runner = RealToolRunner::new(paths);
+        let error = runner
+            .run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(2)),
+                vec![
+                    ToolStreamSegment {
+                        start_byte: 0,
+                        byte_len: 4,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            vec!["first".to_string()],
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                    ToolStreamSegment {
+                        start_byte: 4,
+                        byte_len: 8,
+                        consumer: closed_command(
+                            ToolBinary::Ffmpeg,
+                            vec!["second".to_string()],
+                            Duration::from_secs(2),
+                        ),
+                        mirror: None,
+                        stop_producer_after: false,
+                    },
+                ],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("producer shortfall/nonzero must fail the group");
+
+        assert!(matches!(
+            error.error,
+            ToolRunnerError::NonZeroExit {
+                exit: ProcessExit::Code(7),
+                ..
+            }
+        ));
+        assert_eq!(error.completed_consumers.len(), 1);
+        assert_eq!(error.completed_consumers[0].stdout_tail, "abcd");
     }
 
     #[cfg(unix)]

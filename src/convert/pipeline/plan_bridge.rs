@@ -148,7 +148,8 @@ pub fn plan_request_for_track(
         settings.preferred_tool = PreferredTool::Ffmpeg;
     }
 
-    // CUE materialization produces an audio-only, validated PCM WAV carrier:
+    // CUE planning uses an audio-only PCM carrier model. Stream segments keep the
+    // same carrier semantics without eagerly writing the hypothetical WAV:
     // S32 for integer sources and class-preserving F32/F64 for float sources.
     // It is a sample-bounded decoded segment, not the original image
     // container, so the planner must not claim source tag/artwork transfer or
@@ -342,7 +343,7 @@ fn reference_programme_scope(
     if request.merge
         || matches!(
             &track.source_ref,
-            TrackSourceRef::CueSegmentCarrier { .. } | TrackSourceRef::ImageSegment { .. }
+            TrackSourceRef::CueStreamSegment { .. } | TrackSourceRef::CueSegmentCarrier { .. } | TrackSourceRef::ImageSegment { .. }
         )
     {
         return ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing;
@@ -876,7 +877,11 @@ pub fn source_info_for_realized_track(
         _ => PlannerFormat::Flac,
     });
     let codec = match &track.source_ref {
-        TrackSourceRef::CueSegmentCarrier {
+        TrackSourceRef::CueStreamSegment {
+            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+            ..
+        }
+        | TrackSourceRef::CueSegmentCarrier {
             carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
             ..
         } => PlannerCodec::PcmFloat,
@@ -919,6 +924,7 @@ pub fn source_info_for_realized_track(
         .as_ref()
         .map(|metadata| metadata.channels)
         .or_else(|| match &track.source_ref {
+            TrackSourceRef::CueStreamSegment { channels, .. } => Some(*channels),
             TrackSourceRef::SacdTrack { area: super::types::SacdArea::Stereo, .. } => Some(2),
             // Multichannel Reference is rejected by policy; a non-stereo value
             // keeps preflight and execution on the same deterministic error cell.
@@ -1058,7 +1064,8 @@ pub(super) fn resolve_dither_source_pcm_depth(track: &PreparedTrack) -> Option<P
 
 fn cue_pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
     match &track.source_ref {
-        TrackSourceRef::CueSegmentCarrier { carrier, .. } => {
+        TrackSourceRef::CueStreamSegment { carrier, .. }
+        | TrackSourceRef::CueSegmentCarrier { carrier, .. } => {
             Some(carrier.source_depth_descriptor())
         }
         // Legacy callers that still use ImageSegment are realized by stages.rs as
