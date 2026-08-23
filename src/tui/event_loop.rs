@@ -17668,7 +17668,6 @@ mod async_message_drain_tests {
                 clipboard_owner_generation: Some(
                     app.browse.filesystem_clipboard_generation,
                 ),
-                plan,
                 retry_plan: Some(retry_plan.clone()),
             },
         );
@@ -17751,20 +17750,12 @@ mod async_message_drain_tests {
             app.browse
                 .replace_filesystem_clipboard_from_user(clipboard.clone());
             let owner_generation = app.browse.filesystem_clipboard_generation;
-            let plan = tui_file_picker::PastePlan {
-                mode: tui_file_picker::FilePickerClipboardMode::Copy,
-                mappings: vec![tui_file_picker::PasteMapping {
-                    source: source.clone(),
-                    destination: destination.clone(),
-                }],
-            };
             app.file_transfers.pending_by_session.insert(
                 session_id,
                 crate::tui::browse::PendingClipboardPaste {
                     session_id,
                     clipboard: clipboard.clone(),
                     clipboard_owner_generation: Some(owner_generation),
-                    plan,
                     retry_plan: None,
                 },
             );
@@ -17808,13 +17799,6 @@ mod async_message_drain_tests {
             vec![source.clone()],
         )
         .expect("clipboard");
-        let plan = tui_file_picker::PastePlan {
-            mode: tui_file_picker::FilePickerClipboardMode::Cut,
-            mappings: vec![tui_file_picker::PasteMapping {
-                source: source.clone(),
-                destination: destination.clone(),
-            }],
-        };
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.browse
             .replace_filesystem_clipboard_from_user(clipboard.clone());
@@ -17833,7 +17817,6 @@ mod async_message_drain_tests {
                 session_id,
                 clipboard: clipboard.clone(),
                 clipboard_owner_generation: Some(older_generation),
-                plan,
                 retry_plan: None,
             },
         );
@@ -18510,19 +18493,6 @@ mod browse_tab_async_routing_tests {
         let clipboard_owner_generation = app.browse.filesystem_clipboard_generation;
         let moved_destination = destination.join("moved-album");
         let failed_destination = destination.join("failed-album");
-        let plan = tui_file_picker::PastePlan {
-            mode: tui_file_picker::FilePickerClipboardMode::Cut,
-            mappings: vec![
-                tui_file_picker::PasteMapping {
-                    source: moved.clone(),
-                    destination: moved_destination.clone(),
-                },
-                tui_file_picker::PasteMapping {
-                    source: failed.clone(),
-                    destination: failed_destination.clone(),
-                },
-            ],
-        };
         let session_id = 1401;
         app.file_transfers.pending_by_session.insert(
             session_id,
@@ -18530,7 +18500,6 @@ mod browse_tab_async_routing_tests {
                 session_id,
                 clipboard,
                 clipboard_owner_generation: Some(clipboard_owner_generation),
-                plan,
                 retry_plan: None,
             },
         );

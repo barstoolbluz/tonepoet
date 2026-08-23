@@ -38376,6 +38376,7 @@ pub(super) fn metadata_editor_detail_paste_status(
     status
 }
 
+#[cfg(test)]
 pub(super) fn metadata_editor_apply_detail_paste(
     state: &mut super::app::MetadataEditorState,
     entry_idx: usize,
@@ -40788,7 +40789,6 @@ pub(super) fn maybe_start_next_file_transfer(
             session_id,
             clipboard: queued.clipboard,
             clipboard_owner_generation: queued.clipboard_owner_generation,
-            plan,
             retry_plan: dispatch_retry_plan,
         },
     );
@@ -53805,16 +53805,6 @@ fn delete_path_permanently_admitted(path: &std::path::Path) -> std::io::Result<b
     Ok(true)
 }
 
-fn delete_path_permanently(path: &std::path::Path) -> std::io::Result<bool> {
-    let Some(claim) = permanent_delete_claim(path)? else {
-        return Ok(false);
-    };
-    let admitted = claim.identity.resolved_io_path.clone();
-    let _guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error))?;
-    delete_path_permanently_admitted(&admitted)
-}
-
 fn permanently_delete_paths(paths: &[std::path::PathBuf]) -> PermanentDeleteSummary {
     let mut ordered = paths.to_vec();
     ordered.sort();
@@ -53883,12 +53873,14 @@ mod permanent_delete_tests {
         let file = temp.path().join("track.flac");
         std::fs::write(&file, b"audio").expect("fixture");
 
-        assert_eq!(delete_path_permanently(&file).expect("delete file"), true);
+        let first = permanently_delete_paths(std::slice::from_ref(&file));
+        assert_eq!(first.deleted, 1);
+        assert_eq!(first.errors, 0);
         assert!(!file.exists(), "file should be permanently removed");
-        assert_eq!(
-            delete_path_permanently(&file).expect("missing is idempotent"),
-            false
-        );
+
+        let second = permanently_delete_paths(std::slice::from_ref(&file));
+        assert_eq!(second.already_missing, 1);
+        assert_eq!(second.errors, 0);
     }
 
     #[test]
@@ -53898,7 +53890,9 @@ mod permanent_delete_tests {
         std::fs::create_dir_all(dir.join("disc-1")).expect("fixture dir");
         std::fs::write(dir.join("disc-1").join("track.flac"), b"audio").expect("fixture");
 
-        assert_eq!(delete_path_permanently(&dir).expect("delete dir"), true);
+        let summary = permanently_delete_paths(std::slice::from_ref(&dir));
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.errors, 0);
         assert!(!dir.exists(), "directory tree should be permanently removed");
     }
 
@@ -54051,9 +54045,13 @@ mod permanent_delete_tests {
             std::path::PathBuf::from("album/../track.flac"),
             std::path::PathBuf::from("album/./track.flac"),
         ] {
-            let err = delete_path_permanently(&unsafe_path)
-                .expect_err("dot-component paths must be rejected before deletion");
+            let err = permanent_delete_claim(&unsafe_path)
+                .expect_err("dot-component paths must be rejected by admission");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+            let summary = permanently_delete_paths(std::slice::from_ref(&unsafe_path));
+            assert_eq!(summary.deleted, 0);
+            assert_eq!(summary.errors, 1, "live delete path must reject dot components");
         }
     }
 
@@ -54067,7 +54065,9 @@ mod permanent_delete_tests {
         std::fs::write(target.join("track.flac"), b"audio").expect("fixture");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        assert_eq!(delete_path_permanently(&link).expect("delete symlink"), true);
+        let summary = permanently_delete_paths(std::slice::from_ref(&link));
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.errors, 0);
         assert!(!link.exists(), "symlink should be removed");
         assert!(target.exists(), "symlink target must not be followed/deleted");
     }
@@ -86563,7 +86563,6 @@ mod file_transfer_queue_state_tests {
                 session_id: 8100,
                 clipboard: clipboard.clone(),
                 clipboard_owner_generation: None,
-                plan,
                 retry_plan: Some(exact_retry),
             },
         );

@@ -137,6 +137,7 @@ fn format_text_input_spans(
 /// glyphs never straddle a row boundary; a glyph that cannot fit even on an
 /// empty one-cell row is represented by an ellipsis rather than overflowing
 /// the overlay border.
+#[cfg(test)]
 fn wrap_display_rows_with_cursor(
     text: &str,
     width: usize,

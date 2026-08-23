@@ -292,7 +292,6 @@ impl QueueExecutionCoordinator {
 struct DeadQueueRow {
     id: String,
     item_json: String,
-    position: i64,
     execution_id: Option<String>,
 }
 
@@ -3049,7 +3048,7 @@ impl Database {
             };
 
             let mut rows_stmt = self.conn.prepare(
-                "SELECT id, item_json, position, execution_id
+                "SELECT id, item_json, execution_id
                  FROM conversion_queue_v24
                  WHERE owner_scope=?1
                  ORDER BY position ASC, id ASC",
@@ -3058,8 +3057,7 @@ impl Database {
                 Ok(DeadQueueRow {
                     id: row.get(0)?,
                     item_json: row.get(1)?,
-                    position: row.get(2)?,
-                    execution_id: row.get(3)?,
+                    execution_id: row.get(2)?,
                 })
             }).map_err(|e| format!("queue dead-scope rows query: {e}"))?
               .collect::<Result<Vec<_>, _>>()

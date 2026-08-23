@@ -3707,12 +3707,6 @@ mod backend {
         }
     }
 
-    pub(super) fn apply_changes_to_tag(tag: &mut Tag, changes: &[DsfTagChange]) {
-        for change in changes {
-            apply_one(tag, change);
-        }
-    }
-
     fn apply_value_changes_to_tag(
         tag: &mut Tag,
         changes: &[DsfTagValueChange],
@@ -3817,7 +3811,15 @@ mod backend {
             description: "second".to_string(),
             text: "second comment".to_string(),
         });
-        apply_changes_to_tag(&mut tag, changes);
+        let value_changes = changes
+            .iter()
+            .map(|change| DsfTagValueChange {
+                canonical_key: change.canonical_key.clone(),
+                values: change.value.clone().map(|value| vec![value]),
+            })
+            .collect::<Vec<_>>();
+        apply_value_changes_to_tag(&mut tag, &value_changes)
+            .expect("scalar fixture changes must remain representable");
         snapshot_from_tag(&tag)
     }
 
@@ -3832,7 +3834,15 @@ mod backend {
             description: String::new(),
             text: "Original comment".to_string(),
         });
-        apply_changes_to_tag(&mut tag, changes);
+        let value_changes = changes
+            .iter()
+            .map(|change| DsfTagValueChange {
+                canonical_key: change.canonical_key.clone(),
+                values: change.value.clone().map(|value| vec![value]),
+            })
+            .collect::<Vec<_>>();
+        apply_value_changes_to_tag(&mut tag, &value_changes)
+            .expect("scalar fixture changes must remain representable");
         snapshot_from_tag(&tag)
     }
 

@@ -3828,7 +3828,7 @@ mod flac_metadata_writer {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     fn process_start_ticks(pid: u32) -> Option<u64> {
         let stat = std::fs::read_to_string(std::path::Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
         let (_, after_comm) = stat.rsplit_once(") ")?;
@@ -3838,19 +3838,19 @@ mod flac_metadata_writer {
         fields.get(19)?.parse::<u64>().ok()
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(test, not(unix)))]
     fn process_start_ticks(_pid: u32) -> Option<u64> {
         None
     }
 
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     fn boot_id_hash() -> Option<u64> {
         std::fs::read(std::path::Path::new("/proc/sys/kernel/random/boot_id"))
             .ok()
             .map(|bytes| checksum64(&bytes))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(test, not(unix)))]
     fn boot_id_hash() -> Option<u64> {
         None
     }
@@ -11982,10 +11982,6 @@ fn encode_native_ape_text_values_item(key: &str, values: &[String]) -> Result<Ve
     Ok(raw)
 }
 
-fn encode_native_ape_text_item(key: &str, value: &str) -> Result<Vec<u8>, String> {
-    encode_native_ape_text_values_item(key, &[value.to_string()])
-}
-
 fn native_ape_descriptor(size: u32, item_count: u32, flags: u32) -> [u8; APE_DESCRIPTOR_LEN] {
     let mut descriptor = [0u8; APE_DESCRIPTOR_LEN];
     descriptor[..8].copy_from_slice(APE_SIGNATURE);
@@ -12196,16 +12192,6 @@ fn prepare_native_ape_value_replacement(
         false
     };
     Ok((replace_start, footer_end, replacement, unchanged))
-}
-
-fn prepare_native_ape_replacement(
-    path: &std::path::Path,
-    changes: &[(lofty::tag::ItemKey, Option<String>)],
-    drop_invalid_items: bool,
-    clear_all_items: bool,
-) -> Result<(u64, u64, Vec<u8>, bool), String> {
-    let changes = scalar_native_ape_changes(changes);
-    prepare_native_ape_value_replacement(path, &changes, drop_invalid_items, clear_all_items)
 }
 
 const APE_TAIL_JOURNAL_MAGIC: &[u8; 8] = b"TPAPEJ01";
@@ -22525,7 +22511,9 @@ mod tests {
     fn synthetic_monkeys_audio_with_ape_tag(path: &std::path::Path, title: &str) -> Vec<u8> {
         let mut bytes = vec![0x5au8; 2 * 1024 * 1024];
         bytes[..4].copy_from_slice(b"MAC ");
-        let item = encode_native_ape_text_item("Title", title).expect("encode APEv2 title");
+        let values = [title.to_string()];
+        let item = encode_native_ape_text_values_item("Title", &values)
+            .expect("encode APEv2 title");
         bytes.extend_from_slice(
             &serialize_native_ape_tag(&[item], true).expect("serialize APEv2 fixture tag"),
         );
@@ -22599,8 +22587,9 @@ mod tests {
             lofty::tag::ItemKey::TrackTitle,
             Some("Replacement title with a different length".to_string()),
         )];
+        let value_changes = scalar_native_ape_changes(&changes);
         let (replace_start, footer_end, replacement, unchanged) =
-            prepare_native_ape_replacement(&path, &changes, false, false)
+            prepare_native_ape_value_replacement(&path, &value_changes, false, false)
                 .expect("prepare APEv2 replacement");
         assert!(!unchanged);
         let mut source = std::fs::File::open(&path).expect("open recovery fixture");
@@ -22666,8 +22655,9 @@ mod tests {
             lofty::tag::ItemKey::TrackTitle,
             Some("Durable replacement title".to_string()),
         )];
+        let value_changes = scalar_native_ape_changes(&changes);
         let (replace_start, footer_end, replacement, unchanged) =
-            prepare_native_ape_replacement(&path, &changes, false, false)
+            prepare_native_ape_value_replacement(&path, &value_changes, false, false)
                 .expect("prepare committed APEv2 replacement");
         assert!(!unchanged);
         let mut source = std::fs::File::open(&path).expect("open committed fixture");

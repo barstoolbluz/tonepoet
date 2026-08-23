@@ -2305,7 +2305,6 @@ pub(crate) struct PendingClipboardPaste {
     /// User clipboard revision that this job may reconcile. `None` is used for
     /// older startup recoveries that must never overwrite the visible clipboard.
     pub clipboard_owner_generation: Option<u64>,
-    pub plan: tui_file_picker::PastePlan,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
 }
 
