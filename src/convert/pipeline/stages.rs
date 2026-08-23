@@ -29058,7 +29058,7 @@ pub async fn prepare_pipeline_item_for_scheduler(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
 ) -> ScheduledMaterialization {
-    let mut req = req;
+    let req = req;
     let item_id = req.item_id.clone();
     if crate::concurrency::runtime_execution_id(&item_id).is_some() {
         crate::concurrency::with_runtime_execution_scope(
@@ -31779,7 +31779,7 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
-    let mut req = req;
+    let req = req;
     let item_id = req.item_id.clone();
     if crate::concurrency::runtime_execution_id(&item_id).is_some() {
         crate::concurrency::with_runtime_execution_scope(

@@ -2828,22 +2828,6 @@ impl Database {
         references.dedup();
     }
 
-    fn durable_queue_secret_refs(
-        persisted_items: &[crate::convert::ConversionItem],
-    ) -> Vec<String> {
-        let mut references = persisted_items
-            .iter()
-            .filter_map(|item| item.archive_password_ref.as_ref())
-            .filter(|reference| {
-                crate::secret_store::reference_has_namespace(reference, "queue-item")
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        references.sort();
-        references.dedup();
-        references
-    }
-
     fn cleanup_v24_setup_orphans(&self) {
         // Snapshot lifecycle pathname hints, prove backing-row absence with no
         // registry lock held, then ask lifecycle-owned retirement to revalidate

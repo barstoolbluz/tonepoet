@@ -4043,6 +4043,10 @@ pub async fn process_item(
 /// Policy-aware variant of `process_item`. This is the direct single-item path
 /// that preserves configured scratch memory limits instead of silently using
 /// `DEFAULT_SCRATCH_MEMORY_LIMIT_PERCENT`.
+// In non-test builds the body returns early via the `#[cfg(not(test))]` guard
+// below (direct single-item conversion is disabled), which makes the remaining
+// test-only body unreachable; that is intentional.
+#[allow(unreachable_code)]
 pub async fn process_item_with_scratch_policy(
     item: ConversionItem,
     progress_tx: broadcast::Sender<ProgressUpdate>,

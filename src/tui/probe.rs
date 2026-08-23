@@ -10969,22 +10969,6 @@ pub(crate) fn write_all_tag_value_lists_with_cancel(
     write_tag_value_lists_with_target_type(path, changes, None, cancel)
 }
 
-/// Conversion-only boundary for establishing a complete authoritative ID3v2
-/// view in a container such as WAV whose primary command-line metadata carrier
-/// is different. This deliberately reuses the editor serializer and its
-/// repeated-field capability policy instead of introducing a second ID3 writer.
-pub(crate) fn write_all_tag_value_lists_to_id3v2(
-    path: &std::path::Path,
-    changes: &[(lofty::tag::ItemKey, Vec<String>)],
-) -> Result<MetadataWriteCommitReport, String> {
-    write_tag_value_lists_with_target_type(
-        path,
-        changes,
-        Some(lofty::tag::TagType::Id3v2),
-        None,
-    )
-}
-
 pub(crate) fn write_all_tag_value_lists_to_id3v2_with_cancel(
     path: &std::path::Path,
     changes: &[(lofty::tag::ItemKey, Vec<String>)],

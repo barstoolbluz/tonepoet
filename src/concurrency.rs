@@ -2052,10 +2052,6 @@ impl Drop for RegistryLock {
 /// Check this before taking the registry lock; journal directory I/O never runs
 /// in the shared critical section. Only nonterminal or unclassifiable top-level
 /// legacy journals block; terminal-clean records are inert historical evidence.
-fn reject_detectable_legacy_mutation_ambiguity() -> Result<(), String> {
-    reject_detectable_legacy_mutation_ambiguity_except(None)
-}
-
 fn reject_detectable_legacy_mutation_ambiguity_except(legacy_exception: Option<&Path>) -> Result<(), String> {
     if legacy_exception.is_some() {
         // Explicit adoption publishes only durable v2 recovery authority; it

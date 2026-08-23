@@ -24098,7 +24098,7 @@ fn open_metadata_editor_for_resolved_groups(
 
     if groups.len() == 1 {
         let group = &groups[0];
-        let mut state = match group.representation {
+        let state = match group.representation {
             crate::config::AggregateMetadataTarget::IndividualFiles => {
                 let tab = build_plain_metadata_presentation_tab(
                     app,
@@ -24204,7 +24204,7 @@ fn open_metadata_editor_for_resolved_groups(
                         &group.covered_paths,
                     )?);
                 } else {
-                    let (mut state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
+                    let (state, _) = build_metadata_editor_for_cue_surfaces_with_policy(
                         app,
                         &group.selected_surfaces,
                         0,

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
