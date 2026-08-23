@@ -5,9 +5,13 @@
 //! backed stub runner for materializer/orchestrator unit tests.
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(unix)]
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -510,6 +514,8 @@ pub struct RealToolRunner {
     version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
     execution_item_id: Option<String>,
     execution_supervisor: Option<crate::convert::script_supervisor::ItemExecutionSupervisorClient>,
+    #[cfg(all(test, unix))]
+    segmented_idle_timeout_override: Option<Duration>,
 }
 
 impl RealToolRunner {
@@ -533,7 +539,24 @@ impl RealToolRunner {
             version_cache,
             execution_item_id: None,
             execution_supervisor: None,
+            #[cfg(all(test, unix))]
+            segmented_idle_timeout_override: None,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_segmented_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.segmented_idle_timeout_override = Some(idle_timeout);
+        self
+    }
+
+    #[cfg(unix)]
+    fn segmented_idle_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(idle_timeout) = self.segmented_idle_timeout_override {
+            return idle_timeout;
+        }
+        CUE_STREAM_TRANSPORT_IDLE_TIMEOUT
     }
 
     /// Bind this runner to one durable queue execution. Scheduled fan-out
@@ -862,6 +885,11 @@ pub(crate) fn detect_tool_version(binary: ToolBinary, path: &Path) -> Option<Str
 }
 
 pub(crate) const TOOL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time an actively-moving segmented CUE stream may make zero byte progress.
+/// This is deliberately far shorter than the six-hour source-ReplayGain tool budget,
+/// but far longer than any healthy 64 KiB PCM transfer cadence.
+#[cfg(unix)]
+const CUE_STREAM_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Map a `std::process::ExitStatus` to a `ProcessExit`.
 fn map_exit_status(status: std::process::ExitStatus) -> ProcessExit {
@@ -980,22 +1008,80 @@ fn executable_sha256(path: &Path) -> std::io::Result<Sha256Digest> {
 }
 
 #[cfg(unix)]
+struct SegmentedStreamIdleWatchdog<'a> {
+    stream_cancel: &'a CancellationToken,
+    stalled: &'a AtomicBool,
+    idle_timeout: Duration,
+}
+
+#[cfg(unix)]
+impl<'a> SegmentedStreamIdleWatchdog<'a> {
+    fn new(
+        stream_cancel: &'a CancellationToken,
+        stalled: &'a AtomicBool,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            stream_cancel,
+            stalled,
+            idle_timeout,
+        }
+    }
+
+    async fn wait_for_progress<T, F>(&self, operation: F) -> std::io::Result<T>
+    where
+        F: Future<Output = std::io::Result<T>>,
+    {
+        tokio::select! {
+            biased;
+            _ = self.stream_cancel.cancelled() => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "segmented pipeline cancelled",
+                ))
+            }
+            result = tokio::time::timeout(self.idle_timeout, operation) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if !self.stalled.swap(true, Ordering::AcqRel) {
+                            log::warn!(
+                                "CUE stream transport made no byte progress for {:?}; cancelling the transport so source-pass ReplayGain can fall back to output-measured ReplayGain",
+                                self.idle_timeout
+                            );
+                        }
+                        // This child token intentionally does not propagate to the
+                        // album/conversion parent token. The caller's established
+                        // source-ReplayGain fallback depends on that distinction.
+                        self.stream_cancel.cancel();
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "segmented CUE stream transport made no byte progress for {:?}",
+                                self.idle_timeout
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn transfer_exact_stream_bytes(
     reader: &mut tokio::fs::File,
     mut writer: Option<&mut tokio::fs::File>,
     mut remaining: u64,
-    cancel: &CancellationToken,
+    watchdog: &SegmentedStreamIdleWatchdog<'_>,
 ) -> std::io::Result<()> {
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded transfer chunk fits usize");
-        let read = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-            }
-            read = reader.read(&mut buffer[..wanted]) => read?,
-        };
+        let read = watchdog
+            .wait_for_progress(reader.read(&mut buffer[..wanted]))
+            .await?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -1003,12 +1089,9 @@ async fn transfer_exact_stream_bytes(
             ));
         }
         if let Some(output) = writer.as_deref_mut() {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-                }
-                write = output.write_all(&buffer[..read]) => write?,
-            }
+            watchdog
+                .wait_for_progress(output.write_all(&buffer[..read]))
+                .await?;
         }
         remaining -= read as u64;
     }
@@ -1066,37 +1149,28 @@ async fn transfer_exact_stream_bytes_mirrored(
     writer: &mut tokio::fs::File,
     mut mirror: Option<&mut tokio::fs::File>,
     mut remaining: u64,
-    cancel: &CancellationToken,
+    watchdog: &SegmentedStreamIdleWatchdog<'_>,
 ) -> std::io::Result<()> {
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded transfer chunk fits usize");
-        let read = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-            }
-            read = reader.read(&mut buffer[..wanted]) => read?,
-        };
+        let read = watchdog
+            .wait_for_progress(reader.read(&mut buffer[..wanted]))
+            .await?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("producer ended with {remaining} requested stream bytes remaining"),
             ));
         }
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-            }
-            write = writer.write_all(&buffer[..read]) => write?,
-        }
+        watchdog
+            .wait_for_progress(writer.write_all(&buffer[..read]))
+            .await?;
         if let Some(output) = mirror.as_deref_mut() {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-                }
-                write = output.write_all(&buffer[..read]) => write?,
-            }
+            watchdog
+                .wait_for_progress(output.write_all(&buffer[..read]))
+                .await?;
         }
         remaining -= read as u64;
     }
@@ -1106,16 +1180,11 @@ async fn transfer_exact_stream_bytes_mirrored(
 #[cfg(unix)]
 async fn drain_stream_to_eof(
     reader: &mut tokio::fs::File,
-    cancel: &CancellationToken,
+    watchdog: &SegmentedStreamIdleWatchdog<'_>,
 ) -> std::io::Result<()> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
-            }
-            read = reader.read(&mut buffer) => read?,
-        };
+        let read = watchdog.wait_for_progress(reader.read(&mut buffer)).await?;
         if read == 0 {
             return Ok(());
         }
@@ -1131,6 +1200,30 @@ fn command_record_from_runner_error(error: &ToolRunnerError) -> Option<CommandRe
         | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
         ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => None,
     }
+}
+
+#[cfg(unix)]
+fn remap_segmented_stall_error(
+    mut error: ToolSegmentedPipelineError,
+    stalled: bool,
+    idle_timeout: Duration,
+) -> ToolSegmentedPipelineError {
+    if stalled {
+        error.error = match error.error {
+            ToolRunnerError::Cancelled { command } => {
+                // A watchdog-fired stream_cancel is intentionally identical to an
+                // ordinary cancellation at the process-supervisor boundary. Give
+                // the transport stall a distinct programmatic identity without
+                // adding a new workspace-wide error variant.
+                ToolRunnerError::Timeout {
+                    elapsed: idle_timeout,
+                    command,
+                }
+            }
+            other => other,
+        };
+    }
+    error
 }
 
 impl RealToolRunner {
@@ -1714,6 +1807,19 @@ impl ToolRunner for RealToolRunner {
                 }
             })?;
             let stream_cancel = cancel.child_token();
+            // The watchdog exists only around the byte-transfer helpers below.
+            // FIFO-open/prefix setup, encoder flush/exit, and the outer producer
+            // join stay deliberately quiet. The first producer read is watched;
+            // the five-minute production budget is chosen to leave ample room
+            // for heavy decode-to-first-byte latency while still cutting the
+            // six-hour source-ReplayGain wedge by orders of magnitude.
+            let segmented_idle_timeout = self.segmented_idle_timeout();
+            let stalled = AtomicBool::new(false);
+            let watchdog = SegmentedStreamIdleWatchdog::new(
+                &stream_cancel,
+                &stalled,
+                segmented_idle_timeout,
+            );
             // Intentional end-of-selection shutdown must not cancel the splitter
             // or a just-completed consumer. Errors/caller cancellation still flow
             // through stream_cancel and therefore also cancel this child token.
@@ -1758,7 +1864,7 @@ impl ToolRunner for RealToolRunner {
                                 &mut producer_reader,
                                 None,
                                 gap,
-                                &stream_cancel,
+                                &watchdog,
                             )
                             .await
                             .map_err(|error| SplitFailure {
@@ -1816,7 +1922,7 @@ impl ToolRunner for RealToolRunner {
                                 &mut consumer_writer,
                                 mirror_writer.as_mut(),
                                 segment.byte_len,
-                                &stream_cancel,
+                                &watchdog,
                             )
                             .await;
                             drop(mirror_writer);
@@ -1875,7 +1981,7 @@ impl ToolRunner for RealToolRunner {
                     // Full-image (or otherwise EOF-significant) selection keeps the
                     // historical behavior: consume to EOF so decoder failures in the
                     // required stream remain observable.
-                    drain_stream_to_eof(&mut producer_reader, &stream_cancel)
+                    drain_stream_to_eof(&mut producer_reader, &watchdog)
                         .await
                         .map_err(|error| SplitFailure {
                             error: ToolRunnerError::Io(error),
@@ -1900,7 +2006,7 @@ impl ToolRunner for RealToolRunner {
             };
 
             let (producer_result, splitter_result) = tokio::join!(producer_future, splitter_future);
-            match (producer_result, splitter_result) {
+            let result = match (producer_result, splitter_result) {
                 (Ok(producer), Ok(split)) => Ok(ToolSegmentedPipelineOutput {
                     producer,
                     consumers: split.consumers,
@@ -1998,7 +2104,14 @@ impl ToolRunner for RealToolRunner {
                         })
                     }
                 }
-            }
+            };
+            result.map_err(|error| {
+                remap_segmented_stall_error(
+                    error,
+                    stalled.load(Ordering::Acquire),
+                    segmented_idle_timeout,
+                )
+            })
         }
         #[cfg(not(unix))]
         {
@@ -2907,6 +3020,105 @@ printf 'consumer diagnostic\n' >&2
         assert_eq!(output.consumers[1].stdout_tail, "ijk");
         assert_eq!(output.producer.command.binary, ToolBinary::Sox);
         assert_eq!(output.producer.command.exit, Some(ProcessExit::Code(0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_idle_watchdog_breaks_a_stalled_transport_without_cancelling_parent() {
+        let producer = write_executable_script(
+            "segmented-stall-producer",
+            "#!/bin/sh\nexec /bin/dd if=/dev/zero bs=200000 count=1 2>/dev/null\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-stall-consumer",
+            "#!/bin/sh\n/bin/dd bs=16 count=1 of=/dev/null 2>/dev/null\nexec /bin/sleep 3600\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        let idle_timeout = Duration::from_millis(250);
+        let runner = RealToolRunner::new(paths).with_segmented_idle_timeout(idle_timeout);
+        let parent_cancel = CancellationToken::new();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(30)),
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 200_000,
+                    consumer: closed_command(
+                        ToolBinary::Ffmpeg,
+                        Vec::new(),
+                        Duration::from_secs(30),
+                    ),
+                    mirror: None,
+                    stop_producer_after: false,
+                }],
+                &parent_cancel,
+            ),
+        )
+        .await
+        .expect("idle watchdog must make a stalled transport terminal promptly")
+        .expect_err("stalled segmented transport must fail its direct attempt");
+
+        assert!(
+            matches!(
+                &error.error,
+                ToolRunnerError::Timeout { elapsed, .. } if *elapsed == idle_timeout
+            ),
+            "watchdog stall must be distinguishable from user cancellation: {:?}",
+            error.error
+        );
+        assert!(
+            !parent_cancel.is_cancelled(),
+            "transport watchdog must never cancel the parent token needed for graceful fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segmented_pipeline_idle_watchdog_allows_slow_continuous_progress() {
+        let producer = write_executable_script(
+            "segmented-slow-progress-producer",
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 8 ]; do\n  /bin/dd if=/dev/zero bs=8192 count=1 2>/dev/null\n  /bin/sleep 0.05\n  i=$((i + 1))\ndone\n",
+        );
+        let consumer = write_executable_script(
+            "segmented-slow-progress-consumer",
+            "#!/bin/sh\nexec /bin/cat\n",
+        );
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
+        // Deliberately generous relative to the whole fixture transfer so CI
+        // scheduling jitter cannot turn a healthy progress test into a race.
+        let runner = RealToolRunner::new(paths)
+            .with_segmented_idle_timeout(Duration::from_secs(3));
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.run_segmented_pipeline(
+                closed_command(ToolBinary::Sox, Vec::new(), Duration::from_secs(5)),
+                vec![ToolStreamSegment {
+                    start_byte: 0,
+                    byte_len: 8 * 8192,
+                    consumer: closed_command(
+                        ToolBinary::Ffmpeg,
+                        Vec::new(),
+                        Duration::from_secs(5),
+                    ),
+                    mirror: None,
+                    stop_producer_after: true,
+                }],
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("slow-progress fixture must remain bounded")
+        .expect("slow-but-progressing transport must not trip idle watchdog");
+
+        assert_eq!(output.consumers.len(), 1);
+        assert_eq!(output.consumers[0].command.exit, Some(ProcessExit::Code(0)));
     }
 
     #[cfg(unix)]
