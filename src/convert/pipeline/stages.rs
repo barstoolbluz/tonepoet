@@ -3531,7 +3531,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 next_index += 1;
             }
 
-            let outputs = encode_cue_stream_group_with_runner(
+            let outputs = Box::pin(encode_cue_stream_group_with_runner(
                 scheduled,
                 req.clone(),
                 staging.root.clone(),
@@ -3543,7 +3543,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
                 reporter,
                 cancel.clone(),
                 None,
-            )
+            ))
             .await;
             for output in outputs {
                 let output_track = &source.tracks[output.index];
@@ -29940,7 +29940,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
         let mut outputs = Vec::with_capacity(tracks.len());
         for group in groups {
             outputs.extend(
-                encode_cue_stream_group_with_runner(
+                Box::pin(encode_cue_stream_group_with_runner(
                     group,
                     req.clone(),
                     staging_root.clone(),
@@ -29952,7 +29952,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
                     Some(reporter),
                     cancel.clone(),
                     None,
-                )
+                ))
                 .await,
             );
         }
@@ -29972,7 +29972,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
             let mut outputs = Vec::with_capacity(tracks.len());
             for group in groups {
                 outputs.extend(
-                    encode_cue_stream_group_with_runner(
+                    Box::pin(encode_cue_stream_group_with_runner(
                         group,
                         req.clone(),
                         staging_root.clone(),
@@ -29984,7 +29984,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
                         Some(reporter),
                         cancel.clone(),
                         None,
-                    )
+                    ))
                     .await,
                 );
             }
@@ -30017,7 +30017,10 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
     let rg_cancel = cancel.child_token();
     let analysis_cancel = rg_cancel.clone();
     let analysis_limits = tool_concurrency_limits.clone();
-    let analysis = async {
+    // The production album path polls analysis and conversion concurrently.
+    // Keep both album-sized futures behind heap boundaries so the scheduler's
+    // `join!` does not re-aggregate the stack depth removed below.
+    let analysis = Box::pin(async {
         let result = run_tool_command_with_concurrency(
             scan_cmd,
             &runner,
@@ -30029,13 +30032,13 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
             analysis_cancel.cancel();
         }
         result
-    };
+    });
     let conversion_cancel = rg_cancel.clone();
-    let conversion = async {
+    let conversion = Box::pin(async {
         let mut outputs = Vec::with_capacity(tracks.len());
         let mut direct = true;
         for group in groups {
-            let group_outputs = encode_cue_stream_group_with_runner(
+            let group_outputs = Box::pin(encode_cue_stream_group_with_runner(
                 group,
                 req.clone(),
                 staging_root.clone(),
@@ -30047,7 +30050,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
                 Some(reporter),
                 conversion_cancel.clone(),
                 Some(&mirrors),
-            )
+            ))
             .await;
             if group_outputs.iter().any(|output| !output.ok || output.record.realized_input.is_some()) {
                 direct = false;
@@ -30061,7 +30064,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
             // from being left short of `pending.expected`.
         }
         (outputs, direct)
-    };
+    });
 
     let (analysis_result, (mut outputs, direct)) = tokio::join!(analysis, conversion);
     let _ = fs::remove_dir_all(&rg_dir);
@@ -30073,7 +30076,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
         outputs.clear();
         for group in cue_stream_groups(&tracks) {
             outputs.extend(
-                encode_cue_stream_group_with_runner(
+                Box::pin(encode_cue_stream_group_with_runner(
                     group,
                     req.clone(),
                     staging_root.clone(),
@@ -30085,7 +30088,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
                     Some(reporter),
                     cancel.clone(),
                     None,
-                )
+                ))
                 .await,
             );
         }
@@ -30144,7 +30147,7 @@ pub async fn encode_cue_stream_group_for_scheduler_with_tool_limits_and_version_
         version_cache,
         &req.item_id,
     );
-    encode_cue_stream_group_with_runner(
+    Box::pin(encode_cue_stream_group_with_runner(
         tracks,
         req,
         staging_root,
@@ -30156,7 +30159,7 @@ pub async fn encode_cue_stream_group_for_scheduler_with_tool_limits_and_version_
         Some(reporter),
         cancel,
         None,
-    )
+    ))
     .await
 }
 
@@ -30345,7 +30348,7 @@ async fn encode_cue_stream_group_with_runner(
             source_image.clone(),
         ),
         _ => {
-            return encode_cue_stream_group_fallback(
+            return Box::pin(encode_cue_stream_group_fallback(
                 tracks,
                 &req,
                 &staging_root,
@@ -30356,13 +30359,13 @@ async fn encode_cue_stream_group_with_runner(
                 runner,
                 reporter,
                 &cancel,
-            )
+            ))
             .await;
         }
     };
 
     let Some(sample_rate) = tracks[0].track.sample_rate.filter(|value| *value > 0) else {
-        return encode_cue_stream_group_fallback(
+        return Box::pin(encode_cue_stream_group_fallback(
             tracks,
             &req,
             &staging_root,
@@ -30373,7 +30376,7 @@ async fn encode_cue_stream_group_with_runner(
             runner,
             reporter,
             &cancel,
-        )
+        ))
         .await;
     };
 
@@ -30406,7 +30409,7 @@ async fn encode_cue_stream_group_with_runner(
                 _ => true,
             }
     }) {
-        return encode_cue_stream_group_fallback(
+        return Box::pin(encode_cue_stream_group_fallback(
             tracks,
             &req,
             &staging_root,
@@ -30417,7 +30420,7 @@ async fn encode_cue_stream_group_with_runner(
             runner,
             reporter,
             &cancel,
-        )
+        ))
         .await;
     }
 
@@ -30439,7 +30442,7 @@ async fn encode_cue_stream_group_with_runner(
                 for (_, _, plan) in &planned {
                     cleanup_cue_stream_direct_track_plan(plan);
                 }
-                return encode_cue_stream_group_fallback(
+                return Box::pin(encode_cue_stream_group_fallback(
                     tracks,
                     &req,
                     &staging_root,
@@ -30450,7 +30453,7 @@ async fn encode_cue_stream_group_with_runner(
                     runner,
                     reporter,
                     &cancel,
-                )
+                ))
                 .await;
             }
         }
@@ -30466,7 +30469,7 @@ async fn encode_cue_stream_group_with_runner(
                 for (_, _, plan) in &planned {
                     cleanup_cue_stream_direct_track_plan(plan);
                 }
-                return encode_cue_stream_group_fallback(
+                return Box::pin(encode_cue_stream_group_fallback(
                     tracks,
                     &req,
                     &staging_root,
@@ -30477,7 +30480,7 @@ async fn encode_cue_stream_group_with_runner(
                     runner,
                     reporter,
                     &cancel,
-                )
+                ))
                 .await;
             }
         }
@@ -30502,7 +30505,7 @@ async fn encode_cue_stream_group_with_runner(
             for (_, _, plan) in &planned {
                 cleanup_cue_stream_direct_track_plan(plan);
             }
-            return encode_cue_stream_group_fallback(
+            return Box::pin(encode_cue_stream_group_fallback(
                 tracks,
                 &req,
                 &staging_root,
@@ -30513,7 +30516,7 @@ async fn encode_cue_stream_group_with_runner(
                 runner,
                 reporter,
                 &cancel,
-            )
+            ))
             .await;
         };
         let consumer = match cue_stream_consumer_command(
@@ -30527,7 +30530,7 @@ async fn encode_cue_stream_group_with_runner(
                 for (_, _, plan) in &planned {
                     cleanup_cue_stream_direct_track_plan(plan);
                 }
-                return encode_cue_stream_group_fallback(
+                return Box::pin(encode_cue_stream_group_fallback(
                     tracks,
                     &req,
                     &staging_root,
@@ -30538,7 +30541,7 @@ async fn encode_cue_stream_group_with_runner(
                     runner,
                     reporter,
                     &cancel,
-                )
+                ))
                 .await;
             }
         };
@@ -30548,7 +30551,7 @@ async fn encode_cue_stream_group_with_runner(
                     for (_, _, plan) in &planned {
                         cleanup_cue_stream_direct_track_plan(plan);
                     }
-                    return encode_cue_stream_group_fallback(
+                    return Box::pin(encode_cue_stream_group_fallback(
                         tracks,
                         &req,
                         &staging_root,
@@ -30559,7 +30562,7 @@ async fn encode_cue_stream_group_with_runner(
                         runner,
                         reporter,
                         &cancel,
-                    )
+                    ))
                     .await;
                 }
             }
@@ -30598,13 +30601,16 @@ async fn encode_cue_stream_group_with_runner(
     // O(images) while live encoder/intermediate state remains O(1 track).
     let producer = cue_stream_decoder_command(&first_source.0, first_source.1);
     let producer_for_records = producer.clone();
-    let execution = run_segmented_tool_pipeline_with_concurrency(
+    // This boundary separates the large group-planning/finalization future
+    // from the segmented transport state. It executes once per decoder group,
+    // so stack safety does not add allocation to the 64 KiB transfer loop.
+    let execution = Box::pin(run_segmented_tool_pipeline_with_concurrency(
         producer,
         segments,
         runner,
         &cancel,
         tool_concurrency_limits.as_ref(),
-    )
+    ))
     .await;
 
     let pipeline_output = match execution {
@@ -30663,7 +30669,7 @@ async fn encode_cue_stream_group_with_runner(
                                 break;
                             };
                             outputs.push(
-                                finalize_cue_stream_consumer_output(
+                                Box::pin(finalize_cue_stream_consumer_output(
                                     input,
                                     staged_path,
                                     plan,
@@ -30674,7 +30680,7 @@ async fn encode_cue_stream_group_with_runner(
                                     runner,
                                     &cancel,
                                     tool_concurrency_limits.as_ref(),
-                                )
+                                ))
                                 .await,
                             );
                         }
@@ -30769,7 +30775,7 @@ async fn encode_cue_stream_group_with_runner(
         planned.into_iter().zip(consumer_outputs)
     {
         outputs.push(
-            finalize_cue_stream_consumer_output(
+            Box::pin(finalize_cue_stream_consumer_output(
                 input,
                 staged_path,
                 plan,
@@ -30780,7 +30786,7 @@ async fn encode_cue_stream_group_with_runner(
                 runner,
                 &cancel,
                 tool_concurrency_limits.as_ref(),
-            )
+            ))
             .await,
         );
     }

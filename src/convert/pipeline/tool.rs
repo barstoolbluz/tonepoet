@@ -1837,14 +1837,17 @@ impl ToolRunner for RealToolRunner {
             // or a just-completed consumer. Errors/caller cancellation still flow
             // through stream_cancel and therefore also cancel this child token.
             let producer_cancel = stream_cancel.child_token();
-            let producer_future = self.run_supervised_with_stdio(
+            // Keep the supervised producer state off the Tokio worker stack. The
+            // segmented transport is already process-bound, so this is one heap
+            // allocation per image decode, never per PCM chunk.
+            let producer_future = Box::pin(self.run_supervised_with_stdio(
                 producer,
                 producer_path,
                 &producer_cancel,
                 None,
                 Some(Arc::new(producer_write)),
                 None,
-            );
+            ));
 
             struct SplitSuccess {
                 consumers: Vec<ToolOutput>,
@@ -1858,8 +1861,11 @@ impl ToolRunner for RealToolRunner {
                 consumer_primary: bool,
             }
 
+            // The splitter core contains the per-segment consumer/transfer join
+            // plus 64 KiB transfer futures. Pin that core so the outer join keeps
+            // only a thin pointer instead of re-aggregating the transport state.
             let splitter_future = async {
-                let result = async {
+                let result = Box::pin(async {
                     let mut producer_reader = tokio::fs::File::from_std(producer_read);
                     let mut position = 0_u64;
                     let mut consumer_outputs = Vec::with_capacity(segments.len());
@@ -1894,15 +1900,18 @@ impl ToolRunner for RealToolRunner {
                         let mut consumer_writer = tokio::fs::File::from_std(consumer_write);
                         let stop_producer_after = segment.stop_producer_after;
                         let mirror = segment.mirror;
-                        let consumer_future = self.run_supervised_with_stdio(
+                        // Both sides of this join are substantial state machines.
+                        // Box them once per segment so `join!` stores two thin pinned
+                        // pointers rather than folding both futures into one frame.
+                        let consumer_future = Box::pin(self.run_supervised_with_stdio(
                             segment.consumer,
                             consumer_path,
                             &stream_cancel,
                             Some(Arc::new(consumer_read)),
                             None,
                             None,
-                        );
-                        let transfer_future = async {
+                        ));
+                        let transfer_future = Box::pin(async {
                             let mut mirror_writer = if let Some(mirror) = mirror {
                                 let mut output = open_stream_mirror_writer(
                                     &mirror.path,
@@ -1939,7 +1948,7 @@ impl ToolRunner for RealToolRunner {
                                 producer_cancel.cancel();
                             }
                             result
-                        };
+                        });
                         let (consumer_result, transfer_result) =
                             tokio::join!(consumer_future, transfer_future);
 
@@ -1997,7 +2006,7 @@ impl ToolRunner for RealToolRunner {
                         consumers: consumer_outputs,
                         producer_stopped_intentionally: false,
                     })
-                }
+                })
                 .await;
                 if result.is_err() {
                     // Any splitter-side failure must tear down the producer.
