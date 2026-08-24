@@ -259,6 +259,12 @@ EXTERNAL_LAUNCH_INVENTORY = [
     ("src/tui/browse.rs", "run_7z_extract_to_dir", 1, "scratch_workspace"),
     ("src/tui/cue_parser.rs", "extract_single_image_tracks", 2, "scratch_workspace"),
     ("src/tui/cue_parser.rs", "can_ffmpeg_read", 1, "read_only_probe"),
+    (
+        "src/tui/external_editor.rs",
+        "run_foreground_interactive_editor",
+        1,
+        "interactive_foreground_claimed",
+    ),
     ("src/tui/external_editor.rs", "run_read_only_command", 1, "read_only_probe"),
     ("src/tui/external_editor.rs", "which", 1, "read_only_probe"),
     ("src/tui/host_clipboard.rs", "run_clipboard_write", 1, "ui_helper"),
@@ -315,6 +321,7 @@ def audit_external_launch_inventory() -> bool:
         "supervisor_contained_exec",
         "internal_helper_durable_lease",
         "inactive_library_api",
+        "interactive_foreground_claimed",
         "read_only_probe",
         "scratch_workspace",
         "ui_helper",
@@ -606,7 +613,11 @@ def main() -> int:
     real_tool = function_body("src/convert/pipeline/tool.rs", "run_supervised_with_stdio")
     actions_script = function_body("src/convert/pipeline/actions.rs", "run")
     replaygain_scan = function_body("src/tui/keybindings.rs", "metadata_editor_start_replaygain_scan")
-    external_editor = function_body("src/tui/external_editor.rs", "run_supervised_interactive_editor")
+    external_editor = function_body("src/tui/external_editor.rs", "open_in_editor_with_terminal")
+    external_editor_pin = function_body("src/tui/external_editor.rs", "pin_editor_executable")
+    external_editor_launch = function_body(
+        "src/tui/external_editor.rs", "run_foreground_interactive_editor"
+    )
     file_helper = function_body("src/tui/keybindings.rs", "supervise_file_task_process")
     require(
         "external-command launch inventory and supervision classification",
@@ -614,9 +625,30 @@ def main() -> int:
         and contains_all(real_tool, ["run_supervised_via_item_supervisor", "run_supervised", "current_supervision_lifetime_files"])
         and contains_all(actions_script, ["run_supervised_via_item_supervisor", "run_supervised", "current_supervision_lifetime_files"])
         and contains_all(replaygain_scan, ["MutationClaimGuard::acquire_ephemeral", "with_additional_supervision_lifetime_files", "ToolRunner::run"])
-        and contains_all(external_editor, ["mutation_claim.into_lease()", "duplicate_lifetime_file", "retained_lifetime_files", "run_supervised"])
+        and contains_all(
+            external_editor,
+            [
+                "MutationClaimGuard::acquire_ephemeral",
+                "pin_editor_executable",
+                "TuiRestoreGuard::suspend_with",
+                "let _mutation_claim = mutation_claim",
+                "run_foreground_interactive_editor",
+                "terminal_restore.restore_now()",
+            ],
+        )
+        and contains_all(external_editor_pin, ["O_CLOEXEC", "O_NOFOLLOW", ".is_file()"])
+        and contains_all(external_editor_launch, ["Command::new(&pinned.path)", ".status()"])
+        and not any(
+            token in external_editor
+            for token in (
+                "mutation_claim.into_lease()",
+                "duplicate_lifetime_file",
+                "retained_lifetime_files",
+                "run_supervised",
+            )
+        )
         and contains_all(file_helper, ["journal.lease_fd()", "FD_CLOEXEC", "__file-task-worker", "command.spawn()"]),
-        "every production process construction must be explicitly classified; mutation-capable conversion/action/ReplayGain/editor launches must route through the existing supervisor with retained lifetime authority, while the file helper must carry its durable lease",
+        "every production process construction must be explicitly classified; mutation-capable conversion/action/ReplayGain launches must route through the existing supervisor with retained lifetime authority, the interactive editor must remain a foreground child protected by a parent-held WRITE claim and exact executable pin, and the file helper must carry its durable lease",
     )
 
     # Metadata uses one named outer admission helper. The audit checks the real

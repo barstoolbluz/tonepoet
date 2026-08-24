@@ -33,6 +33,9 @@ struct CueInput {
     sheet: CueSheet,
     raw_cue: String,
     origin: CueOrigin,
+    /// Concrete sidecar CUE path when one exists. Embedded-only inputs leave
+    /// this unset so diagnostics do not invent a filename.
+    cue_path: Option<PathBuf>,
     cue_parent: Option<PathBuf>,
     fallback_image: Option<PathBuf>,
 }
@@ -543,10 +546,11 @@ impl Materializer for CueImageMaterializer {
             image_artwork.insert(image_key, artwork);
         }
 
-        let boundaries = compute_track_boundaries_for_layout(
+        let boundaries = compute_track_boundaries_for_layout_with_cue(
             &cue_input.sheet,
             &track_images,
             &probes,
+            cue_input.cue_path.as_deref(),
         )?;
         let cue_annotations = CueAnnotations::parse(&cue_input.raw_cue);
         let track_number_plan = cue_track_number_plan(&cue_input.sheet);
@@ -826,6 +830,7 @@ fn read_sidecar_cue(
         sheet,
         raw_cue,
         origin: CueOrigin::Sidecar,
+        cue_path: Some(cue_path.clone()),
         cue_parent,
         fallback_image,
     };
@@ -872,6 +877,7 @@ pub(crate) fn dispatch_metadata_sheet_for_sidecar_cue(cue_path: &Path) -> Option
         sheet,
         raw_cue,
         origin: CueOrigin::Sidecar,
+        cue_path: Some(cue_path.to_path_buf()),
         cue_parent: cue_path.parent().map(Path::to_path_buf),
         fallback_image: None,
     };
@@ -956,6 +962,7 @@ fn try_upgrade_sidecar_to_embedded_image_cue(sidecar: &CueInput) -> Option<CueIn
         sheet,
         raw_cue,
         origin: CueOrigin::Embedded,
+        cue_path: sidecar.cue_path.clone(),
         cue_parent: None,
         fallback_image: Some(image.clone()),
     })
@@ -980,6 +987,7 @@ fn try_resolve_embedded_cue(req: &PipelineRequest) -> Result<Option<CueInput>, M
         sheet,
         raw_cue,
         origin: CueOrigin::Embedded,
+        cue_path: None,
         cue_parent: None,
         fallback_image: Some(req.container.clone()),
     }))
@@ -1081,6 +1089,7 @@ fn sidecar_cue_track_count_for_image(
         sheet,
         raw_cue: content,
         origin: CueOrigin::Sidecar,
+        cue_path: Some(cue_path.to_path_buf()),
         cue_parent: cue_path.parent().map(Path::to_path_buf),
         fallback_image: Some(image.to_path_buf()),
     };
@@ -1193,6 +1202,7 @@ fn sidecar_cue_track_count_for_image_materialize(
         sheet,
         raw_cue,
         origin: CueOrigin::Sidecar,
+        cue_path: Some(cue_path.to_path_buf()),
         cue_parent: cue_path.parent().map(Path::to_path_buf),
         fallback_image: Some(image.to_path_buf()),
     };
@@ -2195,6 +2205,15 @@ fn compute_track_boundaries_for_layout(
     track_images: &[PathBuf],
     probes: &HashMap<PathBuf, AudioProbe>,
 ) -> Result<Vec<SegmentBounds>, MaterializeError> {
+    compute_track_boundaries_for_layout_with_cue(sheet, track_images, probes, None)
+}
+
+fn compute_track_boundaries_for_layout_with_cue(
+    sheet: &CueSheet,
+    track_images: &[PathBuf],
+    probes: &HashMap<PathBuf, AudioProbe>,
+    cue_path: Option<&Path>,
+) -> Result<Vec<SegmentBounds>, MaterializeError> {
     if sheet.tracks.len() != track_images.len() {
         return Err(MaterializeError::Parse(format!(
             "CUE track/image cardinality mismatch: {} tracks, {} images",
@@ -2249,10 +2268,14 @@ fn compute_track_boundaries_for_layout(
         };
 
         if !is_lossy_tail && start >= probe.total_samples {
+            let cue_name = cue_path
+                .map(|path| format!(" in CUE {}", path.display()))
+                .unwrap_or_default();
             return Err(MaterializeError::Parse(format!(
-                "track {} starts beyond image duration for {}",
+                "track {} starts beyond image duration for {}{}; the CUE's FILE-local timeline starts beyond this image. In a malformed multi-FILE CUE, a common cause is that later FILE sections use cumulative timestamps instead of resetting for each image; try the per-disc CUEs if available",
                 track.number,
-                image_path.display()
+                image_path.display(),
+                cue_name,
             )));
         }
         if end <= start {
@@ -2263,10 +2286,14 @@ fn compute_track_boundaries_for_layout(
             )));
         }
         if !is_lossy_tail && end > probe.total_samples {
+            let cue_name = cue_path
+                .map(|path| format!(" in CUE {}", path.display()))
+                .unwrap_or_default();
             return Err(MaterializeError::Parse(format!(
-                "track {} ends beyond image duration for {}",
+                "track {} ends beyond image duration for {}{}; the CUE's FILE-local timeline exceeds this image. In a malformed multi-FILE CUE, a common cause is that later FILE sections use cumulative timestamps instead of resetting for each image; try the per-disc CUEs if available",
                 track.number,
-                image_path.display()
+                image_path.display(),
+                cue_name,
             )));
         }
         if !is_lossy_tail
@@ -5246,6 +5273,77 @@ TRACK XX AUDIO
         assert_eq!(lossy_tail_shortfall_limit(44_100, 4_000), 1_000);
         assert_eq!(lossy_tail_shortfall_limit(44_100, 17_280), 4_320);
         assert_eq!(lossy_tail_shortfall_limit(96_000, 100_000), 11_520);
+    }
+
+    #[test]
+    fn boundary_overflow_diagnostic_names_sidecar_and_explains_multi_file_failure_mode() {
+        let image = PathBuf::from("side-b.flac");
+        let cue = PathBuf::from("album.cue");
+        let sheet = parse_cue(
+            "FILE \"side-b.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 02:00:00\n",
+        );
+        let mut probes = HashMap::new();
+        probes.insert(
+            path_identity(&image),
+            AudioProbe {
+                sample_rate: 44_100,
+                channels: Some(2),
+                total_samples: 44_100,
+                exact_samples: true,
+                bit_depth: Some(16),
+                coding: SourceAudioCoding::Pcm,
+                codec_name: Some("flac".to_string()),
+                format_name: Some("flac".to_string()),
+            },
+        );
+
+        let error = compute_track_boundaries_for_layout_with_cue(
+            &sheet,
+            &[image.clone(), image],
+            &probes,
+            Some(&cue),
+        )
+        .expect_err("the next INDEX exceeds the authoritative image duration");
+        let message = error.to_string();
+        assert!(message.contains("album.cue"), "{message}");
+        assert!(message.contains("cumulative timestamps"), "{message}");
+        assert!(message.contains("per-disc CUEs"), "{message}");
+    }
+
+    #[test]
+    fn start_overflow_diagnostic_names_sidecar_and_explains_multi_file_failure_mode() {
+        let image = PathBuf::from("side-b.flac");
+        let cue = PathBuf::from("album.cue");
+        let sheet = parse_cue(
+            "FILE \"side-b.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:02:00\n",
+        );
+        let mut probes = HashMap::new();
+        probes.insert(
+            path_identity(&image),
+            AudioProbe {
+                sample_rate: 44_100,
+                channels: Some(2),
+                total_samples: 44_100,
+                exact_samples: true,
+                bit_depth: Some(16),
+                coding: SourceAudioCoding::Pcm,
+                codec_name: Some("flac".to_string()),
+                format_name: Some("flac".to_string()),
+            },
+        );
+
+        let error = compute_track_boundaries_for_layout_with_cue(
+            &sheet,
+            &[image],
+            &probes,
+            Some(&cue),
+        )
+        .expect_err("INDEX starts beyond the authoritative image duration");
+        let message = error.to_string();
+        assert!(message.contains("starts beyond image duration"), "{message}");
+        assert!(message.contains("album.cue"), "{message}");
+        assert!(message.contains("cumulative timestamps"), "{message}");
+        assert!(message.contains("per-disc CUEs"), "{message}");
     }
 
     #[test]

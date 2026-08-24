@@ -630,6 +630,15 @@ impl SplitCueAdmissionMember {
     }
 }
 
+/// Admission-only facts that are useful to folder policy but are not part of
+/// the public member surface. `track_audio_keys` are the resolved-image keys
+/// already computed for the canonical per-image monotonicity check, so later
+/// structural policy can stay probe-free and add zero filesystem I/O.
+struct SplitCueAdmissionFacts {
+    member: SplitCueAdmissionMember,
+    track_audio_keys: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitCueMemberRejectionReason {
     ParseFailure { detail: String },
@@ -651,12 +660,29 @@ pub enum SplitCueMemberRejectionReason {
         previous_track_number: u32,
         previous_index: u32,
     },
+    /// A later resolved image starts its INDEX 01 timeline after the previous
+    /// image block's last INDEX 01 instead of resetting to an image-relative
+    /// timeline. This is the narrow, probe-free signature of an externally
+    /// authored cumulative multi-FILE CUE.
+    CrossFileCumulativeIndex {
+        track_number: u32,
+        path: PathBuf,
+        index: u32,
+        previous_track_number: u32,
+        previous_path: PathBuf,
+        previous_index: u32,
+    },
 }
 
 impl SplitCueMemberRejectionReason {
     #[must_use]
     pub fn is_parse_failure(&self) -> bool {
         matches!(self, Self::ParseFailure { .. })
+    }
+
+    #[must_use]
+    pub fn is_cross_file_cumulative_index(&self) -> bool {
+        matches!(self, Self::CrossFileCumulativeIndex { .. })
     }
 }
 
@@ -706,6 +732,19 @@ impl std::fmt::Display for SplitCueMemberRejectionReason {
                 "member CUE has non-increasing INDEX 01 for track {track_number} in {}; previous track {previous_track_number} was at frame {previous_index}",
                 path.display()
             ),
+            Self::CrossFileCumulativeIndex {
+                track_number,
+                path,
+                index,
+                previous_track_number,
+                previous_path,
+                previous_index,
+            } => write!(
+                f,
+                "malformed multi-FILE CUE: track {track_number} in {} starts at frame {index}, after track {previous_track_number} in {} ended its index timeline at frame {previous_index}; later FILE sections appear to use cumulative timestamps instead of resetting to the new image's timeline",
+                path.display(),
+                previous_path.display()
+            ),
         }
     }
 }
@@ -743,6 +782,20 @@ impl SplitCueMemberRejection {
             reason,
             parsed_sheet: Some(Box::new(sheet.clone())),
             resolved_in_folder_audio: resolved_in_folder_audio_references(cue_path, sheet),
+        }
+    }
+
+    fn from_admitted_member(
+        member: &SplitCueAdmissionMember,
+        reason: SplitCueMemberRejectionReason,
+    ) -> Self {
+        Self {
+            cue_path: member.cue_path.clone(),
+            reason,
+            parsed_sheet: Some(Box::new(member.sheet.clone())),
+            // Reuse the canonical admission result: the structural screen must
+            // be O(tracks) over already-resolved data and perform no new I/O.
+            resolved_in_folder_audio: member.referenced_audio.clone(),
         }
     }
 
@@ -852,8 +905,14 @@ pub enum SplitCueFolderSelection {
     /// More than one viable alternative remains after exact-match ranking.
     /// The caller must ask the user to choose exactly one.
     NeedsChoice {
+        /// Equally best-ranked candidates retained for baseline compatibility.
         candidates: Vec<SplitCueAdmissionMember>,
+        /// Every structurally viable member, for the advanced chooser.
+        viable: Vec<SplitCueAdmissionMember>,
         rejected: Vec<SplitCueMemberRejection>,
+        /// True when all useful viable members are pairwise disjoint and can
+        /// therefore be safely assembled as one album after explicit opt-in.
+        automatic_available: bool,
     },
     /// No candidate resolves safely to local audio. Callers must fall back to
     /// their ordinary file/TOC path and surface the rejection visibly.
@@ -878,33 +937,229 @@ pub enum SplitCueFolderSelection {
 /// so an exact metadata sidecar continues to beat a fallback split source.
 /// Otherwise selection remains role-neutral. Rejected alternatives never
 /// poison a viable winner.
+#[derive(Debug, Clone, Copy)]
+pub enum SplitCueFolderPreference<'a> {
+    /// Preserve the established operation-scoped chooser semantics: only
+    /// break a tie after the normal exact/disjoint auto-selection rungs have
+    /// had a chance to resolve the folder.
+    RankedCue(&'a Path),
+    /// Advanced persistent override: choose this viable representation even
+    /// when it is lower-ranked than another viable CUE. If it is no longer
+    /// viable, ignore the stale preference and let the ordinary folder ladder
+    /// decide whether the remaining current choices are actually ambiguous.
+    Cue(&'a Path),
+    /// Advanced persistent override for whole-album assembly. If the current
+    /// viable set can no longer be assembled safely, return `NeedsChoice`.
+    AutomaticWholeAlbum,
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitCueFolderInspection {
+    pub viable: Vec<SplitCueAdmissionMember>,
+    pub rejected: Vec<SplitCueMemberRejection>,
+    pub automatic_members: Vec<SplitCueAdmissionMember>,
+}
+
+impl SplitCueFolderInspection {
+    #[must_use]
+    pub fn automatic_available(&self) -> bool {
+        !self.automatic_members.is_empty()
+            && split_cue_member_audio_sets_are_pairwise_disjoint(&self.automatic_members)
+    }
+}
+
+/// Classify all direct candidate CUEs for folder-choice policy. Canonical
+/// member admission intentionally stays unchanged: copy-tags and explicit CUE
+/// consumers still see the same admitted member, while folder selection can
+/// reject the narrowly detectable cumulative multi-FILE representation.
+#[must_use]
+pub fn inspect_split_cue_folder_members(cue_paths: &[PathBuf]) -> SplitCueFolderInspection {
+    let mut ordered_paths = cue_paths.to_vec();
+    ordered_paths.sort_by(|left, right| split_cue_path_cmp(left, right));
+    ordered_paths.dedup_by(|left, right| cue_path_key(left) == cue_path_key(right));
+
+    let mut viable = Vec::new();
+    let mut rejected = Vec::new();
+    for cue_path in ordered_paths {
+        match admit_split_cue_member_with_facts(&cue_path) {
+            Ok(facts) => {
+                if let Some(reason) = cross_file_cumulative_index_rejection(
+                    &facts.member,
+                    &facts.track_audio_keys,
+                ) {
+                    rejected.push(SplitCueMemberRejection::from_admitted_member(
+                        &facts.member,
+                        reason,
+                    ));
+                } else {
+                    viable.push(facts.member);
+                }
+            }
+            Err(rejection) => rejected.push(rejection),
+        }
+    }
+    let automatic_members = remove_metadata_sidecars_covered_by_split_sources(viable.clone());
+    SplitCueFolderInspection {
+        viable,
+        rejected,
+        automatic_members,
+    }
+}
+
+/// Detect only the structurally certain cumulative-across-image class. The
+/// comparison is made at a RESOLVED image boundary, uses exact INDEX 01 frame
+/// integers, requires at least two tracks in the preceding image block, and is
+/// strictly `>` by design. Any missing/alignment uncertainty fails open.
+fn cross_file_cumulative_index_rejection(
+    member: &SplitCueAdmissionMember,
+    track_audio_keys: &[PathBuf],
+) -> Option<SplitCueMemberRejectionReason> {
+    if member.sheet.tracks.len() != member.track_audio_paths.len()
+        || member.sheet.tracks.len() != track_audio_keys.len()
+    {
+        return None;
+    }
+
+    let mut previous_key: Option<PathBuf> = None;
+    let mut previous_path: Option<PathBuf> = None;
+    let mut block_track_count = 0usize;
+    let mut previous_track_number = 0u32;
+    let mut previous_index = 0u32;
+
+    for ((track, audio_path), key) in member
+        .sheet
+        .tracks
+        .iter()
+        .zip(&member.track_audio_paths)
+        .zip(track_audio_keys)
+    {
+        let index = track.index01_frames?;
+        match previous_key.as_ref() {
+            None => {
+                block_track_count = 1;
+            }
+            Some(previous) if previous == key => {
+                block_track_count += 1;
+            }
+            Some(_) => {
+                if block_track_count >= 2 && index > previous_index {
+                    return Some(SplitCueMemberRejectionReason::CrossFileCumulativeIndex {
+                        track_number: track.number,
+                        path: audio_path.clone(),
+                        index,
+                        previous_track_number,
+                        previous_path: previous_path.clone()?,
+                        previous_index,
+                    });
+                }
+                block_track_count = 1;
+            }
+        }
+        previous_key = Some(key.clone());
+        previous_path = Some(audio_path.clone());
+        previous_track_number = track.number;
+        previous_index = index;
+    }
+    None
+}
+
+fn ranked_split_cue_candidates_for_prompt(
+    members: &[SplitCueAdmissionMember],
+) -> Vec<SplitCueAdmissionMember> {
+    if members.len() <= 1 {
+        return members.to_vec();
+    }
+
+    let exact_members = members
+        .iter()
+        .filter(|member| member.all_file_references_exact)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut candidates = if exact_members.is_empty() {
+        members.to_vec()
+    } else {
+        exact_members
+    };
+    if candidates.len() > 1 {
+        candidates = remove_metadata_sidecars_covered_by_split_sources(candidates);
+    }
+    candidates
+}
+
 #[must_use]
 pub fn select_split_cue_folder_members(
     cue_paths: &[PathBuf],
     selected_cue: Option<&Path>,
 ) -> SplitCueFolderSelection {
-    let mut ordered_paths = cue_paths.to_vec();
-    ordered_paths.sort_by(|left, right| split_cue_path_cmp(left, right));
-    ordered_paths.dedup_by(|left, right| cue_path_key(left) == cue_path_key(right));
+    select_split_cue_folder_members_with_preference(
+        cue_paths,
+        selected_cue.map(SplitCueFolderPreference::RankedCue),
+    )
+}
 
-    let mut members = Vec::new();
-    let mut rejected = Vec::new();
-    let mut rejected_audio = Vec::new();
-    for cue_path in ordered_paths {
-        match admit_split_cue_member(&cue_path) {
-            Ok(member) => members.push(member),
-            Err(rejection) => {
-                rejected_audio.extend(rejection.resolved_in_folder_audio.iter().cloned());
-                rejected.push(rejection);
-            }
-        }
-    }
+#[must_use]
+pub fn select_split_cue_folder_members_with_preference(
+    cue_paths: &[PathBuf],
+    preference: Option<SplitCueFolderPreference<'_>>,
+) -> SplitCueFolderSelection {
+    let inspection = inspect_split_cue_folder_members(cue_paths);
+    let members = inspection.viable;
+    let rejected = inspection.rejected;
+    let rejected_audio = rejected
+        .iter()
+        .flat_map(|rejection| rejection.resolved_in_folder_audio.iter().cloned())
+        .collect::<Vec<_>>();
+    let automatic_members = inspection.automatic_members;
+    let automatic_available = !automatic_members.is_empty()
+        && split_cue_member_audio_sets_are_pairwise_disjoint(&automatic_members);
 
     let selection_album_group =
         selection_album_group_from_parseable_multi_file_candidates(&members, &rejected);
 
     if members.is_empty() {
         return SplitCueFolderSelection::NoViable { rejected };
+    }
+
+    // A still-viable Advanced CUE preference is authoritative. If that exact
+    // CUE is no longer viable after revalidation, however, it must not create
+    // ambiguity by itself: continue through the ordinary ladder so a clean
+    // surviving per-disc set can still auto-assemble quietly. Genuine current
+    // ambiguity will reach NeedsChoice below. AutomaticWholeAlbum remains a
+    // strict persistent policy because failure of that policy with viable
+    // members means the current useful set is no longer safely disjoint.
+    if let Some(SplitCueFolderPreference::Cue(selected_cue)) = preference {
+        let selected_key = cue_path_key(selected_cue);
+        if let Some(selected) = members
+            .iter()
+            .find(|member| cue_path_key(&member.cue_path) == selected_key)
+            .cloned()
+        {
+            return selected_split_cue_folder_members(
+                &members,
+                vec![selected],
+                rejected_audio,
+                rejected,
+                selection_album_group,
+            );
+        }
+    }
+
+    if matches!(preference, Some(SplitCueFolderPreference::AutomaticWholeAlbum)) {
+        if automatic_available {
+            return selected_split_cue_folder_members(
+                &members,
+                automatic_members,
+                rejected_audio,
+                rejected,
+                selection_album_group,
+            );
+        }
+        return SplitCueFolderSelection::NeedsChoice {
+            candidates: ranked_split_cue_candidates_for_prompt(&members),
+            viable: members,
+            rejected,
+            automatic_available,
+        };
     }
 
     if members.len() == 1 {
@@ -960,7 +1215,7 @@ pub fn select_split_cue_folder_members(
         );
     }
 
-    if let Some(selected_cue) = selected_cue {
+    if let Some(SplitCueFolderPreference::RankedCue(selected_cue)) = preference {
         let selected_key = cue_path_key(selected_cue);
         if let Some(selected) = candidates
             .iter()
@@ -977,9 +1232,13 @@ pub fn select_split_cue_folder_members(
         }
     }
 
+    // A requested automatic choice that is no longer safe must not be treated
+    // as an arbitrary explicit cue. Fall through to a fresh prompt.
     SplitCueFolderSelection::NeedsChoice {
         candidates,
+        viable: members,
         rejected,
+        automatic_available,
     }
 }
 
@@ -1277,6 +1536,12 @@ pub fn admit_split_cue_candidate_paths(cue_paths: &[PathBuf]) -> SplitCueAdmissi
 pub fn admit_split_cue_member(
     cue_path: &Path,
 ) -> Result<SplitCueAdmissionMember, SplitCueMemberRejection> {
+    admit_split_cue_member_with_facts(cue_path).map(|facts| facts.member)
+}
+
+fn admit_split_cue_member_with_facts(
+    cue_path: &Path,
+) -> Result<SplitCueAdmissionFacts, SplitCueMemberRejection> {
     let sheet = crate::convert::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| SplitCueMemberRejection::parse_failure(cue_path, err.to_string()))?;
     if sheet.tracks.is_empty() {
@@ -1297,6 +1562,7 @@ pub fn admit_split_cue_member(
     let mut referenced_audio = Vec::new();
     let mut referenced_keys = HashSet::new();
     let mut track_audio_paths = Vec::with_capacity(sheet.tracks.len());
+    let mut track_audio_keys = Vec::with_capacity(sheet.tracks.len());
     let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
     let mut all_file_references_exact = true;
 
@@ -1410,6 +1676,7 @@ pub fn admit_split_cue_member(
             }
         }
         previous_by_file.insert(resolved_key.clone(), (track.number, index01));
+        track_audio_keys.push(resolved_key.clone());
         if referenced_keys.insert(resolved_key) {
             referenced_audio.push(resolved.clone());
         }
@@ -1417,8 +1684,8 @@ pub fn admit_split_cue_member(
     }
 
     let mut tracks_per_image: BTreeMap<PathBuf, usize> = BTreeMap::new();
-    for audio_path in &track_audio_paths {
-        *tracks_per_image.entry(cue_path_key(audio_path)).or_insert(0) += 1;
+    for audio_key in &track_audio_keys {
+        *tracks_per_image.entry(audio_key.clone()).or_insert(0) += 1;
     }
     let role = if tracks_per_image.values().any(|count| *count > 1) {
         SplitCueMemberRole::SyntheticAlbumPart
@@ -1426,13 +1693,16 @@ pub fn admit_split_cue_member(
         SplitCueMemberRole::MetadataSidecar
     };
 
-    Ok(SplitCueAdmissionMember {
-        cue_path: cue_path.to_path_buf(),
-        sheet,
-        referenced_audio,
-        track_audio_paths,
-        role,
-        all_file_references_exact,
+    Ok(SplitCueAdmissionFacts {
+        member: SplitCueAdmissionMember {
+            cue_path: cue_path.to_path_buf(),
+            sheet,
+            referenced_audio,
+            track_audio_paths,
+            role,
+            all_file_references_exact,
+        },
+        track_audio_keys,
     })
 }
 
@@ -1895,6 +2165,207 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_cross_file_timeline_is_rejected_only_by_folder_policy() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.flac");
+        std::fs::write(&side_a, b"audio").expect("side A");
+        std::fs::write(&side_b, b"audio").expect("side B");
+        let cue = td.path().join("combined.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "TITLE \"Album\"\n",
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 06:00:00\n",
+            ),
+        )
+        .expect("combined cue");
+
+        let admitted = admit_split_cue_member(&cue)
+            .expect("canonical explicit-CUE admission remains backward compatible");
+        assert_eq!(admitted.referenced_audio, vec![side_a, side_b]);
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert!(inspection.viable.is_empty());
+        assert_eq!(inspection.rejected.len(), 1);
+        assert!(matches!(
+            inspection.rejected[0].reason,
+            SplitCueMemberRejectionReason::CrossFileCumulativeIndex {
+                track_number: 3,
+                previous_track_number: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            select_split_cue_folder_members(std::slice::from_ref(&cue), None),
+            SplitCueFolderSelection::NoViable { .. }
+        ));
+    }
+
+    #[test]
+    fn cross_file_screen_fails_open_for_small_nonzero_reset() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for side in ["side-a.flac", "side-b.flac"] {
+            std::fs::write(td.path().join(side), b"audio").expect("audio");
+        }
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 10:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:02:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+            ),
+        )
+        .expect("cue");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert_eq!(inspection.viable.len(), 1);
+        assert!(inspection.rejected.is_empty());
+        assert!(matches!(
+            select_split_cue_folder_members(std::slice::from_ref(&cue), None),
+            SplitCueFolderSelection::Selected { .. }
+        ));
+    }
+
+    #[test]
+    fn cross_file_equal_index_is_not_rejected_by_strict_cumulative_screen() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for side in ["side-a.flac", "side-b.flac"] {
+            std::fs::write(td.path().join(side), b"audio").expect("audio");
+        }
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:00:00\n",
+            ),
+        )
+        .expect("cue");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert_eq!(inspection.viable.len(), 1, "strict > must not become >=");
+        assert!(inspection.rejected.is_empty());
+    }
+
+    #[test]
+    fn single_track_previous_image_does_not_trigger_cumulative_screen() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for side in ["side-a.flac", "side-b.flac"] {
+            std::fs::write(td.path().join(side), b"audio").expect("audio");
+        }
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 00:02:00\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 04:00:00\n",
+            ),
+        )
+        .expect("cue");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert_eq!(
+            inspection.viable.len(),
+            1,
+            "a one-track previous image must fail open even when the next index is non-zero"
+        );
+        assert!(inspection.rejected.is_empty());
+    }
+
+    #[test]
+    fn textual_file_boundary_resolving_to_same_image_is_not_a_reset_boundary() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.flac");
+        std::fs::write(&image, b"audio").expect("audio");
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"album.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 04:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 06:00:00\n",
+            ),
+        )
+        .expect("cue");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert!(inspection.rejected.is_empty());
+        assert_eq!(inspection.viable.len(), 1);
+        assert_eq!(inspection.viable[0].referenced_audio, vec![image]);
+    }
+
+    #[test]
+    fn malformed_combined_alternative_drops_without_suppressing_exact_per_side_set() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.flac");
+        std::fs::write(&side_a, b"audio").expect("side A");
+        std::fs::write(&side_b, b"audio").expect("side B");
+        let cue_a = td.path().join("side-a.cue");
+        let cue_b = td.path().join("side-b.cue");
+        let combined = td.path().join("combined.cue");
+        std::fs::write(
+            &cue_a,
+            "TITLE \"Album\"\nFILE \"side-a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "TITLE \"Album\"\nFILE \"side-b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+        )
+        .expect("side B cue");
+        std::fs::write(
+            &combined,
+            concat!(
+                "TITLE \"Album\"\n",
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 07:00:00\n",
+            ),
+        )
+        .expect("combined cue");
+
+        let SplitCueFolderSelection::Selected {
+            members, rejected, ..
+        } = select_split_cue_folder_members(&[combined.clone(), cue_b.clone(), cue_a.clone()], None)
+        else {
+            panic!("the exact per-side set must auto-select after dropping the broken superset");
+        };
+        let selected = members
+            .iter()
+            .map(|member| cue_path_key(&member.cue_path))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&cue_path_key(&cue_a)));
+        assert!(selected.contains(&cue_path_key(&cue_b)));
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(cue_path_key(&rejected[0].cue_path), cue_path_key(&combined));
+        assert!(rejected[0].reason.is_cross_file_cumulative_index());
+    }
+
+    #[test]
     fn normalized_overflow_cannot_bypass_per_file_index_monotonicity() {
         let td = tempfile::tempdir().expect("tempdir");
         std::fs::write(td.path().join("side.flac"), TINY_VALID_FLAC).expect("FLAC stub");
@@ -1946,6 +2417,9 @@ mod tests {
         assert_eq!(member.role, SplitCueMemberRole::MetadataSidecar);
         assert!(!member.contributes_synthetic_album_part());
         assert_eq!(member.referenced_audio, vec![a, b]);
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert_eq!(inspection.viable.len(), 1, "all-zero per-FILE reset must remain viable");
+        assert!(inspection.rejected.is_empty());
     }
 
     #[test]
@@ -2323,6 +2797,184 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|member| !member.all_file_references_exact));
+    }
+
+    #[test]
+    fn stale_persisted_cue_preference_does_not_create_ambiguity_for_disjoint_survivors() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.flac");
+        let cue_a = td.path().join("side-a.cue");
+        let cue_b = td.path().join("side-b.cue");
+        let rejected_cue = td.path().join("combined.cue");
+        std::fs::write(&side_a, b"audio").expect("side A audio");
+        std::fs::write(&side_b, b"audio").expect("side B audio");
+        std::fs::write(
+            &cue_a,
+            "FILE \"side-a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "FILE \"side-b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+        )
+        .expect("side B cue");
+        std::fs::write(
+            &rejected_cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 07:00:00\n",
+            ),
+        )
+        .expect("cumulative cue");
+
+        let SplitCueFolderSelection::Selected {
+            members,
+            rejected,
+            ..
+        } = select_split_cue_folder_members_with_preference(
+            &[cue_a.clone(), cue_b.clone(), rejected_cue.clone()],
+            Some(SplitCueFolderPreference::Cue(&rejected_cue)),
+        ) else {
+            panic!(
+                "a stale malformed CUE override must not create ambiguity when the surviving per-disc set is safely disjoint"
+            );
+        };
+
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&cue_a)));
+        assert!(members
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&cue_b)));
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            cue_path_key(&rejected[0].cue_path),
+            cue_path_key(&rejected_cue)
+        );
+        assert!(rejected[0].reason.is_cross_file_cumulative_index());
+    }
+
+    #[test]
+    fn stale_persisted_cue_preference_still_prompts_for_current_overlap() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.flac");
+        let first = td.path().join("first.cue");
+        let second = td.path().join("second.cue");
+        let rejected_cue = td.path().join("combined.cue");
+        std::fs::write(&side_a, b"audio").expect("side A audio");
+        std::fs::write(&side_b, b"audio").expect("side B audio");
+        std::fs::write(
+            &first,
+            "FILE \"side-a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("first cue");
+        std::fs::write(
+            &second,
+            "FILE \"side-a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 04:00:00\n",
+        )
+        .expect("second cue");
+        std::fs::write(
+            &rejected_cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 07:00:00\n",
+            ),
+        )
+        .expect("cumulative cue");
+
+        let SplitCueFolderSelection::NeedsChoice {
+            candidates,
+            viable,
+            rejected,
+            automatic_available,
+        } = select_split_cue_folder_members_with_preference(
+            &[first.clone(), second.clone(), rejected_cue.clone()],
+            Some(SplitCueFolderPreference::Cue(&rejected_cue)),
+        ) else {
+            panic!(
+                "a stale CUE override must still surface a chooser when the current viable alternatives genuinely overlap"
+            );
+        };
+
+        assert!(!automatic_available);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(viable.len(), 2);
+        assert!(viable
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&first)));
+        assert!(viable
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&second)));
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            cue_path_key(&rejected[0].cue_path),
+            cue_path_key(&rejected_cue)
+        );
+        assert!(rejected[0].reason.is_cross_file_cumulative_index());
+    }
+
+    #[test]
+    fn strict_persisted_automatic_preference_prompts_when_auto_assembly_becomes_unsafe() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.wv");
+        let exact = td.path().join("exact.cue");
+        let fallback = td.path().join("fallback.cue");
+        std::fs::write(&image, b"audio").expect("audio");
+        std::fs::write(
+            &exact,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("exact cue");
+        std::fs::write(
+            &fallback,
+            "FILE \"album.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 04:00:00\n",
+        )
+        .expect("fallback cue");
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members_with_preference(
+                &[exact.clone(), fallback.clone()],
+                None,
+            )
+        else {
+            panic!(
+                "without a strict override the unique exact CUE should win the ordinary ranking ladder"
+            );
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&exact));
+
+        let SplitCueFolderSelection::NeedsChoice {
+            candidates,
+            viable,
+            automatic_available,
+            ..
+        } = select_split_cue_folder_members_with_preference(
+            &[exact.clone(), fallback.clone()],
+            Some(SplitCueFolderPreference::AutomaticWholeAlbum),
+        ) else {
+            panic!(
+                "an unavailable persistent automatic policy must prompt instead of degrading to the exact CUE winner"
+            );
+        };
+        assert!(!automatic_available);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(cue_path_key(&candidates[0].cue_path), cue_path_key(&exact));
+        assert_eq!(viable.len(), 2);
+        assert!(viable
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&fallback)));
     }
 
     #[test]

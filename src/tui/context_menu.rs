@@ -174,6 +174,8 @@ pub enum ContextAction {
     DuplicateSelection,
     /// Open a single file in the user's configured system editor.
     OpenSystemDefault(PathBuf),
+    /// Open the advanced folder CUE chooser without starting conversion.
+    InspectCueChoices(PathBuf),
     /// Tree-pane operations carry their target explicitly so a later cursor
     /// change cannot redirect the operation.
     TreeNewFile(PathBuf),
@@ -1221,6 +1223,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
+            items.push(item(
+                "Advanced CUE choices…",
+                ContextAction::InspectCueChoices(entry.path.clone()),
+            ));
             // Directory menu construction must not synchronously scan the
             // directory for CUE files. Both sidecar-import and embedded-only
             // availability consume the background classification cache; the
@@ -1656,6 +1662,7 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::PasteSelection
         | ContextAction::DuplicateSelection => Some("filesystem clipboard operation"),
         ContextAction::OpenSystemDefault(_) => Some("system-default editing"),
+        ContextAction::InspectCueChoices(_) => Some("CUE folder inspection"),
         ContextAction::BulkRename
         | ContextAction::RenameFixCapitalization(_) => Some("rename"),
         ContextAction::Analyze => Some("analysis"),
@@ -2789,22 +2796,48 @@ pub fn execute_context_action(
         }
         // ── Browse: Convert actions ─────────────────────────────────
         ContextAction::ConvertCustom => {
-            // Open Convert screen for manual review — no auto-commit.
-            let cmd = super::command::Command::Queue { preset: None };
-            super::command::execute_command(app, cmd, tx);
+            // Capture the ephemeral context-menu target before the menu closes.
+            // From here on the Convert operation owns this snapshot; it must
+            // never reconstruct its target from unrelated Browse marks.
+            if let Some(selection) = app.browse_context_action_paths.clone() {
+                super::command::execute_queue_for_selection(app, tx, None, selection);
+            } else {
+                let cmd = super::command::Command::Queue { preset: None };
+                super::command::execute_command(app, cmd, tx);
+            }
         }
         ContextAction::ConvertLastUsed => {
             let start = resolve_convert_start(app, invert);
-            super::command::execute_queue_with_post_load_commit(app, tx, None, start);
+            if let Some(selection) = app.browse_context_action_paths.clone() {
+                super::command::execute_queue_with_post_load_commit_for_selection(
+                    app,
+                    tx,
+                    None,
+                    start,
+                    selection,
+                );
+            } else {
+                super::command::execute_queue_with_post_load_commit(app, tx, None, start);
+            }
         }
         ContextAction::ConvertWithPreset(name) => {
             let start = resolve_convert_start(app, invert);
-            super::command::execute_queue_with_post_load_commit(app, tx, Some(name), start);
+            if let Some(selection) = app.browse_context_action_paths.clone() {
+                super::command::execute_queue_with_post_load_commit_for_selection(
+                    app,
+                    tx,
+                    Some(name),
+                    start,
+                    selection,
+                );
+            } else {
+                super::command::execute_queue_with_post_load_commit(app, tx, Some(name), start);
+            }
         }
         ContextAction::Select => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.toggle_selection();
-                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
+                app.cancel_browse_convert_expansion_for_selection_change();
             }
         }
         ContextAction::SelectAll => {
@@ -2818,7 +2851,7 @@ pub fn execute_context_action(
                     .map(|e| e.path.clone())
                     .collect();
                 app.browse.multi_selected = paths;
-                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
+                app.cancel_browse_convert_expansion_for_selection_change();
             }
         }
         ContextAction::SelectInverse => {
@@ -2833,13 +2866,13 @@ pub fn execute_context_action(
                     .map(|e| e.path.clone())
                     .collect();
                 app.browse.multi_selected = new_sel;
-                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
+                app.cancel_browse_convert_expansion_for_selection_change();
             }
         }
         ContextAction::Deselect => {
             if app.current_screen == AppScreen::Browse {
                 app.browse.clear_multi_selection();
-                app.cancel_browse_convert_expansion_for_browse_change("browse selection changed");
+                app.cancel_browse_convert_expansion_for_selection_change();
             }
         }
         ContextAction::OpenEntry => {
@@ -2856,6 +2889,11 @@ pub fn execute_context_action(
                     Ok(()) => app.set_status(format!("Opened {} in a background tab", path.display())),
                     Err(err) => app.set_status(format!("Open in New Tab: {err}")),
                 }
+            }
+        }
+        ContextAction::InspectCueChoices(path) => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::open_browse_cue_selection_inspector(app, tx, path);
             }
         }
         ContextAction::BrowseTabNew => {
@@ -3089,6 +3127,7 @@ pub fn execute_context_action(
                 Ok(created) => {
                     app.browse.refresh_with_search(Some(tx));
                     app.browse.multi_selected = created.clone();
+                    app.cancel_browse_convert_expansion_for_selection_change();
                     if let Some(last) = created.last() {
                         if let Some(index) = app.browse.entries.iter().position(|entry| &entry.path == last) {
                             app.browse.selected_index = index;
@@ -4727,6 +4766,49 @@ mod tests {
     }
 
     #[test]
+    fn copy_tags_keeps_canonical_admission_for_cumulative_combined_cue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir_all(&album).expect("album");
+        let side_a = album.join("side-a.flac");
+        let side_b = album.join("side-b.flac");
+        let combined = album.join("combined.cue");
+        std::fs::write(&side_a, b"audio").expect("side A");
+        std::fs::write(&side_b, b"audio").expect("side B");
+        std::fs::write(
+            &combined,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+            ),
+        )
+        .expect("combined cue");
+
+        let member = crate::convert::split_cue_album::admit_split_cue_member(&combined)
+            .expect("copy-tags explicit admission must remain backward compatible");
+        assert!(member.contributes_synthetic_album_part());
+        let sources = crate::tui::command::expand_metadata_read_sources_limited(
+            std::slice::from_ref(&album),
+            32,
+            32,
+            || false,
+            "Copy tags",
+            "cancelled",
+        )
+        .expect("folder metadata sources");
+        let error = read_copy_tag_entries_from_admitted_sources(
+            &sources,
+            TagCopySelection::All,
+            || false,
+        )
+        .expect_err("synthetic CUE authority must still require materialization");
+        assert!(error.contains("require materialization"), "{error}");
+    }
+
+    #[test]
     fn copy_tags_cue_role_keeps_one_track_per_file_as_metadata_sidecar() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("01.flac");
@@ -4777,6 +4859,32 @@ mod tests {
                 && !production.contains("is_dvdv_iso")
                 && !production.contains("is_bluray_iso"),
             "browse context-menu construction must not synchronously probe disc-image headers"
+        );
+    }
+
+    #[test]
+    fn advanced_cue_inspection_defers_filesystem_scan_to_blocking_worker() {
+        let source = include_str!("keybindings.rs");
+        let launch = source
+            .split("pub(super) fn open_browse_cue_selection_inspector")
+            .nth(1)
+            .expect("Advanced CUE launcher")
+            .split("pub(super) fn handle_browse_cue_inspection_complete")
+            .next()
+            .expect("Advanced CUE launcher body");
+        let blocking = launch
+            .find("tokio::task::spawn_blocking")
+            .expect("Advanced CUE inspection must have a blocking boundary");
+        let reducer_prefix = &launch[..blocking];
+        assert!(
+            !reducer_prefix.contains("split_cue_candidate_paths")
+                && !reducer_prefix.contains("inspect_split_cue_folder_members"),
+            "Advanced CUE action handler must not perform candidate discovery/inspection before spawn_blocking"
+        );
+        assert!(
+            launch[blocking..].contains("split_cue_candidate_paths")
+                && launch[blocking..].contains("inspect_split_cue_folder_members"),
+            "both CUE discovery and FILE-reference inspection must execute behind spawn_blocking"
         );
     }
 
@@ -4873,6 +4981,302 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_menu_convert_custom_targets_unmarked_entry_instead_of_unrelated_marks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.flac");
+        let second = temp.path().join("b.flac");
+        let target = temp.path().join("c.flac");
+        for path in [&first, &second, &target] {
+            std::fs::write(path, b"fixture").expect("audio fixture");
+        }
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "a.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                second.clone(),
+                "b.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                target.clone(),
+                "c.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![first.clone(), second.clone()];
+        app.browse.selected_index = 2;
+        app.browse_context_action_paths = Some(vec![target.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![target]);
+        assert_eq!(
+            app.browse.multi_selected,
+            vec![first, second],
+            "context Convert must not rewrite the ordinary marked selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_menu_convert_folder_keeps_operation_target_after_menu_closes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.flac");
+        let second = temp.path().join("b.flac");
+        let album = temp.path().join("album-c");
+        std::fs::create_dir_all(&album).expect("album dir");
+        std::fs::write(&first, b"fixture").expect("first fixture");
+        std::fs::write(&second, b"fixture").expect("second fixture");
+        let track_one = album.join("01.flac");
+        let track_two = album.join("02.flac");
+        std::fs::write(&track_one, b"fixture").expect("track one");
+        std::fs::write(&track_two, b"fixture").expect("track two");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "a.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                second.clone(),
+                "b.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                album.clone(),
+                "album-c".to_string(),
+                EntryKind::Directory,
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![first.clone(), second.clone()];
+        app.browse.selected_index = 2;
+        app.browse_context_action_paths = Some(vec![album.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+        let pending = app
+            .pending_browse_convert_expansion
+            .as_ref()
+            .expect("context folder Convert should start async expansion");
+        assert_eq!(pending.request.selection_snapshot, vec![album.clone()]);
+        assert!(pending.request.selection_owned_by_context_menu);
+
+        // The real context-menu close path clears this ephemeral dispatch state.
+        app.browse_context_action_paths = None;
+        assert_eq!(app.browse.multi_selected, vec![first, second]);
+
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        assert_eq!(request.selection_snapshot, vec![album]);
+        assert!(request.selection_owned_by_context_menu);
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![track_one, track_two]);
+    }
+
+    #[tokio::test]
+    async fn context_menu_convert_cue_choice_continuation_keeps_operation_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.flac");
+        let second = temp.path().join("b.flac");
+        let album = temp.path().join("album-c");
+        std::fs::create_dir_all(&album).expect("album dir");
+        std::fs::write(&first, b"fixture").expect("first fixture");
+        std::fs::write(&second, b"fixture").expect("second fixture");
+        std::fs::write(album.join("image.flac"), b"fixture").expect("image fixture");
+        let cue_text = concat!(
+            "TITLE \"Album\"\n",
+            "FILE \"image.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        );
+        std::fs::write(album.join("a.cue"), cue_text).expect("cue A");
+        std::fs::write(album.join("b.cue"), cue_text).expect("cue B");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "a.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                second.clone(),
+                "b.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                album.clone(),
+                "album-c".to_string(),
+                EntryKind::Directory,
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![first, second];
+        app.browse.selected_index = 2;
+        app.browse_context_action_paths = Some(vec![album.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+        app.browse_context_action_paths = None;
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        assert_eq!(request.selection_snapshot, vec![album.clone()]);
+        assert!(request.selection_owned_by_context_menu);
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::CueSelect(_)));
+        crate::tui::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+
+        let pending = app
+            .pending_browse_convert_expansion
+            .as_ref()
+            .expect("accepting the CUE choice should resume folder expansion");
+        assert_eq!(pending.request.selection_snapshot, vec![album.clone()]);
+        assert!(pending.request.selection_owned_by_context_menu);
+
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        assert_eq!(request.selection_snapshot, vec![album.clone()]);
+        assert!(request.selection_owned_by_context_menu);
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert!(
+            app.convert
+                .source
+                .mode
+                .all_paths()
+                .iter()
+                .all(|path| path.starts_with(&album)),
+            "CUE continuation must publish only the context-target album",
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_convert_still_uses_the_marked_browse_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("a.flac");
+        let second = temp.path().join("b.flac");
+        let cursor = temp.path().join("c.flac");
+        for path in [&first, &second, &cursor] {
+            std::fs::write(path, b"fixture").expect("audio fixture");
+        }
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(
+                first.clone(),
+                "a.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                second.clone(),
+                "b.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+            BrowseEntry::new(
+                cursor,
+                "c.flac".to_string(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+                0,
+                None,
+            ),
+        ];
+        app.browse.multi_selected = vec![first.clone(), second.clone()];
+        app.browse.selected_index = 2;
+        app.browse_context_action_paths = None;
+
+        crate::tui::command::execute_command(
+            &mut app,
+            crate::tui::command::Command::Queue { preset: None },
+            &tx,
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        let pending = app
+            .pending_browse_convert_expansion
+            .as_ref()
+            .expect("ordinary marked Convert should be worker-routed");
+        assert_eq!(
+            pending.request.selection_snapshot,
+            vec![first.clone(), second.clone()]
+        );
+
+        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
+        crate::tui::command::handle_browse_convert_expansion_complete(
+            &mut app,
+            &tx,
+            generation,
+            request,
+            expansion,
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![first, second]);
+    }
+
+    #[tokio::test]
     async fn context_menu_convert_custom_audio_directory_expands_to_convert_review_source() {
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
@@ -4916,6 +5320,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         let mut app = app_with_selected_audio_directory(&album, Some(output));
+        app.browse_context_action_paths = Some(vec![album.clone()]);
 
         execute_context_action(&mut app, ContextAction::ConvertLastUsed, &tx, false);
 
@@ -4930,7 +5335,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(pending.request.selection_owned_by_context_menu);
+        assert_eq!(pending.request.selection_snapshot, vec![album.clone()]);
         assert_eq!(app.current_screen, AppScreen::Browse);
+        app.browse_context_action_paths = None;
 
         let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
         crate::tui::command::handle_browse_convert_expansion_complete(

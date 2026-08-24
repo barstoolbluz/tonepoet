@@ -4685,6 +4685,13 @@ impl BrowseState {
         self.archive.is_some()
     }
 
+    /// Filesystem-free identity for the current navigation location inside an
+    /// open archive. Browse Convert ownership uses this to distinguish real
+    /// archive navigation from unrelated cursor/mark changes.
+    pub(crate) fn current_archive_inner_path(&self) -> Option<&str> {
+        self.archive.as_ref().map(|archive| archive.inner_path.as_str())
+    }
+
     fn rebuild_probe_cache_scan_identity_index(&mut self) {
         let mut index = HashMap::with_capacity(
             self.parent_entry.iter().count()

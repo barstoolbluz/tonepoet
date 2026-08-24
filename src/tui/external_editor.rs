@@ -3,12 +3,16 @@
 use std::path::Path;
 use std::process::Command;
 
-struct TuiRestoreGuard {
-    restore: bool,
+trait TuiTerminalBackend {
+    fn suspend(&self);
+    fn restore(&self);
 }
 
-impl TuiRestoreGuard {
-    fn suspend() -> Self {
+#[derive(Clone, Copy)]
+struct CrosstermTerminalBackend;
+
+impl TuiTerminalBackend for CrosstermTerminalBackend {
+    fn suspend(&self) {
         // Suspend TUI: restore normal terminal mode so the editor can run.
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
@@ -18,7 +22,47 @@ impl TuiRestoreGuard {
             crossterm::cursor::Show,
             crossterm::terminal::LeaveAlternateScreen,
         );
-        Self { restore: true }
+    }
+
+    fn restore(&self) {
+        // Restore TUI: re-enter raw mode and alternate screen.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::cursor::Hide,
+        );
+        let _ = crossterm::terminal::enable_raw_mode();
+
+        // Force a full redraw on the next frame by clearing the terminal.
+        // Without this, ratatui's diff-based rendering may leave artifacts
+        // from the editor's output.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        );
+    }
+}
+
+struct TuiRestoreGuard<B: TuiTerminalBackend = CrosstermTerminalBackend> {
+    backend: B,
+    restore: bool,
+}
+
+impl TuiRestoreGuard<CrosstermTerminalBackend> {
+    fn suspend() -> Self {
+        Self::suspend_with(CrosstermTerminalBackend)
+    }
+}
+
+impl<B: TuiTerminalBackend> TuiRestoreGuard<B> {
+    fn suspend_with(backend: B) -> Self {
+        backend.suspend();
+        Self {
+            backend,
+            restore: true,
+        }
     }
 
     fn restore_now(&mut self) {
@@ -26,36 +70,15 @@ impl TuiRestoreGuard {
             return;
         }
         self.restore = false;
-        restore_tui_terminal();
+        self.backend.restore();
     }
 }
 
-impl Drop for TuiRestoreGuard {
+impl<B: TuiTerminalBackend> Drop for TuiRestoreGuard<B> {
     fn drop(&mut self) {
         self.restore_now();
     }
 }
-
-fn restore_tui_terminal() {
-    // Restore TUI: re-enter raw mode and alternate screen.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
-        crossterm::cursor::Hide,
-    );
-    let _ = crossterm::terminal::enable_raw_mode();
-
-    // Force a full redraw on the next frame by clearing the terminal.
-    // Without this, ratatui's diff-based rendering may leave artifacts
-    // from the editor's output.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-    );
-}
-
 
 /// Remove stale per-process embedded-CUESHEET edit buffers left by crashed
 /// instances. Live and malformed process directories are retained: deletion is
@@ -104,8 +127,20 @@ pub fn scavenge_stale_embedded_cuesheet_edit_dirs() {
 /// (e.g., user killed it), or `Err` if no editor could be found.
 pub fn open_in_editor(path: &Path) -> Result<bool, String> {
     let editor_str = detect_editor()?;
-    let (program, args) = split_command(&editor_str);
+    open_in_editor_with_terminal(path, &editor_str, CrosstermTerminalBackend)
+}
 
+fn open_in_editor_with_terminal<B: TuiTerminalBackend>(
+    path: &Path,
+    editor_str: &str,
+    terminal: B,
+) -> Result<bool, String> {
+    let (program, args) = split_command(editor_str);
+
+    // Admission happens before terminal suspension so a busy file never tears
+    // down the TUI. Keep the parent-side guard alive for the complete editor
+    // lifetime; unlike the old supervised launch, no lease descriptor is ever
+    // duplicated into or exported to the child process.
     let claim = crate::concurrency::PathClaim::resolve(
         path,
         crate::concurrency::ClaimMode::Write,
@@ -118,141 +153,95 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
         .map(|claim| claim.identity.resolved_io_path.clone())
         .ok_or_else(|| "editor mutation admission produced no path claim".to_string())?;
 
-    let mut terminal_restore = TuiRestoreGuard::suspend();
+    // Validate and exact-open the executable before disturbing the terminal.
+    // The CLOEXEC handle stays parent-owned through spawn/status, just like the
+    // mutation claim, and is never exported to the editor.
+    let pinned = pin_editor_executable(program)
+        .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
 
-    // Run the editor, blocking until it exits. The terminal restore guard
-    // above intentionally survives this fallible spawn so early returns
-    // cannot leave the TUI suspended. Documented exemption from the
-    // subprocess stdin-nulling convention (see the sentinel test
-    // tests/subprocess_stdin_convention.rs): the user's $EDITOR needs the
-    // terminal — DELIBERATE stdin inheritance.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut terminal_restore = TuiRestoreGuard::suspend_with(terminal);
+
+    // An interactive editor is intentionally a normal foreground child. It
+    // inherits tonepoet's process group and terminal stdio, exactly like the
+    // proven read-only viewer path. Process-tree detachment is actively wrong
+    // here: a background process group cannot interact with the controlling
+    // terminal without SIGTTIN/SIGTTOU job-control stops.
+    //
+    // `_mutation_claim` is parent-owned RAII state and remains live across the
+    // blocking `status()` call. This preserves cross-session WRITE exclusion
+    // without exposing a lifetime descriptor to the editor.
+    let _mutation_claim = mutation_claim;
+    let status = run_foreground_interactive_editor(&pinned, &args, &admitted_path);
+
+    // Restore before interpreting the child's result, so even a spawn failure
+    // returns to a live TUI while the parent still owns the WRITE claim. A
+    // panic anywhere above is still covered by `TuiRestoreGuard::drop`.
+    terminal_restore.restore_now();
+    let status = status.map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
+    Ok(status.success())
+}
+
+struct PinnedEditorExecutable {
+    path: std::path::PathBuf,
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+fn pin_editor_executable(program: &str) -> Result<PinnedEditorExecutable, String> {
+    let path = resolve_editor_program(program)?;
+
+    #[cfg(unix)]
     {
-        let status = run_supervised_interactive_editor(program, &args, &admitted_path, mutation_claim)
-            .map_err(|e| format!("failed to run {}: {}", editor_str, e))?;
-        terminal_restore.restore_now();
-        Ok(status.success())
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| format!("open exact editor executable {}: {error}", path.display()))?;
+        if !file
+            .metadata()
+            .map_err(|error| format!("stat editor executable {}: {error}", path.display()))?
+            .is_file()
+        {
+            return Err(format!(
+                "editor executable is not a regular file: {}",
+                path.display()
+            ));
+        }
+        return Ok(PinnedEditorExecutable { path, _file: file });
     }
 
-    // Tonepoet's durable process-tree supervisor currently has production
-    // backends only on Linux and macOS. Refuse a mutation-capable external
-    // editor elsewhere rather than letting a third-party process outlive the
-    // only holder of the WRITE claim. The restore guard runs on this return.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(unix))]
     {
-        let _mutation_claim = mutation_claim;
-        Err(format!(
-            "failed to run {}: durable external-editor supervision is unavailable on this platform",
-            editor_str
-        ))
+        if !std::fs::metadata(&path)
+            .map_err(|error| format!("stat editor executable {}: {error}", path.display()))?
+            .is_file()
+        {
+            return Err(format!(
+                "editor executable is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Ok(PinnedEditorExecutable { path })
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_supervised_interactive_editor(
-    program: &str,
+fn run_foreground_interactive_editor(
+    pinned: &PinnedEditorExecutable,
     args: &[&str],
     path: &Path,
-    mutation_claim: crate::concurrency::MutationClaimGuard,
 ) -> Result<std::process::ExitStatus, String> {
-    use crate::convert::script_supervisor::{
-        run_supervised, ContainmentPreference, RuntimeDirectoryIdentity, SupervisedCommand,
-    };
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::sync::Arc;
-
-    let binary_path = resolve_editor_program(program)?;
-    let binary_file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&binary_path)
-        .map_err(|error| format!("open exact editor executable {}: {error}", binary_path.display()))?;
-    if !binary_file
-        .metadata()
-        .map_err(|error| format!("stat editor executable {}: {error}", binary_path.display()))?
-        .is_file()
-    {
-        return Err(format!("editor executable is not a regular file: {}", binary_path.display()));
-    }
-
-    let cwd = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| format!("resolve editor working directory: {error}"))?;
-    let cwd_file = std::fs::File::open(&cwd)
-        .map_err(|error| format!("open editor working directory {}: {error}", cwd.display()))?;
-
-    let runtime_base = std::env::temp_dir().join("tonepoet-interactive-editor-supervisor");
-    std::fs::create_dir_all(&runtime_base)
-        .map_err(|error| format!("create editor supervisor root: {error}"))?;
-    std::fs::set_permissions(&runtime_base, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("protect editor supervisor root: {error}"))?;
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let runtime_directory = runtime_base.join(&token);
-    std::fs::create_dir(&runtime_directory)
-        .map_err(|error| format!("create editor supervisor runtime: {error}"))?;
-    std::fs::set_permissions(&runtime_directory, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("protect editor supervisor runtime: {error}"))?;
-    let runtime_meta = std::fs::metadata(&runtime_directory)
-        .map_err(|error| format!("stat editor supervisor runtime: {error}"))?;
-
-    // Attach the contained editor to the controlling terminal while the TUI is
-    // suspended. The tonepoet helper receives these only as ordinary stdio;
-    // the mutation lease is a separate supervisor-retained CLOEXEC descriptor.
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|error| format!("open controlling terminal for editor: {error}"))?;
-    let stdin_file = Arc::new(tty.try_clone().map_err(|error| format!("clone editor stdin: {error}"))?);
-    let stdout_file = Arc::new(tty.try_clone().map_err(|error| format!("clone editor stdout: {error}"))?);
-    let stderr_file = Arc::new(tty);
-
-    let path_arg = path
-        .to_str()
-        .ok_or_else(|| format!("cannot safely supervise editor for non-UTF-8 path: {}", path.display()))?;
-    let mut invocation_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
-    invocation_args.push(path_arg.to_string());
-    let lease = Arc::new(mutation_claim.into_lease());
-    let retained = lease
-        .duplicate_lifetime_file()
-        .map_err(|error| format!("duplicate editor mutation lease: {error}"))?;
-    let invocation = SupervisedCommand {
-        token,
-        runtime_directory: runtime_directory.clone(),
-        script_file: Arc::new(binary_file),
-        working_directory_file: Arc::new(cwd_file),
-        script: binary_path,
-        args: invocation_args,
-        working_directory: cwd,
-        environment: std::env::vars().collect(),
-        // Interactive editors have no useful application timeout. Process-tree
-        // termination still follows cancellation/parent-loss containment.
-        timeout: std::time::Duration::from_secs(365 * 24 * 60 * 60),
-        runtime_identity: RuntimeDirectoryIdentity {
-            device: runtime_meta.dev(),
-            inode: runtime_meta.ino(),
-        },
-        containment_preference: ContainmentPreference::Auto,
-        helper_executable: None,
-        retained_lifetime_files: vec![retained],
-        stdin_file: Some(stdin_file),
-        stdout_file: Some(stdout_file),
-        stderr_file: Some(stderr_file),
-    };
-
-    let outcome = run_supervised(&invocation, || false, |_event| Ok(()))
-        .map_err(|error| error.to_string());
-    // Keep the parent-side claim holder alive until the helper has settled the
-    // complete contained process tree. The helper's duplicate is the authority
-    // if this parent dies first.
-    drop(lease);
-    if outcome.as_ref().is_ok_and(|result| result.containment_empty) {
-        let _ = std::fs::remove_dir_all(&runtime_directory);
-    }
-    outcome.map(|result| result.status)
+    // Keep the exact-open CLOEXEC handle alive through spawn/status. The child
+    // receives no claim or executable-pin descriptors; only inherited terminal
+    // stdio plus the ordinary argv path. DELIBERATE stdin inheritance: the
+    // foreground editor must own the interactive terminal.
+    Command::new(&pinned.path)
+        .args(args)
+        .arg(path)
+        .status()
+        .map_err(|error| error.to_string())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_editor_program(program: &str) -> Result<std::path::PathBuf, String> {
     let path = std::path::PathBuf::from(program);
     let candidate = if path.is_absolute() || path.components().count() > 1 {
@@ -435,31 +424,176 @@ fn which(cmd: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn editor_spawn_error_path_is_guarded_by_terminal_restore_drop() {
-        let source = include_str!("external_editor.rs");
-        let editor_fn = source
-            .split("pub fn open_in_editor")
-            .nth(1)
-            .expect("open_in_editor function")
-            .split("pub fn open_in_viewer")
-            .next()
-            .expect("open_in_editor body");
-        assert!(editor_fn.contains("TuiRestoreGuard::suspend()"));
-        assert!(editor_fn.contains("run_supervised_interactive_editor"));
-        assert!(editor_fn.contains("durable external-editor supervision is unavailable"));
-        assert!(editor_fn.contains("terminal_restore.restore_now();"));
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FakeTerminalState {
+        raw_mode: std::sync::atomic::AtomicBool,
+        alternate_screen: std::sync::atomic::AtomicBool,
+        suspend_count: std::sync::atomic::AtomicUsize,
+        restore_count: std::sync::atomic::AtomicUsize,
+    }
 
-        let viewer_fn = source
-            .split("fn run_read_only_command")
-            .nth(1)
-            .expect("read-only command runner")
-            .split("fn preferred_log_viewer_command")
-            .next()
-            .expect("read-only command runner body");
-        assert!(viewer_fn.contains("TuiRestoreGuard::suspend()"));
-        assert!(viewer_fn.contains(".map_err(|e| format!(\"failed to run {}: {}\", editor_str, e))?"));
-        assert!(viewer_fn.contains("terminal_restore.restore_now();"));
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct FakeTerminalBackend(std::sync::Arc<FakeTerminalState>);
+
+    #[cfg(unix)]
+    impl TuiTerminalBackend for FakeTerminalBackend {
+        fn suspend(&self) {
+            use std::sync::atomic::Ordering;
+            self.0.raw_mode.store(false, Ordering::SeqCst);
+            self.0.alternate_screen.store(false, Ordering::SeqCst);
+            self.0.suspend_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn restore(&self) {
+            use std::sync::atomic::Ordering;
+            self.0.raw_mode.store(true, Ordering::SeqCst);
+            self.0.alternate_screen.store(true, Ordering::SeqCst);
+            self.0.restore_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    fn executable_test_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write editor fixture");
+        let mut permissions = std::fs::metadata(path)
+            .expect("stat editor fixture")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod editor fixture");
+    }
+
+    #[cfg(unix)]
+    fn wait_for_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_editor_holds_write_claim_and_restores_terminal_after_signal_exit() {
+        use std::sync::atomic::Ordering;
+
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("notes.txt");
+        std::fs::write(&target, b"notes\n").expect("write target");
+        let editor = dir.path().join("editor.sh");
+        executable_test_script(
+            &editor,
+            r#"#!/bin/sh
+set -eu
+folder=$(dirname "$1")
+self_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+parent_pgid=$(ps -o pgid= -p "$PPID" | tr -d ' ')
+printf '%s %s\n' "$self_pgid" "$parent_pgid" > "$folder/pgids"
+: > "$folder/started"
+while [ ! -e "$folder/release" ]; do sleep 0.01; done
+kill -TERM $$
+"#,
+        );
+
+        let terminal_state = std::sync::Arc::new(FakeTerminalState::default());
+        terminal_state.raw_mode.store(true, Ordering::SeqCst);
+        terminal_state.alternate_screen.store(true, Ordering::SeqCst);
+        let terminal = FakeTerminalBackend(terminal_state.clone());
+        let thread_target = target.clone();
+        let editor_command = editor.to_string_lossy().into_owned();
+        let editor_thread = std::thread::spawn(move || {
+            open_in_editor_with_terminal(&thread_target, &editor_command, terminal)
+        });
+
+        wait_for_file(&dir.path().join("started"));
+        let pgids = std::fs::read_to_string(dir.path().join("pgids")).expect("read pgids");
+        let pgids: Vec<&str> = pgids.split_whitespace().collect();
+        assert_eq!(pgids.len(), 2);
+        assert_eq!(
+            pgids[0], pgids[1],
+            "interactive editor must inherit tonepoet's foreground process group"
+        );
+
+        let competing_claim = crate::concurrency::PathClaim::resolve(
+            &target,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("resolve competing claim");
+        let busy = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![competing_claim])
+            .expect_err("editor must keep the WRITE claim live while it runs");
+        assert!(busy.contains("live owner"), "unexpected busy error: {busy}");
+
+        std::fs::write(dir.path().join("release"), b"go").expect("release editor");
+        let result = editor_thread.join().expect("editor thread must not panic");
+        assert_eq!(result, Ok(false), "signal-killed editor is a clean false result");
+        assert!(terminal_state.raw_mode.load(Ordering::SeqCst));
+        assert!(terminal_state.alternate_screen.load(Ordering::SeqCst));
+        assert_eq!(terminal_state.suspend_count.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal_state.restore_count.load(Ordering::SeqCst), 1);
+
+        let released_claim = crate::concurrency::PathClaim::resolve(
+            &target,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+        )
+        .expect("resolve released claim");
+        crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![released_claim])
+            .expect("WRITE claim must release after editor exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_editor_restores_terminal_after_nonzero_and_spawn_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("notes.md");
+        std::fs::write(&target, b"notes\n").expect("write target");
+
+        let nonzero = dir.path().join("nonzero.sh");
+        executable_test_script(&nonzero, "#!/bin/sh\nexit 7\n");
+        let state = std::sync::Arc::new(FakeTerminalState::default());
+        state.raw_mode.store(true, Ordering::SeqCst);
+        state.alternate_screen.store(true, Ordering::SeqCst);
+        let result = open_in_editor_with_terminal(
+            &target,
+            &nonzero.to_string_lossy(),
+            FakeTerminalBackend(state.clone()),
+        );
+        assert_eq!(result, Ok(false));
+        assert!(state.raw_mode.load(Ordering::SeqCst));
+        assert!(state.alternate_screen.load(Ordering::SeqCst));
+
+        let unexecutable = dir.path().join("unexecutable.sh");
+        std::fs::write(&unexecutable, "#!/bin/sh\nexit 0\n").expect("write unexecutable");
+        let mut permissions = std::fs::metadata(&unexecutable)
+            .expect("stat unexecutable")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&unexecutable, permissions).expect("chmod unexecutable");
+
+        let spawn_state = std::sync::Arc::new(FakeTerminalState::default());
+        spawn_state.raw_mode.store(true, Ordering::SeqCst);
+        spawn_state.alternate_screen.store(true, Ordering::SeqCst);
+        let error = open_in_editor_with_terminal(
+            &target,
+            &unexecutable.to_string_lossy(),
+            FakeTerminalBackend(spawn_state.clone()),
+        )
+        .expect_err("non-executable regular file must fail at spawn");
+        assert!(error.contains("failed to run"), "unexpected error: {error}");
+        assert!(spawn_state.raw_mode.load(Ordering::SeqCst));
+        assert!(spawn_state.alternate_screen.load(Ordering::SeqCst));
     }
 
     #[test]

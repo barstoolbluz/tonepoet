@@ -5011,6 +5011,24 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 expansion,
             );
         }
+        AppMessage::BrowseCueInspectionComplete {
+            generation,
+            browse_scan_generation,
+            tab_id,
+            origin_dir,
+            folder,
+            result,
+        } => {
+            super::keybindings::handle_browse_cue_inspection_complete(
+                app,
+                generation,
+                browse_scan_generation,
+                tab_id,
+                origin_dir,
+                folder,
+                result,
+            );
+        }
         AppMessage::ProbeResult {
             generation,
             path,

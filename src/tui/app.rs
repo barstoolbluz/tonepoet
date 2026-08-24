@@ -5758,12 +5758,15 @@ pub enum CueSelectOperation {
     BrowseConvert {
         request: crate::tui::command::BrowseConvertExpansionRequest,
     },
+    /// Browse advanced chooser: store a session-persistent folder policy only;
+    /// no conversion or metadata operation is in flight.
+    BrowseOverride,
 }
 
 #[derive(Debug, Clone)]
 pub struct CueSelectState {
     pub parent: std::path::PathBuf,
-    pub candidates: Vec<std::path::PathBuf>,
+    pub rows: Vec<crate::convert::queue_expansion::QueueCueSelectionRow>,
     pub selected: usize,
     pub scroll: usize,
     pub operation: CueSelectOperation,
@@ -11332,6 +11335,13 @@ pub struct AppState {
     /// New source/queue requests cancel and replace this handle; completion
     /// reducers accept only the matching generation and request snapshot.
     pub pending_browse_convert_expansion: Option<PendingBrowseConvertExpansion>,
+    /// Session-persistent advanced CUE choices keyed by folder. Normal quiet
+    /// auto-selection remains the default for folders with no override.
+    pub cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides,
+    /// Last-request-wins ownership for explicit Browse "Advanced CUE choices"
+    /// inspection. This is intentionally separate from directory-scan ownership:
+    /// multiple inspections may target the same still-current directory.
+    pub browse_cue_inspection_generation: u64,
     pub preset: PresetState,
 
     // Browse screen state
@@ -12517,6 +12527,8 @@ impl AppState {
             probe_generation: 0,
             tui_tx: None,
             pending_browse_convert_expansion: None,
+            cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+            browse_cue_inspection_generation: 0,
             preset: PresetState::default(),
             browse,
             inline_metadata_write_generation: 0,
@@ -12706,6 +12718,37 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Cancel a pending Browse Convert only when a selection/navigation gesture
+    /// actually invalidates the request that is running. Context-menu requests
+    /// own a frozen target and therefore ignore unrelated cursor/mark changes
+    /// while their originating Browse location remains current. Live-selection
+    /// requests compare the effective selected path set against the request's
+    /// captured snapshot, so no-op gestures do not wastefully cancel work.
+    pub fn cancel_browse_convert_expansion_for_selection_change(&mut self) -> bool {
+        let should_cancel = self
+            .pending_browse_convert_expansion
+            .as_ref()
+            .is_some_and(|pending| {
+                if pending.request.selection_owned_by_context_menu {
+                    !(self.current_screen == AppScreen::Browse
+                        && self.browse.active_tab_id() == pending.request.browse_tab_id
+                        && self.browse.current_dir == pending.request.browse_directory
+                        && self.browse.current_archive_inner_path()
+                            == pending.request.browse_archive_inner_path.as_deref()
+                        && self.browse.scan_generation == pending.request.browse_scan_generation)
+                } else {
+                    !crate::tui::command::browse_convert_expansion_selection_still_current(
+                        self,
+                        &pending.request,
+                    )
+                }
+            });
+        if !should_cancel {
+            return false;
+        }
+        self.cancel_browse_convert_expansion_for_browse_change("browse selection changed")
     }
 
     pub fn begin_inline_metadata_write(
@@ -13485,19 +13528,15 @@ impl AppState {
             return;
         }
         if let Some(pending) = &self.pending_browse_convert_expansion {
-            let folder_count = pending
-                .request
-                .selection_snapshot
-                .iter()
-                .filter(|path| path.is_dir())
-                .count();
-            let label = if folder_count > 1 {
-                "selected folders"
+            let activity = if pending.request.cached_regular_folder_count > 1 {
+                "Expanding selected folders"
+            } else if pending.request.cached_regular_folder_count == 1 {
+                "Expanding folder"
             } else {
-                "folder"
+                "Preparing selected sources"
             };
             self.status_message = Some((
-                format!("Expanding {label}... Esc or navigation cancels"),
+                format!("{activity}... Esc or navigation cancels"),
                 std::time::Instant::now(),
             ));
             return;
@@ -19118,6 +19157,13 @@ mod browse_convert_expansion_lifecycle_tests {
                 post_load: crate::tui::command::BrowseConvertPostLoad::ReviewOnly,
             },
             selection_snapshot: vec![PathBuf::from(path)],
+            queue_input_paths: vec![PathBuf::from(path)],
+            selection_owned_by_context_menu: false,
+            browse_tab_id: 1,
+            browse_directory: PathBuf::new(),
+            browse_archive_inner_path: None,
+            browse_scan_generation: 0,
+            cached_regular_folder_count: 0,
             browse_in_archive: false,
             dropped_stale_selection_count: 0,
             cue_selection_overrides:
@@ -19169,13 +19215,13 @@ mod browse_convert_expansion_lifecycle_tests {
     }
 
     #[test]
-    fn browse_change_cancellation_cancels_pending_worker_token() {
+    fn live_selection_change_cancels_pending_browse_convert_worker() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let request = expansion_request("album");
         let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
 
         assert!(app.browse_convert_expansion_pending_for(generation, &request));
-        assert!(app.cancel_browse_convert_expansion_for_browse_change("browse selection changed"));
+        assert!(app.cancel_browse_convert_expansion_for_selection_change());
 
         assert!(cancel.is_cancelled());
         assert!(!app.browse_convert_expansion_pending_for(generation, &request));
@@ -19184,5 +19230,117 @@ mod browse_convert_expansion_lifecycle_tests {
             .as_ref()
             .map(|(message, _)| message.contains("browse selection changed"))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn unchanged_effective_live_selection_does_not_cancel_pending_browse_convert_worker() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = PathBuf::from("/music");
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            PathBuf::from("/music/album.flac"),
+            "album.flac".to_string(),
+            crate::convert::classify::EntryKind::AudioFile(
+                crate::convert::formats::AudioFormat::Flac,
+            ),
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        let mut request = expansion_request("/music/album.flac");
+        request.browse_tab_id = app.browse.active_tab_id();
+        request.browse_directory = app.browse.current_dir.clone();
+        request.browse_archive_inner_path = app
+            .browse
+            .current_archive_inner_path()
+            .map(str::to_owned);
+        request.browse_scan_generation = app.browse.scan_generation;
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        assert!(!app.cancel_browse_convert_expansion_for_selection_change());
+
+        assert!(!cancel.is_cancelled());
+        assert!(app.browse_convert_expansion_pending_for(generation, &request));
+    }
+
+    #[test]
+    fn context_owned_browse_convert_survives_unrelated_selection_change() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = PathBuf::from("/music");
+        app.browse.scan_generation = 41;
+        let mut request = expansion_request("/music/album-c");
+        request.selection_owned_by_context_menu = true;
+        request.browse_tab_id = app.browse.active_tab_id();
+        request.browse_directory = app.browse.current_dir.clone();
+        request.browse_archive_inner_path = app
+            .browse
+            .current_archive_inner_path()
+            .map(str::to_owned);
+        request.browse_scan_generation = app.browse.scan_generation;
+        request.cached_regular_folder_count = 1;
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        app.browse.multi_selected = vec![PathBuf::from("/music/unrelated-d.flac")];
+        assert!(!app.cancel_browse_convert_expansion_for_selection_change());
+
+        assert!(!cancel.is_cancelled());
+        assert!(app.browse_convert_expansion_pending_for(generation, &request));
+    }
+
+    #[test]
+    fn context_owned_browse_convert_selection_callback_still_cancels_after_navigation() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = PathBuf::from("/music");
+        app.browse.scan_generation = 7;
+        let mut request = expansion_request("/music/album-c");
+        request.selection_owned_by_context_menu = true;
+        request.browse_tab_id = app.browse.active_tab_id();
+        request.browse_directory = app.browse.current_dir.clone();
+        request.browse_archive_inner_path = app
+            .browse
+            .current_archive_inner_path()
+            .map(str::to_owned);
+        request.browse_scan_generation = app.browse.scan_generation;
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        app.browse.current_dir = PathBuf::from("/elsewhere");
+        app.browse.scan_generation = app.browse.scan_generation.wrapping_add(1);
+        assert!(app.cancel_browse_convert_expansion_for_selection_change());
+
+        assert!(cancel.is_cancelled());
+        assert!(!app.browse_convert_expansion_pending_for(generation, &request));
+    }
+
+    #[test]
+    fn explicit_cancel_still_cancels_context_owned_browse_convert() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let mut request = expansion_request("album-c");
+        request.selection_owned_by_context_menu = true;
+        request.browse_tab_id = app.browse.active_tab_id();
+        request.browse_directory = app.browse.current_dir.clone();
+        request.browse_archive_inner_path = app
+            .browse
+            .current_archive_inner_path()
+            .map(str::to_owned);
+        request.browse_scan_generation = app.browse.scan_generation;
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        assert!(app.cancel_browse_convert_expansion());
+        assert!(cancel.is_cancelled());
+        assert!(!app.browse_convert_expansion_pending_for(generation, &request));
+    }
+
+    #[test]
+    fn explicit_cancel_still_cancels_live_selection_owned_browse_convert() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let request = expansion_request("album-live");
+        let (generation, cancel) = app.begin_browse_convert_expansion(request.clone());
+
+        assert!(app.cancel_browse_convert_expansion());
+        assert!(cancel.is_cancelled());
+        assert!(!app.browse_convert_expansion_pending_for(generation, &request));
     }
 }

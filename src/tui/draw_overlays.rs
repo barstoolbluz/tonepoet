@@ -8563,7 +8563,7 @@ fn draw_cue_select(
         .max(48)
         .min(area.width.saturating_sub(2));
     let desired_height = state
-        .candidates
+        .rows
         .len()
         .saturating_add(7)
         .min(usize::from(u16::MAX)) as u16;
@@ -8583,10 +8583,15 @@ fn draw_cue_select(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("folder");
-    let block = super::draw::solid_title_block(popup, format!(" Choose CUE · {folder} "), theme.purple, theme);
+    let block = super::draw::solid_title_block(
+        popup,
+        format!(" Choose CUE · {folder} "),
+        theme.purple,
+        theme,
+    );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    if inner.height < 4 || state.candidates.is_empty() {
+    if inner.height < 4 || state.rows.is_empty() {
         return;
     }
 
@@ -8601,11 +8606,11 @@ fn draw_cue_select(
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "Multiple CUE files describe viable audio.",
+                "Choose how tonepoet should resolve this folder's CUE files.",
                 Style::default().fg(theme.text_bright),
             )),
             Line::from(Span::styled(
-                "Choose one for this operation; alternatives will not be merged.",
+                "Unavailable CUEs stay visible in gray with the rejection reason.",
                 theme.muted(),
             )),
         ]),
@@ -8613,26 +8618,43 @@ fn draw_cue_select(
     );
 
     let visible_height = chunks[1].height as usize;
-    let max_scroll = state.candidates.len().saturating_sub(visible_height);
+    let max_scroll = state.rows.len().saturating_sub(visible_height);
     let scroll = state.scroll.min(max_scroll).min(state.selected).max(
         state
             .selected
             .saturating_sub(visible_height.saturating_sub(1)),
     );
     let lines = state
-        .candidates
+        .rows
         .iter()
         .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|(index, path)| {
+        .map(|(index, row)| {
             let selected = index == state.selected;
-            let basename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_else(|| path.to_str().unwrap_or("(unrepresentable path)"));
             let prefix = if selected { "▸ " } else { "  " };
-            let style = if selected {
+            let mut label = row.label.clone();
+            if row.recommended {
+                label.push_str(" (recommended)");
+            }
+            if let Some(reason) = row.reason.as_deref() {
+                let verdict = match row.verdict {
+                    crate::convert::queue_expansion::QueueCueSelectionVerdict::Rejected => {
+                        "rejected"
+                    }
+                    _ => "unavailable",
+                };
+                label.push_str(&format!(" — {verdict}: {reason}"));
+            }
+
+            let style = if !row.selectable() {
+                let style = theme.muted().add_modifier(Modifier::DIM);
+                if selected {
+                    style.bg(theme.surface)
+                } else {
+                    style
+                }
+            } else if selected {
                 Style::default()
                     .fg(theme.text_bright)
                     .bg(theme.surface)
@@ -8649,21 +8671,27 @@ fn draw_cue_select(
                     1,
                 ),
             );
-            Line::from(Span::styled(format!("{prefix}{basename}"), style))
+            Line::from(Span::styled(format!("{prefix}{label}"), style))
         })
         .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
+    let selected_is_selectable = state
+        .rows
+        .get(state.selected)
+        .is_some_and(|row| row.selectable());
     let accept_label = " [Use selected] ";
     let cancel_label = " [Cancel] ";
+    let accept_style = if selected_is_selectable {
+        Style::default()
+            .fg(theme.green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted()
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                accept_label,
-                Style::default()
-                    .fg(theme.green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(accept_label, accept_style),
             Span::styled(
                 cancel_label,
                 Style::default()

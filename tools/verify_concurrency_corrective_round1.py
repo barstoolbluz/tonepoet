@@ -125,7 +125,35 @@ require("operator probe concurrency imports retained", "ClaimMode, ClaimScope, M
 require("operator descriptor-path accessor retained", "guard.lease().descriptor_path()" in file_task)
 require("operator recovery Debug arms retained", 'f.debug_tuple("FileRecoveryResume")' in command and 'f.debug_tuple("FileRecoveryDefer")' in command)
 require("operator sidecar visibility retained", "pub(super) fn sidecar_for_playlist" in command)
-require("operator retained Arc fix retained", "retained_lifetime_files: vec![retained]" in external_editor)
+require(
+    "interactive editor retains parent-side WRITE claim across foreground status",
+    all(
+        seam in external_editor
+        for seam in (
+            "MutationClaimGuard::acquire_ephemeral",
+            "let _mutation_claim = mutation_claim",
+            "pin_editor_executable",
+            "run_foreground_interactive_editor",
+            "terminal_restore.restore_now()",
+        )
+    ),
+)
+require(
+    "interactive editor no longer exports a mutation lease to a detached supervisor",
+    all(
+        seam not in external_editor
+        for seam in (
+            "mutation_claim.into_lease()",
+            "retained_lifetime_files: vec![retained]",
+            "run_supervised_interactive_editor",
+        )
+    ),
+)
+require(
+    "interactive editor exact executable pin retained",
+    "libc::O_CLOEXEC | libc::O_NOFOLLOW" in external_editor
+    and "editor executable is not a regular file" in external_editor,
+)
 require("operator unsafe annotations retained", "#[allow(unsafe_code)]" in streaming and "#[allow(unsafe_code)]" in tool)
 require(
     "operator containment fd fields retained",
