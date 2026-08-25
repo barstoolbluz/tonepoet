@@ -4,6 +4,12 @@ Running list of diagnosed-but-unfixed issues. Newest at the top. Each entry reco
 symptom, the root cause (with code anchors), and the intended fix direction — enough to
 hand to a reasoning-model brief without re-diagnosing.
 
+**Status sweep 2026-08-25:** every entry was re-verified against `main @ ec362ee` by reading the code
+path (not by grepping for absence — that method produced a false "open" on #7). Each issue carries a
+dated verification note; drifted anchors are corrected in those notes rather than rewritten in the
+bodies below, so the original diagnosis stays intact. **#1 and #9 are resolved; #7 is mostly
+resolved; the rest are open.**
+
 ---
 
 ## 1. Single-image (taggable) FLAC + sidecar CUE: metadata SAVE rewrites the multi-GB image and embeds a CUESHEET instead of writing the sidecar only
@@ -102,6 +108,8 @@ when the user edited a field that only lives in the image, not the CUE. A test (
 
 ## 2. Confirmation dialog is fixed-height (9 rows) — long recovery prompts clip their text and buttons
 
+> **Verified STILL OPEN 2026-08-25** (read, not grepped). `draw_confirmation` is now at `src/tui/draw_overlays.rs:1519`; the fixed height is `centered_rect(popup_w, 9, area)` at `:1532`. Width DOES adapt (`50.max(footer_w+4).min(area.width-2)`); height has no content measurement, the message `Paragraph` has `Wrap` but **no scroll offset** so overflow is clipped, and the buttons are a single `Constraint::Length(1)` row with no wrap. Anchor `:1428` in the text below has drifted.
+
 **Discovered:** 2026-08-09, on a startup archive-recovery prompt in a second tonepoet instance.
 
 **Symptom.** The startup "resume" prompt surfaces four buttons (`Y resume` / `N discard…` /
@@ -142,6 +150,8 @@ recovery; the second instance also had a pending archive session waiting.
 ---
 
 ## 3. `current_exe()`-deleted → cryptic ENOENT when a file op runs from a pre-rebuild TUI
+
+> **Verified STILL OPEN 2026-08-25** (read, not grepped). **Anchor correction:** `current_exe()` is at `src/tui/keybindings.rs:49710`, not `:44365` — and its `Err` arm (`:49712`) is **NOT** the failing path, because `current_exe()` *succeeds* on a deleted binary and returns `"<path> (deleted)"`. The real failure is downstream at `command.spawn()`, whose handler formats the raw `"start isolated file-task helper: {error}"` at **`:49753`**. No `(deleted)` detection and no un-suffixed-path fallback exist. Both fix directions unimplemented.
 
 **Discovered:** 2026-08-09, on a Ctrl+X (cut/move) in a stale tonepoet instance.
 
@@ -202,6 +212,8 @@ was rebuilt underneath it; relaunch tonepoet after any rebuild.
 
 ## 4. Metadata stage `tool timed out after 30s` on a large multi-track conversion
 
+> **Verified STILL OPEN 2026-08-25** (read, not grepped). **Sharper than filed:** the metadata dispatcher already tiers timeouts by binary (`stages.rs:6064-6067`) — **ffmpeg 60s, everything else 30s** — so metaflac/opustags/wvtag all get 30s while the FLAC art embed nearby gets 90s (`:6220`). The failing Donna Summer case is FLAC, i.e. **metaflac at 30s**. So this is not one fragile default but an ad-hoc 30/60/90 scheme in which the heaviest real-world path drew the shortest timeout. Still no scaling by source size and no config.
+
 **Discovered:** 2026-08-12, on a Donna Summer conversion. Likely explains an earlier failure of a
 7-LP Allman Brothers box-set conversion (a few weeks prior) — same class (large, many-track, heavy
 concurrent load).
@@ -251,6 +263,8 @@ the exact conversion) to name the precise tool + args.
 
 ## 5. DSD-to-PCM auto-gain inflates DC-bias readings and flips `negligible`→`significant` — the DC threshold is absolute (level-dependent), not a conversion defect
 
+> **Verified STILL OPEN 2026-08-25.** **Anchor correction:** the absolute classification is at `src/tui/draw_overlays.rs:4094` and `:4099` (not `:4093`/`:4098`). `analyze.rs:394` is still correct. Unchanged.
+
 **Discovered:** 2026-08-13, converting Charles Mingus *Blues & Roots* SACD → FLAC (SoX rate `-u`, DSD64→176.4k, DSD→32-bit int, DSD gain **auto**, margin 0.15 dB).
 
 **Symptom.** With DSD auto-gain **enabled**, every track's DC-bias reading rises and some flip to `significant!`; with auto-gain **disabled**, all read `negligible`. Consistent across bit depths, sample rates, and SoX quality (ultra/insane). The redbook CD of the same album reads `negligible`. Raising the auto-gain margin (0.15→0.5 dB) drops one problem track just under the line (0.000996) but doesn't eliminate the effect. Example (track 1): no-gain DC `0.000353` (peak −10.1 dBFS) → auto-gain DC `0.001114` **significant** (peak −0.1 dBFS); redbook DC `0.000706` negligible (peak −4.1 dBFS).
@@ -268,6 +282,8 @@ the exact conversion) to name the precise tool + args.
 ---
 
 ## 6. Cross-process DB init lock can time out during a schema migration under heavy concurrent load (self-recovering, no corruption)
+
+> **Verified STILL OPEN 2026-08-25.** Acquisition is still poll-based `fs2::FileExt::try_lock_exclusive` (`src/db.rs:714`, and a second site at `:981`), not a blocking `lock_exclusive`. **Anchor correction:** the timeout/message now live at `src/db.rs:725` under `DB_OPEN_INIT_LOCK_WAIT_LIMIT` (not `:322`-`326`), and the wording is `"timed out after {} ms waiting for {mode} database initialization lock <path>"`.
 
 **Discovered:** 2026-08-13, during the adversarial audit of the multi-value Phase-1 cross-session DB-open hardening (`src/db.rs`, committed on `hardening` @ `3ae33e5`). Not observed in the field — a code-review finding on the new lock path, filed for completeness.
 
@@ -316,6 +332,31 @@ migrating process polls, never finds a gap, and times out at 30 s.
 ---
 
 ## 7. File-task startup recovery auto-replays every pending operation with no prompt and no supersession
+
+> **MOSTLY RESOLVED — re-verified 2026-08-25 by reading the path (an earlier grep-based pass wrongly
+> called this fully open).**
+>
+> - **(b) auto-replay without a prompt — FIXED.** Recovered journals no longer enter the execution
+>   queue. They land in a separate `file_transfers.recovery_queued` **review** queue (`app.rs:12487`),
+>   drained only by explicit command: `:recovery-resume` moves one entry to `file_transfers.queued`
+>   (`keybindings.rs:44249-44255`), `:recovery-defer` removes one (`:44186-44190`); commands are
+>   `Command::FileRecoveryResume` / `FileRecoveryDefer` (`command.rs:3342`/`3344`, parsed at `:3876`).
+>   The startup status line enumerates them: *"N exact journal reconciliation job(s) await explicit
+>   review (use :recovery-resume [id] or :recovery-defer [id])"*. The filed symptom — everything
+>   replaying unasked — can no longer occur.
+> - **(4) journal GC — FIXED.** `retire_terminal_clean` (`file_task_runtime.rs:690`) deletes a journal
+>   only when it is `Completed | Reconciled` with no pending mappings, temp artifacts, quarantines or
+>   rename intents, and runs on the job-completion path after `child.wait()` (`keybindings.rs:49948`).
+>   This bounds the directory growth that had reached 101 journals.
+> - **(a) supersession — STILL OPEN.** No supersession logic exists in the file-task surface.
+>   Multiple journals for the same source+destination pair still each appear as their own review
+>   entry, so the reviewed list is not the minimal correct set. **Severity is much reduced** now that
+>   (b) is fixed: superseded entries no longer execute, they only clutter the review list and can be
+>   `:recovery-defer`red. Cosmetic/ergonomic residual, not the data hazard originally filed.
+>
+> **Anchor corrections:** `startup_file_task_recovery_inventory` is at `file_task_runtime.rs:1650`
+> (not `:1212`); `file_task_journal_dir` at `:1912` (not `:1309`); the `recoveries.last()` clipboard
+> special-case at `app.rs:12464` (not `:12367`).
 
 **Discovered:** 2026-08-13, restarting tonepoet after the several Ctrl+X cut/copy operations that
 had failed with the `current_exe()`-deleted helper-spawn error (issue #3). On relaunch, **all** of
@@ -375,6 +416,8 @@ chance to veto before the filesystem work begins.
 ---
 
 ## 8. Containerless / untaggable outputs (raw PCM, DFF, W64, raw AAC) handle metadata THREE inconsistent ways — need a unified policy
+
+> **Verified STILL OPEN 2026-08-25.** The grab-bag is intact: `w64` -> `MetadataError::PolicyRejected` (`stages.rs:6044`) and `_ => MetadataError::UnsupportedTagFormat` (`:6062`); no `StageOutcome::SkippedWithReason` unification. **Anchor corrections:** `metadata_tag_command` is at `stages.rs:6028` (not `:5386`); `MetadataPersistenceBackend::UnsupportedDff` at `metadata_persistence.rs:699`; `SkippedWithReason` at `types.rs:2776`. NOTE: the Phase-5 multi-value work added an RF64 metadata **fail-closed** policy, which commits that format toward reject-early rather than skip-and-label — reconcile with fix direction 1 before briefing.
 
 **Raised:** 2026-08-14 (reasoning-model observations during Phase-4 pipeline work — raw PCM, then DFF).
 
@@ -508,6 +551,8 @@ valid alternatives.
 
 ## 10. gnuDB lookup runs a synchronous CUE directory-scan + parse on the reducer thread (can block the TUI on slow/network folders)
 
+> **Verified STILL OPEN 2026-08-25** (read, not grepped). Confirmed precisely: inside the synchronous reducer fn `execute_gnudb_query(app: &mut AppState, ...)` (`src/tui/context_menu.rs:4221`), `collect_single_image_cue_infos_for_sources` (`:4256`) and `discover_multi_file_cues_for_sources` (`:4260`) both run **before** the `tokio::task::spawn_blocking` boundary at **`:4291`**. **Anchor correction:** `~4181-4188` has drifted to `:4256`/`:4260`.
+
 **Discovered:** 2026-08-17, during the two-source adversarial audit of the per-track multi-value work.
 **Pre-existing** — present verbatim at `b8d96d0`; **not** a regression from that work.
 
@@ -537,6 +582,8 @@ supported lookup sources"` message must stay immediate) and the operation-ID lif
 ---
 
 ## 11. Native FLAC metadata write refused on an sshfs-mounted, well-formed FLAC — message blames the file, but cause is likely an in-process leaked write-claim (partial diagnosis)
+
+> **Verified STILL OPEN 2026-08-25** — and still blocked on the same thing: it needs a field reproduction, which cannot be settled from source. **Useful finding:** nothing in the code truncates the diagnosis. `native_flac_write_refused_error` (`src/tui/probe.rs:13744`) embeds `{native_err}` verbatim inside its own sentence, so the lost text is whatever the **native FLAC writer** returned at one of the call sites `:11136`, `:13660`, `:17382`, `:17433` — the field truncation was the status-line surface, not the message. (An earlier session speculated the missing text was the journal rollback-marker message at `db.rs:4481`; that is a **separate** string with a different prefix and there is no evidence linking it here.)
 
 **Discovered:** 2026-08-17, field-test editing metadata on
 `~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/UK/1969 - Led Zeppelin (UK 1st Press Version 6 … Superhype Publishing)/Led Zeppelin I.flac` (a 1.9 GB 24/192 FLAC). **Partial diagnosis — needs the
