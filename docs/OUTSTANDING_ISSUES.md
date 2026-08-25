@@ -404,6 +404,44 @@ The key is a **single, predictable rule** across the family instead of today's g
 
 ## 9. Multi-cue folder chooser offers a structurally-unmaterializable CUE as an equal "viable" option; materialize then dead-ends with an opaque error
 
+> **✅ RESOLVED by `2b52c0a` ("Editor foreground fix + multi-CUE chooser + Browse-responsiveness async refactor"),
+> Part 2.** Re-corroborated against `main @ a675fef` (2026-08-25). Both gaps are closed:
+>
+> *(b) — the chooser no longer offers it as an equal option.* A probe-free **structural pre-screen** now runs at
+> selection time: `cross_file_cumulative_index_rejection` (`src/convert/split_cue_album.rs:1013`) compares exact
+> `INDEX 01` frame integers **at a resolved image boundary** and rejects a later image whose timeline continues
+> the previous one (`SplitCueMemberRejectionReason::CrossFileCumulativeIndex`, `:667`). It is deliberately narrow
+> and **fails open on any uncertainty**: it requires ≥2 tracks in the preceding image block, is strictly `>`, and
+> bails when track/audio/key counts disagree or an `INDEX 01` is missing. `inspect_split_cue_folder_members`
+> (`:976`) partitions candidates into `viable` / `rejected`, and the Browse "Advanced CUE choices…" prompt
+> (`context_menu.rs:1241` → `keybindings.rs:10774`) is built from that inspection, so a known-bad cue is surfaced
+> as rejected rather than as an equal choice. **Canonical member admission is intentionally unchanged** — copy-tags
+> and explicit-CUE consumers still see the same admitted member; only *folder* selection policy rejects.
+>
+> *(1) — the materialize-time error now explains the cause.* The boundary guard is retained as a backstop and its
+> message now names the mechanism (`materializer_cue.rs:2293`): "…the CUE's FILE-local timeline exceeds this image.
+> In a malformed multi-FILE CUE, a common cause is that later FILE sections use cumulative timestamps instead of
+> resetting for each image; try the per-disc CUEs if available".
+>
+> *(3) — folder expansion degrades instead of dead-ending.* `queue_expansion.rs:1029-1055` drops the malformed cue
+> and **preserves the surviving folder CUE set for automatic album assembly**, warning "Ignored malformed cumulative
+> multi-FILE CUE … Use CUE choices… from Browse to inspect or override the folder policy." An explicit user choice
+> is still honored (different wording, same drop). The `authoritative_failed_merged_groups` exception
+> (`queue_expansion.rs:1158`) keeps a redundant *superset* cue from failing closed a group that the per-side cues
+> already prove.
+>
+> Codified by passing tests: `cumulative_cross_file_timeline_is_rejected_only_by_folder_policy`
+> (`split_cue_album.rs:2168`), `cross_file_equal_index_is_not_rejected_by_strict_cumulative_screen` (`:2240`),
+> `single_track_previous_image_does_not_trigger_cumulative_screen` (`:2264`),
+> `cumulative_combined_superset_does_not_fail_closed_a_proven_per_side_album` (`queue_expansion.rs:3529`),
+> `only_cumulative_combined_cue_falls_back_to_audio_with_clear_warning` (`:4680`),
+> `genuine_overlap_ambiguity_keeps_cumulative_alternative_visible_but_rejected` (`:4712`),
+> `copy_tags_keeps_canonical_admission_for_cumulative_combined_cue` (`context_menu.rs:4795`),
+> `metadata_folder_open_drops_cumulative_combined_cue_and_keeps_per_side_surfaces` (`keybindings.rs:75139`).
+> Fix direction 4 ("avoid full probe-at-selection boundary validation") was honored — the screen is purely
+> structural. **The diagnosis below is retained for history but its anchors are now STALE (pre-`2b52c0a`); do not
+> implement from it.**
+
 **Discovered:** 2026-08-16, materializing a folder-selected album. Field case (kept for reproduction):
 `~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/JP/1975 - Physical Graffiti (Japan 1st Press Swan Song Records P-6317 8N)/`.
 
