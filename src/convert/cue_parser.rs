@@ -441,13 +441,328 @@ pub fn compose_cue_metadata_replacement(
         template_cuesheet,
         &desired,
         CueMetadataRewriteMode::PreserveAbsent,
+        None,
     )
+}
+
+/// Merge one synthetic Album-view projection into an existing embedded
+/// CUESHEET while preserving unsupported/unmodeled directives from the
+/// physical carrier. Modeled metadata and structural CUE provenance are owned
+/// by the Album projection: TRACK numbers are normalized by ordinal and
+/// FILE/INDEX geometry is projected from `replacement_cuesheet`.
+pub(crate) fn compose_cue_metadata_album_merge_replacement(
+    template_cuesheet: &str,
+    replacement_cuesheet: &str,
+    deletion_intent: &CueAlbumMetadataDeletionIntent,
+) -> Result<String, String> {
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, true)?;
+    let desired = explicit_cue_metadata(replacement_cuesheet);
+    if desired.tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+    let merged = rewrite_cue_metadata_text(
+        template_cuesheet,
+        &desired,
+        CueMetadataRewriteMode::AlbumMergeProjection,
+        Some(deletion_intent),
+    )?;
+    project_embedded_album_cue_geometry(&merged, replacement_cuesheet)
+}
+
+#[derive(Debug, Clone, Default)]
+struct EmbeddedCueTrackGeometry {
+    file_line: Option<usize>,
+    index00_line: Option<usize>,
+    index01_line: Option<usize>,
+}
+
+fn embedded_cue_geometry_layout(
+    lines: &[CueTextLine],
+) -> Result<Vec<EmbeddedCueTrackGeometry>, String> {
+    let mut tracks = Vec::<EmbeddedCueTrackGeometry>::new();
+    let mut current_track: Option<usize> = None;
+    let mut current_file_line: Option<usize> = None;
+    let mut ignored_track_block = false;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.body.trim();
+
+        if parse_file_line(trimmed).is_some() {
+            current_file_line = Some(idx);
+            ignored_track_block = false;
+            // Mirror `parse_cue`: a FILE after TRACK but before INDEX 01 is
+            // the active file for that track in the noncompliant pregap form.
+            if let Some(track_idx) = current_track {
+                if tracks
+                    .get(track_idx)
+                    .is_some_and(|track| track.index01_line.is_none())
+                {
+                    tracks[track_idx].file_line = current_file_line;
+                }
+            }
+            continue;
+        }
+
+        if let Some((_number, is_audio)) = parse_track_header(trimmed) {
+            if is_audio {
+                tracks.push(EmbeddedCueTrackGeometry {
+                    file_line: current_file_line,
+                    ..Default::default()
+                });
+                current_track = Some(tracks.len() - 1);
+                ignored_track_block = false;
+            } else {
+                current_track = None;
+                ignored_track_block = true;
+            }
+            continue;
+        }
+
+        if ignored_track_block {
+            continue;
+        }
+
+        let Some(track_idx) = current_track else {
+            continue;
+        };
+        let Some(index_rest) = strip_keyword_ci(trimmed, "INDEX") else {
+            continue;
+        };
+        let mut parts = index_rest.split_whitespace();
+        let Some(index_number) = parts.next() else {
+            continue;
+        };
+        if !matches!(index_number, "00" | "01") {
+            continue;
+        }
+        let Some(timestamp) = parts.next() else {
+            return Err(format!(
+                "embedded CUESHEET has INDEX {index_number} without a timestamp; carrier left unchanged"
+            ));
+        };
+        if parse_cue_timestamp(timestamp).is_none() {
+            return Err(format!(
+                "embedded CUESHEET has invalid INDEX {index_number} timestamp; carrier left unchanged"
+            ));
+        }
+        let slot = match index_number {
+            "00" => &mut tracks[track_idx].index00_line,
+            "01" => &mut tracks[track_idx].index01_line,
+            _ => unreachable!(),
+        };
+        if slot.replace(idx).is_some() {
+            return Err(format!(
+                "embedded CUESHEET has duplicate INDEX {index_number} in one audio track; carrier left unchanged"
+            ));
+        }
+    }
+
+    Ok(tracks)
+}
+
+fn embedded_cue_file_group_shape(
+    tracks: &[EmbeddedCueTrackGeometry],
+) -> Result<Vec<usize>, String> {
+    let mut groups = std::collections::BTreeMap::<usize, usize>::new();
+    let mut next_group = 0usize;
+    let mut shape = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let line = track.file_line.ok_or_else(|| {
+            "embedded CUESHEET audio track has no FILE association; carrier left unchanged"
+                .to_string()
+        })?;
+        let group = *groups.entry(line).or_insert_with(|| {
+            let group = next_group;
+            next_group += 1;
+            group
+        });
+        shape.push(group);
+    }
+    Ok(shape)
+}
+
+fn structural_line_with_template_indent(template: &str, desired: &str) -> String {
+    format!("{}{}", leading_indent(template), desired.trim_start())
+}
+
+fn project_embedded_album_cue_geometry(
+    template_cuesheet: &str,
+    replacement_cuesheet: &str,
+) -> Result<String, String> {
+    let lines = split_cue_lines_preserving_eol(template_cuesheet);
+    let desired_lines = split_cue_lines_preserving_eol(replacement_cuesheet);
+    let tracks = embedded_cue_geometry_layout(&lines)?;
+    let desired_tracks = embedded_cue_geometry_layout(&desired_lines)?;
+    if tracks.len() != desired_tracks.len() {
+        return Err(format!(
+            "embedded CUESHEET has {} audio tracks but replacement CUESHEET has {}; carrier left unchanged",
+            tracks.len(),
+            desired_tracks.len()
+        ));
+    }
+    if tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+
+    let template_shape = embedded_cue_file_group_shape(&tracks)?;
+    let desired_shape = embedded_cue_file_group_shape(&desired_tracks)?;
+    if template_shape != desired_shape {
+        return Err(
+            "embedded CUESHEET FILE grouping is incompatible with the Album-view projection; carrier left unchanged"
+                .to_string(),
+        );
+    }
+
+    let mut replacements = std::collections::BTreeMap::<usize, String>::new();
+    let mut deletions = std::collections::BTreeSet::<usize>::new();
+    let mut insert_before = std::collections::BTreeMap::<usize, Vec<String>>::new();
+
+    for (track, desired_track) in tracks.iter().zip(desired_tracks.iter()) {
+        let template_file_idx = track.file_line.ok_or_else(|| {
+            "embedded CUESHEET audio track has no FILE association; carrier left unchanged"
+                .to_string()
+        })?;
+        let desired_file_idx = desired_track.file_line.ok_or_else(|| {
+            "replacement CUESHEET audio track has no FILE association; carrier left unchanged"
+                .to_string()
+        })?;
+        let projected_file = structural_line_with_template_indent(
+            &lines[template_file_idx].body,
+            &desired_lines[desired_file_idx].body,
+        );
+        if let Some(existing) = replacements.get(&template_file_idx) {
+            if existing != &projected_file {
+                return Err(
+                    "embedded CUESHEET FILE grouping cannot represent the Album-view projection; carrier left unchanged"
+                        .to_string(),
+                );
+            }
+        } else {
+            replacements.insert(template_file_idx, projected_file);
+        }
+
+        match (track.index00_line, desired_track.index00_line) {
+            (Some(template_idx), Some(desired_idx)) => {
+                replacements.insert(
+                    template_idx,
+                    structural_line_with_template_indent(
+                        &lines[template_idx].body,
+                        &desired_lines[desired_idx].body,
+                    ),
+                );
+            }
+            (Some(template_idx), None) => {
+                deletions.insert(template_idx);
+            }
+            (None, Some(desired_idx)) => {
+                let index01_idx = track.index01_line.ok_or_else(|| {
+                    "embedded CUESHEET audio track has no INDEX 01 insertion anchor; carrier left unchanged"
+                        .to_string()
+                })?;
+                insert_before.entry(index01_idx).or_default().push(
+                    structural_line_with_template_indent(
+                        &lines[index01_idx].body,
+                        &desired_lines[desired_idx].body,
+                    ),
+                );
+            }
+            (None, None) => {}
+        }
+
+        let template_index01 = track.index01_line.ok_or_else(|| {
+            "embedded CUESHEET audio track has no INDEX 01; carrier left unchanged".to_string()
+        })?;
+        let desired_index01 = desired_track.index01_line.ok_or_else(|| {
+            "replacement CUESHEET audio track has no INDEX 01; carrier left unchanged".to_string()
+        })?;
+        replacements.insert(
+            template_index01,
+            structural_line_with_template_indent(
+                &lines[template_index01].body,
+                &desired_lines[desired_index01].body,
+            ),
+        );
+    }
+
+    let default_eol = dominant_eol(&lines);
+    let mut output = String::with_capacity(template_cuesheet.len());
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(insertions) = insert_before.get(&idx) {
+            let eol = if line.eol.is_empty() {
+                default_eol
+            } else {
+                line.eol.as_str()
+            };
+            for body in insertions {
+                output.push_str(body);
+                output.push_str(eol);
+            }
+        }
+        if deletions.contains(&idx) {
+            continue;
+        }
+        output.push_str(
+            replacements
+                .get(&idx)
+                .map(String::as_str)
+                .unwrap_or(line.body.as_str()),
+        );
+        output.push_str(&line.eol);
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CueMetadataRewriteMode {
     PreserveAbsent,
+    /// Preserve absent physical-side metadata like `PreserveAbsent`, while
+    /// also projecting track ISRC when the Album view supplies it. Explicit
+    /// clears are carried separately as field-scoped deletion intent.
+    AlbumMergeProjection,
     AuthoritativeProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CueAlbumMetadataField {
+    Title,
+    Performer,
+    Date,
+    Genre,
+    Catalog,
+    Isrc,
+}
+
+/// Exact editor-owned fields the synthetic Album view deliberately cleared.
+///
+/// Track keys use the Album-view projection's desired side-local TRACK number.
+/// AlbumMergeProjection may be normalizing an existing physical 05..08 side to
+/// 01..04, so deletion matching must follow the desired number rather than the
+/// stale header token. Keeping deletion intent separate from the generated
+/// replacement CUESHEET is important: an
+/// absent field can mean either "the Album view never modeled this" (preserve)
+/// or "the user explicitly cleared this" (delete).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CueAlbumMetadataDeletionIntent {
+    pub(crate) album_fields: std::collections::BTreeSet<CueAlbumMetadataField>,
+    pub(crate) track_fields:
+        std::collections::BTreeMap<u32, std::collections::BTreeSet<CueAlbumMetadataField>>,
+}
+
+impl CueAlbumMetadataDeletionIntent {
+    fn requests(
+        &self,
+        album_scope: bool,
+        track_number: Option<u32>,
+        field: CueAlbumMetadataField,
+    ) -> bool {
+        if album_scope {
+            self.album_fields.contains(&field)
+        } else {
+            track_number
+                .and_then(|number| self.track_fields.get(&number))
+                .is_some_and(|fields| fields.contains(&field))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +825,7 @@ pub fn rewrite_cue_sidecar_metadata_from_cuesheet(
         replacement_cuesheet,
         |_raw, _decoded| Ok(()),
         CueMetadataRewriteMode::PreserveAbsent,
+        None,
     )
 }
 
@@ -525,6 +841,26 @@ pub fn rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
         replacement_cuesheet,
         |_raw, _decoded| Ok(()),
         CueMetadataRewriteMode::AuthoritativeProjection,
+        None,
+    )
+}
+
+/// Merge one synthetic Album-view side back into an existing physical CUE.
+///
+/// Ordinary Album-view saves preserve physical-side metadata that the
+/// synthetic sheet did not model. Only an explicit user clear/delete opts into
+/// authoritative deletion semantics for editor-owned fields.
+pub(crate) fn rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+    deletion_intent: &CueAlbumMetadataDeletionIntent,
+) -> Result<CueSidecarWritebackOutcome, String> {
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode(
+        cue_path,
+        replacement_cuesheet,
+        |_raw, _decoded| Ok(()),
+        CueMetadataRewriteMode::AlbumMergeProjection,
+        Some(deletion_intent),
     )
 }
 
@@ -639,6 +975,7 @@ where
         replacement_cuesheet,
         validate_snapshot,
         CueMetadataRewriteMode::PreserveAbsent,
+        None,
     )
 }
 
@@ -647,6 +984,7 @@ fn rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode<F>(
     replacement_cuesheet: &str,
     validate_snapshot: F,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
 ) -> Result<CueSidecarWritebackOutcome, String>
 where
     F: FnOnce(&[u8], &str) -> Result<(), String>,
@@ -669,7 +1007,13 @@ where
         return Err("replacement CUESHEET has no audio tracks".to_string());
     }
 
-    let rewrite = rewrite_cue_metadata_preserving_bytes(&raw, &decoded, &desired, mode)?;
+    let rewrite = rewrite_cue_metadata_preserving_bytes(
+        &raw,
+        &decoded,
+        &desired,
+        mode,
+        deletion_intent,
+    )?;
     let (bytes, encoding_outcome) = match rewrite {
         CueByteRewrite::Unchanged => {
             if mode == CueMetadataRewriteMode::AuthoritativeProjection {
@@ -897,6 +1241,7 @@ struct CueMetadataLayout {
 #[derive(Debug, Clone, Default)]
 struct CueScopeLayout {
     track_number: Option<u32>,
+    track_header: Option<usize>,
     title: Option<usize>,
     performer: Option<usize>,
     songwriter: Option<usize>,
@@ -912,6 +1257,7 @@ struct CueScopeLayout {
 fn pair_cue_track_metadata<'a>(
     layout_tracks: &'a [CueScopeLayout],
     desired_tracks: &'a [ExplicitCueScopeMetadata],
+    mode: CueMetadataRewriteMode,
 ) -> Result<Vec<(&'a CueScopeLayout, &'a ExplicitCueScopeMetadata)>, String> {
     if layout_tracks.len() != desired_tracks.len() {
         return Err(format!(
@@ -935,6 +1281,24 @@ fn pair_cue_track_metadata<'a>(
     }
 
     let mut seen_layout_numbers = std::collections::BTreeSet::new();
+    if mode == CueMetadataRewriteMode::AlbumMergeProjection {
+        for layout in layout_tracks {
+            let number = layout.track_number.ok_or_else(|| {
+                "sidecar CUE audio track has no track number; sidecar left unchanged".to_string()
+            })?;
+            if !seen_layout_numbers.insert(number) {
+                return Err(format!(
+                    "sidecar CUE has duplicate audio track number {number}; sidecar left unchanged"
+                ));
+            }
+        }
+        // Album-view partitions have already fixed physical-side order. Pair
+        // by that ordinal order so a side authored as TRACK 05..08 can be
+        // normalized to local TRACK 01..04 without rebuilding FILE/INDEX
+        // structure or weakening the generic number-keyed writer semantics.
+        return Ok(layout_tracks.iter().zip(desired_tracks.iter()).collect());
+    }
+
     let mut paired = Vec::with_capacity(layout_tracks.len());
     for layout in layout_tracks {
         let number = layout.track_number.ok_or_else(|| {
@@ -1029,6 +1393,7 @@ fn rewrite_cue_metadata_text(
     original_text: &str,
     desired: &ExplicitCueMetadata,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
 ) -> Result<String, String> {
     let lines = split_cue_lines_preserving_eol(original_text);
     let layout = cue_metadata_layout(&lines);
@@ -1054,11 +1419,28 @@ fn rewrite_cue_metadata_text(
         &mut album_insertions,
         true,
         mode,
+        deletion_intent,
+        None,
     )?;
 
     for (track_layout, desired_track) in
-        pair_cue_track_metadata(&layout.tracks, &desired.tracks)?
+        pair_cue_track_metadata(&layout.tracks, &desired.tracks, mode)?
     {
+        if mode == CueMetadataRewriteMode::AlbumMergeProjection
+            && track_layout.track_number != desired_track.track_number
+        {
+            let desired_number = desired_track.track_number.ok_or_else(|| {
+                "replacement CUESHEET audio track has no track number; sidecar left unchanged"
+                    .to_string()
+            })?;
+            let header_idx = track_layout.track_header.ok_or_else(|| {
+                "internal error: CUE track metadata layout missing TRACK header".to_string()
+            })?;
+            replacements.insert(
+                header_idx,
+                rewrite_track_header_number(&lines[header_idx].body, desired_number)?,
+            );
+        }
         let mut insertions = Vec::new();
         queue_scope_metadata_edits(
             &lines,
@@ -1069,6 +1451,8 @@ fn rewrite_cue_metadata_text(
             &mut insertions,
             false,
             mode,
+            deletion_intent,
+            desired_track.track_number,
         )?;
         if !insertions.is_empty() {
             let insert_after = track_layout.insert_after.ok_or_else(|| {
@@ -1149,6 +1533,7 @@ fn rewrite_cue_metadata_preserving_bytes(
     decoded: &DecodedCueForWrite,
     desired: &ExplicitCueMetadata,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
 ) -> Result<CueByteRewrite, String> {
     if !encoding_supports_ascii_byte_span_rewrite(decoded.encoding) {
         return rewrite_cue_metadata_by_text_reencode(
@@ -1156,6 +1541,7 @@ fn rewrite_cue_metadata_preserving_bytes(
             desired,
             decoded.encoding,
             mode,
+            deletion_intent,
         );
     }
 
@@ -1192,12 +1578,29 @@ fn rewrite_cue_metadata_preserving_bytes(
         &mut album_insertions,
         true,
         mode,
+        deletion_intent,
+        None,
         &mut need_utf8_fallback,
     )?;
 
     for (track_layout, desired_track) in
-        pair_cue_track_metadata(&layout.tracks, &desired.tracks)?
+        pair_cue_track_metadata(&layout.tracks, &desired.tracks, mode)?
     {
+        if mode == CueMetadataRewriteMode::AlbumMergeProjection
+            && track_layout.track_number != desired_track.track_number
+        {
+            let desired_number = desired_track.track_number.ok_or_else(|| {
+                "replacement CUESHEET audio track has no track number; sidecar left unchanged"
+                    .to_string()
+            })?;
+            let header_idx = track_layout.track_header.ok_or_else(|| {
+                "internal error: CUE track metadata layout missing TRACK header".to_string()
+            })?;
+            replacements.insert(
+                header_idx,
+                rewrite_track_header_number_bytes(&raw_lines[header_idx], desired_number)?,
+            );
+        }
         let mut insertions = Vec::new();
         queue_scope_metadata_byte_edits(
             &raw_lines,
@@ -1209,6 +1612,8 @@ fn rewrite_cue_metadata_preserving_bytes(
             &mut insertions,
             false,
             mode,
+            deletion_intent,
+            desired_track.track_number,
             &mut need_utf8_fallback,
         )?;
         if !insertions.is_empty() {
@@ -1220,7 +1625,8 @@ fn rewrite_cue_metadata_preserving_bytes(
     }
 
     if need_utf8_fallback {
-        let rewritten_text = rewrite_cue_metadata_text(&decoded.text, desired, mode)?;
+        let rewritten_text =
+            rewrite_cue_metadata_text(&decoded.text, desired, mode, deletion_intent)?;
         if rewritten_text == decoded.text {
             return Ok(CueByteRewrite::Unchanged);
         }
@@ -1285,8 +1691,9 @@ fn rewrite_cue_metadata_by_text_reencode(
     desired: &ExplicitCueMetadata,
     source_encoding: CueWriteEncoding,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
 ) -> Result<CueByteRewrite, String> {
-    let rewritten = rewrite_cue_metadata_text(original_text, desired, mode)?;
+    let rewritten = rewrite_cue_metadata_text(original_text, desired, mode, deletion_intent)?;
     if rewritten == original_text {
         return Ok(CueByteRewrite::Unchanged);
     }
@@ -1389,9 +1796,21 @@ fn queue_scope_metadata_byte_edits(
     insertions: &mut Vec<Vec<u8>>,
     album_scope: bool,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
+    deletion_track_number: Option<u32>,
     need_utf8_fallback: &mut bool,
 ) -> Result<(), String> {
     let authoritative = mode == CueMetadataRewriteMode::AuthoritativeProjection;
+    let field_authoritative = |field| {
+        authoritative
+            || deletion_intent.is_some_and(|intent| {
+                intent.requests(
+                    album_scope,
+                    deletion_track_number.or(layout.track_number),
+                    field,
+                )
+            })
+    };
     if authoritative {
         deletions.extend(layout.authoritative_duplicates.iter().copied());
     }
@@ -1405,7 +1824,7 @@ fn queue_scope_metadata_byte_edits(
         replacements,
         deletions,
         insertions,
-        authoritative,
+        field_authoritative(CueAlbumMetadataField::Title),
         need_utf8_fallback,
     )?;
     queue_quoted_metadata_byte_edit(
@@ -1418,7 +1837,7 @@ fn queue_scope_metadata_byte_edits(
         replacements,
         deletions,
         insertions,
-        authoritative,
+        field_authoritative(CueAlbumMetadataField::Performer),
         need_utf8_fallback,
     )?;
     if !authoritative {
@@ -1437,7 +1856,9 @@ fn queue_scope_metadata_byte_edits(
         )?;
     }
 
-    if !album_scope && authoritative {
+    if !album_scope
+        && (authoritative || mode == CueMetadataRewriteMode::AlbumMergeProjection)
+    {
         queue_plain_metadata_byte_edit(
             lines,
             layout.isrc,
@@ -1448,7 +1869,7 @@ fn queue_scope_metadata_byte_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Isrc),
             need_utf8_fallback,
         )?;
     }
@@ -1464,7 +1885,7 @@ fn queue_scope_metadata_byte_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Date),
             need_utf8_fallback,
         )?;
         queue_rem_metadata_byte_edit(
@@ -1477,7 +1898,7 @@ fn queue_scope_metadata_byte_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Genre),
             need_utf8_fallback,
         )?;
         queue_plain_metadata_byte_edit(
@@ -1490,7 +1911,7 @@ fn queue_scope_metadata_byte_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Catalog),
             need_utf8_fallback,
         )?;
     }
@@ -1840,8 +2261,20 @@ fn queue_scope_metadata_edits(
     insertions: &mut Vec<String>,
     album_scope: bool,
     mode: CueMetadataRewriteMode,
+    deletion_intent: Option<&CueAlbumMetadataDeletionIntent>,
+    deletion_track_number: Option<u32>,
 ) -> Result<(), String> {
     let authoritative = mode == CueMetadataRewriteMode::AuthoritativeProjection;
+    let field_authoritative = |field| {
+        authoritative
+            || deletion_intent.is_some_and(|intent| {
+                intent.requests(
+                    album_scope,
+                    deletion_track_number.or(layout.track_number),
+                    field,
+                )
+            })
+    };
     if authoritative {
         deletions.extend(layout.authoritative_duplicates.iter().copied());
     }
@@ -1854,7 +2287,7 @@ fn queue_scope_metadata_edits(
         replacements,
         deletions,
         insertions,
-        authoritative,
+        field_authoritative(CueAlbumMetadataField::Title),
     )?;
     queue_quoted_metadata_edit(
         lines,
@@ -1865,7 +2298,7 @@ fn queue_scope_metadata_edits(
         replacements,
         deletions,
         insertions,
-        authoritative,
+        field_authoritative(CueAlbumMetadataField::Performer),
     )?;
     if !authoritative {
         queue_quoted_metadata_edit(
@@ -1881,7 +2314,9 @@ fn queue_scope_metadata_edits(
         )?;
     }
 
-    if !album_scope && authoritative {
+    if !album_scope
+        && (authoritative || mode == CueMetadataRewriteMode::AlbumMergeProjection)
+    {
         queue_plain_metadata_edit(
             lines,
             layout.isrc,
@@ -1891,7 +2326,7 @@ fn queue_scope_metadata_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Isrc),
         )?;
     }
 
@@ -1905,7 +2340,7 @@ fn queue_scope_metadata_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Date),
         )?;
         queue_rem_metadata_edit(
             lines,
@@ -1916,7 +2351,7 @@ fn queue_scope_metadata_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Genre),
         )?;
         queue_plain_metadata_edit(
             lines,
@@ -1927,7 +2362,7 @@ fn queue_scope_metadata_edits(
             replacements,
             deletions,
             insertions,
-            authoritative,
+            field_authoritative(CueAlbumMetadataField::Catalog),
         )?;
     }
 
@@ -2064,6 +2499,7 @@ fn cue_metadata_layout(lines: &[CueTextLine]) -> CueMetadataLayout {
             if is_audio {
                 layout.tracks.push(CueScopeLayout {
                     track_number: Some(number),
+                    track_header: Some(idx),
                     insert_after: Some(idx),
                     indent: Some(child_indent_for_track_line(&line.body)),
                     ..Default::default()
@@ -2742,6 +3178,79 @@ fn parse_track_header(line: &str) -> Option<(u32, bool)> {
     Some((number, mode.eq_ignore_ascii_case("AUDIO")))
 }
 
+fn cue_track_number_span(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && is_ascii_cue_whitespace(bytes[idx]) {
+        idx += 1;
+    }
+    let keyword_end = idx.checked_add(5)?;
+    if keyword_end > bytes.len()
+        || !bytes[idx..keyword_end].eq_ignore_ascii_case(b"TRACK")
+    {
+        return None;
+    }
+    idx = keyword_end;
+    if idx >= bytes.len() || !is_ascii_cue_whitespace(bytes[idx]) {
+        return None;
+    }
+    idx = skip_ascii_whitespace(bytes, idx);
+    let number_start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == number_start {
+        return None;
+    }
+    Some((number_start, idx))
+}
+
+fn rewrite_track_header_number(line: &str, desired_number: u32) -> Result<String, String> {
+    if desired_number == 0 || desired_number > 99 {
+        return Err(format!(
+            "replacement CUESHEET TRACK number {desired_number} is outside 01..99; sidecar left unchanged"
+        ));
+    }
+    let (start, end) = cue_track_number_span(line).ok_or_else(|| {
+        "sidecar CUE TRACK header could not be rewritten safely; sidecar left unchanged"
+            .to_string()
+    })?;
+    let mut rewritten = String::with_capacity(line.len().saturating_add(2));
+    rewritten.push_str(&line[..start]);
+    rewritten.push_str(&format!("{desired_number:02}"));
+    rewritten.push_str(&line[end..]);
+    Ok(rewritten)
+}
+
+fn rewrite_track_header_number_bytes(
+    line: &CueRawLine,
+    desired_number: u32,
+) -> Result<Vec<u8>, String> {
+    if desired_number == 0 || desired_number > 99 {
+        return Err(format!(
+            "replacement CUESHEET TRACK number {desired_number} is outside 01..99; sidecar left unchanged"
+        ));
+    }
+    let (start, end) = cue_track_number_span(&line.text_body).ok_or_else(|| {
+        "sidecar CUE TRACK header could not be rewritten safely; sidecar left unchanged"
+            .to_string()
+    })?;
+    if end > line.body.len()
+        || !line.body[start..end].iter().all(u8::is_ascii_digit)
+    {
+        return Err(
+            "sidecar CUE TRACK header byte span is inconsistent; sidecar left unchanged"
+                .to_string(),
+        );
+    }
+    let replacement = format!("{desired_number:02}");
+    let mut rewritten = Vec::with_capacity(line.body.len().saturating_add(2));
+    rewritten.extend_from_slice(&line.body[..start]);
+    rewritten.extend_from_slice(replacement.as_bytes());
+    rewritten.extend_from_slice(&line.body[end..]);
+    Ok(rewritten)
+}
+
 /// Parse a line like `TITLE "Some Title"` or `PERFORMER "Name"`.
 fn parse_quoted_field(line: &str, keyword: &str) -> Option<String> {
     let rest = strip_keyword_ci(line, keyword)?.trim_start();
@@ -3114,6 +3623,342 @@ FILE \"different-generated-name.flac\" FLAC\n\
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn album_merge_sidecar_writeback_updates_exposed_fields_without_pruning_unmodeled_directives() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("album_merge_sidecar_preserve_absent");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "REM COMMENT keep provenance\r\n",
+            "REM DISCID DEADBEEF\r\n",
+            "REM DATE 1973\r\n",
+            "TITLE \"Physical Side\"\r\n",
+            "FILE \"side.flac\" FLAC\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"Old Track\"\r\n",
+            "    SONGWRITER \"Keep Writer\"\r\n",
+            "    ISRC OLD000000001\r\n",
+            "    FLAGS PRE\r\n",
+            "    INDEX 00 00:00:00\r\n",
+            "    INDEX 01 00:00:32\r\n",
+        );
+        std::fs::write(&cue_path, original).expect("write original sidecar");
+        let replacement = concat!(
+            "TITLE \"Edited Album\"\n",
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Edited Track\"\n",
+            "    ISRC NEW000000001\n",
+            "    INDEX 01 00:00:32\n",
+        );
+
+        let outcome = rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+            &cue_path,
+            replacement,
+            &CueAlbumMetadataDeletionIntent::default(),
+        )
+        .expect("Album-view merge rewrite");
+        assert!(matches!(outcome, CueSidecarWritebackOutcome::Rewritten { .. }));
+        let rewritten = std::fs::read_to_string(&cue_path).expect("read rewritten sidecar");
+        assert!(rewritten.contains("TITLE \"Edited Album\""));
+        assert!(rewritten.contains("TITLE \"Edited Track\""));
+        assert!(rewritten.contains("ISRC NEW000000001"));
+        assert!(rewritten.contains("REM DATE 1973"), "absent modeled field must be preserved");
+        for preserved in [
+            "REM COMMENT keep provenance",
+            "REM DISCID DEADBEEF",
+            "SONGWRITER \"Keep Writer\"",
+            "FLAGS PRE",
+            "INDEX 00 00:00:00",
+            "FILE \"side.flac\" FLAC",
+        ] {
+            assert!(rewritten.contains(preserved), "unmodeled/structural line lost: {preserved}");
+        }
+        assert!(!rewritten.contains("generated.flac"));
+
+        let second = rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+            &cue_path,
+            replacement,
+            &CueAlbumMetadataDeletionIntent::default(),
+        )
+        .expect("idempotent Album-view merge rewrite");
+        assert_eq!(second, CueSidecarWritebackOutcome::Unchanged);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn album_merge_sidecar_writeback_deletes_only_explicitly_cleared_fields() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("album_merge_selective_delete");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "REM COMMENT keep provenance\n",
+            "REM DATE 1973\n",
+            "REM GENRE Rock\n",
+            "PERFORMER \"Keep Album Artist\"\n",
+            "TITLE \"Delete Album Title\"\n",
+            "FILE \"side.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Keep Track One\"\n",
+            "    ISRC DELETE0000001\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Keep Track Two\"\n",
+            "    ISRC KEEP000000002\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        std::fs::write(&cue_path, original).expect("write original sidecar");
+        let replacement = concat!(
+            "REM GENRE Rock\n",
+            "PERFORMER \"Keep Album Artist\"\n",
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Keep Track One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Keep Track Two\"\n",
+            "    ISRC KEEP000000002\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let mut deletions = CueAlbumMetadataDeletionIntent::default();
+        deletions.album_fields.insert(CueAlbumMetadataField::Title);
+        deletions
+            .track_fields
+            .entry(1)
+            .or_default()
+            .insert(CueAlbumMetadataField::Isrc);
+
+        rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+            &cue_path,
+            replacement,
+            &deletions,
+        )
+        .expect("selective Album-view merge rewrite");
+        let rewritten = std::fs::read_to_string(&cue_path).expect("read rewritten sidecar");
+        assert!(!rewritten.contains("Delete Album Title"));
+        assert!(!rewritten.contains("DELETE0000001"));
+        assert!(rewritten.contains("KEEP000000002"));
+        assert!(rewritten.contains("REM DATE 1973"), "unmodeled/uncleared DATE must survive");
+        assert!(rewritten.contains("REM COMMENT keep provenance"));
+        assert!(rewritten.contains("PERFORMER \"Keep Album Artist\""));
+        assert!(!rewritten.contains("generated.flac"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn album_merge_sidecar_writeback_normalizes_release_global_track_numbers_by_ordinal() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("album_merge_local_track_number_projection");
+        let cue_path = dir.join("side-two.cue");
+        let original = concat!(
+            "REM COMMENT keep provenance\r\n",
+            "FILE \"physical-side-two.flac\" FLAC\r\n",
+            "  TRACK 05 AUDIO\r\n",
+            "    TITLE \"Old Five\"\r\n",
+            "    ISRC DELETE0000005\r\n",
+            "    FLAGS PRE\r\n",
+            "    INDEX 00 00:00:00\r\n",
+            "    INDEX 01 00:00:32\r\n",
+            "  TRACK 06 AUDIO\r\n",
+            "    TITLE \"Old Six\"\r\n",
+            "    SONGWRITER \"Keep Writer\"\r\n",
+            "    ISRC KEEP000000006\r\n",
+            "    INDEX 01 04:12:34\r\n",
+        );
+        std::fs::write(&cue_path, original).expect("write release-global sidecar");
+        let replacement = concat!(
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Edited Local One\"\n",
+            "    INDEX 01 00:00:32\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Six\"\n",
+            "    ISRC KEEP000000006\n",
+            "    INDEX 01 04:12:34\n",
+        );
+        let mut deletions = CueAlbumMetadataDeletionIntent::default();
+        deletions
+            .track_fields
+            .entry(1)
+            .or_default()
+            .insert(CueAlbumMetadataField::Isrc);
+
+        let outcome = rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+            &cue_path,
+            replacement,
+            &deletions,
+        )
+        .expect("ordinal Album-view local-number projection");
+        assert!(matches!(outcome, CueSidecarWritebackOutcome::Rewritten { .. }));
+        let rewritten = std::fs::read_to_string(&cue_path).expect("read normalized sidecar");
+        assert!(rewritten.contains("  TRACK 01 AUDIO\r\n"));
+        assert!(rewritten.contains("  TRACK 02 AUDIO\r\n"));
+        assert!(!rewritten.contains("TRACK 05 AUDIO"));
+        assert!(!rewritten.contains("TRACK 06 AUDIO"));
+        assert!(rewritten.contains("TITLE \"Edited Local One\""));
+        assert!(!rewritten.contains("DELETE0000005"));
+        assert!(rewritten.contains("ISRC KEEP000000006"));
+        for preserved in [
+            "REM COMMENT keep provenance",
+            "FILE \"physical-side-two.flac\" FLAC",
+            "FLAGS PRE",
+            "INDEX 00 00:00:00",
+            "INDEX 01 00:00:32",
+            "SONGWRITER \"Keep Writer\"",
+            "INDEX 01 04:12:34",
+        ] {
+            assert!(
+                rewritten.contains(preserved),
+                "AlbumMergeProjection changed structural/unmodeled line: {preserved}"
+            );
+        }
+        assert!(!rewritten.contains("generated.flac"));
+
+        let before_second = std::fs::read(&cue_path).expect("read before idempotent save");
+        let second = rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+            &cue_path,
+            replacement,
+            &deletions,
+        )
+        .expect("second ordinal Album-view projection");
+        assert_eq!(second, CueSidecarWritebackOutcome::Unchanged);
+        assert_eq!(
+            std::fs::read(&cue_path).expect("read after idempotent save"),
+            before_second,
+            "second AlbumMergeProjection must be byte-identical"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn album_merge_embedded_composer_preserves_unmodeled_directives_and_normalizes_tracks() {
+        let template = concat!(
+            "REM COMMENT keep provenance chain\r\n",
+            "REM DISCID DEADBEEF\r\n",
+            "CDTEXTFILE \"keep.cdtext\"\r\n",
+            "TITLE \"Old Album\"\r\n",
+            "FILE \"stale-embedded-side-two.flac\" WAVE\r\n",
+            "  TRACK 05 AUDIO\r\n",
+            "    TITLE \"Old Five\"\r\n",
+            "    SONGWRITER \"Keep Writer Five\"\r\n",
+            "    ISRC DELETE0000005\r\n",
+            "    FLAGS PRE\r\n",
+            "    INDEX 00 00:00:00\r\n",
+            "    INDEX 01 00:00:31\r\n",
+            "  TRACK 06 AUDIO\r\n",
+            "    TITLE \"Old Six\"\r\n",
+            "    SONGWRITER \"Keep Writer Six\"\r\n",
+            "    ISRC KEEP000000006\r\n",
+            "    INDEX 01 04:12:35\r\n",
+        );
+        let replacement = concat!(
+            "TITLE \"Edited Album\"\n",
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Edited Local One\"\n",
+            "    INDEX 01 00:00:32\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Old Six\"\n",
+            "    ISRC KEEP000000006\n",
+            "    INDEX 00 04:00:00\n",
+            "    INDEX 01 04:12:34\n",
+        );
+        let mut deletions = CueAlbumMetadataDeletionIntent::default();
+        deletions
+            .track_fields
+            .entry(1)
+            .or_default()
+            .insert(CueAlbumMetadataField::Isrc);
+
+        let composed = compose_cue_metadata_album_merge_replacement(
+            template,
+            replacement,
+            &deletions,
+        )
+        .expect("compose existing embedded CUESHEET");
+        assert!(composed.contains("TITLE \"Edited Album\"\r\n"));
+        assert!(composed.contains("  TRACK 01 AUDIO\r\n"));
+        assert!(composed.contains("  TRACK 02 AUDIO\r\n"));
+        assert!(!composed.contains("TRACK 05 AUDIO"));
+        assert!(!composed.contains("TRACK 06 AUDIO"));
+        assert!(composed.contains("TITLE \"Edited Local One\""));
+        assert!(!composed.contains("DELETE0000005"));
+        assert!(composed.contains("ISRC KEEP000000006"));
+        for preserved in [
+            "REM COMMENT keep provenance chain",
+            "REM DISCID DEADBEEF",
+            "CDTEXTFILE \"keep.cdtext\"",
+            "SONGWRITER \"Keep Writer Five\"",
+            "SONGWRITER \"Keep Writer Six\"",
+            "FLAGS PRE",
+        ] {
+            assert!(
+                composed.contains(preserved),
+                "embedded AlbumMergeProjection changed unmodeled line: {preserved}"
+            );
+        }
+        assert!(composed.contains("FILE \"generated.flac\" FLAC\r\n"));
+        assert!(!composed.contains("stale-embedded-side-two.flac"));
+        assert!(!composed.contains("INDEX 00 00:00:00"));
+        assert!(composed.contains("INDEX 01 00:00:32\r\n"));
+        assert!(composed.contains("INDEX 00 04:00:00\r\n"));
+        assert!(composed.contains("INDEX 01 04:12:34\r\n"));
+        assert!(!composed.contains("INDEX 01 00:00:31"));
+        assert!(!composed.contains("INDEX 01 04:12:35"));
+
+        let second = compose_cue_metadata_album_merge_replacement(
+            &composed,
+            replacement,
+            &deletions,
+        )
+        .expect("second embedded AlbumMergeProjection");
+        assert_eq!(
+            second, composed,
+            "second embedded AlbumMergeProjection must be byte-identical"
+        );
+
+        let incompatible = concat!(
+            "FILE \"generated.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Only One\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let error = compose_cue_metadata_album_merge_replacement(
+            &composed,
+            incompatible,
+            &CueAlbumMetadataDeletionIntent::default(),
+        )
+        .expect_err("embedded AlbumMergeProjection must refuse structural mismatch");
+        assert!(error.contains("2 audio tracks"));
+        assert!(error.contains("replacement CUESHEET has 1"));
+    }
+
+    #[test]
+    fn album_merge_embedded_composer_refuses_incompatible_file_grouping() {
+        let template = concat!(
+            "FILE \"stale-one.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 00:00:03\n",
+        );
+        let replacement = concat!(
+            "FILE \"one.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "FILE \"two.flac\" FLAC\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let error = compose_cue_metadata_album_merge_replacement(
+            template,
+            replacement,
+            &CueAlbumMetadataDeletionIntent::default(),
+        )
+        .expect_err("embedded projection must refuse incompatible FILE grouping");
+        assert!(error.contains("FILE grouping is incompatible"));
     }
 
     #[test]

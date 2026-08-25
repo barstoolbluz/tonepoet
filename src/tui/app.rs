@@ -7621,6 +7621,25 @@ pub struct CueAlbumSyntheticSheet {
     pub album_catalog: Option<String>,
 }
 
+/// One independently-authored physical side/member represented by a
+/// synthetic multi-part Album view.
+///
+/// The Album view is deliberately not assigned one `MetadataCueSource`: each
+/// side can have a different policy-selected authority. Keeping those facts
+/// explicit prevents a merged sheet from ever being projected wholesale onto
+/// one physical carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueAlbumViewSide {
+    pub sidecar_path: Option<std::path::PathBuf>,
+    pub sidecar_present: bool,
+    pub audio_paths: Vec<std::path::PathBuf>,
+    /// Exact embedded CUESHEET text observed at editor-open, keyed by carrier.
+    /// Used only for pre-commit revalidation; it is not a second editable
+    /// model.
+    pub embedded_cuesheet_snapshots: Vec<(std::path::PathBuf, String)>,
+    pub authoritative_target: crate::config::AggregateMetadataTarget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataCueSource {
     Sidecar(std::path::PathBuf),
@@ -7711,10 +7730,18 @@ pub struct PresentationTab {
     /// Unified multi-surface CUE state. Used by grouped sidecar albums and by
     /// selected sets of independent embedded-CUE carriers.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
+    /// Non-empty only for the synthetic additive "Album view". This is the
+    /// per-side authority/provenance model used by distributed write-back.
+    pub cue_album_view_sides: Vec<CueAlbumViewSide>,
     /// Regenerate one CUESHEET per member image rather than projecting one
     /// unified physical sheet to every path. Used only for selected sets of
     /// independent embedded-CUE carriers.
     pub per_carrier_embedded_cuesheets: bool,
+    /// Last system-owned CUESHEET row values for a unified CUE surface.
+    /// Carrier originals intentionally remain in the CUESHEET TagEntry for
+    /// provenance/write-back; this separate baseline identifies a genuine raw
+    /// edit of the derived row without mistaking regeneration for user dirt.
+    pub cue_album_cuesheet_row_baseline: Option<Vec<String>>,
     /// File-indexed managed whole-file track-scoped tags observed on load that
     /// must be deleted during the next successful unified-album save. This is a
     /// migration/cleanup plan for F2-era polluted files, not an unconditional
@@ -7753,7 +7780,9 @@ impl Default for PresentationTab {
             cue_source: None,
             pending_sidecar_cue_creation: false,
             cue_album_synthetic_sheet: None,
+            cue_album_view_sides: Vec::new(),
             per_carrier_embedded_cuesheets: false,
+            cue_album_cuesheet_row_baseline: None,
             cue_album_forced_cleanup: Vec::new(),
         }
     }
@@ -7837,6 +7866,7 @@ impl PresentationTab {
         tab.cue_source = active.cue_source.clone();
         tab.pending_sidecar_cue_creation = active.pending_sidecar_cue_creation;
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
+        tab.cue_album_view_sides = active.cue_album_view_sides.clone();
         tab.per_carrier_embedded_cuesheets = active.per_carrier_embedded_cuesheets;
         tab
     }

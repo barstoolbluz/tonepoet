@@ -45,7 +45,7 @@ pub struct NamingConfig {
     pub windows_portable: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataConfig {
     /// When a sidecar-authoritative save includes changed fields the CUE
     /// representation cannot persist, proceed with the save anyway: persist
@@ -55,6 +55,25 @@ pub struct MetadataConfig {
     /// conflicts) still block regardless of this setting. Default: false.
     #[serde(default)]
     pub sidecar_save_with_warnings: bool,
+    /// Present one synthetic merged "Album view" alongside the physical CUE
+    /// carrier surfaces when a folder is positively identified as a
+    /// multi-part CUE release. This is presentation-only; the merged surface
+    /// retains per-side provenance for save routing. Default: true.
+    #[serde(default = "default_synthetic_album_view")]
+    pub synthetic_album_view: bool,
+}
+
+const fn default_synthetic_album_view() -> bool {
+    true
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            sidecar_save_with_warnings: false,
+            synthetic_album_view: default_synthetic_album_view(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2307,6 +2326,36 @@ mod theme_config_tests {
             parsed.conversion.aggregate_metadata_target_priority,
             default_aggregate_metadata_target_priority(),
         );
+    }
+
+    #[test]
+    fn metadata_synthetic_album_view_defaults_on_and_legacy_configs_inherit_default() {
+        let default = TonepoetConfig::default();
+        assert!(default.metadata.synthetic_album_view);
+
+        let serialized = toml::to_string_pretty(&default).expect("serialize config");
+        assert!(serialized.contains("synthetic_album_view = true"));
+
+        let mut legacy_value: toml::Value =
+            toml::from_str(&serialized).expect("parse serialized config");
+        legacy_value
+            .get_mut("metadata")
+            .and_then(toml::Value::as_table_mut)
+            .expect("metadata table")
+            .remove("synthetic_album_view");
+        let legacy: TonepoetConfig = toml::from_str(
+            &toml::to_string_pretty(&legacy_value).expect("serialize legacy config"),
+        )
+        .expect("deserialize legacy config");
+        assert!(legacy.metadata.synthetic_album_view);
+
+        let mut disabled = default;
+        disabled.metadata.synthetic_album_view = false;
+        let round_trip: TonepoetConfig = toml::from_str(
+            &toml::to_string_pretty(&disabled).expect("serialize disabled config"),
+        )
+        .expect("deserialize disabled config");
+        assert!(!round_trip.metadata.synthetic_album_view);
     }
 
     struct ConfigPathOverrideGuard;

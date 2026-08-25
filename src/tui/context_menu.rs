@@ -248,6 +248,10 @@ pub enum ContextAction {
     MetadataTagsGnudb,
     MetadataTagsClipboard,
     MetadataTagsFile,
+    /// Metadata editor footer popup: explicitly project the active editor
+    /// metadata into one CUE carrier kind, creating that carrier when absent.
+    MetadataWriteTagsToSidecarCue,
+    MetadataWriteTagsToEmbeddedCue,
     /// Metadata editor footer popup: transfer between the open editor and a picker target.
     MetadataTransferTags {
         direction: TagTransferDirection,
@@ -830,8 +834,9 @@ fn build_tagging_submenu(
     }
 }
 
-/// Build the metadata editor's bottom-anchored `tags` popup. The ten leaf
-/// actions are deliberately explicit so dispatch tests can pin each route.
+/// Build the metadata editor's bottom-anchored `tags` popup. Carrier-write
+/// actions are always present: availability is decided at dispatch so the menu
+/// remains an explicit command surface even when a carrier must be created.
 pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
     vec![
         ContextMenuEntry::Submenu {
@@ -881,6 +886,15 @@ pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
                 ),
             ],
         },
+        separator(),
+        item(
+            "Write tags to sidecar cue",
+            ContextAction::MetadataWriteTagsToSidecarCue,
+        ),
+        item(
+            "Write tags to embedded cue",
+            ContextAction::MetadataWriteTagsToEmbeddedCue,
+        ),
         separator(),
         item("Repair tags", ContextAction::MetadataRepairTags),
         separator(),
@@ -3620,6 +3634,18 @@ pub fn execute_context_action(
             }
             app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
         }
+        ContextAction::MetadataWriteTagsToSidecarCue => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                super::keybindings::metadata_editor_write_tags_to_sidecar_cue(app, &mut state, tx);
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
+        ContextAction::MetadataWriteTagsToEmbeddedCue => {
+            if let Some(mut state) = app.pending_metadata_editor.take() {
+                super::keybindings::metadata_editor_write_tags_to_embedded_cue(app, &mut state, tx);
+                app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+            }
+        }
         ContextAction::MetadataCueView => {
             // Open a read-only CuePreview seeded with the row's full CUE
             // text. The display value is only a summary.
@@ -5720,7 +5746,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_tags_popup_exposes_exactly_ten_leaf_routes() {
+    fn metadata_tags_popup_exposes_exactly_twelve_leaf_routes() {
         fn collect<'a>(entries: &'a [ContextMenuEntry], out: &mut Vec<(&'a str, &'a ContextAction)>) {
             for entry in entries {
                 match entry {
@@ -5734,7 +5760,7 @@ mod tests {
         let popup = build_metadata_tags_popup();
         let mut leaves = Vec::new();
         collect(&popup, &mut leaves);
-        assert_eq!(leaves.len(), 10);
+        assert_eq!(leaves.len(), 12);
         assert!(leaves.iter().any(|(label, action)| {
             *label == "MusicBrainz" && matches!(action, ContextAction::MetadataTagsMusicBrainz)
         }));
@@ -5746,6 +5772,14 @@ mod tests {
         }));
         assert!(leaves.iter().any(|(label, action)| {
             *label == "File" && matches!(action, ContextAction::MetadataTagsFile)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Write tags to sidecar cue"
+                && matches!(action, ContextAction::MetadataWriteTagsToSidecarCue)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Write tags to embedded cue"
+                && matches!(action, ContextAction::MetadataWriteTagsToEmbeddedCue)
         }));
         for direction in [TagTransferDirection::From, TagTransferDirection::To] {
             for scope in [TagTransferScope::Canonical, TagTransferScope::All] {
@@ -5812,7 +5846,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_tags_popup_all_ten_leaf_actions_execute_their_dispatch_routes() {
+    fn metadata_tags_popup_leaf_actions_execute_their_dispatch_routes() {
         tui_file_picker::with_scoped_shared_text_clipboard("TITLE\nDuke", || {
             let tx = {
                 let (tx, _rx) = mpsc::channel(16);
@@ -5889,6 +5923,26 @@ mod tests {
                 state.file_picker.as_ref().map(|picker| &picker.purpose),
                 Some(FilePickerPurpose::MetadataTagBlocksFile)
             ));
+
+            for action in [
+                ContextAction::MetadataWriteTagsToSidecarCue,
+                ContextAction::MetadataWriteTagsToEmbeddedCue,
+            ] {
+                let mut carrier = AppState::new_for_test(TonepoetConfig::default());
+                carrier.pending_metadata_editor = Some(parked_test_editor(Vec::new()));
+                execute_context_action(&mut carrier, action, &tx, false);
+                assert!(matches!(
+                    &carrier.active_overlay,
+                    ActiveOverlay::MetadataEditor(_)
+                ));
+                assert_eq!(
+                    carrier
+                        .status_message
+                        .as_ref()
+                        .map(|(message, _)| message.as_str()),
+                    Some("CUE carrier write: editor has no audio paths")
+                );
+            }
 
             for direction in [TagTransferDirection::From, TagTransferDirection::To] {
                 for scope in [TagTransferScope::Canonical, TagTransferScope::All] {
