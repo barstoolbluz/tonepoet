@@ -501,6 +501,66 @@ impl ToolRunner for StubToolRunner {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn write_executable_test_script(name: &str, body: &str) -> PathBuf {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let unique = format!(
+        "tonepoet-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    fs::create_dir_all(&dir).expect("script temp dir");
+    let path = dir.join(name);
+    // Inject a side-effect-free selfcheck arm right after the shebang so
+    // the ETXTBSY verify loop below can execute the script without
+    // touching any fixture state (several bodies mutate count files
+    // unconditionally).
+    let (shebang, rest) = body
+        .split_once('\n')
+        .expect("fixture scripts start with a shebang line");
+    let guarded = format!(
+        "{shebang}\nif [ \"$1\" = \"--tonepoet-fixture-selfcheck\" ]; then exit 0; fi\n{rest}"
+    );
+    fs::write(&path, guarded).expect("write script");
+    let mut perms = fs::metadata(&path).expect("script metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).expect("chmod script");
+    // Write-then-exec is racy in a threaded test process: a concurrent
+    // test's fork can inherit this file's write fd for a moment, and a
+    // direct exec then fails with ETXTBSY ("Text file busy"). Verify the
+    // script is executable before handing it out; one successful exec
+    // proves no writer fd survives, and nothing rewrites the file after.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::process::Command::new(&path)
+            .arg("--tonepoet-fixture-selfcheck")
+            .output()
+        {
+            Ok(output) if output.status.success() => break,
+            Ok(output) => panic!(
+                "fixture script selfcheck failed for {}: {:?}",
+                path.display(),
+                output.status
+            ),
+            // ETXTBSY (errno 26): a racing fork still holds the write fd.
+            Err(err) if err.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!(
+                "fixture script selfcheck could not execute {}: {err}",
+                path.display()
+            ),
+        }
+    }
+    path
+}
+
 // ===========================================================================
 // Real runner — PR 2
 // ===========================================================================
@@ -3849,64 +3909,7 @@ exec /bin/cat >/dev/null
     }
 
     #[cfg(unix)]
-    fn write_executable_script(name: &str, body: &str) -> PathBuf {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let unique = format!(
-            "tonepoet-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&dir).expect("script temp dir");
-        let path = dir.join(name);
-        // Inject a side-effect-free selfcheck arm right after the shebang so
-        // the ETXTBSY verify loop below can execute the script without
-        // touching any fixture state (several bodies mutate count files
-        // unconditionally).
-        let (shebang, rest) = body
-            .split_once('\n')
-            .expect("fixture scripts start with a shebang line");
-        let guarded = format!(
-            "{shebang}\nif [ \"$1\" = \"--tonepoet-fixture-selfcheck\" ]; then exit 0; fi\n{rest}"
-        );
-        fs::write(&path, guarded).expect("write script");
-        let mut perms = fs::metadata(&path).expect("script metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod script");
-        // Write-then-exec is racy in a threaded test process: a concurrent
-        // test's fork can inherit this file's write fd for a moment, and a
-        // direct exec then fails with ETXTBSY ("Text file busy"). Verify the
-        // script is executable before handing it out; one successful exec
-        // proves no writer fd survives, and nothing rewrites the file after.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match std::process::Command::new(&path)
-                .arg("--tonepoet-fixture-selfcheck")
-                .output()
-            {
-                Ok(output) if output.status.success() => break,
-                Ok(output) => panic!(
-                    "fixture script selfcheck failed for {}: {:?}",
-                    path.display(),
-                    output.status
-                ),
-                // ETXTBSY (errno 26): a racing fork still holds the write fd.
-                Err(err) if err.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => panic!(
-                    "fixture script selfcheck could not execute {}: {err}",
-                    path.display()
-                ),
-            }
-        }
-        path
-    }
+    use super::write_executable_test_script as write_executable_script;
 
     #[cfg(unix)]
     #[tokio::test]

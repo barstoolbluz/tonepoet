@@ -3664,13 +3664,17 @@ async fn convert_tracks_with_reporter_with_tool_paths(
 fn real_tool_runner_with_optional_version_cache(
     tool_paths: HashMap<String, PathBuf>,
     version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
-    item_id: &str,
+    req: &PipelineRequest,
 ) -> RealToolRunner {
     let runner = match version_cache {
         Some(version_cache) => RealToolRunner::with_version_cache(tool_paths, version_cache),
         None => RealToolRunner::new(tool_paths),
     };
-    runner.with_execution_item(item_id.to_string())
+    if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&req.container) {
+        runner
+    } else {
+        runner.with_execution_item(req.item_id.clone())
+    }
 }
 
 async fn convert_one_track_work(
@@ -29929,7 +29933,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
     let runner = real_tool_runner_with_optional_version_cache(
         tool_paths.clone(),
         version_cache,
-        &req.item_id,
+        &req,
     );
     let groups = cue_stream_groups(&tracks);
     let source_rg = cue_source_replaygain_eligible(&source, &req)
@@ -30145,7 +30149,7 @@ pub async fn encode_cue_stream_group_for_scheduler_with_tool_limits_and_version_
     let runner = real_tool_runner_with_optional_version_cache(
         tool_paths.clone(),
         version_cache,
-        &req.item_id,
+        &req,
     );
     Box::pin(encode_cue_stream_group_with_runner(
         tracks,
@@ -30868,7 +30872,7 @@ pub async fn encode_track_for_scheduler_with_tool_limits_and_version_cache(
     reporter: &dyn PipelineReporter,
     cancel: CancellationToken,
 ) -> Result<ScheduledTrackOutput, String> {
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req.item_id);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req);
     convert_one_track_work(
         track_index,
         track,
@@ -30962,7 +30966,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     cancel: CancellationToken,
 ) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache, &req.item_id);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache, &req);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
     match realize_track_with_tool_limits_and_stats(
@@ -31030,7 +31034,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
     version_cache: Option<Arc<Mutex<HashMap<ToolBinary, String>>>>,
     reporter: &dyn PipelineReporter,
 ) -> Result<ScheduledTrackOutput, String> {
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &realized.req.item_id);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &realized.req);
     let staged_path = staged_audio_path(
         &realized.convert_root,
         &realized.final_path,
@@ -50689,6 +50693,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         ToolOutput, ToolRunner, ToolSegmentedPipelineError, ToolSegmentedPipelineOutput,
         ToolStreamSegment,
     };
+    #[cfg(unix)]
+    use crate::convert::pipeline::tool::write_executable_test_script;
     use crate::convert::pipeline::errors::ToolRunnerError;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -50781,6 +50787,70 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             container_ffmpeg_flags: Vec::new(),
             companion: CompanionCopyPolicy::default(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_request_runner_binding_is_synthetic_only() {
+        let temp = tempfile::tempdir().expect("queue runner binding tempdir");
+        let script = write_executable_test_script(
+            "ffprobe",
+            "#!/bin/sh\nprintf 'runner-ok\\n'\n",
+        );
+        let tool_paths = HashMap::from([("ffprobe".to_string(), script)]);
+        let command = ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            binary: ToolBinary::Ffprobe,
+            args: vec!["probe".to_string()],
+            secret_args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        let ordinary = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        let ordinary_runner = real_tool_runner_with_optional_version_cache(
+            tool_paths.clone(),
+            None,
+            &ordinary,
+        );
+        let ordinary_error = ordinary_runner
+            .run(command.clone(), &CancellationToken::new())
+            .await
+            .expect_err("ordinary queue runner must remain execution-bound");
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("without an active item-supervisor capability"),
+            "ordinary queue runner must fail closed when its QueueExecution supervisor is absent: {ordinary_error}"
+        );
+
+        let mut synthetic = ordinary.clone();
+        synthetic.item_id = "synthetic-runner-binding".to_string();
+        synthetic.container = temp
+            .path()
+            .join("tonepoet-synthetic-cue-albums")
+            .join("process-test")
+            .join("artifact-test")
+            .join("album.cue");
+        assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+            &synthetic.container
+        ));
+        let synthetic_runner = real_tool_runner_with_optional_version_cache(
+            tool_paths,
+            None,
+            &synthetic,
+        );
+        let output = synthetic_runner
+            .run(command, &CancellationToken::new())
+            .await
+            .expect("synthetic queue runner uses established unbound supervision");
+        assert!(output.stdout_tail.contains("runner-ok"));
     }
 
     pub(super) fn stage_policy(metadata: bool, replaygain: bool, features: bool) -> StagePolicy {

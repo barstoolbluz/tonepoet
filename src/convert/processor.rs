@@ -119,11 +119,20 @@ pub struct ProcessorConfig {
     pub scratch_memory_limit_percent: u8,
 }
 
-/// Durable transition invoked immediately before an initial queue item is
-/// admitted to the shared worker pool. Production processors require this
-/// capability so no mutation-capable pipeline can start without a committed
-/// QueueExecution authority.
+/// Durable transition invoked immediately before an ordinary persisted queue
+/// item is admitted to the shared worker pool. Production processors require
+/// this capability; the only exemption is the process-scoped synthetic CUE
+/// class that is deliberately excluded from durable queue persistence.
 type ExecutionAcquisitionHook = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+fn requires_durable_execution_acquisition(item: &ConversionItem) -> bool {
+    // Synthetic merged-album CUEs are deliberately process-scoped work. The
+    // durable queue excludes the temp artifact on both persist and load, so it
+    // can never have the v24 row required by QueueExecution acquisition. Keep
+    // that exemption exactly symmetric with the persistence predicate; every
+    // other item must still acquire durable execution authority before submit.
+    !crate::convert::queue_expansion::is_synthetic_cue_album_artifact(&item.input_path)
+}
 
 /// Handles the actual conversion of audio files.
 pub struct ConversionProcessor {
@@ -2127,7 +2136,8 @@ impl ConversionProcessor {
 
     /// Install the durable per-item execution transition used by production
     /// application entry points. The hook commits QueueExecution authority
-    /// before an initial work unit can enter the worker pool.
+    /// before an ordinary persisted item's initial work unit can enter the
+    /// worker pool; process-scoped synthetic CUEs intentionally bypass it.
     pub fn set_execution_acquisition_hook<F>(&mut self, hook: F)
     where
         F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
@@ -2570,6 +2580,8 @@ impl SubmissionPump {
             if let Some(item) = self.initial_items.pop_front() {
                 let item_id = item.id.clone();
                 let output_format = item.output_format.clone();
+                let durable_acquisition_required =
+                    requires_durable_execution_acquisition(&item);
                 if let Some(unit) = build_initial_work(
                     item,
                     pool,
@@ -2583,18 +2595,22 @@ impl SubmissionPump {
                     tool_concurrency_limits.clone(),
                     scratch_staging.clone(),
                 ) {
-                    // Keep the queue write guard across the short durable
-                    // transition. This prevents a UI persistence snapshot from
-                    // observing Processing before the matching QueueExecution
-                    // descriptor/row is committed, or from deleting that row
-                    // between commit and runtime lease publication.
+                    // Keep the queue write guard across the short execution
+                    // transition. For durable items this prevents a UI
+                    // persistence snapshot from observing Processing before the
+                    // matching QueueExecution descriptor/row is committed, or
+                    // from deleting that row between commit and runtime lease
+                    // publication. Synthetic merged-album CUEs are excluded
+                    // from persistence by design, so their same-session path
+                    // has no durable transition to publish.
                     let mut queue_guard = queue.write().await;
                     let Some(queue_item) = queue_guard.find_item_mut(&item_id) else {
                         pool.metrics().record_job_failed();
                         terminal.insert(
                             item_id.clone(),
                             ConversionStatus::Failed {
-                                error: "queue item disappeared before durable execution acquisition".to_string(),
+                                error: "queue item disappeared before execution submission"
+                                    .to_string(),
                                 log_path: None,
                             },
                         );
@@ -2613,18 +2629,25 @@ impl SubmissionPump {
                         queue_item.started_at = Some(chrono::Utc::now());
                     }
 
-                    let acquisition = match execution_acquisition_hook {
-                        Some(hook) => hook(&item_id),
-                        None => {
-                            #[cfg(test)]
-                            {
-                                Ok(())
-                            }
-                            #[cfg(not(test))]
-                            {
-                                Err("conversion processor has no durable QueueExecution acquisition capability".to_string())
+                    let acquisition = if durable_acquisition_required {
+                        match execution_acquisition_hook {
+                            Some(hook) => hook(&item_id),
+                            None => {
+                                #[cfg(test)]
+                                {
+                                    Ok(())
+                                }
+                                #[cfg(not(test))]
+                                {
+                                    Err(
+                                        "conversion processor has no durable QueueExecution acquisition capability"
+                                            .to_string(),
+                                    )
+                                }
                             }
                         }
+                    } else {
+                        Ok(())
                     };
                     if let Err(error) = acquisition {
                         queue_item.status = ConversionStatus::Interrupted;
@@ -3125,8 +3148,17 @@ fn build_initial_work(
         unit_id: format!("{unit_prefix}:{submit_item_id}"),
         kind: materialize_kind,
         task: boxed_work(move |worker_cancel| async move {
-            let runner = RealToolRunner::with_version_cache(submit_tool_paths.clone(), submit_version_cache.clone())
-                .with_execution_item(submit_item_id.clone());
+            let runner = RealToolRunner::with_version_cache(
+                submit_tool_paths.clone(),
+                submit_version_cache.clone(),
+            );
+            let runner = if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+                &request.container,
+            ) {
+                runner
+            } else {
+                runner.with_execution_item(submit_item_id.clone())
+            };
             let reporter = BroadcastReporter::new(submit_progress_tx, None, submit_item_id.clone(), None);
             let result = prepare_pipeline_item_for_scheduler(
                 request,
@@ -3691,8 +3723,14 @@ fn run_album_postprocess_work_scoped(
 ) -> AlbumPostprocessFuture {
     Box::pin(async move {
         let item_id = album.req.item_id.clone();
-        let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone())
-            .with_execution_item(item_id.clone());
+        let runner = RealToolRunner::with_version_cache(tool_paths.clone(), version_cache.clone());
+        let runner = if crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+            &album.req.container,
+        ) {
+            runner
+        } else {
+            runner.with_execution_item(item_id.clone())
+        };
         let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
         let scratch_retry_context = if album.staging.is_scratch_staging() {
             Some((
@@ -4338,6 +4376,355 @@ mod tests {
         item
     }
 
+    #[cfg(unix)]
+    fn write_processor_test_pcm_wav(path: &std::path::Path, frames: u32) {
+        let channels = 2_u16;
+        let sample_rate = 44_100_u32;
+        let bits_per_sample = 16_u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_len = frames * u32::from(block_align);
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36_u32 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(44 + data_len as usize, 0);
+        std::fs::write(path, bytes).expect("write processor PCM WAV fixture");
+    }
+
+    #[cfg(unix)]
+    fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_file_named(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn synthetic_processor_fake_tools(root: &std::path::Path) -> (HashMap<String, PathBuf>, PathBuf) {
+        use crate::convert::pipeline::tool::write_executable_test_script;
+
+        let log_path = root.join("fake-tools.log");
+        let ffprobe = write_executable_test_script(
+            "ffprobe",
+            &format!(
+                r#"#!/bin/sh
+LOG='{}'
+printf 'ffprobe %s\n' "$*" >> "$LOG"
+if [ "$1" = "-version" ] || [ "$1" = "--version" ]; then
+  printf 'ffprobe version 7.1.3\n'
+  exit 0
+fi
+case "$*" in
+  *stream=index,codec_name:stream_disposition=attached_pic:stream_tags=mimetype*)
+    printf '{{"streams":[]}}\n'
+    exit 0
+    ;;
+esac
+last=''
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  *merged.wav)
+    samples=88200
+    duration=2.0
+    ;;
+  *cue-segments*)
+    samples=44100
+    duration=1.0
+    ;;
+  *)
+    samples=44100
+    duration=1.0
+    ;;
+esac
+printf '{{"streams":[{{"codec_name":"pcm_s16le","sample_fmt":"s16","sample_rate":"44100","channels":2,"duration_ts":%s,"time_base":"1/44100","duration":"%s","bits_per_raw_sample":"16","bits_per_sample":16}}],"format":{{"format_name":"wav","duration":"%s"}}}}\n' "$samples" "$duration" "$duration"
+"#,
+                log_path.display()
+            ),
+        );
+        let ffmpeg = write_executable_test_script(
+            "ffmpeg",
+            &format!(
+                r#"#!/bin/sh
+LOG='{}'
+printf 'ffmpeg %s\n' "$*" >> "$LOG"
+if [ "$1" = "-version" ] || [ "$1" = "--version" ]; then
+  printf 'ffmpeg version 7.1.3\n'
+  exit 0
+fi
+input=''
+out=''
+prev=''
+for arg in "$@"; do
+  if [ "$prev" = "-i" ]; then input="$arg"; fi
+  prev="$arg"
+  out="$arg"
+done
+if [ "$out" = "-" ] || [ "$out" = "pipe:1" ]; then
+  case "$*" in
+    *f64le*) bytes=705600 ;;
+    *f32le*|*s32le*) bytes=352800 ;;
+    *) bytes=176400 ;;
+  esac
+  dd if=/dev/zero bs="$bytes" count=1 2>/dev/null
+  exit 0
+fi
+if [ -z "$out" ]; then exit 0; fi
+mkdir -p "$(dirname "$out")"
+if [ "$input" = "pipe:0" ] || [ "$input" = "-" ]; then
+  cat > "$out"
+elif [ -n "$input" ] && [ -f "$input" ]; then
+  cp "$input" "$out"
+else
+  printf 'fake-audio\n' > "$out"
+fi
+"#,
+                log_path.display()
+            ),
+        );
+        (
+            HashMap::from([
+                ("ffprobe".to_string(), ffprobe),
+                ("ffmpeg".to_string(), ffmpeg),
+            ]),
+            log_path,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runnable_synthetic_queue_item_uses_unbound_tools_and_completes_album() {
+        let temp = tempfile::tempdir().expect("synthetic success tempdir");
+        let side_a = temp.path().join("LP1.wav");
+        let side_b = temp.path().join("LP2.wav");
+        write_processor_test_pcm_wav(&side_a, 44_100);
+        write_processor_test_pcm_wav(&side_b, 44_100);
+
+        let synthetic = temp
+            .path()
+            .join("tonepoet-synthetic-cue-albums")
+            .join("process-test")
+            .join("artifact-test")
+            .join("album.cue");
+        std::fs::create_dir_all(synthetic.parent().expect("synthetic artifact parent"))
+            .expect("create synthetic artifact directory");
+        std::fs::write(
+            &synthetic,
+            format!(
+                concat!(
+                    "PERFORMER \"Artist\"\n",
+                    "TITLE \"Synthetic Album\"\n",
+                    "FILE \"{}\" WAVE\n",
+                    "  TRACK 01 AUDIO\n",
+                    "    TITLE \"Side A\"\n",
+                    "    INDEX 01 00:00:00\n",
+                    "FILE \"{}\" WAVE\n",
+                    "  TRACK 02 AUDIO\n",
+                    "    TITLE \"Side B\"\n",
+                    "    INDEX 01 00:00:00\n",
+                ),
+                side_a.display(),
+                side_b.display(),
+            ),
+        )
+        .expect("write runnable synthetic CUE fixture");
+        assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+            &synthetic
+        ));
+
+        let item_id = "synthetic-runnable-no-durable-row";
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+        request.item_id = item_id.to_string();
+        request.job_id = format!("job-{item_id}");
+        request.container = synthetic.clone();
+        request.output_root = temp.path().join("out");
+        request.merge = true;
+        request.naming.per_album_subdir = false;
+        request.log.write_json_log = false;
+        request.log.write_conversion_log = false;
+        request.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        request.settings.force_encode = true;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+
+        let mut item = conversion_item_with_pipeline_request(item_id, request);
+        item.output_format = crate::convert::formats::AudioFormat::Wav;
+        item.status = ConversionStatus::Queued;
+
+        let hook_calls = Arc::new(Mutex::new(0usize));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let (tool_paths, tool_log) = synthetic_processor_fake_tools(temp.path());
+        let mut processor = ConversionProcessor::new(ProcessorConfig {
+            worker_count: 1,
+            tool_paths,
+            default_destination_directory: None,
+            scratch_directory: None,
+            scratch_memory_limit_percent: 0,
+        });
+        processor.set_execution_acquisition_hook(move |_| {
+            *hook_calls_for_hook
+                .lock()
+                .expect("synthetic success hook call counter") += 1;
+            Err("queue execution item is not durably owned by this session".to_string())
+        });
+
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(item);
+        processor
+            .process_queue(&mut queue)
+            .await
+            .expect("runnable synthetic item completes without durable acquisition");
+
+        assert_eq!(
+            *hook_calls.lock().expect("synthetic success hook call counter"),
+            0,
+            "process-scoped synthetic work must not enter durable QueueExecution acquisition"
+        );
+        let items = queue.all_items();
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(
+                &items[0].status,
+                ConversionStatus::Completed { .. } | ConversionStatus::CompletedWithActionErrors { .. }
+            ),
+            "valid synthetic album must finish successfully, got {:?}",
+            &items[0].status
+        );
+        assert!(items[0].is_finished());
+        assert_eq!(queue.failed_items(), 0);
+
+        let tool_log = std::fs::read_to_string(&tool_log).expect("read synthetic fake-tool log");
+        assert!(
+            tool_log
+                .lines()
+                .any(|line| line.starts_with("ffprobe ") && !line.contains("-version")),
+            "valid synthetic CUE must execute a real-tool probe through the unbound materializer runner: {tool_log}"
+        );
+        assert!(
+            tool_log.lines().any(|line| {
+                line.starts_with("ffmpeg ")
+                    && !line.contains("-version")
+                    && !line.contains(" -f concat ")
+            }),
+            "valid synthetic CUE must execute track conversion through the unbound shared-stage runner: {tool_log}"
+        );
+        assert!(
+            tool_log
+                .lines()
+                .any(|line| line.starts_with("ffmpeg ") && line.contains(" -f concat ")),
+            "valid synthetic CUE must execute merge post-processing through the unbound album runner: {tool_log}"
+        );
+        assert!(
+            !tool_log.contains("item-supervisor"),
+            "synthetic real-tool execution must not require a QueueExecution supervisor: {tool_log}"
+        );
+        let merged = find_file_named(&temp.path().join("out"), "merged.wav")
+            .expect("merged synthetic album output");
+        assert!(
+            merged.metadata().expect("merged output metadata").len() > 0,
+            "merged synthetic album output must be non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_queue_item_bypasses_missing_durable_row_and_settles_terminally() {
+        let temp = tempfile::tempdir().expect("synthetic acquisition tempdir");
+        let synthetic = temp
+            .path()
+            .join("tonepoet-synthetic-cue-albums")
+            .join("process-test")
+            .join("artifact-test")
+            .join("album.cue");
+        std::fs::create_dir_all(synthetic.parent().expect("synthetic artifact parent"))
+            .expect("create synthetic artifact directory");
+        std::fs::write(
+            &synthetic,
+            concat!(
+                "TITLE \"Synthetic Album\"\n",
+                "FILE \"missing-side.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    TITLE \"Track 1\"\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("write synthetic CUE fixture");
+        assert!(crate::convert::queue_expansion::is_synthetic_cue_album_artifact(
+            &synthetic
+        ));
+
+        let item_id = "synthetic-no-durable-row";
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+        request.item_id = item_id.to_string();
+        request.job_id = format!("job-{item_id}");
+        request.container = synthetic.clone();
+        request.output_root = temp.path().join("out");
+        let mut item = conversion_item_with_pipeline_request(item_id, request);
+        item.status = ConversionStatus::Queued;
+
+        let hook_calls = Arc::new(Mutex::new(0usize));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let mut processor = ConversionProcessor::new(ProcessorConfig {
+            worker_count: 1,
+            tool_paths: HashMap::new(),
+            default_destination_directory: None,
+            scratch_directory: None,
+            scratch_memory_limit_percent: 0,
+        });
+        processor.set_execution_acquisition_hook(move |_| {
+            *hook_calls_for_hook
+                .lock()
+                .expect("synthetic hook call counter") += 1;
+            Err("queue execution item is not durably owned by this session".to_string())
+        });
+
+        let mut queue = ConversionQueue::new();
+        queue.items_mut().push_back(item);
+        processor
+            .process_queue(&mut queue)
+            .await
+            .expect("synthetic item reaches worker outcome without durable acquisition");
+
+        assert_eq!(
+            *hook_calls.lock().expect("synthetic hook call counter"),
+            0,
+            "a process-scoped synthetic CUE must not ask for a v24 row that persistence forbids"
+        );
+        assert_eq!(
+            queue.failed_items(),
+            1,
+            "unrunnable synthetic fixture must fail loudly"
+        );
+        let items = queue.all_items();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].is_finished(),
+            "synthetic item must settle out of the active queue"
+        );
+        assert!(matches!(&items[0].status, ConversionStatus::Failed { .. }));
+        assert!(
+            !matches!(&items[0].status, ConversionStatus::Interrupted),
+            "synthetic work must never re-enter the retry loop solely because it has no durable row"
+        );
+    }
+
     #[tokio::test]
     async fn durable_acquisition_failure_preserves_retryable_interrupted_outcome() {
         let temp = tempfile::tempdir().expect("acquisition failure tempdir");
@@ -4352,7 +4739,12 @@ mod tests {
             queue.items_mut().push_back(item.clone());
             Arc::new(tokio::sync::RwLock::new(queue))
         };
-        let hook: ExecutionAcquisitionHook = Arc::new(|_| {
+        let hook_calls = Arc::new(Mutex::new(0usize));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let hook: ExecutionAcquisitionHook = Arc::new(move |_| {
+            *hook_calls_for_hook
+                .lock()
+                .expect("durable acquisition hook call counter") += 1;
             Err("synthetic SQLite busy retry exhaustion".to_string())
         });
         let (progress_tx, _progress_rx) = broadcast::channel(16);
@@ -4378,6 +4770,11 @@ mod tests {
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0, item.id);
+        assert_eq!(
+            *hook_calls.lock().expect("durable acquisition hook call counter"),
+            1,
+            "ordinary queue work must still enter durable acquisition exactly once",
+        );
         assert!(matches!(&outcomes[0].1, ConversionStatus::Interrupted));
         assert_eq!(
             metrics.snapshot().jobs_failed,

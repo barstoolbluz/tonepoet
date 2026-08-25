@@ -8,11 +8,18 @@ hand to a reasoning-model brief without re-diagnosing.
 
 ## 1. Single-image (taggable) FLAC + sidecar CUE: metadata SAVE rewrites the multi-GB image and embeds a CUESHEET instead of writing the sidecar only
 
-> **⚠ DO NOT brief or implement yet.** The root cause is diagnosed and verified, but the *handling* is
-> an open design question (see "Open design questions" below) — it touches the LODESTAR
-> metadata-source-selection area (regressed 6–7×) **and** raises whether the editor SAVE path should honor
-> `aggregate_metadata_target_priority` at all. **Prompt the user to discuss the approach afresh before
-> writing any brief.**
+> **✅ RESOLVED by `466cec0` ("Honor CUE source preference on single-image metadata SAVE").** Re-corroborated
+> against `main @ 9bb8d51` (2026-08-23): the SAVE authority predicate is now `paths.len()`-agnostic
+> (`dedicated_cue_sidecar_authority`, `src/tui/app.rs:9506` = `cue_album_synthetic_sheet.is_some() &&
+> cue_source == Sidecar(_)`), so a single-image taggable FLAC + sidecar edits **sidecar-only**: the image
+> is byte- and mtime-invariant and no `CUESHEET` is embedded. The metadata-source priority list IS now
+> consulted (authority resolves `cue_source` at editor-open). Codified by passing tests
+> `single_image_sidecar_save_is_image_byte_and_mtime_invariant` (`keybindings.rs:79570`),
+> `single_image_save_authority_flips_only_with_configured_priority` (`:79518`),
+> `taggable_single_image_sidecar_refuses_unrepresentable_field_without_io` (`:79741`). Design note: image-only
+> / non-CUE-representable edits are now **refused + reverted with a warning** (`sidecar_unsupported`), not
+> written to the image — the strict sidecar-only model. **The diagnosis below is retained for history but is
+> now STALE (pre-466cec0 anchors); do not implement from it.**
 
 **Discovered:** 2026-08-16, editing metadata at folder level on single-image vinyl rips
 (Led Zeppelin UK/JP discographies, `~/torrents/Led Zeppelin - Discography+ (1968 - 2025)/`). Field cases
