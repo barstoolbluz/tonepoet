@@ -7900,6 +7900,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
     }
 }
 
+/// Insert the retained first line of a terminal paste into a single-line input.
+/// An empty retained line is a no-op, matching the pre-string-insertion behavior
+/// where the old character loop executed zero times and preserved selections.
+fn insert_single_line_terminal_paste(input: &mut TextInputState, text: &str) {
+    let first_line = text.lines().next().unwrap_or("");
+    if !first_line.is_empty() {
+        input.insert_string(first_line);
+    }
+}
+
 /// Handle a bracketed paste event. When the BulkRename overlay is active,
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
@@ -7932,10 +7942,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 if state.focus == super::app::BulkRenameFocus::Template {
                     // Template focus: insert the first line into the template
                     // input (single-line field), then rebuild the plan.
-                    let first_line = text.lines().next().unwrap_or("");
-                    for c in first_line.chars() {
-                        state.template_input.insert_char(c);
-                    }
+                    insert_single_line_terminal_paste(&mut state.template_input, text);
                     state.rebuild_plan();
                 } else {
                     // List focus: replace ops line-by-line with pasted names.
@@ -7971,8 +7978,6 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
         ActiveOverlay::TextEdit { .. }
         | ActiveOverlay::CommandInput { .. }
         | ActiveOverlay::FileInput { .. } => {
-            let first_line = text.lines().next().unwrap_or("");
-            // Insert each character at the cursor via the text input's insert_char.
             let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             match overlay {
                 ActiveOverlay::TextEdit {
@@ -7980,9 +7985,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                     target,
                     label,
                 } => {
-                    for c in first_line.chars() {
-                        input.insert_char(c);
-                    }
+                    insert_single_line_terminal_paste(&mut input, text);
                     app.active_overlay = ActiveOverlay::TextEdit {
                         input,
                         target,
@@ -7990,9 +7993,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                     };
                 }
                 ActiveOverlay::CommandInput { mut input, .. } => {
-                    for c in first_line.chars() {
-                        input.insert_char(c);
-                    }
+                    insert_single_line_terminal_paste(&mut input, text);
                     // Clear completion — pasted text invalidates candidates.
                     app.active_overlay = ActiveOverlay::CommandInput {
                         input,
@@ -8000,9 +8001,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                     };
                 }
                 ActiveOverlay::FileInput { mut input } => {
-                    for c in first_line.chars() {
-                        input.insert_char(c);
-                    }
+                    insert_single_line_terminal_paste(&mut input, text);
                     app.active_overlay = ActiveOverlay::FileInput { input };
                 }
                 other => {
@@ -8011,14 +8010,11 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
             }
         }
         ActiveOverlay::MetadataAutoNumber(_) => {
-            let first_line = text.lines().next().unwrap_or("");
             let overlay =
                 std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
             if let ActiveOverlay::MetadataAutoNumber(mut state) = overlay {
                 if let Some(input) = state.prefix_input.as_mut() {
-                    for character in first_line.chars() {
-                        input.insert_char(character);
-                    }
+                    insert_single_line_terminal_paste(input, text);
                 }
                 app.active_overlay = ActiveOverlay::MetadataAutoNumber(state);
             }
@@ -8046,10 +8042,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                     if let Some(input) = state.detail_edit.as_mut() {
                         // Detail row editors are single-line inputs. Keep terminal
                         // paste on the focused editor; commit owns list parsing.
-                        let first_line = text.lines().next().unwrap_or("");
-                        for c in first_line.chars() {
-                            input.insert_char(c);
-                        }
+                        insert_single_line_terminal_paste(input, text);
                     } else {
                         let field_idx = state.detail_field_idx;
                         if field_idx < state.active_surface().entries.len() {
@@ -8072,10 +8065,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 } else if state.phase == MetadataEditorPhase::InlineEdit {
                     // Single-field inline edit: insert first line at cursor.
                     if let Some(ref mut input) = state.edit_input {
-                        let first_line = text.lines().next().unwrap_or("");
-                        for c in first_line.chars() {
-                            input.insert_char(c);
-                        }
+                        insert_single_line_terminal_paste(input, text);
                     }
                 } else if state.phase == MetadataEditorPhase::Editing {
                     if let Err(reason) =
@@ -8638,6 +8628,84 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
+    fn inline_comment_terminal_paste_is_one_undo_even_beyond_history_cap() {
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into()],
+            vec![editing_entry("COMMENT", ItemKey::Comment, &["before"])],
+            vec!["a".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "before".to_string(),
+        ));
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(8);
+        let pasted = "x".repeat(300);
+        let terminal_payload = format!("{pasted}\nignored second line");
+
+        handle_paste(&mut app, &terminal_payload, &tx);
+
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            panic!("metadata editor should remain open after terminal paste");
+        };
+        let input = state.edit_input.as_mut().expect("inline COMMENT editor");
+        assert_eq!(input.text, format!("before{pasted}"));
+        assert_eq!(input.cursor, "before".len() + pasted.len());
+        assert!(input.undo(), "one undo must exist for the whole terminal paste");
+        assert_eq!(input.text, "before");
+        assert_eq!(input.cursor, "before".len());
+        assert!(
+            !input.can_undo(),
+            "the 300-character paste must consume exactly one undo snapshot"
+        );
+    }
+
+    #[test]
+    fn inline_comment_empty_first_line_terminal_paste_preserves_selected_input() {
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into()],
+            vec![editing_entry("COMMENT", ItemKey::Comment, &["before"])],
+            vec!["a".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::InlineEdit;
+        state.edit_input = Some(super::super::text_input::TextInputState::new_selected(
+            "before".to_string(),
+        ));
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(8);
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor should be open");
+        };
+        let input = state.edit_input.as_ref().expect("inline COMMENT editor");
+        let before_text = input.text.clone();
+        let before_cursor = input.cursor;
+        let before_selection = input.selection_range();
+        assert_eq!(before_selection, Some(0.."before".len()));
+        assert!(!input.can_undo());
+
+        handle_paste(&mut app, "\nignored", &tx);
+
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            panic!("metadata editor should remain open after terminal paste");
+        };
+        let input = state.edit_input.as_mut().expect("inline COMMENT editor");
+        assert_eq!(input.text, before_text);
+        assert_eq!(input.cursor, before_cursor);
+        assert_eq!(input.selection_range(), before_selection);
+        assert!(
+            !input.can_undo(),
+            "an empty retained first line must not create an undo snapshot"
+        );
+    }
+
+    #[test]
     fn detail_bracketed_paste_without_row_editor_uses_list_aware_whole_field_path() {
         let entry = set_valued_entry(
             "PERFORMER",
@@ -8713,7 +8781,7 @@ mod metadata_detail_paste_tests {
         );
 
         handle_paste(&mut app, "X; Y", &tx);
-        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
             panic!("metadata editor should remain open after terminal paste");
         };
         assert_eq!(state.detail_cursor, 1);
@@ -8729,6 +8797,11 @@ mod metadata_detail_paste_tests {
             state.active_surface().entries[0].per_file_values[1].to_texts(),
             ["C", "D"]
         );
+        let input = state.detail_edit.as_mut().expect("focused detail input");
+        assert!(input.undo(), "terminal paste into a detail row must be one undo unit");
+        assert_eq!(input.text, "C; D");
+
+        handle_paste(&mut app, "X; Y", &tx);
 
         handle_key(
             &mut app,

@@ -1102,6 +1102,70 @@ mod tests {
     }
 
     #[test]
+    fn transfer_created_custom_field_is_session_visible_but_existing_custom_field_stays_hidden() {
+        let source = vec![entry("CUSTOM_LABEL", &["replacement"])];
+
+        let mut created = editor_with_files(
+            1,
+            vec![entry("TITLE", &["Song"])],
+        );
+        assert_eq!(
+            created.metadata_view,
+            super::super::app::MetadataEditorView::Canonical
+        );
+        apply_transfer_entries_to_editor_with_dimension(
+            &mut created,
+            &source,
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("transfer may create a missing custom field");
+        let created_index = created
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "CUSTOM_LABEL")
+            .expect("created custom field");
+        assert!(
+            created.metadata_entry_is_visible(created_index),
+            "a custom field created by tag transfer must stay visible for this session"
+        );
+
+        let mut existing = editor_with_files(
+            1,
+            vec![
+                entry("TITLE", &["Song"]),
+                entry("CUSTOM_LABEL", &["old"]),
+            ],
+        );
+        let existing_index = existing
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "CUSTOM_LABEL")
+            .expect("pre-existing custom field");
+        assert!(
+            !existing.metadata_entry_is_visible(existing_index),
+            "pre-existing custom field starts hidden in Canonical view"
+        );
+        apply_transfer_entries_to_editor_with_dimension(
+            &mut existing,
+            &source,
+            TransferDimension::Files(1),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("transfer may update an existing custom field");
+        assert_eq!(
+            existing.active_surface().entries[existing_index].value,
+            "replacement"
+        );
+        assert!(
+            !existing.metadata_entry_is_visible(existing_index),
+            "updating an existing custom field must not grant session-added visibility"
+        );
+    }
+
+    #[test]
     fn block_apply_prevalidates_all_counts_and_pins_success_wording() {
         let mut state = editor_with_files(12, Vec::new());
         let blocks = vec![
@@ -6329,6 +6393,7 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
             surface.deleted.retain(|deleted| *deleted != row);
         } else {
             let key = canonical_key.clone();
+            let new_row = state.active_surface().entries.len();
             state.active_surface_mut().entries.push(TagEntry {
                 display_key: key.clone(),
                 item_key,
@@ -6344,7 +6409,8 @@ pub(crate) fn apply_transfer_entries_to_editor_with_dimension(
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
-            target_rows.insert(key, state.active_surface().entries.len() - 1);
+            state.remember_session_added_metadata_key(&key);
+            target_rows.insert(key, new_row);
         }
         report.applied.push((canonical_key, mode));
     }

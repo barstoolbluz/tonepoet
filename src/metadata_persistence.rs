@@ -120,6 +120,22 @@ pub(crate) fn metadata_field_taxonomy(
     }
 }
 
+/// Whether the field's ordinary Enter/value-double-click gesture should open
+/// the per-track detail editor rather than the in-place editor.
+///
+/// TITLE and ISRC intentionally share this affordance because both are
+/// track-scalar fields whose normal editing axis is the logical track list.
+/// TRACKNUMBER and DISCNUMBER remain track-scalar for distribution/persistence
+/// purposes but retain their existing default editing behavior (TRACKNUMBER in
+/// particular has its dedicated autonumber workflow).
+pub(crate) fn metadata_field_defaults_to_per_track_editor(
+    canonical_display_key: &str,
+) -> bool {
+    metadata_field_taxonomy(canonical_display_key).inline_class
+        == MetadataInlineEditClass::TrackScalar
+        && matches!(canonical_display_key, "TITLE" | "ISRC")
+}
+
 /// Ordered-list fields carried end-to-end by conversion metadata.
 ///
 /// ALBUMARTIST is conversion-visible while LYRICIST is editor-only.

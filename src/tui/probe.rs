@@ -8073,6 +8073,10 @@ pub(super) const STANDARD_KEY_ORDER: &[&str] = &[
     "COMMENT",
     "CATALOGNUMBER",
     "RELEASECOUNTRY",
+    // COUNTRY is a distinct user/carrier field, not an alias for
+    // RELEASECOUNTRY. Keep it adjacent while preserving the pre-existing
+    // relative order of every established standard key.
+    "COUNTRY",
     "CONDUCTOR",
     "LABEL",
     "ISRC",
@@ -25089,6 +25093,26 @@ mod tests {
         assert_eq!(canonical_metadata_display_key("TOTAL-DISCS"), "TOTAL-DISCS");
         assert_eq!(canonical_metadata_display_key("MUSICBRAINZ_ALBUMID"), "MUSICBRAINZ_ALBUMID");
         assert_eq!(canonical_metadata_display_key("MusicBrainz Release Track Id"), "MUSICBRAINZ_RELEASETRACKID");
+        assert_eq!(canonical_metadata_display_key("COUNTRY"), "COUNTRY");
+        assert_eq!(canonical_metadata_display_key("RELEASECOUNTRY"), "RELEASECOUNTRY");
+        assert_ne!(
+            canonical_metadata_display_key("COUNTRY"),
+            canonical_metadata_display_key("RELEASECOUNTRY"),
+            "COUNTRY and RELEASECOUNTRY are distinct metadata authorities"
+        );
+    }
+
+    #[test]
+    fn country_is_a_distinct_standard_field_adjacent_to_release_country() {
+        let release_country = STANDARD_KEY_ORDER
+            .iter()
+            .position(|key| *key == "RELEASECOUNTRY")
+            .expect("RELEASECOUNTRY standard key");
+        let country = STANDARD_KEY_ORDER
+            .iter()
+            .position(|key| *key == "COUNTRY")
+            .expect("COUNTRY standard key");
+        assert_eq!(country, release_country + 1);
     }
 
     #[test]

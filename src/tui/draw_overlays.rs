@@ -5514,7 +5514,7 @@ fn draw_metadata_editor(
                 pill_gap(),
                 footer_pill(":u undo", theme.amber, theme),
                 pill_gap(),
-                footer_pill(":a add", theme.cyan, theme),
+                footer_pill("Alt+F add", theme.cyan, theme),
                 pill_gap(),
             ]);
             if state.any_presentation_dirty() {

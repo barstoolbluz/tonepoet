@@ -12008,6 +12008,9 @@ pub(super) fn open_context_menu_with_tx(
 /// Open the "add new field" prompt (sets cursor to the add row,
 /// initializes add_key_input, transitions to AddingKey phase).
 pub(super) fn metadata_editor_open_add(state: &mut super::app::MetadataEditorState) -> Option<String> {
+    if state.read_only {
+        return Some("read-only editor (SACD ISO)".to_string());
+    }
     let (writable, blocked) = metadata_editor_file_slot_counts(state);
     if writable == 0 && blocked > 0 {
         return Some("metadata editor: cannot add field — no writable files in this editor session".to_string());
@@ -12054,7 +12057,6 @@ fn metadata_field_name_completion_candidates() -> &'static [String] {
         let mut candidates = super::probe::STANDARD_KEY_ORDER
             .iter()
             .copied()
-            .chain(["COUNTRY"])
             .map(str::to_string)
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| candidate.to_ascii_lowercase());
@@ -12522,9 +12524,13 @@ fn metadata_editor_inline_entry_text(
         .unwrap_or_default()
 }
 
-fn metadata_editor_entry_is_track_title(entry: &super::probe::TagEntry) -> bool {
-    matches!(&entry.item_key, &lofty::tag::ItemKey::TrackTitle)
+fn metadata_editor_entry_defaults_to_per_track_editor(entry: &super::probe::TagEntry) -> bool {
+    let canonical = super::probe::canonical_metadata_display_key(&entry.display_key);
+    crate::metadata_persistence::metadata_field_defaults_to_per_track_editor(&canonical)
 }
+
+const METADATA_EDIT_IN_PLACE_LABEL: &str = "Edit in-place";
+const METADATA_EDIT_PER_TRACK_LABEL: &str = "Edit per track";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataEditorCursorEditRoute {
@@ -12559,7 +12565,8 @@ fn metadata_editor_begin_cursor_value_edit_with_route(
         return Some("metadata editor: cannot edit binary field".to_string());
     }
 
-    let is_track_title = metadata_editor_entry_is_track_title(entry);
+    let defaults_to_per_track_editor =
+        metadata_editor_entry_defaults_to_per_track_editor(entry);
     let set_valued = super::probe::metadata_field_is_set_valued(&entry.display_key);
     let is_mixed = entry.is_mixed;
     let (writable, blocked) = metadata_editor_entry_slot_counts(state, cursor);
@@ -12569,18 +12576,19 @@ fn metadata_editor_begin_cursor_value_edit_with_route(
         return Some(format!("metadata editor: cannot edit blocked field — {reason}"));
     }
 
-    let title_defaults_to_detail =
-        route == MetadataEditorCursorEditRoute::DefaultGesture && is_track_title;
+    let default_gesture_uses_detail = route == MetadataEditorCursorEditRoute::DefaultGesture
+        && defaults_to_per_track_editor;
     let preserve_uniform_blocked_detail_route = blocked > 0
         && !set_valued
         && !is_mixed
-        && !(route == MetadataEditorCursorEditRoute::ExplicitInline && is_track_title);
-    if title_defaults_to_detail || preserve_uniform_blocked_detail_route {
+        && !(route == MetadataEditorCursorEditRoute::ExplicitInline
+            && defaults_to_per_track_editor);
+    if default_gesture_uses_detail || preserve_uniform_blocked_detail_route {
         if let Some(status) = metadata_editor_begin_detail_edit_for_entry_inner(
             state,
             cursor,
             true,
-            title_defaults_to_detail,
+            default_gesture_uses_detail,
         ) {
             return Some(status);
         }
@@ -12608,13 +12616,11 @@ fn metadata_editor_begin_cursor_value_edit_with_route(
     state.phase = super::app::MetadataEditorPhase::InlineEdit;
     (blocked > 0).then(|| {
         let detail_action = if route == MetadataEditorCursorEditRoute::ExplicitInline
-            && is_track_title
+            && defaults_to_per_track_editor
         {
             "Enter"
-        } else if set_valued {
-            "Edit"
         } else {
-            "Edit values (per file)"
+            METADATA_EDIT_PER_TRACK_LABEL
         };
         format!(
             "metadata editor: editing {} writable slot{} inline; {} blocked slot{} will remain unchanged; use {} to inspect locked slots",
@@ -20525,6 +20531,11 @@ fn handle_metadata_editor_key(
                         crate::tui::app::ContentTab::Metadata => {}
                     }
                 }
+                KeyCode::Char('f') if key.modifiers == KeyModifiers::ALT => {
+                    if let Some(status) = metadata_editor_open_add(state) {
+                        app.set_status(status);
+                    }
+                }
                 KeyCode::Char('a')
                     if key.modifiers == KeyModifiers::CONTROL =>
                 {
@@ -20842,7 +20853,7 @@ fn handle_metadata_editor_key(
                         state.active_surface_mut().entries.push(crate::tui::probe::TagEntry {
                             row_scope,
                             display_key: key_name.clone(),
-                            item_key: lofty::tag::ItemKey::Unknown(key_name),
+                            item_key: lofty::tag::ItemKey::Unknown(key_name.clone()),
                             value: String::new(),
                             original: String::new(),
                             is_binary: false,
@@ -20854,6 +20865,7 @@ fn handle_metadata_editor_key(
                             mb_proposed_value: None,
                             mb_proposed_per_file: None,
                         });
+                        state.remember_session_added_metadata_key(&key_name);
                         state.cursor = state.active_surface().entries.len() - 1;
                         state.add_key_input = None;
                         if blocked > 0 {
@@ -20871,6 +20883,7 @@ fn handle_metadata_editor_key(
                             state.edit_input = Some(super::text_input::TextInputState::empty());
                             state.phase = MetadataEditorPhase::InlineEdit;
                         }
+                        state.repair_metadata_cursor_visibility();
                         ensure_cursor_visible(state);
                     } else {
                         state.add_key_input = None;
@@ -39732,11 +39745,6 @@ pub(super) fn build_metadata_row_context_menu_for_column(
     }
     let is_binary = state.active_surface().entries.get(row).map(|e| e.is_binary).unwrap_or(true);
     if !is_binary {
-        let is_track_title = state
-            .active_surface()
-            .entries
-            .get(row)
-            .is_some_and(metadata_editor_entry_is_track_title);
         let set_valued = state
             .active_surface()
             .entries
@@ -39744,13 +39752,7 @@ pub(super) fn build_metadata_row_context_menu_for_column(
             .map(|entry| super::probe::metadata_field_is_set_valued(&entry.display_key))
             .unwrap_or(false);
         entries.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: if is_track_title {
-                "Edit inline".to_string()
-            } else if set_valued {
-                "Edit (in-place)".to_string()
-            } else {
-                "Edit value".to_string()
-            },
+            label: METADATA_EDIT_IN_PLACE_LABEL.to_string(),
             action: ContextAction::MetadataEditValue,
             shortcut: None,
             enabled: true,
@@ -39764,11 +39766,7 @@ pub(super) fn build_metadata_row_context_menu_for_column(
             })
         {
             entries.push(ContextMenuEntry::Item(ContextMenuItem {
-                label: if set_valued {
-                    "Edit".to_string()
-                } else {
-                    "Edit values (per file)".to_string()
-                },
+                label: METADATA_EDIT_PER_TRACK_LABEL.to_string(),
                 action: ContextAction::MetadataEditValuesPerFile,
                 shortcut: None,
                 enabled: true,
@@ -42406,7 +42404,7 @@ fn handle_metadata_editor_mouse_in_area(
                         (":fix-caps", ":fix-caps"),
                         (":d delete", ":d"),
                         (":u undo", ":u"),
-                        (":a add", ":a"),
+                        ("Alt+F add", ":a"),
                     ]);
                     if state.any_presentation_dirty() {
                         pills.push(("Alt+A Apply", "apply"));
@@ -62762,7 +62760,7 @@ mod phase4_tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(inline_actions, vec!["Edit inline"]);
+        assert_eq!(inline_actions, vec![METADATA_EDIT_IN_PLACE_LABEL]);
         let per_file_actions = menu
             .iter()
             .filter_map(|entry| match entry {
@@ -62790,7 +62788,7 @@ mod phase4_tests {
         );
         let state = match &app.active_overlay {
             ActiveOverlay::MetadataEditor(state) => state,
-            other => panic!("expected metadata editor after Edit inline, got {other:?}"),
+            other => panic!("expected metadata editor after Edit in-place, got {other:?}"),
         };
         assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
         assert!(state.edit_input.is_some());
@@ -62842,7 +62840,7 @@ mod phase4_tests {
         assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
         assert!(status.contains("blocked slot"));
         assert!(status.contains("use Enter to inspect locked slots"));
-        assert!(!status.contains("Edit values (per file)"));
+        assert!(!status.contains(METADATA_EDIT_PER_TRACK_LABEL));
         state.edit_input = Some(super::super::text_input::TextInputState::new(
             "Changed".to_string(),
         ));
@@ -62853,7 +62851,7 @@ mod phase4_tests {
     }
 
     #[test]
-    fn title_routing_uses_semantic_item_key_not_display_text() {
+    fn title_default_routing_uses_canonical_field_taxonomy_even_with_unknown_item_key() {
         let mut state = two_file_editor(vec![entry(
             "TITLE",
             ItemKey::Unknown("TITLE".to_string()),
@@ -62864,7 +62862,7 @@ mod phase4_tests {
 
         press_metadata_enter(&mut state);
 
-        assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+        assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         let menu = build_metadata_row_context_menu_for_column(
             &state,
             0,
@@ -62873,21 +62871,144 @@ mod phase4_tests {
         assert!(menu.iter().any(|entry| matches!(
             entry,
             super::super::context_menu::ContextMenuEntry::Item(item)
-                if item.label == "Edit value"
+                if item.label == METADATA_EDIT_IN_PLACE_LABEL
                     && matches!(
                         &item.action,
                         &super::super::context_menu::ContextAction::MetadataEditValue
                     )
         )));
-        assert!(!menu.iter().any(|entry| matches!(
+        assert!(menu.iter().any(|entry| matches!(
             entry,
             super::super::context_menu::ContextMenuEntry::Item(item)
-                if item.label == "Edit inline"
+                if item.label == METADATA_EDIT_PER_TRACK_LABEL
+                    && matches!(
+                        &item.action,
+                        &super::super::context_menu::ContextAction::MetadataEditValuesPerFile
+                    )
         )));
     }
 
     #[test]
-    fn non_title_default_gestures_keep_existing_inline_routing() {
+    fn isrc_default_gesture_uses_per_track_editor_without_changing_number_fields() {
+        for item_key in [ItemKey::Isrc, ItemKey::Unknown("ISRC".to_string())] {
+            let mut state = two_file_editor(vec![entry(
+                "ISRC",
+                item_key,
+                &["US-AAA-26-00001", "US-AAA-26-00002"],
+                &["US-AAA-26-00001", "US-AAA-26-00002"],
+            )]);
+            state.cursor = 0;
+            press_metadata_enter(&mut state);
+            assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
+        }
+
+        for (display_key, item_key) in [
+            ("TRACKNUMBER", ItemKey::TrackNumber),
+            ("DISCNUMBER", ItemKey::DiscNumber),
+        ] {
+            let mut state = two_file_editor(vec![entry(
+                display_key,
+                item_key,
+                &["1", "2"],
+                &["1", "2"],
+            )]);
+            state.cursor = 0;
+            press_metadata_enter(&mut state);
+            assert_eq!(
+                state.phase,
+                MetadataEditorPhase::InlineEdit,
+                "{display_key} must retain its existing default route"
+            );
+        }
+    }
+
+    #[test]
+    fn isrc_value_double_click_uses_the_same_detail_route_as_enter() {
+        let mut state = two_file_editor(vec![entry(
+            "ISRC",
+            ItemKey::Isrc,
+            &["US-AAA-26-00001", "US-AAA-26-00002"],
+            &["US-AAA-26-00001", "US-AAA-26-00002"],
+        )]);
+        state.cursor = 0;
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = mpsc::channel(1);
+        let area = Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout
+                .content_area
+                .x
+                .saturating_add(layout.content_area.width.saturating_sub(2)),
+            row: layout.content_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            metadata_editor_row_column_for_x(layout.inner.x, click.column),
+            MetadataRowColumn::Value,
+            "fixture click must land in the value column"
+        );
+        handle_metadata_editor_mouse_in_area(&mut app, click, &tx, area);
+        handle_metadata_editor_mouse_in_area(&mut app, click, &tx, area);
+
+        let state = match &app.active_overlay {
+            ActiveOverlay::MetadataEditor(state) => state,
+            other => panic!("expected metadata editor after double-click, got {other:?}"),
+        };
+        assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
+        assert_eq!(state.detail_field_idx, 0);
+    }
+
+    #[test]
+    fn explicit_inline_isrc_keeps_sequential_semicolon_distribution() {
+        let mut state = four_file_editor(vec![entry(
+            "ISRC",
+            ItemKey::Isrc,
+            &[
+                "US-AAA-26-00001",
+                "US-AAA-26-00002",
+                "US-AAA-26-00003",
+                "US-AAA-26-00004",
+            ],
+            &[
+                "US-AAA-26-00001",
+                "US-AAA-26-00002",
+                "US-AAA-26-00003",
+                "US-AAA-26-00004",
+            ],
+        )]);
+        state.cursor = 0;
+
+        assert_eq!(
+            metadata_editor_begin_explicit_inline_value_edit(&mut state, true),
+            None
+        );
+        assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "US-BBB-26-10001; US-BBB-26-10002; US-BBB-26-10003".to_string(),
+        ));
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        assert_eq!(
+            state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "US-BBB-26-10001",
+                "US-BBB-26-10002",
+                "US-BBB-26-10003",
+                "US-AAA-26-00004",
+            ]
+        );
+    }
+
+    #[test]
+    fn unrelated_default_gestures_keep_existing_inline_routing() {
         let mut composer = two_file_editor(vec![entry(
             "COMPOSER",
             ItemKey::Composer,
@@ -62898,13 +63019,12 @@ mod phase4_tests {
         press_metadata_enter(&mut composer);
         assert_eq!(composer.phase, MetadataEditorPhase::InlineEdit);
 
-        let mut album = two_file_editor(vec![entry(
+        let album = two_file_editor(vec![entry(
             "ALBUM",
             ItemKey::AlbumTitle,
             &["Side A", "Side B"],
             &["Side A", "Side B"],
         )]);
-        album.cursor = 0;
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(album));
         let (tx, _rx) = mpsc::channel(1);
@@ -63017,7 +63137,7 @@ mod phase4_tests {
         assert_eq!(
             state.edit_input.as_ref().map(|input| input.text.as_str()),
             Some("Old 1; Old 2; Old 3; Old 4"),
-            "mixed class-B rows must remain reachable through Edit value"
+            "mixed class-B rows must remain reachable through Edit in-place"
         );
 
         state.edit_input = Some(super::super::text_input::TextInputState::new(
@@ -63056,7 +63176,7 @@ mod phase4_tests {
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         assert!(
             !state.detail_apply_shared,
-            "Edit values per file must remain a distinct positional overlay for TITLE"
+            "Edit per track must remain a distinct positional overlay for TITLE"
         );
         state.detail_cursor = 1;
         state.detail_edit = Some(super::super::text_input::TextInputState::new(
@@ -63090,7 +63210,7 @@ mod phase4_tests {
         assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
         assert!(status.contains("blocked slot"), "unexpected status: {status}");
         assert!(
-            status.contains("Edit values (per file)"),
+            status.contains(METADATA_EDIT_PER_TRACK_LABEL),
             "status must tell the user how to inspect locked slots: {status}"
         );
         assert_eq!(
@@ -63113,7 +63233,7 @@ mod phase4_tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            labels.contains(&"Edit values (per file)"),
+            labels.contains(&METADATA_EDIT_PER_TRACK_LABEL),
             "mixed scalar rows must expose the lock-inspection action named by the status"
         );
 
@@ -63189,12 +63309,8 @@ mod phase4_tests {
             .expect("blocked set-valued inline edit should explain the locked slot");
         assert_eq!(state.phase, MetadataEditorPhase::InlineEdit);
         assert!(
-            status.contains("use Edit to inspect locked slots"),
+            status.contains("use Edit per track to inspect locked slots"),
             "set-valued hint must use the actual context-menu label: {status}"
-        );
-        assert!(
-            !status.contains("Edit values (per file)"),
-            "set-valued rows do not expose the scalar per-file label"
         );
 
         let menu = build_metadata_row_context_menu_for_column(
@@ -63212,7 +63328,7 @@ mod phase4_tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            labels.contains(&"Edit"),
+            labels.contains(&METADATA_EDIT_PER_TRACK_LABEL),
             "the set-valued lock-inspection action named by the hint must exist"
         );
     }
@@ -65144,6 +65260,71 @@ ignored".to_string()),
     }
 
     #[test]
+    fn metadata_context_menu_editor_labels_are_uniform_across_field_classes() {
+        let fixtures = [
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["One", "Two"],
+                &["One", "Two"],
+            ),
+            entry(
+                "COMPOSER",
+                ItemKey::Composer,
+                &["Bach", "Handel"],
+                &["Bach", "Handel"],
+            ),
+            entry(
+                "ALBUM",
+                ItemKey::AlbumTitle,
+                &["Same", "Same"],
+                &["Same", "Same"],
+            ),
+        ];
+
+        for fixture in fixtures {
+            let display_key = fixture.display_key.clone();
+            let expects_detail = fixture.is_mixed
+                || super::super::probe::metadata_field_is_set_valued(&fixture.display_key);
+            let state = two_file_editor(vec![fixture]);
+            let menu = build_metadata_row_context_menu_for_column(
+                &state,
+                0,
+                MetadataRowColumn::Value,
+            );
+            let mut saw_inline = false;
+            let mut saw_detail = false;
+            for menu_entry in menu {
+                let super::super::context_menu::ContextMenuEntry::Item(item) = menu_entry else {
+                    continue;
+                };
+                match item.action {
+                    super::super::context_menu::ContextAction::MetadataEditValue => {
+                        saw_inline = true;
+                        assert_eq!(
+                            item.label, METADATA_EDIT_IN_PLACE_LABEL,
+                            "{display_key} inline label"
+                        );
+                    }
+                    super::super::context_menu::ContextAction::MetadataEditValuesPerFile => {
+                        saw_detail = true;
+                        assert_eq!(
+                            item.label, METADATA_EDIT_PER_TRACK_LABEL,
+                            "{display_key} detail label"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_inline, "{display_key} must expose Edit in-place");
+            assert_eq!(
+                saw_detail, expects_detail,
+                "{display_key} detail-action presence must keep the existing availability rule"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_row_context_menu_classifies_both_columns_and_exposes_per_file_edit() {
         let mut mixed = entry(
             "TITLE",
@@ -65169,7 +65350,7 @@ ignored".to_string()),
             for required in ["Copy", "Cut", "Paste", "Select All", "Invert Selection", "Deselect"] {
                 assert!(labels.contains(&required), "{column:?} menu missing {required}");
             }
-            assert!(labels.contains(&"Edit values (per file)"));
+            assert!(labels.contains(&METADATA_EDIT_PER_TRACK_LABEL));
         }
     }
 
@@ -67304,7 +67485,7 @@ ignored".to_string()),
             (":fix-caps", ":fix-caps"),
             (":d delete", ":d"),
             (":u undo", ":u"),
-            (":a add", ":a"),
+            ("Alt+F add", ":a"),
             (":w save", ":w"),
             ("Esc close", "esc"),
         ];
@@ -67433,7 +67614,7 @@ ignored".to_string()),
         app.active_overlay = ActiveOverlay::ContextMenu {
             levels: vec![MenuLevel::new(vec![ContextMenuEntry::Item(
                 ContextMenuItem {
-                    label: "Edit value".to_string(),
+                    label: METADATA_EDIT_IN_PLACE_LABEL.to_string(),
                     action: ContextAction::MetadataEditValue,
                     shortcut: None,
                     enabled: true,
@@ -68684,11 +68865,15 @@ ignored".to_string()),
         let (tx, _rx) = mpsc::channel(1);
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
-        // TITLE routes Enter to the per-file editor by design; this test is about
-        // Enter editing a mixed scalar row in the grid, so use a non-TITLE scalar.
+        // This test is about Enter editing a mixed row inline in the grid, so the
+        // row must satisfy two constraints: it must be a TrackScalar field (those
+        // seed the inline editor with the positional slots joined by "; "), and it
+        // must NOT be on the default-detail route. TITLE and ISRC are TrackScalar
+        // but default to the per-track detail editor; DISCNUMBER is TrackScalar and
+        // deliberately stays on the inline route.
         let mut enter_state = Box::new(dvda_multitab_state(selector_test_tabs_for(
-            "ISRC",
-            ItemKey::Isrc,
+            "DISCNUMBER",
+            ItemKey::DiscNumber,
         )));
         handle_metadata_editor_key(
             &mut app,
@@ -83540,6 +83725,12 @@ FILE "a.flac" WAVE
         let field_names = metadata_field_name_completion_candidates();
         assert!(field_names.iter().any(|candidate| candidate == "DISCOGS_URL"));
         assert!(field_names.iter().any(|candidate| candidate == "LINEAGE"));
+        assert!(field_names.iter().any(|candidate| candidate == "COUNTRY"));
+        assert!(field_names.iter().all(|candidate| {
+            super::super::probe::STANDARD_KEY_ORDER
+                .iter()
+                .any(|standard| *standard == candidate.as_str())
+        }), "the add-field suggestion authority must not outrun Canonical visibility");
 
         for field in [
             "ARTIST",
@@ -90422,6 +90613,153 @@ mod metadata_editor_inline_navigation_tests {
             } if metadata_target_priority.as_slice()
                 == &[IndividualFiles, EmbeddedCue, SidecarCue]
         ));
+    }
+
+    #[test]
+    fn alt_f_opens_add_field_through_the_shared_entry_point() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut via_shortcut = editor(
+            vec![entry("TITLE", ItemKey::TrackTitle, &["old"], false)],
+            1,
+        );
+        let mut via_entry_point = via_shortcut.clone();
+
+        let expected_status = metadata_editor_open_add(&mut via_entry_point);
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            &mut via_shortcut,
+            &tx(),
+        );
+
+        assert_eq!(via_shortcut.phase, MetadataEditorPhase::AddingKey);
+        assert_eq!(via_shortcut.cursor, via_entry_point.cursor);
+        assert_eq!(
+            via_shortcut.add_key_input.as_ref().map(|input| input.text.as_str()),
+            via_entry_point.add_key_input.as_ref().map(|input| input.text.as_str())
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            expected_status.as_deref()
+        );
+    }
+
+    #[test]
+    fn country_and_release_country_are_both_visible_in_canonical_view() {
+        let state = editor(
+            vec![
+                entry(
+                    "COUNTRY",
+                    ItemKey::Unknown("COUNTRY".to_string()),
+                    &["US"],
+                    false,
+                ),
+                entry(
+                    "RELEASECOUNTRY",
+                    ItemKey::Unknown("RELEASECOUNTRY".to_string()),
+                    &["GB"],
+                    false,
+                ),
+                entry(
+                    "PREEXISTING_CUSTOM",
+                    ItemKey::Unknown("PREEXISTING_CUSTOM".to_string()),
+                    &["legacy"],
+                    false,
+                ),
+            ],
+            1,
+        );
+
+        assert!(state.metadata_entry_is_visible(0));
+        assert!(state.metadata_entry_is_visible(1));
+        assert!(!state.metadata_entry_is_visible(2));
+    }
+
+    #[test]
+    fn newly_added_custom_key_is_canonical_visible_only_for_this_editor_session() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = editor(
+            vec![
+                entry("TITLE", ItemKey::TrackTitle, &["old"], false),
+                entry(
+                    "PREEXISTING_CUSTOM",
+                    ItemKey::Unknown("PREEXISTING_CUSTOM".to_string()),
+                    &["legacy"],
+                    false,
+                ),
+            ],
+            1,
+        );
+        state.metadata_view = super::super::app::MetadataEditorView::Canonical;
+        assert!(state.metadata_entry_is_visible(0));
+        assert!(!state.metadata_entry_is_visible(1));
+
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            &mut state,
+            &tx(),
+        );
+        let input = state.add_key_input.as_mut().expect("add-key input");
+        input.set_text_and_cursor("SESSION_CUSTOM".to_string(), "SESSION_CUSTOM".len());
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx(),
+        );
+
+        let added = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "SESSION_CUSTOM")
+            .expect("new custom row");
+        assert_eq!(state.cursor, added);
+        assert!(state.metadata_entry_is_visible(added));
+        assert!(state.visible_metadata_rows().contains(&added));
+        assert!(
+            !state.metadata_entry_is_visible(1),
+            "pre-existing custom rows must remain hidden in Canonical view"
+        );
+
+        let current_entries = state.active_surface().entries.clone();
+        let fresh = editor(current_entries, 1);
+        let added_in_fresh = fresh
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key == "SESSION_CUSTOM")
+            .expect("persisted custom row in fresh fixture");
+        assert!(
+            !fresh.metadata_entry_is_visible(added_in_fresh),
+            "the session-only visibility exception must not survive a new editor state"
+        );
+    }
+
+    #[test]
+    fn cursor_repair_never_leaves_a_hidden_row_selected() {
+        let mut state = editor(
+            vec![
+                entry("TITLE", ItemKey::TrackTitle, &["old"], false),
+                entry(
+                    "PREEXISTING_CUSTOM",
+                    ItemKey::Unknown("PREEXISTING_CUSTOM".to_string()),
+                    &["legacy"],
+                    false,
+                ),
+            ],
+            1,
+        );
+        state.metadata_view = super::super::app::MetadataEditorView::All;
+        state.cursor = 1;
+        assert!(state.metadata_entry_is_visible(1));
+
+        state.set_metadata_view(super::super::app::MetadataEditorView::Canonical);
+
+        assert_eq!(state.cursor, 0);
+        assert!(state.metadata_entry_is_visible(state.cursor));
+        assert!(state.visible_metadata_rows().contains(&state.cursor));
     }
 
     #[test]

@@ -7999,6 +7999,11 @@ pub struct MetadataEditorModel {
     pub scroll: usize,
     pub content_tab: ContentTab,
     pub metadata_view: MetadataEditorView,
+    /// Canonical keys explicitly added during this editor session, scoped by
+    /// the active surface's stable session id. These keys are allowed
+    /// through Canonical view for the lifetime of this in-memory editor only;
+    /// they are intentionally absent from all persisted metadata/state.
+    pub session_added_metadata_keys: std::collections::BTreeSet<(u64, String)>,
     pub maximized: bool,
     pub content_tab_scrolls: [usize; ContentTab::COUNT],
     pub last_click: Option<(usize, std::time::Instant)>,
@@ -8068,6 +8073,7 @@ impl Default for MetadataEditorModel {
             scroll: 0,
             content_tab: ContentTab::Metadata,
             metadata_view: MetadataEditorView::Canonical,
+            session_added_metadata_keys: std::collections::BTreeSet::new(),
             maximized: false,
             content_tab_scrolls: [0; ContentTab::COUNT],
             last_click: None,
@@ -8147,15 +8153,37 @@ impl MetadataEditorModel {
         }
     }
 
+    fn active_metadata_surface_session_id(&self) -> u64 {
+        self.active_surface().technical_details.session_id
+    }
+
+    pub(crate) fn remember_session_added_metadata_key(&mut self, display_key: &str) {
+        let canonical = crate::tui::probe::canonical_metadata_display_key(display_key);
+        if canonical.is_empty() {
+            return;
+        }
+        let session_id = self.active_metadata_surface_session_id();
+        self.session_added_metadata_keys.insert((session_id, canonical));
+    }
+
+    fn metadata_key_was_added_this_session(&self, canonical_key: &str) -> bool {
+        let session_id = self.active_metadata_surface_session_id();
+        self.session_added_metadata_keys
+            .iter()
+            .any(|(surface_session_id, key)| {
+                *surface_session_id == session_id && key == canonical_key
+            })
+    }
+
     pub fn metadata_entry_is_visible(&self, index: usize) -> bool {
         let Some(entry) = self.active_surface().entries.get(index) else {
             return false;
         };
+        let canonical = crate::tui::probe::canonical_metadata_display_key(&entry.display_key);
         self.metadata_view == MetadataEditorView::All
             || entry.display_key.eq_ignore_ascii_case("NO EDITABLE METADATA")
-            || crate::tui::probe::STANDARD_KEY_ORDER.iter().any(|known| {
-                *known == crate::tui::probe::canonical_metadata_display_key(&entry.display_key)
-            })
+            || self.metadata_key_was_added_this_session(&canonical)
+            || crate::tui::probe::STANDARD_KEY_ORDER.contains(&canonical.as_str())
     }
 
     pub fn visible_metadata_entry_indices(&self) -> Vec<usize> {
@@ -8170,18 +8198,23 @@ impl MetadataEditorModel {
         rows
     }
 
+    pub(crate) fn repair_metadata_cursor_visibility(&mut self) {
+        let rows = self.visible_metadata_rows();
+        if !rows.contains(&self.cursor) {
+            self.cursor = rows.first().copied().unwrap_or(0);
+        }
+    }
+
     pub fn set_metadata_view(&mut self, view: MetadataEditorView) {
         if self.metadata_view == view {
+            self.repair_metadata_cursor_visibility();
             return;
         }
         self.metadata_view = view;
         if view == MetadataEditorView::All {
             self.maximized = true;
         }
-        let rows = self.visible_metadata_rows();
-        if !rows.contains(&self.cursor) {
-            self.cursor = rows.first().copied().unwrap_or(0);
-        }
+        self.repair_metadata_cursor_visibility();
         self.scroll = 0;
     }
 
@@ -9087,6 +9120,7 @@ impl MetadataEditorState {
         // cloned out or reconciled back.
         self.active_tab = next;
         self.cursor = self.cursor.min(self.active_surface().entries.len());
+        self.repair_metadata_cursor_visibility();
         self.content_tab_scrolls = [0; ContentTab::COUNT];
         let ct_idx = self.content_tab.index();
         self.scroll = if self.content_tab == ContentTab::Metadata {
@@ -9347,6 +9381,7 @@ impl MetadataEditorState {
             tab.entries.len()
         };
         self.cursor = self.cursor.min(entries_len.saturating_sub(1));
+        self.repair_metadata_cursor_visibility();
         true
     }
 
@@ -17189,6 +17224,49 @@ mod metadata_presentation_tab_tests {
         assert!(!state.active_surface().refresh_failed);
         assert!(!state.recompute_active_dirty());
         assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn successful_surface_reread_rehomes_cursor_when_model_shift_lands_on_hidden_row() {
+        let mut surface = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Group 1",
+            vec![
+                tag("TITLE", "Song", vec!["Song"]),
+                tag("ARTIST", "Artist", vec!["Artist"]),
+                tag("RELEASECOUNTRY", "US", vec!["US"]),
+                tag("COUNTRY", "US", vec!["US"]),
+                tag("ZZZ_CUSTOM", "custom", vec!["custom"]),
+            ],
+            1,
+        );
+        surface.technical_details.session_id = 79;
+        let mut state = state_with_tabs(vec![surface], 0);
+        state.cursor = 3;
+
+        assert_eq!(state.metadata_view, MetadataEditorView::Canonical);
+        assert!(state.metadata_entry_is_visible(3), "COUNTRY must be canonical");
+        assert!(
+            !state.metadata_entry_is_visible(4),
+            "pre-existing custom field must stay hidden in Canonical view"
+        );
+
+        assert!(state.replace_saved_surface_entries(
+            79,
+            vec![
+                tag("TITLE", "Song", vec!["Song"]),
+                tag("ARTIST", "Artist", vec!["Artist"]),
+                tag("RELEASECOUNTRY", "US", vec!["US"]),
+                tag("ZZZ_CUSTOM", "custom", vec!["custom"]),
+            ],
+        ));
+
+        assert!(state.visible_metadata_rows().contains(&state.cursor));
+        assert_ne!(
+            state.active_surface().entries.get(state.cursor).map(|entry| entry.display_key.as_str()),
+            Some("ZZZ_CUSTOM"),
+            "post-save cursor must not target the hidden row that shifted into COUNTRY's index"
+        );
     }
 
     #[test]
