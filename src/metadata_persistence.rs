@@ -26,12 +26,99 @@ pub(crate) const MAX_ID3V2_FLAC_PREFIX_LEN: u64 = 16 * 1024 * 1024;
 /// pipeline contract or the repeatable subset of fixed-vocabulary backends.
 pub(crate) const EDITOR_ORDERED_LIST_FIELDS: &[&str] = &[
     "ARTIST",
+    "ALBUMARTIST",
     "COMPOSER",
     "PERFORMER",
     "GENRE",
     "LYRICIST",
     "ARRANGER",
 ];
+
+/// Inline metadata editing semantics. This is deliberately separate from
+/// [`EDITOR_ORDERED_LIST_FIELDS`]: the latter is a serialization/list contract,
+/// while this enum describes what a semicolon-delimited inline entry means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataInlineEditClass {
+    /// One ordered list is written to every writable slot.
+    OrderedList,
+    /// Values are mapped positionally across logical tracks.
+    TrackScalar,
+    /// The complete entry is one release value broadcast to writable slots.
+    ReleaseScalar,
+    /// Unknown/custom keys preserve the historical scalar-broadcast behavior.
+    BroadcastScalar,
+}
+
+/// Existing unified-CUE scope override. Keeping this dimension in the same
+/// authority removes duplicated key literals without changing the CUE save
+/// contract for fields (notably DISCNUMBER) that historically have no override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataUnifiedCueScope {
+    File,
+    Track,
+    Declared,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataFieldTaxonomy {
+    pub(crate) inline_class: MetadataInlineEditClass,
+    pub(crate) release_scoped: bool,
+    pub(crate) unified_cue_scope: MetadataUnifiedCueScope,
+}
+
+/// Authoritative field taxonomy for editor semantics and unified-CUE scope
+/// overrides. `canonical_display_key` must already be canonicalized by the
+/// caller. Unknown/custom fields intentionally remain scalar broadcast values.
+pub(crate) fn metadata_field_taxonomy(
+    canonical_display_key: &str,
+) -> MetadataFieldTaxonomy {
+    use MetadataInlineEditClass as Inline;
+    use MetadataUnifiedCueScope as Cue;
+
+    match canonical_display_key {
+        "ARTIST" => MetadataFieldTaxonomy {
+            inline_class: Inline::OrderedList,
+            release_scoped: false,
+            unified_cue_scope: Cue::Declared,
+        },
+        "ALBUMARTIST" | "GENRE" => MetadataFieldTaxonomy {
+            inline_class: Inline::OrderedList,
+            release_scoped: true,
+            unified_cue_scope: Cue::File,
+        },
+        "COMPOSER" | "PERFORMER" | "LYRICIST" | "ARRANGER" => {
+            MetadataFieldTaxonomy {
+                inline_class: Inline::OrderedList,
+                release_scoped: false,
+                unified_cue_scope: Cue::None,
+            }
+        }
+        "TITLE" | "ISRC" | "TRACKNUMBER" => MetadataFieldTaxonomy {
+            inline_class: Inline::TrackScalar,
+            release_scoped: false,
+            unified_cue_scope: Cue::Track,
+        },
+        // DISCNUMBER is track-scoped for inline distribution, but the
+        // unified-CUE save/scope contract has never overridden its declared
+        // scope. Preserve that contract rather than making it a new CUE row.
+        "DISCNUMBER" => MetadataFieldTaxonomy {
+            inline_class: Inline::TrackScalar,
+            release_scoped: false,
+            unified_cue_scope: Cue::None,
+        },
+        "ALBUM" | "DATE" | "CATALOGNUMBER" => MetadataFieldTaxonomy {
+            inline_class: Inline::ReleaseScalar,
+            release_scoped: true,
+            unified_cue_scope: Cue::File,
+        },
+        _ => MetadataFieldTaxonomy {
+            inline_class: Inline::BroadcastScalar,
+            release_scoped: false,
+            unified_cue_scope: Cue::None,
+        },
+    }
+}
 
 /// Ordered-list fields carried end-to-end by conversion metadata.
 ///
@@ -2132,7 +2219,15 @@ mod tests {
     fn ordered_list_field_contracts_are_intentionally_distinct_and_guarded() {
         assert_eq!(
             EDITOR_ORDERED_LIST_FIELDS,
-            &["ARTIST", "COMPOSER", "PERFORMER", "GENRE", "LYRICIST", "ARRANGER"]
+            &[
+                "ARTIST",
+                "ALBUMARTIST",
+                "COMPOSER",
+                "PERFORMER",
+                "GENRE",
+                "LYRICIST",
+                "ARRANGER",
+            ]
         );
         assert_eq!(
             PIPELINE_ORDERED_LIST_FIELDS,
@@ -2150,10 +2245,51 @@ mod tests {
         assert!(field_is_in_contract("LYRICIST", EDITOR_ORDERED_LIST_FIELDS));
         assert!(!field_is_in_contract("LYRICIST", PIPELINE_ORDERED_LIST_FIELDS));
         assert!(field_is_in_contract("ALBUMARTIST", PIPELINE_ORDERED_LIST_FIELDS));
-        assert!(!field_is_in_contract("ALBUMARTIST", EDITOR_ORDERED_LIST_FIELDS));
+        assert!(field_is_in_contract("ALBUMARTIST", EDITOR_ORDERED_LIST_FIELDS));
         assert!(field_is_in_contract("GENRE", EDITOR_ORDERED_LIST_FIELDS));
         assert!(field_is_in_contract("GENRE", PIPELINE_ORDERED_LIST_FIELDS));
         assert!(!field_is_in_contract("GENRE", FIXED_VOCABULARY_REPEATED_FIELDS));
+    }
+
+    #[test]
+    fn metadata_field_taxonomy_is_the_single_edit_semantics_authority() {
+        use MetadataInlineEditClass::{BroadcastScalar, OrderedList, ReleaseScalar, TrackScalar};
+        use MetadataUnifiedCueScope::{Declared, File, None, Track};
+
+        for field in [
+            "ARTIST",
+            "ALBUMARTIST",
+            "COMPOSER",
+            "PERFORMER",
+            "LYRICIST",
+            "ARRANGER",
+            "GENRE",
+        ] {
+            assert_eq!(
+                metadata_field_taxonomy(field).inline_class,
+                OrderedList,
+                "{field}"
+            );
+        }
+        for field in ["TITLE", "TRACKNUMBER", "DISCNUMBER", "ISRC"] {
+            assert_eq!(
+                metadata_field_taxonomy(field).inline_class,
+                TrackScalar,
+                "{field}"
+            );
+        }
+        for field in ["ALBUM", "DATE", "CATALOGNUMBER"] {
+            let taxonomy = metadata_field_taxonomy(field);
+            assert_eq!(taxonomy.inline_class, ReleaseScalar, "{field}");
+            assert!(taxonomy.release_scoped, "{field}");
+        }
+        assert_eq!(metadata_field_taxonomy("MYCUSTOM").inline_class, BroadcastScalar);
+        assert!(!metadata_field_taxonomy("MYCUSTOM").release_scoped);
+
+        assert_eq!(metadata_field_taxonomy("ARTIST").unified_cue_scope, Declared);
+        assert_eq!(metadata_field_taxonomy("ALBUM").unified_cue_scope, File);
+        assert_eq!(metadata_field_taxonomy("TITLE").unified_cue_scope, Track);
+        assert_eq!(metadata_field_taxonomy("DISCNUMBER").unified_cue_scope, None);
     }
 
     #[test]

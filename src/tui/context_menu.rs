@@ -3510,7 +3510,12 @@ pub fn execute_context_action(
         }
         ContextAction::MetadataEditValue => {
             if let Some(mut state) = app.pending_metadata_editor.take() {
-                if let Some(status) = super::keybindings::metadata_editor_begin_cursor_value_edit(&mut state, false) {
+                if let Some(status) =
+                    super::keybindings::metadata_editor_begin_explicit_inline_value_edit(
+                        &mut state,
+                        false,
+                    )
+                {
                     app.set_status(status);
                 }
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);

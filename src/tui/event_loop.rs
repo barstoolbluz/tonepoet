@@ -6755,6 +6755,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 {
                     let mut close_editor = summary.all_saved()
                         && taken.state.close_after_successful_save;
+                    if summary.all_saved() {
+                        super::keybindings::metadata_completion_learn_from_state(
+                            &app.db,
+                            &taken.state,
+                            "write",
+                        );
+                    }
                     let mut refresh_failure = None;
                     for path in &summary.saved_paths {
                         app.browse.remove_probe_cache_entry(path);

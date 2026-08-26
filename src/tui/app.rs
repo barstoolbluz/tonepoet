@@ -6759,6 +6759,10 @@ pub enum MetadataEditorWriteOutcome {
         unchanged: bool,
         rewritten_as_utf8: bool,
         created: bool,
+        /// Semantic fidelity warnings from projecting editor values into the
+        /// scalar CUE representation. These are successful-save warnings,
+        /// not post-commit durability failures.
+        fidelity_warnings: Vec<String>,
     },
     SidecarCueFailed { cue_path: std::path::PathBuf, reason: String },
     /// Typed result from the invalid-APEv2 repair worker. This remains a
@@ -6773,27 +6777,55 @@ pub enum MetadataEditorWriteOutcome {
 pub struct MetadataEditorWriteResult {
     pub path: std::path::PathBuf,
     pub outcome: MetadataEditorWriteOutcome,
+    /// Semantic fidelity warnings associated with a successful non-sidecar
+    /// carrier write. Kept separate from durability warnings in `outcome`.
+    pub fidelity_warnings: Vec<String>,
 }
 
 impl MetadataEditorWriteResult {
     pub fn saved(path: std::path::PathBuf) -> Self {
-        Self { path, outcome: MetadataEditorWriteOutcome::Saved }
+        Self {
+            path,
+            outcome: MetadataEditorWriteOutcome::Saved,
+            fidelity_warnings: Vec::new(),
+        }
     }
 
     pub fn saved_with_warnings(path: std::path::PathBuf, warnings: Vec<String>) -> Self {
         if warnings.is_empty() {
             Self::saved(path)
         } else {
-            Self { path, outcome: MetadataEditorWriteOutcome::SavedWithWarnings { warnings } }
+            Self {
+                path,
+                outcome: MetadataEditorWriteOutcome::SavedWithWarnings { warnings },
+                fidelity_warnings: Vec::new(),
+            }
         }
     }
 
     pub fn failed(path: std::path::PathBuf, reason: impl Into<String>) -> Self {
-        Self { path, outcome: MetadataEditorWriteOutcome::Failed { reason: reason.into() } }
+        Self {
+            path,
+            outcome: MetadataEditorWriteOutcome::Failed {
+                reason: reason.into(),
+            },
+            fidelity_warnings: Vec::new(),
+        }
     }
 
     pub fn skipped(path: std::path::PathBuf, reason: impl Into<String>) -> Self {
-        Self { path, outcome: MetadataEditorWriteOutcome::Skipped { reason: reason.into() } }
+        Self {
+            path,
+            outcome: MetadataEditorWriteOutcome::Skipped {
+                reason: reason.into(),
+            },
+            fidelity_warnings: Vec::new(),
+        }
+    }
+
+    pub fn with_fidelity_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.fidelity_warnings = warnings;
+        self
     }
 
     pub fn sidecar_cue_saved(
@@ -6803,6 +6835,24 @@ impl MetadataEditorWriteResult {
         rewritten_as_utf8: bool,
         created: bool,
     ) -> Self {
+        Self::sidecar_cue_saved_with_fidelity_warnings(
+            audio_path,
+            cue_path,
+            unchanged,
+            rewritten_as_utf8,
+            created,
+            Vec::new(),
+        )
+    }
+
+    pub fn sidecar_cue_saved_with_fidelity_warnings(
+        audio_path: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        unchanged: bool,
+        rewritten_as_utf8: bool,
+        created: bool,
+        fidelity_warnings: Vec<String>,
+    ) -> Self {
         Self {
             path: audio_path,
             outcome: MetadataEditorWriteOutcome::SidecarCueSaved {
@@ -6810,7 +6860,9 @@ impl MetadataEditorWriteResult {
                 unchanged,
                 rewritten_as_utf8,
                 created,
+                fidelity_warnings,
             },
+            fidelity_warnings: Vec::new(),
         }
     }
 
@@ -6825,6 +6877,7 @@ impl MetadataEditorWriteResult {
                 cue_path,
                 reason: reason.into(),
             },
+            fidelity_warnings: Vec::new(),
         }
     }
 
@@ -6835,6 +6888,7 @@ impl MetadataEditorWriteResult {
         Self {
             path,
             outcome: MetadataEditorWriteOutcome::InvalidApeRepair(outcome),
+            fidelity_warnings: Vec::new(),
         }
     }
 
@@ -6880,6 +6934,8 @@ pub struct MetadataEditorWriteSummary {
     pub sidecar_cue_unchanged: usize,
     pub sidecar_cue_failed: usize,
     pub sidecar_cue_utf8_fallback: usize,
+    pub fidelity_warnings: usize,
+    pub first_fidelity_warning: Option<String>,
     pub durability_warnings: usize,
     pub first_durability_warning: Option<String>,
     /// True when save-result reduction leaves pending model changes behind.
@@ -6950,6 +7006,13 @@ impl MetadataEditorWriteSummary {
                     if self.durability_warnings == 1 { "" } else { "s" }
                 ));
             }
+            if self.fidelity_warnings > 0 {
+                suffixes.push(format!(
+                    "{} fidelity warning{}",
+                    self.fidelity_warnings,
+                    if self.fidelity_warnings == 1 { "" } else { "s" }
+                ));
+            }
             let suffix = if suffixes.is_empty() {
                 String::new()
             } else {
@@ -6961,10 +7024,17 @@ impl MetadataEditorWriteSummary {
                 if self.saved == 1 { "" } else { "s" },
                 suffix,
             );
-            if let Some(warning) = &self.first_durability_warning {
-                if !warning.trim().is_empty() {
-                    return format!("{line} — {warning}");
-                }
+            let warning = self
+                .first_durability_warning
+                .as_ref()
+                .filter(|warning| !warning.trim().is_empty())
+                .or_else(|| {
+                    self.first_fidelity_warning
+                        .as_ref()
+                        .filter(|warning| !warning.trim().is_empty())
+                });
+            if let Some(warning) = warning {
+                return format!("{line} — {warning}");
             }
             return line;
         }
@@ -6995,14 +7065,28 @@ impl MetadataEditorWriteSummary {
                 if self.durability_warnings == 1 { "" } else { "s" }
             ));
         }
+        if self.fidelity_warnings > 0 {
+            parts.push(format!(
+                "{} fidelity warning{}",
+                self.fidelity_warnings,
+                if self.fidelity_warnings == 1 { "" } else { "s" }
+            ));
+        }
         if self.remaining_dirty {
             parts.push("unsaved changes remain".to_string());
         }
-        match (&self.first_problem, &self.first_durability_warning) {
-            (Some(problem), _) if !problem.trim().is_empty() => {
+        match (
+            &self.first_problem,
+            &self.first_durability_warning,
+            &self.first_fidelity_warning,
+        ) {
+            (Some(problem), _, _) if !problem.trim().is_empty() => {
                 format!("Metadata: {} — {}", parts.join(", "), problem)
             }
-            (_, Some(warning)) if !warning.trim().is_empty() => {
+            (_, Some(warning), _) if !warning.trim().is_empty() => {
+                format!("Metadata: {} — {}", parts.join(", "), warning)
+            }
+            (_, _, Some(warning)) if !warning.trim().is_empty() => {
                 format!("Metadata: {} — {}", parts.join(", "), warning)
             }
             _ => format!("Metadata: {}", parts.join(", ")),
@@ -9374,13 +9458,30 @@ fn apply_write_results_to_tab(
     let mut summary = MetadataEditorWriteSummary::default();
     let mut saved_slots = std::collections::BTreeSet::new();
 
-    for MetadataEditorWriteResult { path, outcome } in results {
+    for MetadataEditorWriteResult {
+        path,
+        outcome,
+        fidelity_warnings: result_fidelity_warnings,
+    } in results
+    {
+        if path_to_index.contains_key(&path) {
+            summary.fidelity_warnings = summary
+                .fidelity_warnings
+                .saturating_add(result_fidelity_warnings.len());
+            if summary.first_fidelity_warning.is_none() {
+                summary.first_fidelity_warning = result_fidelity_warnings
+                    .iter()
+                    .find(|warning| !warning.trim().is_empty())
+                    .cloned();
+            }
+        }
         match outcome {
             MetadataEditorWriteOutcome::SidecarCueSaved {
                 cue_path: _,
                 unchanged,
                 rewritten_as_utf8,
                 created,
+                fidelity_warnings,
             } => {
                 if unchanged {
                     summary.sidecar_cue_unchanged = summary.sidecar_cue_unchanged.saturating_add(1);
@@ -9394,6 +9495,15 @@ fn apply_write_results_to_tab(
                             .sidecar_cue_utf8_fallback
                             .saturating_add(1);
                     }
+                }
+                summary.fidelity_warnings = summary
+                    .fidelity_warnings
+                    .saturating_add(fidelity_warnings.len());
+                if summary.first_fidelity_warning.is_none() {
+                    summary.first_fidelity_warning = fidelity_warnings
+                        .iter()
+                        .find(|warning| !warning.trim().is_empty())
+                        .cloned();
                 }
                 mark_sidecar_cue_writeback_saved(tab);
             }
@@ -9667,6 +9777,33 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
     let path_count = tab.paths.len();
     let deleted: std::collections::BTreeSet<usize> = tab.deleted.iter().copied().collect();
     let unified_cue_album_fully_saved = unified_cue_album_fully_saved_for_dirty_clear(tab, saved_slots);
+    let album_view_track_indices_by_path = tab
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .filter(|_| !tab.cue_album_view_sides.is_empty())
+        .map(|sheet| {
+            tab.paths
+                .iter()
+                .map(|path| {
+                    let path_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                    sheet
+                        .track_sources
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(track_index, source)| {
+                            let source_key = std::fs::canonicalize(&source.audio_path)
+                                .unwrap_or_else(|_| source.audio_path.clone());
+                            (source_key == path_key).then_some(track_index)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+    let album_view_track_count = tab
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .filter(|_| !tab.cue_album_view_sides.is_empty())
+        .map(|sheet| sheet.track_sources.len());
     let mut remove_entries = Vec::new();
     let mut retained_deleted = Vec::new();
 
@@ -9676,6 +9813,64 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
             && entry.per_file_originals.len() == path_count;
 
         if !file_aligned {
+            let side_scoped_discnumber = entry.display_key.eq_ignore_ascii_case("DISCNUMBER")
+                && entry.row_scope == crate::tui::probe::RowScope::Track
+                && album_view_track_count.is_some_and(|count| {
+                    entry.per_file_values.len() == count
+                        && entry.per_file_originals.len() == count
+                });
+            if side_scoped_discnumber {
+                if deleted.contains(&entry_idx) {
+                    let all_album_paths_saved = album_view_track_indices_by_path
+                        .as_ref()
+                        .is_some_and(|track_indices_by_path| {
+                            track_indices_by_path
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, track_indices)| !track_indices.is_empty())
+                                .all(|(path_slot, _)| saved_slots.contains(&path_slot))
+                        });
+                    if all_album_paths_saved {
+                        remove_entries.push(entry_idx);
+                    } else {
+                        retained_deleted.push(entry_idx);
+                    }
+                    continue;
+                }
+
+                if let Some(track_indices_by_path) = album_view_track_indices_by_path.as_ref() {
+                    for &path_slot in saved_slots {
+                        let Some(track_indices) = track_indices_by_path.get(path_slot) else {
+                            continue;
+                        };
+                        for &track_index in track_indices {
+                            if let (Some(value), Some(original)) = (
+                                entry.per_file_values.get(track_index).cloned(),
+                                entry.per_file_originals.get_mut(track_index),
+                            ) {
+                                let changed = *original != value;
+                                *original = value.clone();
+                                if changed
+                                    && entry.per_file_stored_value_counts.len()
+                                        == entry.per_file_values.len()
+                                {
+                                    entry.per_file_stored_value_counts[track_index] =
+                                        value.value_count();
+                                }
+                            }
+                        }
+                    }
+                }
+                refresh_stored_value_summary(entry);
+                recompute_tag_entry_display(entry);
+                if entry.per_file_values == entry.per_file_originals {
+                    entry.original = entry.value.clone();
+                    entry.mb_proposed_value = None;
+                    entry.mb_proposed_per_file = None;
+                }
+                continue;
+            }
+
             let unified_row_persistable = unified_cue_album_per_track_key_is_persistable_for_dirty_clear(
                 &entry.display_key,
             );
@@ -9742,6 +9937,18 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 
         refresh_stored_value_summary(entry);
         recompute_tag_entry_display(entry);
+        if !deleted.contains(&entry_idx)
+            && entry.per_file_values == entry.per_file_originals
+        {
+            // Once every logical slot in a file-aligned row reflects the
+            // successfully saved value, advance the summary baseline too.
+            // Dedicated CUE-authority dirty checks compare both vectors and
+            // their summary strings; leaving `original` stale would make a
+            // successful mixed/list-valued projection appear unsaved.
+            entry.original = entry.value.clone();
+            entry.mb_proposed_value = None;
+            entry.mb_proposed_per_file = None;
+        }
         if deleted.contains(&entry_idx)
             && entry.per_file_values.iter().all(|value| value.trim().is_empty())
             && entry.per_file_originals.iter().all(|value| value.trim().is_empty())
@@ -15557,7 +15764,7 @@ mod app_startup_options_tests {
     }
 
     #[test]
-    fn quiescent_v23_startup_activates_v24_without_in_memory_fallback_or_env_gate() {
+    fn quiescent_v23_startup_activates_v24_protocol_then_current_schema_without_fallback() {
         let _serial = crate::tui::file_task_runtime::test_environment_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let db_path = temp.path().join("tonepoet.db");
@@ -15579,6 +15786,7 @@ mod app_startup_options_tests {
                  DROP TABLE conversion_queue_executions;
                  DROP TABLE conversion_queue_scopes;
                  DROP TABLE concurrency_protocol_epoch;
+                 DROP TABLE metadata_completion_values;
                  ALTER TABLE conversion_queue_v23_frozen RENAME TO conversion_queue;
                  PRAGMA user_version = 23;",
             )
@@ -15588,11 +15796,25 @@ mod app_startup_options_tests {
         let app = AppState::try_new_with_startup_options(TonepoetConfig::default(), options)
             .expect("quiescent v23 startup should activate v24 without external confirmation");
         drop(app);
-        let conn = rusqlite::Connection::open(&db_path).expect("reopen activated v24 db");
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen activated database");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
-        assert_eq!(version, 24, "quiescent startup must durably activate v24");
+        assert_eq!(
+            version, 25,
+            "quiescent startup must durably advance through the current schema"
+        );
+        let protocol_version: u32 = conn
+            .query_row(
+                "SELECT protocol_version FROM concurrency_protocol_epoch WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read activated concurrency protocol epoch");
+        assert_eq!(
+            protocol_version, 24,
+            "the v25 completion migration must not redefine the v24 concurrency protocol"
+        );
         match prior_journal {
             Some(value) => std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", value),
             None => std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR"),

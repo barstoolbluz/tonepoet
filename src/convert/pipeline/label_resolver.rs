@@ -656,6 +656,18 @@ static CANONICAL_ARTIST_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
     candidates
 });
 
+static CANONICAL_LABEL_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut candidates = CANONICAL_LABEL_VARIANTS
+        .iter()
+        .map(|(canonical, _)| (*canonical).to_string())
+        .chain(parse_hexload_mappings().into_iter().map(|mapping| mapping.key))
+        .filter(|candidate| !candidate.trim().is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.to_ascii_lowercase());
+    candidates.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    candidates
+});
+
 static CANONICAL_COUNTRY_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
     let mut candidates = CANONICAL_COUNTRY_VARIANTS
         .iter()
@@ -669,6 +681,11 @@ static CANONICAL_COUNTRY_CANDIDATES: LazyLock<Vec<String>> = LazyLock::new(|| {
 /// Sorted canonical names embedded for artist-like metadata completion.
 pub fn canonical_artist_candidates() -> &'static [String] {
     CANONICAL_ARTIST_CANDIDATES.as_slice()
+}
+
+/// Sorted embedded label/pressing keys available to metadata completion.
+pub fn canonical_label_candidates() -> &'static [String] {
+    CANONICAL_LABEL_CANDIDATES.as_slice()
 }
 
 /// Sorted canonical country labels emitted by the dictionary resolver.

@@ -874,22 +874,56 @@ mod tests {
             "{MULTI_VALUE_LINE_PREFIX}{}",
             serde_json::to_string(&vec!["A", "B"]).unwrap()
         );
-        for key in ["TITLE", "ALBUMARTIST"] {
-            let input = format!("{key}\n{encoded_pair}");
-            let error = parse_field_blocks(&input)
-                .expect_err("scalar editor fields must reject structured multi-value input");
-            assert!(matches!(
-                &error,
-                FieldBlockParseError::ScalarFieldMultiValue {
-                    value_count: 2,
-                    ..
-                }
-            ));
-            assert!(
-                error.to_string().contains("implicit lossy collapse"),
-                "{key}: {error}"
-            );
-        }
+        let title_input = format!("TITLE\n{encoded_pair}");
+        let error = parse_field_blocks(&title_input)
+            .expect_err("TITLE must reject structured multi-value input");
+        assert!(matches!(
+            &error,
+            FieldBlockParseError::ScalarFieldMultiValue {
+                value_count: 2,
+                ..
+            }
+        ));
+        assert!(
+            error.to_string().contains("implicit lossy collapse"),
+            "{error}"
+        );
+
+        let albumartist_input = format!("ALBUMARTIST\n{encoded_pair}");
+        let albumartist = parse_field_blocks(&albumartist_input)
+            .expect("ALBUMARTIST is an ordered-list editor field");
+        assert_eq!(albumartist[0].values[0].to_texts(), vec!["A", "B"]);
+
+        let mut albumartist_state = editor_with_files(
+            1,
+            vec![entry("ALBUMARTIST", &["Old Album Artist"])],
+        );
+        apply_field_blocks_to_editor(&mut albumartist_state, &albumartist)
+            .expect("structured ALBUMARTIST block must apply without scalar collapse");
+        let albumartist_entry = albumartist_state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "ALBUMARTIST")
+            .expect("ALBUMARTIST row");
+        assert_eq!(
+            albumartist_entry.per_file_values[0].to_texts(),
+            vec!["A", "B"]
+        );
+
+        let transfer = plan_transfer_values_for_dimensions(
+            std::slice::from_ref(albumartist_entry),
+            TransferDimension::Files(1),
+            TransferDimension::Files(2),
+            super::super::app::TagTransferScope::All,
+        )
+        .expect("list-valued ALBUMARTIST must remain transferable between taggable files");
+        assert_eq!(transfer.fields.len(), 1);
+        assert_eq!(transfer.fields[0].canonical_key, "ALBUMARTIST");
+        assert!(transfer.fields[0]
+            .values
+            .iter()
+            .all(|value| value.to_texts() == vec!["A", "B"]));
 
         let artist_values = vec![
             "Artist A",

@@ -6316,17 +6316,18 @@ pub(crate) fn unified_cue_row_shape(
     declared_scope: RowScope,
 ) -> Option<UnifiedCueRowShape> {
     let canonical = canonical_metadata_display_key(display_key);
-    let (scope, axis, dimension_name) = match canonical.as_str() {
-        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER" => {
+    let taxonomy = crate::metadata_persistence::metadata_field_taxonomy(&canonical);
+    let (scope, axis, dimension_name) = match taxonomy.unified_cue_scope {
+        crate::metadata_persistence::MetadataUnifiedCueScope::File => {
             (RowScope::File, UnifiedCueAxis::File, "album/file")
         }
-        "TITLE" | "ISRC" | "TRACKNUMBER" => {
+        crate::metadata_persistence::MetadataUnifiedCueScope::Track => {
             (RowScope::Track, UnifiedCueAxis::Track, "logical-track")
         }
-        // ARTIST intentionally remains declared-scope.  Track ARTIST is the
+        // ARTIST intentionally remains declared-scope. Track ARTIST is the
         // normal unified-CUE representation, while File ARTIST is retained as
         // an album-performer compatibility fallback.
-        "ARTIST" => match declared_scope {
+        crate::metadata_persistence::MetadataUnifiedCueScope::Declared => match declared_scope {
             RowScope::File => (
                 RowScope::File,
                 UnifiedCueAxis::File,
@@ -6338,12 +6339,17 @@ pub(crate) fn unified_cue_row_shape(
                 "logical-track",
             ),
         },
-        "CUESHEET" => (
-            RowScope::File,
-            UnifiedCueAxis::Presentation,
-            "presentation CUESHEET",
-        ),
-        _ => return None,
+        crate::metadata_persistence::MetadataUnifiedCueScope::None => {
+            if canonical == "CUESHEET" {
+                (
+                    RowScope::File,
+                    UnifiedCueAxis::Presentation,
+                    "presentation CUESHEET",
+                )
+            } else {
+                return None;
+            }
+        }
     };
     Some(UnifiedCueRowShape {
         scope,
@@ -8864,10 +8870,10 @@ fn read_mp4_pipeline_set_valued_text_state(
 }
 
 /// Read the conversion pipeline's six ordered-list fields through the same
-/// canonical format mapping used by the editor. This deliberately has its own
-/// field set: the shipped editor registry excludes ALBUMARTIST, while Phase 4
-/// pipeline metadata must carry it losslessly for native repeating carriers.
-/// The editor registry itself remains unchanged.
+/// canonical format mapping used by the editor. The pipeline and editor sets
+/// intentionally remain separate contracts even though ALBUMARTIST is now in
+/// both: LYRICIST is editor-only, while pipeline transport has its own bounded
+/// field surface.
 pub(crate) fn read_pipeline_set_valued_text_fields(
     path: &std::path::Path,
     tag: &lofty::tag::Tag,
@@ -9999,10 +10005,10 @@ struct EditorTagChange {
     item_key: lofty::tag::ItemKey,
     values: Option<MetadataFieldValues>,
     /// Whether this caller treats the logical field as an ordered value list.
-    /// Editor callers derive this from the shipped set-valued registry; the
-    /// conversion pipeline has its own six-field contract, which additionally
-    /// includes ALBUMARTIST. Keeping the bit on the change preserves the editor
-    /// registry exactly while still reusing every audited backend serializer.
+    /// Editor callers derive this from the shipped set-valued registry and the
+    /// conversion pipeline carries its own six-field contract. Keeping the bit
+    /// on the change lets both callers reuse the same audited backend projection,
+    /// including scalar collapse where a backend cannot repeat the field.
     list_semantics: bool,
 }
 
@@ -19016,8 +19022,8 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_albumartist_list_semantics_do_not_change_the_editor_registry() {
-        assert!(!metadata_field_is_set_valued("ALBUMARTIST"));
+    fn pipeline_albumartist_list_semantics_now_match_the_editor_without_expanding_fixed_backends() {
+        assert!(metadata_field_is_set_valued("ALBUMARTIST"));
         assert!(public_list_writer_field_has_list_semantics("ALBUMARTIST"));
         assert!(metadata_field_is_set_valued("LYRICIST"));
         assert!(!public_list_writer_field_has_list_semantics("LYRICIST"));
@@ -19033,6 +19039,53 @@ mod tests {
             !crate::metadata_persistence::MetadataPersistenceBackend::LoftyMp4Ilst
                 .supports_repeated_field("ALBUMARTIST")
         );
+        assert!(
+            !crate::metadata_persistence::MetadataPersistenceBackend::NativeDsfId3
+                .supports_repeated_field("ALBUMARTIST")
+        );
+    }
+
+    #[test]
+    fn albumartist_list_classification_preserves_fixed_backend_bytes() {
+        use lofty::tag::ItemKey;
+
+        let _xdg = isolated_metadata_journal_home(
+            "tonepoet-editor-albumartist-fixed-backend-byte-parity",
+        );
+        let assert_projection = |file_name: &str, fixture: &[u8]| {
+            let temp = tempfile::tempdir().expect("ALBUMARTIST byte-parity tempdir");
+            let scalar_path = temp.path().join(format!("scalar-{file_name}"));
+            let list_path = temp.path().join(format!("list-{file_name}"));
+            std::fs::write(&scalar_path, fixture).expect("write scalar fixture");
+            std::fs::write(&list_path, fixture).expect("write list fixture");
+
+            write_all_tags(
+                &scalar_path,
+                &[(ItemKey::AlbumArtist, Some("AA1; AA2".to_string()))],
+            )
+            .expect("write historical scalar ALBUMARTIST representation");
+            write_all_tag_value_lists(
+                &list_path,
+                &[(ItemKey::AlbumArtist, owned_test_values(&["AA1", "AA2"]))],
+            )
+            .expect("write list-valued ALBUMARTIST representation");
+
+            assert_eq!(
+                std::fs::read(&list_path).expect("read list ALBUMARTIST carrier"),
+                std::fs::read(&scalar_path).expect("read scalar ALBUMARTIST carrier"),
+                "{file_name}: D1 must not change fixed-backend ALBUMARTIST bytes",
+            );
+        };
+
+        assert_projection("albumartist.mp3", ID3V2_NUMBERING_FIXTURE);
+        assert_projection("albumartist.m4a", MP4_NUMBERING_FIXTURE);
+
+        let dsf_seed = tempfile::tempdir().expect("DSF ALBUMARTIST seed tempdir");
+        let dsf_seed_path = dsf_seed.path().join("albumartist.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&dsf_seed_path, None)
+            .expect("write DSF ALBUMARTIST fixture");
+        let dsf_fixture = std::fs::read(&dsf_seed_path).expect("read DSF ALBUMARTIST fixture");
+        assert_projection("albumartist.dsf", &dsf_fixture);
     }
 
     #[test]

@@ -148,6 +148,21 @@ struct TextInputSnapshot {
 
 const TEXT_INPUT_HISTORY_LIMIT: usize = 128;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RankedCompletionScope {
+    Scalar,
+    Segment,
+}
+
+#[derive(Debug, Clone)]
+struct RankedCompletionCycle {
+    scope: RankedCompletionScope,
+    query: String,
+    current_candidate: String,
+    completed_text: String,
+    cursor: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextInputState {
     pub text: String,
@@ -165,6 +180,7 @@ pub struct TextInputState {
     pub clipboard: String,
     undo_history: Vec<TextInputSnapshot>,
     redo_history: Vec<TextInputSnapshot>,
+    ranked_completion_cycle: Option<RankedCompletionCycle>,
 }
 
 /// Completion strategy for an inline text field.
@@ -238,6 +254,7 @@ impl TextInputState {
             clipboard: String::new(),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            ranked_completion_cycle: None,
         }
     }
 
@@ -252,6 +269,7 @@ impl TextInputState {
             clipboard: String::new(),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            ranked_completion_cycle: None,
         }
     }
 
@@ -279,6 +297,7 @@ impl TextInputState {
         self.selection_anchor = snapshot
             .selection_anchor
             .filter(|anchor| *anchor <= self.text.len() && self.text.is_char_boundary(*anchor));
+        self.ranked_completion_cycle = None;
     }
 
     fn push_bounded(history: &mut Vec<TextInputSnapshot>, snapshot: TextInputSnapshot) {
@@ -350,12 +369,14 @@ impl TextInputState {
     pub fn clear_selection(&mut self) {
         self.select_all = false;
         self.selection_anchor = None;
+        self.ranked_completion_cycle = None;
     }
 
     pub fn select_all_text(&mut self) {
         self.cursor = self.text.len();
         self.select_all = true;
         self.selection_anchor = Some(0);
+        self.ranked_completion_cycle = None;
     }
 
     fn delete_selection(&mut self) -> bool {
@@ -1290,6 +1311,257 @@ pub fn apply_candidate_completion(
     true
 }
 
+/// Complete a single scalar value with the same ranked matcher used by
+/// semicolon-aware metadata completion. Unlike segment completion, semicolons
+/// remain literal because the caller's field taxonomy says they are not syntax.
+pub fn apply_ranked_candidate_completion(
+    input: &mut TextInputState,
+    candidates: &[String],
+    direction: CompletionDirection,
+) -> bool {
+    let query = input.text.trim().to_string();
+    let Some((completed, cycle_query)) = ranked_completion_choice(
+        input,
+        &query,
+        candidates,
+        direction,
+        RankedCompletionScope::Scalar,
+    ) else {
+        input.ranked_completion_cycle = None;
+        return true;
+    };
+    let cursor = completed.len();
+    input.set_text_and_cursor(completed.clone(), cursor);
+    remember_ranked_completion(
+        input,
+        RankedCompletionScope::Scalar,
+        cycle_query,
+        completed,
+    );
+    true
+}
+
+/// Complete only the unescaped-semicolon segment containing the caret.
+/// Prefix matches rank before substring matches; no typo/fuzzy matching is
+/// performed. The surrounding segments and separator whitespace are retained.
+pub fn apply_segment_candidate_completion(
+    input: &mut TextInputState,
+    candidates: &[String],
+    direction: CompletionDirection,
+) -> bool {
+    let (start, end) = unescaped_semicolon_segment_bounds(&input.text, input.cursor);
+    let segment = &input.text[start..end];
+    let leading_len = segment.len() - segment.trim_start().len();
+    let continuing_terminal_segment = end == input.text.len()
+        && input.ranked_completion_cycle.as_ref().is_some_and(|cycle| {
+            cycle.scope == RankedCompletionScope::Segment
+                && cycle.completed_text == input.text
+                && cycle.cursor == input.cursor
+        });
+    let trailing_len = if continuing_terminal_segment {
+        // A first LCP extension can itself end in whitespace (for example
+        // `pro` -> `Progressive `). On the next cycle that whitespace is
+        // completion output, not preserved user framing, so replace it along
+        // with the query and land exactly on the selected candidate.
+        0
+    } else {
+        segment.len() - segment.trim_end().len()
+    };
+    let query_start = start + leading_len;
+    let query_end = end.saturating_sub(trailing_len).max(query_start);
+    let query = decode_segment_completion_query(&input.text[query_start..query_end]);
+
+    let Some((completed, cycle_query)) = ranked_completion_choice(
+        input,
+        &query,
+        candidates,
+        direction,
+        RankedCompletionScope::Segment,
+    ) else {
+        input.ranked_completion_cycle = None;
+        return true;
+    };
+    let completed = escape_segment_completion_value(&completed);
+    input.replace_range(query_start..query_end, &completed);
+    remember_ranked_completion(
+        input,
+        RankedCompletionScope::Segment,
+        cycle_query,
+        decode_segment_completion_query(&completed),
+    );
+    true
+}
+
+fn remember_ranked_completion(
+    input: &mut TextInputState,
+    scope: RankedCompletionScope,
+    query: String,
+    current_candidate: String,
+) {
+    input.ranked_completion_cycle = Some(RankedCompletionCycle {
+        scope,
+        query,
+        current_candidate,
+        completed_text: input.text.clone(),
+        cursor: input.cursor,
+    });
+}
+
+fn ranked_completion_choice(
+    input: &TextInputState,
+    fresh_query: &str,
+    candidates: &[String],
+    direction: CompletionDirection,
+    scope: RankedCompletionScope,
+) -> Option<(String, String)> {
+    let continuing = input.ranked_completion_cycle.as_ref().filter(|cycle| {
+        cycle.scope == scope
+            && cycle.completed_text == input.text
+            && cycle.cursor == input.cursor
+    });
+    let query = continuing
+        .map(|cycle| cycle.query.as_str())
+        .unwrap_or(fresh_query)
+        .trim();
+    let matches = ranked_candidate_matches(query, candidates);
+    if matches.is_empty() {
+        return None;
+    }
+    if continuing.is_none() {
+        if let Some(extension) = ranked_prefix_common_extension(query, candidates) {
+            return Some((extension, query.to_string()));
+        }
+    }
+
+    let current_index = continuing
+        .and_then(|cycle| {
+            matches
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(&cycle.current_candidate))
+        })
+        .or_else(|| {
+            matches
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(fresh_query.trim()))
+        });
+    let index = match (current_index, direction) {
+        (Some(index), CompletionDirection::Forward) if matches.len() > 1 => {
+            (index + 1) % matches.len()
+        }
+        (Some(index), CompletionDirection::Backward) if matches.len() > 1 => {
+            (index + matches.len() - 1) % matches.len()
+        }
+        (Some(index), _) => index,
+        (None, CompletionDirection::Forward) => 0,
+        (None, CompletionDirection::Backward) => matches.len() - 1,
+    };
+    Some((matches[index].to_string(), query.to_string()))
+}
+
+fn ranked_prefix_common_extension(query: &str, candidates: &[String]) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let query_lower = query.to_lowercase();
+    let prefix = candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|candidate| !candidate.trim().is_empty())
+        .filter(|candidate| candidate.to_lowercase().starts_with(&query_lower))
+        .collect::<Vec<_>>();
+    if prefix.len() < 2 {
+        return None;
+    }
+
+    let first = prefix[0];
+    let mut common_len = first.len();
+    for candidate in prefix.iter().skip(1) {
+        common_len = first
+            .as_bytes()
+            .iter()
+            .zip(candidate.as_bytes())
+            .take(common_len)
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+        while common_len > 0 && !first.is_char_boundary(common_len) {
+            common_len -= 1;
+        }
+    }
+    (common_len > query.len()).then(|| first[..common_len].to_string())
+}
+
+fn ranked_candidate_matches<'a>(query: &str, candidates: &'a [String]) -> Vec<&'a str> {
+    let query_lower = query.to_lowercase();
+    let mut prefix = Vec::new();
+    let mut substring = Vec::new();
+    for candidate in candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|candidate| !candidate.trim().is_empty())
+    {
+        let candidate_lower = candidate.to_lowercase();
+        if candidate_lower.starts_with(&query_lower) {
+            prefix.push(candidate);
+        } else if candidate_lower.contains(&query_lower) {
+            substring.push(candidate);
+        }
+    }
+    prefix.extend(substring);
+    prefix
+}
+
+fn decode_segment_completion_query(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek().copied() {
+                Some(';' | '!' | '\\') => decoded.push(chars.next().unwrap_or_default()),
+                _ => decoded.push('\\'),
+            }
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
+}
+
+fn escape_segment_completion_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            ';' => escaped.push_str("\\;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn unescaped_semicolon_segment_bounds(text: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(text.len());
+    let mut start = 0usize;
+    let mut end = text.len();
+    let mut preceding_backslashes = 0usize;
+
+    for (offset, ch) in text.char_indices() {
+        if ch == ';' && preceding_backslashes % 2 == 0 {
+            if offset < cursor {
+                start = offset + ch.len_utf8();
+            } else {
+                end = offset;
+                break;
+            }
+        }
+        if ch == '\\' {
+            preceding_backslashes = preceding_backslashes.saturating_add(1);
+        } else {
+            preceding_backslashes = 0;
+        }
+    }
+    (start.min(end), end)
+}
+
 fn complete_candidate_text(
     text: &str,
     candidates: &[String],
@@ -1955,6 +2227,129 @@ mod tests {
         ));
         assert_eq!(input.text, "DISCOGS_URL");
         assert_eq!(input.cursor, input.text.len());
+    }
+
+    #[test]
+    fn ranked_scalar_completion_keeps_literal_semicolons_in_the_query() {
+        let candidates = vec![
+            "Foo; Bar Records".to_string(),
+            "Bar Records".to_string(),
+        ];
+        let mut input = TextInputState::new("Foo; Bar".to_string());
+        assert!(apply_ranked_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Foo; Bar Records");
+    }
+
+    #[test]
+    fn segment_candidate_completion_preserves_neighbors_and_escaped_semicolons() {
+        let candidates = vec![
+            "John Bonham".to_string(),
+            "John Paul Jones".to_string(),
+            "Paul McCartney".to_string(),
+        ];
+        let mut input = TextInputState::new("John Bonham; John Pa; Jimmy Page".to_string());
+        input.cursor = "John Bonham; John Pa".len();
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "John Bonham; John Paul Jones; Jimmy Page");
+
+        let mut escaped = TextInputState::new("Earth\\; Wind; Bonham".to_string());
+        escaped.cursor = escaped.text.len();
+        assert!(apply_segment_candidate_completion(
+            &mut escaped,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(escaped.text, "Earth\\; Wind; John Bonham");
+
+        let candidates = vec!["Earth; Wind & Fire".to_string()];
+        let mut literal = TextInputState::new("Earth\\; Wi".to_string());
+        literal.cursor = literal.text.len();
+        assert!(apply_segment_candidate_completion(
+            &mut literal,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(
+            literal.text,
+            "Earth\\; Wind & Fire",
+            "stored literal semicolons must remain escaped editor syntax"
+        );
+    }
+
+    #[test]
+    fn ranked_completion_keeps_common_prefix_extension_before_cycling() {
+        let candidates = vec![
+            "Progressive Metal".to_string(),
+            "Progressive Rock".to_string(),
+            "Art Rock".to_string(),
+        ];
+        let mut input = TextInputState::new("pro".to_string());
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Progressive ");
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Progressive Metal");
+    }
+
+    #[test]
+    fn segment_candidate_completion_cycles_prefix_before_substring() {
+        let candidates = vec![
+            "John Bonham".to_string(),
+            "Bonham Carter".to_string(),
+            "Bonham Sisters".to_string(),
+        ];
+        let mut input = TextInputState::new("Bonham".to_string());
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Bonham ");
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Bonham Carter");
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "Bonham Sisters");
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(
+            input.text, "John Bonham",
+            "substring hits must remain reachable after all prefix hits"
+        );
+
+        let candidates = vec!["John Bonham".to_string()];
+        let mut input = TextInputState::new("Bonham".to_string());
+        assert!(apply_segment_candidate_completion(
+            &mut input,
+            &candidates,
+            CompletionDirection::Forward,
+        ));
+        assert_eq!(input.text, "John Bonham");
     }
 
     #[test]

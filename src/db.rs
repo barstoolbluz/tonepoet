@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 24;
+const CURRENT_VERSION: u32 = 25;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -18,6 +18,13 @@ pub enum LegacyImportPublication {
     Imported,
     AlreadyDone,
     ExistingSqliteAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LearnedMetadataCompletionValue {
+    pub(crate) field: String,
+    pub(crate) value: String,
+    pub(crate) provenance: String,
 }
 
 #[derive(Debug)]
@@ -92,6 +99,9 @@ pub struct Database {
     conn: Connection,
     queue_scope: std::sync::OnceLock<QueueScopeRuntime>,
     execution_leases: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::concurrency::PersistentLease>>>>,
+    metadata_completion_candidates_cache: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<[String]>>,
+    >,
 }
 
 struct QueueScopeRuntime {
@@ -379,6 +389,11 @@ enum DatabasePragmaProfile {
 }
 
 const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Completion harvesting is advisory UI-adjacent persistence. Never let another
+// process holding SQLite's writer slot turn editor activation into a multi-second
+// wait; a later read/save will naturally offer another harvest opportunity.
+const METADATA_COMPLETION_HARVEST_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(25);
 const QUEUE_TRANSACTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 const QUEUE_TRANSACTION_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 const QUEUE_TRANSACTION_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
@@ -666,7 +681,16 @@ impl Database {
                 .map_err(|e| format!("busy_timeout pragma failed: {}", e))?;
             if Self::file_backed_database_is_initialized(&conn)? {
                 Self::configure_file_backed_connection(&conn)?;
-                return Ok(Self { conn, queue_scope: std::sync::OnceLock::new(), execution_leases: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) });
+                return Ok(Self {
+                    conn,
+                    queue_scope: std::sync::OnceLock::new(),
+                    execution_leases: std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    metadata_completion_candidates_cache: std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    ),
+                });
             }
         }
         drop(shared_init);
@@ -837,7 +861,16 @@ impl Database {
             }
         }
 
-        let mut db = Self { conn, queue_scope: std::sync::OnceLock::new(), execution_leases: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) };
+        let mut db = Self {
+            conn,
+            queue_scope: std::sync::OnceLock::new(),
+            execution_leases: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            metadata_completion_candidates_cache: std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -960,6 +993,10 @@ impl Database {
             };
             self.require_v24_activation_confirmation(initial_version)?;
             self.run_migration_step(24, Self::migrate_v24)?;
+            version = 24;
+        }
+        if version < 25 {
+            self.run_migration_step(25, Self::migrate_v25)?;
         }
 
         Ok(())
@@ -2060,6 +2097,200 @@ impl Database {
                  VALUES(1, 24, CAST(strftime('%s','now') AS INTEGER) * 1000, 0);"
         ).map_err(|e| format!("v24 migration failed: {e}"))?;
         Ok(())
+    }
+
+    /// v25: persistent, individually addressable metadata value-completion corpus.
+    /// One row per field/value pair makes repeated harvests idempotent and
+    /// retains source provenance for future maintenance UI.
+    fn migrate_v25(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE metadata_completion_values (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                field               TEXT NOT NULL COLLATE NOCASE,
+                value               TEXT NOT NULL COLLATE NOCASE,
+                provenance          TEXT NOT NULL,
+                first_seen_unix_ms  INTEGER NOT NULL,
+                UNIQUE(field, value)
+            );",
+        )
+        .map_err(|error| format!("v25 migration create metadata completion corpus: {error}"))?;
+        Ok(())
+    }
+
+    /// Merge harvested values into the global completion corpus in one short
+    /// transaction. Empty values are ignored; callers are responsible for
+    /// limiting fields to the completion-enabled set.
+    pub(crate) fn learn_metadata_completion_values(
+        &self,
+        values: &[LearnedMetadataCompletionValue],
+    ) -> Result<usize, String> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .busy_timeout(METADATA_COMPLETION_HARVEST_BUSY_TIMEOUT)
+            .map_err(|error| format!("set metadata completion harvest busy timeout: {error}"))?;
+
+        let harvest_result = (|| {
+            // Reserve the writer slot up front so contention fails within the
+            // short advisory budget instead of surfacing midway through the batch.
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|error| format!("begin metadata completion harvest: {error}"))?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            let mut touched = 0usize;
+            {
+                let mut statement = tx
+                    .prepare_cached(
+                        "INSERT INTO metadata_completion_values(
+                            field, value, provenance, first_seen_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(field, value) DO NOTHING",
+                    )
+                    .map_err(|error| format!("prepare metadata completion harvest: {error}"))?;
+                for value in values {
+                    let field = value.field.trim();
+                    let text = value.value.trim();
+                    if field.is_empty() || text.is_empty() {
+                        continue;
+                    }
+                    touched = touched.saturating_add(
+                        statement
+                            .execute(params![field, text, value.provenance, now_ms])
+                            .map_err(|error| {
+                                format!("store metadata completion value: {error}")
+                            })?,
+                    );
+                }
+            }
+            tx.commit()
+                .map_err(|error| format!("commit metadata completion harvest: {error}"))?;
+            Ok(touched)
+        })();
+
+        let harvest_result = match self.conn.busy_timeout(DB_BUSY_TIMEOUT) {
+            Ok(()) => harvest_result,
+            Err(restore_error) => match harvest_result {
+                // A committed advisory harvest must not be reported as failed:
+                // callers could otherwise infer that retrying is required even
+                // though the rows are already durable.
+                Ok(touched) => {
+                    log::error!(
+                        "metadata completion harvest committed but could not restore busy timeout: {restore_error}"
+                    );
+                    Ok(touched)
+                }
+                Err(error) => Err(format!(
+                    "{error}; restore metadata completion busy timeout: {restore_error}"
+                )),
+            },
+        };
+
+        if matches!(&harvest_result, Ok(touched) if *touched > 0) {
+            self.metadata_completion_candidates_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+        harvest_result
+    }
+
+    /// Learned completion values for one field, ordered deterministically.
+    pub(crate) fn metadata_completion_values_for_field(
+        &self,
+        field: &str,
+    ) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT value FROM metadata_completion_values
+                 WHERE field = ?1 COLLATE NOCASE
+                 ORDER BY value COLLATE NOCASE, id",
+            )
+            .map_err(|error| format!("prepare metadata completion query: {error}"))?;
+        let rows = statement
+            .query_map([field.trim()], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("query metadata completion values: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read metadata completion values: {error}"))
+    }
+
+    /// Completion candidates for one field, merging the caller-supplied
+    /// embedded seed with learned rows and caching the merged/deduplicated
+    /// corpus. Successful inserts through `learn_metadata_completion_values`
+    /// invalidate this cache so values learned later in the same app session
+    /// become visible without rebuilding the corpus on every keypress.
+    pub(crate) fn metadata_completion_candidates_for_field(
+        &self,
+        field: &str,
+        embedded: &[String],
+    ) -> std::sync::Arc<[String]> {
+        let cache_key = field.trim().to_ascii_uppercase();
+        if let Some(cached) = self
+            .metadata_completion_candidates_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let (learned, cacheable) = match self.metadata_completion_values_for_field(field) {
+            Ok(learned) => (learned, true),
+            Err(_) => (Vec::new(), false),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut candidates = Vec::with_capacity(embedded.len().saturating_add(learned.len()));
+        for candidate in embedded.iter().chain(learned.iter()) {
+            let normalized = candidate.to_lowercase();
+            if seen.insert(normalized) {
+                candidates.push(candidate.clone());
+            }
+        }
+        let candidates: std::sync::Arc<[String]> = candidates.into();
+        if !cacheable {
+            // Preserve the previous failure behavior: embedded candidates stay
+            // available, and a later keypress retries the learned-row query.
+            return candidates;
+        }
+        let mut cache = self
+            .metadata_completion_candidates_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry(cache_key)
+            .or_insert_with(|| candidates.clone())
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn metadata_completion_rows_for_test(
+        &self,
+        field: &str,
+    ) -> Result<Vec<(i64, String, String)>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, value, provenance
+                 FROM metadata_completion_values
+                 WHERE field = ?1 COLLATE NOCASE
+                 ORDER BY id",
+            )
+            .map_err(|error| format!("prepare metadata completion test query: {error}"))?;
+        let rows = statement
+            .query_map([field], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| format!("query metadata completion test rows: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read metadata completion test rows: {error}"))
     }
 
     /// Look up cached AR results for a file. Returns None if not cached
@@ -6073,6 +6304,114 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn metadata_completion_corpus_is_row_addressable_idempotent_and_persistent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("completion.sqlite3");
+        {
+            let db = Database::open_path(&path).expect("open database");
+            assert_eq!(
+                db.learn_metadata_completion_values(&[
+                    LearnedMetadataCompletionValue {
+                        field: "PERFORMER".to_string(),
+                        value: "John Paul Jones".to_string(),
+                        provenance: "read:/music/led-zeppelin.flac".to_string(),
+                    },
+                    LearnedMetadataCompletionValue {
+                        field: "PERFORMER".to_string(),
+                        value: "John Bonham".to_string(),
+                        provenance: "read:/music/led-zeppelin.flac".to_string(),
+                    },
+                ])
+                .expect("initial harvest"),
+                2
+            );
+            assert_eq!(
+                db.learn_metadata_completion_values(&[LearnedMetadataCompletionValue {
+                    field: "performer".to_string(),
+                    value: "john paul jones".to_string(),
+                    provenance: "write:/music/physical-graffiti.flac".to_string(),
+                }])
+                .expect("repeat harvest"),
+                0,
+                "case-only repeats must be storage-idempotent"
+            );
+
+            let rows = db
+                .metadata_completion_rows_for_test("PERFORMER")
+                .expect("completion rows");
+            assert_eq!(rows.len(), 2, "case-only repeats must upsert one row");
+            let jones = rows
+                .iter()
+                .find(|(_, value, _)| value.eq_ignore_ascii_case("John Paul Jones"))
+                .expect("Jones row");
+            assert!(jones.0 > 0, "learned rows need stable individual IDs");
+            assert_eq!(
+                jones.2, "read:/music/led-zeppelin.flac",
+                "the first concrete provenance remains stable across duplicate harvests"
+            );
+        }
+
+        let reopened = Database::open_path(&path).expect("reopen database");
+        assert_eq!(
+            reopened
+                .metadata_completion_values_for_field("PERFORMER")
+                .expect("persisted corpus"),
+            vec!["John Bonham".to_string(), "John Paul Jones".to_string()],
+            "the learned corpus must survive process/database reopen"
+        );
+        let version: u32 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn v25_migrates_an_existing_v24_database_without_disturbing_existing_data() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("v24-to-v25.sqlite3");
+        {
+            let db = Database::open_path(&path).expect("create current database fixture");
+            db.conn
+                .execute(
+                    "INSERT INTO recent_files(file_path, accessed_at) VALUES(?1, ?2)",
+                    params!["/music/existing.flac", 123_i64],
+                )
+                .expect("seed pre-existing v24 data");
+            db.conn
+                .execute("DROP TABLE metadata_completion_values", [])
+                .expect("remove only the v25 table from fixture");
+            db.conn
+                .pragma_update(None, "user_version", 24)
+                .expect("stamp fixture as v24");
+        }
+
+        let migrated = Database::open_path(&path).expect("migrate v24 database to v25");
+        let version: u32 = migrated
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, 25);
+        let completion_columns = table_columns(&migrated.conn, "metadata_completion_values");
+        assert_eq!(
+            completion_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "field", "value", "provenance", "first_seen_unix_ms"]
+        );
+        let existing: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM recent_files WHERE file_path=?1 AND accessed_at=?2",
+                params!["/music/existing.flac", 123_i64],
+                |row| row.get(0),
+            )
+            .expect("query pre-existing v24 data");
+        assert_eq!(existing, 1, "v25 migration must preserve existing rows");
     }
 
     const CROSS_PROCESS_DB_PATH_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_PATH";

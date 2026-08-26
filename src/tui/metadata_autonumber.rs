@@ -327,6 +327,166 @@ pub fn parse_side_number(input: &str) -> Option<DerivedSideNumber> {
     })
 }
 
+/// Continue one explicit numbering seed while preserving its lexical notation.
+/// This is the pure continuation primitive used by inline `!` expansion;
+/// structure/boundary decisions remain with the metadata editor.
+pub fn continue_numbering_seed(seed: &str, increment: usize) -> Result<String, String> {
+    let trimmed = seed.trim();
+    if trimmed.is_empty() {
+        return Err("numbering continuation needs a non-empty seed".to_string());
+    }
+
+    if let Some(side) = parse_side_number(trimmed) {
+        let prefix_len = side.prefix.len();
+        let raw_prefix = &trimmed[..prefix_len];
+        let rest = &trimmed[prefix_len..];
+        let digit_len = rest.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+        if digit_len == 0 || !rest[digit_len..].is_empty() {
+            return Err(format!("cannot continue numbering from seed '{trimmed}'"));
+        }
+        let scheme = match digit_len {
+            1 => NumberingScheme::SN,
+            2 => NumberingScheme::SNN,
+            _ => return Err(format!("cannot continue numbering from seed '{trimmed}'")),
+        };
+        let next = side
+            .sequence
+            .checked_add(increment)
+            .ok_or_else(|| "numbering continuation overflowed".to_string())?;
+        return Ok(format_side_numbering_value(
+            scheme,
+            raw_prefix,
+            next,
+            next,
+        ));
+    }
+
+    let (number_text, total) = match trimmed.split_once('/') {
+        Some((number, total)) => {
+            if total.is_empty()
+                || !total.bytes().all(|byte| byte.is_ascii_digit())
+                || total.parse::<usize>().ok().filter(|value| *value > 0).is_none()
+            {
+                return Err(format!("cannot continue numbering from seed '{trimmed}'"));
+            }
+            (number, Some(total.parse::<usize>().unwrap_or_default()))
+        }
+        None => (trimmed, None),
+    };
+    if number_text.is_empty() || !number_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("cannot continue numbering from seed '{trimmed}'"));
+    }
+    let number = number_text
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("cannot continue numbering from seed '{trimmed}'"))?;
+    let next = number
+        .checked_add(increment)
+        .ok_or_else(|| "numbering continuation overflowed".to_string())?;
+    let padded = match number_text.len() {
+        1 => false,
+        2 => true,
+        _ => return Err(format!("cannot continue numbering from seed '{trimmed}'")),
+    };
+    let scheme = match (padded, total.is_some()) {
+        (false, false) => NumberingScheme::N,
+        (true, false) => NumberingScheme::NN,
+        (false, true) => NumberingScheme::NOverNN,
+        (true, true) => NumberingScheme::NNOverNN,
+    };
+    let total_or_maximum = if let Some(total) = total {
+        if next > total {
+            return Err(format!(
+                "cannot continue numbering past declared total {total} from seed '{trimmed}'"
+            ));
+        }
+        total
+    } else {
+        next
+    };
+    Ok(format_non_side_numbering_value(
+        scheme,
+        next,
+        total_or_maximum,
+    ))
+}
+
+/// Continue a side-style seed onto a later declared partition, resetting the
+/// numeric sequence while advancing the seed's alphabetic side prefix. The
+/// caller supplies the declared partition offset; this helper never invents a
+/// boundary on its own.
+pub fn continue_side_numbering_seed(
+    seed: &str,
+    prefix_increment: usize,
+    sequence: usize,
+) -> Result<String, String> {
+    let trimmed = seed.trim();
+    let side = parse_side_number(trimmed)
+        .ok_or_else(|| format!("cannot continue side numbering from seed '{trimmed}'"))?;
+    let prefix_len = side.prefix.len();
+    let raw_prefix = &trimmed[..prefix_len];
+    let rest = &trimmed[prefix_len..];
+    let digit_len = rest.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if digit_len == 0 || !rest[digit_len..].is_empty() || sequence == 0 {
+        return Err(format!("cannot continue side numbering from seed '{trimmed}'"));
+    }
+    let scheme = match digit_len {
+        1 => NumberingScheme::SN,
+        2 => NumberingScheme::SNN,
+        _ => return Err(format!("cannot continue side numbering from seed '{trimmed}'")),
+    };
+    let prefix = advance_ascii_side_prefix(raw_prefix, prefix_increment)?;
+    Ok(format_side_numbering_value(
+        scheme,
+        &prefix,
+        sequence,
+        sequence,
+    ))
+}
+
+fn advance_ascii_side_prefix(prefix: &str, increment: usize) -> Result<String, String> {
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(format!("invalid side prefix '{prefix}'"));
+    }
+    if increment == 0 {
+        return Ok(prefix.to_string());
+    }
+
+    // Spreadsheet-style alphabetic succession gives the familiar A -> B ->
+    // ... -> Z -> AA sequence without imposing a one-letter-only policy.
+    let lowercase = prefix.bytes().all(|byte| byte.is_ascii_lowercase());
+    let mut ordinal = 0u64;
+    for byte in prefix.bytes() {
+        let digit = u64::from(byte.to_ascii_uppercase() - b'A' + 1);
+        ordinal = ordinal
+            .checked_mul(26)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(|| "side prefix continuation overflowed".to_string())?;
+    }
+    ordinal = ordinal
+        .checked_add(u64::try_from(increment).unwrap_or(u64::MAX))
+        .ok_or_else(|| "side prefix continuation overflowed".to_string())?;
+
+    let mut reversed = Vec::new();
+    while ordinal > 0 {
+        ordinal -= 1;
+        reversed.push((ordinal % 26) as u8);
+        ordinal /= 26;
+    }
+    if reversed.len() > 8 {
+        return Err("side prefix continuation exceeds the 8-letter numbering limit".to_string());
+    }
+    reversed.reverse();
+    Ok(reversed
+        .into_iter()
+        .map(|digit| {
+            let byte = (if lowercase { b'a' } else { b'A' }) + digit;
+            char::from(byte)
+        })
+        .collect())
+}
+
 pub fn side_number_from_filename(path: &Path) -> Option<DerivedSideNumber> {
     let stem = path.file_stem()?.to_str()?;
     let mut chars = stem.chars();
@@ -351,6 +511,39 @@ fn decimal_width(total: usize) -> usize {
     total.max(1).to_string().len().max(2)
 }
 
+fn format_non_side_numbering_value(
+    scheme: NumberingScheme,
+    sequence: usize,
+    total: usize,
+) -> String {
+    let width = decimal_width(total);
+    match scheme {
+        NumberingScheme::N => sequence.to_string(),
+        NumberingScheme::NN => format!("{sequence:0width$}"),
+        NumberingScheme::NOverNN => format!("{sequence}/{total:0width$}"),
+        NumberingScheme::NNOverNN => {
+            format!("{sequence:0width$}/{total:0width$}")
+        }
+        NumberingScheme::SN | NumberingScheme::SNN => unreachable!(),
+    }
+}
+
+fn format_side_numbering_value(
+    scheme: NumberingScheme,
+    prefix: &str,
+    sequence: usize,
+    maximum: usize,
+) -> String {
+    match scheme {
+        NumberingScheme::SN => format!("{prefix}{sequence}"),
+        NumberingScheme::SNN => {
+            let width = decimal_width(maximum);
+            format!("{prefix}{sequence:0width$}")
+        }
+        _ => unreachable!(),
+    }
+}
+
 pub fn format_numbering_values(
     scheme: NumberingScheme,
     count: usize,
@@ -369,17 +562,8 @@ fn format_numbering_values_with_sequences(
         return Ok(Vec::new());
     }
     if !scheme.is_side() {
-        let width = decimal_width(count);
         return Ok((1..=count)
-            .map(|n| match scheme {
-                NumberingScheme::N => n.to_string(),
-                NumberingScheme::NN => format!("{n:0width$}"),
-                NumberingScheme::NOverNN => format!("{n}/{count:0width$}"),
-                NumberingScheme::NNOverNN => {
-                    format!("{n:0width$}/{count:0width$}")
-                }
-                NumberingScheme::SN | NumberingScheme::SNN => unreachable!(),
-            })
+            .map(|sequence| format_non_side_numbering_value(scheme, sequence, count))
             .collect());
     }
 
@@ -459,13 +643,13 @@ fn format_numbering_values_with_sequences(
     Ok(prefixes
         .iter()
         .zip(assigned)
-        .map(|(prefix, sequence)| match scheme {
-            NumberingScheme::SN => format!("{prefix}{sequence}"),
-            NumberingScheme::SNN => {
-                let width = decimal_width(*maximum_by_prefix.get(prefix.as_str()).unwrap_or(&1));
-                format!("{prefix}{sequence:0width$}")
-            }
-            _ => unreachable!(),
+        .map(|(prefix, sequence)| {
+            format_side_numbering_value(
+                scheme,
+                prefix,
+                sequence,
+                *maximum_by_prefix.get(prefix.as_str()).unwrap_or(&1),
+            )
         })
         .collect())
 }
@@ -1502,6 +1686,32 @@ impl AutoNumberOverlayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_preserves_seed_notation_without_inventing_a_side() {
+        for (seed, increment, expected) in [
+            ("1", 3usize, "4"),
+            ("01", 3, "04"),
+            ("A1", 3, "A4"),
+            ("A01", 3, "A04"),
+            ("01/12", 3, "04/12"),
+        ] {
+            assert_eq!(
+                continue_numbering_seed(seed, increment).expect("valid continuation seed"),
+                expected,
+                "{seed} + {increment}"
+            );
+        }
+        assert_eq!(
+            continue_side_numbering_seed("A01", 1, 1).expect("declared next side"),
+            "B01"
+        );
+        assert_eq!(
+            continue_side_numbering_seed("Z1", 1, 1).expect("alphabetic rollover"),
+            "AA1"
+        );
+        assert!(continue_numbering_seed("Side A", 1).is_err());
+    }
     use crate::tui::app::{
         CueAlbumSyntheticSheet, CueAlbumTrackSource, DiscTechnicalDetails, MetadataCueSource,
         MetadataTechnicalDetails,

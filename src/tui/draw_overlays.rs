@@ -5308,7 +5308,9 @@ fn draw_metadata_editor(
         } else if entry.is_binary {
             entry.value.clone()
         } else {
-            entry.value.replace('\n', "↵").replace('\r', "")
+            super::keybindings::metadata_editor_inline_display_text(entry)
+                .replace('\n', "↵")
+                .replace('\r', "")
         };
 
         let max_discrete_values = entry
