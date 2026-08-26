@@ -8678,11 +8678,12 @@ fn draw_cue_select(
         .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let selected_is_selectable = state
-        .rows
-        .get(state.selected)
-        .is_some_and(|row| row.selectable());
+    let selected_row = state.rows.get(state.selected);
+    let selected_is_selectable = selected_row.is_some_and(|row| row.selectable());
+    let repair_available = matches!(&state.operation, super::app::CueSelectOperation::BrowseOverride)
+        && selected_row.and_then(|row| row.repair_cue.as_ref()).is_some();
     let accept_label = " [Use selected] ";
+    let repair_label = " [Repair copy] ";
     let cancel_label = " [Cancel] ";
     let accept_style = if selected_is_selectable {
         Style::default()
@@ -8694,26 +8695,56 @@ fn draw_cue_select(
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(accept_label, accept_style),
+            if matches!(&state.operation, super::app::CueSelectOperation::BrowseOverride) {
+                Span::styled(
+                    repair_label,
+                    if repair_available {
+                        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
+                    } else {
+                        theme.muted()
+                    },
+                )
+            } else {
+                Span::raw("")
+            },
             Span::styled(
                 cancel_label,
                 Style::default()
                     .fg(theme.destructive)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  ↑↓ select · Enter accept", theme.muted()),
+            Span::styled(
+                if matches!(&state.operation, super::app::CueSelectOperation::BrowseOverride) {
+                    "  Up/Down select | Enter use | R repair"
+                } else {
+                    "  ↑↓ select · Enter accept"
+                },
+                theme.muted(),
+            ),
         ])),
         chunks[2],
     );
     let accept_width = super::display_width::width(accept_label) as u16;
+    let repair_width = if matches!(&state.operation, super::app::CueSelectOperation::BrowseOverride) {
+        super::display_width::width(repair_label) as u16
+    } else {
+        0
+    };
     let cancel_width = super::display_width::width(cancel_label) as u16;
     button_map.record_button(
         TuiButton::CueSelectAccept,
         Rect::new(chunks[2].x, chunks[2].y, accept_width, 1),
     );
+    if repair_width > 0 {
+        button_map.record_button(
+            TuiButton::CueSelectRepair,
+            Rect::new(chunks[2].x + accept_width, chunks[2].y, repair_width, 1),
+        );
+    }
     button_map.record_button(
         TuiButton::CueSelectCancel,
         Rect::new(
-            chunks[2].x + accept_width,
+            chunks[2].x + accept_width + repair_width,
             chunks[2].y,
             cancel_width,
             1,

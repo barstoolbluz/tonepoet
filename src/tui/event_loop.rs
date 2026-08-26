@@ -5029,6 +5029,26 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 result,
             );
         }
+        AppMessage::BrowseCueRepairComplete {
+            generation,
+            browse_scan_generation,
+            tab_id,
+            origin_dir,
+            folder,
+            cue_path,
+            result,
+        } => {
+            super::keybindings::handle_browse_cue_repair_complete(
+                app,
+                generation,
+                browse_scan_generation,
+                tab_id,
+                origin_dir,
+                folder,
+                cue_path,
+                result,
+            );
+        }
         AppMessage::ProbeResult {
             generation,
             path,

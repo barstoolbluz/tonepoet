@@ -1349,6 +1349,61 @@ fn validate_sidecar_layout(sheet: &CueSheet) -> Result<(), MaterializeError> {
     validate_sidecar_layout_detect(sheet).map_err(MaterializeError::Parse)
 }
 
+/// Validate a proposed sidecar CUE repair against the resolved audio images
+/// before any repaired copy is written. This reuses the materializer's own
+/// duration/boundary rules so the repair gate cannot drift from conversion.
+/// Cheap FLAC/WAV header probes are used when authoritative; other formats use
+/// the normal bounded ffprobe path, with the established WavPack fallback.
+pub(crate) async fn validate_repaired_sidecar_layout_against_images(
+    sheet: &CueSheet,
+    track_images: &[PathBuf],
+    cue_path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    validate_sidecar_layout_detect(sheet)?;
+    if sheet.tracks.len() != track_images.len() {
+        return Err(format!(
+            "repaired CUE track/image cardinality mismatch: {} tracks, {} images",
+            sheet.tracks.len(),
+            track_images.len()
+        ));
+    }
+
+    let temp = tempfile::tempdir()
+        .map_err(|err| format!("failed to create CUE repair validation staging: {err}"))?;
+    let staging_root = temp.path().join("cue-repair-validation");
+    std::fs::create_dir_all(&staging_root)
+        .map_err(|err| format!("failed to prepare CUE repair validation staging: {err}"))?;
+    let staging = StagingDir::new(staging_root, "cue-repair-validation".to_string());
+
+    let mut probes = HashMap::new();
+    for image_path in unique_existing_paths(track_images) {
+        if cancel.is_cancelled() {
+            return Err("CUE repair validation cancelled".to_string());
+        }
+        let image_key = path_identity(&image_path);
+        let probe = if let Some(probe) = cue_preflight_exact_pcm_probe(&image_path) {
+            probe
+        } else {
+            probe_cue_image_with_wavpack_fallback(&image_path, &staging, runner, cancel)
+                .await
+                .map(|(probe, _, _)| probe)
+                .map_err(|err| {
+                    format!(
+                        "failed to validate repaired CUE against {}: {err}",
+                        image_path.display()
+                    )
+                })?
+        };
+        probes.insert(image_key, probe);
+    }
+
+    compute_track_boundaries_for_layout_with_cue(sheet, track_images, &probes, Some(cue_path))
+        .map(|_| ())
+        .map_err(|err| format!("repaired CUE failed image-boundary validation: {err}"))
+}
+
 fn validate_sidecar_layout_detect(sheet: &CueSheet) -> Result<(), String> {
     validate_common_cue_layout(sheet)?;
     if !sheet.tracks.iter().all(|track| track.file.is_some()) {

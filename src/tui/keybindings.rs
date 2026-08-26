@@ -10139,28 +10139,43 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     app.set_status("CUE selection cancelled; no changes were applied");
                 }
                 KeyCode::Enter => accept_cue_selection(app, tx, *state),
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    start_browse_cue_repair(app, tx, *state)
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    state.selected = cue_select_move(&state.rows, state.selected, -1, 1);
+                    state.selected =
+                        cue_select_move(&state.rows, state.selected, -1, 1, &state.operation);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    state.selected = cue_select_move(&state.rows, state.selected, 1, 1);
+                    state.selected =
+                        cue_select_move(&state.rows, state.selected, 1, 1, &state.operation);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 KeyCode::PageUp => {
-                    state.selected = cue_select_move(&state.rows, state.selected, -1, 10);
+                    state.selected =
+                        cue_select_move(&state.rows, state.selected, -1, 10, &state.operation);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 KeyCode::PageDown => {
-                    state.selected = cue_select_move(&state.rows, state.selected, 1, 10);
+                    state.selected =
+                        cue_select_move(&state.rows, state.selected, 1, 10, &state.operation);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 KeyCode::Home => {
-                    state.selected = state.rows.iter().position(|row| row.selectable()).unwrap_or(0);
+                    state.selected = state
+                        .rows
+                        .iter()
+                        .position(|row| cue_select_row_focusable(row, &state.operation))
+                        .unwrap_or(0);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 KeyCode::End => {
-                    state.selected = state.rows.iter().rposition(|row| row.selectable()).unwrap_or(0);
+                    state.selected = state
+                        .rows
+                        .iter()
+                        .rposition(|row| cue_select_row_focusable(row, &state.operation))
+                        .unwrap_or(0);
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 _ => app.active_overlay = ActiveOverlay::CueSelect(state),
@@ -10859,7 +10874,14 @@ pub(super) fn handle_browse_cue_inspection_complete(
                 row.selectable() && row.selection.as_ref().is_some_and(|choice| choice == saved)
             })
         })
-        .unwrap_or_else(|| prompt.first_selectable_row());
+        .unwrap_or_else(|| {
+            prompt
+                .rows
+                .iter()
+                .position(|row| row.selectable())
+                .or_else(|| prompt.rows.iter().position(|row| row.repair_cue.is_some()))
+                .unwrap_or(0)
+        });
     app.active_overlay = ActiveOverlay::CueSelect(Box::new(CueSelectState {
         parent: prompt.parent,
         rows: prompt.rows,
@@ -10867,7 +10889,15 @@ pub(super) fn handle_browse_cue_inspection_complete(
         scroll: 0,
         operation: CueSelectOperation::BrowseOverride,
     }));
-    app.set_status("Advanced CUE choices: unavailable CUEs are shown with their reason");
+    app.set_status("Advanced CUE Options: unavailable CUEs are shown with their reason");
+}
+
+fn cue_select_row_focusable(
+    row: &crate::convert::queue_expansion::QueueCueSelectionRow,
+    operation: &CueSelectOperation,
+) -> bool {
+    row.selectable()
+        || (matches!(operation, CueSelectOperation::BrowseOverride) && row.repair_cue.is_some())
 }
 
 fn cue_select_move(
@@ -10875,6 +10905,7 @@ fn cue_select_move(
     selected: usize,
     direction: isize,
     steps: usize,
+    operation: &CueSelectOperation,
 ) -> usize {
     if rows.is_empty() {
         return 0;
@@ -10884,7 +10915,7 @@ fn cue_select_move(
         let mut cursor = index as isize + direction;
         let mut found = None;
         while cursor >= 0 && (cursor as usize) < rows.len() {
-            if rows[cursor as usize].selectable() {
+            if cue_select_row_focusable(&rows[cursor as usize], operation) {
                 found = Some(cursor as usize);
                 break;
             }
@@ -10896,6 +10927,122 @@ fn cue_select_move(
         }
     }
     index
+}
+
+const BROWSE_CUE_REPAIR_STATUS: &str = "Validating CUE repair...";
+
+fn start_browse_cue_repair(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    state: CueSelectState,
+) {
+    if !matches!(&state.operation, CueSelectOperation::BrowseOverride) {
+        app.active_overlay = ActiveOverlay::CueSelect(Box::new(state));
+        return;
+    }
+    let Some(cue_path) = state
+        .rows
+        .get(state.selected)
+        .and_then(|row| row.repair_cue.clone())
+    else {
+        app.active_overlay = ActiveOverlay::CueSelect(Box::new(state));
+        app.set_status("CUE repair is only available for a cumulative cross-file rejection");
+        return;
+    };
+
+    // Share the Advanced-CUE request generation so any older inspection or
+    // repair completion cannot steal UI ownership after this explicit action.
+    app.browse_cue_inspection_generation = app.browse_cue_inspection_generation.wrapping_add(1);
+    let generation = app.browse_cue_inspection_generation;
+    let browse_scan_generation = app.browse.scan_generation;
+    let tab_id = app.browse.active_tab_id();
+    let origin_dir = app.browse.current_dir.clone();
+    let folder = state.parent;
+    let tool_paths = app.manager.config.tool_paths.clone();
+    app.active_overlay = ActiveOverlay::None;
+    app.set_status(BROWSE_CUE_REPAIR_STATUS);
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = crate::convert::split_cue_album::repair_cross_file_cumulative_cue(
+            &cue_path,
+            &runner,
+            &cancel,
+        )
+        .await;
+        let _ = tx
+            .send(AppMessage::BrowseCueRepairComplete {
+                generation,
+                browse_scan_generation,
+                tab_id,
+                origin_dir,
+                folder,
+                cue_path,
+                result,
+            })
+            .await;
+    });
+}
+
+pub(super) fn handle_browse_cue_repair_complete(
+    app: &mut AppState,
+    generation: u64,
+    browse_scan_generation: u64,
+    tab_id: super::browse::BrowseTabId,
+    origin_dir: std::path::PathBuf,
+    folder: std::path::PathBuf,
+    cue_path: std::path::PathBuf,
+    result: Result<crate::convert::split_cue_album::SplitCueRepairOutcome, String>,
+) {
+    if app.browse_cue_inspection_generation != generation {
+        log::debug!("discarded superseded CUE repair for {}", cue_path.display());
+        return;
+    }
+    if app.current_screen != AppScreen::Browse
+        || app.browse.scan_generation != browse_scan_generation
+        || app.browse.active_tab_id() != tab_id
+        || app.browse.current_dir != origin_dir
+    {
+        if app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message == BROWSE_CUE_REPAIR_STATUS)
+        {
+            app.status_message = None;
+        }
+        log::debug!(
+            "discarded stale CUE repair completion for {} in {}",
+            cue_path.display(),
+            folder.display()
+        );
+        return;
+    }
+
+    match result {
+        Ok(crate::convert::split_cue_album::SplitCueRepairOutcome::AlreadyValid { path }) => {
+            app.set_status(format!(
+                "CUE is already structurally valid; no repair copy was needed: {}",
+                path.display()
+            ));
+        }
+        Ok(crate::convert::split_cue_album::SplitCueRepairOutcome::Created { path }) => {
+            app.set_status(format!(
+                "Created validated repair copy {}; original CUE was not changed",
+                path.display()
+            ));
+        }
+        Ok(crate::convert::split_cue_album::SplitCueRepairOutcome::ExistingIdentical { path }) => {
+            app.set_status(format!(
+                "Validated repair copy already exists at {}; no files were changed",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            app.set_status(format!("CUE repair failed; original left unchanged: {error}"));
+        }
+    }
 }
 
 fn accept_cue_selection(
@@ -41395,11 +41542,13 @@ fn handle_cue_select_mouse(
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            state.selected = cue_select_move(&state.rows, state.selected, -1, 1);
+            state.selected =
+                cue_select_move(&state.rows, state.selected, -1, 1, &state.operation);
             app.active_overlay = ActiveOverlay::CueSelect(state);
         }
         MouseEventKind::ScrollDown => {
-            state.selected = cue_select_move(&state.rows, state.selected, 1, 1);
+            state.selected =
+                cue_select_move(&state.rows, state.selected, 1, 1, &state.operation);
             app.active_overlay = ActiveOverlay::CueSelect(state);
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -41409,6 +41558,7 @@ fn handle_cue_select_mouse(
                     app.active_overlay = ActiveOverlay::CueSelect(state);
                 }
                 Some(TuiButton::CueSelectAccept) => accept_cue_selection(app, tx, *state),
+                Some(TuiButton::CueSelectRepair) => start_browse_cue_repair(app, tx, *state),
                 Some(TuiButton::CueSelectCancel) => {
                     app.active_overlay = ActiveOverlay::None;
                     app.set_status("CUE selection cancelled; no changes were applied");
@@ -61747,6 +61897,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MbSelectCancel
             | TuiButton::CueSelectRow(_)
             | TuiButton::CueSelectAccept
+            | TuiButton::CueSelectRepair
             | TuiButton::CueSelectCancel
             | TuiButton::CuePreviewLine(_)
             | TuiButton::CuePreviewSave
@@ -78098,7 +78249,7 @@ mod single_image_metadata_editor_regression_tests {
         let ActiveOverlay::CueSelect(mut state) = overlay else {
             panic!("advanced CUE completion must open the rich chooser");
         };
-        assert!(matches!(state.operation, CueSelectOperation::BrowseOverride));
+        assert!(matches!(&state.operation, CueSelectOperation::BrowseOverride));
         let automatic = state.rows.first().expect("automatic row");
         assert_eq!(automatic.label, "Let tonepoet handle it");
         assert!(automatic.recommended);
@@ -78110,6 +78261,7 @@ mod single_image_metadata_editor_regression_tests {
         assert_eq!(rejected.label, "combined.cue");
         assert!(rejected.selection.is_none());
         assert!(rejected.reason.as_deref().is_some_and(|reason| reason.contains("cumulative")));
+        assert_eq!(rejected.repair_cue.as_ref(), Some(&combined));
 
         let saved_cue = album.join("side-b.cue");
         state.selected = state
@@ -78134,7 +78286,7 @@ mod single_image_metadata_editor_regression_tests {
         let message = receiver.recv().await.expect("reopened inspection completion");
         super::super::event_loop::handle_message(&mut app, message, &sender);
         let ActiveOverlay::CueSelect(state) = &app.active_overlay else {
-            panic!("reopened Advanced CUE choices must restore the chooser");
+            panic!("reopened Advanced CUE Options must restore the chooser");
         };
         assert!(matches!(
             state.rows[state.selected].selection.as_ref(),
@@ -78202,6 +78354,7 @@ mod single_image_metadata_editor_regression_tests {
                     crate::convert::queue_expansion::QueueCueSelectionOverride::AutomaticWholeAlbum,
                 ),
                 reason: None,
+                repair_cue: None,
                 recommended: true,
             }],
         };
@@ -79059,6 +79212,7 @@ mod single_image_metadata_editor_regression_tests {
                         std::path::PathBuf::from("a.cue"),
                     )),
                     reason: None,
+                    repair_cue: None,
                     recommended: false,
                 },
                 crate::convert::queue_expansion::QueueCueSelectionRow {
@@ -79068,6 +79222,7 @@ mod single_image_metadata_editor_regression_tests {
                         std::path::PathBuf::from("b.cue"),
                     )),
                     reason: None,
+                    repair_cue: None,
                     recommended: false,
                 },
             ],

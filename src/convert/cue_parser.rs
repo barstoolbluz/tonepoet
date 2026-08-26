@@ -864,6 +864,402 @@ pub(crate) fn rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CueIndexRepairCopyOutcome {
+    Created,
+    ExistingIdentical,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CuePhysicalTrackIndexes {
+    index00: Option<(u32, usize)>,
+    index01: Option<(u32, usize)>,
+}
+
+/// Build the exact parsed geometry for a cumulative-index repair by rebasing
+/// each AUDIO-track INDEX line against the physical FILE section active at
+/// that line. This matters for older-ripper pregaps where FILE appears between
+/// one track's INDEX 00 and INDEX 01: the parser intentionally associates the
+/// track with the later FILE while INDEX 00 still names a position in the
+/// preceding FILE's timeline.
+pub(crate) fn rebase_cue_index_lines_by_physical_file_section(
+    source_path: &Path,
+    source_bytes: &[u8],
+) -> Result<CueSheet, String> {
+    let decoded = decode_cue_bytes_for_path(source_bytes, source_path)
+        .map_err(|err| format!("failed to decode CUE repair source: {err}"))?;
+    let mut lines = split_cue_lines_preserving_eol(&decoded);
+
+    let mut current_file_section: Option<usize> = None;
+    let mut section_bases = Vec::<Option<u32>>::new();
+    let mut audio_track_ordinal: Option<usize> = None;
+    let mut next_audio_track = 0usize;
+    let mut track_indexes = Vec::<CuePhysicalTrackIndexes>::new();
+
+    for line in &mut lines {
+        let trimmed = line.body.trim();
+        if parse_file_line(trimmed).is_some() {
+            let section = section_bases.len();
+            current_file_section = Some(section);
+            // The first physical FILE section keeps its authored timeline.
+            // Each later section establishes its own base from the first
+            // AUDIO INDEX 00/01 physically contained in that section.
+            section_bases.push(if section == 0 { Some(0) } else { None });
+            continue;
+        }
+
+        if let Some((_number, is_audio)) = parse_track_header(trimmed) {
+            if is_audio {
+                audio_track_ordinal = Some(next_audio_track);
+                next_audio_track += 1;
+                track_indexes.push(CuePhysicalTrackIndexes::default());
+            } else {
+                audio_track_ordinal = None;
+            }
+            continue;
+        }
+
+        let Some(track_ordinal) = audio_track_ordinal else {
+            continue;
+        };
+        let index00 = parse_index_line(trimmed, "00");
+        let index01 = parse_index_line(trimmed, "01");
+        if strip_keyword_ci(trimmed, "INDEX").is_some()
+            && index00.is_none()
+            && index01.is_none()
+        {
+            return Err(format!(
+                "source CUE AUDIO track {} contains an INDEX other than 00/01; repair copy not written",
+                track_ordinal + 1
+            ));
+        }
+        let (index_number, source_frames) = match (index00, index01) {
+            (Some(frames), None) => ("00", frames),
+            (None, Some(frames)) => ("01", frames),
+            (None, None) => continue,
+            (Some(_), Some(_)) => unreachable!("one INDEX line cannot be both 00 and 01"),
+        };
+        let section = current_file_section.ok_or_else(|| {
+            format!(
+                "cannot repair CUE AUDIO track {} INDEX {} without a preceding FILE section",
+                track_ordinal + 1,
+                index_number
+            )
+        })?;
+        let base = match section_bases[section] {
+            Some(base) => base,
+            None => {
+                section_bases[section] = Some(source_frames);
+                source_frames
+            }
+        };
+        let repaired_frames = source_frames.checked_sub(base).ok_or_else(|| {
+            format!(
+                "cannot rebase CUE AUDIO track {} INDEX {} at frame {} below physical FILE-section base {}",
+                track_ordinal + 1,
+                index_number,
+                source_frames,
+                base
+            )
+        })?;
+
+        let indexes = &mut track_indexes[track_ordinal];
+        let slot = if index_number == "00" {
+            &mut indexes.index00
+        } else {
+            &mut indexes.index01
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "source CUE AUDIO track {} contains multiple INDEX {} lines; repair copy not written",
+                track_ordinal + 1,
+                index_number
+            ));
+        }
+        *slot = Some((repaired_frames, section));
+        line.body = replace_index_timestamp_preserving_line(
+            &line.body,
+            index_number,
+            repaired_frames,
+        )
+        .ok_or_else(|| {
+            format!(
+                "failed to prepare repaired INDEX {} for AUDIO track {} without rebuilding the CUE",
+                index_number,
+                track_ordinal + 1
+            )
+        })?;
+    }
+
+    if section_bases.len() < 2 {
+        return Err(
+            "cannot repair cumulative CUE without multiple physical FILE sections".to_string(),
+        );
+    }
+
+    for (ordinal, indexes) in track_indexes.iter().enumerate() {
+        let Some((index01, index01_section)) = indexes.index01 else {
+            return Err(format!(
+                "cannot repair CUE AUDIO track {} without INDEX 01",
+                ordinal + 1
+            ));
+        };
+        if let Some((index00, index00_section)) = indexes.index00 {
+            // INDEX 00 <= INDEX 01 is meaningful only when both lines live in
+            // the same physical FILE. The supported older-ripper form can put
+            // INDEX 00 in the previous FILE and INDEX 01 in the next one.
+            if index00_section == index01_section && index00 > index01 {
+                return Err(format!(
+                    "cannot repair CUE AUDIO track {}: rebased INDEX 00 is after INDEX 01 within one FILE section",
+                    ordinal + 1
+                ));
+            }
+        }
+    }
+
+    let mut repaired_text = String::with_capacity(decoded.len());
+    for line in lines {
+        repaired_text.push_str(&line.body);
+        repaired_text.push_str(&line.eol);
+    }
+    let repaired = parse_cue(&repaired_text);
+    if repaired.tracks.len() != track_indexes.len() {
+        return Err(format!(
+            "repaired CUE reparsed to {} AUDIO tracks, expected {}",
+            repaired.tracks.len(),
+            track_indexes.len()
+        ));
+    }
+    for (ordinal, (track, indexes)) in repaired
+        .tracks
+        .iter()
+        .zip(&track_indexes)
+        .enumerate()
+    {
+        let expected_index00 = indexes.index00.map(|(frames, _)| frames);
+        let expected_index01 = indexes.index01.map(|(frames, _)| frames);
+        if track.index00_frames != expected_index00 || track.index01_frames != expected_index01 {
+            return Err(format!(
+                "repaired CUE AUDIO track {} did not reparse with the prepared INDEX geometry",
+                ordinal + 1
+            ));
+        }
+    }
+
+    Ok(repaired)
+}
+
+/// Create a repaired sibling CUE from an exact source snapshot while changing
+/// only AUDIO-track `INDEX 00`/`INDEX 01` timestamps. The original is never modified.
+/// Existing identical output is an idempotent no-op; conflicting output is
+/// refused rather than overwritten.
+pub(crate) fn create_cue_index_repair_copy(
+    source_path: &Path,
+    destination_path: &Path,
+    expected_original: &[u8],
+    repaired_sheet: &CueSheet,
+) -> Result<CueIndexRepairCopyOutcome, String> {
+    let decoded = decode_cue_bytes_with_context_for_write(
+        expected_original,
+        source_path.parent(),
+    )?;
+    let mut lines = split_cue_lines_preserving_eol(&decoded.text);
+    let desired_indexes = repaired_sheet
+        .tracks
+        .iter()
+        .map(|track| {
+            track
+                .index01_frames
+                .map(|index01| (track.index00_frames, index01))
+                .ok_or_else(|| format!("repaired CUE track {} has no INDEX 01", track.number))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut audio_track_ordinal: Option<usize> = None;
+    let mut next_audio_track = 0usize;
+    let mut rewritten_index00_counts = vec![0usize; desired_indexes.len()];
+    let mut rewritten_index01_counts = vec![0usize; desired_indexes.len()];
+    for line in &mut lines {
+        let trimmed = line.body.trim();
+        if let Some((_number, is_audio)) = parse_track_header(trimmed) {
+            if is_audio {
+                if next_audio_track >= desired_indexes.len() {
+                    return Err(
+                        "source CUE contains more AUDIO tracks than the validated repair"
+                            .to_string(),
+                    );
+                }
+                audio_track_ordinal = Some(next_audio_track);
+                next_audio_track += 1;
+            } else {
+                audio_track_ordinal = None;
+            }
+            continue;
+        }
+        let Some(track_ordinal) = audio_track_ordinal else {
+            continue;
+        };
+
+        if strip_keyword_ci(trimmed, "INDEX").is_some()
+            && parse_index_line(trimmed, "00").is_none()
+            && parse_index_line(trimmed, "01").is_none()
+        {
+            return Err(format!(
+                "source CUE track {} contains an INDEX other than 00/01; repair copy not written",
+                repaired_sheet.tracks[track_ordinal].number
+            ));
+        }
+
+        if parse_index_line(trimmed, "00").is_some() {
+            let desired = desired_indexes[track_ordinal].0.ok_or_else(|| {
+                format!(
+                    "source CUE track {} has INDEX 00 but the validated repair does not",
+                    repaired_sheet.tracks[track_ordinal].number
+                )
+            })?;
+            if rewritten_index00_counts[track_ordinal] != 0 {
+                return Err(format!(
+                    "source CUE track {} contains multiple INDEX 00 lines; repair copy not written",
+                    repaired_sheet.tracks[track_ordinal].number
+                ));
+            }
+            line.body = replace_index_timestamp_preserving_line(&line.body, "00", desired)
+                .ok_or_else(|| {
+                    format!(
+                        "failed to rewrite INDEX 00 for track {} without rebuilding the CUE",
+                        repaired_sheet.tracks[track_ordinal].number
+                    )
+                })?;
+            rewritten_index00_counts[track_ordinal] += 1;
+            continue;
+        }
+
+        if parse_index_line(trimmed, "01").is_some() {
+            if rewritten_index01_counts[track_ordinal] != 0 {
+                return Err(format!(
+                    "source CUE track {} contains multiple INDEX 01 lines; repair copy not written",
+                    repaired_sheet.tracks[track_ordinal].number
+                ));
+            }
+            line.body = replace_index_timestamp_preserving_line(
+                &line.body,
+                "01",
+                desired_indexes[track_ordinal].1,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "failed to rewrite INDEX 01 for track {} without rebuilding the CUE",
+                    repaired_sheet.tracks[track_ordinal].number
+                )
+            })?;
+            rewritten_index01_counts[track_ordinal] += 1;
+        }
+    }
+
+    if next_audio_track != desired_indexes.len() {
+        return Err(format!(
+            "source CUE has {next_audio_track} AUDIO tracks but validated repair has {}",
+            desired_indexes.len()
+        ));
+    }
+    for (ordinal, ((expected_index00, _), (count00, count01))) in desired_indexes
+        .iter()
+        .zip(
+            rewritten_index00_counts
+                .iter()
+                .zip(&rewritten_index01_counts),
+        )
+        .enumerate()
+    {
+        let expected_count00 = if expected_index00.is_some() { 1 } else { 0 };
+        if *count00 != expected_count00 || *count01 != 1 {
+            return Err(format!(
+                "source CUE track {} does not contain the expected INDEX 00/01 lines; repair copy not written",
+                repaired_sheet.tracks[ordinal].number
+            ));
+        }
+    }
+
+    let mut rewritten_text = String::with_capacity(decoded.text.len());
+    for line in lines {
+        rewritten_text.push_str(&line.body);
+        rewritten_text.push_str(&line.eol);
+    }
+    let (repaired_bytes, _encoding_outcome) =
+        encode_cue_text_for_write(&rewritten_text, decoded.encoding);
+
+    let reparsed = decode_cue_bytes_for_path(&repaired_bytes, destination_path)
+        .map(|text| parse_cue(&text))
+        .map_err(|err| format!("failed to verify encoded repaired CUE: {err}"))?;
+    if reparsed.tracks.len() != repaired_sheet.tracks.len()
+        || reparsed
+            .tracks
+            .iter()
+            .zip(&repaired_sheet.tracks)
+            .any(|(actual, expected)| {
+                actual.number != expected.number
+                    || actual.file != expected.file
+                    || actual.index00_frames != expected.index00_frames
+                    || actual.index01_frames != expected.index01_frames
+            })
+    {
+        return Err(
+            "encoded repaired CUE did not preserve the validated track/file/index geometry"
+                .to_string(),
+        );
+    }
+
+    ensure_sidecar_snapshot_unchanged(source_path, expected_original)?;
+    let (_mutation_claim, admitted_destination) =
+        acquire_cue_sidecar_write_claim(destination_path)?;
+    let destination_path = admitted_destination.as_path();
+    if destination_path.exists() {
+        let existing = std::fs::read(destination_path).map_err(|err| {
+            format!(
+                "failed to read existing repaired CUE '{}': {err}",
+                destination_path.display()
+            )
+        })?;
+        if existing == repaired_bytes {
+            return Ok(CueIndexRepairCopyOutcome::ExistingIdentical);
+        }
+        return Err(format!(
+            "repaired CUE destination '{}' already exists with different contents; left it unchanged",
+            destination_path.display()
+        ));
+    }
+
+    atomic_create_new_no_replace(destination_path, &repaired_bytes)?;
+    Ok(CueIndexRepairCopyOutcome::Created)
+}
+
+fn replace_index_timestamp_preserving_line(
+    body: &str,
+    index_number: &str,
+    frames: u32,
+) -> Option<String> {
+    let trimmed = body.trim_start();
+    let rest = strip_keyword_ci(trimmed, "INDEX")?.trim_start();
+    let mut tokens = rest.split_whitespace();
+    let actual_index = tokens.next()?;
+    if actual_index != index_number {
+        return None;
+    }
+    let timestamp = tokens.next()?;
+    let timestamp_start = body.find(timestamp)?;
+    let timestamp_end = timestamp_start.checked_add(timestamp.len())?;
+    let minutes = frames / (75 * 60);
+    let remainder = frames % (75 * 60);
+    let seconds = remainder / 75;
+    let frame = remainder % 75;
+    let replacement = format!("{minutes:02}:{seconds:02}:{frame:02}");
+    let mut out = String::with_capacity(body.len().max(replacement.len()));
+    out.push_str(&body[..timestamp_start]);
+    out.push_str(&replacement);
+    out.push_str(&body[timestamp_end..]);
+    Some(out)
+}
+
 /// Materialize a new UTF-8 sidecar CUE from a generated CUESHEET.
 ///
 /// The destination-exists preflight preserves create-only behavior for the
@@ -2928,6 +3324,102 @@ fn atomic_create_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomic_replace_if_unchanged(path, bytes, None)
 }
 
+/// Create a new file atomically without an overwrite race. The staged inode is
+/// linked into the final name only if that name is still absent; unlike a
+/// plain `rename`, `hard_link` cannot replace a concurrently-created file.
+/// This is used by explicit repair copies where preserving an independently
+/// created destination is more important than falling back on a weaker write.
+fn atomic_create_new_no_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("sidecar CUE '{}' has no parent directory", path.display()))?;
+    let mut temp_path = parent.join(format!(
+        ".cue-sidecar-create.{}.{}.tmp",
+        std::process::id(),
+        monotonic_temp_nonce(),
+    ));
+
+    for attempt in 0..128u32 {
+        if attempt > 0 {
+            temp_path = parent.join(format!(
+                ".cue-sidecar-create.{}.{}.{}.tmp",
+                std::process::id(),
+                monotonic_temp_nonce(),
+                attempt,
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temporary repaired CUE '{}': {err}",
+                    temp_path.display()
+                ));
+            }
+        };
+
+        let result = (|| -> Result<(), String> {
+            file.write_all(bytes).map_err(|err| {
+                format!(
+                    "failed to write temporary repaired CUE '{}': {err}",
+                    temp_path.display()
+                )
+            })?;
+            file.sync_all().map_err(|err| {
+                format!(
+                    "failed to sync temporary repaired CUE '{}': {err}",
+                    temp_path.display()
+                )
+            })?;
+            drop(file);
+
+            std::fs::hard_link(&temp_path, path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!(
+                        "repaired CUE destination '{}' appeared before commit; left it unchanged",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "failed to atomically publish repaired CUE '{}' without overwrite: {err}",
+                        path.display()
+                    )
+                }
+            })?;
+            sync_parent_dir(parent);
+            if let Err(err) = std::fs::remove_file(&temp_path) {
+                // The final link is already durable and authoritative. Cleanup
+                // failure must not report the explicit repair itself as failed;
+                // the hidden sibling is harmless and a later cleanup can remove it.
+                log::warn!(
+                    "repaired CUE '{}' was created, but temporary link '{}' could not be removed: {err}",
+                    path.display(),
+                    temp_path.display()
+                );
+            }
+            sync_parent_dir(parent);
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        return result;
+    }
+
+    Err(format!(
+        "failed to allocate a unique temporary repaired CUE path beside '{}'",
+        path.display()
+    ))
+}
+
 fn sync_parent_dir(parent: &Path) {
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
@@ -4586,6 +5078,35 @@ FILE "current.wav" WAVE
         assert_eq!(sheet.tracks[1].file.as_deref(), Some("current.wav"));
         assert_eq!(sheet.tracks[1].index00_frames, Some(16762));
         assert_eq!(sheet.tracks[1].index01_frames, Some(0));
+    }
+
+    #[test]
+    fn repair_rebases_cross_file_index00_by_the_physically_active_previous_section() {
+        let source = concat!(
+            "FILE \"a.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    INDEX 00 05:59:00\n",
+            "FILE \"b.wav\" WAVE\n    INDEX 01 06:00:00\n",
+            "  TRACK 03 AUDIO\n    INDEX 00 09:59:00\n",
+            "FILE \"c.wav\" WAVE\n    INDEX 01 10:00:00\n",
+        );
+        let repaired = rebase_cue_index_lines_by_physical_file_section(
+            std::path::Path::new("/tmp/album.cue"),
+            source.as_bytes(),
+        )
+        .expect("three-FILE physical rebase");
+
+        assert_eq!(repaired.tracks.len(), 3);
+        assert_eq!(repaired.tracks[1].file.as_deref(), Some("b.wav"));
+        assert_eq!(repaired.tracks[1].index00_frames, Some(26_925));
+        assert_eq!(repaired.tracks[1].index01_frames, Some(0));
+        assert_eq!(repaired.tracks[2].file.as_deref(), Some("c.wav"));
+        assert_eq!(
+            repaired.tracks[2].index00_frames,
+            Some(17_925),
+            "the INDEX 00 before FILE c must subtract FILE b's established 06:00 base"
+        );
+        assert_eq!(repaired.tracks[2].index01_frames, Some(0));
     }
 
     #[test]

@@ -660,8 +660,8 @@ pub enum SplitCueMemberRejectionReason {
         previous_track_number: u32,
         previous_index: u32,
     },
-    /// A later resolved image starts its INDEX 01 timeline after the previous
-    /// image block's last INDEX 01 instead of resetting to an image-relative
+    /// A later resolved image starts its INDEX 01 timeline at or after the
+    /// previous image block's last INDEX 01 instead of resetting to an image-relative
     /// timeline. This is the narrow, probe-free signature of an externally
     /// authored cumulative multi-FILE CUE.
     CrossFileCumulativeIndex {
@@ -741,7 +741,7 @@ impl std::fmt::Display for SplitCueMemberRejectionReason {
                 previous_index,
             } => write!(
                 f,
-                "malformed multi-FILE CUE: track {track_number} in {} starts at frame {index}, after track {previous_track_number} in {} ended its index timeline at frame {previous_index}; later FILE sections appear to use cumulative timestamps instead of resetting to the new image's timeline",
+                "malformed multi-FILE CUE: track {track_number} in {} starts at frame {index}, matching or exceeding the previous image's last track {previous_track_number} in {} at frame {previous_index}; later FILE sections appear to use cumulative timestamps instead of resetting to the new image's timeline",
                 path.display(),
                 previous_path.display()
             ),
@@ -998,7 +998,7 @@ pub fn inspect_split_cue_folder_members(cue_paths: &[PathBuf]) -> SplitCueFolder
             Err(rejection) => rejected.push(rejection),
         }
     }
-    let automatic_members = remove_metadata_sidecars_covered_by_split_sources(viable.clone());
+    let automatic_members = automatic_whole_album_members(viable.clone());
     SplitCueFolderInspection {
         viable,
         rejected,
@@ -1008,8 +1008,10 @@ pub fn inspect_split_cue_folder_members(cue_paths: &[PathBuf]) -> SplitCueFolder
 
 /// Detect only the structurally certain cumulative-across-image class. The
 /// comparison is made at a RESOLVED image boundary, uses exact INDEX 01 frame
-/// integers, requires at least two tracks in the preceding image block, and is
-/// strictly `>` by design. Any missing/alignment uncertainty fails open.
+/// integers, and requires at least two tracks in the preceding image block.
+/// A later block at or beyond that preceding block's non-zero final index is
+/// the narrow cumulative-timeline signature; zero and smaller resets remain
+/// valid. Any missing/alignment uncertainty fails open.
 fn cross_file_cumulative_index_rejection(
     member: &SplitCueAdmissionMember,
     track_audio_keys: &[PathBuf],
@@ -1042,7 +1044,7 @@ fn cross_file_cumulative_index_rejection(
                 block_track_count += 1;
             }
             Some(_) => {
-                if block_track_count >= 2 && index > previous_index {
+                if block_track_count >= 2 && previous_index > 0 && index >= previous_index {
                     return Some(SplitCueMemberRejectionReason::CrossFileCumulativeIndex {
                         track_number: track.number,
                         path: audio_path.clone(),
@@ -1061,6 +1063,158 @@ fn cross_file_cumulative_index_rejection(
         previous_index = index;
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitCueRepairOutcome {
+    /// The selected CUE no longer has the cumulative cross-file shape. No file
+    /// was created or changed.
+    AlreadyValid { path: PathBuf },
+    /// A new sibling repair copy was created; the original remains untouched.
+    Created { path: PathBuf },
+    /// The exact repair copy already existed, so the repeated operation was a
+    /// no-op.
+    ExistingIdentical { path: PathBuf },
+}
+
+#[must_use]
+pub fn split_cue_repair_copy_path(cue_path: &Path) -> Option<PathBuf> {
+    let parent = cue_path.parent()?;
+    let mut name = cue_path.file_stem()?.to_os_string();
+    name.push(".repaired.cue");
+    Some(parent.join(name))
+}
+
+/// Explicitly repair the cumulative cross-file index timeline into a new
+/// sibling CUE. Detection and rebasing use the same already-resolved image
+/// identity as folder policy; validation then runs against the real images
+/// with the materializer's boundary rules before anything is written.
+pub async fn repair_cross_file_cumulative_cue(
+    cue_path: &Path,
+    runner: &dyn crate::convert::pipeline::tool::ToolRunner,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<SplitCueRepairOutcome, String> {
+    if cancel.is_cancelled() {
+        return Err("CUE repair cancelled".to_string());
+    }
+
+    let cue_path_owned = cue_path.to_path_buf();
+    let preparation = tokio::task::spawn_blocking(move || {
+        prepare_cross_file_cumulative_cue_repair(&cue_path_owned)
+    })
+    .await
+    .map_err(|err| format!("CUE repair preparation worker did not complete: {err}"))??;
+
+    let (source_path, destination, expected_original, repaired_sheet, track_audio_paths) =
+        match preparation {
+            SplitCueRepairPreparation::AlreadyValid { path } => {
+                return Ok(SplitCueRepairOutcome::AlreadyValid { path });
+            }
+            SplitCueRepairPreparation::Ready {
+                source_path,
+                destination,
+                expected_original,
+                repaired_sheet,
+                track_audio_paths,
+            } => (
+                source_path,
+                destination,
+                expected_original,
+                repaired_sheet,
+                track_audio_paths,
+            ),
+        };
+
+    if cancel.is_cancelled() {
+        return Err("CUE repair cancelled".to_string());
+    }
+    crate::convert::pipeline::materializer_cue::validate_repaired_sidecar_layout_against_images(
+        &repaired_sheet,
+        &track_audio_paths,
+        &source_path,
+        runner,
+        cancel,
+    )
+    .await?;
+
+    if cancel.is_cancelled() {
+        return Err("CUE repair cancelled".to_string());
+    }
+    let write_outcome = tokio::task::spawn_blocking(move || {
+        crate::convert::cue_parser::create_cue_index_repair_copy(
+            &source_path,
+            &destination,
+            &expected_original,
+            &repaired_sheet,
+        )
+        .map(|outcome| (outcome, destination))
+    })
+    .await
+    .map_err(|err| format!("CUE repair write worker did not complete: {err}"))??;
+
+    match write_outcome {
+        (crate::convert::cue_parser::CueIndexRepairCopyOutcome::Created, path) => {
+            Ok(SplitCueRepairOutcome::Created { path })
+        }
+        (crate::convert::cue_parser::CueIndexRepairCopyOutcome::ExistingIdentical, path) => {
+            Ok(SplitCueRepairOutcome::ExistingIdentical { path })
+        }
+    }
+}
+
+enum SplitCueRepairPreparation {
+    AlreadyValid {
+        path: PathBuf,
+    },
+    Ready {
+        source_path: PathBuf,
+        destination: PathBuf,
+        expected_original: Vec<u8>,
+        repaired_sheet: crate::convert::cue_parser::CueSheet,
+        track_audio_paths: Vec<PathBuf>,
+    },
+}
+
+fn prepare_cross_file_cumulative_cue_repair(
+    cue_path: &Path,
+) -> Result<SplitCueRepairPreparation, String> {
+    let expected_original = std::fs::read(cue_path)
+        .map_err(|err| format!("failed to read CUE '{}': {err}", cue_path.display()))?;
+    let facts = admit_split_cue_member_with_facts(cue_path)
+        .map_err(|rejection| format!("CUE is not repairable: {}", rejection.reason))?;
+    let current = std::fs::read(cue_path)
+        .map_err(|err| format!("failed to re-read CUE '{}': {err}", cue_path.display()))?;
+    if current != expected_original {
+        return Err(format!(
+            "CUE '{}' changed while repair was being prepared; no repair copy was written",
+            cue_path.display()
+        ));
+    }
+
+    if cross_file_cumulative_index_rejection(&facts.member, &facts.track_audio_keys).is_none() {
+        return Ok(SplitCueRepairPreparation::AlreadyValid {
+            path: cue_path.to_path_buf(),
+        });
+    }
+
+    let repaired_sheet =
+        crate::convert::cue_parser::rebase_cue_index_lines_by_physical_file_section(
+            cue_path,
+            &expected_original,
+        )?;
+    let destination = split_cue_repair_copy_path(cue_path).ok_or_else(|| {
+        format!(
+            "cannot derive repaired CUE path beside '{}'",
+            cue_path.display()
+        )
+    })?;
+    Ok(SplitCueRepairPreparation::Ready {
+        source_path: cue_path.to_path_buf(),
+        destination,
+        expected_original,
+        repaired_sheet,
+        track_audio_paths: facts.member.track_audio_paths,
+    })
 }
 
 fn ranked_split_cue_candidates_for_prompt(
@@ -1315,6 +1469,94 @@ fn remove_metadata_sidecars_covered_by_split_sources(
                     None => true,
                 }
         })
+        .collect()
+}
+
+/// Derive the unambiguous member set offered by the explicit automatic
+/// whole-album policy. A redundant multi-image CUE must not veto a clean set
+/// of smaller, pairwise-disjoint CUEs that covers exactly the same images.
+///
+/// This deliberately does not choose between overlapping alternatives for the
+/// same image: if the strict-subset cover itself overlaps, the ambiguity stays
+/// visible and automatic assembly remains unavailable.
+fn automatic_whole_album_members(
+    candidates: Vec<SplitCueAdmissionMember>,
+) -> Vec<SplitCueAdmissionMember> {
+    let candidates = remove_metadata_sidecars_covered_by_split_sources(candidates);
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+
+    let audio_sets = candidates
+        .iter()
+        .map(|member| {
+            member
+                .referenced_audio
+                .iter()
+                .map(|path| cue_path_key(path))
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    // Prune in rounds. A redundant intermediate superset can itself make a
+    // larger superset look overlapping; once the intermediate is removed, the
+    // larger candidate may become provably redundant too. Genuine same-image
+    // alternatives are never strict supersets of one another, so they survive
+    // and continue to block automatic selection as intended.
+    let mut active = vec![true; candidates.len()];
+    loop {
+        let mut newly_redundant = Vec::new();
+        for (index, candidate_set) in audio_sets.iter().enumerate() {
+            if !active[index] || candidate_set.len() <= 1 {
+                continue;
+            }
+
+            let strict_subset_indices = audio_sets
+                .iter()
+                .enumerate()
+                .filter_map(|(other_index, other_set)| {
+                    (active[other_index]
+                        && other_index != index
+                        && candidates[other_index].contributes_synthetic_album_part()
+                        && other_set.len() < candidate_set.len()
+                        && other_set.is_subset(candidate_set))
+                    .then_some(other_index)
+                })
+                .collect::<Vec<_>>();
+            if strict_subset_indices.is_empty() {
+                continue;
+            }
+
+            let mut covered = HashSet::new();
+            let mut disjoint = true;
+            for other_index in strict_subset_indices {
+                for audio in &audio_sets[other_index] {
+                    if !covered.insert(audio.clone()) {
+                        disjoint = false;
+                        break;
+                    }
+                }
+                if !disjoint {
+                    break;
+                }
+            }
+            if disjoint && covered == *candidate_set {
+                newly_redundant.push(index);
+            }
+        }
+
+        if newly_redundant.is_empty() {
+            break;
+        }
+        for index in newly_redundant {
+            active[index] = false;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, member)| active[index].then_some(member))
         .collect()
 }
 
@@ -1824,6 +2066,37 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
+    fn write_sparse_pcm_wav(path: &Path, sample_rate: u32, total_samples: u64) {
+        let channels = 2u16;
+        let bits_per_sample = 16u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let data_size = total_samples
+            .checked_mul(u64::from(block_align))
+            .expect("WAV fixture size");
+        let data_size_u32 = u32::try_from(data_size).expect("WAV fixture below 4 GiB");
+        let mut header = Vec::with_capacity(44);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36_u32 + data_size_u32).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16_u32.to_le_bytes());
+        header.extend_from_slice(&1_u16.to_le_bytes());
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&sample_rate.to_le_bytes());
+        header.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&bits_per_sample.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_size_u32.to_le_bytes());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("create sparse WAV fixture");
+        std::io::Write::write_all(&mut file, &header).expect("write WAV header");
+        file.set_len(44 + data_size).expect("size sparse WAV fixture");
+    }
+
     #[test]
     fn merged_group_provenance_requires_every_member_and_ignores_outsiders() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2237,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_file_equal_index_is_not_rejected_by_strict_cumulative_screen() {
+    fn cross_file_equal_nonzero_boundary_is_rejected_as_cumulative() {
         let td = tempfile::tempdir().expect("tempdir");
         for side in ["side-a.flac", "side-b.flac"] {
             std::fs::write(td.path().join(side), b"audio").expect("audio");
@@ -2256,8 +2529,9 @@ mod tests {
         .expect("cue");
 
         let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
-        assert_eq!(inspection.viable.len(), 1, "strict > must not become >=");
-        assert!(inspection.rejected.is_empty());
+        assert!(inspection.viable.is_empty());
+        assert_eq!(inspection.rejected.len(), 1);
+        assert!(inspection.rejected[0].reason.is_cross_file_cumulative_index());
     }
 
     #[test]
@@ -2858,6 +3132,303 @@ mod tests {
             cue_path_key(&rejected_cue)
         );
         assert!(rejected[0].reason.is_cross_file_cumulative_index());
+    }
+
+    #[test]
+    fn redundant_viable_superset_does_not_veto_disjoint_automatic_album() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.flac");
+        let side_b = td.path().join("side-b.flac");
+        std::fs::write(&side_a, b"audio").expect("side A audio");
+        std::fs::write(&side_b, b"audio").expect("side B audio");
+
+        let cue_a = td.path().join("side-a.cue");
+        let cue_b = td.path().join("side-b.cue");
+        let album = td.path().join("album.cue");
+        std::fs::write(
+            &cue_a,
+            "FILE \"side-a.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+        )
+        .expect("side A cue");
+        std::fs::write(
+            &cue_b,
+            "FILE \"side-b.flac\" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+        )
+        .expect("side B cue");
+        std::fs::write(
+            &album,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 04:00:00\n",
+            ),
+        )
+        .expect("album cue");
+
+        let paths = vec![album.clone(), cue_a.clone(), cue_b.clone()];
+        let inspection = inspect_split_cue_folder_members(&paths);
+        assert_eq!(inspection.viable.len(), 3);
+        assert!(inspection.automatic_available());
+        assert_eq!(inspection.automatic_members.len(), 2);
+        assert!(inspection
+            .automatic_members
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&cue_a)));
+        assert!(inspection
+            .automatic_members
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&cue_b)));
+        assert!(!inspection
+            .automatic_members
+            .iter()
+            .any(|member| cue_path_key(&member.cue_path) == cue_path_key(&album)));
+
+        let SplitCueFolderSelection::NeedsChoice {
+            automatic_available,
+            ..
+        } = select_split_cue_folder_members(&paths, None)
+        else {
+            panic!("overlapping viable descriptions should still require an explicit policy");
+        };
+        assert!(automatic_available);
+
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members_with_preference(
+                &paths,
+                Some(SplitCueFolderPreference::AutomaticWholeAlbum),
+            )
+        else {
+            panic!("explicit automatic policy should select the disjoint side CUEs");
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .all(|member| cue_path_key(&member.cue_path) != cue_path_key(&album)));
+    }
+
+    #[tokio::test]
+    async fn cumulative_repair_is_validated_reversible_and_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.wav");
+        let side_b = td.path().join("side-b.wav");
+        // Four minutes at 1 kHz keeps the real-duration validation fixture tiny.
+        write_sparse_pcm_wav(&side_a, 1_000, 240_000);
+        write_sparse_pcm_wav(&side_b, 1_000, 240_000);
+        let cue = td.path().join("album.cue");
+        let original = concat!(
+            "REM COMMENT \"keep this byte-for-byte\"\r\n",
+            "FILE \"side-a.wav\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n",
+            "  TRACK 02 AUDIO\r\n    FLAGS PRE\r\n    INDEX 01 03:02:00\r\n",
+            "FILE \"side-b.wav\" WAVE\r\n",
+            "  TRACK 03 AUDIO\r\n    INDEX 00 03:00:00\r\n    INDEX 01 03:02:00\r\n",
+            "  TRACK 04 AUDIO\r\n    INDEX 00 05:59:00\r\n    INDEX 01 06:00:00\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        std::fs::write(&cue, &original).expect("cue fixture");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert!(inspection.viable.is_empty());
+        assert!(inspection.rejected[0].reason.is_cross_file_cumulative_index());
+
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(
+            std::collections::HashMap::new(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = repair_cross_file_cumulative_cue(&cue, &runner, &cancel)
+            .await
+            .expect("validated repair");
+        let repaired_path = match first {
+            SplitCueRepairOutcome::Created { path } => path,
+            other => panic!("first repair must create sibling, got {other:?}"),
+        };
+        assert_eq!(std::fs::read(&cue).expect("original remains"), original);
+        assert_eq!(repaired_path, td.path().join("album.repaired.cue"));
+
+        let repaired_bytes = std::fs::read(&repaired_path).expect("repaired bytes");
+        let repaired_text = String::from_utf8(repaired_bytes.clone()).expect("UTF-8 fixture");
+        assert!(repaired_text.contains("REM COMMENT \"keep this byte-for-byte\"\r\n"));
+        assert!(repaired_text.contains("    FLAGS PRE\r\n"));
+        assert!(repaired_text.contains("    INDEX 00 00:00:00\r\n"));
+        assert!(repaired_text.contains("    INDEX 01 00:02:00\r\n"));
+        assert!(repaired_text.contains("    INDEX 00 02:59:00\r\n"));
+        assert!(repaired_text.contains("    INDEX 01 03:00:00\r\n"));
+        assert_eq!(
+            repaired_text.matches('\n').count(),
+            repaired_text.matches("\r\n").count(),
+            "CRLF layout must be retained"
+        );
+
+        let parsed = crate::convert::cue_parser::parse_cue_file(&repaired_path)
+            .expect("parse repaired CUE");
+        assert_eq!(parsed.tracks[2].index00_frames, Some(0));
+        assert_eq!(parsed.tracks[2].index01_frames, Some(150));
+        assert_eq!(parsed.tracks[3].index00_frames, Some(13_425));
+        assert_eq!(parsed.tracks[3].index01_frames, Some(13_500));
+        let repaired_inspection =
+            inspect_split_cue_folder_members(std::slice::from_ref(&repaired_path));
+        assert_eq!(repaired_inspection.viable.len(), 1);
+        assert!(repaired_inspection.rejected.is_empty());
+
+        assert!(matches!(
+            repair_cross_file_cumulative_cue(&cue, &runner, &cancel)
+                .await
+                .expect("repeat original repair"),
+            SplitCueRepairOutcome::ExistingIdentical { path } if path == repaired_path
+        ));
+        assert!(matches!(
+            repair_cross_file_cumulative_cue(&repaired_path, &runner, &cancel)
+                .await
+                .expect("repair already-valid copy"),
+            SplitCueRepairOutcome::AlreadyValid { path } if path == repaired_path
+        ));
+        assert!(
+            !td.path().join("album.repaired.repaired.cue").exists(),
+            "already-valid repair must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_repair_preserves_cross_file_pregap_index_ownership() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.wav");
+        let side_b = td.path().join("side-b.wav");
+        // The previous-FILE pregap starts at 05:59, so keep side A long enough
+        // to make the physical representation realistic. Side B needs only the
+        // repaired 00:00 and 03:00 track starts.
+        write_sparse_pcm_wav(&side_a, 1_000, 420_000);
+        write_sparse_pcm_wav(&side_b, 1_000, 240_000);
+        let cue = td.path().join("album.cue");
+        let original = concat!(
+            "FILE \"side-a.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+            "  TRACK 03 AUDIO\n",
+            "    INDEX 00 05:59:00\n",
+            "FILE \"side-b.wav\" WAVE\n",
+            "    INDEX 01 06:00:00\n",
+            "  TRACK 04 AUDIO\n",
+            "    INDEX 00 08:59:00\n",
+            "    INDEX 01 09:00:00\n",
+        )
+        .as_bytes()
+        .to_vec();
+        std::fs::write(&cue, &original).expect("cue fixture");
+
+        let inspection = inspect_split_cue_folder_members(std::slice::from_ref(&cue));
+        assert!(inspection.viable.is_empty());
+        assert_eq!(inspection.rejected.len(), 1);
+        assert!(inspection.rejected[0].reason.is_cross_file_cumulative_index());
+
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(
+            std::collections::HashMap::new(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = repair_cross_file_cumulative_cue(&cue, &runner, &cancel)
+            .await
+            .expect("validated cross-FILE pregap repair");
+        let repaired_path = match first {
+            SplitCueRepairOutcome::Created { path } => path,
+            other => panic!("first repair must create sibling, got {other:?}"),
+        };
+        assert_eq!(std::fs::read(&cue).expect("original remains"), original);
+
+        let expected = concat!(
+            "FILE \"side-a.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    INDEX 01 03:00:00\n",
+            "  TRACK 03 AUDIO\n",
+            "    INDEX 00 05:59:00\n",
+            "FILE \"side-b.wav\" WAVE\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 04 AUDIO\n",
+            "    INDEX 00 02:59:00\n",
+            "    INDEX 01 03:00:00\n",
+        );
+        let repaired_bytes = std::fs::read(&repaired_path).expect("repaired bytes");
+        assert_eq!(repaired_bytes, expected.as_bytes());
+        let repaired_text = String::from_utf8(repaired_bytes).expect("UTF-8 fixture");
+        assert!(
+            !repaired_text.contains("INDEX 01 00:01:00"),
+            "the next-FILE INDEX 01 must use that FILE's 06:00 base, not the preceding pregap's 05:59 timestamp"
+        );
+
+        let parsed = crate::convert::cue_parser::parse_cue_file(&repaired_path)
+            .expect("older-ripper form reparses");
+        assert_eq!(parsed.tracks[2].file.as_deref(), Some("side-b.wav"));
+        assert_eq!(parsed.tracks[2].index00_frames, Some(26_925));
+        assert_eq!(parsed.tracks[2].index01_frames, Some(0));
+        assert_eq!(parsed.tracks[3].index00_frames, Some(13_425));
+        assert_eq!(parsed.tracks[3].index01_frames, Some(13_500));
+        let repaired_inspection =
+            inspect_split_cue_folder_members(std::slice::from_ref(&repaired_path));
+        assert_eq!(repaired_inspection.viable.len(), 1);
+        assert!(repaired_inspection.rejected.is_empty());
+
+        assert!(matches!(
+            repair_cross_file_cumulative_cue(&cue, &runner, &cancel)
+                .await
+                .expect("repeat original repair"),
+            SplitCueRepairOutcome::ExistingIdentical { path } if path == repaired_path
+        ));
+        assert!(matches!(
+            repair_cross_file_cumulative_cue(&repaired_path, &runner, &cancel)
+                .await
+                .expect("repair already-valid copy"),
+            SplitCueRepairOutcome::AlreadyValid { path } if path == repaired_path
+        ));
+        assert!(!td.path().join("album.repaired.repaired.cue").exists());
+    }
+
+    #[tokio::test]
+    async fn cumulative_repair_refuses_invalid_rebased_geometry_before_write() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side-a.wav");
+        let side_b = td.path().join("side-b.wav");
+        write_sparse_pcm_wav(&side_a, 1_000, 240_000);
+        // Two minutes: track 4 below rebases to minute 3 and must overrun.
+        write_sparse_pcm_wav(&side_b, 1_000, 120_000);
+        let cue = td.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side-a.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.wav\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:00:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 06:00:00\n",
+            ),
+        )
+        .expect("cue fixture");
+        let original = std::fs::read(&cue).expect("original snapshot");
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(
+            std::collections::HashMap::new(),
+        );
+        let error = repair_cross_file_cumulative_cue(
+            &cue,
+            &runner,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("duration-invalid repair must be refused");
+        assert!(error.contains("boundary") || error.contains("duration"), "{error}");
+        assert_eq!(std::fs::read(&cue).expect("source after refusal"), original);
+        assert!(
+            !td.path().join("album.repaired.cue").exists(),
+            "validation failure must happen before destination creation"
+        );
     }
 
     #[test]

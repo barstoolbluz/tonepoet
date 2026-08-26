@@ -20190,6 +20190,7 @@ FILE "{stem}.flac" WAVE
                                     verdict: crate::convert::queue_expansion::QueueCueSelectionVerdict::Automatic,
                                     selection: None,
                                     reason: Some("overlapping alternatives".to_string()),
+                                    repair_cue: None,
                                     recommended: false,
                                 },
                                 crate::convert::queue_expansion::QueueCueSelectionRow {
@@ -20197,6 +20198,7 @@ FILE "{stem}.flac" WAVE
                                     verdict: crate::convert::queue_expansion::QueueCueSelectionVerdict::Viable,
                                     selection: Some(crate::convert::queue_expansion::QueueCueSelectionOverride::Cue(cue_a.clone())),
                                     reason: None,
+                                    repair_cue: None,
                                     recommended: false,
                                 },
                                 crate::convert::queue_expansion::QueueCueSelectionRow {
@@ -20204,6 +20206,7 @@ FILE "{stem}.flac" WAVE
                                     verdict: crate::convert::queue_expansion::QueueCueSelectionVerdict::Viable,
                                     selection: Some(crate::convert::queue_expansion::QueueCueSelectionOverride::Cue(cue_b.clone())),
                                     reason: None,
+                                    repair_cue: None,
                                     recommended: false,
                                 },
                             ],
@@ -20298,6 +20301,7 @@ FILE "side_b.flac" WAVE
                         crate::convert::queue_expansion::QueueCueSelectionOverride::AutomaticWholeAlbum,
                     ),
                     reason: None,
+                    repair_cue: None,
                     recommended: true,
                 }],
             });

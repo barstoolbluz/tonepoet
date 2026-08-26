@@ -58,6 +58,10 @@ pub struct QueueCueSelectionRow {
     pub verdict: QueueCueSelectionVerdict,
     pub selection: Option<QueueCueSelectionOverride>,
     pub reason: Option<String>,
+    /// Rejected CUE that can be repaired explicitly from the Browse advanced
+    /// chooser. This is intentionally separate from `selection`: a malformed
+    /// CUE never becomes selectable until a validated repair copy exists.
+    pub repair_cue: Option<PathBuf>,
     pub recommended: bool,
 }
 
@@ -107,6 +111,7 @@ impl QueueCueSelectionPrompt {
                         .to_string()
                 }
             }),
+            repair_cue: None,
             // The product-level default remains "let tonepoet handle it". On a
             // genuine overlap the row stays visibly recommended but is disabled
             // with an explicit reason rather than inventing an unsafe winner.
@@ -122,19 +127,27 @@ impl QueueCueSelectionPrompt {
             verdict: QueueCueSelectionVerdict::Viable,
             selection: Some(QueueCueSelectionOverride::Cue(member.cue_path)),
             reason: None,
+            repair_cue: None,
             recommended: false,
         }));
-        rows.extend(rejected.into_iter().map(|rejection| QueueCueSelectionRow {
-            label: rejection
-                .cue_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| rejection.cue_path.display().to_string()),
-            verdict: QueueCueSelectionVerdict::Rejected,
-            selection: None,
-            reason: Some(rejection.reason.to_string()),
-            recommended: false,
+        rows.extend(rejected.into_iter().map(|rejection| {
+            let repair_cue = rejection
+                .reason
+                .is_cross_file_cumulative_index()
+                .then(|| rejection.cue_path.clone());
+            QueueCueSelectionRow {
+                label: rejection
+                    .cue_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| rejection.cue_path.display().to_string()),
+                verdict: QueueCueSelectionVerdict::Rejected,
+                selection: None,
+                reason: Some(rejection.reason.to_string()),
+                repair_cue,
+                recommended: false,
+            }
         }));
         Self {
             parent,

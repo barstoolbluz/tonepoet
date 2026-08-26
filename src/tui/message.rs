@@ -327,7 +327,7 @@ pub enum AppMessage {
         request: crate::tui::command::BrowseConvertExpansionRequest,
         expansion: crate::tui::command::BrowseConvertExpansion,
     },
-    /// Completion of the explicit Browse "Advanced CUE choices" inspection.
+    /// Completion of the explicit Browse "Advanced CUE Options" inspection.
     /// Request ownership plus captured Browse scan/tab/directory identity
     /// prevents a late filesystem worker from opening a chooser after a newer
     /// request or an away-and-back navigation cycle.
@@ -338,6 +338,18 @@ pub enum AppMessage {
         origin_dir: std::path::PathBuf,
         folder: std::path::PathBuf,
         result: Result<Option<crate::convert::queue_expansion::QueueCueSelectionPrompt>, String>,
+    },
+    /// Completion of an explicit repair requested from the Browse advanced
+    /// CUE chooser. The repair never mutates the selected source CUE; it can
+    /// only report a validated sibling copy (or a no-op).
+    BrowseCueRepairComplete {
+        generation: u64,
+        browse_scan_generation: u64,
+        tab_id: crate::tui::browse::BrowseTabId,
+        origin_dir: std::path::PathBuf,
+        folder: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        result: Result<crate::convert::split_cue_album::SplitCueRepairOutcome, String>,
     },
     /// Result of an asynchronous Convert-source probe launched from command
     /// handlers or picker returns. `generation` is captured at dispatch time;

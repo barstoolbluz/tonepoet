@@ -226,6 +226,7 @@ pub enum TuiButton {
     CueSelectRow(usize),
     /// CUE selection overlay footer actions.
     CueSelectAccept,
+    CueSelectRepair,
     CueSelectCancel,
 
     /// CuePreview overlay: clickable content line (0-based line index).
@@ -455,6 +456,7 @@ impl TuiButton {
             | Self::MbSelectCancel
             | Self::CueSelectRow(_)
             | Self::CueSelectAccept
+            | Self::CueSelectRepair
             | Self::CueSelectCancel
             | Self::CuePreviewLine(_)
             | Self::CuePreviewSave

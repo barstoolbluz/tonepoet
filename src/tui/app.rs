@@ -11575,9 +11575,10 @@ pub struct AppState {
     /// Session-persistent advanced CUE choices keyed by folder. Normal quiet
     /// auto-selection remains the default for folders with no override.
     pub cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides,
-    /// Last-request-wins ownership for explicit Browse "Advanced CUE choices"
-    /// inspection. This is intentionally separate from directory-scan ownership:
-    /// multiple inspections may target the same still-current directory.
+    /// Last-request-wins ownership for explicit Browse "Advanced CUE Options"
+    /// inspection/repair. This is intentionally separate from directory-scan
+    /// ownership: multiple explicit CUE operations may target the same
+    /// still-current directory.
     pub browse_cue_inspection_generation: u64,
     pub preset: PresetState,
 

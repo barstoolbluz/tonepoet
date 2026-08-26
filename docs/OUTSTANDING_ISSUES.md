@@ -447,6 +447,23 @@ The key is a **single, predictable rule** across the family instead of today's g
 
 ## 9. Multi-cue folder chooser offers a structurally-unmaterializable CUE as an equal "viable" option; materialize then dead-ends with an opaque error
 
+> **⚠ CORRECTION (2026-08-26): the note below was WRONG, and is superseded.** The structural screen it
+> credits required a *strictly greater* index at each `FILE` boundary. Every malformed CUE encountered in
+> the field — including this issue's own named reproduction case, `Physical Graffiti All LP's.cue` — has an
+> **equal** boundary (the author offsets each file by the previous file's last track start rather than its
+> duration). The screen therefore **never fired on any real file**, verified by running the production
+> `inspect_split_cue_folder_members` against them. The certifying fixture used a greater boundary, and a
+> second test asserted the equal case must *not* be rejected, so the suite was green throughout. The
+> lesson: passing tests plus verified anchors are not evidence a defect is fixed when the fixtures encode
+> a shape the field case does not have.
+>
+> **Genuinely resolved 2026-08-26** by the cumulative-CUE detection work, which rejects the equal-or-exceeding
+> boundary while still failing open for a legitimate small non-zero reset. Verified against all three real
+> files (`BBC Sessions`, `Physical Graffiti`, `The Song Remains The Same`) — all now rejected — and
+> field-confirmed by a successful conversion through the synthetic album view.
+>
+> The superseded note follows, kept for history:
+>
 > **✅ RESOLVED by `2b52c0a` ("Editor foreground fix + multi-CUE chooser + Browse-responsiveness async refactor"),
 > Part 2.** Re-corroborated against `main @ a675fef` (2026-08-25). Both gaps are closed:
 >

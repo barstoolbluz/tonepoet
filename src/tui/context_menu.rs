@@ -1073,13 +1073,14 @@ fn selected_audio_embedded_cue_availability(
     }
 }
 
-fn directory_cue_import_available(app: &AppState, entry: &BrowseEntry) -> bool {
+fn directory_cue_import_availability(
+    app: &AppState,
+    entry: &BrowseEntry,
+) -> super::probe::CueImportAvailability {
     app.browse
         .valid_folder_classification_for_entry(entry)
-        .is_some_and(|classification| {
-            classification.cue_import_availability
-                == super::probe::CueImportAvailability::Present
-        })
+        .map(|classification| classification.cue_import_availability)
+        .unwrap_or(super::probe::CueImportAvailability::Unknown)
 }
 
 fn directory_embedded_cue_availability(
@@ -1237,16 +1238,26 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open", ContextAction::OpenEntry));
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
-            items.push(item(
-                "Advanced CUE choices…",
-                ContextAction::InspectCueChoices(entry.path.clone()),
-            ));
+            let cue_import_availability = directory_cue_import_availability(app, entry);
+            match cue_import_availability {
+                super::probe::CueImportAvailability::Present => items.push(item(
+                    "Advanced CUE Options",
+                    ContextAction::InspectCueChoices(entry.path.clone()),
+                )),
+                super::probe::CueImportAvailability::Unknown => items.push(item_enabled(
+                    "Advanced CUE Options",
+                    ContextAction::InspectCueChoices(entry.path.clone()),
+                    false,
+                )),
+                super::probe::CueImportAvailability::Absent => {}
+            }
             // Directory menu construction must not synchronously scan the
-            // directory for CUE files. Both sidecar-import and embedded-only
-            // availability consume the background classification cache; the
-            // embedded items stay disabled until exact authority is confirmed.
+            // directory for CUE files. Sidecar/Advanced-CUE and embedded-only
+            // availability consume the background classification cache; an
+            // unknown Advanced-CUE state stays visible but disabled until the
+            // cache resolves, while known-absent folders omit it entirely.
             items.push(build_tagging_submenu(
-                directory_cue_import_available(app, entry),
+                cue_import_availability == super::probe::CueImportAvailability::Present,
                 directory_embedded_cue_availability(app, entry),
             ));
             items.push(build_disk_tools_submenu());
@@ -6393,6 +6404,11 @@ mod tests {
             action,
             ContextAction::ImportCueFromBrowse
         )));
+        assert_eq!(
+            menu_action_enabled(&menu, |action| matches!(action, ContextAction::InspectCueChoices(_))),
+            Some(true)
+        );
+        assert!(menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"));
     }
 
     #[test]
@@ -6421,6 +6437,10 @@ mod tests {
             action,
             ContextAction::ImportCueFromBrowse
         )));
+        assert!(
+            !menu_contains_action(&menu, |action| matches!(action, ContextAction::InspectCueChoices(_))),
+            "known-absent folder must omit Advanced CUE Options"
+        );
     }
 
     #[test]
@@ -6439,7 +6459,14 @@ mod tests {
             None,
         )];
         app.browse.selected_index = 0;
-        assert_embedded_actions_enabled(&build_browse_entry_menu(&app), false);
+        let menu = build_browse_entry_menu(&app);
+        assert_embedded_actions_enabled(&menu, false);
+        assert_eq!(
+            menu_action_enabled(&menu, |action| matches!(action, ContextAction::InspectCueChoices(_))),
+            Some(false),
+            "unknown cache state keeps Advanced CUE Options discoverable but disabled"
+        );
+        assert!(menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"));
     }
 
     #[test]
