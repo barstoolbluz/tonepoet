@@ -5,6 +5,7 @@
 //! module-local mutex still permits theme, config, and bookmark tests to race
 //! one another and intermittently resolve the live user's configuration path.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -17,6 +18,29 @@ fn xdg_config_home_lock() -> &'static Mutex<()> {
 fn test_config_home_cell() -> &'static RwLock<Option<PathBuf>> {
     static OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
     OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+thread_local! {
+    /// Data-home ownership is deliberately thread-local. `XDG_DATA_HOME` is
+    /// process-global, so an unrelated libtest worker must never resolve its
+    /// metadata journal through another test's temporary override.
+    static TEST_DATA_HOME_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+}
+
+pub(crate) fn test_data_home_override() -> Option<PathBuf> {
+    TEST_DATA_HOME_OVERRIDE.with(|override_path| override_path.borrow().clone())
+}
+
+pub(crate) fn test_process_data_home() -> PathBuf {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tonepoet-test-data-home")
+            .tempdir()
+            .expect("create process-local test data home")
+    })
+    .path()
+    .to_path_buf()
 }
 
 /// Explicit test seam used by path helpers that must not rely on a library's
@@ -38,12 +62,14 @@ pub(crate) fn test_config_home_override() -> Option<PathBuf> {
 pub(crate) struct XdgConfigHomeGuard {
     _lock: MutexGuard<'static, ()>,
     previous: Option<OsString>,
-    /// `XDG_DATA_HOME` is redirected alongside the config home: the metadata
-    /// journal database resolves through `dirs::data_dir()`, and a guard that
-    /// left it pointing at the user's real data directory let tests write
-    /// journal entries into the live tonepoet.db (field-observed leak).
+    /// `XDG_DATA_HOME` is redirected alongside the config home for code that
+    /// still consults the environment. `db_path()` uses the thread-local seam
+    /// below in unit tests (and `dirs::data_dir()` in production), so guarded
+    /// journal writes stay isolated without exposing unrelated libtest workers
+    /// to this process-global override.
     previous_data: Option<OsString>,
     previous_override: Option<PathBuf>,
+    previous_data_override: Option<PathBuf>,
     previous_picker_override: Option<PathBuf>,
     directory: tempfile::TempDir,
 }
@@ -65,6 +91,9 @@ impl XdgConfigHomeGuard {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             override_path.replace(directory.path().to_path_buf())
         };
+        let previous_data_override = TEST_DATA_HOME_OVERRIDE.with(|override_path| {
+            override_path.replace(Some(directory.path().join("data")))
+        });
         let previous_picker_override =
             tui_file_picker::replace_bookmark_config_home_override_for_tests(Some(
                 directory.path().to_path_buf(),
@@ -76,6 +105,7 @@ impl XdgConfigHomeGuard {
             previous,
             previous_data,
             previous_override,
+            previous_data_override,
             previous_picker_override,
             directory,
         }
@@ -100,6 +130,9 @@ impl Drop for XdgConfigHomeGuard {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *override_path = self.previous_override.take();
+        TEST_DATA_HOME_OVERRIDE.with(|override_path| {
+            *override_path.borrow_mut() = self.previous_data_override.take();
+        });
         tui_file_picker::replace_bookmark_config_home_override_for_tests(
             self.previous_picker_override.take(),
         );
@@ -146,6 +179,28 @@ mod tests {
         second.join().expect("second test thread");
 
         assert_ne!(first_path, second_path);
+    }
+
+    #[test]
+    fn unguarded_db_reader_never_borrows_another_tests_data_home() {
+        let process_db = crate::db::db_path();
+        let guard = XdgConfigHomeGuard::new("tonepoet-xdg-db-owner");
+        let guarded_db = crate::db::db_path();
+        assert_eq!(
+            guarded_db,
+            guard.path().join("data").join("tonepoet").join("tonepoet.db")
+        );
+
+        let reader_db = std::thread::spawn(crate::db::db_path)
+            .join()
+            .expect("unguarded db-path reader");
+        assert_eq!(
+            reader_db, process_db,
+            "an unrelated libtest worker must use the process-local test DB, not the active guard's temporary XDG_DATA_HOME",
+        );
+        assert_ne!(reader_db, guarded_db);
+        drop(guard);
+        assert_eq!(crate::db::db_path(), process_db);
     }
 
     #[test]

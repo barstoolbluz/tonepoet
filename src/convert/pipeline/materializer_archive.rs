@@ -95,17 +95,19 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 // and per-channel sample count. Prefer the header facts so
                 // post-encode sample validation checks against reality, not
                 // an estimate. Mirrors materializer_single.
-                if let Ok(Some(dsd)) =
-                    crate::convert::pipeline::plan_bridge::dsd_source_metadata_from_path(path)
-                {
-                    let header_is_authoritative = !matches!(
-                        dsd.validation,
-                        crate::convert::pipeline::plan_bridge::DsdPlannerValidationStatus::Errors { .. }
-                    ) && dsd.sample_rate_hz > 0
-                        && dsd.sample_count_per_channel.is_some_and(|count| count > 0);
-                    if header_is_authoritative {
-                        probe.sample_rate = dsd.sample_rate_hz;
-                        probe.expected_samples = dsd.sample_count_per_channel;
+                match crate::convert::pipeline::plan_bridge::authoritative_dsd_sample_timing_from_path(
+                    path,
+                ) {
+                    Ok(Some((sample_rate_hz, sample_count))) => {
+                        probe.sample_rate = sample_rate_hz;
+                        probe.expected_samples = Some(sample_count);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(MaterializeError::Extraction(format!(
+                            "cannot establish exact DSD sample timing for {}: {error}",
+                            path.display()
+                        )));
                     }
                 }
             }

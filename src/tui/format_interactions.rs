@@ -111,6 +111,12 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::DsdGainScopePill(index) => format.select_row_index(
+            FormatField::DsdGainScope,
+            index,
+            source_bits,
+            source_rate,
+        ),
         TuiButton::DsdGainDbField => format.select_row_index(
             FormatField::DsdGainDb,
             0,
@@ -120,6 +126,18 @@ pub fn handle_format_button(
         TuiButton::DsdNormalizeTargetField => format.select_row_index(
             FormatField::DsdNormalizeTarget,
             0,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::ContainerPill(index) => format.select_row_index(
+            FormatField::Container,
+            index,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::ResampleQualityPill(index) => format.select_row_index(
+            FormatField::ResampleQuality,
+            index,
             source_bits,
             source_rate,
         ),

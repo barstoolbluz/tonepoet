@@ -824,13 +824,15 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             if app.convert.focus == ConvertFocus::Format
                 && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
-            app.convert.format.focus_prev();
+            let maximized = app.convert.is_maximized(ConvertFocus::Format);
+            app.convert.format.focus_prev(maximized);
         }
         (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format
                 && !app.convert.is_collapsed(ConvertFocus::Format) =>
         {
-            app.convert.format.focus_next();
+            let maximized = app.convert.is_maximized(ConvertFocus::Format);
+            app.convert.format.focus_next(maximized);
         }
         (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format
@@ -3630,6 +3632,13 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
         FormatField::DsdNormalizeTarget => format.dsd_normalize_target_dbfs.render(false),
         FormatField::DsdGainScope => format.dsd_auto_gain_scope.selected_label().to_string(),
+        FormatField::Container => format.selected_container().display_name.to_string(),
+        FormatField::ResampleQuality => format
+            .resample_quality_choices()
+            .into_iter()
+            .find(|(quality, _)| *quality == format.resample_quality)
+            .map(|(_, label)| label.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -10951,6 +10960,15 @@ fn start_browse_cue_repair(
         return;
     };
 
+    start_browse_cue_repair_for_path(app, tx, state.parent, cue_path);
+}
+
+pub(super) fn start_browse_cue_repair_for_path(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    folder: std::path::PathBuf,
+    cue_path: std::path::PathBuf,
+) {
     // Share the Advanced-CUE request generation so any older inspection or
     // repair completion cannot steal UI ownership after this explicit action.
     app.browse_cue_inspection_generation = app.browse_cue_inspection_generation.wrapping_add(1);
@@ -10958,7 +10976,6 @@ fn start_browse_cue_repair(
     let browse_scan_generation = app.browse.scan_generation;
     let tab_id = app.browse.active_tab_id();
     let origin_dir = app.browse.current_dir.clone();
-    let folder = state.parent;
     let tool_paths = app.manager.config.tool_paths.clone();
     app.active_overlay = ActiveOverlay::None;
     app.set_status(BROWSE_CUE_REPAIR_STATUS);
@@ -12589,6 +12606,7 @@ fn metadata_editor_begin_cursor_value_edit_with_route(
             state,
             cursor,
             true,
+            false,
             default_gesture_uses_detail,
         ) {
             return Some(status);
@@ -42840,7 +42858,8 @@ fn metadata_editor_first_writable_slot(
 fn metadata_editor_begin_detail_edit_for_entry_inner(
     state: &mut super::app::MetadataEditorState,
     entry_idx: usize,
-    edit_first_writable_slot: bool,
+    move_to_first_writable_slot: bool,
+    begin_edit: bool,
     allow_single_scalar: bool,
 ) -> Option<String> {
     if entry_idx >= state.active_surface().entries.len() {
@@ -42873,7 +42892,7 @@ fn metadata_editor_begin_detail_edit_for_entry_inner(
     state.detail_scroll = 0;
     state.detail_edit = None;
     state.last_click = None;
-    if edit_first_writable_slot {
+    if move_to_first_writable_slot {
         let n = state
             .active_surface()
             .entries
@@ -42882,27 +42901,32 @@ fn metadata_editor_begin_detail_edit_for_entry_inner(
             .unwrap_or(0);
         if let Some(slot) = metadata_editor_first_writable_slot(state, entry_idx, n) {
             state.detail_cursor = slot;
-            if set_valued {
-                if let Some(value) = state
+            // Default gestures land on the first actionable row so a blocked
+            // leading slot is not a dead end, but merely opening the detail
+            // view must not also start editing that value.
+            if begin_edit {
+                if set_valued {
+                    if let Some(value) = state
+                        .active_surface()
+                        .entries
+                        .get(entry_idx)
+                        .and_then(|entry| entry.per_file_values.get(slot))
+                        .and_then(|values| values.value_text(0))
+                    {
+                        state.detail_edit = Some(super::text_input::TextInputState::new_selected(
+                            value.to_string(),
+                        ));
+                    }
+                } else if let Some(value) = state
                     .active_surface()
                     .entries
                     .get(entry_idx)
                     .and_then(|entry| entry.per_file_values.get(slot))
-                    .and_then(|values| values.value_text(0))
                 {
-                    state.detail_edit = Some(super::text_input::TextInputState::new_selected(
-                        value.to_string(),
+                    state.detail_edit = Some(super::text_input::TextInputState::new(
+                        value.as_str().to_string(),
                     ));
                 }
-            } else if let Some(value) = state
-                .active_surface()
-                .entries
-                .get(entry_idx)
-                .and_then(|entry| entry.per_file_values.get(slot))
-            {
-                state.detail_edit = Some(super::text_input::TextInputState::new(
-                    value.as_str().to_string(),
-                ));
             }
         }
     }
@@ -42918,6 +42942,7 @@ pub(super) fn metadata_editor_begin_detail_edit_for_entry(
     metadata_editor_begin_detail_edit_for_entry_inner(
         state,
         entry_idx,
+        edit_first_writable_slot,
         edit_first_writable_slot,
         false,
     )
@@ -61215,19 +61240,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DsdPathPill(_)
             | TuiButton::DsdProfilePill(_)
             | TuiButton::DsdGainPill(_)
+            | TuiButton::DsdGainScopePill(_)
             | TuiButton::DsdGainDbField
-            | TuiButton::DsdNormalizeTargetField => {
+            | TuiButton::DsdNormalizeTargetField
+            | TuiButton::ContainerPill(_)
+            | TuiButton::ResampleQualityPill(_) => {
                 app.convert.focus = ConvertFocus::Format;
                 if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
-                    app.preset.mark_modified();
-                }
-            }
-            TuiButton::ContainerPill(i) => {
-                app.convert.focus = ConvertFocus::Format;
-                let containers = app.convert.format.format.selected_value().available_containers();
-                if i < containers.len() && containers[i].enabled {
-                    app.convert.format.selected_container_index = i;
-                    app.convert.format.reference_target_confirmed = true;
                     app.preset.mark_modified();
                 }
             }
@@ -61296,24 +61315,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     _ => return,
                 };
                 app.active_overlay = ActiveOverlay::FormatSettings { kind, focus, help_scroll: None };
-            }
-            TuiButton::ResampleQualityPill(i) => {
-                use tonepoet_pipeline::enums::ResampleQuality;
-                app.convert.focus = ConvertFocus::Format;
-                let mut qualities = vec![
-                    ResampleQuality::Low,
-                    ResampleQuality::Medium,
-                    ResampleQuality::High,
-                    ResampleQuality::VeryHigh,
-                    ResampleQuality::Ultra,
-                ];
-                if matches!(*app.convert.format.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
-                    qualities.push(ResampleQuality::Insane);
-                }
-                if let Some(&q) = qualities.get(i) {
-                    app.convert.format.resample_quality = q;
-                    app.preset.mark_modified();
-                }
             }
             TuiButton::ResamplerSettingsButton => {
                 app.convert.focus = ConvertFocus::Format;
@@ -62488,6 +62489,39 @@ mod phase4_tests {
         )
     }
 
+    /// Two files whose technical details are populated, with the FIRST slot
+    /// blocked. Mirrors `two_file_editor_with_second_blocked`; the plain
+    /// `two_file_editor` leaves `technical_details.files` empty, so tests that
+    /// need per-file write eligibility must use one of these.
+    fn two_file_editor_with_first_blocked(entries: Vec<TagEntry>) -> MetadataEditorState {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/01.flac"),
+            std::path::PathBuf::from("/tmp/02.flac"),
+        ];
+        let mut details = crate::tui::app::MetadataTechnicalDetails::default();
+        details.files = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = crate::tui::app::MetadataFileDetails::default();
+                file.file_facts.path = path.clone();
+                if index == 0 {
+                    file.file_facts.write_eligibility =
+                        crate::tui::app::FileWriteEligibility::Blocked {
+                            reason: "read-only fixture".to_string(),
+                        };
+                }
+                file
+            })
+            .collect();
+        MetadataEditorState::for_files(
+            paths,
+            entries,
+            vec!["01".to_string(), "02".to_string()],
+            details,
+        )
+    }
+
     fn four_file_editor(entries: Vec<TagEntry>) -> MetadataEditorState {
         MetadataEditorState::for_files(
             (1..=4)
@@ -62539,6 +62573,7 @@ mod phase4_tests {
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         assert_eq!(state.detail_field_idx, 0);
         assert_eq!(state.detail_cursor, 0);
+        assert!(state.detail_edit.is_none());
     }
 
     #[test]
@@ -62556,10 +62591,11 @@ mod phase4_tests {
 
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         assert_eq!(state.detail_field_idx, 0);
+        assert!(state.detail_edit.is_none());
     }
 
     #[test]
-    fn unchanged_title_detail_commit_remains_clean() {
+    fn default_title_detail_view_does_not_begin_inline_edit() {
         let mut state = two_file_editor(vec![entry(
             "TITLE",
             ItemKey::TrackTitle,
@@ -62569,6 +62605,24 @@ mod phase4_tests {
         state.cursor = 0;
         press_metadata_enter(&mut state);
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
+        assert!(state.detail_edit.is_none());
+    }
+
+    #[test]
+    fn unchanged_title_detail_commit_remains_clean_after_explicit_value_edit() {
+        let mut state = two_file_editor(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Same", "Same"],
+            &["Same", "Same"],
+        )]);
+        state.cursor = 0;
+
+        // The default gesture opens the per-track view. A second Enter is the
+        // explicit request to edit the currently focused value.
+        press_metadata_enter(&mut state);
+        assert!(state.detail_edit.is_none());
+        press_metadata_enter(&mut state);
         assert_eq!(
             state.detail_edit.as_ref().map(|input| input.text.as_str()),
             Some("Same")
@@ -62578,7 +62632,7 @@ mod phase4_tests {
         assert!(metadata_editor_commit_detail_edit(&mut app, &mut state));
         assert!(
             !crate::tui::probe::metadata_editor_has_changes(&state),
-            "opening and committing an unchanged TITLE detail slot must not dirty the editor"
+            "committing an unchanged explicitly-opened TITLE detail slot must not dirty the editor"
         );
     }
 
@@ -62602,6 +62656,7 @@ mod phase4_tests {
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         assert_eq!(state.detail_field_idx, 0);
         assert_eq!(state.detail_cursor, 0);
+        assert!(state.detail_edit.is_none());
     }
 
     #[test]
@@ -62622,6 +62677,27 @@ mod phase4_tests {
             metadata_editor_detail_value_edit_refusal(&state, 0, 1)
                 .is_some_and(|reason| reason.contains("slot is not editable")),
             "the blocked TITLE slot must remain visible and non-editable"
+        );
+    }
+
+    #[test]
+    fn title_default_gesture_skips_a_blocked_first_slot_without_starting_edit() {
+        let mut state = two_file_editor_with_first_blocked(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["One", "Two"],
+            &["One", "Two"],
+        )]);
+        state.cursor = 0;
+
+        press_metadata_enter(&mut state);
+
+        assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
+        assert_eq!(state.detail_cursor, 1);
+        assert!(state.detail_edit.is_none());
+        assert!(
+            metadata_editor_detail_value_edit_refusal(&state, 0, 0)
+                .is_some_and(|reason| reason.contains("slot is not editable"))
         );
     }
 
@@ -62697,6 +62773,7 @@ mod phase4_tests {
         };
         assert_eq!(state.phase, MetadataEditorPhase::DetailEdit);
         assert_eq!(state.detail_field_idx, 0);
+        assert!(state.detail_edit.is_none());
     }
 
     #[test]

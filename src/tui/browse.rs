@@ -942,6 +942,7 @@ impl DirectorySummaryCacheEntry {
                 disc_marker: directory_summary_marker_from_code(fields[14]),
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+                cue_repair_availability: CueRepairAvailability::Unknown,
             };
             entry.facts.classification_scope = Some(classification_scope);
             entry.facts.classification = Some(Arc::new(classification));
@@ -1048,6 +1049,13 @@ pub struct FolderUnitSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueRepairAvailability {
+    Unknown,
+    Absent,
+    Repairable(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderContentClassification {
     pub kind: FolderClassificationKind,
     pub identity: ProbeCacheIdentity,
@@ -1066,6 +1074,10 @@ pub struct FolderContentClassification {
     /// classification leaves this `Unknown`; the explicit context-menu probe
     /// resolves it on the same worker as embedded authority.
     pub cue_import_availability: CueImportAvailability,
+    /// Repairability of a direct-child sidecar CUE. Like the other CUE facts,
+    /// this is resolved only by an explicit context-menu enrichment request so
+    /// normal Browse movement never parses CUE sheets on the reducer thread.
+    pub cue_repair_availability: CueRepairAvailability,
 }
 
 fn classification_summary_scope(classification: &FolderContentClassification) -> DirectorySummaryScope {
@@ -1102,6 +1114,7 @@ impl FolderContentClassification {
             disc_marker: None,
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: CueRepairAvailability::Unknown,
         }
     }
 
@@ -1117,6 +1130,7 @@ impl FolderContentClassification {
             disc_marker: None,
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: CueRepairAvailability::Unknown,
         }
     }
 
@@ -9317,7 +9331,8 @@ impl BrowseState {
     /// Request exact CUE availability for the currently selected folder.
     /// The ordinary folder classifier remains extension-only and fast; this
     /// explicit request enriches its cached result on the same bounded worker
-    /// only when the context menu needs sidecar-import and embedded-only facts.
+    /// only when the context menu needs sidecar-import, repairability, or
+    /// embedded-only facts.
     pub fn request_current_folder_cue_availability(
         &mut self,
         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
@@ -9336,6 +9351,8 @@ impl BrowseState {
                     != EmbeddedCueAvailability::Unknown
                     && classification.cue_import_availability
                         != CueImportAvailability::Unknown
+                    && classification.cue_repair_availability
+                        != CueRepairAvailability::Unknown
             })
         {
             self.folder_cue_availability_probe_requested.remove(&entry.path);
@@ -9419,7 +9436,9 @@ impl BrowseState {
                         || (cached.classification.embedded_cue_availability
                             != EmbeddedCueAvailability::Unknown
                             && cached.classification.cue_import_availability
-                                != CueImportAvailability::Unknown)
+                                != CueImportAvailability::Unknown
+                            && cached.classification.cue_repair_availability
+                                != CueRepairAvailability::Unknown)
                 });
             if cached_satisfies_request {
                 self.folder_classification_pending.remove(&request.path);
@@ -11608,6 +11627,25 @@ pub fn spawn_folder_classification(
                 } else {
                     cue_import
                 };
+                classification.cue_repair_availability = if incomplete_member_set
+                    && cue_import == CueImportAvailability::Absent
+                {
+                    CueRepairAvailability::Unknown
+                } else if cue_import == CueImportAvailability::Unknown {
+                    CueRepairAvailability::Unknown
+                } else if cue_import == CueImportAvailability::Absent {
+                    CueRepairAvailability::Absent
+                } else {
+                    let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+                        classify_path.clone(),
+                    ]);
+                    crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates)
+                        .rejected
+                        .into_iter()
+                        .find(|rejection| rejection.reason.is_cross_file_cumulative_index())
+                        .map(|rejection| CueRepairAvailability::Repairable(rejection.cue_path))
+                        .unwrap_or(CueRepairAvailability::Absent)
+                };
             }
             classification
         })
@@ -11721,6 +11759,7 @@ fn classify_folder_content_blocking(
             disc_marker: None,
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: CueRepairAvailability::Unknown,
         };
     }
 
@@ -11736,6 +11775,7 @@ fn classify_folder_content_blocking(
             disc_marker: Some(marker),
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: CueRepairAvailability::Unknown,
         };
     }
 
@@ -11921,6 +11961,7 @@ fn classify_units_if_decided(
                 disc_marker: common_unit_disc_marker(units),
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+                cue_repair_availability: CueRepairAvailability::Unknown,
             })
         }
         MultiDiscDecision::Collection => Some(FolderContentClassification::collection(
@@ -11961,6 +12002,7 @@ fn finalize_folder_units(
                 io_budget_exhausted,
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+                cue_repair_availability: CueRepairAvailability::Unknown,
             }
         }
         _ => classify_units_if_decided(
@@ -18175,6 +18217,7 @@ mod browse_perf_followup_v10_tests {
             disc_marker: None,
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: CueRepairAvailability::Unknown,
         }));
         entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
         entry.facts.stats = Some(Arc::new(DirStats {

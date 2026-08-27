@@ -6,7 +6,8 @@
 use tonepoet::convert::formats::AudioFormat;
 use tonepoet::convert::simple_wizard::DitherType;
 use tonepoet::tui::app::{
-    BitDepthChoice, FormatField, FormatState, MergeMode, OutputOptionsState, ReplayGainChoice,
+    BitDepthChoice, FormatField, FormatPaneRow, FormatState, MergeMode, OutputOptionsState,
+    ReplayGainChoice,
     ResamplerChoice,
 };
 use tonepoet::tui::convert_actions::{format_state_to_pipeline_settings, try_pills_to_options};
@@ -106,14 +107,35 @@ fn auto_dither_selects_defaults_and_preserves_manual_choice() {
     assert_eq!(*state.dither.selected_value(), DitherType::Gesemann);
 }
 
+/// The Format pane's visible rows now come from one dynamic layout model
+/// (`FormatState::pane_rows`) rather than a static per-target table, so these
+/// tests ask a configured state which fields it currently shows.
+fn visible_format_fields(state: &FormatState) -> Vec<FormatField> {
+    state
+        .pane_rows(false)
+        .into_iter()
+        .filter_map(|row| match row {
+            FormatPaneRow::Field(field) => Some(field),
+            _ => None,
+        })
+        .collect()
+}
+
+fn format_state_for(format: AudioFormat) -> FormatState {
+    let mut state = FormatState::new();
+    state.format.select_value(&format);
+    state.apply_format_constraints();
+    state
+}
+
 #[test]
 fn format_navigation_skips_hidden_rows() {
-    let pcm_rows = FormatField::visible_rows(false, false, false);
+    let pcm_rows = visible_format_fields(&format_state_for(AudioFormat::Flac));
     assert!(pcm_rows.contains(&FormatField::Resampler));
     assert!(pcm_rows.contains(&FormatField::Dither));
     assert!(!pcm_rows.contains(&FormatField::NoiseShaper));
 
-    let dsd_rows = FormatField::visible_rows(true, false, false);
+    let dsd_rows = visible_format_fields(&format_state_for(AudioFormat::Dsf));
     assert!(dsd_rows.contains(&FormatField::DsdRate));
     assert!(dsd_rows.contains(&FormatField::NoiseShaper));
     assert!(!dsd_rows.contains(&FormatField::Resampler));
@@ -240,7 +262,7 @@ fn all_format_families_have_expected_visible_rows_and_valid_pipeline_mapping() {
         state.format.select_value(&format);
         state.apply_format_constraints();
 
-        let rows = FormatField::visible_rows(is_dsd, false, false);
+        let rows = visible_format_fields(&state);
         assert_eq!(state.is_dsd_selected(), is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Resampler), !is_dsd, "{:?}", format);
         assert_eq!(rows.contains(&FormatField::Dither), !is_dsd, "{:?}", format);

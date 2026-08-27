@@ -846,6 +846,33 @@ impl DsdPlannerSourceMetadata {
             (nanos % 1_000_000_000_u128) as u32,
         ))
     }
+
+    /// Return exact container-header timing when the timing fields themselves
+    /// are usable. DSF payload-size diagnostics do not demote an otherwise
+    /// usable declared sample count: an oversized payload can be trailing slack,
+    /// while an undersized payload still fails during decoding/materialization
+    /// or downstream sample validation. Preserve the historical error-free
+    /// requirement for DSDIFF, whose sample count may itself be derived from
+    /// container structures.
+    pub fn authoritative_sample_timing(&self) -> Option<(u32, u64)> {
+        let samples = self.sample_count_per_channel?;
+        if samples == 0 || tonepoet_pipeline::DsdRate::from_hz(self.sample_rate_hz).is_none() {
+            return None;
+        }
+        match self.source_kind {
+            DsdPlannerSourceKind::Dsf => {
+                if samples % 8 != 0 {
+                    return None;
+                }
+            }
+            DsdPlannerSourceKind::DsdiffDsd | DsdPlannerSourceKind::DsdiffDst => {
+                if matches!(self.validation, DsdPlannerValidationStatus::Errors { .. }) {
+                    return None;
+                }
+            }
+        }
+        Some((self.sample_rate_hz, samples))
+    }
 }
 
 /// Inspect standalone DSF/DFF input and return planner-facing DSD metadata.
@@ -879,6 +906,36 @@ pub fn dsd_source_metadata_from_path(
             "failed to inspect standalone DSD source {}: {err}",
             path.display()
         ))),
+    }
+}
+
+/// Resolve the exact timing facts used to override ffprobe's padded DSD
+/// duration estimate. A structurally unrelated diagnostic may remain visible
+/// without forcing callers back to the weaker byte-rate-derived estimate.
+pub fn authoritative_dsd_sample_timing_from_path(
+    path: &Path,
+) -> Result<Option<(u32, u64)>, ConvertError> {
+    let Some(metadata) = dsd_source_metadata_from_path(path)? else {
+        return Ok(None);
+    };
+    if let Some(timing) = metadata.authoritative_sample_timing() {
+        return Ok(Some(timing));
+    }
+
+    // Item 7 is a DSF authority correction. Keep the pre-existing DSDIFF
+    // fallback contract unchanged when its container-derived timing is not
+    // authoritative; a malformed DSF, however, must never validate against
+    // ffprobe's block-padding-inclusive duration estimate.
+    match metadata.source_kind {
+        DsdPlannerSourceKind::Dsf => Err(ConvertError::Backend(format!(
+            "standalone DSF source {} does not provide usable exact container sample timing \
+             (rate {} Hz, sample_count {:?}, validation {:?}); refusing the padded-duration ffprobe fallback",
+            path.display(),
+            metadata.sample_rate_hz,
+            metadata.sample_count_per_channel,
+            metadata.validation,
+        ))),
+        DsdPlannerSourceKind::DsdiffDsd | DsdPlannerSourceKind::DsdiffDst => Ok(None),
     }
 }
 
@@ -1164,12 +1221,14 @@ mod tests {
     };
 
     use super::{
-        apply_unsupported_target_metadata_policy_downgrades, dsd_source_metadata_from_path,
+        apply_unsupported_target_metadata_policy_downgrades,
+        authoritative_dsd_sample_timing_from_path, dsd_source_metadata_from_path,
         flac_streaminfo_audio_md5, metadata_obligations_for_request,
         orchestrator_metadata_stage_required, plan_request_for_track,
         planner_metadata_obligations_for_track, source_audio_md5_policy_downgrade_message,
         source_info_for_realized_track, source_needs_authoritative_metadata,
         source_supports_source_tag_transfer, DsdPlannerSourceKind,
+        DsdPlannerValidationStatus,
     };
     use crate::disc::bluray_backend::BluRayAudioCoding;
     use crate::convert::pipeline::types::{
@@ -1386,6 +1445,30 @@ mod tests {
         writer.finish().expect("finish DSF fixture");
     }
 
+    fn add_declared_dsf_payload_overhang(path: &Path, extra_bytes: usize) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open DSF fixture for overhang mutation");
+        let original_len = file.metadata().expect("DSF fixture metadata").len();
+        let new_len = original_len + extra_bytes as u64;
+        file.seek(SeekFrom::End(0)).expect("seek DSF payload end");
+        file.write_all(&vec![0_u8; extra_bytes])
+            .expect("append DSF payload overhang");
+        file.seek(SeekFrom::Start(12)).expect("seek DSF total size");
+        file.write_all(&new_len.to_le_bytes())
+            .expect("patch DSF total size");
+        file.seek(SeekFrom::Start(84)).expect("seek DSF data size");
+        let original_data_chunk_size = original_len - 80;
+        let new_data_chunk_size = original_data_chunk_size + extra_bytes as u64;
+        file.write_all(&new_data_chunk_size.to_le_bytes())
+            .expect("patch DSF data chunk size");
+        file.sync_all().expect("sync DSF overhang fixture");
+    }
+
     fn write_minimal_dff_dsd(path: &Path) {
         let file = std::fs::File::create(path).expect("create DFF/DSD fixture");
         let mut writer = sacd_rs::dff_writer::DffWriter::new(file, 2, 2_822_400)
@@ -1445,6 +1528,60 @@ mod tests {
         assert_eq!(source.sample_kind, Some(tonepoet_pipeline::SampleKind::Dsd));
         assert!(source.bit_depth.is_none());
         assert!(source.duration.is_some());
+    }
+
+    #[test]
+    fn dsf_payload_overhang_keeps_declared_sample_timing_authoritative() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("payload-overhang.dsf");
+        write_minimal_dsf(&input);
+        add_declared_dsf_payload_overhang(&input, 8_192);
+
+        let metadata = dsd_source_metadata_from_path(&input)
+            .expect("DSF inspection succeeds")
+            .expect("DSF metadata exists");
+
+        assert!(matches!(
+            metadata.validation,
+            DsdPlannerValidationStatus::Errors { .. }
+        ));
+        assert_eq!(
+            authoritative_dsd_sample_timing_from_path(&input)
+                .expect("exact DSF timing resolution succeeds"),
+            Some((2_822_400, 16_384)),
+            "an unrelated payload-size error must not demote a valid declared sample count",
+        );
+    }
+
+    #[test]
+    fn unusable_dsf_declared_timing_refuses_ffprobe_fallback() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("invalid-sample-count.dsf");
+        write_minimal_dsf(&input);
+
+        // DSF fmt sample_count begins at byte 64. Seven one-bit samples cannot
+        // be represented by the byte-granular reader, so this header timing is
+        // genuinely unusable rather than merely accompanied by an unrelated
+        // payload diagnostic.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&input)
+            .expect("open DSF fixture for sample-count mutation");
+        file.seek(SeekFrom::Start(64))
+            .expect("seek DSF sample count");
+        file.write_all(&7_u64.to_le_bytes())
+            .expect("patch invalid DSF sample count");
+        file.sync_all().expect("sync invalid DSF timing fixture");
+        drop(file);
+
+        let error = authoritative_dsd_sample_timing_from_path(&input)
+            .expect_err("unusable DSF header timing must not fall back to ffprobe");
+        assert!(
+            error.to_string().contains("refusing the padded-duration ffprobe fallback"),
+            "unexpected exact-timing rejection: {error}",
+        );
     }
 
     #[test]

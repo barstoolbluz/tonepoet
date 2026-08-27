@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{AppState, ConvertFocus, ConvertLayout, ResamplerChoice, SourceMode};
+use super::app::{AppState, ConvertFocus, ConvertLayout, FormatField, FormatPaneRow, ResamplerChoice, SourceMode};
 use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
@@ -34,13 +34,7 @@ pub fn draw_convert_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme:
     };
 
     let source_h = super::draw_source::source_pane_height(&app.convert.source.mode, area.width);
-    let format_h = if app.convert.format.dsd_reference_controls_available() {
-        14
-    } else if app.convert.format.dsd_to_pcm_gain_available() {
-        12
-    } else {
-        10
-    };
+    let format_h = (app.convert.format.pane_rows(false).len() as u16).saturating_add(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -288,138 +282,131 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
         return;
     }
 
+    let maximized = app.convert.is_maximized(ConvertFocus::Format);
+    let rows = app.convert.format.pane_rows(maximized);
     let state = &app.convert.format;
     let buttons = &mut app.button_map;
     let label_col = area.x + 17;
-    register_pill_row(buttons, &state.format, area.y + 2, label_col, |i| TuiButton::FormatPill(i));
 
-    let mut last_standard_row;
-    if state.is_dsd_selected() {
-        register_pill_row(buttons, &state.sample_rate, area.y + 3, label_col, |i| TuiButton::RatePill(i));
-        register_pill_row(buttons, &state.noise_shaper, area.y + 5, label_col, |i| TuiButton::NoiseShaperPill(i));
-        register_pill_row(buttons, &state.modulator_order, area.y + 6, label_col, |i| TuiButton::ModulatorOrderPill(i));
-        register_pill_row(buttons, &state.conversion_preset, area.y + 7, label_col, |i| TuiButton::ConversionPresetPill(i));
-        last_standard_row = 7;
-    } else {
-        register_pill_row(buttons, &state.sample_rate, area.y + 3, label_col, |i| TuiButton::RatePill(i));
-        register_pill_row(buttons, &state.bit_depth, area.y + 4, label_col, |i| TuiButton::DepthPill(i));
-        register_pill_row(buttons, &state.resampler, area.y + 5, label_col, |i| TuiButton::ResamplerPill(i));
-        register_pill_row(buttons, &state.dither, area.y + 6, label_col, |i| TuiButton::DitherPill(i));
-        register_pill_row(buttons, &state.replaygain, area.y + 7, label_col, |i| TuiButton::ReplayGainPill(i));
-        last_standard_row = 7;
-        if state.dsd_reference_controls_available() {
-            register_pill_row(buttons, &state.dsd_pathway, area.y + 8, label_col, |i| TuiButton::DsdPathPill(i));
-            register_pill_row(buttons, &state.dsd_profile, area.y + 9, label_col, |i| TuiButton::DsdProfilePill(i));
-            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 10, label_col, |i| TuiButton::DsdGainPill(i));
-            if area.y + 11 < area.y + area.height {
-                buttons.record_button(
-                    TuiButton::DsdGainDbField,
-                    ratatui::layout::Rect::new(area.x, area.y + 11, area.width, 1),
-                );
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let y = area.y.saturating_add(1).saturating_add(row_index as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        let FormatPaneRow::Field(field) = row else {
+            continue;
+        };
+        match field {
+            FormatField::Format => register_pill_row(buttons, &state.format, y, label_col, TuiButton::FormatPill),
+            FormatField::SampleRate | FormatField::DsdRate => register_pill_row(buttons, &state.sample_rate, y, label_col, TuiButton::RatePill),
+            FormatField::BitDepth => register_pill_row(buttons, &state.bit_depth, y, label_col, TuiButton::DepthPill),
+            FormatField::Resampler => register_pill_row(buttons, &state.resampler, y, label_col, TuiButton::ResamplerPill),
+            FormatField::Dither => register_pill_row(buttons, &state.dither, y, label_col, TuiButton::DitherPill),
+            FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
+            FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
+            FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
+            FormatField::ConversionPreset => register_pill_row(buttons, &state.conversion_preset, y, label_col, TuiButton::ConversionPresetPill),
+            FormatField::DsdPath => register_pill_row(buttons, &state.dsd_pathway, y, label_col, TuiButton::DsdPathPill),
+            FormatField::DsdProfile => register_pill_row(buttons, &state.dsd_profile, y, label_col, TuiButton::DsdProfilePill),
+            FormatField::DsdGain => register_enabled_pill_row(buttons, &state.dsd_gain_mode, y, label_col, TuiButton::DsdGainPill),
+            FormatField::DsdGainScope => register_pill_row(buttons, &state.dsd_auto_gain_scope, y, label_col, TuiButton::DsdGainScopePill),
+            FormatField::DsdGainDb => buttons.record_button(
+                TuiButton::DsdGainDbField,
+                ratatui::layout::Rect::new(area.x, y, area.width, 1),
+            ),
+            FormatField::DsdNormalizeTarget => buttons.record_button(
+                TuiButton::DsdNormalizeTargetField,
+                ratatui::layout::Rect::new(area.x, y, area.width, 1),
+            ),
+            FormatField::Container => {
+                let containers = state.format.selected_value().available_containers();
+                let mut x = label_col;
+                for (index, container) in containers.iter().enumerate() {
+                    let width = container.display_name.len() as u16 + 2;
+                    if container.enabled {
+                        buttons.record_button(
+                            TuiButton::ContainerPill(index),
+                            ratatui::layout::Rect::new(x, y, width, 1),
+                        );
+                    }
+                    x = x.saturating_add(width);
+                    if index + 1 < containers.len() {
+                        x = x.saturating_add(1);
+                    }
+                }
+                if matches!(
+                    *state.format.selected_value(),
+                    crate::convert::formats::AudioFormat::Flac
+                        | crate::convert::formats::AudioFormat::Aac
+                        | crate::convert::formats::AudioFormat::Opus
+                        | crate::convert::formats::AudioFormat::Mp3
+                        | crate::convert::formats::AudioFormat::WavPack
+                ) {
+                    let name = state.format.selected_value().name().to_lowercase();
+                    let width = name.len() as u16 + 11;
+                    if right_settings_pill_fits(area, x, width) {
+                        let x = area.x + area.width.saturating_sub(width + 1);
+                        buttons.record_button(
+                            TuiButton::FormatSettingsButton,
+                            ratatui::layout::Rect::new(x, y, width, 1),
+                        );
+                    }
+                }
             }
-            if area.y + 12 < area.y + area.height {
-                buttons.record_button(
-                    TuiButton::DsdNormalizeTargetField,
-                    ratatui::layout::Rect::new(area.x, area.y + 12, area.width, 1),
-                );
+            FormatField::ResampleQuality => {
+                let mut x = label_col;
+                let quality_choices = state.resample_quality_choices();
+                for (index, (_, label)) in quality_choices.iter().enumerate() {
+                    let width = label.len() as u16 + 2;
+                    buttons.record_button(
+                        TuiButton::ResampleQualityPill(index),
+                        ratatui::layout::Rect::new(x, y, width, 1),
+                    );
+                    x = x.saturating_add(width);
+                    if index + 1 < quality_choices.len() {
+                        x = x.saturating_add(1);
+                    }
+                }
+                let resampler_name = match *state.resampler.selected_value() {
+                    ResamplerChoice::Ssrc => Some("ssrc"),
+                    ResamplerChoice::Sox => Some("sox"),
+                    ResamplerChoice::Soxr => Some("soxr"),
+                    ResamplerChoice::None => None,
+                };
+                if let Some(name) = resampler_name {
+                    let width = name.len() as u16 + 11;
+                    if right_settings_pill_fits(area, x, width) {
+                        let x = area.x + area.width.saturating_sub(width + 1);
+                        buttons.record_button(
+                            TuiButton::ResamplerSettingsButton,
+                            ratatui::layout::Rect::new(x, y, width, 1),
+                        );
+                    }
+                }
             }
-            last_standard_row = 12;
-        } else if state.dsd_to_pcm_gain_available() {
-            register_pill_row(buttons, &state.dsd_gain_mode, area.y + 8, label_col, |i| TuiButton::DsdGainPill(i));
-            if area.y + 9 < area.y + area.height {
-                buttons.record_button(
-                    TuiButton::DsdGainDbField,
-                    ratatui::layout::Rect::new(area.x, area.y + 9, area.width, 1),
-                );
-            }
-            if area.y + 10 < area.y + area.height {
-                buttons.record_button(
-                    TuiButton::DsdNormalizeTargetField,
-                    ratatui::layout::Rect::new(area.x, area.y + 10, area.width, 1),
-                );
-            }
-            last_standard_row = 10;
         }
     }
+}
 
-    // Below-the-fold: container pill buttons when maximized.
-    let containers = state.format.selected_value().available_containers();
-    let is_maximized = app.convert.is_maximized(ConvertFocus::Format);
-    if is_maximized && containers.len() > 1 {
-        let container_row_y = area.y + last_standard_row + 2; // +1 blank + 1 container row
-        let mut x = label_col;
-        for (i, c) in containers.iter().enumerate() {
-            let w = c.display_name.len() as u16 + 2; // " name "
-            if c.enabled && container_row_y < area.y + area.height {
-                buttons.record_button(
-                    TuiButton::ContainerPill(i),
-                    ratatui::layout::Rect::new(x, container_row_y, w, 1),
-                );
-            }
-            x += w + 1; // pill width + gap
-        }
+fn right_settings_pill_fits(area: Rect, left_content_end_x: u16, pill_width: u16) -> bool {
+    let left_content_width = left_content_end_x.saturating_sub(area.x);
+    left_content_width
+        .saturating_add(pill_width)
+        .saturating_add(2)
+        <= area.width
+}
 
-        // Right-aligned "<format> settings" pill for codec-specific settings.
-        if matches!(
-            *state.format.selected_value(),
-            crate::convert::formats::AudioFormat::Flac
-                | crate::convert::formats::AudioFormat::Aac
-                | crate::convert::formats::AudioFormat::Opus
-                | crate::convert::formats::AudioFormat::Mp3
-                | crate::convert::formats::AudioFormat::WavPack
-        ) {
-            let fmt_name = state.format.selected_value().name().to_lowercase();
-            let pill_w = fmt_name.len() as u16 + 11; // " {name} settings " length
-            let pill_x = area.x + area.width.saturating_sub(pill_w + 1); // +1 for border
-            buttons.record_button(
-                TuiButton::FormatSettingsButton,
-                ratatui::layout::Rect::new(pill_x, container_row_y, pill_w, 1),
-            );
-        }
-    }
-
-    // Below-the-fold: quality pill row when maximized and resampler is active.
-    if is_maximized
-        && !matches!(
-            *state.resampler.selected_value(),
-            crate::tui::app::ResamplerChoice::None
-        )
-    {
-        let quality_row_y = if containers.len() > 1 {
-            area.y + last_standard_row + 5 // after blank + container + blank + resampler header
-        } else {
-            area.y + last_standard_row + 4 // after blank + blank + resampler header (no container)
-        };
-        // Register quality pills
-        let mut qx = label_col;
-        let mut quality_labels: Vec<&str> = vec!["low", "med", "high", "vhigh", "ultra"];
-        if matches!(*state.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
-            quality_labels.push("insane");
-        }
-        for (i, label) in quality_labels.iter().enumerate() {
-            let w = label.len() as u16 + 2; // " label "
-            buttons.record_button(
-                TuiButton::ResampleQualityPill(i),
-                ratatui::layout::Rect::new(qx, quality_row_y, w, 1),
-            );
-            qx += w + 1; // pill + gap
-        }
-        // Right-aligned "ssrc settings" pill when SSRC selected
-        // Right-aligned "<resampler> settings" pill
-        let resampler_name = match *state.resampler.selected_value() {
-            crate::tui::app::ResamplerChoice::Ssrc => Some("ssrc"),
-            crate::tui::app::ResamplerChoice::Sox => Some("sox"),
-            crate::tui::app::ResamplerChoice::Soxr => Some("soxr"),
-            _ => None,
-        };
-        if let Some(name) = resampler_name {
-            let pill_w = name.len() as u16 + 11; // " {name} settings "
-            let pill_x = area.x + area.width.saturating_sub(pill_w + 1);
-            buttons.record_button(
-                TuiButton::ResamplerSettingsButton,
-                ratatui::layout::Rect::new(pill_x, quality_row_y, pill_w, 1),
-            );
-        }
+fn register_enabled_pill_row<T>(
+    buttons: &mut ButtonRenderMap,
+    state: &PillState<T>,
+    y: u16,
+    mut x: u16,
+    button: impl Fn(usize) -> TuiButton,
+) {
+    for (index, option) in state.options.iter().enumerate().filter(|(_, option)| option.enabled) {
+        let width = option.label.len() as u16 + 2;
+        buttons.record_button(button(index), Rect::new(x, y, width, 1));
+        x = x.saturating_add(width.saturating_add(2));
     }
 }
 
@@ -763,5 +750,162 @@ mod output_options_registration_tests {
                 .is_none(),
             "collapsed Output Options pane must not receive invisible Actions-row targets"
         );
+    }
+}
+
+#[cfg(test)]
+mod format_render_registration_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::convert::formats::AudioFormat;
+    use crate::tui::app::{AppScreen, DsdGainMode, FormatField, ResamplerChoice};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tonepoet_pipeline::enums::ResampleQuality;
+
+    fn row_text(terminal: &Terminal<TestBackend>, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| terminal.backend().buffer().get(x, y).symbol().to_string())
+            .collect()
+    }
+
+    fn rendered_row(terminal: &Terminal<TestBackend>, width: u16, height: u16, needle: &str) -> u16 {
+        (0..height)
+            .find(|&y| row_text(terminal, y, width).contains(needle))
+            .unwrap_or_else(|| panic!("rendered row containing {needle:?} not found"))
+    }
+
+    #[test]
+    fn dsd_to_pcm_render_keyboard_and_hit_map_share_one_dynamic_layout() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+        app.convert.format.set_source_is_dsd(true);
+        assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
+        assert!(app.convert.format.resampler.select_value(&ResamplerChoice::Sox));
+        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::Auto));
+        app.convert.format.resample_quality = ResampleQuality::Ultra;
+        app.convert.format.apply_format_constraints();
+
+        let backend = TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        app.button_map.clear();
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw DSD-to-PCM format pane");
+
+        let gain_scope_y = rendered_row(&terminal, WIDTH, HEIGHT, "gain scope");
+        let auto_margin_y = rendered_row(&terminal, WIDTH, HEIGHT, "auto margin");
+        let container_y = rendered_row(&terminal, WIDTH, HEIGHT, "container");
+        let resample_quality_y = rendered_row(&terminal, WIDTH, HEIGHT, "insane");
+        let gain_y = rendered_row(&terminal, WIDTH, HEIGHT, "DSD gain");
+
+        let album_scope_rect = app
+            .button_map
+            .find_button_rect(&TuiButton::DsdGainScopePill(1))
+            .expect("gain-scope album pill hit region");
+        assert_eq!(album_scope_rect.y, gain_scope_y);
+        assert_eq!(
+            app.button_map.find_button_at(album_scope_rect.x, album_scope_rect.y),
+            Some(TuiButton::DsdGainScopePill(1)),
+        );
+        assert!(crate::tui::format_interactions::handle_convert_format_button(
+            &mut app.convert,
+            TuiButton::DsdGainScopePill(1),
+        ));
+        assert_eq!(app.convert.format.dsd_gain_mode.selected_value(), &DsdGainMode::Auto);
+        assert_eq!(app.convert.format.dsd_auto_gain_scope.selected, 1);
+        assert_eq!(
+            app.button_map
+                .find_button_rect(&TuiButton::DsdNormalizeTargetField)
+                .expect("auto-margin hit region")
+                .y,
+            auto_margin_y,
+        );
+        assert!(
+            app.button_map.find_button_rect(&TuiButton::DsdGainDbField).is_none(),
+            "manual-gain row is inactive in auto mode and must not render or receive a hit target"
+        );
+        assert_eq!(
+            app.button_map
+                .find_button_rect(&TuiButton::ContainerPill(0))
+                .expect("container hit region")
+                .y,
+            container_y,
+        );
+        assert_eq!(
+            app.button_map
+                .find_button_rect(&TuiButton::ResampleQualityPill(5))
+                .expect("insane resampling-quality hit region")
+                .y,
+            resample_quality_y,
+        );
+
+        let gain_text = row_text(&terminal, gain_y, WIDTH);
+        assert!(gain_text.contains("disabled"));
+        assert!(gain_text.contains("auto"));
+        assert!(gain_text.contains("manual"));
+        assert!(!gain_text.contains("reference"));
+        assert!(!gain_text.contains("native"));
+        assert!(!gain_text.contains("normalize"));
+
+        let keyboard_rows = app.convert.format.visible_fields(true);
+        assert!(keyboard_rows.contains(&FormatField::DsdGainScope));
+        assert!(keyboard_rows.contains(&FormatField::DsdNormalizeTarget));
+        assert!(keyboard_rows.contains(&FormatField::Container));
+        assert!(keyboard_rows.contains(&FormatField::ResampleQuality));
+        assert!(!keyboard_rows.contains(&FormatField::DsdGainDb));
+
+        assert!(crate::tui::format_interactions::handle_convert_format_button(
+            &mut app.convert,
+            TuiButton::ContainerPill(1),
+        ));
+        assert_eq!(app.convert.format.field_focus, FormatField::Container);
+        let clicked_container = app.convert.format.selected_container_index;
+        app.convert.format.select_focused_next(None, None);
+        assert_ne!(app.convert.format.selected_container_index, clicked_container);
+
+        app.convert.format.resample_quality = ResampleQuality::Ultra;
+        assert!(crate::tui::format_interactions::handle_convert_format_button(
+            &mut app.convert,
+            TuiButton::ResampleQualityPill(4),
+        ));
+        assert_eq!(app.convert.format.field_focus, FormatField::ResampleQuality);
+        app.convert.format.select_focused_next(None, None);
+        assert_eq!(app.convert.format.resample_quality, ResampleQuality::Insane);
+
+        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        app.convert.format.apply_format_constraints();
+        app.button_map.clear();
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("redraw manual DSD-to-PCM format pane");
+
+        let gain_db_y = rendered_row(&terminal, WIDTH, HEIGHT, "gain dB");
+        assert_eq!(
+            app.button_map
+                .find_button_rect(&TuiButton::DsdGainDbField)
+                .expect("manual-gain hit region")
+                .y,
+            gain_db_y,
+        );
+        let all_text: String = (0..HEIGHT)
+            .map(|y| row_text(&terminal, y, WIDTH))
+            .collect();
+        assert!(!all_text.contains("gain scope"));
+        assert!(!all_text.contains("auto margin"));
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::DsdGainScopePill(0))
+            .is_none());
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::DsdNormalizeTargetField)
+            .is_none());
     }
 }

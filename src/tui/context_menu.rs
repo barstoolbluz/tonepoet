@@ -176,6 +176,11 @@ pub enum ContextAction {
     OpenSystemDefault(PathBuf),
     /// Open the advanced folder CUE chooser without starting conversion.
     InspectCueChoices(PathBuf),
+    /// Create/reuse the validated repair copy for a known cumulative CUE.
+    RepairCue {
+        folder: PathBuf,
+        cue_path: Option<PathBuf>,
+    },
     /// Tree-pane operations carry their target explicitly so a later cursor
     /// change cannot redirect the operation.
     TreeNewFile(PathBuf),
@@ -1093,6 +1098,16 @@ fn directory_embedded_cue_availability(
         .unwrap_or(super::probe::EmbeddedCueAvailability::Unknown)
 }
 
+fn directory_cue_repair_availability(
+    app: &AppState,
+    entry: &BrowseEntry,
+) -> super::browse::CueRepairAvailability {
+    app.browse
+        .valid_folder_classification_for_entry(entry)
+        .map(|classification| classification.cue_repair_availability.clone())
+        .unwrap_or(super::browse::CueRepairAvailability::Unknown)
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -1251,11 +1266,36 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 )),
                 super::probe::CueImportAvailability::Absent => {}
             }
-            // Directory menu construction must not synchronously scan the
-            // directory for CUE files. Sidecar/Advanced-CUE and embedded-only
-            // availability consume the background classification cache; an
-            // unknown Advanced-CUE state stays visible but disabled until the
-            // cache resolves, while known-absent folders omit it entirely.
+            match directory_cue_repair_availability(app, entry) {
+                super::browse::CueRepairAvailability::Repairable(cue_path) => {
+                    items.push(item(
+                        "Repair malformed CUE (create copy)",
+                        ContextAction::RepairCue {
+                            folder: entry.path.clone(),
+                            cue_path: Some(cue_path),
+                        },
+                    ));
+                }
+                super::browse::CueRepairAvailability::Unknown
+                    if cue_import_availability != super::probe::CueImportAvailability::Absent =>
+                {
+                    items.push(item_enabled(
+                        "Repair malformed CUE (create copy)",
+                        ContextAction::RepairCue {
+                            folder: entry.path.clone(),
+                            cue_path: None,
+                        },
+                        false,
+                    ));
+                }
+                super::browse::CueRepairAvailability::Unknown
+                | super::browse::CueRepairAvailability::Absent => {}
+            }
+            // Directory menu construction must not synchronously scan or parse
+            // CUE files. Sidecar import, repairability, Advanced-CUE, and
+            // embedded-only availability consume the background classification
+            // cache; unresolved actions stay disabled until the cache resolves,
+            // while known-absent actions are omitted.
             items.push(build_tagging_submenu(
                 cue_import_availability == super::probe::CueImportAvailability::Present,
                 directory_embedded_cue_availability(app, entry),
@@ -1687,7 +1727,9 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::PasteSelection
         | ContextAction::DuplicateSelection => Some("filesystem clipboard operation"),
         ContextAction::OpenSystemDefault(_) => Some("system-default editing"),
-        ContextAction::InspectCueChoices(_) => Some("CUE folder inspection"),
+        ContextAction::InspectCueChoices(_) | ContextAction::RepairCue { .. } => {
+            Some("CUE folder inspection")
+        }
         ContextAction::BulkRename
         | ContextAction::RenameFixCapitalization(_) => Some("rename"),
         ContextAction::Analyze => Some("analysis"),
@@ -2919,6 +2961,18 @@ pub fn execute_context_action(
         ContextAction::InspectCueChoices(path) => {
             if app.current_screen == AppScreen::Browse {
                 super::keybindings::open_browse_cue_selection_inspector(app, tx, path);
+            }
+        }
+        ContextAction::RepairCue { folder, cue_path } => {
+            if app.current_screen == AppScreen::Browse {
+                if let Some(cue_path) = cue_path {
+                    super::keybindings::start_browse_cue_repair_for_path(
+                        app,
+                        tx,
+                        folder,
+                        cue_path,
+                    );
+                }
             }
         }
         ContextAction::BrowseTabNew => {
@@ -6327,6 +6381,27 @@ mod tests {
         app.browse.selected_index = 0;
         let cue_import_availability =
             super::super::keybindings::cue_import_availability_for_paths(&audio_paths);
+        let cue_repair_availability = match cue_import_availability {
+            crate::tui::probe::CueImportAvailability::Present => {
+                let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+                    folder.to_path_buf(),
+                ]);
+                crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates)
+                    .rejected
+                    .into_iter()
+                    .find(|rejection| rejection.reason.is_cross_file_cumulative_index())
+                    .map(|rejection| {
+                        crate::tui::browse::CueRepairAvailability::Repairable(rejection.cue_path)
+                    })
+                    .unwrap_or(crate::tui::browse::CueRepairAvailability::Absent)
+            }
+            crate::tui::probe::CueImportAvailability::Unknown => {
+                crate::tui::browse::CueRepairAvailability::Unknown
+            }
+            crate::tui::probe::CueImportAvailability::Absent => {
+                crate::tui::browse::CueRepairAvailability::Absent
+            }
+        };
         let mut format_counts = std::collections::BTreeMap::new();
         format_counts.insert("FLAC".to_string(), audio_paths.len());
         app.browse.insert_folder_classification_for_test(
@@ -6349,6 +6424,7 @@ mod tests {
                 disc_marker: None,
                 embedded_cue_availability: availability,
                 cue_import_availability,
+                cue_repair_availability,
             },
         );
         app
@@ -6409,6 +6485,55 @@ mod tests {
             Some(true)
         );
         assert!(menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"));
+        assert!(!menu_contains_action(&menu, |action| matches!(
+            action,
+            ContextAction::RepairCue { .. }
+        )));
+    }
+
+    #[test]
+    fn cumulative_sidecar_exposes_file_creating_repair_action_in_browse_menu() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("cumulative-cue");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let side_a = album.join("side-a.flac");
+        let side_b = album.join("side-b.flac");
+        std::fs::write(&side_a, b"audio").expect("side A");
+        std::fs::write(&side_b, b"audio").expect("side B");
+        let cue = album.join("album.cue");
+        std::fs::write(
+            &cue,
+            concat!(
+                "FILE \"side-a.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n",
+                "FILE \"side-b.flac\" WAVE\n",
+                "  TRACK 03 AUDIO\n    INDEX 01 03:10:00\n",
+                "  TRACK 04 AUDIO\n    INDEX 01 06:00:00\n",
+            ),
+        )
+        .expect("cumulative cue");
+
+        let app = app_with_selected_folder_for_cue_menu(
+            TonepoetConfig::default(),
+            &album,
+            vec![side_a, side_b],
+            crate::tui::probe::EmbeddedCueAvailability::Absent,
+        );
+        let menu = build_browse_entry_menu(&app);
+        assert_eq!(
+            menu_action_enabled(&menu, |action| matches!(
+                action,
+                ContextAction::RepairCue {
+                    cue_path: Some(path),
+                    ..
+                } if path == &cue
+            )),
+            Some(true),
+        );
+        assert!(menu_labels_recursive(&menu)
+            .iter()
+            .any(|label| label == "Repair malformed CUE (create copy)"));
     }
 
     #[test]

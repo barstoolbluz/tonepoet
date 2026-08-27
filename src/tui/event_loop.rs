@@ -17634,6 +17634,7 @@ mod async_message_drain_tests {
             embedded_cue_availability:
                 crate::tui::probe::EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
         }
     }
 

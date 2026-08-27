@@ -3154,71 +3154,20 @@ pub enum FormatField {
     DsdGainDb,
     /// Native NormalizePeak target or exact legacy Auto safety margin.
     DsdNormalizeTarget,
+    /// Below-the-fold output container selector.
+    Container,
+    /// Below-the-fold resampler quality preset.
+    ResampleQuality,
 }
 
-impl FormatField {
-    /// Rows visible in the format pane. Legacy gain remains visible for every
-    /// DSD-to-PCM conversion; native Reference-only rows are independently
-    /// promotion-gated.
-    pub fn visible_rows(
-        is_dsd_target: bool,
-        show_dsd_to_pcm_gain: bool,
-        show_reference_controls: bool,
-    ) -> &'static [Self] {
-        if is_dsd_target {
-            &[
-                Self::Format,
-                Self::DsdRate,
-                Self::BitDepth,
-                Self::NoiseShaper,
-                Self::ModulatorOrder,
-                Self::ConversionPreset,
-            ]
-        } else if show_reference_controls {
-            &[
-                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
-                Self::Dither, Self::ReplayGain, Self::DsdPath, Self::DsdProfile,
-                Self::DsdGain, Self::DsdGainScope, Self::DsdGainDb, Self::DsdNormalizeTarget,
-            ]
-        } else if show_dsd_to_pcm_gain {
-            &[
-                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
-                Self::Dither, Self::ReplayGain, Self::DsdGain, Self::DsdGainScope,
-                Self::DsdGainDb, Self::DsdNormalizeTarget,
-            ]
-        } else {
-            &[
-                Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
-                Self::Dither, Self::ReplayGain,
-            ]
-        }
-    }
-
-    pub fn next_for(
-        self,
-        is_dsd_target: bool,
-        show_dsd_to_pcm_gain: bool,
-        show_reference_controls: bool,
-    ) -> Self {
-        let rows = Self::visible_rows(
-            is_dsd_target, show_dsd_to_pcm_gain, show_reference_controls,
-        );
-        let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
-        rows[(idx + 1) % rows.len()]
-    }
-
-    pub fn prev_for(
-        self,
-        is_dsd_target: bool,
-        show_dsd_to_pcm_gain: bool,
-        show_reference_controls: bool,
-    ) -> Self {
-        let rows = Self::visible_rows(
-            is_dsd_target, show_dsd_to_pcm_gain, show_reference_controls,
-        );
-        let idx = rows.iter().position(|row| *row == self).unwrap_or(0);
-        rows[(idx + rows.len() - 1) % rows.len()]
-    }
+/// One concrete rendered row in the Format pane. Drawing, keyboard navigation,
+/// and mouse hit registration all consume this same sequence so dynamic rows
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatPaneRow {
+    Spacer,
+    ResamplingHeader,
+    Field(FormatField),
 }
 
 /// Which row in the output options pane is focused
@@ -3785,6 +3734,86 @@ impl FormatState {
         self.selected_container().extension
     }
 
+    pub fn select_container_index(&mut self, index: usize) -> bool {
+        let containers = self.format.selected_value().available_containers();
+        if containers.get(index).is_some_and(|container| container.enabled) {
+            self.selected_container_index = index;
+            self.reference_target_confirmed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_container_next(&mut self) {
+        let len = self.format.selected_value().available_containers().len();
+        if len == 0 {
+            return;
+        }
+        for offset in 1..=len {
+            let index = (self.selected_container_index + offset) % len;
+            if self.select_container_index(index) {
+                return;
+            }
+        }
+    }
+
+    fn select_container_prev(&mut self) {
+        let len = self.format.selected_value().available_containers().len();
+        if len == 0 {
+            return;
+        }
+        for offset in 1..=len {
+            let index = (self.selected_container_index + len - offset) % len;
+            if self.select_container_index(index) {
+                return;
+            }
+        }
+    }
+
+    pub fn resample_quality_choices(
+        &self,
+    ) -> Vec<(tonepoet_pipeline::enums::ResampleQuality, &'static str)> {
+        use tonepoet_pipeline::enums::ResampleQuality;
+        let mut choices = vec![
+            (ResampleQuality::Low, "low"),
+            (ResampleQuality::Medium, "med"),
+            (ResampleQuality::High, "high"),
+            (ResampleQuality::VeryHigh, "vhigh"),
+            (ResampleQuality::Ultra, "ultra"),
+        ];
+        if matches!(*self.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
+            choices.push((ResampleQuality::Insane, "insane"));
+        }
+        choices
+    }
+
+    pub fn select_resample_quality_index(&mut self, index: usize) -> bool {
+        let Some((quality, _)) = self.resample_quality_choices().get(index).copied() else {
+            return false;
+        };
+        self.resample_quality = quality;
+        true
+    }
+
+    fn select_resample_quality_next(&mut self) {
+        let choices = self.resample_quality_choices();
+        let current = choices
+            .iter()
+            .position(|(quality, _)| *quality == self.resample_quality)
+            .unwrap_or(0);
+        self.resample_quality = choices[(current + 1) % choices.len()].0;
+    }
+
+    fn select_resample_quality_prev(&mut self) {
+        let choices = self.resample_quality_choices();
+        let current = choices
+            .iter()
+            .position(|(quality, _)| *quality == self.resample_quality)
+            .unwrap_or(0);
+        self.resample_quality = choices[(current + choices.len() - 1) % choices.len()].0;
+    }
+
     pub fn is_dsd_selected(&self) -> bool {
         is_dsd_format(*self.format.selected_value())
     }
@@ -3886,24 +3915,96 @@ impl FormatState {
         self.apply_format_constraints();
     }
 
-    pub fn focus_next(&mut self) {
-        self.field_focus = self
-            .field_focus
-            .next_for(
-                self.is_dsd_selected(),
-                self.dsd_to_pcm_gain_available(),
-                self.dsd_reference_controls_available(),
-            );
+    /// Exact dynamic row sequence rendered by the Format pane. This is the
+    /// single layout authority used by drawing, keyboard stops, and hit maps.
+    pub fn pane_rows(&self, maximized: bool) -> Vec<FormatPaneRow> {
+        let mut rows = vec![FormatPaneRow::Spacer, FormatPaneRow::Field(FormatField::Format)];
+        if self.is_dsd_selected() {
+            rows.extend([
+                FormatPaneRow::Field(FormatField::DsdRate),
+                FormatPaneRow::Field(FormatField::NoiseShaper),
+                FormatPaneRow::Field(FormatField::ModulatorOrder),
+                FormatPaneRow::Field(FormatField::ConversionPreset),
+            ]);
+        } else {
+            rows.extend([
+                FormatPaneRow::Field(FormatField::SampleRate),
+                FormatPaneRow::Field(FormatField::BitDepth),
+            ]);
+            if !self.dsd_reference_controls_available() {
+                rows.extend([
+                    FormatPaneRow::Field(FormatField::Resampler),
+                    FormatPaneRow::Field(FormatField::Dither),
+                ]);
+            }
+            rows.push(FormatPaneRow::Field(FormatField::ReplayGain));
+
+            if self.dsd_to_pcm_gain_available() {
+                if self.dsd_reference_controls_available() {
+                    rows.extend([
+                        FormatPaneRow::Field(FormatField::DsdPath),
+                        FormatPaneRow::Field(FormatField::DsdProfile),
+                    ]);
+                }
+                rows.push(FormatPaneRow::Field(FormatField::DsdGain));
+                match *self.dsd_gain_mode.selected_value() {
+                    DsdGainMode::Auto | DsdGainMode::NormalizePeak => rows.extend([
+                        FormatPaneRow::Field(FormatField::DsdGainScope),
+                        FormatPaneRow::Field(FormatField::DsdNormalizeTarget),
+                    ]),
+                    DsdGainMode::Fixed => {
+                        rows.push(FormatPaneRow::Field(FormatField::DsdGainDb));
+                    }
+                    DsdGainMode::Disabled
+                    | DsdGainMode::Reference
+                    | DsdGainMode::NativeLevel => {}
+                }
+            }
+        }
+
+        if maximized && self.format.selected_value().available_containers().len() > 1 {
+            rows.push(FormatPaneRow::Spacer);
+            rows.push(FormatPaneRow::Field(FormatField::Container));
+        }
+        let resampler_controls_active = !self.is_dsd_selected()
+            && !self.dsd_reference_controls_available();
+        if maximized
+            && resampler_controls_active
+            && !matches!(*self.resampler.selected_value(), ResamplerChoice::None)
+        {
+            rows.push(FormatPaneRow::Spacer);
+            rows.push(FormatPaneRow::ResamplingHeader);
+            rows.push(FormatPaneRow::Field(FormatField::ResampleQuality));
+        }
+        rows
     }
 
-    pub fn focus_prev(&mut self) {
-        self.field_focus = self
-            .field_focus
-            .prev_for(
-                self.is_dsd_selected(),
-                self.dsd_to_pcm_gain_available(),
-                self.dsd_reference_controls_available(),
-            );
+    pub fn visible_fields(&self, maximized: bool) -> Vec<FormatField> {
+        self.pane_rows(maximized)
+            .into_iter()
+            .filter_map(|row| match row {
+                FormatPaneRow::Field(field) => Some(field),
+                FormatPaneRow::Spacer | FormatPaneRow::ResamplingHeader => None,
+            })
+            .collect()
+    }
+
+    pub fn focus_next(&mut self, maximized: bool) {
+        let rows = self.visible_fields(maximized);
+        let Some(idx) = rows.iter().position(|row| *row == self.field_focus) else {
+            self.field_focus = rows.first().copied().unwrap_or(FormatField::Format);
+            return;
+        };
+        self.field_focus = rows[(idx + 1) % rows.len()];
+    }
+
+    pub fn focus_prev(&mut self, maximized: bool) {
+        let rows = self.visible_fields(maximized);
+        let Some(idx) = rows.iter().position(|row| *row == self.field_focus) else {
+            self.field_focus = rows.last().copied().unwrap_or(FormatField::Format);
+            return;
+        };
+        self.field_focus = rows[(idx + rows.len() - 1) % rows.len()];
     }
 
     pub fn mark_dither_overridden(&mut self) {
@@ -4076,6 +4177,14 @@ impl FormatState {
     /// Select the next enabled pill in the focused row and run row-specific side effects.
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
     pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::Container {
+            self.select_container_next();
+            return;
+        }
+        if self.field_focus == FormatField::ResampleQuality {
+            self.select_resample_quality_next();
+            return;
+        }
         if self.field_focus == FormatField::BitDepth && self.is_lossy_codec_selected() {
             self.select_lossy_preset_next();
             self.apply_format_constraints();
@@ -4090,6 +4199,14 @@ impl FormatState {
 
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
     pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::Container {
+            self.select_container_prev();
+            return;
+        }
+        if self.field_focus == FormatField::ResampleQuality {
+            self.select_resample_quality_prev();
+            return;
+        }
         if self.field_focus == FormatField::BitDepth && self.is_lossy_codec_selected() {
             self.select_lossy_preset_prev();
             self.apply_format_constraints();
@@ -4165,6 +4282,8 @@ impl FormatState {
                 }
                 true
             }
+            FormatField::Container => self.select_container_index(index),
+            FormatField::ResampleQuality => self.select_resample_quality_index(index),
         };
         if accepted {
             self.after_user_selection(row, before_format, before_depth, source_bits, source_rate);
@@ -4658,6 +4777,13 @@ impl FormatState {
         // disable them merely because the source is DSD.
 
         self.clamp_disabled_selections();
+        let quality_is_available = self
+            .resample_quality_choices()
+            .iter()
+            .any(|(quality, _)| *quality == self.resample_quality);
+        if !quality_is_available {
+            self.resample_quality = tonepoet_pipeline::enums::ResampleQuality::Ultra;
+        }
         // Constraint clamping does not change provenance. When a source-derived
         // 768 kHz/32-bit default is constrained to 384 kHz/24-bit, the clamped
         // scalar is still automatic and must remain removable if source facts
@@ -4674,13 +4800,7 @@ impl FormatState {
                 self.source_derived_bit_depth = Some(selected);
             }
         }
-        if !FormatField::visible_rows(
-            self.is_dsd_selected(),
-            self.dsd_to_pcm_gain_available(),
-            self.dsd_reference_controls_available(),
-        )
-        .contains(&self.field_focus)
-        {
+        if !self.visible_fields(true).contains(&self.field_focus) {
             self.field_focus = FormatField::Format;
         }
     }
@@ -4744,6 +4864,9 @@ impl FormatState {
                 margin_db: &mut self.dsd_auto_gain_margin_db,
                 gain_mode: &mut self.dsd_gain_mode,
             },
+            FormatField::Container | FormatField::ResampleQuality => {
+                unreachable!("below-the-fold rows use dedicated selectors")
+            }
         }
     }
 }
@@ -5342,6 +5465,11 @@ impl ConvertState {
             ConvertLayout::Maximized(current) if current == pane => ConvertLayout::Default,
             _ => ConvertLayout::Maximized(pane),
         };
+        if !self.is_maximized(ConvertFocus::Format)
+            && !self.format.visible_fields(false).contains(&self.format.field_focus)
+        {
+            self.format.field_focus = FormatField::Format;
+        }
     }
 
     /// Reset metadata file-list view state after the convert source changes.
@@ -15932,17 +16060,32 @@ mod dsd_gain_format_state_tests {
     use super::*;
 
     #[test]
-    fn dsd_gain_rows_are_visible_only_for_dsd_sources_targeting_pcm() {
-        assert!(!FormatField::visible_rows(false, false, false).contains(&FormatField::DsdGain));
-        assert!(!FormatField::visible_rows(false, false, false).contains(&FormatField::DsdGainDb));
-        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdGain));
-        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdGainDb));
-        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdPath));
-        assert!(FormatField::visible_rows(false, true, true).contains(&FormatField::DsdProfile));
-        assert!(FormatField::visible_rows(false, true, true)
-            .contains(&FormatField::DsdNormalizeTarget));
-        assert!(!FormatField::visible_rows(true, false, false).contains(&FormatField::DsdGain));
-        assert!(!FormatField::visible_rows(true, true, true).contains(&FormatField::DsdGain));
+    fn dsd_gain_rows_are_dynamic_for_the_selected_mode() {
+        let mut state = FormatState::new();
+        assert!(!state.visible_fields(false).contains(&FormatField::DsdGain));
+
+        state.set_source_is_dsd(true);
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdGain));
+        assert!(!rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdGainDb));
+        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
+
+        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Auto));
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdGainScope));
+        assert!(rows.contains(&FormatField::DsdNormalizeTarget));
+        assert!(!rows.contains(&FormatField::DsdGainDb));
+
+        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdGainDb));
+        assert!(!rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
+
+        state.format.select_value(&AudioFormat::Dsf);
+        state.apply_format_constraints();
+        assert!(!state.visible_fields(false).contains(&FormatField::DsdGain));
     }
 
     #[test]
@@ -15958,14 +16101,10 @@ mod dsd_gain_format_state_tests {
         assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Auto && option.enabled));
         assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Fixed && option.enabled));
         assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Reference && !option.enabled));
-        let rows = FormatField::visible_rows(
-            s.is_dsd_selected(),
-            s.dsd_to_pcm_gain_available(),
-            s.dsd_reference_controls_available(),
-        );
+        let rows = s.visible_fields(false);
         assert!(rows.contains(&FormatField::DsdGain));
-        assert!(rows.contains(&FormatField::DsdGainDb));
-        assert!(rows.contains(&FormatField::DsdNormalizeTarget));
+        assert!(!rows.contains(&FormatField::DsdGainDb));
+        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
         assert!(!rows.contains(&FormatField::DsdPath));
         assert!(!rows.contains(&FormatField::DsdProfile));
         assert!(s.resampler.options.iter().any(|option| option.enabled));
@@ -15976,17 +16115,30 @@ mod dsd_gain_format_state_tests {
     fn dsd_target_hides_reference_controls_even_for_dsd_source() {
         let mut s = FormatState::new();
         s.set_source_is_dsd(true);
+        assert!(s.resampler.select_value(&ResamplerChoice::Sox));
         s.format.select_value(&AudioFormat::Dsf);
         s.apply_format_constraints();
 
         assert!(!s.dsd_to_pcm_gain_available());
         assert!(!s.dsd_reference_controls_available());
-        assert!(!FormatField::visible_rows(
-            s.is_dsd_selected(),
-            s.dsd_to_pcm_gain_available(),
-            s.dsd_reference_controls_available(),
-        )
-        .contains(&FormatField::DsdGain));
+        let rows = s.visible_fields(true);
+        assert!(!rows.contains(&FormatField::BitDepth));
+        assert!(!rows.contains(&FormatField::DsdGain));
+        assert!(!rows.contains(&FormatField::ResampleQuality));
+    }
+
+    #[test]
+    fn resample_quality_is_clamped_when_the_new_resampler_does_not_offer_it() {
+        let mut s = FormatState::new();
+        assert!(s.resampler.select_value(&ResamplerChoice::Sox));
+        s.resample_quality = tonepoet_pipeline::enums::ResampleQuality::Insane;
+        assert!(s.resampler.select_value(&ResamplerChoice::Soxr));
+        s.apply_format_constraints();
+
+        assert_eq!(
+            s.resample_quality,
+            tonepoet_pipeline::enums::ResampleQuality::Ultra
+        );
     }
 
 
@@ -15994,12 +16146,12 @@ mod dsd_gain_format_state_tests {
     fn focus_navigation_skips_reference_rows_before_promotion() {
         let mut s = FormatState::new();
         s.field_focus = FormatField::ReplayGain;
-        s.focus_next();
+        s.focus_next(false);
         assert_eq!(s.field_focus, FormatField::Format);
 
         s.set_source_is_dsd(true);
         s.field_focus = FormatField::ReplayGain;
-        s.focus_next();
+        s.focus_next(false);
         assert_eq!(s.field_focus, FormatField::DsdGain);
     }
 

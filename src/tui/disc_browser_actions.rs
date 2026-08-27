@@ -777,6 +777,7 @@ mod tests {
             disc_marker: Some(marker),
             embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
         };
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());

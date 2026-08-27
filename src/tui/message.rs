@@ -500,9 +500,11 @@ pub enum AppMessage {
         cancelled: bool,
     },
     /// Result of a bounded folder-content classification launched after the
-    /// Browse cursor debounce. The worker performs only directory reads and
-    /// extension checks; reducers still validate the captured directory identity
-    /// and current selection before publishing the cached classification.
+    /// Browse cursor debounce. Ordinary classification performs only bounded
+    /// directory/extension work; an explicit context-menu enrichment may also
+    /// inspect CUE availability and repairability on that worker. Reducers still
+    /// validate the captured directory identity and current selection before
+    /// publishing the cached classification.
     FolderClassifyComplete {
         path: std::path::PathBuf,
         identity: crate::tui::browse::ProbeCacheIdentity,

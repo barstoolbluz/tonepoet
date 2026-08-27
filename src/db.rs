@@ -559,8 +559,13 @@ impl Drop for DatabaseOpenInitFileLock {
 
 /// Return the database file path.
 pub fn db_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+    #[cfg(test)]
+    let data_dir = crate::tui::test_support::test_data_home_override()
+        .unwrap_or_else(crate::tui::test_support::test_process_data_home);
+    #[cfg(not(test))]
+    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+
+    data_dir
         .join("tonepoet")
         .join("tonepoet.db")
 }
@@ -8957,6 +8962,7 @@ mod tests {
             disc_marker: None,
             embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
         };
         let entry = DirectorySummaryCacheEntry {
             identity,

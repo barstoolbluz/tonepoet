@@ -8,14 +8,14 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{BitDepthChoice, DsdGainMode, FormatField, FormatState, ResamplerChoice};
+use super::app::{FormatField, FormatState, ResamplerChoice};
 use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
 ///
 /// When native-v2 is the release default, DSD-to-PCM targets expose the P0
-/// Reference control surface and lock its policy-owned resampler/dither rows.
-/// Pre-promotion releases render the ordinary legacy PCM controls instead.
+/// Reference control surface and omit generic resampler/dither rows owned by
+/// that policy. Pre-promotion releases render the ordinary legacy PCM controls.
 pub fn draw_format_pane(
     f: &mut Frame,
     area: Rect,
@@ -30,370 +30,323 @@ pub fn draw_format_pane(
 
     let border_color = if focused { theme.green } else { theme.text_dim };
     let w = area.width as usize;
-    let is_dsd = format_state.is_dsd_selected();
-
     let top_line = format_title_line(border_color, w, maximized, theme);
-
     let bot_line = Line::from(Span::styled(
         format!("└{}┘", "─".repeat(w.saturating_sub(2))),
         theme.border(border_color),
     ));
 
     let mut lines = vec![top_line];
-    lines.push(bordered_line(border_color, w, vec![], theme));
-    lines.push(pill_row(
-        border_color,
-        w,
-        "format     ",
-        "",
-        &render_pill_spans(
-            &format_state.format,
-            focused && format_state.field_focus == FormatField::Format, theme),
-        focused && format_state.field_focus == FormatField::Format, theme));
-
-    if is_dsd {
-        lines.push(pill_row(
-            border_color,
-            w,
-            "DSD rate   ",
-            "",
-            &render_pill_spans(
-                &format_state.sample_rate,
-                focused && format_state.field_focus == FormatField::DsdRate, theme),
-            focused && format_state.field_focus == FormatField::DsdRate, theme));
-        lines.push(static_row(
-            border_color,
-            w,
-            "bit depth  ",
-            "1-bit",
-            focused && format_state.field_focus == FormatField::BitDepth, theme));
-        lines.push(pill_row(
-            border_color,
-            w,
-            "noise sh.  ",
-            "",
-            &render_pill_spans(
-                &format_state.noise_shaper,
-                focused && format_state.field_focus == FormatField::NoiseShaper, theme),
-            focused && format_state.field_focus == FormatField::NoiseShaper, theme));
-        lines.push(pill_row(
-            border_color,
-            w,
-            "mod order  ",
-            "",
-            &render_pill_spans(
-                &format_state.modulator_order,
-                focused && format_state.field_focus == FormatField::ModulatorOrder, theme),
-            focused && format_state.field_focus == FormatField::ModulatorOrder, theme));
-        lines.push(pill_row(
-            border_color,
-            w,
-            "preset     ",
-            "",
-            &render_pill_spans(
-                &format_state.conversion_preset,
-                focused && format_state.field_focus == FormatField::ConversionPreset, theme),
-            focused && format_state.field_focus == FormatField::ConversionPreset, theme));
-    } else {
-        lines.push(pill_row(
-            border_color,
-            w,
-            "sample rate",
-            "kHz",
-            &render_pill_spans(
-                &format_state.sample_rate,
-                focused && format_state.field_focus == FormatField::SampleRate, theme),
-            focused && format_state.field_focus == FormatField::SampleRate, theme));
-        let bit_depth_focused = focused && format_state.field_focus == FormatField::BitDepth;
-        if let Some(preset_spans) = lossy_preset_spans(format_state, bit_depth_focused, theme) {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "preset     ",
-                "",
-                &preset_spans,
-                bit_depth_focused,
-                theme,
-            ));
-        } else {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "bit depth  ",
-                "bit",
-                &render_pill_spans(&format_state.bit_depth, bit_depth_focused, theme),
-                bit_depth_focused,
-                theme,
-            ));
-        }
-        if format_state.dsd_reference_controls_available() {
-            lines.push(static_row(
-                border_color,
-                w,
-                "resampler  ",
-                "SoX-ng Reference (rate -u) — locked",
-                focused && format_state.field_focus == FormatField::Resampler,
-                theme,
-            ));
-            lines.push(static_row(
-                border_color,
-                w,
-                "dither     ",
-                reference_dither_label(*format_state.bit_depth.selected_value()),
-                focused && format_state.field_focus == FormatField::Dither,
-                theme,
-            ));
-        } else {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "resampler  ",
-                "",
-                &render_pill_spans(
-                    &format_state.resampler,
-                    focused && format_state.field_focus == FormatField::Resampler, theme),
-                focused && format_state.field_focus == FormatField::Resampler, theme));
-            let ssrc_dither_override = format_state.ssrc_dither_override_active();
-            let dither_focused = focused
-                && format_state.field_focus == FormatField::Dither
-                && !ssrc_dither_override;
-            let rendered_dither = render_pill_spans(&format_state.dither, dither_focused, theme);
-            let dither_spans = if ssrc_dither_override {
-                dim_pill_spans(&rendered_dither, theme)
-            } else {
-                rendered_dither
-            };
-            lines.push(pill_row(
-                border_color,
-                w,
-                "dither     ",
-                format_state.ssrc_dither_status_label().unwrap_or(""),
-                &dither_spans,
-                dither_focused, theme));
-        }
-        lines.push(pill_row(
-            border_color,
-            w,
-            "replaygain ",
-            "",
-            &render_pill_spans(
-                &format_state.replaygain,
-                focused && format_state.field_focus == FormatField::ReplayGain, theme),
-            focused && format_state.field_focus == FormatField::ReplayGain, theme));
-        if format_state.dsd_to_pcm_gain_available() {
-            let reference_available = format_state.dsd_reference_controls_available();
-            if reference_available {
-                lines.push(pill_row(
+    for row in format_state.pane_rows(maximized) {
+        use super::app::FormatPaneRow;
+        match row {
+            FormatPaneRow::Spacer => lines.push(bordered_line(border_color, w, vec![], theme)),
+            FormatPaneRow::ResamplingHeader => {
+                let style = if focused { theme.bright() } else { theme.muted() };
+                lines.push(bordered_line(
                     border_color,
                     w,
-                    "DSD path   ",
-                    "",
-                    &render_pill_spans(
-                        &format_state.dsd_pathway,
-                        focused && format_state.field_focus == FormatField::DsdPath,
-                        theme,
-                    ),
-                    focused && format_state.field_focus == FormatField::DsdPath,
-                    theme,
-                ));
-                lines.push(pill_row(
-                    border_color,
-                    w,
-                    "DSD profile",
-                    "",
-                    &render_pill_spans(
-                        &format_state.dsd_profile,
-                        focused && format_state.field_focus == FormatField::DsdProfile,
-                        theme,
-                    ),
-                    focused && format_state.field_focus == FormatField::DsdProfile,
+                    vec![Span::styled("   resampling", style)],
                     theme,
                 ));
             }
-            lines.push(pill_row(
-                border_color,
-                w,
-                "DSD gain  ",
-                "",
-                &render_pill_spans(
-                    &format_state.dsd_gain_mode,
-                    focused && format_state.field_focus == FormatField::DsdGain,
-                    theme,
-                ),
-                focused && format_state.field_focus == FormatField::DsdGain,
-                theme,
-            ));
-            lines.push(pill_row(
-                border_color,
-                w,
-                "gain scope ",
-                "",
-                &render_pill_spans(
-                    &format_state.dsd_auto_gain_scope,
-                    focused && format_state.field_focus == FormatField::DsdGainScope,
-                    theme,
-                ),
-                focused && format_state.field_focus == FormatField::DsdGainScope,
-                theme,
-            ));
-            lines.push(dsd_db_value_row(
-                border_color,
-                w,
-                "gain dB    ",
-                format_state.dsd_gain_db,
-                *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Fixed,
-                focused && format_state.field_focus == FormatField::DsdGainDb,
-                if reference_available {
-                    "select fixed to apply"
-                } else {
-                    "select manual to apply"
-                },
-                theme,
-            ));
-            let (target_label, target_value, target_active, target_hint) =
-                if reference_available {
-                    (
-                        "normalize  ",
-                        format_state.dsd_normalize_target_dbfs,
-                        *format_state.dsd_gain_mode.selected_value()
-                            == DsdGainMode::NormalizePeak,
-                        "select normalize to apply",
-                    )
-                } else {
-                    (
-                        "auto margin",
-                        format_state.dsd_auto_gain_margin_db,
-                        *format_state.dsd_gain_mode.selected_value() == DsdGainMode::Auto,
-                        "select auto to apply",
-                    )
-                };
-            lines.push(dsd_db_value_row(
-                border_color,
-                w,
-                target_label,
-                target_value,
-                target_active,
-                focused && format_state.field_focus == FormatField::DsdNormalizeTarget,
-                target_hint,
-                theme,
-            ));
-        }
-    }
-
-    // Below-the-fold: container selector when maximized and codec has alternatives.
-    let containers = format_state.format.selected_value().available_containers();
-    let has_format_settings = matches!(
-        *format_state.format.selected_value(),
-        crate::convert::formats::AudioFormat::Flac
-            | crate::convert::formats::AudioFormat::Aac
-            | crate::convert::formats::AudioFormat::Opus
-            | crate::convert::formats::AudioFormat::Mp3
-            | crate::convert::formats::AudioFormat::WavPack
-    );
-    if maximized && containers.len() > 1 {
-        lines.push(bordered_line(border_color, w, vec![], theme));
-        let container_spans: Vec<Span> = containers
-            .iter()
-            .enumerate()
-            .flat_map(|(i, c)| {
-                let selected = i == format_state.selected_container_index;
-                let style = if !c.enabled {
-                    Style::default().fg(theme.text_dim)
-                } else if selected {
-                    Style::default().fg(theme.green).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_dim)
-                };
-                let mut spans = vec![Span::styled(format!(" {} ", c.display_name), style)];
-                if i + 1 < containers.len() {
-                    spans.push(Span::styled(" ", Style::default()));
+            FormatPaneRow::Field(field) => {
+                let row_focused = focused && format_state.field_focus == field;
+                match field {
+                    FormatField::Format => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "format     ",
+                        "",
+                        &render_pill_spans(&format_state.format, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdRate => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "DSD rate   ",
+                        "",
+                        &render_pill_spans(&format_state.sample_rate, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::SampleRate => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "sample rate",
+                        "kHz",
+                        &render_pill_spans(&format_state.sample_rate, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::BitDepth => {
+                        if let Some(preset_spans) = lossy_preset_spans(format_state, row_focused, theme) {
+                            lines.push(pill_row(
+                                border_color,
+                                w,
+                                "preset     ",
+                                "",
+                                &preset_spans,
+                                row_focused,
+                                theme,
+                            ));
+                        } else {
+                            lines.push(pill_row(
+                                border_color,
+                                w,
+                                "bit depth  ",
+                                "bit",
+                                &render_pill_spans(&format_state.bit_depth, row_focused, theme),
+                                row_focused,
+                                theme,
+                            ));
+                        }
+                    }
+                    FormatField::Resampler => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "resampler  ",
+                        "",
+                        &render_pill_spans(&format_state.resampler, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::Dither => {
+                        let ssrc_override = format_state.ssrc_dither_override_active();
+                        let rendered = render_pill_spans(
+                            &format_state.dither,
+                            row_focused && !ssrc_override,
+                            theme,
+                        );
+                        let spans = if ssrc_override {
+                            dim_pill_spans(&rendered, theme)
+                        } else {
+                            rendered
+                        };
+                        lines.push(pill_row(
+                            border_color,
+                            w,
+                            "dither     ",
+                            format_state.ssrc_dither_status_label().unwrap_or(""),
+                            &spans,
+                            row_focused && !ssrc_override,
+                            theme,
+                        ));
+                    }
+                    FormatField::ReplayGain => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "replaygain ",
+                        "",
+                        &render_pill_spans(&format_state.replaygain, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::NoiseShaper => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "noise sh.  ",
+                        "",
+                        &render_pill_spans(&format_state.noise_shaper, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::ModulatorOrder => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "mod order  ",
+                        "",
+                        &render_pill_spans(&format_state.modulator_order, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::ConversionPreset => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "preset     ",
+                        "",
+                        &render_pill_spans(&format_state.conversion_preset, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdPath => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "DSD path   ",
+                        "",
+                        &render_pill_spans(&format_state.dsd_pathway, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdProfile => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "DSD profile",
+                        "",
+                        &render_pill_spans(&format_state.dsd_profile, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdGain => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "DSD gain   ",
+                        "",
+                        &render_enabled_pill_spans(&format_state.dsd_gain_mode, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdGainScope => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "gain scope ",
+                        "",
+                        &render_pill_spans(&format_state.dsd_auto_gain_scope, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::DsdGainDb => lines.push(dsd_db_value_row(
+                        border_color,
+                        w,
+                        "gain dB    ",
+                        format_state.dsd_gain_db,
+                        true,
+                        row_focused,
+                        "",
+                        theme,
+                    )),
+                    FormatField::DsdNormalizeTarget => {
+                        let (label, value) = if format_state.dsd_reference_controls_available() {
+                            ("normalize  ", format_state.dsd_normalize_target_dbfs)
+                        } else {
+                            ("auto margin", format_state.dsd_auto_gain_margin_db)
+                        };
+                        lines.push(dsd_db_value_row(
+                            border_color,
+                            w,
+                            label,
+                            value,
+                            true,
+                            row_focused,
+                            "",
+                            theme,
+                        ));
+                    }
+                    FormatField::Container => {
+                        let containers = format_state.format.selected_value().available_containers();
+                        let spans: Vec<Span> = containers
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, container)| {
+                                let selected = i == format_state.selected_container_index;
+                                let style = if !container.enabled {
+                                    Style::default().fg(theme.text_dim)
+                                } else if selected && row_focused {
+                                    Style::default()
+                                        .fg(theme.pill_active_fg)
+                                        .bg(theme.green)
+                                        .add_modifier(Modifier::BOLD)
+                                } else if selected {
+                                    Style::default().fg(theme.green).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme.text_dim)
+                                };
+                                let mut spans = vec![Span::styled(
+                                    format!(" {} ", container.display_name),
+                                    style,
+                                )];
+                                if i + 1 < containers.len() {
+                                    spans.push(Span::styled(" ", Style::default()));
+                                }
+                                spans
+                            })
+                            .collect();
+                        let has_settings = matches!(
+                            *format_state.format.selected_value(),
+                            crate::convert::formats::AudioFormat::Flac
+                                | crate::convert::formats::AudioFormat::Aac
+                                | crate::convert::formats::AudioFormat::Opus
+                                | crate::convert::formats::AudioFormat::Mp3
+                                | crate::convert::formats::AudioFormat::WavPack
+                        );
+                        if has_settings {
+                            let name = format_state.format.selected_value().name().to_lowercase();
+                            lines.push(container_row_with_settings_pill(
+                                border_color,
+                                w,
+                                &spans,
+                                row_focused,
+                                &name,
+                                theme,
+                            ));
+                        } else {
+                            lines.push(pill_row(
+                                border_color,
+                                w,
+                                "container  ",
+                                "",
+                                &spans,
+                                row_focused,
+                                theme,
+                            ));
+                        }
+                    }
+                    FormatField::ResampleQuality => {
+                        let qualities = format_state.resample_quality_choices();
+                        let count = qualities.len();
+                        let spans: Vec<Span> = qualities
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, (quality, label))| {
+                                let selected = *quality == format_state.resample_quality;
+                                let style = if selected && row_focused {
+                                    Style::default()
+                                        .fg(theme.pill_active_fg)
+                                        .bg(theme.green)
+                                        .add_modifier(Modifier::BOLD)
+                                } else if selected {
+                                    Style::default().fg(theme.green).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme.text_dim)
+                                };
+                                let mut spans = vec![Span::styled(format!(" {label} "), style)];
+                                if i + 1 < count {
+                                    spans.push(Span::styled(" ", Style::default()));
+                                }
+                                spans
+                            })
+                            .collect();
+                        let resampler_name = match *format_state.resampler.selected_value() {
+                            ResamplerChoice::Ssrc => Some("ssrc"),
+                            ResamplerChoice::Sox => Some("sox"),
+                            ResamplerChoice::Soxr => Some("soxr"),
+                            ResamplerChoice::None => None,
+                        };
+                        if let Some(name) = resampler_name {
+                            lines.push(row_with_settings_pill(
+                                border_color,
+                                w,
+                                "preset     ",
+                                &spans,
+                                row_focused,
+                                name,
+                                theme,
+                            ));
+                        } else {
+                            lines.push(pill_row(
+                                border_color,
+                                w,
+                                "preset     ",
+                                "",
+                                &spans,
+                                row_focused,
+                                theme,
+                            ));
+                        }
+                    }
                 }
-                spans
-            })
-            .collect();
-        if has_format_settings {
-            let fmt_name = format_state.format.selected_value().name().to_lowercase();
-            lines.push(container_row_with_settings_pill(
-                border_color, w, &container_spans, focused, &fmt_name, theme));
-        } else {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "container ",
-                "",
-                &container_spans,
-                focused, theme));
-        }
-    }
-
-    // Below-the-fold: quality pill row when maximized and resampler is active.
-    let resampler_active = maximized
-        && !matches!(
-            *format_state.resampler.selected_value(),
-            ResamplerChoice::None
-        );
-    if resampler_active {
-        lines.push(bordered_line(border_color, w, vec![], theme));
-        let resample_label_style = if focused { theme.bright() } else { theme.muted() };
-        lines.push(bordered_line(
-            border_color,
-            w,
-            vec![Span::styled("   resampling", resample_label_style)], theme));
-        use tonepoet_pipeline::enums::ResampleQuality;
-        let mut quality_list: Vec<(ResampleQuality, &str)> = vec![
-            (ResampleQuality::Low, "low"),
-            (ResampleQuality::Medium, "med"),
-            (ResampleQuality::High, "high"),
-            (ResampleQuality::VeryHigh, "vhigh"),
-            (ResampleQuality::Ultra, "ultra"),
-        ];
-        if matches!(*format_state.resampler.selected_value(), ResamplerChoice::Sox | ResamplerChoice::Ssrc) {
-            quality_list.push((ResampleQuality::Insane, "insane"));
-        }
-        let quality_count = quality_list.len();
-        let quality_pills: Vec<Span> = quality_list
-            .iter()
-            .enumerate()
-            .flat_map(|(i, (q, label))| {
-                let selected = *q == format_state.resample_quality;
-                let style = if selected {
-                    Style::default()
-                        .fg(theme.pill_active_fg)
-                        .bg(theme.green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_dim)
-                };
-                let mut spans = vec![Span::styled(format!(" {} ", label), style)];
-                if i < quality_count - 1 {
-                    spans.push(Span::styled(" ", Style::default()));
-                }
-                spans
-            })
-            .collect();
-
-        let resampler_name = match *format_state.resampler.selected_value() {
-            ResamplerChoice::Ssrc => Some("ssrc"),
-            ResamplerChoice::Sox => Some("sox"),
-            ResamplerChoice::Soxr => Some("soxr"),
-            _ => None,
-        };
-        if let Some(name) = resampler_name {
-            lines.push(row_with_settings_pill(
-                border_color,
-                w,
-                "preset     ",
-                &quality_pills,
-                focused,
-                name, theme));
-        } else {
-            lines.push(pill_row(
-                border_color,
-                w,
-                "preset     ",
-                "",
-                &quality_pills,
-                focused, theme));
+            }
         }
     }
 
@@ -403,10 +356,40 @@ pub fn draw_format_pane(
         lines.push(bordered_line(border_color, w, vec![], theme));
     }
     lines.push(bot_line);
-
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_enabled_pill_spans<T: Clone>(
+    state: &super::pill::PillState<T>,
+    row_focused: bool,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (visible_index, (index, option)) in state
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| option.enabled)
+        .enumerate()
+    {
+        if visible_index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let selected = index == state.selected;
+        let style = if selected {
+            Style::default()
+                .fg(theme.pill_active_fg)
+                .bg(theme.pill_active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if row_focused {
+            Style::default().fg(theme.text_muted)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        spans.push(Span::styled(format!(" {} ", option.label), style));
+    }
+    spans
+}
 
 /// Draw the collapsed format title bar.
 pub fn draw_format_title_bar(f: &mut Frame, area: Rect, focused: bool, theme: super::theme::Theme) {
@@ -444,28 +427,6 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
         bar_style,
     ));
     spans.extend(right_spans);
-    Line::from(spans)
-}
-
-fn static_row<'a>(
-    border_color: ratatui::style::Color,
-    width: usize,
-    label: &'a str,
-    value: &'a str,
-    focused: bool,
-    theme: super::theme::Theme,
-) -> Line<'a> {
-    let label_style = if focused { theme.bright() } else { theme.muted() };
-    let value_style = if focused { theme.bright() } else { theme.muted() };
-    let mut spans = vec![
-        Span::styled("│", theme.border(border_color)),
-        Span::styled(format!("   {}  ", label), label_style),
-        Span::styled(value, value_style),
-    ];
-    let content_width: usize = spans.iter().map(|s| s.width()).sum();
-    let padding = width.saturating_sub(content_width + 1);
-    spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 
@@ -512,15 +473,6 @@ fn dsd_db_value_row(
     spans.push(Span::styled("│", theme.border(border_color)));
 
     Line::from(spans)
-}
-
-fn reference_dither_label(depth: BitDepthChoice) -> &'static str {
-    match depth {
-        BitDepthChoice::Int16 => "Shibata (Reference) — locked",
-        BitDepthChoice::Int24 | BitDepthChoice::Source => "TPDF (Reference) — locked",
-        BitDepthChoice::Float32 | BitDepthChoice::Float64 => "none (float) — locked",
-        BitDepthChoice::Int32 => "unsupported Reference depth",
-    }
 }
 
 fn lossy_preset_spans(
