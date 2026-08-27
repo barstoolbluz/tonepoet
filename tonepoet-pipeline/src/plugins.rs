@@ -725,6 +725,10 @@ fn build_ffmpeg_encode_lossy(
     let mut args = ffmpeg_base_input_args(&input);
     add_ffmpeg_metadata_args(context, &mut args, target_format);
     if apply_processing {
+        if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+            args.push("-af".into());
+            args.push(format!("volume={}dB", gain.render(false)));
+        }
         if let Some(rate) = target_rate_hz {
             args.push("-ar".into());
             args.push(rate.to_string());
@@ -1320,23 +1324,11 @@ fn ffmpeg_audio_filter(
     target_depth: Option<PcmBitDepth>,
 ) -> Result<String> {
     let settings = &context.request.settings;
-    let mut opts = vec!["resampler=soxr".to_string()];
-    if let Some(rate) = target_rate_hz {
-        opts.push(format!("out_sample_rate={rate}"));
+    let mut filters = Vec::new();
+    if let Some(gain) = settings.dsd.runtime_album_gain_db() {
+        filters.push(format!("volume={}dB", gain.render(false)));
     }
-    opts.push(format!(
-        "precision={}",
-        mapping::soxr_precision(settings.resample_quality)
-    ));
-    let cutoff = settings.soxr_resampler.cutoff
-        .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
-    opts.push(format!("cutoff={:.3}", cutoff));
-    if settings.soxr_resampler.chebyshev {
-        opts.push("cheby=1".to_string());
-    }
-    if let Some(phase) = settings.soxr_resampler.phase {
-        opts.push(format!("phase_shift={}", phase));
-    }
+
     let ffmpeg_needs_dither = match target_depth {
         Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
         None => match context.request.settings.target_bit_depth {
@@ -1345,38 +1337,54 @@ fn ffmpeg_audio_filter(
                 context.request.source.authoritative_pcm_depth(), depth),
         },
     };
-    if settings.dither_type != DitherType::None {
-        let explicit_int32 = explicit_int32_dither_requested(
-            settings,
-            effective_target_depth(context, target_depth),
-        );
-        match mapping::soxr_dither_method(settings.dither_type) {
-            Some(method) if ffmpeg_needs_dither || explicit_int32 => {
-                opts.push(format!("dither_method={method}"));
-            }
-            None if ffmpeg_needs_dither => {
-                return Err(PlanningError::invalid_settings(
-                    "dither_type",
-                    "selected dither is not supported by FFmpeg/SoXR; select SoX or Auto",
-                ));
-            }
-            _ => {}
+    let aresample_needed = target_rate_hz.is_some()
+        || target_depth.is_some()
+        || settings.dither_type != DitherType::None;
+    if aresample_needed {
+        let mut opts = vec!["resampler=soxr".to_string()];
+        if let Some(rate) = target_rate_hz {
+            opts.push(format!("out_sample_rate={rate}"));
         }
-    }
-    if let Some(depth) = target_depth {
         opts.push(format!(
-            "out_sample_fmt={}",
-            mapping::ffmpeg_sample_fmt(depth)
+            "precision={}",
+            mapping::soxr_precision(settings.resample_quality)
         ));
+        let cutoff = settings.soxr_resampler.cutoff
+            .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
+        opts.push(format!("cutoff={:.3}", cutoff));
+        if settings.soxr_resampler.chebyshev {
+            opts.push("cheby=1".to_string());
+        }
+        if let Some(phase) = settings.soxr_resampler.phase {
+            opts.push(format!("phase_shift={}", phase));
+        }
+        if settings.dither_type != DitherType::None {
+            let explicit_int32 = explicit_int32_dither_requested(
+                settings,
+                effective_target_depth(context, target_depth),
+            );
+            match mapping::soxr_dither_method(settings.dither_type) {
+                Some(method) if ffmpeg_needs_dither || explicit_int32 => {
+                    opts.push(format!("dither_method={method}"));
+                }
+                None if ffmpeg_needs_dither => {
+                    return Err(PlanningError::invalid_settings(
+                        "dither_type",
+                        "selected dither is not supported by FFmpeg/SoXR; select SoX or Auto",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(depth) = target_depth {
+            opts.push(format!(
+                "out_sample_fmt={}",
+                mapping::ffmpeg_sample_fmt(depth)
+            ));
+        }
+        filters.push(format!("aresample={}", opts.join(":")));
     }
-    if target_rate_hz.is_none()
-        && settings.dither_type == DitherType::None
-        && target_depth.is_none()
-    {
-        Ok(String::new())
-    } else {
-        Ok(format!("aresample={}", opts.join(":")))
-    }
+    Ok(filters.join(","))
 }
 
 fn add_ffmpeg_pcm_encoder_args(
@@ -1435,6 +1443,12 @@ fn build_wavpack_hybrid_encode(
     context: &PlanContext<'_>,
     step: &PlanStep,
 ) -> Result<PlannedCommand> {
+    if context.request.settings.dsd.runtime_album_gain_db().is_some() {
+        return Err(PlanningError::invalid_settings(
+            "dsd.auto_gain_scope",
+            "album-scoped DSD auto-gain is not available with WavPack hybrid output because the native hybrid encoder cannot apply the submitted-batch fixed-gain authority",
+        ));
+    }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let settings = &context.request.settings.wavpack;
@@ -1511,6 +1525,10 @@ fn add_sox_pcm_effects(
     target_rate_hz: Option<u32>,
     target_depth: Option<PcmBitDepth>,
 ) {
+    if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+        args.push("gain".into());
+        args.push(gain.render(false));
+    }
     if let Some(rate) = target_rate_hz {
         let sox_rs = &context.request.settings.sox_resampler;
 
@@ -2001,6 +2019,94 @@ mod tests {
             settings,
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+
+    fn album_gain_pcm_request(target_format: AudioFormat) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = target_format.clone();
+        settings.target_sample_rate = crate::enums::RateTarget::PcmHz(96_000);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        settings
+            .dsd
+            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
+        settings
+            .dsd
+            .set_runtime_album_gain_db(Some("2.125000000".parse().unwrap()));
+        let mut request = pcm_request_with(settings, PcmBitDepth::Float64);
+        request.source.source_representation = crate::source::SourceRepresentationKind::Dsd;
+        request.source.true_source_depth = None;
+        request.input_path = PathBuf::from("album-carrier.caf");
+        request.output_path = match target_format {
+            AudioFormat::Mp3 => PathBuf::from("output.mp3"),
+            _ => PathBuf::from("output.flac"),
+        };
+        request
+    }
+
+    fn album_gain_encode_step(target_format: AudioFormat, apply_processing: bool) -> PlanStep {
+        PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing,
+            },
+            InputSource::Path(PathBuf::from("album-carrier.caf")),
+            OutputSink::Path(PathBuf::from("output.flac")),
+            "album gain application test",
+        )
+    }
+
+    #[test]
+    fn ffmpeg_pcm_album_gain_is_owned_only_by_processing_encode_step() {
+        let request = album_gain_pcm_request(AudioFormat::Flac);
+        for (apply_processing, expected_count) in [(false, 0), (true, 1)] {
+            let step = album_gain_encode_step(AudioFormat::Flac, apply_processing);
+            let command = build_ffmpeg_encode_pcm(
+                &request.context(),
+                &step,
+                &AudioFormat::Flac,
+                None,
+                PcmBitDepth::Int24,
+                apply_processing,
+            )
+            .expect("FFmpeg album-gain encode command");
+            let count = command
+                .args
+                .iter()
+                .filter(|arg| arg.contains("volume=2.125000000dB"))
+                .count();
+            assert_eq!(count, expected_count, "{:?}", command.args);
+        }
+    }
+
+    #[test]
+    fn sox_pcm_album_gain_is_owned_only_by_processing_encode_step() {
+        let request = album_gain_pcm_request(AudioFormat::Flac);
+        for (apply_processing, expected_count) in [(false, 0), (true, 1)] {
+            let step = album_gain_encode_step(AudioFormat::Flac, apply_processing);
+            let command = build_sox_encode_pcm(
+                &request.context(),
+                &step,
+                &AudioFormat::Flac,
+                None,
+                PcmBitDepth::Int24,
+                apply_processing,
+            )
+            .expect("SoX album-gain encode command");
+            let count = command
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "gain" && pair[1] == "2.125000000")
+                .count();
+            assert_eq!(count, expected_count, "{:?}", command.args);
         }
     }
 

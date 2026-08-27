@@ -6,7 +6,7 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
+    DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
     NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
@@ -397,6 +397,40 @@ fn validate_metadata(settings: &PipelineSettings) -> Result<()> {
 }
 
 fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
+    if settings.runtime_album_gain_db().is_some() && !settings.album_auto_gain_selected() {
+        return Err(PlanningError::invalid_settings(
+            "dsd.runtime_album_gain_db",
+            "runtime album gain may be bound only for an active album-scoped automatic DSD gain mode",
+        ));
+    }
+    if settings.runtime_album_track_count().is_some() && settings.runtime_album_gain_db().is_none() {
+        return Err(PlanningError::invalid_settings(
+            "dsd.runtime_album_track_count",
+            "runtime album measurement context requires a bound album gain",
+        ));
+    }
+    if settings.runtime_album_loudest_peak_dbfs().is_some()
+        && settings.runtime_album_gain_db().is_none()
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.runtime_album_loudest_peak_dbfs",
+            "runtime album measurement context requires a bound album gain",
+        ));
+    }
+    if settings.runtime_album_track_count() == Some(0) {
+        return Err(PlanningError::invalid_settings(
+            "dsd.runtime_album_track_count",
+            "runtime album measurement context must represent at least one DSD track",
+        ));
+    }
+    if settings.runtime_album_loudest_peak_dbfs().is_some()
+        && settings.runtime_album_track_count().is_none()
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.runtime_album_track_count",
+            "a finite album peak requires the measured DSD track count",
+        ));
+    }
     if let Some(legacy) = settings.legacy_wire() {
         validate_finite_f32(
             "dsd.dsd_to_pcm_auto_gain_margin_db",
@@ -780,6 +814,16 @@ pub struct DsdSettings {
     pub pcm_to_dsd: PcmToDsdSettings,
     /// Native-v2 DSD-source Reference controls.
     pub from_dsd: DsdSourceSettings,
+    /// Automatic DSD peak-normalization scope. Track is the compatibility default.
+    auto_gain_scope: DsdAutoGainScope,
+    /// Runtime-only fixed album gain bound after submitted-batch analysis.
+    /// Never serialized. Once bound, it is included in the execution
+    /// fingerprint because it changes output bytes.
+    runtime_album_gain_db: Option<DbNano>,
+    /// Runtime-only loudest reported peak that authorized the shared gain.
+    runtime_album_loudest_peak_dbfs: Option<DbNano>,
+    /// Runtime-only number of measured DSD tracks in the submitted scope.
+    runtime_album_track_count: Option<usize>,
     /// Private wire/behavior origin. Pre-promotion defaults and exact legacy
     /// deserialization retain `LegacyFlatV1`; native v2 is explicit opt-in.
     pub(crate) origin: DsdSettingsOrigin,
@@ -923,6 +967,10 @@ impl DsdSettings {
         Self {
             pcm_to_dsd: PcmToDsdSettings::default(),
             from_dsd: DsdSourceSettings::default(),
+            auto_gain_scope: DsdAutoGainScope::Track,
+            runtime_album_gain_db: None,
+            runtime_album_loudest_peak_dbfs: None,
+            runtime_album_track_count: None,
             origin: DsdSettingsOrigin::NativeV2,
         }
     }
@@ -933,6 +981,10 @@ impl DsdSettings {
         Self {
             pcm_to_dsd: legacy_pcm_to_dsd(wire),
             from_dsd: legacy_from_dsd_mirror(wire),
+            auto_gain_scope: DsdAutoGainScope::Track,
+            runtime_album_gain_db: None,
+            runtime_album_loudest_peak_dbfs: None,
+            runtime_album_track_count: None,
             origin: DsdSettingsOrigin::LegacyFlatV1(wire),
         }
     }
@@ -961,9 +1013,108 @@ impl DsdSettings {
             DsdSettingsOrigin::LegacyFlatV1(_) => Self {
                 pcm_to_dsd: self.pcm_to_dsd,
                 from_dsd: DsdSourceSettings::default(),
+                auto_gain_scope: self.auto_gain_scope,
+                runtime_album_gain_db: None,
+                runtime_album_loudest_peak_dbfs: None,
+                runtime_album_track_count: None,
                 origin: DsdSettingsOrigin::NativeV2,
             },
         }
+    }
+
+    /// Return the configured automatic peak-normalization scope.
+    #[must_use]
+    pub const fn auto_gain_scope(&self) -> DsdAutoGainScope {
+        self.auto_gain_scope
+    }
+
+    /// Set the automatic DSD peak-normalization scope.
+    pub fn set_auto_gain_scope(&mut self, scope: DsdAutoGainScope) {
+        self.auto_gain_scope = scope;
+        self.clear_runtime_album_gain();
+    }
+
+    /// True when the selected DSD gain mode makes album scope effective.
+    #[must_use]
+    pub fn album_auto_gain_selected(&self) -> bool {
+        self.auto_gain_scope == DsdAutoGainScope::Album
+            && match self.origin {
+                DsdSettingsOrigin::LegacyFlatV1(wire) => {
+                    wire.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Auto
+                }
+                DsdSettingsOrigin::NativeV2 => {
+                    self.from_dsd.gain_mode == DsdSourceGainMode::NormalizePeak
+                }
+            }
+    }
+
+    /// Target peak in exact nanodecibels when album auto-gain is active.
+    #[must_use]
+    pub fn album_auto_gain_target_dbfs(&self) -> Option<DbNano> {
+        if !self.album_auto_gain_selected() {
+            return None;
+        }
+        match self.origin {
+            DsdSettingsOrigin::LegacyFlatV1(wire) => {
+                // Match the live legacy SoX command exactly: Auto has always
+                // rendered its margin to two decimal places (`norm -{:.2}`).
+                // Converting the binary f32 directly to nanodecibels would turn
+                // 0.15 into 0.150000006 and subtly change established semantics.
+                format!("-{:.2}", wire.dsd_to_pcm_auto_gain_margin_db)
+                    .parse::<DbNano>()
+                    .ok()
+            }
+            DsdSettingsOrigin::NativeV2 => Some(self.from_dsd.normalize_peak_target_dbfs),
+        }
+    }
+
+    /// Bind only the runtime fixed gain. This narrow setter exists for planner
+    /// tests and compatibility callers; production submitted-batch execution
+    /// should use [`Self::bind_runtime_album_gain`] so the durable conversion
+    /// summary can explain the aggregate authority. This setter always clears
+    /// aggregate context so a gain-only update can never retain stale peak or
+    /// track-count provenance from an earlier authority.
+    pub fn set_runtime_album_gain_db(&mut self, gain: Option<DbNano>) {
+        self.runtime_album_gain_db = gain;
+        self.runtime_album_loudest_peak_dbfs = None;
+        self.runtime_album_track_count = None;
+    }
+
+    /// Bind the complete runtime authority derived from one submitted batch.
+    pub fn bind_runtime_album_gain(
+        &mut self,
+        gain: DbNano,
+        loudest_peak_dbfs: Option<DbNano>,
+        track_count: usize,
+    ) {
+        self.runtime_album_gain_db = Some(gain);
+        self.runtime_album_loudest_peak_dbfs = loudest_peak_dbfs;
+        self.runtime_album_track_count = Some(track_count);
+    }
+
+    /// Clear every runtime-only album-gain authority field.
+    pub fn clear_runtime_album_gain(&mut self) {
+        self.runtime_album_gain_db = None;
+        self.runtime_album_loudest_peak_dbfs = None;
+        self.runtime_album_track_count = None;
+    }
+
+    /// Runtime fixed gain to apply to a decoded album carrier, if any.
+    #[must_use]
+    pub const fn runtime_album_gain_db(&self) -> Option<DbNano> {
+        self.runtime_album_gain_db
+    }
+
+    /// Loudest reported peak in the submitted DSD measurement scope.
+    #[must_use]
+    pub const fn runtime_album_loudest_peak_dbfs(&self) -> Option<DbNano> {
+        self.runtime_album_loudest_peak_dbfs
+    }
+
+    /// Number of measured DSD tracks represented by the runtime authority.
+    #[must_use]
+    pub const fn runtime_album_track_count(&self) -> Option<usize> {
+        self.runtime_album_track_count
     }
 
     /// Materialize the exact flat compatibility view used by the frozen v1
@@ -1046,6 +1197,7 @@ impl DsdSettings {
             }
         }
 
+        let scope = self.auto_gain_scope;
         let mut wire = self.legacy_compat_wire();
         wire.dsd_to_pcm_gain_mode = mode;
         wire.dsd_to_pcm_auto_gain_margin_db = if mode == DsdToPcmGainMode::Auto {
@@ -1059,6 +1211,7 @@ impl DsdSettings {
             None
         };
         *self = Self::from_legacy_wire(wire);
+        self.auto_gain_scope = scope;
         Ok(())
     }
 
@@ -1143,20 +1296,51 @@ impl serde::Serialize for DsdSettings {
     where
         S: serde::Serializer,
     {
+        use serde::ser::SerializeMap;
+
         match self.origin {
-            DsdSettingsOrigin::NativeV2 => DsdSettingsWireV2 {
-                schema_version: 2,
-                pcm_to_dsd: self.pcm_to_dsd,
-                from_dsd: self.from_dsd,
+            DsdSettingsOrigin::NativeV2 if self.auto_gain_scope == DsdAutoGainScope::Track => {
+                DsdSettingsWireV2 {
+                    schema_version: 2,
+                    pcm_to_dsd: self.pcm_to_dsd,
+                    from_dsd: self.from_dsd,
+                }
+                .serialize(serializer)
             }
-            .serialize(serializer),
+            DsdSettingsOrigin::NativeV2 => {
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("schema_version", &2_u32)?;
+                map.serialize_entry("pcm_to_dsd", &self.pcm_to_dsd)?;
+                map.serialize_entry("from_dsd", &self.from_dsd)?;
+                map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
+                map.end()
+            }
             DsdSettingsOrigin::LegacyFlatV1(wire) => {
                 if !legacy_mirror_matches(self, wire) {
                     return Err(serde::ser::Error::custom(
                         "native DSD-source settings were edited on a legacy value; explicitly migrate it to native v2 before serialization",
                     ));
                 }
-                self.legacy_compat_wire().serialize(serializer)
+                if self.auto_gain_scope == DsdAutoGainScope::Track {
+                    return self.legacy_compat_wire().serialize(serializer);
+                }
+                let wire = self.legacy_compat_wire();
+                let mut map = serializer.serialize_map(Some(11))?;
+                map.serialize_entry("noise_shaper", &wire.noise_shaper)?;
+                map.serialize_entry("modulator_order", &wire.modulator_order)?;
+                map.serialize_entry("trellis", &wire.trellis)?;
+                map.serialize_entry("pcm_to_dsd_filter", &wire.pcm_to_dsd_filter)?;
+                map.serialize_entry("dsd_to_pcm_lowpass", &wire.dsd_to_pcm_lowpass)?;
+                map.serialize_entry("dsd_to_pcm_gain_mode", &wire.dsd_to_pcm_gain_mode)?;
+                map.serialize_entry(
+                    "dsd_to_pcm_auto_gain_margin_db",
+                    &wire.dsd_to_pcm_auto_gain_margin_db,
+                )?;
+                map.serialize_entry("dsd_to_pcm_gain_db", &wire.dsd_to_pcm_gain_db)?;
+                map.serialize_entry("sinc", &wire.sinc)?;
+                map.serialize_entry("gain_compensation", &wire.gain_compensation)?;
+                map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
+                map.end()
             }
         }
     }
@@ -1198,6 +1382,7 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                 let mut dsd_to_pcm_gain_db_seen = false;
                 let mut sinc = None;
                 let mut gain_compensation = None;
+                let mut auto_gain_scope = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     macro_rules! unique {
@@ -1230,12 +1415,13 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                         }
                         "sinc" => unique!(sinc, map.next_value::<PcmToDsdSincSettings>()?),
                         "gain_compensation" => unique!(gain_compensation, map.next_value::<GainCompensation>()?),
+                        "auto_gain_scope" => unique!(auto_gain_scope, map.next_value::<DsdAutoGainScope>()?),
                         _ => return Err(A::Error::unknown_field(&key, &[
                             "schema_version", "pcm_to_dsd", "from_dsd", "noise_shaper",
                             "modulator_order", "trellis", "pcm_to_dsd_filter",
                             "dsd_to_pcm_lowpass", "dsd_to_pcm_gain_mode",
                             "dsd_to_pcm_auto_gain_margin_db", "dsd_to_pcm_gain_db", "sinc",
-                            "gain_compensation",
+                            "gain_compensation", "auto_gain_scope",
                         ])),
                     }
                 }
@@ -1255,6 +1441,10 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                     return Ok(DsdSettings {
                         pcm_to_dsd: pcm_to_dsd.ok_or_else(|| A::Error::missing_field("pcm_to_dsd"))?,
                         from_dsd: from_dsd.ok_or_else(|| A::Error::missing_field("from_dsd"))?,
+                        auto_gain_scope: auto_gain_scope.unwrap_or_default(),
+                        runtime_album_gain_db: None,
+                        runtime_album_loudest_peak_dbfs: None,
+                        runtime_album_track_count: None,
                         origin: DsdSettingsOrigin::NativeV2,
                     });
                 }
@@ -1271,7 +1461,9 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                     sinc: sinc.ok_or_else(|| A::Error::missing_field("sinc"))?,
                     gain_compensation: gain_compensation.ok_or_else(|| A::Error::missing_field("gain_compensation"))?,
                 };
-                Ok(DsdSettings::from_legacy_wire(wire))
+                let mut settings = DsdSettings::from_legacy_wire(wire);
+                settings.auto_gain_scope = auto_gain_scope.unwrap_or_default();
+                Ok(settings)
             }
         }
 
@@ -1664,6 +1856,38 @@ mod legacy_dsd_gain_mutation_tests {
     }
 
     #[test]
+    fn legacy_album_target_matches_existing_two_decimal_sox_norm_rendering() {
+        let mut settings = DsdSettings::default();
+        settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+        assert_eq!(
+            settings.album_auto_gain_target_dbfs(),
+            Some("-0.150000000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_is_rejected_outside_active_album_automatic_mode() {
+        let mut pipeline = PipelineSettings::default();
+        pipeline
+            .dsd
+            .set_runtime_album_gain_db(Some("1.000000000".parse().unwrap()));
+        assert!(pipeline.validate().is_err());
+
+        pipeline
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        pipeline.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        pipeline
+            .dsd
+            .set_runtime_album_gain_db(Some("1.000000000".parse().unwrap()));
+        assert!(pipeline.validate().is_ok());
+    }
+
+    #[test]
     fn exact_legacy_gain_mutation_never_creates_a_mixed_native_origin() {
         let mut settings = DsdSettings::native_v2();
         assert!(settings
@@ -1689,5 +1913,55 @@ mod pipeline_settings_serde_compatibility_tests {
         let decoded: PipelineSettings =
             serde_json::from_value(value).expect("deserialize legacy pipeline settings");
         assert!(!decoded.dither_explicit);
+    }
+
+
+    #[test]
+    fn legacy_album_gain_scope_round_trips_without_serializing_runtime_authority() {
+        let mut settings = PipelineSettings::default();
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings.dsd.bind_runtime_album_gain(
+            "2.125000000".parse().unwrap(),
+            Some("-2.285000000".parse().unwrap()),
+            12,
+        );
+
+        let value = serde_json::to_value(&settings).expect("serialize album settings");
+        assert_eq!(value["dsd"]["auto_gain_scope"], "album");
+        assert!(value["dsd"].get("runtime_album_gain_db").is_none());
+        assert!(value["dsd"].get("runtime_album_loudest_peak_dbfs").is_none());
+        assert!(value["dsd"].get("runtime_album_track_count").is_none());
+
+        let decoded: PipelineSettings =
+            serde_json::from_value(value).expect("deserialize album settings");
+        assert_eq!(decoded.dsd.auto_gain_scope(), DsdAutoGainScope::Album);
+        assert_eq!(decoded.dsd.runtime_album_gain_db(), None);
+        assert_eq!(decoded.dsd.runtime_album_loudest_peak_dbfs(), None);
+        assert_eq!(decoded.dsd.runtime_album_track_count(), None);
+        assert!(decoded.dsd.album_auto_gain_selected());
+    }
+
+    #[test]
+    fn native_album_gain_scope_round_trips_and_track_wire_stays_unchanged() {
+        let track = DsdSettings::native_v2();
+        let track_value = serde_json::to_value(track).expect("serialize native track settings");
+        assert!(track_value.get("auto_gain_scope").is_none());
+
+        let mut album = DsdSettings::native_v2();
+        album.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+        album.set_auto_gain_scope(DsdAutoGainScope::Album);
+        let value = serde_json::to_value(album).expect("serialize native album settings");
+        assert_eq!(value["auto_gain_scope"], "album");
+
+        let decoded: DsdSettings =
+            serde_json::from_value(value).expect("deserialize native album settings");
+        assert!(decoded.is_native_v2());
+        assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Album);
+        assert!(decoded.album_auto_gain_selected());
+        assert_eq!(decoded.runtime_album_gain_db(), None);
     }
 }

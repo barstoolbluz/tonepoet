@@ -720,3 +720,17 @@ impl Default for DsdToPcmGainMode {
         Self::Disabled
     }
 }
+
+/// Peak-normalization scope for DSD-to-PCM automatic gain.
+///
+/// `Track` preserves the historical one-input SoX `norm` behavior. `Album`
+/// requests one submitted-batch authority derived from the loudest DSD track.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum DsdAutoGainScope {
+    /// Normalize each DSD track independently. This is the compatibility default.
+    #[default]
+    Track,
+    /// Normalize all DSD tracks in one submitted conversion batch with one gain.
+    Album,
+}

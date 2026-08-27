@@ -159,6 +159,17 @@ pub struct TrackProgress {
 pub struct ConversionItem {
     /// Unique identifier
     pub id: String,
+    /// Opaque identity for the exact set admitted by one user submission.
+    ///
+    /// Album-scoped DSD auto-gain uses this only as an execution barrier key;
+    /// album membership is never inferred from tags, folders, or disc layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
+    /// Number of queue items admitted by the same submitted batch. Album-gain
+    /// execution refuses a partial persisted cohort rather than silently
+    /// changing scope after interruption/retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_size: Option<u32>,
     /// Input file path
     pub input_path: PathBuf,
     /// Detected input format (archive or audio)
@@ -249,6 +260,8 @@ impl Default for ConversionItem {
     fn default() -> Self {
         Self {
             id: String::new(),
+            submission_id: None,
+            submission_size: None,
             input_path: PathBuf::new(),
             input_format: FileFormat::Audio(AudioFormat::Flac),
             output_format: AudioFormat::Flac,
@@ -288,6 +301,8 @@ impl ConversionItem {
 
         Self {
             id,
+            submission_id: None,
+            submission_size: None,
             input_path,
             input_format,
             output_format: options.output_format,

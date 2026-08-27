@@ -445,6 +445,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             dsd.set_legacy_dsd_to_pcm_gain(mode, margin, gain)
                 .map_err(|error| error.to_string())?;
         }
+        dsd.set_auto_gain_scope(*format.dsd_auto_gain_scope.selected_value());
     }
     if is_dsd {
         dsd.pcm_to_dsd.noise_shaper = *format.noise_shaper.selected_value();

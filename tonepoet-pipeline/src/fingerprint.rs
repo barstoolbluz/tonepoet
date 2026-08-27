@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::enums::{
     AacProfile, AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
+    DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
     NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcProfile, WavPackMode,
@@ -56,12 +56,12 @@ impl std::fmt::Display for SettingsFingerprint {
 }
 
 
-/// Canonical field-path inventory covered by [`settings_fingerprint`].
+/// Frozen manifest-v1 field-path inventory covered by [`settings_fingerprint`].
 ///
 /// The list is public so integration tests can compare handoff, legacy, and
-/// mutation coverage against the same conversion-affecting field set. Some
-/// paths are mode-scoped: they are emitted only when the selected mode makes
-/// them output-affecting.
+/// mutation coverage against the same compatibility field set. Additive,
+/// mode-scoped extensions that must not perturb historical track-scoped
+/// fingerprints are inventoried separately.
 pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "target_format",
     "target_sample_rate",
@@ -136,8 +136,20 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "replay_gain.existing_tags",
 ];
 
-/// Number of conversion-affecting field paths in [`SETTINGS_FINGERPRINT_FIELD_PATHS`].
+/// Number of compatibility field paths in [`SETTINGS_FINGERPRINT_FIELD_PATHS`].
 pub const SETTINGS_FINGERPRINT_FIELD_COUNT: usize = SETTINGS_FINGERPRINT_FIELD_PATHS.len();
+
+/// Additive fingerprint fields used only by submitted-batch DSD album gain.
+///
+/// Keeping these outside [`SETTINGS_FINGERPRINT_FIELD_PATHS`] is deliberate:
+/// the compatibility inventory and all track-scoped fingerprints stay frozen,
+/// while album scope and its resolved fixed gain still participate whenever
+/// they can change output bytes.
+pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
+    "dsd.auto_gain_scope",
+    "dsd.album_native_from_dsd_profile",
+    "dsd.album_gain_db",
+];
 
 /// Native-v2 DSD settings paths written by [`settings_snapshot_fingerprint_v2`].
 ///
@@ -550,6 +562,14 @@ fn push_native_dsd_v2(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         "dsd.from_dsd.normalize_peak_target_dbfs",
         from.normalize_peak_target_dbfs.render(false),
     );
+    if from.gain_mode == crate::DsdSourceGainMode::NormalizePeak
+        && settings.auto_gain_scope() == DsdAutoGainScope::Album
+    {
+        writer.field_static("dsd.auto_gain_scope", "album");
+        if let Some(gain) = settings.runtime_album_gain_db() {
+            writer.field_string("dsd.album_gain_db", gain.render(false));
+        }
+    }
 }
 
 fn push_sinc_v2(writer: &mut FingerprintWriter, settings: &SincFilterSettings) {
@@ -752,6 +772,30 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         dsd_lowpass_method(legacy.dsd_to_pcm_lowpass),
     );
     push_legacy_dsd_to_pcm_gain(writer, legacy);
+    // This additive extension is intentionally outside the frozen v1 field
+    // inventory. It applies to either automatic regime, so native-v2
+    // NormalizePeak+Album remains byte-identifying after Reference promotion
+    // without perturbing any historical track-scoped fingerprint.
+    if settings.album_auto_gain_selected() {
+        writer.field_static("dsd.auto_gain_scope", "album");
+        // Native album-mode reconstruction is deliberately unqualified and
+        // therefore still uses the legacy manifest-v1 settings fingerprint.
+        // Bind only the native reconstruction selector consumed by the album
+        // analysis command; track scope and legacy album fingerprints remain
+        // byte-for-byte unchanged.
+        if settings.is_native_v2() {
+            writer.field_static(
+                "dsd.album_native_from_dsd_profile",
+                match settings.from_dsd.profile {
+                    crate::DsdReconstructionSelection::Reference => "reference",
+                    crate::DsdReconstructionSelection::Wideband => "wideband",
+                },
+            );
+        }
+        if let Some(gain) = settings.runtime_album_gain_db() {
+            writer.field_string("dsd.album_gain_db", gain.render(false));
+        }
+    }
     push_sinc(writer, &pcm.sinc);
     writer.field_string(
         "dsd.gain_compensation",

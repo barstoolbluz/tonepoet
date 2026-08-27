@@ -3629,6 +3629,7 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::DsdGain => format.dsd_gain_mode.selected_label().to_string(),
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
         FormatField::DsdNormalizeTarget => format.dsd_normalize_target_dbfs.render(false),
+        FormatField::DsdGainScope => format.dsd_auto_gain_scope.selected_label().to_string(),
     }
 }
 

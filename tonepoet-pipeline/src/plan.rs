@@ -64,7 +64,10 @@ pub fn selects_reference_dsd_to_pcm(
     settings: &PipelineSettings,
     source_is_dsd: bool,
 ) -> bool {
-    source_is_dsd && settings.dsd.is_native_v2() && !settings.target_format.is_dsd()
+    source_is_dsd
+        && settings.dsd.is_native_v2()
+        && !settings.dsd.album_auto_gain_selected()
+        && !settings.target_format.is_dsd()
 }
 
 impl PlanRequest {
@@ -1390,13 +1393,29 @@ fn plan_from_pcm(
     final_work: PathBuf,
 ) -> Result<()> {
     let processing_rate = rate_change_for_pcm(request);
+    if request.settings.dsd.runtime_album_gain_db().is_some() {
+        if request.source.representation_kind() != SourceRepresentationKind::Dsd {
+            return Err(PlanningError::invalid_source(
+                "source_representation",
+                "runtime DSD album gain may be applied only to a retained carrier whose original source representation is DSD",
+            ));
+        }
+        if processing_rate.is_some() {
+            return Err(PlanningError::invalid_source(
+                "sample_rate_hz",
+                "runtime DSD album gain carrier rate must already equal the requested final PCM rate",
+            ));
+        }
+    }
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
     let depth_change = match request.settings.target_bit_depth {
         BitDepthTarget::Source => false,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
     };
-    let needs_processing = processing_rate.is_some() || depth_change;
+    let needs_processing = processing_rate.is_some()
+        || depth_change
+        || request.settings.dsd.runtime_album_gain_db().is_some();
     let needs_ssrc = processing_rate.is_some()
         && (request.settings.nyquist_transition == NyquistTransition::BrickWall
             || request.settings.ssrc.force);
@@ -1802,6 +1821,103 @@ mod reference_admission_tests {
         pcm_source.sample_rate_hz = Some(44_100);
         pcm_source.source_representation = SourceRepresentationKind::Pcm;
         assert!(!selects_reference_dsd_to_pcm(&settings, pcm_source.is_dsd()));
+    }
+}
+
+#[cfg(test)]
+mod dsd_album_gain_carrier_planning_tests {
+    use super::*;
+    use crate::enums::{
+        AudioCodec, AudioFormat, BitDepthTarget, DsdAutoGainScope, DsdToPcmGainMode,
+        PcmBitDepth, RateTarget, SampleKind,
+    };
+    use crate::settings::PipelineSettings;
+    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use std::path::PathBuf;
+
+    fn carrier_request(source_rate_hz: u32) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings
+            .dsd
+            .set_runtime_album_gain_db(Some("2.125000000".parse().unwrap()));
+        PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("album-carrier.caf"),
+            output_path: PathBuf::from("output.flac"),
+            source: SourceInfo {
+                dsd_source_kind: None,
+                format: AudioFormat::Wav,
+                codec: AudioCodec::PcmFloat,
+                sample_rate_hz: Some(source_rate_hz),
+                bit_depth: Some(PcmBitDepth::Float64),
+                true_source_depth: None,
+                source_representation: SourceRepresentationKind::Dsd,
+                sample_kind: Some(SampleKind::Float),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_album_gain_requires_dsd_semantic_carrier() {
+        let mut request = carrier_request(96_000);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        let error = plan_topology(&request).expect_err("PCM authority must not receive DSD album gain");
+        assert!(
+            error.to_string().contains("runtime DSD album gain may be applied only"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_carrier_must_already_be_at_final_rate() {
+        let request = carrier_request(88_200);
+        let error = plan_topology(&request).expect_err("post-measurement resampling must be refused");
+        assert!(
+            error.to_string().contains("carrier rate must already equal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_forces_one_processing_encode_without_resample() {
+        let request = carrier_request(96_000);
+        let topology = plan_topology(&request).expect("valid retained DSD carrier topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force an executable encode");
+        };
+        let processing_encodes = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    &step.operation,
+                    PlanOperation::EncodePcm {
+                        apply_processing: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(processing_encodes, 1, "{steps:#?}");
+        assert!(
+            !steps.iter().any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "post-measurement resampling would invalidate the measured peak: {steps:#?}"
+        );
     }
 }
 

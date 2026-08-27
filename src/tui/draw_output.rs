@@ -223,6 +223,19 @@ pub fn draw_format_pane(
                 focused && format_state.field_focus == FormatField::DsdGain,
                 theme,
             ));
+            lines.push(pill_row(
+                border_color,
+                w,
+                "gain scope ",
+                "",
+                &render_pill_spans(
+                    &format_state.dsd_auto_gain_scope,
+                    focused && format_state.field_focus == FormatField::DsdGainScope,
+                    theme,
+                ),
+                focused && format_state.field_focus == FormatField::DsdGainScope,
+                theme,
+            ));
             lines.push(dsd_db_value_row(
                 border_color,
                 w,

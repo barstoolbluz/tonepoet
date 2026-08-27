@@ -1111,6 +1111,16 @@ pub enum TrackSourceRef {
         /// Channel count required to build an unambiguous raw/graph stream.
         channels: u16,
     },
+    /// Audio-only Float64 CAF produced by the album-scoped DSD analysis pass.
+    /// The path is a retained post-reconstruction PCM carrier; `source_path`
+    /// remains the original source identity for provenance/metadata policy.
+    DsdAlbumGainCarrier {
+        path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        channels: u16,
+        duration: Option<std::time::Duration>,
+    },
     CueSegmentCarrier {
         /// Validated, sample-bounded CUE segment carrier produced by the
         /// materializer. This is an audio-only PCM WAV carrier (`pcm_s32le`

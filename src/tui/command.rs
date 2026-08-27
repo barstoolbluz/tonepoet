@@ -8316,6 +8316,25 @@ fn queue_browse_convert_paths_for_processing(
     } else {
         None
     };
+    let submission_size = match u32::try_from(paths.len()) {
+        Ok(0) => {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                &synthetic_cue_artifacts,
+            );
+            app.set_status("queue admission found no supported conversion paths".to_string());
+            return;
+        }
+        Ok(size) => size,
+        Err(_) => {
+            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                &synthetic_cue_artifacts,
+            );
+            app.set_status("queue admission refused a submission too large to represent safely".to_string());
+            return;
+        }
+    };
+    let submission_id = uuid::Uuid::new_v4().to_string();
+
     let mut options = options;
     if options.pipeline_settings.is_none() {
         match crate::convert::pipeline::unified_request::pipeline_settings_from_legacy_options(
@@ -8364,12 +8383,17 @@ fn queue_browse_convert_paths_for_processing(
         let archive_reference = archive_password
             .as_deref()
             .map(super::keychain::reference_for_password);
-        match app.manager.add_file_ready_for_processing_with_cue_metadata_decision(
-            path.clone(),
-            options.clone(),
-            archive_password.clone(),
-            cue_decision,
-        ) {
+        match app
+            .manager
+            .add_file_ready_for_processing_with_cue_metadata_decision_for_submission(
+                path.clone(),
+                options.clone(),
+                archive_password.clone(),
+                cue_decision,
+                &submission_id,
+                submission_size,
+            )
+        {
             Ok(item_id) => {
                 // Synthetic album-CUE artifacts are transactionally registered
                 // by the manager's ready-admission helper while the queue write
@@ -14853,7 +14877,7 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target, verification)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-scope, dsd-gain-db, dsd-auto-margin, dsd-normalize-target, verification)",
         );
         return;
     }
@@ -14864,7 +14888,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         );
         return;
     }
-    let dsd_gain_key = matches!(key, "dsd-gain" | "dsd-gain-db" | "dsd-auto-margin");
+    let dsd_gain_key = matches!(
+        key,
+        "dsd-gain" | "dsd-gain-scope" | "dsd-gain-db" | "dsd-auto-margin"
+    );
     if dsd_gain_key && !app.convert.format.dsd_to_pcm_gain_available() {
         app.set_status("DSD gain controls require a DSD source and a PCM output target");
         return;
@@ -14925,6 +14952,12 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "dsd-gain = {}",
                     app.convert.format.dsd_gain_mode.selected_label()
+                ));
+            }
+            "dsd-gain-scope" => {
+                app.set_status(format!(
+                    "dsd-gain-scope = {}",
+                    app.convert.format.dsd_auto_gain_scope.selected_label()
                 ));
             }
             "dsd-gain-db" => {
@@ -15237,6 +15270,26 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status("Unknown dsd-gain. Try: disabled, auto, manual, reference, native, fixed, normalize");
             }
         }
+        "dsd-gain-scope" => {
+            let scope = match value.to_ascii_lowercase().as_str() {
+                "track" => Some(tonepoet_pipeline::DsdAutoGainScope::Track),
+                "album" => Some(tonepoet_pipeline::DsdAutoGainScope::Album),
+                _ => None,
+            };
+            if let Some(scope) = scope {
+                if app.convert.format.dsd_auto_gain_scope.select_value(&scope) {
+                    app.preset.mark_modified();
+                    app.set_status(format!(
+                        "dsd-gain-scope = {}",
+                        app.convert.format.dsd_auto_gain_scope.selected_label()
+                    ));
+                } else {
+                    app.set_status("That DSD gain scope is unavailable for the current settings");
+                }
+            } else {
+                app.set_status("Unknown dsd-gain-scope. Try: track, album");
+            }
+        }
         "dsd-gain-db" => match value.parse::<tonepoet_pipeline::DbNano>() {
             Ok(parsed) => {
                 if !(tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
@@ -15301,7 +15354,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-db, dsd-auto-margin, dsd-normalize-target",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-scope, dsd-gain-db, dsd-auto-margin, dsd-normalize-target",
                 key
             ));
         }
@@ -19648,6 +19701,42 @@ mod execute_queue_state_consistency_tests {
             .unwrap_or("");
         assert!(status.contains("Queued 1 files"), "{status}");
         assert!(status.contains("refused 1 unsupported path"), "{status}");
+    }
+
+    #[test]
+    fn browse_queue_return_admission_preserves_one_submission_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("01.flac");
+        let second = temp.path().join("02.flac");
+        std::fs::write(&first, b"not real flac").expect("first fixture");
+        std::fs::write(&second, b"not real flac").expect("second fixture");
+
+        let expansion = expand_regular_filesystem_audio_folders_for_convert_blocking(
+            false,
+            vec![first, second],
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert_eq!(expansion.queue.paths.len(), 2);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let options = browse_queue_return_conversion_options(&app);
+        queue_browse_convert_paths_for_processing(
+            &mut app,
+            expansion.queue,
+            options,
+            expansion.refused_explicit_paths,
+        );
+
+        let queue = app.manager.queue.try_read().expect("queue read");
+        let items = queue.all_items();
+        assert_eq!(items.len(), 2);
+        let submission_id = items[0]
+            .submission_id
+            .as_deref()
+            .expect("submission identity");
+        assert_eq!(items[1].submission_id.as_deref(), Some(submission_id));
+        assert_eq!(items[0].submission_size, Some(2));
+        assert_eq!(items[1].submission_size, Some(2));
     }
 
     #[test]

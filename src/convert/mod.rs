@@ -654,10 +654,16 @@ impl ConversionManager {
         files: Vec<PathBuf>,
         options: ConversionOptions,
     ) -> ConversionResult<()> {
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        let submission_size = u32::try_from(files.len()).unwrap_or(u32::MAX);
         let mut queue = self.queue.write().await;
         for file in files {
             let format = FormatDetector::detect(&file)?;
             queue.add_item(file, format, options.clone());
+            if let Some(item) = queue.items_mut().back_mut() {
+                item.submission_id = Some(submission_id.clone());
+                item.submission_size = Some(submission_size);
+            }
         }
         Ok(())
     }
@@ -703,6 +709,8 @@ impl ConversionManager {
             }
         }
 
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        let submission_size = u32::try_from(detected.len()).unwrap_or(u32::MAX);
         let mut claimed = std::collections::HashSet::new();
         let mut claimed_by_item: Vec<(String, PathBuf)> = Vec::new();
         let mut admitted_ids: Vec<String> = Vec::new();
@@ -710,6 +718,10 @@ impl ConversionManager {
         let mut queue = self.queue.write().await;
         for (file, format) in detected {
             queue.add_item(file.clone(), format, options.clone());
+            if let Some(item) = queue.items_mut().back_mut() {
+                item.submission_id = Some(submission_id.clone());
+                item.submission_size = Some(submission_size);
+            }
             let Some(item_id) = queue.items_mut().back().map(|item| item.id.clone()) else {
                 continue;
             };
@@ -813,6 +825,13 @@ impl ConversionManager {
     where
         F: FnMut(&mut ConversionItem),
     {
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        let submission_size = u32::try_from(batch.len()).unwrap_or(u32::MAX);
+        let album_scope_requested = options
+            .pipeline_settings
+            .as_ref()
+            .map(|settings| settings.dsd.album_auto_gain_selected())
+            .unwrap_or(false);
         let mut outcome = CommitBatchOutcome::success();
         if batch.is_empty() {
             outcome.errors = 1;
@@ -836,6 +855,16 @@ impl ConversionManager {
                     ));
                 }
             }
+        }
+        if album_scope_requested && outcome.errors > 0 {
+            outcome.last_error = Some(
+                "album-scoped DSD auto-gain requires every item in the submitted batch to be admitted; source detection failed for at least one item"
+                    .to_string(),
+            );
+            return CommitBatchCueArtifactTransaction::failed_without_queue_mutation(
+                outcome,
+                source_synthetic_cue_artifacts.clone(),
+            );
         }
         if detected.is_empty() {
             return CommitBatchCueArtifactTransaction::failed_without_queue_mutation(
@@ -876,6 +905,16 @@ impl ConversionManager {
                 })
                 .map(|item| item.id.clone())
             {
+                if album_scope_requested {
+                    outcome.errors += 1;
+                    outcome.last_error = Some(format!(
+                        "album-scoped DSD auto-gain requires the exact submitted batch; {} is already present as live queue item {}",
+                        file.display(),
+                        existing_id,
+                    ));
+                    configuration_error = outcome.last_error.clone();
+                    break;
+                }
                 outcome.skipped += 1;
                 skipped_items.push(file.clone());
                 if let Some(artifact) = source_synthetic_cue_artifacts
@@ -923,6 +962,8 @@ impl ConversionManager {
                 options.clone(),
                 cue_decision.cue_sidecar_override,
             );
+            item.submission_id = Some(submission_id.clone());
+            item.submission_size = Some(submission_size);
             item.sidecar_cue_track_metadata = cue_decision.sidecar_cue_track_metadata;
             // Finish all executable request configuration before the item is
             // marked queued or published to the shared queue. This keeps a
@@ -1298,6 +1339,10 @@ impl ConversionManager {
             ConversionError::ConversionFailed("Queue is busy, try again".to_string())
         })?;
         queue.add_item(file, format, options);
+        if let Some(item) = queue.items_mut().back_mut() {
+            item.submission_id = Some(uuid::Uuid::new_v4().to_string());
+            item.submission_size = Some(1);
+        }
         Ok(())
     }
 
@@ -1357,6 +1402,36 @@ impl ConversionManager {
         archive_password: Option<String>,
         cue_decision: crate::convert::queue_expansion::CueArtifactCommitDecision,
     ) -> ConversionResult<String> {
+        let submission_id = uuid::Uuid::new_v4().to_string();
+        self.add_file_ready_for_processing_with_cue_metadata_decision_for_submission(
+            file,
+            options,
+            archive_password,
+            cue_decision,
+            &submission_id,
+            1,
+        )
+    }
+
+    /// Ready-queue admission for one member of an already-defined user
+    /// submission. Every member must receive the same identity and declared
+    /// cardinality so submitted-batch policies cannot silently collapse into
+    /// per-file execution when Browse admits paths one at a time.
+    pub(crate) fn add_file_ready_for_processing_with_cue_metadata_decision_for_submission(
+        &mut self,
+        file: std::path::PathBuf,
+        options: ConversionOptions,
+        archive_password: Option<String>,
+        cue_decision: crate::convert::queue_expansion::CueArtifactCommitDecision,
+        submission_id: &str,
+        submission_size: u32,
+    ) -> ConversionResult<String> {
+        if submission_id.is_empty() || submission_size == 0 {
+            return Err(ConversionError::ConversionFailed(
+                "ready queue insertion requires a non-empty submission identity and non-zero submission size"
+                    .to_string(),
+            ));
+        }
         let format = FormatDetector::detect(&file)?;
 
         // Create item and mark as Queued (ready for processing). A runnable
@@ -1370,6 +1445,8 @@ impl ConversionManager {
             options,
             cue_decision.cue_sidecar_override,
         );
+        item.submission_id = Some(submission_id.to_string());
+        item.submission_size = Some(submission_size);
         item.sidecar_cue_track_metadata = cue_decision.sidecar_cue_track_metadata;
         item.set_archive_password(archive_password, None);
         item.status = ConversionStatus::Queued;
@@ -1452,6 +1529,8 @@ impl ConversionManager {
             request,
             cue_sidecar_override,
         );
+        item.submission_id = Some(uuid::Uuid::new_v4().to_string());
+        item.submission_size = Some(1);
         item.set_archive_password(archive_password, None);
         item.status = ConversionStatus::Queued;
 

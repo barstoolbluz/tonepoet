@@ -67,6 +67,9 @@ pub struct TuiPreset {
     /// Canonical NormalizePeak target text.
     #[serde(default)]
     pub dsd_normalize_target_dbfs: Option<String>,
+    /// Automatic DSD peak-normalization scope. Missing v4 values mean Track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_auto_gain_scope: Option<String>,
 
     // Metadata pane
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +169,8 @@ struct PresetWireV4 {
     dsd_gain_db: Option<String>,
     #[serde(default)]
     dsd_normalize_target_dbfs: Option<String>,
+    #[serde(default)]
+    dsd_auto_gain_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     album_artist_for_conversion: Option<String>,
     #[serde(default)]
@@ -241,6 +246,7 @@ impl PresetWireLegacy {
             dsd_gain: None,
             dsd_gain_db: None,
             dsd_normalize_target_dbfs: None,
+            dsd_auto_gain_scope: None,
             album_artist_for_conversion: self.album_artist_for_conversion,
             dest_path: self.dest_path,
             folder_template: self.folder_template,
@@ -285,6 +291,7 @@ impl PresetWireV4 {
             dsd_gain: self.dsd_gain,
             dsd_gain_db: self.dsd_gain_db,
             dsd_normalize_target_dbfs: self.dsd_normalize_target_dbfs,
+            dsd_auto_gain_scope: self.dsd_auto_gain_scope,
             album_artist_for_conversion: self.album_artist_for_conversion,
             dest_path: self.dest_path,
             folder_template: self.folder_template,
@@ -410,6 +417,13 @@ impl TuiPreset {
             // distinguishes Auto from native NormalizePeak; apply still accepts
             // a negative historical token by magnitude for compatibility.
             dsd_normalize_target_dbfs: Some(dsd_gain_parameter),
+            dsd_auto_gain_scope: match format.dsd_auto_gain_scope.selected_value() {
+                // Track is the compatibility default. Omitting it keeps newly
+                // saved track-scoped v4 presets byte-shape compatible with
+                // presets written before album scope existed.
+                tonepoet_pipeline::DsdAutoGainScope::Track => None,
+                tonepoet_pipeline::DsdAutoGainScope::Album => Some("album".to_string()),
+            },
             album_artist_for_conversion: normalize_optional_text_override(
                 metadata.album_artist_for_conversion.as_deref(),
             ),
@@ -551,6 +565,19 @@ impl TuiPreset {
                 };
                 if let Some(mode) = gain_mode {
                     report.record("dsd_gain", format_state.dsd_gain_mode.select_value(&mode));
+                    let scope = match self.dsd_auto_gain_scope.as_deref().unwrap_or("track") {
+                        "track" => Some(tonepoet_pipeline::DsdAutoGainScope::Track),
+                        "album" => Some(tonepoet_pipeline::DsdAutoGainScope::Album),
+                        _ => None,
+                    };
+                    if let Some(scope) = scope {
+                        report.record(
+                            "dsd_auto_gain_scope",
+                            format_state.dsd_auto_gain_scope.select_value(&scope),
+                        );
+                    } else {
+                        report.record("dsd_auto_gain_scope", false);
+                    }
                     if mode == DsdGainMode::Fixed {
                         if let Some(raw) = self.dsd_gain_db.as_deref() {
                             match raw.parse::<tonepoet_pipeline::DbNano>() {
@@ -875,6 +902,7 @@ impl TuiPreset {
             output_target: None,
             dsd_path: None,
             dsd_profile: None,
+            dsd_auto_gain_scope: None,
             dsd_gain: None,
             dsd_gain_db: None,
             dsd_normalize_target_dbfs: None,

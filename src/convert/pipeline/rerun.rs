@@ -709,6 +709,54 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
     }
 
     #[test]
+    fn native_album_profile_change_does_not_match_legacy_album_manifest() {
+        use tonepoet_pipeline::{
+            DsdAutoGainScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("source.dsf");
+        let output_rel = PathBuf::from("01.flac");
+        let output = album_dir.join(&output_rel);
+        write_file(&source, b"source audio");
+        write_file(&output, b"encoded audio");
+
+        let mut reference = PipelineSettings::default();
+        reference.dsd = DsdSettings::native_v2();
+        reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+        reference.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
+        reference.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        reference.dsd.bind_runtime_album_gain(
+            "-0.750000000".parse().unwrap(),
+            Some("-0.490000000".parse().unwrap()),
+            2,
+        );
+        let manifest = manifest_for_one_track(
+            &album_dir,
+            &reference,
+            &source,
+            &output_rel,
+            13,
+        );
+        write_manifest(&album_dir, &manifest).expect("write manifest");
+
+        let mut wideband = reference.clone();
+        wideband.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
+        assert!(matches!(
+            decide_rerun(
+                &album_dir,
+                &wideband,
+                OverwritePolicy::SkipIfManifestMatch,
+            ),
+            RerunDecision::Redo {
+                reason: RerunReason::ManifestFingerprintMismatch { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn merged_manifest_match_skips_when_policy_requests_skip() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_dir = temp.path().join("Album");

@@ -5,6 +5,7 @@
 //! descriptions. It does not spawn processes, probe files, read configuration,
 //! or perform filesystem writes.
 
+pub mod dsd_album_gain;
 pub mod dsd_reference;
 pub mod enums;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod tools;
 pub mod w64;
 pub mod fingerprint;
 
+pub use dsd_album_gain::*;
 pub use dsd_reference::*;
 pub use enums::*;
 pub use error::{PlanningError, Result};
@@ -38,7 +40,7 @@ pub use source::{SourceInfo, SourceRepresentationKind};
 pub use tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolRegistry, ToolSupport};
 pub use w64::*;
 pub use fingerprint::{
-    settings_fingerprint, SettingsFingerprint, SETTINGS_FINGERPRINT_FIELD_COUNT,
-    SETTINGS_FINGERPRINT_FIELD_PATHS, SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT,
-    SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS,
+    settings_fingerprint, SettingsFingerprint, DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS,
+    SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS,
+    SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT, SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS,
 };

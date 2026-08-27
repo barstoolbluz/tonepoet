@@ -135,6 +135,21 @@ pub fn plan_request_for_track(
     }
 
     let mut settings = request.settings.clone();
+    // Album-scoped DSD normalization has already performed the expensive DSD
+    // reconstruction into an audio-only Float64 CAF carrier. The carrier must
+    // be encoded, never stream-copied, and must not become a metadata/artwork/
+    // source-MD5 authority merely because it is now the planner input.
+    if matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. }) {
+        settings.force_encode = true;
+        disable_planner_source_tag_transfer(&mut settings);
+        disable_planner_artwork_transfer(&mut settings);
+        disable_planner_source_audio_md5(&mut settings);
+    } else if settings.dsd.runtime_album_gain_db().is_some() {
+        // The submitted-batch authority applies only to DSD tracks that were
+        // measured into explicit album-gain carriers. A mixed DSD/non-DSD
+        // source must never apply that gain to its ordinary PCM members.
+        settings.dsd.set_runtime_album_gain_db(None);
+    }
     // Blu-ray compressed-codec realization decodes through FFmpeg into a PCM WAV
     // carrier. In Auto mode, keep the encode leg on FFmpeg as well: FFmpeg
     // preserves decoded WAV precision without requiring the SoX-only `-b` flag
@@ -871,6 +886,31 @@ pub fn source_info_for_realized_track(
     track: &PreparedTrack,
     realized_input: &Path,
 ) -> Result<SourceInfo, ConvertError> {
+    if let TrackSourceRef::DsdAlbumGainCarrier {
+        sample_rate_hz,
+        channels,
+        duration,
+        ..
+    } = &track.source_ref
+    {
+        return Ok(SourceInfo {
+            dsd_source_kind: None,
+            // CAF is an internal transport that the planner does not expose as
+            // a target format. Model it as PCM/WAV-class input while forcing an
+            // encode above; tools still autodetect the actual CAF container.
+            format: PlannerFormat::Wav,
+            codec: PlannerCodec::PcmFloat,
+            sample_rate_hz: Some(*sample_rate_hz),
+            bit_depth: Some(PcmBitDepth::Float64),
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Float),
+            channels: Some(*channels),
+            duration: *duration,
+            audio_md5: None,
+        });
+    }
+
     let format = planner_format_from_path(realized_input).unwrap_or_else(|| match &track.source_ref {
         TrackSourceRef::SacdTrack { .. } => PlannerFormat::Dsf,
         TrackSourceRef::DvdVideoTrack { .. } => PlannerFormat::Wav,
@@ -2251,6 +2291,80 @@ mod tests {
             !message.contains("failed to read SACD TOC")
                 && !message.contains("No such file or directory"),
             "native SACD rejection must not perform plan-time ISO I/O: {message}"
+        );
+    }
+
+    #[test]
+    fn album_gain_carrier_keeps_resolved_fixed_gain_and_never_plans_legacy_norm() {
+        let temp = TempDir::new().expect("temp dir");
+        let original_dsd = temp.path().join("A.dsf");
+        let carrier = temp.path().join("A-album-gain.caf");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(176_400);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.settings.preferred_tool = PreferredTool::Sox;
+        req.settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("legacy auto gain");
+        req.settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        req.settings.dsd.bind_runtime_album_gain(
+            "2.840000000".parse().expect("fixed album gain"),
+            Some("-3.000000000".parse().expect("album peak")),
+            2,
+        );
+        let mut prepared_track = track(TrackSourceRef::DsdAlbumGainCarrier {
+            path: carrier.clone(),
+            source_path: original_dsd,
+            sample_rate_hz: 176_400,
+            channels: 2,
+            duration: None,
+        });
+        prepared_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(5_644_800),
+            None,
+            Some(crate::convert::pipeline::types::SourceAudioCoding::Dsd),
+        );
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared_track,
+            &carrier,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("album-gain carrier plan request builds");
+        assert_eq!(
+            planned
+                .settings
+                .dsd
+                .runtime_album_gain_db()
+                .map(|gain| gain.render(false)),
+            Some("2.840000000".to_string()),
+            "carrier planning must retain submitted-batch fixed-gain authority",
+        );
+        let commands = planned_command_args(&planned);
+        assert!(
+            commands
+                .iter()
+                .any(|args| has_adjacent_args(args, "gain", "2.840000000")),
+            "carrier encode must apply the resolved fixed album gain: {commands:?}",
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "norm")),
+            "carrier encode must never fall back to legacy track-scoped norm: {commands:?}",
         );
     }
 

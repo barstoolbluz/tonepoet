@@ -561,6 +561,66 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
+    fn native_album_profiles_produce_distinct_legacy_manifest_settings_fingerprints() {
+        use tonepoet_pipeline::{
+            DsdAutoGainScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let source = temp.path().join("track.dsf");
+        let staged = temp.path().join("staging").join("track.flac");
+        write_file(&source, b"same source bytes");
+        write_file(&staged, b"same staged bytes");
+
+        let settings_for = |profile| {
+            let mut settings = PipelineSettings::default();
+            settings.dsd = DsdSettings::native_v2();
+            settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+            settings.dsd.from_dsd.profile = profile;
+            settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+            settings.dsd.bind_runtime_album_gain(
+                "-0.750000000".parse().unwrap(),
+                Some("-0.490000000".parse().unwrap()),
+                2,
+            );
+            settings
+        };
+
+        let build = |settings: PipelineSettings| {
+            build_conversion_manifest(ManifestBuildInput {
+                album_dir: album_dir.clone(),
+                settings,
+                tracks: vec![ManifestTrackBuildInput {
+                    source_path: source.clone(),
+                    source_audio_md5: None,
+                    track_identity: crate::convert::pipeline::manifest::TrackIdentity {
+                        source_ordinal: 1,
+                        disc_number: None,
+                        track_number: Some(1),
+                    },
+                    planned_command_hash: "same-plan".to_string(),
+                    album_relative_output_path: PathBuf::from("01.flac"),
+                    staged_output_path: staged.clone(),
+                    validation_status: ValidationStatus::Passed,
+                    record_output_hash: false,
+                    reference_evidence: None,
+                }],
+            })
+            .expect("legacy album manifest")
+        };
+
+        let reference = build(settings_for(DsdReconstructionSelection::Reference));
+        let wideband = build(settings_for(DsdReconstructionSelection::Wideband));
+
+        assert_ne!(
+            reference.legacy_settings_fingerprint(),
+            wideband.legacy_settings_fingerprint(),
+            "the unqualified native album manifest must bind the reconstruction profile",
+        );
+    }
+
+    #[test]
     fn merged_manifest_build_write_read_round_trips_single_manifest_entry() {
         let temp = tempfile::tempdir().expect("temp dir");
         let album_dir = temp.path().join("Album");

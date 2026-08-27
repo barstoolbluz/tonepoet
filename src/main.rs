@@ -150,8 +150,12 @@ enum Commands {
         #[arg(long = "dsd-profile", value_name = "reference|wideband")]
         dsd_profile: Option<String>,
 
-        /// Reference DSD gain policy.
-        #[arg(long = "dsd-gain", value_name = "reference|native|fixed|normalize")]
+        /// DSD gain policy. `auto` selects the live legacy auto-normalizer;
+        /// the other values select the native Reference-era controls.
+        #[arg(
+            long = "dsd-gain",
+            value_name = "reference|native|fixed|normalize|auto"
+        )]
         dsd_gain: Option<String>,
 
         /// Fixed DSD gain in dB; valid only with --dsd-gain fixed.
@@ -161,6 +165,10 @@ enum Commands {
         /// NormalizePeak target in dBFS; valid only with --dsd-gain normalize.
         #[arg(long = "dsd-normalize-target-dbfs", value_name = "DBFS")]
         dsd_normalize_target_dbfs: Option<String>,
+
+        /// Peak-normalization scope for DSD automatic gain.
+        #[arg(long = "dsd-auto-gain-scope", value_name = "track|album")]
+        dsd_auto_gain_scope: Option<String>,
 
         /// Append Lineage.txt content to COMMENT tag
         #[arg(long)]
@@ -604,6 +612,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dsd_gain,
             dsd_gain_db,
             dsd_normalize_target_dbfs,
+            dsd_auto_gain_scope,
             append_lineage,
             write_log,
             disc_subfolders,
@@ -641,6 +650,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dsd_gain,
                 dsd_gain_db,
                 dsd_normalize_target_dbfs,
+                dsd_auto_gain_scope,
                 append_lineage,
                 write_log,
                 generate_cue,
@@ -1087,17 +1097,19 @@ fn apply_cli_dsd_reference_settings(
     gain: Option<&str>,
     fixed_gain: Option<&str>,
     normalize_target: Option<&str>,
+    auto_gain_scope: Option<&str>,
 ) -> anyhow::Result<()> {
     use tonepoet_pipeline::{
-        DbNano, DsdReconstructionSelection, DsdSourceGainMode, DsdSourcePathway,
-        ReferenceErrorCode,
+        DbNano, DsdAutoGainScope, DsdReconstructionSelection, DsdSourceGainMode,
+        DsdSourcePathway, DsdToPcmGainMode, ReferenceErrorCode,
     };
 
     let any_flag = pathway.is_some()
         || profile.is_some()
         || gain.is_some()
         || fixed_gain.is_some()
-        || normalize_target.is_some();
+        || normalize_target.is_some()
+        || auto_gain_scope.is_some();
     // Preserve the pre-existing WavPack CLI canonicalization independently of
     // whether native DSD Reference was selected. D1 must not change non-DSD
     // conversion behavior.
@@ -1111,6 +1123,70 @@ fn apply_cli_dsd_reference_settings(
         anyhow::bail!(
             "DSD Reference flags apply only to DSD-to-PCM conversions, not PCM-to-DSD targets"
         );
+    }
+
+    let requested_scope = match auto_gain_scope.map(|value| value.to_ascii_lowercase()) {
+        Some(value) if value == "track" => Some(DsdAutoGainScope::Track),
+        Some(value) if value == "album" => Some(DsdAutoGainScope::Album),
+        Some(value) => anyhow::bail!(
+            "invalid --dsd-auto-gain-scope '{value}'; expected track or album"
+        ),
+        None => None,
+    };
+
+    let requested_gain = gain.map(|value| value.to_ascii_lowercase());
+    if matches!(requested_gain.as_deref(), Some("auto")) {
+        if pathway.is_some() || profile.is_some() || fixed_gain.is_some() || normalize_target.is_some()
+        {
+            anyhow::bail!(
+                "--dsd-gain auto is the legacy auto-normalizer and cannot be combined with \
+                 --dsd-path, --dsd-profile, --dsd-gain-db, or --dsd-normalize-target-dbfs"
+            );
+        }
+        let legacy = settings.dsd.legacy_behavior().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--dsd-gain auto cannot replace native-v2 DSD settings; use --dsd-gain normalize instead"
+            )
+        })?;
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                DsdToPcmGainMode::Auto,
+                legacy.auto_gain_margin_db,
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+        if let Some(scope) = requested_scope {
+            settings.dsd.set_auto_gain_scope(scope);
+        }
+        return Ok(());
+    }
+
+    // A scope-only override is useful when a preset already selects either
+    // automatic regime. Do not migrate origins just because the orthogonal
+    // scope flag was supplied.
+    if gain.is_none()
+        && pathway.is_none()
+        && profile.is_none()
+        && fixed_gain.is_none()
+        && normalize_target.is_none()
+    {
+        let Some(scope) = requested_scope else {
+            return Ok(());
+        };
+        let automatic = settings
+            .dsd
+            .legacy_behavior()
+            .map(|legacy| legacy.gain_mode == DsdToPcmGainMode::Auto)
+            .unwrap_or(settings.dsd.from_dsd.gain_mode == DsdSourceGainMode::NormalizePeak);
+        if !automatic {
+            anyhow::bail!(
+                "--dsd-auto-gain-scope requires automatic DSD gain \
+                 (--dsd-gain auto, --dsd-gain normalize, or a preset selecting one)"
+            );
+        }
+        settings.dsd.set_auto_gain_scope(scope);
+        return Ok(());
     }
 
     settings.dsd = settings.dsd.migrate_to_native_v2();
@@ -1148,7 +1224,7 @@ fn apply_cli_dsd_reference_settings(
         "fixed" => DsdSourceGainMode::Fixed,
         "normalize" | "normalize-peak" => DsdSourceGainMode::NormalizePeak,
         other => anyhow::bail!(
-            "invalid --dsd-gain '{other}'; expected reference, native, fixed, or normalize"
+            "invalid --dsd-gain '{other}'; expected reference, native, fixed, normalize, or auto"
         ),
     };
 
@@ -1170,6 +1246,14 @@ fn apply_cli_dsd_reference_settings(
         settings.dsd.from_dsd.normalize_peak_target_dbfs =
             value.parse::<DbNano>().map_err(anyhow::Error::msg)?;
     }
+    if let Some(scope) = requested_scope {
+        if settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::NormalizePeak {
+            anyhow::bail!(
+                "--dsd-auto-gain-scope requires --dsd-gain normalize in native-v2 DSD settings"
+            );
+        }
+        settings.dsd.set_auto_gain_scope(scope);
+    }
     // Native-v2 Reference validation is planner-owned so every unsupported
     // cell reaches the stable DSD-REF-P0 error selected by the immutable
     // policy. Generic legacy validation can otherwise preempt those errors
@@ -1188,6 +1272,7 @@ mod dsd_reference_cli_settings_tests {
         apply_cli_dsd_reference_settings(
             &mut settings,
             AudioFormat::Flac,
+            None,
             None,
             None,
             None,
@@ -1213,6 +1298,7 @@ mod dsd_reference_cli_settings_tests {
             None,
             None,
             None,
+            None,
         )
         .expect("default WavPack CLI settings");
 
@@ -1227,6 +1313,7 @@ mod dsd_reference_cli_settings_tests {
             &mut settings,
             AudioFormat::Flac,
             Some("reference"),
+            None,
             None,
             None,
             None,
@@ -1254,6 +1341,7 @@ mod dsd_reference_cli_settings_tests {
             None,
             None,
             None,
+            None,
         )
         .expect("apply explicit Reference pathway");
 
@@ -1264,6 +1352,74 @@ mod dsd_reference_cli_settings_tests {
         );
         assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Reference);
         assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
+    }
+
+
+    #[test]
+    fn cli_album_scope_attaches_to_live_legacy_auto_without_promoting_reference() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            None,
+            None,
+            Some("auto"),
+            None,
+            None,
+            Some("album"),
+        )
+        .expect("legacy album auto gain");
+
+        assert!(!settings.dsd.is_native_v2());
+        assert!(settings.dsd.album_auto_gain_selected());
+        assert_eq!(
+            settings.dsd.auto_gain_scope(),
+            tonepoet_pipeline::DsdAutoGainScope::Album
+        );
+    }
+
+    #[test]
+    fn cli_album_scope_attaches_to_native_normalize_peak_without_reference_qualification() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            Some("reference"),
+            None,
+            Some("normalize"),
+            None,
+            Some("-1.250000000"),
+            Some("album"),
+        )
+        .expect("native album normalize gain");
+
+        assert!(settings.dsd.is_native_v2());
+        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::NormalizePeak);
+        assert!(settings.dsd.album_auto_gain_selected());
+        assert_eq!(
+            settings.dsd.album_auto_gain_target_dbfs(),
+            Some("-1.250000000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn cli_album_scope_rejects_nonautomatic_native_gain() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        let error = apply_cli_dsd_reference_settings(
+            &mut settings,
+            AudioFormat::Flac,
+            Some("reference"),
+            None,
+            Some("native"),
+            None,
+            None,
+            Some("album"),
+        )
+        .expect_err("album scope requires normalize in native v2");
+        assert!(
+            error.to_string().contains("requires --dsd-gain normalize"),
+            "{error}"
+        );
     }
 }
 
@@ -1287,6 +1443,7 @@ async fn run_convert(
     dsd_gain: Option<String>,
     dsd_gain_db: Option<String>,
     dsd_normalize_target_dbfs: Option<String>,
+    dsd_auto_gain_scope: Option<String>,
     append_lineage: bool,
     write_log: bool,
     generate_cue: bool,
@@ -1445,6 +1602,7 @@ async fn run_convert(
         dsd_gain.as_deref(),
         dsd_gain_db.as_deref(),
         dsd_normalize_target_dbfs.as_deref(),
+        dsd_auto_gain_scope.as_deref(),
     )?;
     options.pipeline_settings = Some(cli_pipeline_settings);
 
@@ -1607,11 +1765,6 @@ async fn run_convert(
             }
         }
 
-        // Mark all items as queued now that settings/requests are attached.
-        for item in q.all_items_mut() {
-            item.status = ConversionStatus::Queued;
-        }
-
         let total = q.all_items().len();
         if total == 0 {
             tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
@@ -1619,6 +1772,19 @@ async fn run_convert(
             );
             anyhow::bail!("No supported files found in the provided paths");
         }
+        let submission_size = u32::try_from(total)
+            .map_err(|_| anyhow::anyhow!("CLI submission contains too many queue items"))?;
+        let submission_id = uuid::Uuid::new_v4().to_string();
+
+        // One CLI invocation is one explicit submitted batch after queue
+        // expansion. Persist that exact cohort before scheduling so album DSD
+        // gain never falls back to folder/tag-derived membership.
+        for item in q.all_items_mut() {
+            item.submission_id = Some(submission_id.clone());
+            item.submission_size = Some(submission_size);
+            item.status = ConversionStatus::Queued;
+        }
+
         println!(
             "Queued {} item(s) for conversion to {}",
             total,

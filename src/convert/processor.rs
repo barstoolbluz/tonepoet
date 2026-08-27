@@ -37,13 +37,15 @@ use crate::convert::pipeline::{
     encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache,
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
-    finish_pipeline_album_for_scheduler_with_tool_limits, map_album_outcome,
-    prepare_pipeline_item_for_scheduler,
+    map_album_outcome,
+    prepare_pipeline_item_for_scheduler_with_tool_limits,
+    PreparedSource,
     realize_track_for_scheduler_with_tool_limits_and_version_cache,
     run_pipeline_item_with_tool_paths_and_tool_limits, scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry,
     scheduled_worker_failure_output,
     AlbumBatchTrackContext, AlbumCompletionTracker, BatchResolvedAlbumIdentity,
-    AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, MetadataTextOverride, PipelineReport, PipelineRequest, PoolLimits,
+    AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, MetadataTextOverride,
+    OverwritePolicy, PipelineReport, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledCueStreamTrack, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceKind, StageOutcome, ToolBinary, ToolConcurrencyLimits,
@@ -51,21 +53,25 @@ use crate::convert::pipeline::{
     source_text_tag_key_from_extra,
 };
 use crate::convert::pipeline::stages::{
+    DsdAlbumGainScopeDisclosure, DsdAlbumGainScopeParticipant,
     disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
     prepare_verified_single_file_album_batch_completion_order_fallback,
+    resolve_dsd_album_gain_post_barrier_rerun,
+    finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
 #[cfg(test)]
 use crate::convert::pipeline::stages::{
+    set_dsd_album_gain_scratch_retry_hook_for_test,
     set_post_materialization_stage_fault_hook_for_test, set_publish_fault_hook_for_test,
 };
 #[cfg(test)]
 use crate::convert::pipeline::{
     AlbumMetadata, AlbumPlan, CueSidecarPolicy, DvdaGroupSelection,
     ExtractionProvenance, FailurePolicy, LogPolicy, NamingCollisionPolicy, NamingPolicy,
-    OverwritePolicy, PipelineStage, PlannedMetadataSatisfaction, PlannedTrackOutput, PreparedSource, PreparedTrack, PublishedAlbum,
+    PipelineStage, PlannedMetadataSatisfaction, PlannedTrackOutput, PreparedTrack, PublishedAlbum,
     PublishPolicy, RedactedPipelineRequest, scheduled_album_for_test,
     SourceAudioDescriptor,
     SourceAudioCoding, SourceOptions, StagePolicy, StageRequirement, StagingDir,
@@ -1271,6 +1277,17 @@ fn conversion_settings_fingerprint_key(settings: &PipelineSettings) -> String {
     tonepoet_pipeline::fingerprint::settings_fingerprint(settings).to_string()
 }
 
+fn album_gain_settings_fingerprint_key(settings: &PipelineSettings) -> String {
+    if settings.dsd.is_native_v2() {
+        format!(
+            "native-v2:{}",
+            tonepoet_pipeline::fingerprint::settings_snapshot_fingerprint_v2(settings).0,
+        )
+    } else {
+        format!("legacy-v1:{}", conversion_settings_fingerprint_key(settings))
+    }
+}
+
 fn source_grouping_root_for_dispatch_request(req: &PipelineRequest) -> PathBuf {
     let parent = req
         .container
@@ -2289,8 +2306,32 @@ struct PendingAlbum {
     cancel_requested: bool,
 }
 
+struct PendingDsdAlbumGainSubmission {
+    expected_items: usize,
+    ordered_item_ids: Vec<String>,
+    completed_item_ids: BTreeSet<String>,
+    ready_albums: Vec<ScheduledAlbum>,
+    failure: Option<String>,
+}
+
+impl PendingDsdAlbumGainSubmission {
+    fn new(expected_items: usize, ordered_item_ids: Vec<String>) -> Self {
+        Self {
+            expected_items,
+            ordered_item_ids,
+            completed_item_ids: BTreeSet::new(),
+            ready_albums: Vec::with_capacity(expected_items),
+            failure: None,
+        }
+    }
+}
+
 enum QueueWorkOutput {
     Materialized {
+        item_id: String,
+        result: ScheduledMaterialization,
+    },
+    AlbumGainRerunChecked {
         item_id: String,
         result: ScheduledMaterialization,
     },
@@ -2334,6 +2375,7 @@ struct DeferredSubmission {
 
 struct SubmissionPump {
     initial_items: VecDeque<ConversionItem>,
+    album_gain_rerun: VecDeque<ScheduledAlbum>,
     album_fanout: VecDeque<String>,
     realized_encodes: VecDeque<(String, ScheduledRealizedTrack, CancellationToken)>,
     album_postprocess: VecDeque<(ScheduledAlbum, Vec<ScheduledTrackOutput>)>,
@@ -2354,6 +2396,7 @@ impl SubmissionPump {
     fn new(items: Vec<ConversionItem>) -> Self {
         Self {
             initial_items: items.into_iter().collect(),
+            album_gain_rerun: VecDeque::new(),
             album_fanout: VecDeque::new(),
             realized_encodes: VecDeque::new(),
             album_postprocess: VecDeque::new(),
@@ -2366,6 +2409,10 @@ impl SubmissionPump {
 
     fn enqueue_album_fanout(&mut self, job_id: String) {
         self.album_fanout.push_back(job_id);
+    }
+
+    fn enqueue_album_gain_rerun(&mut self, album: ScheduledAlbum) {
+        self.album_gain_rerun.push_back(album);
     }
 
     fn enqueue_realized_encode(
@@ -2537,6 +2584,14 @@ impl SubmissionPump {
                 continue;
             }
 
+            if let Some(album) = self.album_gain_rerun.pop_front() {
+                let unit = build_album_gain_rerun_work(album, progress_tx);
+                if !self.try_submit_unit(pool, unit, true) {
+                    return;
+                }
+                continue;
+            }
+
             if let Some((job_id, realized, job_cancel)) = self.realized_encodes.pop_front() {
                 let unit = build_realized_encode_work(
                     job_id,
@@ -2688,6 +2743,7 @@ impl SubmissionPump {
         self.initial_items
             .len()
             .saturating_add(usize::from(self.deferred_unit.is_some()))
+            .saturating_add(self.album_gain_rerun.len())
             .saturating_add(self.realized_encodes.len())
             .saturating_add(self.album_postprocess.len())
             .saturating_add(self.pending_album_source_units(pending_albums))
@@ -2737,6 +2793,428 @@ fn source_warning_count(source: Option<&crate::convert::pipeline::PreparedSource
     })
 }
 
+fn queued_item_pipeline_settings(item: &ConversionItem) -> Option<&PipelineSettings> {
+    item.pipeline_request
+        .as_ref()
+        .map(|request| &request.settings)
+        .or(item.pipeline_settings.as_ref())
+        .or(item.options.pipeline_settings.as_ref())
+}
+
+fn queued_item_album_auto_gain_selected(item: &ConversionItem) -> bool {
+    queued_item_pipeline_settings(item)
+        .map(|settings| settings.dsd.album_auto_gain_selected())
+        .unwrap_or(false)
+}
+
+#[derive(Default)]
+struct DsdAlbumGainQueuePreflight {
+    item_to_submission: BTreeMap<String, String>,
+    expected_by_submission: BTreeMap<String, usize>,
+    ordered_item_ids_by_submission: BTreeMap<String, Vec<String>>,
+    failures: BTreeMap<String, String>,
+}
+
+fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGainQueuePreflight {
+    let mut result = DsdAlbumGainQueuePreflight::default();
+    let mut groups: BTreeMap<String, Vec<&ConversionItem>> = BTreeMap::new();
+
+    for item in items {
+        if let Some(submission_id) = item.submission_id.as_ref() {
+            groups.entry(submission_id.clone()).or_default().push(item);
+        } else if queued_item_album_auto_gain_selected(item) {
+            result.failures.insert(
+                item.id.clone(),
+                "album-scoped DSD auto-gain requires persisted submitted-batch identity; re-submit the complete batch"
+                    .to_string(),
+            );
+        }
+    }
+
+    for (submission_id, members) in groups {
+        let selected_count = members
+            .iter()
+            .filter(|item| queued_item_album_auto_gain_selected(item))
+            .count();
+        if selected_count == 0 {
+            continue;
+        }
+
+        let failure = if selected_count != members.len() {
+            Some(
+                "submitted batch has mixed DSD auto-gain scopes; album mode requires one homogeneous scope across every queued member"
+                    .to_string(),
+            )
+        } else if members.iter().skip(1).any(|item| {
+            let Some(settings) = queued_item_pipeline_settings(item) else {
+                return true;
+            };
+            let Some(reference) = queued_item_pipeline_settings(members[0]) else {
+                return true;
+            };
+            album_gain_settings_fingerprint_key(settings)
+                != album_gain_settings_fingerprint_key(reference)
+        }) {
+            Some(
+                "submitted batch has heterogeneous conversion settings; album-scoped DSD auto-gain requires one settings fingerprint for the complete submitted set"
+                    .to_string(),
+            )
+        } else {
+            let declared_sizes = members
+                .iter()
+                .filter_map(|item| item.submission_size)
+                .collect::<BTreeSet<_>>();
+            if declared_sizes.len() != 1 {
+                Some(
+                    "submitted batch has missing or inconsistent persisted member counts; re-submit the complete batch for album-scoped DSD auto-gain"
+                        .to_string(),
+                )
+            } else {
+                let declared = usize::try_from(*declared_sizes.iter().next().unwrap())
+                    .unwrap_or(usize::MAX);
+                if declared != members.len() {
+                    Some(format!(
+                        "album-scoped DSD auto-gain requires the complete submitted batch: {} queued member(s) are present but {} were admitted",
+                        members.len(),
+                        declared,
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(reason) = failure {
+            for item in members {
+                result.failures.insert(item.id.clone(), reason.clone());
+            }
+            continue;
+        }
+
+        result
+            .expected_by_submission
+            .insert(submission_id.clone(), members.len());
+        result.ordered_item_ids_by_submission.insert(
+            submission_id.clone(),
+            members.iter().map(|item| item.id.clone()).collect(),
+        );
+        for item in members {
+            result
+                .item_to_submission
+                .insert(item.id.clone(), submission_id.clone());
+        }
+    }
+
+    result
+}
+
+fn release_scheduled_album(
+    album: ScheduledAlbum,
+    pool: &SharedWorkerPool<QueueWorkOutput>,
+    tracker: &mut AlbumCompletionTracker,
+    pending_albums: &mut BTreeMap<String, PendingAlbum>,
+    submissions: &mut SubmissionPump,
+    cancel: &CancellationToken,
+) {
+    let job_id = album.req.job_id.clone();
+    let expected = album
+        .source
+        .tracks
+        .iter()
+        .filter(|track| album.planned_final_path(&track.id).is_some())
+        .count();
+    let staged_tracks_ready_for_encode = album
+        .source
+        .tracks
+        .iter()
+        .filter(|track| album.planned_final_path(&track.id).is_some())
+        .filter(|track| {
+            matches!(
+                &track.source_ref,
+                TrackSourceRef::StagedFile(_) | TrackSourceRef::DsdAlbumGainCarrier { .. }
+            )
+        })
+        .count();
+    pool.metrics()
+        .record_tracks_materialized(staged_tracks_ready_for_encode as u64);
+    tracker.register_album(job_id.clone(), expected, album.allow_partial());
+    pool.metrics().record_jobs_queued(expected as u64);
+    if expected == 0 {
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_album_postprocess(album, Vec::new());
+    } else {
+        let job_cancel = cancel.child_token();
+        pending_albums.insert(
+            job_id.clone(),
+            PendingAlbum {
+                album: Some(album),
+                outputs: Vec::with_capacity(expected),
+                finished: 0,
+                expected,
+                next_source_track: 0,
+                job_cancel,
+                cancel_requested: false,
+            },
+        );
+        submissions.enqueue_album_fanout(job_id);
+    }
+}
+
+fn account_terminal_dsd_album_gain_participants(
+    terminal: &BTreeMap<String, ConversionStatus>,
+    item_to_submission: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, PendingDsdAlbumGainSubmission>,
+) -> BTreeSet<String> {
+    let mut completed_submissions = BTreeSet::new();
+    for (item_id, status) in terminal {
+        let Some(submission_id) = item_to_submission.get(item_id) else {
+            continue;
+        };
+        let Some(state) = pending.get_mut(submission_id) else {
+            continue;
+        };
+        if state.completed_item_ids.insert(item_id.clone()) {
+            state.failure.get_or_insert_with(|| {
+                format!(
+                    "participant {} ended before every submitted DSD track reached the album-gain barrier: {:?}",
+                    item_id, status,
+                )
+            });
+        }
+        if state.completed_item_ids.len() >= state.expected_items {
+            completed_submissions.insert(submission_id.clone());
+        }
+    }
+    completed_submissions
+}
+
+fn build_dsd_album_gain_scope_disclosure<'a>(
+    sources: impl IntoIterator<Item = &'a PreparedSource>,
+    submitted_item_count: usize,
+) -> DsdAlbumGainScopeDisclosure {
+    let mut dsd_participants = Vec::new();
+    let mut excluded_non_dsd_track_count = 0usize;
+    let mut excluded_non_dsd_item_count = 0usize;
+    for source in sources {
+        let mut item_dsd_tracks = 0usize;
+        for track in &source.tracks {
+            match &track.source_ref {
+                TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => {
+                    item_dsd_tracks = item_dsd_tracks.saturating_add(1);
+                    dsd_participants.push(DsdAlbumGainScopeParticipant {
+                        source_path: source_path.clone(),
+                        track_id: track.id.clone(),
+                    });
+                }
+                _ => {
+                    excluded_non_dsd_track_count =
+                        excluded_non_dsd_track_count.saturating_add(1);
+                }
+            }
+        }
+        if item_dsd_tracks == 0 {
+            excluded_non_dsd_item_count = excluded_non_dsd_item_count.saturating_add(1);
+        }
+    }
+    DsdAlbumGainScopeDisclosure {
+        submitted_item_count,
+        dsd_participants,
+        excluded_non_dsd_track_count,
+        excluded_non_dsd_item_count,
+    }
+}
+
+fn resolve_completed_dsd_album_gain_submission(
+    submission_id: &str,
+    pending: &mut BTreeMap<String, PendingDsdAlbumGainSubmission>,
+) -> Option<Result<Vec<ScheduledAlbum>, (String, Vec<ScheduledAlbum>)>> {
+    let is_complete = pending
+        .get(submission_id)
+        .map(|state| state.completed_item_ids.len() >= state.expected_items)
+        .unwrap_or(false);
+    if !is_complete {
+        return None;
+    }
+
+    let mut state = pending.remove(submission_id)?;
+    if let Some(reason) = state.failure.take() {
+        return Some(Err((reason, state.ready_albums)));
+    }
+    if state.ready_albums.len() != state.expected_items {
+        return Some(Err((
+            "submitted-batch DSD album-gain barrier completed without a ready materialization for every member"
+                .to_string(),
+            state.ready_albums,
+        )));
+    }
+
+    let submission_order = state
+        .ordered_item_ids
+        .iter()
+        .enumerate()
+        .map(|(index, item_id)| (item_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    state.ready_albums.sort_by_key(|album| {
+        submission_order
+            .get(album.item_id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    let actual_order = state
+        .ready_albums
+        .iter()
+        .map(|album| album.item_id.as_str())
+        .collect::<Vec<_>>();
+    let expected_order = state
+        .ordered_item_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if actual_order != expected_order {
+        return Some(Err((
+            "submitted-batch DSD album-gain barrier could not reconstruct the persisted submission order"
+                .to_string(),
+            state.ready_albums,
+        )));
+    }
+
+    let scope_disclosure = build_dsd_album_gain_scope_disclosure(
+        state.ready_albums.iter().map(|album| &album.source),
+        state.expected_items,
+    );
+    for album in &mut state.ready_albums {
+        album.album_gain_scope_disclosure = Some(scope_disclosure.clone());
+    }
+
+    let mut target = None;
+    let mut measurements = Vec::new();
+    let mut validation_error = None;
+    for album in &state.ready_albums {
+        let Some(album_target) = album.req.settings.dsd.album_auto_gain_target_dbfs() else {
+            validation_error = Some(
+                "submitted-batch DSD album-gain settings changed before the measurement barrier completed"
+                    .to_string(),
+            );
+            break;
+        };
+        if let Some(expected_target) = target {
+            if album_target != expected_target {
+                validation_error = Some(
+                    "submitted-batch DSD album-gain members have different headroom targets; refusing to derive a shared gain"
+                        .to_string(),
+                );
+                break;
+            }
+        } else {
+            target = Some(album_target);
+        }
+        measurements.extend(album.album_gain_measurements.iter().copied());
+    }
+    if let Some(error) = validation_error {
+        return Some(Err((error, state.ready_albums)));
+    }
+
+    if measurements.is_empty() {
+        log::info!(
+            "submitted-batch DSD album gain scope contained no DSD tracks: items={}, excluded_non_dsd_tracks={}, excluded_non_dsd_items={}",
+            scope_disclosure.submitted_item_count,
+            scope_disclosure.excluded_non_dsd_track_count,
+            scope_disclosure.excluded_non_dsd_item_count,
+        );
+        return Some(Ok(state.ready_albums));
+    }
+
+    let Some(target) = target else {
+        return Some(Err((
+            "submitted-batch DSD album-gain barrier has measurements but no common headroom target"
+                .to_string(),
+            state.ready_albums,
+        )));
+    };
+    let authority = match tonepoet_pipeline::resolve_album_gain(target, &measurements) {
+        Ok(authority) => authority,
+        Err(error) => return Some(Err((error, state.ready_albums))),
+    };
+    let loudest = authority
+        .loudest_peak_dbfs
+        .map(|value| value.render(false))
+        .unwrap_or_else(|| "-inf (verified silence)".to_string());
+    log::info!(
+        "DSD album gain: submitted batch scope={} item(s), {} DSD track(s), {} excluded non-DSD track(s) in {} DSD-free item(s); participants={:?}; loudest reported peak={} dBFS; analyzer reserve={} dB; target={} dBFS; fixed gain={} dB",
+        state.expected_items,
+        authority.track_count,
+        scope_disclosure.excluded_non_dsd_track_count,
+        scope_disclosure.excluded_non_dsd_item_count,
+        scope_disclosure.dsd_participants,
+        loudest,
+        tonepoet_pipeline::ALBUM_SOX_STATS_REPORTING_UNCERTAINTY.render(false),
+        authority.target_dbfs.render(false),
+        authority.gain_db.render(false),
+    );
+
+    for album in &mut state.ready_albums {
+        if album.album_gain_measurements.is_empty() {
+            continue;
+        }
+        album
+            .req
+            .settings
+            .dsd
+            .bind_runtime_album_gain(
+                authority.gain_db,
+                authority.loudest_peak_dbfs,
+                authority.track_count,
+            );
+    }
+
+    Some(Ok(state.ready_albums))
+}
+
+fn apply_dsd_album_gain_barrier_resolution(
+    resolution: Result<Vec<ScheduledAlbum>, (String, Vec<ScheduledAlbum>)>,
+    pool: &SharedWorkerPool<QueueWorkOutput>,
+    tracker: &mut AlbumCompletionTracker,
+    pending_albums: &mut BTreeMap<String, PendingAlbum>,
+    submissions: &mut SubmissionPump,
+    terminal: &mut BTreeMap<String, ConversionStatus>,
+    cancel: &CancellationToken,
+) {
+    match resolution {
+        Ok(albums) => {
+            for album in albums {
+                if album.req.publish.overwrite == OverwritePolicy::SkipIfManifestMatch
+                    && album.req.settings.dsd.album_auto_gain_selected()
+                {
+                    pool.metrics().record_jobs_queued(1);
+                    submissions.enqueue_album_gain_rerun(album);
+                } else {
+                    release_scheduled_album(
+                        album,
+                        pool,
+                        tracker,
+                        pending_albums,
+                        submissions,
+                        cancel,
+                    );
+                }
+            }
+        }
+        Err((reason, albums)) => {
+            log::error!("submitted-batch DSD album-gain barrier refused conversion: {reason}");
+            for album in albums {
+                let item_id = album.item_id.clone();
+                let status = ConversionStatus::Failed {
+                    error: format!("submitted-batch DSD album gain refused: {reason}"),
+                    log_path: None,
+                };
+                if terminal.insert(item_id, status.clone()).is_none() {
+                    record_terminal_status(pool, &status);
+                }
+            }
+        }
+    }
+}
+
 fn record_terminal_status(
     pool: &SharedWorkerPool<QueueWorkOutput>,
     status: &ConversionStatus,
@@ -2782,6 +3260,16 @@ async fn run_queue_with_shared_orchestrator(
         metrics,
     );
     let total_items = queued_items.len();
+    let album_gain_preflight = preflight_dsd_album_gain_submissions(&queued_items);
+    let invalid_item_ids = album_gain_preflight
+        .failures
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let queued_items = queued_items
+        .into_iter()
+        .filter(|item| !invalid_item_ids.contains(&item.id))
+        .collect::<Vec<_>>();
     let scratch_staging = scratch_staging_config_for_run(
         scratch_directory,
         scratch_memory_limit_percent,
@@ -2791,7 +3279,38 @@ async fn run_queue_with_shared_orchestrator(
     let mut run = pool.start();
     let mut pending_albums: BTreeMap<String, PendingAlbum> = BTreeMap::new();
     let mut tracker = AlbumCompletionTracker::default();
-    let mut terminal: BTreeMap<String, ConversionStatus> = BTreeMap::new();
+    let mut terminal: BTreeMap<String, ConversionStatus> = album_gain_preflight
+        .failures
+        .iter()
+        .map(|(item_id, error)| {
+            (
+                item_id.clone(),
+                ConversionStatus::Failed {
+                    error: error.clone(),
+                    log_path: None,
+                },
+            )
+        })
+        .collect();
+    for _ in 0..terminal.len() {
+        pool.metrics().record_job_failed();
+    }
+    let album_gain_submission_by_item = album_gain_preflight.item_to_submission;
+    let album_gain_ordered_item_ids = album_gain_preflight.ordered_item_ids_by_submission;
+    let mut pending_album_gain_submissions = album_gain_preflight
+        .expected_by_submission
+        .into_iter()
+        .map(|(submission_id, expected)| {
+            let ordered_item_ids = album_gain_ordered_item_ids
+                .get(&submission_id)
+                .cloned()
+                .unwrap_or_default();
+            (
+                submission_id,
+                PendingDsdAlbumGainSubmission::new(expected, ordered_item_ids),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut job_to_item: BTreeMap<String, String> = BTreeMap::new();
     let mut last_progress_by_item: HashMap<String, f32> = HashMap::new();
     submissions.record_backlog(pool.metrics(), &pending_albums);
@@ -2815,6 +3334,34 @@ async fn run_queue_with_shared_orchestrator(
         )
         .await;
         submissions.record_backlog(pool.metrics(), &pending_albums);
+
+        // Initial admission can fail before a worker exists (missing source,
+        // invalid request, durable-acquisition interruption). Account those
+        // terminal participants in the same barrier as worker-side failures so
+        // surviving members never wait indefinitely for an item that cannot
+        // arrive. The completed-id set makes this scan idempotent.
+        let completed_album_gain_submissions = account_terminal_dsd_album_gain_participants(
+            &terminal,
+            &album_gain_submission_by_item,
+            &mut pending_album_gain_submissions,
+        );
+        for submission_id in completed_album_gain_submissions {
+            if let Some(resolution) = resolve_completed_dsd_album_gain_submission(
+                &submission_id,
+                &mut pending_album_gain_submissions,
+            ) {
+                apply_dsd_album_gain_barrier_resolution(
+                    resolution,
+                    &pool,
+                    &mut tracker,
+                    &mut pending_albums,
+                    &mut submissions,
+                    &mut terminal,
+                    &cancel,
+                );
+            }
+        }
+        submissions.record_backlog(pool.metrics(), &pending_albums);
         if terminal.len() >= total_items {
             break;
         }
@@ -2832,6 +3379,99 @@ async fn run_queue_with_shared_orchestrator(
             Some(result) = run.results.recv() => {
                 match result.outcome {
                     Ok(QueueWorkOutput::Materialized { item_id, result }) => {
+                        let album_gain_submission = album_gain_submission_by_item
+                            .get(&item_id)
+                            .cloned();
+                        match result {
+                            ScheduledMaterialization::Finished(report) => {
+                                let warning_count = source_warning_count(report.source.as_ref());
+                                let status = map_album_outcome(
+                                    &report.outcome,
+                                    report.published.as_ref(),
+                                    report.durable_log.as_deref(),
+                                    warning_count,
+                                );
+                                if terminal.insert(item_id.clone(), status.clone()).is_none() {
+                                    record_terminal_status(&pool, &status);
+                                }
+                                if let Some(submission_id) = album_gain_submission.as_deref() {
+                                    let _ = account_terminal_dsd_album_gain_participants(
+                                        &terminal,
+                                        &album_gain_submission_by_item,
+                                        &mut pending_album_gain_submissions,
+                                    );
+                                    if let Some(resolution) = resolve_completed_dsd_album_gain_submission(
+                                        submission_id,
+                                        &mut pending_album_gain_submissions,
+                                    ) {
+                                        apply_dsd_album_gain_barrier_resolution(
+                                            resolution,
+                                            &pool,
+                                            &mut tracker,
+                                            &mut pending_albums,
+                                            &mut submissions,
+                                            &mut terminal,
+                                            &cancel,
+                                        );
+                                        submissions.record_backlog(pool.metrics(), &pending_albums);
+                                    }
+                                }
+                            }
+                            ScheduledMaterialization::Ready(album) => {
+                                if let Some(submission_id) = album_gain_submission.as_deref() {
+                                    if let Some(state) = pending_album_gain_submissions.get_mut(submission_id) {
+                                        if state.completed_item_ids.insert(item_id.clone()) {
+                                            state.ready_albums.push(album);
+                                        } else {
+                                            let status = ConversionStatus::Failed {
+                                                error: "submitted-batch DSD album-gain participant completed the measurement barrier more than once".to_string(),
+                                                log_path: None,
+                                            };
+                                            if terminal.insert(item_id, status.clone()).is_none() {
+                                                record_terminal_status(&pool, &status);
+                                            }
+                                            continue;
+                                        }
+                                    } else {
+                                        let status = ConversionStatus::Failed {
+                                            error: "submitted-batch DSD album-gain barrier state disappeared before materialization completed".to_string(),
+                                            log_path: None,
+                                        };
+                                        if terminal.insert(item_id, status.clone()).is_none() {
+                                            record_terminal_status(&pool, &status);
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(resolution) = resolve_completed_dsd_album_gain_submission(
+                                        submission_id,
+                                        &mut pending_album_gain_submissions,
+                                    ) {
+                                        apply_dsd_album_gain_barrier_resolution(
+                                            resolution,
+                                            &pool,
+                                            &mut tracker,
+                                            &mut pending_albums,
+                                            &mut submissions,
+                                            &mut terminal,
+                                            &cancel,
+                                        );
+                                        submissions.record_backlog(pool.metrics(), &pending_albums);
+                                    }
+                                } else {
+                                    release_scheduled_album(
+                                        album,
+                                        &pool,
+                                        &mut tracker,
+                                        &mut pending_albums,
+                                        &mut submissions,
+                                        &cancel,
+                                    );
+                                    submissions.record_backlog(pool.metrics(), &pending_albums);
+                                }
+                            }
+                        }
+                    }
+                    Ok(QueueWorkOutput::AlbumGainRerunChecked { item_id, result }) => {
                         match result {
                             ScheduledMaterialization::Finished(report) => {
                                 let warning_count = source_warning_count(report.source.as_ref());
@@ -2846,42 +3486,15 @@ async fn run_queue_with_shared_orchestrator(
                                 }
                             }
                             ScheduledMaterialization::Ready(album) => {
-                                let job_id = album.req.job_id.clone();
-                                let expected = album
-                                    .source
-                                    .tracks
-                                    .iter()
-                                    .filter(|track| album.planned_final_path(&track.id).is_some())
-                                    .count();
-                                let staged_tracks_ready_for_encode = album
-                                    .source
-                                    .tracks
-                                    .iter()
-                                    .filter(|track| album.planned_final_path(&track.id).is_some())
-                                    .filter(|track| matches!(&track.source_ref, TrackSourceRef::StagedFile(_)))
-                                    .count();
-                                pool.metrics()
-                                    .record_tracks_materialized(staged_tracks_ready_for_encode as u64);
-                                tracker.register_album(job_id.clone(), expected, album.allow_partial());
-                                pool.metrics().record_jobs_queued(expected as u64);
-                                if expected == 0 {
-                                    pool.metrics().record_jobs_queued(1);
-                                    submissions.enqueue_album_postprocess(album, Vec::new());
-                                    submissions.record_backlog(pool.metrics(), &pending_albums);
-                                } else {
-                                    let job_cancel = cancel.child_token();
-                                    pending_albums.insert(job_id.clone(), PendingAlbum {
-                                        album: Some(album),
-                                        outputs: Vec::with_capacity(expected),
-                                        finished: 0,
-                                        expected,
-                                        next_source_track: 0,
-                                        job_cancel,
-                                        cancel_requested: false,
-                                    });
-                                    submissions.enqueue_album_fanout(job_id.clone());
-                                    submissions.record_backlog(pool.metrics(), &pending_albums);
-                                }
+                                release_scheduled_album(
+                                    album,
+                                    &pool,
+                                    &mut tracker,
+                                    &mut pending_albums,
+                                    &mut submissions,
+                                    &cancel,
+                                );
+                                submissions.record_backlog(pool.metrics(), &pending_albums);
                             }
                         }
                     }
@@ -3095,7 +3708,9 @@ fn build_initial_work(
     job_to_item.insert(request.job_id.clone(), item_id.clone());
 
     let source_kind = detect_source_kind(&request).ok();
-    if matches!(source_kind, Some(SourceKind::SingleFile)) {
+    if matches!(source_kind, Some(SourceKind::SingleFile))
+        && !request.settings.dsd.album_auto_gain_selected()
+    {
         return Some(build_single_file_work(
             request,
             tool_paths,
@@ -3128,7 +3743,7 @@ fn build_initial_work(
         SourceKind::DvdAudio => WorkKind::MaterializeItem,
         SourceKind::DvdVideo => WorkKind::MaterializeItem,
         SourceKind::BluRay => WorkKind::MaterializeItem,
-        SourceKind::SingleFile => unreachable!("single files are submitted as immediate work units"),
+        SourceKind::SingleFile => WorkKind::MaterializeItem,
     };
     let unit_prefix = match source_kind {
         SourceKind::Archive => "archive-extract",
@@ -3137,7 +3752,7 @@ fn build_initial_work(
         SourceKind::DvdAudio => "dvda-materialize",
         SourceKind::DvdVideo => "dvdv-materialize",
         SourceKind::BluRay => "bluray-materialize",
-        SourceKind::SingleFile => unreachable!("single files are submitted as immediate work units"),
+        SourceKind::SingleFile => "single-materialize",
     };
     let submit_tool_paths = tool_paths.clone();
     let submit_version_cache = version_cache.clone();
@@ -3160,12 +3775,13 @@ fn build_initial_work(
                 runner.with_execution_item(submit_item_id.clone())
             };
             let reporter = BroadcastReporter::new(submit_progress_tx, None, submit_item_id.clone(), None);
-            let result = prepare_pipeline_item_for_scheduler(
+            let result = prepare_pipeline_item_for_scheduler_with_tool_limits(
                 request,
                 &runner,
                 &reporter,
                 &worker_cancel,
                 &submit_tool_paths,
+                Some(tool_concurrency_limits.clone()),
             )
             .await;
             Ok(QueueWorkOutput::Materialized {
@@ -3285,7 +3901,8 @@ fn next_album_source_work(
         }
 
         return Some(match &track.source_ref {
-            TrackSourceRef::StagedFile(_) => {
+            TrackSourceRef::StagedFile(_)
+            | TrackSourceRef::DsdAlbumGainCarrier { .. } => {
                 let kind = if album.source.kind == SourceKind::SingleFile {
                     WorkKind::SingleFile
                 } else {
@@ -3424,7 +4041,10 @@ fn build_realize_work(
         TrackSourceRef::DvdaTrack { .. } => WorkKind::MaterializeItem, // Phase 3: DvdaExtractTrack
         TrackSourceRef::DvdVideoTrack { .. } => WorkKind::MaterializeItem,
         TrackSourceRef::BluRayTrack { .. } => WorkKind::MaterializeItem,
-        TrackSourceRef::StagedFile(_) => WorkKind::EncodeTrack { track_id: track_id.clone() },
+        TrackSourceRef::StagedFile(_)
+        | TrackSourceRef::DsdAlbumGainCarrier { .. } => {
+            WorkKind::EncodeTrack { track_id: track_id.clone() }
+        }
     };
     WorkUnit {
         job_id: job_id.clone(),
@@ -3643,6 +4263,26 @@ fn build_album_postprocess_work(
     }
 }
 
+fn build_album_gain_rerun_work(
+    album: ScheduledAlbum,
+    progress_tx: &broadcast::Sender<ProgressUpdate>,
+) -> WorkUnit<QueueWorkOutput> {
+    let item_id = album.req.item_id.clone();
+    let job_id = album.req.job_id.clone();
+    let unit_id = format!("album-gain-rerun:{item_id}");
+    let progress_tx = progress_tx.clone();
+    WorkUnit {
+        job_id,
+        unit_id,
+        kind: WorkKind::PipelineItem,
+        task: boxed_work(move |_worker_cancel| async move {
+            let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
+            let result = resolve_dsd_album_gain_post_barrier_rerun(album, &reporter).await;
+            Ok(QueueWorkOutput::AlbumGainRerunChecked { item_id, result })
+        }),
+    }
+}
+
 
 fn scratch_track_retry_original_error(outputs: &[ScheduledTrackOutput]) -> String {
     outputs
@@ -3741,9 +4381,14 @@ fn run_album_postprocess_work_scoped(
         } else {
             None
         };
-
+        let resolved_album_gain_authority =
+            album.req.settings.dsd.runtime_album_gain_db().is_some();
+        // The generic disk retry rematerializes the original source. A bound
+        // submitted-batch DSD gain is valid only with its retained carrier, so
+        // resolved Album work must stay on the album-aware retry below.
         if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context.clone() {
-            if !worker_cancel.is_cancelled()
+            if !resolved_album_gain_authority
+                && !worker_cancel.is_cancelled()
                 && scheduled_track_outputs_have_scratch_scoped_storage_exhaustion_for_retry(
                     &outputs,
                     &staging_root,
@@ -3781,13 +4426,14 @@ fn run_album_postprocess_work_scoped(
             }
         }
 
-        let report = Box::pin(finish_pipeline_album_for_scheduler_with_tool_limits(
+        let report = Box::pin(finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths(
             album,
             outputs,
             &runner,
             &reporter,
             &worker_cancel,
             Some(tool_concurrency_limits.clone()),
+            Some(&tool_paths),
         ))
         .await;
         let report =
@@ -3795,28 +4441,37 @@ fn run_album_postprocess_work_scoped(
                 if !worker_cancel.is_cancelled()
                     && pipeline_report_requests_scratch_disk_retry(&report)
                 {
-                    let original_error = report
-                        .scratch_retry_intent
-                        .as_ref()
-                        .map(|intent| intent.original_error.clone())
-                        .unwrap_or_else(|| scratch_postprocess_retry_original_error(&report));
-                    retry_req.scratch_staging = None;
-                    log::warn!(
-                        "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
-                        retry_req.job_id,
-                        item_id,
-                        disk_staging_parent_for(&retry_req).display(),
-                        original_error
-                    );
-                    Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
-                        retry_req,
-                        &runner,
-                        &reporter,
-                        &worker_cancel,
-                        &tool_paths,
-                        Some(tool_concurrency_limits),
-                    ))
-                    .await
+                    if retry_req.settings.dsd.runtime_album_gain_db().is_some() {
+                        log::error!(
+                            "refusing unsafe generic scratch retry for resolved DSD album gain: job_id={}, item_id={}; album-aware retry must preserve the submitted-batch fixed gain",
+                            retry_req.job_id,
+                            item_id,
+                        );
+                        report
+                    } else {
+                        let original_error = report
+                            .scratch_retry_intent
+                            .as_ref()
+                            .map(|intent| intent.original_error.clone())
+                            .unwrap_or_else(|| scratch_postprocess_retry_original_error(&report));
+                        retry_req.scratch_staging = None;
+                        log::warn!(
+                            "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
+                            retry_req.job_id,
+                            item_id,
+                            disk_staging_parent_for(&retry_req).display(),
+                            original_error
+                        );
+                        Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
+                            retry_req,
+                            &runner,
+                            &reporter,
+                            &worker_cancel,
+                            &tool_paths,
+                            Some(tool_concurrency_limits),
+                        ))
+                        .await
+                    }
                 } else {
                     report
                 }
@@ -4374,6 +5029,284 @@ mod tests {
         item.input_path = request.container.clone();
         item.pipeline_request = Some(request);
         item
+    }
+
+    fn album_gain_conversion_item(
+        root: &std::path::Path,
+        id: &str,
+        submission_id: &str,
+        submission_size: u32,
+    ) -> ConversionItem {
+        let mut request = pipeline_request_for_processor_limit_test(root);
+        request.item_id = id.to_string();
+        request.job_id = format!("job-{id}");
+        request.container = root.join(format!("{id}.dsf"));
+        request
+            .settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("legacy album auto gain");
+        request
+            .settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        let mut item = conversion_item_with_pipeline_request(id, request);
+        item.submission_id = Some(submission_id.to_string());
+        item.submission_size = Some(submission_size);
+        item
+    }
+
+    fn native_album_gain_conversion_item(
+        root: &std::path::Path,
+        id: &str,
+        submission_id: &str,
+        submission_size: u32,
+    ) -> ConversionItem {
+        let mut request = pipeline_request_for_processor_limit_test(root);
+        request.item_id = id.to_string();
+        request.job_id = format!("job-{id}");
+        request.container = root.join(format!("{id}.dsf"));
+        request.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        request.settings.dsd.from_dsd.gain_mode =
+            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+        request
+            .settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        let mut item = conversion_item_with_pipeline_request(id, request);
+        item.submission_id = Some(submission_id.to_string());
+        item.submission_size = Some(submission_size);
+        item
+    }
+
+    fn album_gain_scope_test_track(id: TrackId, source_ref: TrackSourceRef) -> PreparedTrack {
+        PreparedTrack {
+            id,
+            source_ref,
+            metadata: TrackMetadata::default(),
+            expected_samples: None,
+            sample_rate: Some(176_400),
+            source_audio: SourceAudioDescriptor::default(),
+            bit_depth: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn album_gain_scope_test_source(
+        container: PathBuf,
+        kind: SourceKind,
+        tracks: Vec<PreparedTrack>,
+    ) -> PreparedSource {
+        PreparedSource {
+            container,
+            kind,
+            tracks,
+            album_metadata: AlbumMetadata::default(),
+            provenance: ExtractionProvenance {
+                source_kind: kind,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        }
+    }
+
+    #[test]
+    fn album_gain_scope_disclosure_preserves_submission_track_order_and_exclusions() {
+        let dsd = |source: &str, ordinal: u32, track_number: u32| {
+            album_gain_scope_test_track(
+                TrackId {
+                    source_ordinal: ordinal,
+                    disc_number: None,
+                    track_number,
+                },
+                TrackSourceRef::DsdAlbumGainCarrier {
+                    path: PathBuf::from(format!("/staging/{ordinal}-{track_number}.caf")),
+                    source_path: PathBuf::from(source),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    duration: None,
+                },
+            )
+        };
+        let pcm = |source: &str, ordinal: u32, track_number: u32| {
+            album_gain_scope_test_track(
+                TrackId {
+                    source_ordinal: ordinal,
+                    disc_number: None,
+                    track_number,
+                },
+                TrackSourceRef::StagedFile(PathBuf::from(source)),
+            )
+        };
+
+        let a = album_gain_scope_test_source(
+            PathBuf::from("/submitted/A1.dsf"),
+            SourceKind::SingleFile,
+            vec![dsd("/submitted/A1.dsf", 1, 1)],
+        );
+        let image = album_gain_scope_test_source(
+            PathBuf::from("/submitted/disc.iso"),
+            SourceKind::SacdIso,
+            vec![
+                dsd("/submitted/disc.iso", 4, 4),
+                dsd("/submitted/disc.iso", 7, 7),
+                pcm("/submitted/bonus.wav", 8, 8),
+            ],
+        );
+        let pcm_only = album_gain_scope_test_source(
+            PathBuf::from("/submitted/notes.wav"),
+            SourceKind::SingleFile,
+            vec![pcm("/submitted/notes.wav", 1, 1)],
+        );
+
+        let disclosure = build_dsd_album_gain_scope_disclosure(
+            [&a, &image, &pcm_only],
+            3,
+        );
+        assert_eq!(disclosure.submitted_item_count, 3);
+        assert_eq!(
+            disclosure
+                .dsd_participants
+                .iter()
+                .map(|participant| (
+                    participant.source_path.clone(),
+                    participant.track_id.source_ordinal,
+                    participant.track_id.track_number,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (PathBuf::from("/submitted/A1.dsf"), 1, 1),
+                (PathBuf::from("/submitted/disc.iso"), 4, 4),
+                (PathBuf::from("/submitted/disc.iso"), 7, 7),
+            ],
+        );
+        assert_eq!(disclosure.excluded_non_dsd_track_count, 2);
+        assert_eq!(disclosure.excluded_non_dsd_item_count, 1);
+    }
+
+    #[test]
+    fn album_gain_preflight_accepts_one_complete_persisted_submission() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let items = vec![
+            album_gain_conversion_item(temp.path(), "a", "submission", 2),
+            album_gain_conversion_item(temp.path(), "b", "submission", 2),
+        ];
+
+        let preflight = preflight_dsd_album_gain_submissions(&items);
+        assert!(preflight.failures.is_empty(), "{:?}", preflight.failures);
+        assert_eq!(preflight.expected_by_submission.get("submission"), Some(&2));
+        assert_eq!(
+            preflight
+                .ordered_item_ids_by_submission
+                .get("submission")
+                .cloned(),
+            Some(vec!["a".to_string(), "b".to_string()]),
+        );
+        assert_eq!(preflight.item_to_submission.get("a").map(String::as_str), Some("submission"));
+        assert_eq!(preflight.item_to_submission.get("b").map(String::as_str), Some("submission"));
+    }
+
+    #[test]
+    fn album_gain_preflight_refuses_incomplete_persisted_submission() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let items = vec![album_gain_conversion_item(
+            temp.path(),
+            "a",
+            "submission",
+            2,
+        )];
+
+        let preflight = preflight_dsd_album_gain_submissions(&items);
+        let failure = preflight.failures.get("a").expect("incomplete submission refused");
+        assert!(failure.contains("complete submitted batch"), "{failure}");
+        assert!(preflight.expected_by_submission.is_empty());
+        assert!(preflight.item_to_submission.is_empty());
+    }
+
+    #[test]
+    fn album_gain_preflight_uses_native_snapshot_for_reconstruction_homogeneity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let first = native_album_gain_conversion_item(temp.path(), "a", "submission", 2);
+        let mut second = native_album_gain_conversion_item(temp.path(), "b", "submission", 2);
+        second
+            .pipeline_request
+            .as_mut()
+            .expect("pipeline request")
+            .settings
+            .dsd
+            .from_dsd
+            .profile = tonepoet_pipeline::DsdReconstructionSelection::Wideband;
+
+        let preflight = preflight_dsd_album_gain_submissions(&[first, second]);
+        let failure = preflight
+            .failures
+            .get("a")
+            .expect("heterogeneous native reconstruction refused");
+        assert!(failure.contains("heterogeneous conversion settings"), "{failure}");
+        assert!(preflight.expected_by_submission.is_empty());
+    }
+
+    #[test]
+    fn album_gain_terminal_accounting_resolves_early_failures_without_hanging() {
+        let mut item_to_submission = BTreeMap::new();
+        item_to_submission.insert("a".to_string(), "submission".to_string());
+        item_to_submission.insert("b".to_string(), "submission".to_string());
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            "submission".to_string(),
+            PendingDsdAlbumGainSubmission::new(
+                2,
+                vec!["a".to_string(), "b".to_string()],
+            ),
+        );
+
+        let mut terminal = BTreeMap::new();
+        terminal.insert(
+            "a".to_string(),
+            ConversionStatus::Failed {
+                error: "admission failed".to_string(),
+                log_path: None,
+            },
+        );
+        assert!(
+            account_terminal_dsd_album_gain_participants(
+                &terminal,
+                &item_to_submission,
+                &mut pending,
+            )
+            .is_empty()
+        );
+        assert!(resolve_completed_dsd_album_gain_submission("submission", &mut pending).is_none());
+
+        terminal.insert(
+            "b".to_string(),
+            ConversionStatus::Failed {
+                error: "tool failed".to_string(),
+                log_path: None,
+            },
+        );
+        let complete = account_terminal_dsd_album_gain_participants(
+            &terminal,
+            &item_to_submission,
+            &mut pending,
+        );
+        assert!(complete.contains("submission"));
+        let resolution = resolve_completed_dsd_album_gain_submission("submission", &mut pending)
+            .expect("completed failed cohort resolves");
+        // `ScheduledAlbum` holds a `StagingDir` and `FileLock` and is not `Debug`,
+        // so destructure the error instead of using `expect_err`.
+        let (reason, ready) = match resolution {
+            Err(payload) => payload,
+            Ok(_) => panic!("early failure refuses the cohort"),
+        };
+        assert!(reason.contains("ended before every submitted DSD track"), "{reason}");
+        assert!(ready.is_empty());
+        assert!(!pending.contains_key("submission"));
     }
 
     #[cfg(unix)]
@@ -5207,6 +6140,645 @@ FILE "track.flac" WAVE
     }
 
 
+    #[tokio::test]
+    async fn resolved_dsd_album_gain_track_enospc_uses_album_aware_retry_and_preserves_batch_authority() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_root = temp.path().join("scratch");
+        let scratch_parent = scratch_root.join(".tonepoet-staging");
+        let output_root = temp.path().join("out");
+        let log_root = temp.path().join("logs");
+        std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&log_root).expect("log root");
+        let source_a = temp.path().join("A.dsf");
+        let source_b = temp.path().join("B.dsf");
+        std::fs::write(&source_a, b"A DSD source").expect("A source");
+        std::fs::write(&source_b, b"B DSD source").expect("B source");
+
+        let scratch_config = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            scratch_root.clone(),
+            50,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        scratch_config
+            .ensure_usable(&scratch_parent)
+            .expect("scratch usable");
+        let reservation = scratch_config.try_reserve(4096).expect("scratch reservation");
+
+        let mut req = pipeline_request_for_processor_limit_test(temp.path());
+        req.job_id = "album-gain-scratch-track-job".to_string();
+        req.item_id = "album-gain-scratch-track-A".to_string();
+        req.container = source_a.clone();
+        req.output_root = output_root.clone();
+        req.log.root = log_root;
+        req.scratch_staging = Some(scratch_config.clone());
+        req.settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("legacy Auto");
+        req.settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        req.settings.dsd.bind_runtime_album_gain(
+            "2.840000000".parse().expect("gain"),
+            Some("-3.000000000".parse().expect("peak")),
+            2,
+        );
+
+        let staging_root = scratch_parent.join("album-gain-scratch-track-job-album-gain-scratch-track-A");
+        let carrier_dir = staging_root.join("dsd-album-gain");
+        let converted_root = staging_root.join("converted");
+        std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
+        std::fs::create_dir_all(&converted_root).expect("converted dir");
+        let carrier_path = carrier_dir.join("track-0000-a.caf");
+        std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
+        let staging = StagingDir::new_with_scratch_reservation(
+            staging_root.clone(),
+            req.job_id.clone(),
+            reservation,
+        );
+
+        let track_id = TrackId {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: 1,
+        };
+        let source = PreparedSource {
+            container: source_a.clone(),
+            kind: SourceKind::SingleFile,
+            tracks: vec![PreparedTrack {
+                id: track_id.clone(),
+                source_ref: TrackSourceRef::DsdAlbumGainCarrier {
+                    path: carrier_path.clone(),
+                    source_path: source_a.clone(),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    duration: None,
+                },
+                metadata: TrackMetadata {
+                    title: Some("A".to_string()),
+                    track_number: Some(1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(176_400),
+                sample_rate: Some(5_644_800),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(5_644_800),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
+                bit_depth: None,
+                warnings: Vec::new(),
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("Submitted batch".to_string()),
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let album_dir = output_root.join("A output");
+        let final_path = album_dir.join("01.flac");
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: track_id.clone(),
+                final_path,
+            }],
+        };
+        let mut album = scheduled_album_for_test(
+            req.clone(),
+            req.item_id.clone(),
+            staging,
+            source,
+            plan,
+            Vec::new(),
+            &scratch_parent,
+        );
+        let participant_b = TrackId {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: 1,
+        };
+        album.album_gain_scope_disclosure = Some(DsdAlbumGainScopeDisclosure {
+            submitted_item_count: 2,
+            dsd_participants: vec![
+                DsdAlbumGainScopeParticipant {
+                    source_path: source_a.clone(),
+                    track_id: track_id.clone(),
+                },
+                DsdAlbumGainScopeParticipant {
+                    source_path: source_b.clone(),
+                    track_id: participant_b,
+                },
+            ],
+            excluded_non_dsd_track_count: 0,
+            excluded_non_dsd_item_count: 0,
+        });
+
+        let failed_staged_path = converted_root.join("01.flac");
+        let scratch_failed_output = ScheduledTrackOutput {
+            index: 0,
+            record: TrackRecord {
+                track_id,
+                outcome: TrackOutcome::Err(format!(
+                    "No space left on device while writing {}",
+                    failed_staged_path.display()
+                )),
+                source_ref: TrackSourceRef::DsdAlbumGainCarrier {
+                    path: carrier_path,
+                    source_path: source_a.clone(),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    duration: None,
+                },
+                realized_input: None,
+                output_file: Some(failed_staged_path),
+                commands: Vec::new(),
+                bytes_in: None,
+                bytes_out: None,
+                duration: None,
+                dsd_dst_stats: None,
+                verified_output_bit_depth: None,
+            },
+            artifact: None,
+            ok: false,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+        };
+
+        let generic_retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let generic_count = generic_retry_count.clone();
+        let generic_item_id = req.item_id.clone();
+        let _generic_guard = set_scheduler_disk_retry_hook_for_test(Box::new(move |disk_req| {
+            if disk_req.item_id.as_str() != generic_item_id.as_str() {
+                return None;
+            }
+            generic_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("resolved album gain must never reach the generic serial scratch retry");
+        }));
+        let album_retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let album_count = album_retry_count.clone();
+        let hook_album_dir = album_dir.clone();
+        let hook_source_a = source_a.clone();
+        let hook_source_b = source_b.clone();
+        let hook_staging_root = staging_root.clone();
+        let _album_guard = set_dsd_album_gain_scratch_retry_hook_for_test(Box::new(
+            move |hook_req, hook_source, disclosure, original_error| {
+                if hook_req.item_id != "album-gain-scratch-track-A" {
+                    return None;
+                }
+                album_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    hook_req.scratch_staging.is_none(),
+                    "album-aware retry request must stage outputs on disk"
+                );
+                assert_eq!(
+                    hook_req
+                        .settings
+                        .dsd
+                        .runtime_album_gain_db()
+                        .map(|gain| gain.render(false)),
+                    Some("2.840000000".to_string()),
+                );
+                match &hook_source.tracks[0].source_ref {
+                    TrackSourceRef::DsdAlbumGainCarrier { path, .. } => {
+                        assert!(path.starts_with(&hook_staging_root));
+                        assert!(
+                            path.is_file(),
+                            "retained carrier must remain readable during retry"
+                        );
+                        assert!(
+                            hook_staging_root.exists(),
+                            "scratch staging owner must stay alive until the disk retry finishes"
+                        );
+                    }
+                    other => panic!(
+                        "resolved retry must retain the album-gain carrier, got {other:?}"
+                    ),
+                }
+                let participant_paths = disclosure
+                    .dsd_participants
+                    .iter()
+                    .map(|participant| participant.source_path.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(participant_paths, vec![hook_source_a.clone(), hook_source_b.clone()]);
+                assert!(
+                    original_error.contains("No space left on device"),
+                    "album-aware retry must carry the originating error; actual={original_error}"
+                );
+                Some(crate::convert::pipeline::PipelineReport {
+                    request: RedactedPipelineRequest::from(hook_req),
+                    source: None,
+                    plan: None,
+                    artifacts: None,
+                    published: Some(PublishedAlbum {
+                        album_dir: hook_album_dir.clone(),
+                        entries: Vec::new(),
+                        manifest_path: None,
+                        batch_completion: None,
+                    }),
+                    outcome: AlbumOutcome::Complete {
+                        tracks: Vec::new(),
+                        stages: Vec::new(),
+                    },
+                    durable_log: None,
+                    scratch_retry_intent: None,
+                    settings_fingerprint: Some(
+                        tonepoet_pipeline::fingerprint::settings_fingerprint(&hook_req.settings),
+                    ),
+                    manifest_path: None,
+                    action_reports: Vec::new(),
+                })
+            },
+        ));
+
+        let (progress_tx, _progress_rx) = broadcast::channel(8);
+        let result = run_album_postprocess_work(
+            album,
+            vec![scratch_failed_output],
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+            progress_tx,
+            Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            QueueWorkOutput::PostProcessed {
+                status: ConversionStatus::Completed { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            album_retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resolved album authority must use the dedicated retry"
+        );
+        assert_eq!(
+            generic_retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "resolved album authority must never enter the ordinary serial retry"
+        );
+        assert!(
+            !staging_root.exists(),
+            "scratch staging should be cleaned after the album-aware disk retry completes"
+        );
+        assert_eq!(
+            scratch_config.active_reserved_bytes_for_test(),
+            0,
+            "scratch reservation should be released after the retained carrier is no longer needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_dsd_album_gain_postprocess_enospc_uses_same_album_aware_retry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_root = temp.path().join("scratch");
+        let scratch_parent = scratch_root.join(".tonepoet-staging");
+        let output_root = temp.path().join("out");
+        let log_root = temp.path().join("logs");
+        std::fs::create_dir_all(&scratch_parent).expect("scratch parent");
+        std::fs::create_dir_all(&output_root).expect("output root");
+        std::fs::create_dir_all(&log_root).expect("log root");
+        let source_a = temp.path().join("A.dsf");
+        let source_b = temp.path().join("B.dsf");
+        std::fs::write(&source_a, b"A DSD source").expect("A source");
+        std::fs::write(&source_b, b"B DSD source").expect("B source");
+
+        let scratch_config = ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            scratch_root.clone(),
+            50,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        scratch_config
+            .ensure_usable(&scratch_parent)
+            .expect("scratch usable");
+        let reservation = scratch_config.try_reserve(4096).expect("scratch reservation");
+
+        let mut req = pipeline_request_for_processor_limit_test(temp.path());
+        req.job_id = "album-gain-scratch-post-job".to_string();
+        req.item_id = "album-gain-scratch-post-A".to_string();
+        req.container = source_a.clone();
+        req.output_root = output_root.clone();
+        req.log.root = log_root;
+        req.scratch_staging = Some(scratch_config.clone());
+        req.stages = StagePolicy {
+            metadata: StageRequirement::Disabled,
+            replaygain: StageRequirement::Enabled,
+            features: StageRequirement::Disabled,
+            generate_cue: false,
+        };
+        req.settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("legacy Auto");
+        req.settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        req.settings.dsd.bind_runtime_album_gain(
+            "2.840000000".parse().expect("gain"),
+            Some("-3.000000000".parse().expect("peak")),
+            2,
+        );
+
+        let staging_root = scratch_parent.join("album-gain-scratch-post-job-album-gain-scratch-post-A");
+        let carrier_dir = staging_root.join("dsd-album-gain");
+        let converted_root = staging_root.join("converted");
+        std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
+        std::fs::create_dir_all(&converted_root).expect("converted dir");
+        let carrier_path = carrier_dir.join("track-0000-a.caf");
+        let staged_path = converted_root.join("01.flac");
+        std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
+        std::fs::write(&staged_path, b"encoded output").expect("encoded output");
+        let staging = StagingDir::new_with_scratch_reservation(
+            staging_root.clone(),
+            req.job_id.clone(),
+            reservation,
+        );
+        let track_id = TrackId {
+            source_ordinal: 0,
+            disc_number: None,
+            track_number: 1,
+        };
+        let source = PreparedSource {
+            container: source_a.clone(),
+            kind: SourceKind::SingleFile,
+            tracks: vec![PreparedTrack {
+                id: track_id.clone(),
+                source_ref: TrackSourceRef::DsdAlbumGainCarrier {
+                    path: carrier_path.clone(),
+                    source_path: source_a.clone(),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    duration: None,
+                },
+                metadata: TrackMetadata {
+                    title: Some("A".to_string()),
+                    track_number: Some(1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: Some(176_400),
+                sample_rate: Some(5_644_800),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(5_644_800),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
+                bit_depth: None,
+                warnings: Vec::new(),
+            }],
+            album_metadata: AlbumMetadata {
+                album: Some("Submitted batch".to_string()),
+                total_tracks: 1,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let album_dir = output_root.join("A output");
+        let final_path = album_dir.join("01.flac");
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: track_id.clone(),
+                final_path: final_path.clone(),
+            }],
+        };
+        let mut album = scheduled_album_for_test(
+            req.clone(),
+            req.item_id.clone(),
+            staging,
+            source,
+            plan,
+            Vec::new(),
+            &scratch_parent,
+        );
+        album.album_gain_scope_disclosure = Some(DsdAlbumGainScopeDisclosure {
+            submitted_item_count: 2,
+            dsd_participants: vec![
+                DsdAlbumGainScopeParticipant {
+                    source_path: source_a.clone(),
+                    track_id: track_id.clone(),
+                },
+                DsdAlbumGainScopeParticipant {
+                    source_path: source_b.clone(),
+                    track_id: TrackId {
+                        source_ordinal: 0,
+                        disc_number: None,
+                        track_number: 1,
+                    },
+                },
+            ],
+            excluded_non_dsd_track_count: 0,
+            excluded_non_dsd_item_count: 0,
+        });
+        let output = ScheduledTrackOutput {
+            index: 0,
+            record: TrackRecord {
+                track_id: track_id.clone(),
+                outcome: TrackOutcome::Ok,
+                source_ref: TrackSourceRef::DsdAlbumGainCarrier {
+                    path: carrier_path,
+                    source_path: source_a.clone(),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    duration: None,
+                },
+                realized_input: None,
+                output_file: Some(staged_path.clone()),
+                commands: Vec::new(),
+                bytes_in: Some(1024),
+                bytes_out: Some(1024),
+                duration: None,
+                dsd_dst_stats: None,
+                verified_output_bit_depth: None,
+            },
+            artifact: Some(TrackArtifact {
+                reference_evidence: None,
+                track_id,
+                staged_path,
+                final_path,
+                samples: Some(176_400),
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                metadata_required: PlannedMetadataSatisfaction::none(),
+                planned_command_hash: None,
+            }),
+            ok: true,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+        };
+
+        let expected_item = req.item_id.clone();
+        let expected_staging = staging_root.clone();
+        let _fault_guard = set_post_materialization_stage_fault_hook_for_test(Box::new(
+            move |stage, hook_req, observed_path| {
+                if stage != PipelineStage::ReplayGain || hook_req.item_id != expected_item {
+                    return None;
+                }
+                if let Some(path) = observed_path {
+                    assert!(path.starts_with(&expected_staging));
+                }
+                Some(format!(
+                    "injected ReplayGain ENOSPC while writing {}: No space left on device",
+                    expected_staging.join("replaygain.tmp").display()
+                ))
+            },
+        ));
+
+        let generic_retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let generic_count = generic_retry_count.clone();
+        let generic_item_id = req.item_id.clone();
+        let _generic_guard = set_scheduler_disk_retry_hook_for_test(Box::new(move |disk_req| {
+            if disk_req.item_id.as_str() != generic_item_id.as_str() {
+                return None;
+            }
+            generic_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("resolved album gain must never reach the generic serial scratch retry");
+        }));
+        let album_retry_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let album_count = album_retry_count.clone();
+        let hook_album_dir = album_dir.clone();
+        let hook_source_a = source_a.clone();
+        let hook_source_b = source_b.clone();
+        let hook_staging_root = staging_root.clone();
+        let _album_guard = set_dsd_album_gain_scratch_retry_hook_for_test(Box::new(
+            move |hook_req, hook_source, disclosure, original_error| {
+                if hook_req.item_id != "album-gain-scratch-post-A" {
+                    return None;
+                }
+                album_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    hook_req.scratch_staging.is_none(),
+                    "album-aware retry request must stage outputs on disk"
+                );
+                assert_eq!(
+                    hook_req
+                        .settings
+                        .dsd
+                        .runtime_album_gain_db()
+                        .map(|gain| gain.render(false)),
+                    Some("2.840000000".to_string()),
+                );
+                match &hook_source.tracks[0].source_ref {
+                    TrackSourceRef::DsdAlbumGainCarrier { path, .. } => {
+                        assert!(path.starts_with(&hook_staging_root));
+                        assert!(
+                            path.is_file(),
+                            "retained carrier must remain readable during retry"
+                        );
+                        assert!(
+                            hook_staging_root.exists(),
+                            "scratch staging owner must stay alive until the disk retry finishes"
+                        );
+                    }
+                    other => panic!(
+                        "resolved retry must retain the album-gain carrier, got {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    disclosure
+                        .dsd_participants
+                        .iter()
+                        .map(|participant| participant.source_path.clone())
+                        .collect::<Vec<_>>(),
+                    vec![hook_source_a.clone(), hook_source_b.clone()],
+                );
+                assert!(original_error.contains("ReplayGain"));
+                assert!(
+                    original_error.contains("No space left on device"),
+                    "album-aware retry must carry the originating error; actual={original_error}"
+                );
+                Some(crate::convert::pipeline::PipelineReport {
+                    request: RedactedPipelineRequest::from(hook_req),
+                    source: None,
+                    plan: None,
+                    artifacts: None,
+                    published: Some(PublishedAlbum {
+                        album_dir: hook_album_dir.clone(),
+                        entries: Vec::new(),
+                        manifest_path: None,
+                        batch_completion: None,
+                    }),
+                    outcome: AlbumOutcome::Complete {
+                        tracks: Vec::new(),
+                        stages: Vec::new(),
+                    },
+                    durable_log: None,
+                    scratch_retry_intent: None,
+                    settings_fingerprint: Some(
+                        tonepoet_pipeline::fingerprint::settings_fingerprint(&hook_req.settings),
+                    ),
+                    manifest_path: None,
+                    action_reports: Vec::new(),
+                })
+            },
+        ));
+
+        let (progress_tx, _progress_rx) = broadcast::channel(8);
+        let result = run_album_postprocess_work(
+            album,
+            vec![output],
+            HashMap::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+            progress_tx,
+            Arc::new(ToolConcurrencyLimits::from_available_parallelism()),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            QueueWorkOutput::PostProcessed {
+                status: ConversionStatus::Completed { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            album_retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "post-conversion scratch exhaustion must use the same album-aware retry"
+        );
+        assert_eq!(
+            generic_retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "post-conversion resolved album authority must not enter generic serial retry"
+        );
+        assert!(
+            !staging_root.exists(),
+            "scratch staging should be cleaned after the postprocess album-aware retry completes"
+        );
+        assert_eq!(
+            scratch_config.active_reserved_bytes_for_test(),
+            0,
+            "postprocess retry should release scratch reservation after retained carrier use"
+        );
+    }
 
     #[tokio::test]
     async fn scratch_post_materialization_stage_enospc_retries_disk_before_terminal_failure_publication() {

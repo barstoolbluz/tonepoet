@@ -11,7 +11,7 @@ use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
 use tonepoet_pipeline::enums::{
-    DsdFilterPreset, DsdNoiseShaper, ModulatorOrder,
+    DsdAutoGainScope, DsdFilterPreset, DsdNoiseShaper, ModulatorOrder,
 };
 use tonepoet_pipeline::{DbNano, DsdReconstructionSelection, DsdSourcePathway};
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
@@ -3148,6 +3148,8 @@ pub enum FormatField {
     /// Standard or explicit Wideband Reference reconstruction profile.
     DsdProfile,
     DsdGain,
+    /// Track or submitted-batch scope for automatic DSD peak normalization.
+    DsdGainScope,
     /// Fixed DSD-to-PCM gain value, edited with left/right controls.
     DsdGainDb,
     /// Native NormalizePeak target or exact legacy Auto safety margin.
@@ -3176,13 +3178,13 @@ impl FormatField {
             &[
                 Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
                 Self::Dither, Self::ReplayGain, Self::DsdPath, Self::DsdProfile,
-                Self::DsdGain, Self::DsdGainDb, Self::DsdNormalizeTarget,
+                Self::DsdGain, Self::DsdGainScope, Self::DsdGainDb, Self::DsdNormalizeTarget,
             ]
         } else if show_dsd_to_pcm_gain {
             &[
                 Self::Format, Self::SampleRate, Self::BitDepth, Self::Resampler,
-                Self::Dither, Self::ReplayGain, Self::DsdGain, Self::DsdGainDb,
-                Self::DsdNormalizeTarget,
+                Self::Dither, Self::ReplayGain, Self::DsdGain, Self::DsdGainScope,
+                Self::DsdGainDb, Self::DsdNormalizeTarget,
             ]
         } else {
             &[
@@ -3416,6 +3418,8 @@ pub struct FormatState {
     /// Native-v2 Reference reconstruction profile.
     pub dsd_profile: PillState<DsdReconstructionSelection>,
     pub dsd_gain_mode: PillState<DsdGainMode>,
+    /// Scope for legacy Auto / native NormalizePeak. Track is compatibility default.
+    pub dsd_auto_gain_scope: PillState<DsdAutoGainScope>,
     /// Fixed DSD-to-PCM gain in dB used when `dsd_gain_mode` is Manual.
     pub dsd_gain_db: DbNano,
     /// NormalizePeak target in dBFS. Stored as fixed-point text authority.
@@ -3676,6 +3680,10 @@ impl FormatState {
             (DsdGainMode::Fixed, "manual"),
             (DsdGainMode::NormalizePeak, "normalize"),
         ]);
+        let dsd_auto_gain_scope = PillState::new(vec![
+            (DsdAutoGainScope::Track, "track"),
+            (DsdAutoGainScope::Album, "album"),
+        ]);
         let mut dsd_pathway = PillState::new(vec![
             (DsdSourcePathway::Reference, "reference"),
             (DsdSourcePathway::Manual, "manual (not yet available)"),
@@ -3700,6 +3708,7 @@ impl FormatState {
             dsd_pathway,
             dsd_profile,
             dsd_gain_mode,
+            dsd_auto_gain_scope,
             dsd_gain_db: DbNano(0),
             dsd_normalize_target_dbfs: DbNano::DEFAULT_NORMALIZE_TARGET,
             dsd_auto_gain_margin_db: DbNano(150_000_000),
@@ -4130,6 +4139,9 @@ impl FormatState {
             FormatField::DsdPath => select_enabled_index(&mut self.dsd_pathway, index),
             FormatField::DsdProfile => select_enabled_index(&mut self.dsd_profile, index),
             FormatField::DsdGain => select_enabled_index(&mut self.dsd_gain_mode, index),
+            FormatField::DsdGainScope => {
+                select_enabled_index(&mut self.dsd_auto_gain_scope, index)
+            }
             FormatField::DsdGainDb => {
                 // Clicking/focusing the value row makes Fixed explicit;
                 // keyboard left/right then adjusts the staged dB value.
@@ -4686,6 +4698,7 @@ impl FormatState {
         clamp_pill(&mut self.conversion_preset);
         clamp_pill(&mut self.dsd_pathway);
         clamp_pill(&mut self.dsd_profile);
+        clamp_pill(&mut self.dsd_auto_gain_scope);
         // Manual gain is an explicit output-policy override. Keep it selected
         // while source identity is temporarily unavailable; the disabled option
         // communicates that it cannot currently be applied without erasing it.
@@ -4714,6 +4727,9 @@ impl FormatState {
             FormatField::DsdPath => FocusedPill::DsdPath(&mut self.dsd_pathway),
             FormatField::DsdProfile => FocusedPill::DsdProfile(&mut self.dsd_profile),
             FormatField::DsdGain => FocusedPill::DsdGain(&mut self.dsd_gain_mode),
+            FormatField::DsdGainScope => {
+                FocusedPill::DsdGainScope(&mut self.dsd_auto_gain_scope)
+            }
             FormatField::DsdGainDb => FocusedPill::DsdGainDb {
                 gain_db: &mut self.dsd_gain_db,
                 gain_mode: &mut self.dsd_gain_mode,
@@ -4882,6 +4898,7 @@ pub enum FocusedPill<'a> {
     DsdPath(&'a mut PillState<DsdSourcePathway>),
     DsdProfile(&'a mut PillState<DsdReconstructionSelection>),
     DsdGain(&'a mut PillState<DsdGainMode>),
+    DsdGainScope(&'a mut PillState<DsdAutoGainScope>),
     DsdGainDb {
         gain_db: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
@@ -4911,6 +4928,7 @@ impl FocusedPill<'_> {
             Self::DsdPath(p) => p.select_next(),
             Self::DsdProfile(p) => p.select_next(),
             Self::DsdGain(p) => p.select_next(),
+            Self::DsdGainScope(p) => p.select_next(),
             Self::DsdGainDb { gain_db, gain_mode } => {
                 (*gain_mode).select_value(&DsdGainMode::Fixed);
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
@@ -4940,6 +4958,7 @@ impl FocusedPill<'_> {
             Self::DsdPath(p) => p.select_prev(),
             Self::DsdProfile(p) => p.select_prev(),
             Self::DsdGain(p) => p.select_prev(),
+            Self::DsdGainScope(p) => p.select_prev(),
             Self::DsdGainDb { gain_db, gain_mode } => {
                 (*gain_mode).select_value(&DsdGainMode::Fixed);
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);

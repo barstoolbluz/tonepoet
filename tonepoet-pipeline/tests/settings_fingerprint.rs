@@ -1,10 +1,12 @@
 use tonepoet_pipeline::{
-    settings_fingerprint, AacProfile, AacSettings, AudioFormat, BitDepthTarget, DitherType,
-    DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, FlacSettings,
+    settings_fingerprint, AacProfile, AacSettings, AudioFormat, BitDepthTarget, DbNano, DitherType,
+    DsdAutoGainScope, DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings,
+    DsdSourceGainMode, FlacSettings,
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
     DsdToPcmGainMode, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
-    SETTINGS_FINGERPRINT_FIELD_COUNT, SETTINGS_FINGERPRINT_FIELD_PATHS,
+    DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS, SETTINGS_FINGERPRINT_FIELD_COUNT,
+    SETTINGS_FINGERPRINT_FIELD_PATHS,
     SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
     VerificationSettings, WavPackMode, WavPackSettings,
 };
@@ -220,6 +222,140 @@ fn fingerprint_field_inventory_has_expected_size_and_no_duplicates() {
         SETTINGS_FINGERPRINT_FIELD_PATHS.len(),
         "duplicate settings fingerprint field path"
     );
+}
+
+#[test]
+fn album_gain_fingerprint_extension_is_separate_and_byte_affecting() {
+    assert_eq!(
+        DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS,
+        &[
+            "dsd.auto_gain_scope",
+            "dsd.album_native_from_dsd_profile",
+            "dsd.album_gain_db",
+        ]
+    );
+
+    let mut settings = PipelineSettings::default();
+    settings
+        .dsd
+        .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+        .expect("legacy auto gain");
+    let track = settings_fingerprint(&settings);
+
+    settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    let album_unbound = settings_fingerprint(&settings);
+    assert_ne!(track, album_unbound, "album scope changes output authority");
+
+    settings
+        .dsd
+        .set_runtime_album_gain_db(Some("2.125000000".parse::<DbNano>().unwrap()));
+    let album_bound = settings_fingerprint(&settings);
+    assert_ne!(album_unbound, album_bound, "resolved album gain changes output bytes");
+
+    settings
+        .dsd
+        .set_runtime_album_gain_db(Some("2.124000000".parse::<DbNano>().unwrap()));
+    assert_ne!(
+        album_bound,
+        settings_fingerprint(&settings),
+        "resolved gain is fingerprinted at nanodecibel precision"
+    );
+}
+
+#[test]
+fn native_album_gain_is_visible_to_manifest_v1_settings_fingerprint() {
+    let mut settings = PipelineSettings::default();
+    settings.dsd = DsdSettings::native_v2();
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+    let track = settings_fingerprint(&settings);
+
+    settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    let album_unbound = settings_fingerprint(&settings);
+    assert_ne!(track, album_unbound, "native album scope changes output authority");
+
+    settings
+        .dsd
+        .bind_runtime_album_gain(
+            "-0.750000000".parse().unwrap(),
+            Some("-0.490000000".parse().unwrap()),
+            12,
+        );
+    assert_ne!(
+        album_unbound,
+        settings_fingerprint(&settings),
+        "native resolved submitted-batch gain changes output bytes",
+    );
+}
+
+#[test]
+fn native_album_profile_is_visible_to_manifest_v1_at_identical_runtime_gain() {
+    let mut reference = PipelineSettings::default();
+    reference.dsd = DsdSettings::native_v2();
+    reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+    reference.dsd.from_dsd.profile = tonepoet_pipeline::DsdReconstructionSelection::Reference;
+    reference.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    reference
+        .dsd
+        .bind_runtime_album_gain(
+            "-0.750000000".parse().unwrap(),
+            Some("-0.490000000".parse().unwrap()),
+            12,
+        );
+
+    let mut wideband = reference.clone();
+    wideband.dsd.from_dsd.profile = tonepoet_pipeline::DsdReconstructionSelection::Wideband;
+
+    assert_ne!(
+        settings_fingerprint(&reference),
+        settings_fingerprint(&wideband),
+        "native album reconstruction profile changes reconstructed PCM even when the resolved album gain is identical",
+    );
+
+    reference.dsd.set_auto_gain_scope(DsdAutoGainScope::Track);
+    wideband.dsd.set_auto_gain_scope(DsdAutoGainScope::Track);
+    assert_eq!(
+        settings_fingerprint(&reference),
+        settings_fingerprint(&wideband),
+        "native track scope must retain the frozen manifest-v1 compatibility fingerprint",
+    );
+}
+
+#[test]
+fn legacy_album_fingerprint_does_not_gain_inert_native_profile_state() {
+    let mut reference = PipelineSettings::default();
+    reference
+        .dsd
+        .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+        .expect("legacy auto gain");
+    reference.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    reference
+        .dsd
+        .bind_runtime_album_gain(
+            "-0.750000000".parse().unwrap(),
+            Some("-0.490000000".parse().unwrap()),
+            12,
+        );
+    reference.dsd.from_dsd.profile = tonepoet_pipeline::DsdReconstructionSelection::Reference;
+
+    let mut wideband = reference.clone();
+    wideband.dsd.from_dsd.profile = tonepoet_pipeline::DsdReconstructionSelection::Wideband;
+    assert_eq!(
+        settings_fingerprint(&reference),
+        settings_fingerprint(&wideband),
+        "legacy album mode must not acquire inert native-v2 reconstruction state",
+    );
+}
+
+#[test]
+fn inert_album_scope_does_not_perturb_legacy_track_behavior_fingerprint() {
+    let mut settings = PipelineSettings::default();
+    settings
+        .dsd
+        .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(-2.0))
+        .expect("legacy manual gain");
+    let before = settings_fingerprint(&settings);
+    settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    assert_eq!(before, settings_fingerprint(&settings));
 }
 
 #[test]
