@@ -1953,8 +1953,21 @@ fn classify_opened_descriptor(
     path: &Path,
     lock_state: bool,
 ) -> Result<Option<(ClaimAvailability, LeaseFamily, Vec<PathClaim>, Option<String>)>, String> {
-    if !lock_state && reclaim_empty_descriptor_from_locked_file(&file, path)? {
-        return Ok(None);
+    if !lock_state {
+        // A scanner can open a live ephemeral descriptor just before lexical
+        // guard teardown unpublishes it, then acquire the now-ownerless inode.
+        // Apply the same ephemeral-only missing-path rule used below before
+        // propagating an empty-reclamation binding failure.
+        match reclaim_empty_descriptor_from_locked_file(&file, path) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(error) => {
+                if ephemeral_descriptor_unpublished_during_classification(path)? {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
     }
     let descriptor = match read_descriptor_from(&mut file, path) {
         Ok(descriptor) => descriptor,
@@ -3400,6 +3413,67 @@ mod tests {
             assert!(
                 classified.is_none(),
                 "an unpublished ephemeral inode no longer participates in mutation admission"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_treats_opened_then_unpublished_unlocked_ephemeral_descriptor_as_absent() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("scanner-unlocked-race.mp3");
+            std::fs::write(&target, b"fixture").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(vec![claim]).unwrap();
+            let descriptor = guard.lease().descriptor_path().to_path_buf();
+            let scanner = open_existing_descriptor(&descriptor).unwrap();
+
+            // Deterministic form of the production race: the scanner has
+            // opened the inode, but the lexical owner retires the public name
+            // before the scanner probes the lock. The probe then succeeds on
+            // the now-ownerless inode even though its pathname is already gone.
+            drop(guard);
+            assert!(
+                !descriptor.exists(),
+                "ordinary lexical teardown must unpublish the ephemeral descriptor"
+            );
+            scanner
+                .try_lock_exclusive()
+                .expect("scanner probe must acquire the ownerless descriptor inode");
+
+            let classified = classify_opened_descriptor(scanner, &descriptor, false)
+                .expect("an opened-and-unpublished ephemeral inode must not become an ENOENT admission failure");
+            assert!(
+                classified.is_none(),
+                "an unpublished ephemeral inode no longer participates in mutation admission"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_keeps_opened_then_disappeared_unlocked_durable_descriptor_fail_closed() {
+        with_root(|_| {
+            let lease = PersistentLease::create(
+                LeaseFamily::JournalOperation { job_id: Uuid::new_v4() },
+                &[],
+            )
+            .unwrap();
+            let descriptor = lease.descriptor_path().to_path_buf();
+            let scanner = open_existing_descriptor(&descriptor).unwrap();
+
+            std::fs::remove_file(&descriptor).unwrap();
+            drop(lease);
+            scanner
+                .try_lock_exclusive()
+                .expect("scanner probe must acquire the now-ownerless durable descriptor inode");
+
+            let error = classify_opened_descriptor(scanner, &descriptor, false).unwrap_err();
+            assert!(
+                error.contains("lstat empty coordination descriptor pathname"),
+                "an unlocked durable descriptor disappearance must remain fail closed: {error}"
             );
         });
     }

@@ -4200,6 +4200,7 @@ mod tests {
 
     #[test]
     fn dsf_performer_arranger_production_writer_round_trips_order_and_duplicates() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("performer-arranger.dsf");
         write_test_dsf_fixture(&path, None).expect("write DSF fixture");
@@ -4273,6 +4274,7 @@ mod tests {
 
     #[test]
     fn dsf_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use id3::frame::ExtendedText;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4437,6 +4439,7 @@ mod tests {
 
     #[test]
     fn noncanonical_audio_boundary_is_readable_but_write_blocked() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt-boundary.dsf");
         let mut tag = id3::Tag::new();
@@ -4477,6 +4480,7 @@ mod tests {
 
     #[test]
     fn declared_size_mismatch_is_readable_but_write_blocked() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("declared-size-mismatch.dsf");
         let mut tag = id3::Tag::new();
@@ -4524,6 +4528,7 @@ mod tests {
 
     #[test]
     fn real_dsf_boundary_reads_untagged_file_then_writes_and_rewrites_id3() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         write_test_dsf_fixture(&path, None).expect("write minimal untagged DSF fixture");
@@ -4654,6 +4659,7 @@ mod tests {
 
     #[test]
     fn tagged_dsf_with_unowned_trailing_bytes_is_not_rewritten() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tag-with-tail.dsf");
         let mut tag = id3::Tag::new();
@@ -4687,6 +4693,7 @@ mod tests {
 
     #[test]
     fn nonzero_metadata_pointer_without_id3_marker_is_readable_but_write_blocked() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt-metadata.dsf");
         write_test_dsf_fixture(&path, Some(b"NOT-AN-ID3-TAG"))
@@ -4814,6 +4821,7 @@ mod tests {
 
     #[test]
     fn bounded_tail_write_reuses_allocation_and_reports_byte_progress() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -4866,6 +4874,7 @@ mod tests {
 
     #[test]
     fn compact_tag_growth_rewrites_once_then_reuses_seeded_padding_in_place() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("compact.dsf");
         let mut tag = id3::Tag::new();
@@ -4947,6 +4956,7 @@ mod tests {
 
     #[test]
     fn untagged_first_tag_appends_padded_id3_without_moving_audio_bytes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("untagged.dsf");
         write_test_dsf_fixture(&path, None).expect("write untagged fixture");
@@ -4991,6 +5001,7 @@ mod tests {
 
     #[test]
     fn cancelling_bounded_tail_write_restores_exact_original_bytes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5028,6 +5039,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_final_tail_progress_rolls_back_before_commit() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5069,6 +5081,7 @@ mod tests {
 
     #[test]
     fn commit_state_sync_failure_retains_journal_without_attempting_rollback() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5119,6 +5132,7 @@ mod tests {
 
     #[test]
     fn cancelling_untagged_append_restores_exact_original_without_prefix_copy() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("untagged.dsf");
         write_test_dsf_fixture(&path, None).expect("write untagged fixture");
@@ -5163,6 +5177,7 @@ mod tests {
 
     #[test]
     fn prepared_tail_journal_restores_and_committed_journal_only_cleans_up() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5236,6 +5251,7 @@ mod tests {
 
     #[test]
     fn prepared_append_journal_restores_header_and_truncates_while_committed_keeps_tag() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("append-recovery.dsf");
         write_test_dsf_fixture(&path, None).expect("write untagged fixture");
@@ -5399,6 +5415,7 @@ mod tests {
 
     #[test]
     fn directory_recovery_refuses_unversioned_legacy_backup_and_removes_orphan_temp() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let backup = crate::db::Database::backup_path_for(&path);
@@ -5440,6 +5457,7 @@ mod tests {
 
     #[test]
     fn prewrite_refuses_legacy_marker_before_new_generation_can_commit() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5479,6 +5497,7 @@ mod tests {
 
     #[test]
     fn prewrite_handles_tail_journal_and_orphan_temp_before_refusing_legacy_marker() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5551,6 +5570,7 @@ mod tests {
 
     #[test]
     fn prewrite_retires_byte_identical_legacy_marker_and_continues() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         write_test_dsf_fixture(&path, None).expect("write fixture");
@@ -5575,6 +5595,7 @@ mod tests {
 
     #[test]
     fn explicit_legacy_resolution_supports_keep_current_and_restore_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let backup = crate::db::Database::backup_path_for(&path);
@@ -5623,6 +5644,7 @@ mod tests {
 
     #[test]
     fn restore_backup_refuses_non_dsf_marker_without_mutating_either_generation() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         write_test_dsf_fixture(&path, None).expect("write current DSF");
@@ -5647,6 +5669,7 @@ mod tests {
 
     #[test]
     fn prewrite_removes_target_matched_orphan_temp_before_saving() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
@@ -5789,6 +5812,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_non_utf8_and_literal_dsf_writes_keep_independent_authority() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -5833,6 +5857,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn legacy_fallback_journal_is_attributed_by_embedded_identity_not_filename() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -5892,6 +5917,7 @@ mod tests {
 
     #[test]
     fn dsf_artwork_uses_tail_journal_and_rolls_back_without_full_file_backup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::io::{Seek, SeekFrom};
 
         fn picture_count(path: &Path, code: u8) -> usize {
@@ -5955,6 +5981,7 @@ mod tests {
 
     #[test]
     fn cancelling_dsf_artwork_append_restores_exact_original() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("cancel-artwork.dsf");
         write_test_dsf_fixture(&path, None).expect("write untagged fixture");
@@ -5986,6 +6013,7 @@ mod tests {
 
     #[test]
     fn cancelling_tail_journal_copy_reports_byte_progress_and_preserves_target() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("album.dsf");
         let mut tag = id3::Tag::new();
