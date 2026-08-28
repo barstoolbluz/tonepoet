@@ -301,8 +301,15 @@ pub struct PlannedCommand {
     pub environment_policy: CommandEnvironmentPolicy,
     /// Stable environment variables requested by this command.
     pub environment: BTreeMap<String, String>,
-    /// Optional progress estimate.
+    /// Optional progress estimate. This is media/progress time, not a wall-clock deadline.
     pub expected_duration: Option<Duration>,
+    /// Optional explicit wall-clock process deadline. Executors may derive a broader
+    /// budget when this is absent, but must honor an explicit budget when present.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub timeout_budget: Option<Duration>,
     /// User-facing description.
     pub description: String,
     /// Typed metadata effects produced by this command.
@@ -329,9 +336,17 @@ impl PlannedCommand {
             environment_policy: CommandEnvironmentPolicy::InheritAndSet,
             environment: BTreeMap::new(),
             expected_duration,
+            timeout_budget: None,
             description: description.into(),
             metadata_effect: MetadataPlanEffect::none(),
         }
+    }
+
+    /// Return this command with an explicit wall-clock process deadline.
+    #[must_use]
+    pub fn with_timeout_budget(mut self, timeout_budget: Duration) -> Self {
+        self.timeout_budget = Some(timeout_budget);
+        self
     }
 
     /// Return this command annotated with a typed metadata effect.

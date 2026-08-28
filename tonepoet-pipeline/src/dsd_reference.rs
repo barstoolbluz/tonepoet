@@ -3536,6 +3536,7 @@ fn build_true_peak_measurement(
             );
             producer.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
             producer.environment = environment.clone();
+            producer.timeout_budget = Some(expected_duration);
             (
                 Some(producer),
                 vec![
@@ -3576,6 +3577,7 @@ fn build_true_peak_measurement(
     );
     command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
     command.environment = environment;
+    command.timeout_budget = Some(expected_duration);
     PlannedMeasurement {
         id,
         scope: MeasurementScope::Plan,
@@ -5513,6 +5515,10 @@ mod tests {
                 measurement.command.expected_duration,
                 Some(std::time::Duration::from_secs(290))
             );
+            assert_eq!(
+                measurement.command.timeout_budget,
+                Some(std::time::Duration::from_secs(290))
+            );
         }
 
         let measurement = measurements[0];
@@ -5548,6 +5554,7 @@ mod tests {
         );
         let mut changed_deadline = measurement.clone();
         changed_deadline.command.expected_duration = Some(std::time::Duration::from_secs(291));
+        changed_deadline.command.timeout_budget = Some(std::time::Duration::from_secs(291));
         assert_ne!(
             baseline,
             normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_deadline))

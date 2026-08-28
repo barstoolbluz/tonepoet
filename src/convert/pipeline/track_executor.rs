@@ -8407,6 +8407,7 @@ fn reference_measurement_deadline_is_canonical(
                 tonepoet_pipeline::REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS,
             )
         && command.expected_duration == Some(summary.analyzer_deadline)
+        && command.timeout_budget == Some(summary.analyzer_deadline)
 }
 
 fn validate_reference_package_pipeline(
