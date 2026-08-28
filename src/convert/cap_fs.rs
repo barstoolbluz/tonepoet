@@ -69,6 +69,7 @@ enum RacePoint {
     BeforeRename,
     BeforeLink,
     BeforeUnlink,
+    BeforeListEntryStat,
 }
 
 #[cfg(test)]
@@ -766,7 +767,8 @@ impl PinnedDirectoryCapability {
         loop {
             set_errno_zero();
             // SAFETY: `directory` remains valid until the single `closedir`
-            // below; callers serialize authority mutation while inventorying.
+            // below. Directory membership may still change concurrently, so
+            // each returned name is revalidated descriptor-relatively below.
             let entry = unsafe { libc::readdir(directory) };
             if entry.is_null() {
                 let error = io::Error::last_os_error();
@@ -787,7 +789,21 @@ impl PinnedDirectoryCapability {
             let name = OsString::from_vec(bytes.to_vec());
             #[cfg(not(unix))]
             let name = OsString::from(String::from_utf8_lossy(bytes).into_owned());
-            let identity = fstatat_no_follow(self.directory.as_raw_fd(), &name)?.entry_identity();
+            #[cfg(test)]
+            run_race_hook(RacePoint::BeforeListEntryStat);
+            let identity = match fstatat_no_follow(self.directory.as_raw_fd(), &name) {
+                Ok(metadata) => metadata.entry_identity(),
+                // Directory enumeration is not a snapshot. A sibling may
+                // legitimately unlink an entry after readdir returned its name
+                // but before we inspect it. Treat that as the entry no longer
+                // being present; every other stat failure remains diagnostic.
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(error) => {
+                    // SAFETY: closes both the DIR stream and its owned descriptor.
+                    unsafe { libc::closedir(directory) };
+                    return Err(error.into());
+                }
+            };
             entries.push((name, identity));
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -7566,6 +7582,26 @@ mod tests {
         assert_eq!(std::fs::read(retained.join("first")).unwrap(), b"first");
         assert_eq!(std::fs::read(retained.join("second")).unwrap(), b"second");
         assert!(!logical.join("second").exists());
+    }
+
+    #[test]
+    fn list_entries_tolerates_entry_removed_after_readdir() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let vanishing = root.join("vanishing");
+        std::fs::write(&vanishing, b"temporary authority").unwrap();
+        let capability = PinnedDirectoryCapability::open_trusted(&root).unwrap();
+
+        // With exactly one directory entry the hook runs after readdir has
+        // returned that name and before fstatat inspects it, deterministically
+        // reproducing the publication-lock unlink race.
+        let _hook = RaceHookGuard::install(RacePoint::BeforeListEntryStat, {
+            let vanishing = vanishing.clone();
+            move || std::fs::remove_file(&vanishing).unwrap()
+        });
+        let entries = capability.list_entries().unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

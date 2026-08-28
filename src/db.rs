@@ -3101,10 +3101,152 @@ impl Database {
         }
     }
 
+    /// Reclaim durable QueueScope reservations whose owning session is gone
+    /// and whose SQLite scope is already empty. This closes the lifecycle hole
+    /// where `load_queue_items` returned early for an empty queue and therefore
+    /// never entered ordinary dead-scope recovery.
+    ///
+    /// A live descriptor is never touched. For an abandoned descriptor we first
+    /// acquire its recovery OFD, then re-check the row and both dependent tables
+    /// under SQLite's writer reservation before deleting the scope row. Only
+    /// after that DB transition commits do we release and lifecycle-retire the
+    /// descriptor.
+    fn cleanup_dead_empty_queue_scopes(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.scope_uuid, s.descriptor_path
+                 FROM conversion_queue_scopes s
+                 WHERE NOT EXISTS (
+                           SELECT 1 FROM conversion_queue_v24 q
+                           WHERE q.owner_scope = s.scope_uuid
+                       )
+                   AND NOT EXISTS (
+                           SELECT 1 FROM conversion_queue_executions e
+                           WHERE e.owner_scope = s.scope_uuid
+                       )
+                 ORDER BY s.scope_order ASC, s.scope_uuid ASC",
+            )
+            .map_err(|error| format!("queue empty-scope cleanup prepare: {error}"))?;
+        let candidates = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("queue empty-scope cleanup query: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("queue empty-scope cleanup decode: {error}"))?;
+        drop(stmt);
+
+        for (scope_text, descriptor_text) in candidates {
+            let Ok(scope_id) = uuid::Uuid::parse_str(&scope_text) else {
+                log::warn!(
+                    "empty queue scope id is malformed; leaving it reserved: {scope_text}"
+                );
+                continue;
+            };
+            let descriptor_path = PathBuf::from(&descriptor_text);
+            if !descriptor_path.exists() {
+                // A missing same-boot descriptor can still represent an
+                // ambiguous publication failure. Existing dead-scope recovery
+                // already treats that case fail-closed; preserve the rule here.
+                continue;
+            }
+            let family = crate::concurrency::LeaseFamily::QueueScope { scope_id };
+            match crate::concurrency::descriptor_availability(&descriptor_path) {
+                Ok((observed, crate::concurrency::ClaimAvailability::Live))
+                    if observed == family => continue,
+                Ok((observed, crate::concurrency::ClaimAvailability::RecoveryReserved))
+                    if observed == family => {}
+                Ok((observed, availability)) => {
+                    log::warn!(
+                        "empty queue scope {} has unexpected descriptor {:?} ({availability:?}); leaving it reserved",
+                        scope_text,
+                        observed
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "empty queue scope {scope_text} ownership is ambiguous; leaving it reserved: {error}"
+                    );
+                    continue;
+                }
+            }
+
+            let recovery_lease = match crate::concurrency::PersistentLease::acquire_existing_recovery(
+                &descriptor_path,
+                &family,
+            ) {
+                Ok(lease) => lease,
+                Err(error) if error.contains("live-owned") => continue,
+                Err(error) => {
+                    log::warn!(
+                        "empty queue scope {scope_text} recovery lease acquisition failed closed: {error}"
+                    );
+                    continue;
+                }
+            };
+
+            let retired = run_queue_immediate_transaction(
+                &self.conn,
+                "queue empty-scope cleanup",
+                |tx| {
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM conversion_queue_scopes
+                             WHERE scope_uuid=?1
+                               AND descriptor_path=?2
+                               AND NOT EXISTS (
+                                     SELECT 1 FROM conversion_queue_v24 q
+                                     WHERE q.owner_scope = conversion_queue_scopes.scope_uuid
+                                   )
+                               AND NOT EXISTS (
+                                     SELECT 1 FROM conversion_queue_executions e
+                                     WHERE e.owner_scope = conversion_queue_scopes.scope_uuid
+                                   )",
+                            params![&scope_text, &descriptor_text],
+                        )
+                        .map_err(|error| {
+                            QueueTransactionError::sqlite(
+                                "queue empty-scope conditional retirement",
+                                error,
+                            )
+                        })?;
+                    Ok(changed == 1)
+                },
+            )?;
+
+            drop(recovery_lease);
+            if retired {
+                if let Err(error) =
+                    crate::concurrency::retire_descriptor_after_lifecycle_release(
+                        &descriptor_path,
+                        &family,
+                    )
+                {
+                    // The DB row is already gone, so cleanup_v24_setup_orphans
+                    // can safely retry this descriptor on a later pass.
+                    log::warn!(
+                        "empty queue scope {scope_text} retired in SQLite but descriptor cleanup was incomplete: {error}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_queue_scope(&self) -> Result<&QueueScopeRuntime, String> {
         self.cleanup_v24_setup_orphans();
         if let Some(scope) = self.queue_scope.get() {
             return Ok(scope);
+        }
+        // CLI conversion can enter through sync_queue without first calling
+        // load_queue_items. Reclaim abandoned empty scopes at the common
+        // scope-creation boundary as well as the empty-load boundary so queue
+        // lifecycle state cannot accumulate merely because the TUI was not
+        // involved. Maintenance failure stays non-fatal/fail-closed.
+        if let Err(error) = self.cleanup_dead_empty_queue_scopes() {
+            log::warn!("empty queue-scope cleanup before scope creation failed closed: {error}");
         }
         let scope_id = uuid::Uuid::new_v4();
         let lease = crate::concurrency::PersistentLease::create(
@@ -4072,13 +4214,18 @@ impl Database {
     /// failures are returned to the caller; malformed individual rows are
     /// salvaged by omission and reconciled transactionally afterward.
     pub fn load_queue_items(&self) -> Result<QueueLoadOutcome, String> {
-        // Empty startup is read-only with respect to queue ownership. This is
-        // important for bounded durable history and keeps browsing-only
-        // sessions off the coordination/SQLite write path.
+        // Empty startup is read-only with respect to *new* queue ownership,
+        // but an earlier session may have drained its final row and exited
+        // while leaving an empty QueueScope reservation behind. Reclaim that
+        // dead lifecycle before the no-items fast return. Non-empty startup
+        // reaches the same cleanup through ensure_queue_scope below.
         if !self
             .has_queue_items()
             .map_err(|error| format!("queue load prepare: {error}"))?
         {
+            if let Err(error) = self.cleanup_dead_empty_queue_scopes() {
+                log::warn!("empty queue-scope cleanup failed closed: {error}");
+            }
             return Ok(QueueLoadOutcome { items: Vec::new(), degradation: None });
         }
         let scope_id = self.ensure_queue_scope()?.scope_id;
@@ -7114,6 +7261,110 @@ mod tests {
         // `db` (and therefore its QueueScope lease) deliberately lives until
         // after the parent has proved both independent rows coexist.
         drop(db);
+    }
+
+    #[test]
+    fn empty_dead_queue_scope_is_reclaimed_but_live_empty_scope_is_preserved() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("empty queue-scope tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db_owner = Database::open_path(&db_path).expect("open queue-scope owner database");
+        let item = queue_item(
+            "empty-scope-item",
+            "/music/empty-scope.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        db_owner.sync_queue(&[&item]).expect("publish queue scope");
+        let scope_id = db_owner.ensure_queue_scope().expect("queue scope").scope_id;
+        let descriptor: String = db_owner
+            .conn
+            .query_row(
+                "SELECT descriptor_path FROM conversion_queue_scopes WHERE scope_uuid=?1",
+                [scope_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read queue scope descriptor");
+        let descriptor = PathBuf::from(descriptor);
+        db_owner.sync_queue(&[]).expect("drain owner queue");
+        assert!(descriptor.exists(), "drained live scope keeps durable recovery descriptor");
+
+        let db_observer = Database::open_path(&db_path).expect("open observer database");
+        let live_empty = db_observer.load_queue_items().expect("load while empty scope owner is live");
+        assert!(live_empty.items.is_empty());
+        let live_scope_count: i64 = db_observer
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversion_queue_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(live_scope_count, 1, "live empty scope must never be reaped");
+        assert!(descriptor.exists());
+
+        drop(db_owner);
+        let after_owner_exit = db_observer
+            .load_queue_items()
+            .expect("load after empty scope owner exits");
+        assert!(after_owner_exit.items.is_empty());
+        let scope_count: i64 = db_observer
+            .conn
+            .query_row("SELECT COUNT(*) FROM conversion_queue_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(scope_count, 0, "abandoned empty scope row must be retired");
+        assert!(!descriptor.exists(), "abandoned empty scope descriptor must be retired");
+    }
+
+    #[test]
+    fn new_queue_scope_reclaims_abandoned_empty_scope_without_prior_load() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("queue-scope creation tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db_owner = Database::open_path(&db_path).expect("open first queue-scope database");
+        let old_item = queue_item(
+            "old-empty-scope-item",
+            "/music/old-empty-scope.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        db_owner
+            .sync_queue(&[&old_item])
+            .expect("publish first queue scope");
+        let old_scope = db_owner.ensure_queue_scope().expect("old queue scope").scope_id;
+        let old_descriptor: String = db_owner
+            .conn
+            .query_row(
+                "SELECT descriptor_path FROM conversion_queue_scopes WHERE scope_uuid=?1",
+                [old_scope.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read first queue scope descriptor");
+        let old_descriptor = PathBuf::from(old_descriptor);
+        db_owner.sync_queue(&[]).expect("drain first queue scope");
+        drop(db_owner);
+
+        // Model the CLI path: it opens the DB and publishes a new durable
+        // queue directly through sync_queue, without first load_queue_items.
+        let db_next = Database::open_path(&db_path).expect("open next queue-scope database");
+        let next_item = queue_item(
+            "next-scope-item",
+            "/music/next-scope.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        db_next
+            .sync_queue(&[&next_item])
+            .expect("publish next queue scope without prior load");
+
+        let mut scope_stmt = db_next
+            .conn
+            .prepare("SELECT scope_uuid FROM conversion_queue_scopes ORDER BY scope_order")
+            .expect("prepare surviving queue scopes");
+        let scopes = scope_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query surviving queue scopes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read surviving queue scopes");
+        assert_eq!(scopes.len(), 1, "new scope creation must retire the abandoned empty scope");
+        assert_ne!(scopes[0], old_scope.to_string());
+        assert!(
+            !old_descriptor.exists(),
+            "new scope creation must retire the abandoned empty descriptor"
+        );
     }
 
     #[test]

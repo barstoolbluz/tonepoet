@@ -41249,6 +41249,13 @@ async fn finalize_report_with_binding(
         emit_stage_finished(reporter, &item_id, record).await;
     }
 
+    // Stage failures are already user-visible in the report/TUI, but without a
+    // terminal operator-log record they disappear after the queue item leaves
+    // the screen. Log only failed terminal stages -- never ordinary stage
+    // transitions -- with enough request context to identify the job, track,
+    // source/output path, and the lock/path detail carried by the error itself.
+    log_terminal_stage_failures(req, plan.as_ref(), &outcome);
+
     let warning_count = source.as_ref().map_or(0, |source| {
         source.tracks.iter().fold(0_u32, |total, track| {
             total.saturating_add(u32::try_from(track.warnings.len()).unwrap_or(u32::MAX))
@@ -41627,6 +41634,46 @@ fn durable_log_failure_terminal_error(
     }
 
     format!("durable log failed: {error_text}")
+}
+
+fn terminal_stage_failure_log_line(
+    req: &PipelineRequest,
+    plan: Option<&AlbumPlan>,
+    record: &StageRecord,
+) -> Option<String> {
+    let StageOutcome::Failed(error) = &record.outcome else {
+        return None;
+    };
+    let album_dir = plan
+        .map(|plan| plan.album_dir.as_path())
+        .or_else(|| req.album_batch.as_ref().map(|batch| batch.album_output_dir.as_path()));
+    Some(format!(
+        "conversion terminal stage failure: job_id={:?} item_id={:?} stage={:?} source={:?} output_root={:?} album_dir={:?} error={:?}",
+        &req.job_id,
+        &req.item_id,
+        &record.stage,
+        &req.container,
+        &req.output_root,
+        album_dir,
+        error,
+    ))
+}
+
+fn log_terminal_stage_failures(
+    req: &PipelineRequest,
+    plan: Option<&AlbumPlan>,
+    outcome: &AlbumOutcome,
+) {
+    let stages = match outcome {
+        AlbumOutcome::Complete { stages, .. }
+        | AlbumOutcome::Partial { stages, .. }
+        | AlbumOutcome::Blocked { stages, .. } => stages,
+    };
+    for record in stages {
+        if let Some(line) = terminal_stage_failure_log_line(req, plan, record) {
+            log::warn!("{line}");
+        }
+    }
 }
 
 fn terminal_status(
@@ -47206,6 +47253,47 @@ fn failed_tracks_from(outcome: &AlbumOutcome) -> Vec<TrackRecord> {
 #[cfg(test)]
 mod pipeline_test_helpers {
     use super::*;
+
+    #[test]
+    fn terminal_stage_failure_log_contains_request_and_stage_context() {
+        let mut req = log_test_request();
+        req.job_id = "job\n54".to_string();
+        req.item_id = "track-23".to_string();
+        req.container = PathBuf::from("/music/23 - Since I've Been Loving You.flac");
+        req.output_root = PathBuf::from("/output/Led Zeppelin");
+        let failed = StageRecord {
+            stage: PipelineStage::Publish,
+            outcome: StageOutcome::Failed(
+                "could not acquire descriptor-bound album publication authority: No such file or directory"
+                    .to_string(),
+            ),
+            dsd_dst_stats: None,
+        };
+
+        let plan = AlbumPlan {
+            album_dir: PathBuf::from("/output/Led Zeppelin/Physical Graffiti"),
+            album_dirs: Vec::new(),
+            entries: Vec::new(),
+        };
+        let line = terminal_stage_failure_log_line(&req, Some(&plan), &failed).unwrap();
+        assert!(line.contains("job_id=\"job\\n54\""));
+        assert!(line.contains("item_id=\"track-23\""));
+        assert!(line.contains("stage=Publish"));
+        assert!(line.contains("Since I've Been Loving You.flac"));
+        assert!(line.contains("output/Led Zeppelin"));
+        assert!(line.contains("Physical Graffiti"));
+        assert!(line.contains("descriptor-bound album publication authority"));
+        assert!(terminal_stage_failure_log_line(
+            &req,
+            None,
+            &StageRecord {
+                stage: PipelineStage::Materialize,
+                outcome: StageOutcome::Ok,
+                dsd_dst_stats: None,
+            },
+        )
+        .is_none());
+    }
 
     pub(super) fn log_test_source() -> PreparedSource {
         let mut album_extra = BTreeMap::new();

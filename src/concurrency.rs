@@ -14,13 +14,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Instant;
 use uuid::Uuid;
 
 const DESCRIPTOR_SCHEMA: u32 = 1;
 const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
-const REGISTRY_WAIT: Duration = Duration::from_millis(250);
-const REGISTRY_RETRY: Duration = Duration::from_millis(4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerProcessIdentity {
@@ -96,6 +96,15 @@ impl LeaseFamily {
             Self::ExecutionStaging { .. } => "execution-staging",
             Self::EphemeralMutation { .. } => "ephemeral-mutation",
         }
+    }
+
+    /// Only these families carry filesystem conflict claims. QueueScope and
+    /// QueueExecution are lifecycle/ownership reservations; their path claims
+    /// live in ExecutionClaim/ExecutionStaging descriptors instead. Keeping
+    /// that distinction explicit lets mutation admission avoid scanning the
+    /// two high-churn queue lifecycle directories entirely.
+    fn carries_path_claims(&self) -> bool {
+        !matches!(self, Self::QueueScope { .. } | Self::QueueExecution { .. })
     }
 
     pub fn reserve_after_owner_death(&self) -> bool {
@@ -1012,6 +1021,37 @@ fn sync_coordination_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Reset an empty high-churn queue lease directory while the global registry
+/// is held. ext4 does not shrink a directory inode after a burst of unique
+/// descriptor names is unlinked, so removing the empty inode is the only way
+/// to discard that historical scan cost. This is an optimization only: it is
+/// attempted once when a new queue scope starts, never on per-track retirement.
+fn reset_empty_queue_family_directory_locked(family_dir: &Path) -> bool {
+    match std::fs::remove_dir(family_dir) {
+        Ok(()) => {
+            if let Err(error) = create_private_dir(family_dir) {
+                log::warn!(
+                    "coordination family directory reset could not recreate {}: {error}",
+                    family_dir.display()
+                );
+            }
+            true
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => false,
+        Err(error) => {
+            log::warn!(
+                "coordination family directory compaction skipped {}: {error}",
+                family_dir.display()
+            );
+            false
+        }
+    }
+}
+
 fn reclaim_empty_descriptor_from_locked_file(file: &File, path: &Path) -> Result<bool, String> {
     let metadata =
         verify_coordination_path_binding(file, path, "empty coordination descriptor")?;
@@ -1176,8 +1216,33 @@ impl PersistentLease {
         coordination_group: Option<String>,
         registry_scan_swept_staging: bool,
     ) -> Result<Self, String> {
+        if !family.carries_path_claims() && !claims.is_empty() {
+            return Err(format!(
+                "queue lifecycle family {:?} cannot carry filesystem mutation claims",
+                family
+            ));
+        }
+        if matches!(&family, LeaseFamily::QueueScope { .. }) {
+            // QueueScope is created once per active queue session. Use that
+            // cold boundary to reset historical ext4 directory growth for both
+            // queue lifecycle families before any per-track QueueExecution
+            // creation can pay for it. Never compact on per-track retirement.
+            let mut compacted = false;
+            for namespace in ["queue-scope", "queue-execution"] {
+                compacted |= reset_empty_queue_family_directory_locked(&root.join(namespace));
+            }
+            if compacted {
+                if let Err(error) = sync_coordination_directory(root) {
+                    log::warn!(
+                        "coordination queue directory compaction could not sync {}: {error}",
+                        root.display()
+                    );
+                }
+            }
+        }
         let family_dir = root.join(family.namespace());
         create_private_dir(&family_dir)?;
+        let family_staging_swept = registry_scan_swept_staging && family.carries_path_claims();
         let lifecycle_id = family.lifecycle_id();
         let singular_lifecycle = matches!(
             &family,
@@ -1193,7 +1258,7 @@ impl PersistentLease {
             {
                 let entry = entry.map_err(|e| format!("read persistent lease family entry: {e}"))?;
                 let path = entry.path();
-                if !registry_scan_swept_staging {
+                if !family_staging_swept {
                     removed_staging |= remove_abandoned_descriptor_temp_locked(&path)?;
                 }
                 let name = entry.file_name();
@@ -1212,7 +1277,7 @@ impl PersistentLease {
             if removed_staging {
                 sync_coordination_directory(&family_dir)?;
             }
-        } else if !registry_scan_swept_staging {
+        } else if !family_staging_swept {
             cleanup_abandoned_descriptor_temps_locked(&family_dir)?;
         }
         let descriptor_id = Uuid::new_v4();
@@ -1643,7 +1708,7 @@ impl MutationClaimGuard {
         let root = coordination_root();
         create_private_dir(&root)?;
         let _registry = RegistryLock::acquire(&root)?;
-        let descriptors = descriptor_paths(&root)?;
+        let descriptors = claim_descriptor_paths(&root)?;
         for path in descriptors {
             let probe = classify_descriptor(&path)?;
             let Some((availability, existing_family, existing_claims, existing_group)) = probe else { continue };
@@ -1710,9 +1775,18 @@ impl Drop for MutationClaimGuard {
 /// absent before retirement.
 pub fn lifecycle_descriptor_hints(family_namespace: &LeaseFamily) -> Result<Vec<(Uuid, PathBuf)>, String> {
     let dir = coordination_root().join(family_namespace.namespace());
-    if !dir.exists() { return Ok(Vec::new()); }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read lifecycle descriptor directory {}: {error}",
+                dir.display()
+            ))
+        }
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read lifecycle descriptor directory {}: {e}", dir.display()))? {
+    for entry in entries {
         let entry = entry.map_err(|e| format!("read lifecycle descriptor entry: {e}"))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1752,10 +1826,19 @@ pub fn retire_setup_orphan_by_path_identity(path: &Path, expected_family: &Lease
 pub fn find_family_descriptor(family: &LeaseFamily) -> Result<Option<PathBuf>, String> {
     let root = coordination_root();
     let dir = root.join(family.namespace());
-    if !dir.exists() { return Ok(None); }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "read lease family directory {}: {error}",
+                dir.display()
+            ))
+        }
+    };
     let prefix = format!("{}--", family.lifecycle_id());
     let mut found = None;
-    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read lease family directory {}: {e}", dir.display()))? {
+    for entry in entries {
         let entry = entry.map_err(|e| format!("read lease family entry {}: {e}", dir.display()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1940,19 +2023,46 @@ fn remove_reclaimable_ephemeral_locked(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn descriptor_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+fn claim_descriptor_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
-    if !root.exists() { return Ok(paths); }
-    for entry in std::fs::read_dir(root).map_err(|e| format!("read coordination root {}: {e}", root.display()))? {
-        let entry = entry.map_err(|e| format!("read coordination root entry: {e}"))?;
-        let ty = entry.file_type().map_err(|e| format!("inspect coordination entry: {e}"))?;
-        if !ty.is_dir() { continue; }
+    if !root.exists() {
+        return Ok(paths);
+    }
+    // QueueScope and QueueExecution are lifecycle/ownership reservations and
+    // cannot carry path claims. Skip those directories completely so their
+    // descriptor count and directory-inode history are absent from mutation
+    // admission cost. Continue scanning every other directory fail-closed;
+    // that preserves compatibility with a future claim-bearing family rather
+    // than silently ignoring an unfamiliar namespace.
+    for entry in std::fs::read_dir(root)
+        .map_err(|error| format!("read coordination root {}: {error}", root.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read coordination root entry: {error}"))?;
+        let ty = entry
+            .file_type()
+            .map_err(|error| format!("inspect coordination entry: {error}"))?;
+        if !ty.is_dir() {
+            continue;
+        }
+        let family_name = entry.file_name();
+        if matches!(
+            family_name.to_str(),
+            Some("queue-scope" | "queue-execution")
+        ) {
+            continue;
+        }
         let family_dir = entry.path();
         let mut removed_staging = false;
-        for child in std::fs::read_dir(&family_dir).map_err(|e| format!("read coordination family {}: {e}", family_dir.display()))? {
-            let child = child.map_err(|e| format!("read coordination descriptor entry: {e}"))?;
+        for child in std::fs::read_dir(&family_dir).map_err(|error| {
+            format!(
+                "read coordination claim family {}: {error}",
+                family_dir.display()
+            )
+        })? {
+            let child = child
+                .map_err(|error| format!("read coordination descriptor entry: {error}"))?;
             let child_path = child.path();
-            if child_path.extension().and_then(|v| v.to_str()) == Some("lease") {
+            if child_path.extension().and_then(|value| value.to_str()) == Some("lease") {
                 paths.push(child_path);
             } else {
                 removed_staging |= remove_abandoned_descriptor_temp_locked(&child_path)?;
@@ -2025,18 +2135,16 @@ impl RegistryLock {
                 return Err(format!("coordination registry pathname rebound after open: {}", path.display()));
             }
         }
-        let started = Instant::now();
         loop {
-            match file.try_lock_exclusive() {
+            match file.lock_exclusive() {
                 Ok(()) => return Ok(Self(file)),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if is_lock_contended(&error) => {
-                    if started.elapsed() >= REGISTRY_WAIT {
-                        return Err("coordination registry busy; retry the operation".to_string());
-                    }
-                    std::thread::sleep(REGISTRY_RETRY);
+                Err(error) => {
+                    return Err(format!(
+                        "lock coordination registry {}: {error}",
+                        path.display()
+                    ));
                 }
-                Err(error) => return Err(format!("lock coordination registry {}: {error}", path.display())),
             }
         }
     }
@@ -2911,6 +3019,102 @@ mod tests {
                 Err(error) => panic!("{context}: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn registry_contention_waits_for_holder_instead_of_timing_out() {
+        // Deliberately does NOT install a process-visible coordination-root
+        // override. This test holds the registry lock for longer than the old
+        // 250 ms budget on purpose, and the scoped override is process-global:
+        // a parallel libtest worker that resolved `coordination_root()` while
+        // it was installed would contend on, or observe, this fixture's lease.
+        // Every call below takes `root` explicitly, so no override is needed.
+        let dir = tempfile::tempdir().expect("registry contention temp root");
+        let root = dir.path().to_path_buf();
+        create_private_dir(&root).unwrap();
+        let held = RegistryLock::acquire(&root).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut contenders = Vec::new();
+        for _ in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let root = root.clone();
+            contenders.push(std::thread::spawn(move || {
+                barrier.wait();
+                RegistryLock::acquire(&root).map(drop)
+            }));
+        }
+        barrier.wait();
+
+        // Exceed the historical 250 ms budget with the production worker
+        // count from the field report. Genuine registry contention is
+        // coordination, not a terminal admission error.
+        std::thread::sleep(Duration::from_millis(750));
+        drop(held);
+        for contender in contenders {
+            let acquired = contender.join().expect("join registry contender");
+            if let Err(error) = acquired {
+                panic!("contender must wait and acquire: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_queue_family_reset_recreates_only_empty_directories() {
+        with_root(|root| {
+            let family_dir = root.join("queue-execution");
+            create_private_dir(&family_dir).unwrap();
+            assert!(
+                reset_empty_queue_family_directory_locked(&family_dir),
+                "an existing empty queue family directory should be reset"
+            );
+            assert!(family_dir.is_dir(), "reset must recreate the family directory");
+
+            let live_entry = family_dir.join("live.lease");
+            std::fs::write(&live_entry, b"live authority placeholder").unwrap();
+            assert!(
+                !reset_empty_queue_family_directory_locked(&family_dir),
+                "a non-empty queue family directory must never be removed"
+            );
+            assert!(live_entry.exists());
+        });
+    }
+
+    #[test]
+    fn mutation_admission_ignores_claimless_queue_lifecycle_descriptors() {
+        with_root(|root| {
+            let family_dir = root.join("queue-scope");
+            create_private_dir(&family_dir).unwrap();
+            let malformed = family_dir.join(format!(
+                "{}--{}.lease",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ));
+            std::fs::write(&malformed, b"not a lease descriptor").unwrap();
+
+            let guard = MutationClaimGuard::acquire_ephemeral(Vec::new())
+                .expect("claimless queue lifecycle history must not participate in mutation scans");
+            drop(guard);
+            assert!(malformed.exists(), "mutation admission must not mutate queue lifecycle authority");
+        });
+    }
+
+    #[test]
+    fn queue_lifecycle_descriptors_reject_path_claims() {
+        with_root(|root| {
+            let target = root.join("target");
+            std::fs::write(&target, b"target").unwrap();
+            let claim = PathClaim::resolve(&target, ClaimMode::Write, ClaimScope::Exact).unwrap();
+            let error = match PersistentLease::create(
+                LeaseFamily::QueueScope {
+                    scope_id: Uuid::new_v4(),
+                },
+                &[claim],
+            ) {
+                Ok(_) => panic!("QueueScope must remain claimless"),
+                Err(error) => error,
+            };
+            assert!(error.contains("cannot carry filesystem mutation claims"));
+        });
     }
 
     #[test]
