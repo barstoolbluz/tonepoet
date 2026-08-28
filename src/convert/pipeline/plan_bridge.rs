@@ -136,9 +136,10 @@ pub fn plan_request_for_track(
 
     let mut settings = request.settings.clone();
     // Album-scoped DSD normalization has already performed the expensive DSD
-    // reconstruction into an audio-only Float64 CAF carrier. The carrier must
-    // be encoded, never stream-copied, and must not become a metadata/artwork/
-    // source-MD5 authority merely because it is now the planner input.
+    // reconstruction into an audio-only headerless Float64 carrier. The
+    // carrier must be encoded, never stream-copied, and must not become a
+    // metadata/artwork/source-MD5 authority merely because it is now the
+    // planner input.
     if matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. }) {
         settings.force_encode = true;
         disable_planner_source_tag_transfer(&mut settings);
@@ -952,9 +953,10 @@ pub fn source_info_for_realized_track(
     {
         return Ok(SourceInfo {
             dsd_source_kind: None,
-            // CAF is an internal transport that the planner does not expose as
-            // a target format. Model it as PCM/WAV-class input while forcing an
-            // encode above; tools still autodetect the actual CAF container.
+            // Headerless f64le is an internal transport that the planner does
+            // not expose as a target format. Model it as PCM/WAV-class input;
+            // the plugin builders bind the explicit raw format/rate/channel
+            // arguments from these authoritative source facts.
             format: PlannerFormat::Wav,
             codec: PlannerCodec::PcmFloat,
             sample_rate_hz: Some(*sample_rate_hz),
@@ -2435,7 +2437,7 @@ mod tests {
     fn album_gain_carrier_keeps_resolved_fixed_gain_and_never_plans_legacy_norm() {
         let temp = TempDir::new().expect("temp dir");
         let original_dsd = temp.path().join("A.dsf");
-        let carrier = temp.path().join("A-album-gain.caf");
+        let carrier = temp.path().join("A-album-gain.f64le");
         let output = temp.path().join("out.flac");
         let mut req = request(temp.path());
         req.settings.target_format = PlannerFormat::Flac;

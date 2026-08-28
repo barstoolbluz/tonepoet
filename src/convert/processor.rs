@@ -5125,7 +5125,7 @@ mod tests {
                     track_number,
                 },
                 TrackSourceRef::DsdAlbumGainCarrier {
-                    path: PathBuf::from(format!("/staging/{ordinal}-{track_number}.caf")),
+                    path: PathBuf::from(format!("/staging/{ordinal}-{track_number}.f64le")),
                     source_path: PathBuf::from(source),
                     sample_rate_hz: 176_400,
                     channels: 2,
@@ -6197,7 +6197,7 @@ FILE "track.flac" WAVE
         let converted_root = staging_root.join("converted");
         std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
         std::fs::create_dir_all(&converted_root).expect("converted dir");
-        let carrier_path = carrier_dir.join("track-0000-a.caf");
+        let carrier_path = carrier_dir.join("track-0000-a.f64le");
         std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
         let staging = StagingDir::new_with_scratch_reservation(
             staging_root.clone(),
@@ -6508,7 +6508,7 @@ FILE "track.flac" WAVE
         let converted_root = staging_root.join("converted");
         std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
         std::fs::create_dir_all(&converted_root).expect("converted dir");
-        let carrier_path = carrier_dir.join("track-0000-a.caf");
+        let carrier_path = carrier_dir.join("track-0000-a.f64le");
         let staged_path = converted_root.join("01.flac");
         std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
         std::fs::write(&staged_path, b"encoded output").expect("encoded output");

@@ -23696,7 +23696,7 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             channels,
             ..
         } => format!(
-            "album-gain Float64 CAF carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
+            "album-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
             path_log_value(path),
             path_log_value(source_path),
         ),
@@ -29605,69 +29605,34 @@ fn admit_planned_output_claim(
     )
 }
 
-async fn verify_album_gain_silence_carrier(
+fn verify_album_gain_silence_carrier(
     carrier: &Path,
-    raw_path: &Path,
-    runner: &dyn ToolRunner,
     cancel: &CancellationToken,
-    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), String> {
-    let _ = fs::remove_file(raw_path);
-    let mut planned = tonepoet_pipeline::PlannedCommand::new(
-        tonepoet_pipeline::ToolIdentifier::Sox,
-        vec![
-            "-S".to_string(),
-            "-D".to_string(),
-            carrier.display().to_string(),
-            "-t".to_string(),
-            "raw".to_string(),
-            "-e".to_string(),
-            "floating-point".to_string(),
-            "-b".to_string(),
-            "64".to_string(),
-            "-L".to_string(),
-            raw_path.display().to_string(),
-        ],
-        tonepoet_pipeline::InputSource::Path(carrier.to_path_buf()),
-        tonepoet_pipeline::OutputSink::Path(raw_path.to_path_buf()),
-        None,
-        "Verify album DSD silence as signed-zero Float64 PCM",
-    );
-    planned.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
-    planned
-        .environment
-        .insert("LC_ALL".to_string(), "C".to_string());
-    let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    run_tool_command_with_concurrency(command, runner, cancel, tool_concurrency_limits)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let result = (|| -> Result<(), String> {
-        let mut file = fs::File::open(raw_path)
-            .map_err(|error| format!("could not open album DSD silence proof: {error}"))?;
-        let len = file
-            .metadata()
-            .map_err(|error| format!("could not stat album DSD silence proof: {error}"))?
-            .len();
-        if len == 0 || len % 8 != 0 {
-            return Err("album DSD silence proof produced an empty or truncated f64 stream".to_string());
+    let mut file = fs::File::open(carrier)
+        .map_err(|error| format!("could not open album DSD silence proof: {error}"))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("could not stat album DSD silence proof: {error}"))?
+        .len();
+    if len == 0 || len % 8 != 0 {
+        return Err("album DSD silence proof found an empty or truncated f64 stream".to_string());
+    }
+    let mut buffer = [0_u8; 8 * 4096];
+    let mut remaining = len;
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err("album DSD silence proof cancelled".to_string());
         }
-        let mut buffer = [0_u8; 8 * 4096];
-        let mut remaining = len;
-        while remaining > 0 {
-            let count = usize::try_from(remaining.min(buffer.len() as u64))
-                .map_err(|_| "album DSD silence proof length does not fit this platform".to_string())?;
-            std::io::Read::read_exact(&mut file, &mut buffer[..count])
-                .map_err(|error| format!("could not read album DSD silence proof: {error}"))?;
-            tonepoet_pipeline::validate_signed_zero_f64le(&buffer[..count])
-                .map_err(|error| format!("album DSD silence proof failed: {error}"))?;
-            remaining -= count as u64;
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(raw_path);
-    result
+        let count = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| "album DSD silence proof length does not fit this platform".to_string())?;
+        std::io::Read::read_exact(&mut file, &mut buffer[..count])
+            .map_err(|error| format!("could not read album DSD silence proof: {error}"))?;
+        tonepoet_pipeline::validate_signed_zero_f64le(&buffer[..count])
+            .map_err(|error| format!("album DSD silence proof failed: {error}"))?;
+        remaining -= count as u64;
+    }
+    Ok(())
 }
 
 struct PreparedAlbumGainCarrier {
@@ -29720,17 +29685,20 @@ async fn prepare_album_gain_carrier_for_track(
             track.id.source_ordinal,
         ));
     }
-    let channels = source.channels.ok_or_else(|| {
-        format!(
-            "DSD track {} has no channel count for album peak analysis",
-            track.id.source_ordinal,
-        )
-    })?;
+    let channels = source
+        .channels
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| {
+            format!(
+                "DSD track {} has no valid channel count for album peak analysis",
+                track.id.source_ordinal,
+            )
+        })?;
     let target_rate_hz = tonepoet_pipeline::album_gain_target_rate_hz(&req.settings, &source)
         .map_err(|error| error.to_string())?;
     let carrier_hash = stable_path_hash(&original_source_path);
     let carrier_path = carrier_dir.join(format!(
-        "track-{:04}-{carrier_hash}.caf",
+        "track-{:04}-{carrier_hash}.f64le",
         track.id.source_ordinal,
     ));
     let _ = fs::remove_file(&carrier_path);
@@ -29761,11 +29729,14 @@ async fn prepare_album_gain_carrier_for_track(
     let carrier_len = fs::metadata(&carrier_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    if carrier_len == 0 {
+    let frame_bytes = u64::from(channels) * 8;
+    if carrier_len == 0 || carrier_len % frame_bytes != 0 {
         let _ = fs::remove_file(&carrier_path);
         return Err(format!(
-            "DSD track {} album analysis produced no retained PCM carrier",
+            "DSD track {} album analysis produced an empty or truncated Float64 PCM carrier ({} bytes is not aligned to {}-byte frames)",
             track.id.source_ordinal,
+            carrier_len,
+            frame_bytes,
         ));
     }
     let measurement = tonepoet_pipeline::parse_album_peak_measurement(
@@ -29780,18 +29751,7 @@ async fn prepare_album_gain_carrier_for_track(
         )
     })?;
     if measurement == tonepoet_pipeline::AlbumPeakMeasurement::Silence {
-        let silence_path = carrier_dir.join(format!(
-            "track-{:04}-{carrier_hash}-silence.f64le",
-            track.id.source_ordinal,
-        ));
-        verify_album_gain_silence_carrier(
-            &carrier_path,
-            &silence_path,
-            runner,
-            cancel,
-            tool_concurrency_limits.as_ref(),
-        )
-        .await?;
+        verify_album_gain_silence_carrier(&carrier_path, cancel)?;
     }
     log::info!(
         "album-scoped DSD analysis measured item={} track={} peak={:?} carrier={} rate={} channels={}",
@@ -46438,8 +46398,9 @@ fn standalone_dsd_album_carrier_bytes(req: &PipelineRequest) -> Result<Option<u6
     };
 
     // `sample_count_per_channel` is the 1-bit DSD sample count. The retained
-    // carrier stores one IEEE Float64 value per final-rate PCM sample/channel.
-    // Round sample count upward and include one MiB for CAF/container padding.
+    // carrier stores one headerless IEEE Float64 value per final-rate PCM
+    // sample/channel. Round sample count upward and retain one MiB of
+    // conservative slop for resampler/sample-count boundary differences.
     let numerator = u128::from(sample_count).saturating_mul(u128::from(target_rate_hz));
     let denominator = u128::from(metadata.sample_rate_hz);
     let pcm_samples_per_channel = numerator
@@ -46496,18 +46457,16 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
             Some(SourceKind::SingleFile) => match standalone_dsd_album_carrier_bytes(req) {
                 Ok(Some(carrier_bytes)) => {
                     // The normal estimator already budgets the ordinary
-                    // conversion. Album mode retains the Float64 CAF across
-                    // the submitted-batch barrier. A track reported as -inf
-                    // also gets an independent signed-zero proof through a
-                    // temporary f64le carrier of the same sample payload, so
-                    // reserve for both files in the worst case.
-                    let album_analysis_bytes = carrier_bytes.saturating_mul(2);
+                    // conversion. Album mode retains one headerless Float64
+                    // carrier across the submitted-batch barrier. A silent
+                    // carrier is verified in place, so no second full-size
+                    // proof artifact is required.
+                    let album_analysis_bytes = carrier_bytes;
                     estimated_bytes = estimated_bytes.saturating_add(album_analysis_bytes);
                     log::debug!(
-                        "scratch DSD album-gain preflight: job_id={}, item_id={}, retained_carrier_bytes={}, silence_proof_upper_bound_bytes={}, estimated_peak_bytes={}",
+                        "scratch DSD album-gain preflight: job_id={}, item_id={}, retained_carrier_bytes={}, estimated_peak_bytes={}",
                         req.job_id,
                         req.item_id,
-                        carrier_bytes,
                         carrier_bytes,
                         estimated_bytes,
                     );
@@ -53892,10 +53851,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         let a_source = fixture._temp.path().join("A.dsf");
         let b_source = fixture._temp.path().join("B.dsf");
-        let retained_carrier = fixture._temp.path().join("A-album-gain.caf");
+        let retained_carrier = fixture._temp.path().join("A-album-gain.f64le");
         std::fs::write(&a_source, b"dsd-a").expect("A source");
         std::fs::write(&b_source, b"dsd-b").expect("B source");
-        std::fs::write(&retained_carrier, b"float64-caf-placeholder")
+        std::fs::write(&retained_carrier, b"float64-raw-placeholder")
             .expect("retained album-gain carrier");
         let single_file_track_id = fixture.album.source.tracks[0].id.clone();
         fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {

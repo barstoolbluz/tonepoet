@@ -140,12 +140,15 @@ pub fn album_gain_target_rate_hz(
 
 /// Build the single expensive decode used by album-scoped DSD normalization.
 ///
-/// The command writes a 64-bit floating-point CAF carrier while the final
-/// `stats` effect measures the exact same post-reconstruction samples. CAF is
-/// used instead of RIFF/WAV so long multichannel tracks are not constrained by
-/// the 4 GiB RIFF size ceiling. No normalization gain or output dither is
-/// applied in this pass; the submitted-batch barrier binds one fixed gain only
-/// after every participating track has reported its peak.
+/// The command writes a headerless little-endian Float64 carrier while the
+/// final `stats` effect measures the exact same post-reconstruction samples.
+/// Headerless PCM deliberately avoids both container-size ceilings and the
+/// cross-tool Float64 container interpretation differences exercised by this
+/// pipeline. The orchestrator retains the authoritative sample rate and
+/// channel count beside the carrier, so consumers never need to infer them
+/// from the file. No normalization gain or output dither is applied in this
+/// pass; the submitted-batch barrier binds one fixed gain only after every
+/// participating track has reported its peak.
 pub fn build_album_gain_analysis_command(
     settings: &PipelineSettings,
     source: &SourceInfo,
@@ -167,11 +170,12 @@ pub fn build_album_gain_analysis_command(
         "-D".to_string(),
         input.display().to_string(),
         "-t".to_string(),
-        "caf".to_string(),
+        "raw".to_string(),
         "-e".to_string(),
         "floating-point".to_string(),
         "-b".to_string(),
         "64".to_string(),
+        "-L".to_string(),
         output.display().to_string(),
     ];
 
@@ -291,6 +295,74 @@ mod tests {
 
     fn db(raw: &str) -> DbNano {
         raw.parse().expect("valid test dB")
+    }
+
+    #[test]
+    fn album_analysis_carrier_is_headerless_little_endian_float64() {
+        let mut settings = PipelineSettings::default();
+        settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                crate::enums::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("album auto gain settings");
+        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        let source = SourceInfo {
+            dsd_source_kind: None,
+            format: crate::enums::AudioFormat::Dsf,
+            codec: crate::enums::AudioCodec::Dsd,
+            sample_rate_hz: Some(crate::enums::DsdRate::Dsd64.hz()),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: crate::source::SourceRepresentationKind::Dsd,
+            sample_kind: Some(crate::enums::SampleKind::Dsd),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let command = build_album_gain_analysis_command(
+            &settings,
+            &source,
+            std::path::Path::new("input.dsf"),
+            std::path::Path::new("carrier.f64le"),
+            None,
+        )
+        .expect("album analysis command");
+
+        let output_index = command
+            .args
+            .iter()
+            .position(|arg| arg == "carrier.f64le")
+            .expect("carrier output path");
+        let output_contract = command.args[2..=output_index]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_contract,
+            vec![
+                "input.dsf",
+                "-t",
+                "raw",
+                "-e",
+                "floating-point",
+                "-b",
+                "64",
+                "-L",
+                "carrier.f64le",
+            ],
+            "{:?}",
+            command.args,
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg.eq_ignore_ascii_case("caf")),
+            "album carrier must not depend on a Float64 container contract: {:?}",
+            command.args,
+        );
+        assert_eq!(command.args.last().map(String::as_str), Some("stats"));
     }
 
     #[test]

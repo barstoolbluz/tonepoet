@@ -1111,7 +1111,8 @@ pub enum TrackSourceRef {
         /// Channel count required to build an unambiguous raw/graph stream.
         channels: u16,
     },
-    /// Audio-only Float64 CAF produced by the album-scoped DSD analysis pass.
+    /// Audio-only headerless little-endian Float64 PCM produced by the
+    /// album-scoped DSD analysis pass.
     /// The path is a retained post-reconstruction PCM carrier; `source_path`
     /// remains the original source identity for provenance/metadata policy.
     DsdAlbumGainCarrier {

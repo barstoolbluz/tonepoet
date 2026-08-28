@@ -1852,7 +1852,7 @@ mod dsd_album_gain_carrier_planning_tests {
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
-            input_path: PathBuf::from("album-carrier.caf"),
+            input_path: PathBuf::from("album-carrier.f64le"),
             output_path: PathBuf::from("output.flac"),
             source: SourceInfo {
                 dsd_source_kind: None,

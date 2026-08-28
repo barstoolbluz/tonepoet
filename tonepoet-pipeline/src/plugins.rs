@@ -692,7 +692,7 @@ fn build_ffmpeg_encode_pcm(
     validate_aac_family_container(context, target_format)?;
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = ffmpeg_base_input_args(&input);
+    let mut args = ffmpeg_base_input_args(context, step, &input)?;
     add_ffmpeg_metadata_args(context, &mut args, target_format);
     if apply_processing {
         add_ffmpeg_audio_filter_args(context, &mut args, target_rate_hz, Some(target_depth))?;
@@ -722,7 +722,7 @@ fn build_ffmpeg_encode_lossy(
     validate_aac_family_container(context, target_format)?;
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = ffmpeg_base_input_args(&input);
+    let mut args = ffmpeg_base_input_args(context, step, &input)?;
     add_ffmpeg_metadata_args(context, &mut args, target_format);
     if apply_processing {
         if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
@@ -1056,7 +1056,7 @@ fn build_sox_encode_pcm(
         // established planner behavior.
         args.push("-D".into());
     }
-    args.push(input);
+    add_sox_input_args(context, step, &mut args, input)?;
     add_sox_output_format_args(context, &mut args, target_format, target_depth);
     args.push(output);
     if apply_processing {
@@ -1081,7 +1081,8 @@ fn build_sox_encode_lossy(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec!["-S".into(), input];
+    let mut args = vec!["-S".into()];
+    add_sox_input_args(context, step, &mut args, input)?;
     match target_format {
         AudioFormat::Mp3 => {
             args.push("-C".into());
@@ -1124,7 +1125,8 @@ fn build_sox_resample(
 ) -> Result<PlannedCommand> {
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
-    let mut args = vec!["-S".into(), input];
+    let mut args = vec!["-S".into()];
+    add_sox_input_args(context, step, &mut args, input)?;
     if let Some(depth) = target_depth {
         add_sox_bit_depth_args(&mut args, depth);
     }
@@ -1224,16 +1226,103 @@ fn build_sox_dsd_rate_change(
     ))
 }
 
-fn ffmpeg_base_input_args(input: &str) -> Vec<String> {
-    vec![
+fn album_gain_raw_f64le_input(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+) -> Result<Option<(u32, u16)>> {
+    let input_is_request_source = matches!(
+        step.input.as_path(),
+        Some(path) if path == context.request.input_path.as_path()
+    );
+    let input_is_raw_f64le = step
+        .input
+        .as_path()
+        .and_then(|path| path.extension())
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("f64le"));
+    let source = &context.request.source;
+    if context.request.settings.dsd.runtime_album_gain_db().is_none()
+        || source.representation_kind() != crate::source::SourceRepresentationKind::Dsd
+        || source.bit_depth != Some(PcmBitDepth::Float64)
+        || !input_is_request_source
+        || !input_is_raw_f64le
+    {
+        return Ok(None);
+    }
+
+    let sample_rate_hz = source
+        .sample_rate_hz
+        .filter(|sample_rate_hz| *sample_rate_hz > 0)
+        .ok_or_else(|| {
+            PlanningError::invalid_source(
+                "sample_rate_hz",
+                "raw DSD album-gain carrier requires an authoritative positive PCM sample rate",
+            )
+        })?;
+    let channels = source
+        .channels
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| {
+            PlanningError::invalid_source(
+                "channels",
+                "raw DSD album-gain carrier requires an authoritative positive channel count",
+            )
+        })?;
+    Ok(Some((sample_rate_hz, channels)))
+}
+
+fn ffmpeg_base_input_args(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+    input: &str,
+) -> Result<Vec<String>> {
+    let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-nostdin".into(),
+    ];
+    if let Some((sample_rate_hz, channels)) = album_gain_raw_f64le_input(context, step)? {
+        args.extend([
+            "-f".into(),
+            "f64le".into(),
+            "-ar".into(),
+            sample_rate_hz.to_string(),
+            "-ac".into(),
+            channels.to_string(),
+        ]);
+    }
+    args.extend([
         "-i".into(),
         input.into(),
         "-map".into(),
         "0:a:0".into(),
-    ]
+    ]);
+    Ok(args)
+}
+
+fn add_sox_input_args(
+    context: &PlanContext<'_>,
+    step: &PlanStep,
+    args: &mut Vec<String>,
+    input: String,
+) -> Result<()> {
+    if let Some((sample_rate_hz, channels)) = album_gain_raw_f64le_input(context, step)? {
+        args.extend([
+            "-t".into(),
+            "raw".into(),
+            "-e".into(),
+            "floating-point".into(),
+            "-b".into(),
+            "64".into(),
+            "-L".into(),
+            "-r".into(),
+            sample_rate_hz.to_string(),
+            "-c".into(),
+            channels.to_string(),
+        ]);
+    }
+    args.push(input);
+    Ok(())
 }
 
 /// Insert extra ffmpeg flags for the selected container (e.g., `-rf64 auto`).
@@ -2041,7 +2130,7 @@ mod tests {
         let mut request = pcm_request_with(settings, PcmBitDepth::Float64);
         request.source.source_representation = crate::source::SourceRepresentationKind::Dsd;
         request.source.true_source_depth = None;
-        request.input_path = PathBuf::from("album-carrier.caf");
+        request.input_path = PathBuf::from("album-carrier.f64le");
         request.output_path = match target_format {
             AudioFormat::Mp3 => PathBuf::from("output.mp3"),
             _ => PathBuf::from("output.flac"),
@@ -2058,7 +2147,7 @@ mod tests {
                 target_bit_depth: PcmBitDepth::Int24,
                 apply_processing,
             },
-            InputSource::Path(PathBuf::from("album-carrier.caf")),
+            InputSource::Path(PathBuf::from("album-carrier.f64le")),
             OutputSink::Path(PathBuf::from("output.flac")),
             "album gain application test",
         )
@@ -2108,6 +2197,52 @@ mod tests {
                 .count();
             assert_eq!(count, expected_count, "{:?}", command.args);
         }
+    }
+
+    #[test]
+    fn album_gain_carrier_binds_explicit_raw_f64le_input_contract() {
+        let request = album_gain_pcm_request(AudioFormat::Flac);
+        let step = album_gain_encode_step(AudioFormat::Flac, true);
+
+        let ffmpeg = build_ffmpeg_encode_pcm(
+            &request.context(),
+            &step,
+            &AudioFormat::Flac,
+            None,
+            PcmBitDepth::Int24,
+            true,
+        )
+        .expect("FFmpeg raw album-gain carrier command");
+        assert_arg(&ffmpeg.args, "-f", "f64le");
+        assert_arg(&ffmpeg.args, "-ar", "96000");
+        assert_arg(&ffmpeg.args, "-ac", "2");
+        let ffmpeg_input = ffmpeg
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-i")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(ffmpeg_input, Some("album-carrier.f64le"), "{:?}", ffmpeg.args);
+
+        let sox = build_sox_encode_pcm(
+            &request.context(),
+            &step,
+            &AudioFormat::Flac,
+            None,
+            PcmBitDepth::Int24,
+            true,
+        )
+        .expect("SoX raw album-gain carrier command");
+        assert_arg(&sox.args, "-t", "raw");
+        assert_arg(&sox.args, "-e", "floating-point");
+        assert_arg(&sox.args, "-b", "64");
+        assert!(sox.args.iter().any(|arg| arg == "-L"), "{:?}", sox.args);
+        assert_arg(&sox.args, "-r", "96000");
+        assert_arg(&sox.args, "-c", "2");
+        assert!(
+            sox.args.iter().any(|arg| arg == "album-carrier.f64le"),
+            "{:?}",
+            sox.args
+        );
     }
 
     #[test]
