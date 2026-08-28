@@ -649,3 +649,70 @@ issue #3** (`current_exe()`-deleted helper-spawn failures leaving inconsistent s
    ample padding and the cause is an in-process lock or environment. Key the surfaced advice off the
    `native_err` category (in-process claim vs. durability failure vs. genuine structural).
 
+
+---
+
+## 12. `theme_builder` test reads real theme overrides; a sibling test writes a `surface` override to the same path (test-isolation gap)
+
+**Status:** open, mechanism identified 2026-08-28 while gating `983fa0c`. Same
+shared-global-state family as the coordination race fixed in that commit.
+
+**Symptom.** `tui::theme_builder::tests::derived_space_toggle_writes_theme_lock_only`
+fails intermittently in full-workspace gate runs:
+
+```
+src/tui/theme_builder.rs:2825
+assertion failed: !state.user_overrides.overrides.contains_key("surface")
+```
+
+Observed once across four gate runs on 2026-08-28; **0/25 in isolation**.
+
+**Mechanism.** The failing test looks purely in-memory, but its constructor is not.
+`ThemeBuilderState::from_palette` (`theme_builder.rs:355`) seeds state with:
+
+```rust
+let user_overrides = ThemeOverrides::load_default().unwrap_or_default();
+```
+
+`load_default` reads `theme_overrides_path()` = `<config>/tonepoet/theme_overrides.toml`
+(`theme.rs:793`, `918`) — real on-disk state, not a fixture.
+
+A sibling test in `src/tui/theme.rs:2356-2359` writes exactly the offending key to that
+same path:
+
+```rust
+overrides.overrides.insert("surface".to_string(), Color::Rgb(1, 2, 3));
+overrides.save_default().expect("save overrides atomically");
+```
+
+When that write is visible while the theme_builder test constructs its state, the
+constructor loads `surface` into `user_overrides` and the assertion fails. The toggle
+itself is innocent: `toggle_selected_derived_lock` (`theme_builder.rs:576`) writes only
+`palette.derived_locks` and never touches `user_overrides`.
+
+**The isolation seam already exists and is documented.** `config_base_dir`
+(`theme.rs:894-904`) consults `crate::tui::test_support::test_config_home_override()`
+under `#[cfg(test)]`, with a comment stating tests must use that seam so persistence is
+not redirected into the live configuration tree. Neither test appears to hold it, so
+both operate on the user's real config directory.
+
+**Note:** this means the suite reads and writes `~/.config/tonepoet/theme_overrides.toml`
+during a normal gate run. On this machine that file currently contains an empty
+`[overrides]` table, which is why the failure is rare rather than constant.
+
+**Owed to confirm.**
+1. Verify neither test holds `test_config_home_override`, and check whether other
+   `theme.rs` / `theme_builder.rs` tests touch the live config tree.
+2. Confirm the ordering — that the failure requires the writing test to land before the
+   reading test constructs state.
+
+**Fix direction.** Scope both tests (and any sibling touching theme persistence) to the
+established `test_config_home_override` seam, matching the repository fixture rule.
+Do not relax the assertion — it encodes the behavior the test is named for
+("writes theme lock only"), and the toggle path is in fact correct. Consider whether
+`from_palette` loading real user state is appropriate for a constructor at all, since
+that is what makes the test environment-dependent.
+
+**Related.** Same root class as the `dsf_tags` coordination-scoping gap in `983fa0c`:
+tests reaching global state *indirectly* through a constructor or authority path, where
+nothing in the local file signals that a scoping rule applies.
