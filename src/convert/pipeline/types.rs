@@ -2498,10 +2498,12 @@ pub struct TrackArtifact {
     #[serde(default)]
     pub metadata_satisfaction: PlannedMetadataSatisfaction,
     /// Dimension-by-dimension metadata obligations that were meaningful for
-    /// this realized track after source facts were parsed. In particular,
-    /// `source_audio_md5_written` is required only when the realized source
-    /// actually exposed a parsed `SourceInfo::audio_md5`, not merely because a
-    /// path ended in `.flac`.
+    /// this realized track after source facts were parsed. These are normally
+    /// planner-owned, but an audio-only realized carrier may deliberately keep
+    /// a source-container tag/artwork obligation for a post-encode owner. In
+    /// particular, `source_audio_md5_written` is required only when the
+    /// realized source actually exposed a parsed `SourceInfo::audio_md5`, not
+    /// merely because a path ended in `.flac`.
     #[serde(default)]
     pub metadata_required: PlannedMetadataSatisfaction,
     /// SHA-256 of the planned command sequence, computed during encoding.

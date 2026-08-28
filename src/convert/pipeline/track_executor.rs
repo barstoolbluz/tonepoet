@@ -1072,7 +1072,7 @@ pub(crate) fn prepare_cue_stream_direct_track_plan(
     };
     let command_hash = super::manifest::planned_command_hash(&plan).ok();
     let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
-    let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
+    let metadata_required = planner_metadata_obligations_for_track(request, track, &plan_request);
     let command = match &plan.action {
         PlanAction::Execute { commands, .. } => commands[0].clone(),
         _ => unreachable!("direct-plan helper admits only execute actions"),
@@ -1296,7 +1296,8 @@ pub async fn execute_planned_track_conversion(
         cleanup_guard.add_planner_paths(plan.cleanup_paths());
         let command_hash = super::manifest::planned_command_hash(&plan).ok();
         let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
-        let metadata_required = planner_metadata_obligations_for_track(request, &plan_request);
+        let metadata_required =
+            planner_metadata_obligations_for_track(request, track, &plan_request);
 
         // These test-only failure checkpoints live in the production control-flow
         // frame. They prove that an error or cancellation returned with `?` at each

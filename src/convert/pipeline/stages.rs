@@ -4495,12 +4495,13 @@ fn planner_metadata_already_satisfied(
                     // the planner cannot satisfy them while encoding. Require the
                     // orchestrator metadata stage whenever a realized DVD-Audio
                     // track has authoritative materializer metadata to write.
-                    let authoritative_tags_required = source_level_required
-                        .authoritative_tags_applied
-                        || dvd_audio_artifact_has_authoritative_metadata(track, source)
-                        || sidecar_cue_artifact_has_authoritative_metadata(track, source, req)
-                        || prepared_artifact_requires_post_encode_metadata(track, source, req)
-                        || m4a_artifact_has_freeform_metadata(track, source);
+                    let authoritative_tags_required =
+                        artifact_requires_authoritative_metadata_write(
+                            track,
+                            source,
+                            req,
+                            source_level_required.authoritative_tags_applied,
+                        );
                     let required = track.metadata_required.merge(PlannedMetadataSatisfaction {
                         authoritative_tags_applied: authoritative_tags_required,
                         ..PlannedMetadataSatisfaction::none()
@@ -4515,6 +4516,19 @@ fn planner_metadata_already_satisfied(
         }
         AudioArtifacts::Merged(_) => false,
     }
+}
+
+fn artifact_requires_authoritative_metadata_write(
+    artifact: &TrackArtifact,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    source_level_authoritative_tags_required: bool,
+) -> bool {
+    source_level_authoritative_tags_required
+        || dvd_audio_artifact_has_authoritative_metadata(artifact, source)
+        || sidecar_cue_artifact_has_authoritative_metadata(artifact, source, req)
+        || prepared_artifact_requires_post_encode_metadata(artifact, source, req)
+        || m4a_artifact_has_freeform_metadata(artifact, source)
 }
 
 fn sidecar_cue_artifact_has_authoritative_metadata(
@@ -4775,6 +4789,117 @@ async fn apply_metadata_to_track_artifact(
     Ok(())
 }
 
+fn dsd_album_gain_source_container_is_metadata_authority(source: &PreparedSource) -> bool {
+    matches!(source.kind, SourceKind::SingleFile | SourceKind::Archive)
+}
+
+async fn transfer_dsd_album_gain_source_metadata_with_runner(
+    artifact: &TrackArtifact,
+    source_path: &Path,
+    duration: Option<Duration>,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    let transfer_tags = req.settings.metadata.transfer_tags
+        && req
+            .settings
+            .target_format
+            .supports_planner_source_tag_transfer();
+    let preserve_artwork = req.settings.metadata.preserve_artwork
+        && req
+            .settings
+            .target_format
+            .supports_planner_embedded_artwork_transfer();
+    if !transfer_tags && !preserve_artwork {
+        return Ok(());
+    }
+
+    let temp = metadata_rewrite_temp_path(&artifact.staged_path)?;
+    let container_extension = artifact
+        .staged_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let planned = match tonepoet_pipeline::plugins::build_ffmpeg_source_metadata_transfer_command(
+        &artifact.staged_path,
+        source_path,
+        temp.path(),
+        &req.settings.target_format,
+        container_extension,
+        &req.container_ffmpeg_flags,
+        transfer_tags,
+        preserve_artwork,
+        duration,
+        "Transfer original DSD source metadata after album-gain encode",
+    ) {
+        Ok(planned) => planned,
+        Err(error) => {
+            temp.cleanup_best_effort();
+            return Err(MetadataError::InProcessWrite(format!(
+                "failed to build DSD album-gain source metadata transfer: {error}"
+            )));
+        }
+    };
+    let command = match planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT) {
+        Ok(command) => command,
+        Err(error) => {
+            temp.cleanup_best_effort();
+            return Err(MetadataError::InProcessWrite(format!(
+                "failed to prepare DSD album-gain source metadata transfer: {error}"
+            )));
+        }
+    };
+
+    if let Err(error) =
+        run_tool_command_with_concurrency(command, runner, cancel, tool_concurrency_limits).await
+    {
+        temp.cleanup_best_effort();
+        return Err(MetadataError::Tool(error));
+    }
+    replace_rewritten_metadata_file(&artifact.staged_path, temp)?;
+    Ok(())
+}
+
+async fn transfer_dsd_album_gain_source_metadata(
+    artifact: &TrackArtifact,
+    source_path: &Path,
+    duration: Option<Duration>,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    if let Some(reference) = artifact.reference_evidence.as_ref() {
+        let bound_runner = ReferenceBoundMetadataRunner {
+            inner: runner,
+            toolchain: &reference.toolchain,
+        };
+        transfer_dsd_album_gain_source_metadata_with_runner(
+            artifact,
+            source_path,
+            duration,
+            req,
+            &bound_runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await
+    } else {
+        transfer_dsd_album_gain_source_metadata_with_runner(
+            artifact,
+            source_path,
+            duration,
+            req,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await
+    }
+}
+
 /// Apply metadata tags and CUE artwork to staged audio artifacts.
 ///
 /// CUE tracks use an audio-only PCM WAV carrier whose integer/float class
@@ -4877,11 +5002,56 @@ pub async fn apply_metadata_with_tool_limits(
                         },
                     }));
                 }
-                let meta = source
+                let prepared_track = source
                     .tracks
                     .iter()
-                    .find(|t| t.id == artifact.track_id)
-                    .map(|t| &t.metadata);
+                    .find(|t| t.id == artifact.track_id);
+                if let Some(PreparedTrack {
+                    source_ref:
+                        TrackSourceRef::DsdAlbumGainCarrier {
+                            source_path,
+                            duration,
+                            ..
+                        },
+                    ..
+                }) = prepared_track
+                {
+                    // The raw f64le carrier is audio-only. Only direct
+                    // per-track media containers (ordinary single-file inputs
+                    // or archive-extracted DSF/DFF files) may supply source
+                    // tags/artwork to the post-encode FFmpeg rewrite. Optical
+                    // image roots such as an SACD ISO are provenance, not tag
+                    // containers; their metadata remains materializer-owned.
+                    if dsd_album_gain_source_container_is_metadata_authority(source) {
+                        transfer_dsd_album_gain_source_metadata(
+                            artifact,
+                            source_path,
+                            *duration,
+                            req,
+                            runner,
+                            cancel,
+                            tool_concurrency_limits.as_ref(),
+                        )
+                        .await?;
+                    }
+
+                    // Keep the authoritative prepared-model decision identical
+                    // to the metadata-stage skip gate. Source-container transfer
+                    // runs first when applicable; admitted CUE/TOC/materializer
+                    // metadata then retains its established final authority.
+                    let prepared_overlay_required =
+                        artifact_requires_authoritative_metadata_write(
+                            artifact,
+                            source,
+                            req,
+                            metadata_obligations_for_request(req, source)
+                                .authoritative_tags_applied,
+                        );
+                    if !prepared_overlay_required {
+                        continue;
+                    }
+                }
+                let meta = prepared_track.map(|t| &t.metadata);
                 apply_metadata_to_track_artifact(
                     artifact,
                     meta,
@@ -11968,6 +12138,125 @@ FILE "album.flac" WAVE
             );
             assert_tag_value(&tags, "ISRC", *expected_isrc, case.name);
             assert_tag_value(&tags, "CATALOGNUMBER", "4988005123999", case.name);
+
+            // Reuse the first real DFF/CUE case to pin the album-gain carrier
+            // metadata branch. Start from audio whose metadata has been
+            // explicitly stripped, disable source-container tag transfer, and
+            // require the admitted sidecar CUE projection to repopulate the
+            // same scalar fields as the ordinary path above.
+            if index == 0 {
+                let stripped_path = case_root.join("album-scope-sidecar-stripped.flac");
+                run_checked(
+                    "ffmpeg",
+                    &[
+                        "-y".to_string(),
+                        "-hide_banner".to_string(),
+                        "-nostdin".to_string(),
+                        "-loglevel".to_string(),
+                        "error".to_string(),
+                        "-i".to_string(),
+                        output_path.display().to_string(),
+                        "-map".to_string(),
+                        "0:a:0".to_string(),
+                        "-map_metadata".to_string(),
+                        "-1".to_string(),
+                        "-c:a".to_string(),
+                        "copy".to_string(),
+                        "-vn".to_string(),
+                        stripped_path.display().to_string(),
+                    ],
+                );
+                let stripped_tags = format_tag_map(&ffprobe_json(&stripped_path));
+                assert!(
+                    stripped_tags.get("TITLE").is_none(),
+                    "album-scope sidecar regression must start from a metadata-stripped FLAC: {stripped_tags:?}"
+                );
+
+                let mut album_req = req.clone();
+                album_req.settings.metadata.transfer_tags = false;
+                album_req.settings.metadata.preserve_artwork = false;
+                album_req
+                    .settings
+                    .dsd
+                    .set_legacy_dsd_to_pcm_gain(
+                        tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                        0.15,
+                        None,
+                    )
+                    .expect("album-scope DFF sidecar gain settings");
+                album_req
+                    .settings
+                    .dsd
+                    .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+                album_req.settings.dsd.bind_runtime_album_gain(
+                    "0.000000000".parse().expect("fixed album gain"),
+                    Some("-1.000000000".parse().expect("album peak")),
+                    1,
+                );
+
+                let mut album_source = source.clone();
+                let raw_carrier = case_root.join("sidecar.album-gain.f64le");
+                std::fs::write(&raw_carrier, b"metadata-branch-only raw carrier")
+                    .expect("album-scope DFF raw carrier fixture");
+                album_source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+                    path: raw_carrier,
+                    source_path: carrier.clone(),
+                    sample_rate_hz: album_source.tracks[0]
+                        .scalar_sample_rate()
+                        .unwrap_or(176_400),
+                    channels: 2,
+                    duration: None,
+                };
+
+                let mut album_artifact = track_artifacts[0].clone();
+                album_artifact.staged_path = stripped_path.clone();
+                album_artifact.metadata_required = PlannedMetadataSatisfaction::none();
+                album_artifact.metadata_satisfaction = PlannedMetadataSatisfaction::none();
+                let album_artifacts = ArtifactSet {
+                    audio: AudioArtifacts::Tracks(vec![album_artifact]),
+                    sidecars: Vec::new(),
+                };
+                assert!(
+                    !planner_metadata_already_satisfied(
+                        &album_artifacts,
+                        &album_source,
+                        &album_req,
+                    ),
+                    "admitted sidecar-CUE metadata must keep the album-carrier metadata stage alive even when source-container transfer is disabled"
+                );
+                let record = apply_metadata(
+                    &album_artifacts,
+                    &album_source,
+                    &album_req,
+                    &runner,
+                    &cancel,
+                )
+                .await
+                .expect("album-scope DFF sidecar authoritative metadata stage");
+                assert!(matches!(record.outcome, StageOutcome::Ok));
+
+                let album_tags = format_tag_map(&ffprobe_json(&stripped_path));
+                let selected_tag = |values: &BTreeMap<String, String>, keys: &[&str]| {
+                    keys.iter().find_map(|key| values.get(*key).cloned())
+                };
+                for (label, keys) in [
+                    ("TITLE", &["TITLE"][..]),
+                    ("ARTIST", &["ARTIST"][..]),
+                    ("ALBUM", &["ALBUM"][..]),
+                    ("ALBUMARTIST", &["ALBUMARTIST", "ALBUM_ARTIST"][..]),
+                    ("TRACKNUMBER", &["TRACKNUMBER", "TRACK"][..]),
+                    ("DATE", &["DATE", "YEAR"][..]),
+                    ("GENRE", &["GENRE"][..]),
+                    ("ISRC", &["ISRC"][..]),
+                    ("CATALOGNUMBER", &["CATALOGNUMBER"][..]),
+                ] {
+                    assert_eq!(
+                        selected_tag(&album_tags, keys),
+                        selected_tag(&tags, keys),
+                        "album-scoped DFF sidecar metadata diverged from the ordinary path for {label}: ordinary={tags:?}, album={album_tags:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -22407,6 +22696,52 @@ fn metadata_satisfaction_label(
             },
         };
         return Some(format!("{prefix}{outcome}"));
+    }
+
+    let album_gain_carrier_source_metadata = prepared.zip(source).is_some_and(|(track, source)| {
+        matches!(
+            &track.source_ref,
+            TrackSourceRef::DsdAlbumGainCarrier { .. }
+        ) && dsd_album_gain_source_container_is_metadata_authority(source)
+            && (required.source_tags_transferred || required.artwork_transferred)
+    });
+    if album_gain_carrier_source_metadata {
+        let mut requested = Vec::new();
+        if required.source_tags_transferred {
+            requested.push("source tags");
+        }
+        if required.artwork_transferred {
+            requested.push("embedded artwork");
+        }
+        let requested = requested.join(" and ");
+        let outcome = match metadata_stage {
+            StageRequirement::Disabled => format!(
+                "{requested} were not transferred from the original DSD source because the metadata stage is disabled"
+            ),
+            StageRequirement::Enabled => match metadata_stage_result {
+                Some(StageOutcome::Ok) => format!(
+                    "metadata stage transferred {requested} from the original DSD source after album-gain encoding"
+                ),
+                Some(StageOutcome::NotRequested) => format!(
+                    "{requested} were not transferred from the original DSD source because the metadata stage was not requested"
+                ),
+                Some(StageOutcome::Skipped) => format!(
+                    "{requested} were not transferred from the original DSD source because the metadata stage was skipped"
+                ),
+                Some(StageOutcome::SkippedWithReason(reason)) => format!(
+                    "{requested} were not transferred from the original DSD source because the metadata stage was skipped: {}",
+                    escape_log_value(reason)
+                ),
+                Some(StageOutcome::Failed(reason)) => format!(
+                    "original DSD source {requested} transfer failed: {}",
+                    escape_log_value(reason)
+                ),
+                None => format!(
+                    "original DSD source {requested} transfer outcome is unavailable"
+                ),
+            },
+        };
+        return Some(outcome);
     }
 
     if !satisfied.any() || satisfied.satisfies(required) {
@@ -52218,6 +52553,34 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
+    #[derive(Default)]
+    struct AlbumGainMetadataRecordingRunner {
+        calls: Mutex<Vec<(ToolBinary, Vec<String>, Duration)>>,
+    }
+
+    #[async_trait]
+    impl ToolRunner for AlbumGainMetadataRecordingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            if cmd.binary == ToolBinary::Ffmpeg {
+                let output = cmd.args.last().ok_or_else(|| {
+                    ToolRunnerError::Io(std::io::Error::other(
+                        "album-gain metadata test command has no output path",
+                    ))
+                })?;
+                std::fs::write(output, b"metadata-remuxed audio")?;
+            }
+            self.calls
+                .lock()
+                .expect("album-gain metadata call lock")
+                .push((cmd.binary, cmd.args.clone(), cmd.timeout));
+            Ok(successful_tool_output(&cmd))
+        }
+    }
+
     #[async_trait]
     impl ToolRunner for CueStreamRecordingRunner {
         async fn run(
@@ -54227,6 +54590,159 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[tokio::test]
+    async fn album_gain_sacd_carrier_uses_prepared_authority_without_opening_iso_as_metadata_input() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = PlannerAudioFormat::Flac;
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.metadata.preserve_artwork = true;
+        fixture
+            .album
+            .req
+            .settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(
+                tonepoet_pipeline::DsdToPcmGainMode::Auto,
+                0.15,
+                None,
+            )
+            .expect("SACD album-scope gain settings");
+        fixture
+            .album
+            .req
+            .settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.bind_runtime_album_gain(
+            "0.000000000".parse().expect("SACD album gain"),
+            Some("-1.000000000".parse().expect("SACD album peak")),
+            1,
+        );
+        fixture.album.source.kind = SourceKind::SacdIso;
+        fixture.album.source.provenance.source_kind = SourceKind::SacdIso;
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("SACD Album Authority".to_string()),
+            album_artist: Some("SACD Album Artist".to_string()).into(),
+            genre: Some("Jazz".to_string()).into(),
+            date: Some("1961".to_string()),
+            total_tracks: 4,
+            ..AlbumMetadata::default()
+        };
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Prepared SACD Track".to_string()),
+            artist: Some("Prepared SACD Artist".to_string()).into(),
+            genre: Some("Jazz".to_string()).into(),
+            date: Some("1961".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+
+        let root = fixture._temp.path();
+        let iso = root.join("disc.iso");
+        let carrier = root.join("disc-track-01.album-gain.f64le");
+        std::fs::write(&iso, b"SACD ISO provenance fixture").expect("SACD ISO fixture");
+        std::fs::write(&carrier, b"raw f64 album-gain carrier").expect("SACD carrier fixture");
+        fixture.album.req.container = iso.clone();
+        fixture.album.source.container = iso.clone();
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+            path: carrier,
+            source_path: iso.clone(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            duration: Some(Duration::from_secs(30)),
+        };
+        fixture.album.source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: true,
+            source_audio_md5_written: false,
+            authoritative_tags_applied: false,
+        };
+        artifact.metadata_satisfaction = PlannedMetadataSatisfaction::none();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "SACD prepared metadata must keep the album-carrier metadata stage alive"
+        );
+
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::Succeed, // inspect existing FLAC tags
+            ToolBehavior::Succeed, // write authoritative prepared SACD tags
+        ]);
+        let record = apply_metadata(
+            &artifacts,
+            &fixture.album.source,
+            &fixture.album.req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("SACD album-carrier metadata stage");
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+
+        let transcript = runner.transcript();
+        assert_eq!(
+            transcript.len(),
+            2,
+            "SACD album carrier must use the existing authoritative FLAC writer only"
+        );
+        assert!(
+            transcript.iter().all(|command| command.binary == ToolBinary::Metaflac),
+            "SACD ISO provenance must never be sent through the FFmpeg source-container transfer path: {transcript:?}"
+        );
+        let iso_arg = iso.to_string_lossy();
+        assert!(
+            transcript.iter().all(|command| {
+                command
+                    .sanitized_args
+                    .iter()
+                    .all(|arg| arg != iso_arg.as_ref())
+            }),
+            "disc.iso must not be opened as a per-track metadata container: {transcript:?}"
+        );
+        let args = &transcript[1].sanitized_args;
+        let tags = set_tag_values(args);
+        for (key, value) in [
+            ("TITLE", "Prepared SACD Track"),
+            ("ARTIST", "Prepared SACD Artist"),
+            ("ALBUM", "SACD Album Authority"),
+            ("ALBUMARTIST", "SACD Album Artist"),
+            ("DATE", "1961"),
+            ("GENRE", "Jazz"),
+            ("TRACKNUMBER", "1"),
+            ("TRACKTOTAL", "4"),
+        ] {
+            assert_eq!(
+                tags.get(key).map(String::as_str),
+                Some(value),
+                "authoritative SACD prepared tag {key} must reach the output"
+            );
+        }
+
+        let label = metadata_satisfaction_label(
+            Some(&artifact),
+            fixture.album.source.tracks.first(),
+            Some(&fixture.album.source),
+            StageRequirement::Enabled,
+            Some(&record.outcome),
+        )
+        .unwrap_or_default();
+        assert!(
+            !label.contains("from the original DSD source"),
+            "SACD carrier reporting must not claim the ISO was used as a source-tag container: {label}"
+        );
+    }
+
+    #[tokio::test]
     async fn sacd_dsf_authoritative_metadata_stage_uses_in_process_writer() {
         let mut fixture = fixture(
             FailurePolicy::FailAlbumOnAnyTrackFailure,
@@ -54527,6 +55043,372 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_tags_transferred: true,
             ..PlannedMetadataSatisfaction::none()
         }
+    }
+
+    #[tokio::test]
+    async fn album_gain_carrier_recovers_source_tags_and_artwork_from_original_dsd_post_encode() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.metadata.preserve_artwork = true;
+        fixture.album.req.settings.metadata.store_source_audio_md5 = true;
+
+        let root = fixture._temp.path();
+        let original_dsd = root.join("source.dsf");
+        let carrier = root.join("source.album-gain.f64le");
+        std::fs::write(&original_dsd, b"original DSF metadata authority")
+            .expect("original DSF fixture");
+        std::fs::write(&carrier, b"raw f64 carrier").expect("carrier fixture");
+        fixture.album.source.container = original_dsd.clone();
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+            path: carrier.clone(),
+            source_path: original_dsd.clone(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            duration: Some(Duration::from_secs(123)),
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: true,
+            source_audio_md5_written: false,
+            authoritative_tags_applied: false,
+        };
+        artifact.metadata_satisfaction = PlannedMetadataSatisfaction::none();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
+            "carrier source metadata obligations must keep the post-encode metadata stage alive"
+        );
+
+        let runner = AlbumGainMetadataRecordingRunner::default();
+        apply_metadata(
+            &artifacts,
+            &fixture.album.source,
+            &fixture.album.req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("carrier post-encode metadata transfer");
+
+        let calls = runner.calls.lock().expect("recorded metadata calls");
+        assert_eq!(calls.len(), 1, "scalar carrier metadata recovery needs one remux");
+        let (binary, args, timeout) = &calls[0];
+        assert_eq!(*binary, ToolBinary::Ffmpeg);
+        assert_eq!(
+            *timeout,
+            Duration::from_secs(123) + DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            "metadata remux must inherit the media-duration timeout policy"
+        );
+        assert!(
+            args.windows(2).any(|pair| {
+                pair[0] == "-i"
+                    && pair[1] == artifact.staged_path.to_string_lossy().as_ref()
+            }),
+            "encoded album-gain audio must be the remux audio input: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|pair| {
+                pair[0] == "-i" && pair[1] == original_dsd.to_string_lossy().as_ref()
+            }),
+            "the retained original DSD must be the metadata/artwork input: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == carrier.to_string_lossy().as_ref()),
+            "the headerless f64 carrier must never be read as metadata authority: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-map_metadata" && pair[1] == "1")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-map" && pair[1] == "1:v?")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-c:a" && pair[1] == "copy")
+        );
+        drop(calls);
+
+        assert_eq!(
+            metadata_satisfaction_label(
+                Some(&artifact),
+                fixture.album.source.tracks.first(),
+                Some(&fixture.album.source),
+                StageRequirement::Enabled,
+                Some(&StageOutcome::Ok),
+            ),
+            Some(
+                "metadata stage transferred source tags and embedded artwork from the original DSD source after album-gain encoding"
+                    .to_string()
+            ),
+            "conversion log must disclose the carrier metadata recovery path"
+        );
+        assert_eq!(
+            metadata_satisfaction_label(
+                Some(&artifact),
+                fixture.album.source.tracks.first(),
+                Some(&fixture.album.source),
+                StageRequirement::Enabled,
+                Some(&StageOutcome::SkippedWithReason(
+                    "already satisfied by the output planner".to_string(),
+                )),
+            ),
+            Some(
+                "source tags and embedded artwork were not transferred from the original DSD source because the metadata stage was skipped: already satisfied by the output planner"
+                    .to_string()
+            ),
+            "a future erroneous skip must be explicit in the conversion log instead of silently publishing stripped output"
+        );
+    }
+
+    #[tokio::test]
+    async fn album_scope_dsf_to_flac_round_trips_source_tags_and_artwork_without_changing_audio_when_tools_are_available() {
+        let tool_exists = |name: &str| {
+            std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
+            })
+        };
+        let require_tools = std::env::var("TONEPOET_REQUIRE_TOOLS")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        if !tool_exists("ffmpeg") || !tool_exists("ffprobe") {
+            if require_tools {
+                panic!("album-scope DSF metadata regression requires ffmpeg and ffprobe");
+            }
+            eprintln!("skipping album-scope DSF metadata regression; ffmpeg/ffprobe unavailable");
+            return;
+        }
+
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.metadata.preserve_artwork = true;
+        fixture
+            .album
+            .req
+            .settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(tonepoet_pipeline::DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("album auto gain settings");
+        fixture
+            .album
+            .req
+            .settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.bind_runtime_album_gain(
+            "2.840000000".parse().expect("fixed album gain"),
+            Some("-3.000000000".parse().expect("album peak")),
+            1,
+        );
+
+        let root = fixture._temp.path();
+        let original_dsd = root.join("Presence-01.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&original_dsd, None)
+            .expect("write DSF audio fixture");
+        crate::dsf_tags::write_with_backup(
+            &original_dsd,
+            &[
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "ALBUM".to_string(),
+                    value: Some("Presence".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "ALBUMARTIST".to_string(),
+                    value: Some("Led Zeppelin".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "ARTIST".to_string(),
+                    value: Some("Led Zeppelin".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "DATE".to_string(),
+                    value: Some("1976".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "GENRE".to_string(),
+                    value: Some("Rock".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "TITLE".to_string(),
+                    value: Some("Achilles Last Stand".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "TRACKNUMBER".to_string(),
+                    value: Some("1".to_string()),
+                },
+                crate::dsf_tags::DsfTagChange {
+                    canonical_key: "MY_NOTE".to_string(),
+                    value: Some("source custom value".to_string()),
+                },
+            ],
+        )
+        .expect("write DSF source tags");
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c,
+            0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f, 0x00, 0x05,
+            0xfe, 0x02, 0xfe, 0x0d, 0xa9, 0xd9, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+            0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        crate::dsf_tags::write_artwork_with_control(
+            &original_dsd,
+            3,
+            "image/png",
+            &png,
+            &|| false,
+            &|_| {},
+        )
+        .expect("write DSF source artwork");
+
+        let carrier = root.join("Presence-01.album-gain.f64le");
+        std::fs::write(&carrier, b"carrier provenance only").expect("carrier fixture");
+        fixture.album.source.container = original_dsd.clone();
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+            path: carrier,
+            source_path: original_dsd.clone(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            duration: Some(Duration::from_millis(100)),
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        let encode = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=44100:duration=0.1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(&artifact.staged_path)
+            .output()
+            .expect("run ffmpeg FLAC fixture encoder");
+        assert!(
+            encode.status.success(),
+            "ffmpeg FLAC fixture encode failed: {}",
+            String::from_utf8_lossy(&encode.stderr)
+        );
+
+        let decoded_audio_hash = |path: &Path| -> String {
+            let output = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-map", "0:a:0", "-f", "hash", "-hash", "sha256", "-"])
+                .output()
+                .expect("hash decoded audio");
+            assert!(
+                output.status.success(),
+                "decoded-audio hash failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let audio_hash_before = decoded_audio_hash(&artifact.staged_path);
+
+        artifact.metadata_required = PlannedMetadataSatisfaction {
+            source_tags_transferred: true,
+            artwork_transferred: true,
+            source_audio_md5_written: false,
+            authoritative_tags_applied: false,
+        };
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+        let runner = RealToolRunner::new(HashMap::new());
+        apply_metadata(
+            &artifacts,
+            &fixture.album.source,
+            &fixture.album.req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("apply album-scope source metadata recovery");
+
+        assert_eq!(
+            decoded_audio_hash(&artifact.staged_path),
+            audio_hash_before,
+            "post-encode source metadata recovery must not change decoded audio samples"
+        );
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags:stream=index,codec_type:stream_tags",
+                "-of",
+                "json",
+            ])
+            .arg(&artifact.staged_path)
+            .output()
+            .expect("probe recovered FLAC metadata");
+        assert!(
+            probe.status.success(),
+            "ffprobe recovered FLAC failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&probe.stdout).expect("parse ffprobe metadata JSON");
+        let tags = json
+            .pointer("/format/tags")
+            .and_then(serde_json::Value::as_object)
+            .expect("recovered FLAC format tags");
+        let tag_value = |key: &str| {
+            tags.iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                .and_then(|(_, value)| value.as_str())
+        };
+        for (key, expected) in [
+            ("ALBUM", "Presence"),
+            ("ALBUM_ARTIST", "Led Zeppelin"),
+            ("ARTIST", "Led Zeppelin"),
+            ("DATE", "1976"),
+            ("GENRE", "Rock"),
+            ("TITLE", "Achilles Last Stand"),
+            ("TRACK", "1"),
+            ("MY_NOTE", "source custom value"),
+        ] {
+            assert_eq!(
+                tag_value(key),
+                Some(expected),
+                "album-scope FLAC lost source tag {key}: {json}"
+            );
+        }
+        assert!(
+            json.pointer("/streams")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|streams| streams.iter().any(|stream| {
+                    stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+                })),
+            "album-scope FLAC must retain embedded source artwork: {json}"
+        );
     }
 
     #[test]

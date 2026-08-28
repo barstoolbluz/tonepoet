@@ -151,7 +151,7 @@ fn planner_metadata_satisfaction_is_derived_from_planner_owned_effects() {
     assert!(!bridge.contains("settings.metadata.transfer_tags = false"));
     assert!(executor.contains("let plan = plan_conversion(&plan_request)"));
     assert!(executor.contains("let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan)"));
-    assert!(executor.contains("let metadata_required = planner_metadata_obligations_for_track(request, &plan_request)"));
+    assert!(executor.contains("let metadata_required = planner_metadata_obligations_for_track(request, track, &plan_request)"));
     assert!(executor.contains("command.metadata_effect"));
     assert!(executor.contains("source_tags_transferred_from_original_source"));
     assert!(executor.contains("source_audio_md5_written"));

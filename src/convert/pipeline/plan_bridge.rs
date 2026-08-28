@@ -141,6 +141,28 @@ pub fn plan_request_for_track(
     // metadata/artwork/source-MD5 authority merely because it is now the
     // planner input.
     if matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. }) {
+        if request.settings.metadata.transfer_tags
+            && !request
+                .settings
+                .target_format
+                .supports_planner_source_tag_transfer()
+        {
+            log::warn!(
+                "metadata.transfer_tags requested for a DSD album-gain carrier target {:?}, but the source-container transfer path cannot represent source tags for that target; source tag transfer is unsupported for this track and will be skipped",
+                request.settings.target_format
+            );
+        }
+        if request.settings.metadata.preserve_artwork
+            && !request
+                .settings
+                .target_format
+                .supports_planner_embedded_artwork_transfer()
+        {
+            log::warn!(
+                "metadata.preserve_artwork requested for a DSD album-gain carrier target {:?}, but the source-container transfer path cannot preserve embedded artwork for that target; artwork preservation is unsupported for this track and will be skipped",
+                request.settings.target_format
+            );
+        }
         settings.force_encode = true;
         disable_planner_source_tag_transfer(&mut settings);
         disable_planner_artwork_transfer(&mut settings);
@@ -625,14 +647,26 @@ pub fn metadata_obligations_for_request(
 #[must_use]
 pub fn planner_metadata_obligations_for_track(
     req: &PipelineRequest,
+    track: &PreparedTrack,
     plan_request: &PlanRequest,
 ) -> PlannedMetadataSatisfaction {
+    // The headerless DSD album-gain carrier is intentionally not a metadata
+    // authority, so its planner request has source tag/artwork transfer turned
+    // off. Keep requested, target-supported metadata dimensions alive for the
+    // orchestrator's post-encode owner without re-enabling transfer from raw
+    // f64le. Whether the retained provenance path is itself a direct metadata
+    // container (DSF/DFF) or only a container root (for example SACD ISO) is a
+    // PreparedSource-level decision made by the metadata stage.
+    let post_encode_metadata_obligation =
+        matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. });
     PlannedMetadataSatisfaction {
         source_tags_transferred: req.settings.metadata.transfer_tags
-            && plan_request.settings.metadata.transfer_tags
+            && (plan_request.settings.metadata.transfer_tags
+                || post_encode_metadata_obligation)
             && plan_request.settings.target_format.supports_planner_source_tag_transfer(),
         artwork_transferred: req.settings.metadata.preserve_artwork
-            && plan_request.settings.metadata.preserve_artwork
+            && (plan_request.settings.metadata.preserve_artwork
+                || post_encode_metadata_obligation)
             && plan_request.settings.target_format.supports_planner_embedded_artwork_transfer(),
         source_audio_md5_written: req.settings.metadata.store_source_audio_md5
             && plan_request.settings.metadata.store_source_audio_md5
@@ -2445,6 +2479,9 @@ mod tests {
         req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
             tonepoet_pipeline::PcmBitDepth::Int24,
         );
+        req.settings.metadata.transfer_tags = true;
+        req.settings.metadata.preserve_artwork = true;
+        req.settings.metadata.store_source_audio_md5 = true;
         req.settings.preferred_tool = PreferredTool::Sox;
         req.settings
             .dsd
@@ -2464,7 +2501,7 @@ mod tests {
         );
         let mut prepared_track = track(TrackSourceRef::DsdAlbumGainCarrier {
             path: carrier.clone(),
-            source_path: original_dsd,
+            source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: None,
@@ -2493,6 +2530,34 @@ mod tests {
             "carrier planning must retain submitted-batch fixed-gain authority",
         );
         let commands = planned_command_args(&planned);
+        let obligations = planner_metadata_obligations_for_track(&req, &prepared_track, &planned);
+        assert!(planned.settings.force_encode);
+        assert!(
+            !planned.settings.metadata.transfer_tags
+                && !planned.settings.metadata.preserve_artwork
+                && !planned.settings.metadata.store_source_audio_md5,
+            "the headerless carrier itself must remain excluded from every source-container metadata authority"
+        );
+        assert!(
+            obligations.source_tags_transferred && obligations.artwork_transferred,
+            "album-gain carrier planning must retain source tag/artwork obligations for the post-encode original-source transfer"
+        );
+        assert!(
+            !obligations.source_audio_md5_written,
+            "carrier samples are not source samples, so SOURCE_AUDIO_MD5 must remain absent"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|args| has_adjacent_args(args, "-map_metadata", "1")),
+            "the audio planner must never read metadata from the raw f64le carrier: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|args| has_input_arg(args, original_dsd.to_string_lossy().as_ref())),
+            "the audio encode leg must remain independent of original-source metadata recovery: {commands:?}"
+        );
         assert!(
             commands
                 .iter()
@@ -2819,7 +2884,7 @@ mod tests {
             container_ffmpeg_flags: Vec::new(),
         };
 
-        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+        let obligations = planner_metadata_obligations_for_track(&req, &track, &planned);
 
         assert!(planned.settings.metadata.transfer_tags);
         assert!(
@@ -2864,7 +2929,7 @@ mod tests {
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("staged FLAC plan request builds");
-        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+        let obligations = planner_metadata_obligations_for_track(&req, &track, &planned);
 
         assert!(obligations.source_audio_md5_written);
         assert_eq!(planned.source.audio_md5.as_deref(), Some("00112233445566778899aabbccddeeff"));
@@ -2886,7 +2951,7 @@ mod tests {
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("staged FLAC plan request builds without source MD5");
-        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+        let obligations = planner_metadata_obligations_for_track(&req, &track, &planned);
 
         assert!(!planned.settings.metadata.store_source_audio_md5);
         assert!(planned.source.audio_md5.is_none());
@@ -2913,7 +2978,7 @@ mod tests {
 
         let planned = plan_request_for_track(&req, &track, &input, &output, temp.path().join("work"))
             .expect("non-FLAC plan request builds without source MD5");
-        let obligations = planner_metadata_obligations_for_track(&req, &planned);
+        let obligations = planner_metadata_obligations_for_track(&req, &track, &planned);
 
         assert!(!planned.settings.metadata.store_source_audio_md5);
         assert!(planned.source.audio_md5.is_none());

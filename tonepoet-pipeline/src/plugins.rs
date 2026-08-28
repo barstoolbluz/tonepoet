@@ -10,7 +10,10 @@ use crate::enums::{
 };
 use crate::error::{PlanningError, Result};
 use crate::mapping;
-use crate::plan::{MetadataPlanEffect, PlanContext, PlanOperation, PlanStep, PlannedCommand};
+use crate::plan::{
+    InputSource, MetadataPlanEffect, OutputSink, PlanContext, PlanOperation, PlanStep,
+    PlannedCommand,
+};
 use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
 
 /// FFmpeg plugin.
@@ -955,26 +958,63 @@ fn build_ffmpeg_metadata_transfer(
     transfer_tags: bool,
     preserve_artwork: bool,
 ) -> Result<PlannedCommand> {
+    let encoded_input = required_input_path(step)?;
+    let output = required_output_path(step)?;
+    build_ffmpeg_source_metadata_transfer_command(
+        std::path::Path::new(&encoded_input),
+        &context.request.input_path,
+        std::path::Path::new(&output),
+        target_format,
+        &context.target_container_extension(),
+        &context.request.container_ffmpeg_flags,
+        transfer_tags,
+        preserve_artwork,
+        context.request.source.duration,
+        step.description.clone(),
+    )
+    .map(|command| command.with_metadata_effect(FfmpegPlugin.metadata_effect(context, step)))
+}
+
+/// Build the canonical FFmpeg source-container metadata rewrite used by the
+/// planner after an audio encode.
+///
+/// `metadata_input` is deliberately distinct from `encoded_input`: callers
+/// may have an audio-only realized carrier while the original source remains
+/// the authoritative tag/artwork container. The helper is filesystem-I/O free
+/// and preserves the planner's exact stream-copy semantics.
+pub fn build_ffmpeg_source_metadata_transfer_command(
+    encoded_input: &std::path::Path,
+    metadata_input: &std::path::Path,
+    output: &std::path::Path,
+    target_format: &AudioFormat,
+    container_extension: &str,
+    container_ffmpeg_flags: &[String],
+    transfer_tags: bool,
+    preserve_artwork: bool,
+    expected_duration: Option<std::time::Duration>,
+    description: impl Into<String>,
+) -> Result<PlannedCommand> {
     if !ffmpeg_metadata_transfer_supported(target_format, transfer_tags, preserve_artwork) {
         return Err(PlanningError::unsupported_format(
             target_format.clone(),
             "FFmpeg metadata rewrite does not support the requested tag/artwork policy for this target format",
         ));
     }
-    validate_aac_family_container(context, target_format)?;
-    let encoded_input = required_input_path(step)?;
-    let output = required_output_path(step)?;
-    let needs_source_metadata_input = transfer_tags || preserve_artwork;
+    validate_aac_family_container_extension(
+        &container_extension.trim_start_matches('.').to_ascii_lowercase(),
+        target_format,
+    )?;
+
     let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-nostdin".into(),
         "-i".into(),
-        encoded_input,
+        encoded_input.to_string_lossy().into_owned(),
     ];
-    if needs_source_metadata_input {
+    if transfer_tags || preserve_artwork {
         args.push("-i".into());
-        args.push(context.request.input_path.to_string_lossy().into_owned());
+        args.push(metadata_input.to_string_lossy().into_owned());
     }
     args.push("-map".into());
     args.push("0:a:0".into());
@@ -996,17 +1036,17 @@ fn build_ffmpeg_metadata_transfer(
         args.push("-vn".into());
     }
     add_ffmpeg_container_format_args(&mut args, target_format);
-    add_ffmpeg_container_flags(context, &mut args);
-    args.push(output);
+    args.extend(container_ffmpeg_flags.iter().cloned());
+    args.push(output.to_string_lossy().into_owned());
+
     Ok(PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
         args,
-        step.input.clone(),
-        step.output.clone(),
-        context.request.source.duration,
-        step.description.clone(),
-    )
-    .with_metadata_effect(FfmpegPlugin.metadata_effect(context, step)))
+        InputSource::Path(encoded_input.to_path_buf()),
+        OutputSink::Path(output.to_path_buf()),
+        expected_duration,
+        description,
+    ))
 }
 
 fn build_ffmpeg_verify(context: &PlanContext<'_>, step: &PlanStep) -> Result<PlannedCommand> {
@@ -1333,10 +1373,19 @@ fn add_ffmpeg_container_flags(context: &PlanContext<'_>, args: &mut Vec<String>)
     }
 }
 
-fn validate_aac_family_container(context: &PlanContext<'_>, target_format: &AudioFormat) -> Result<()> {
-    let extension = context.target_container_extension();
+fn validate_aac_family_container(
+    context: &PlanContext<'_>,
+    target_format: &AudioFormat,
+) -> Result<()> {
+    validate_aac_family_container_extension(&context.target_container_extension(), target_format)
+}
+
+fn validate_aac_family_container_extension(
+    extension: &str,
+    target_format: &AudioFormat,
+) -> Result<()> {
     match target_format {
-        AudioFormat::Aac => match extension.as_str() {
+        AudioFormat::Aac => match extension {
             "m4a" | "mp4" => Ok(()),
             "aac" => Err(PlanningError::invalid_settings(
                 "output_path",
@@ -1347,7 +1396,7 @@ fn validate_aac_family_container(context: &PlanContext<'_>, target_format: &Audi
                 "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented",
             )),
         },
-        AudioFormat::Alac => match extension.as_str() {
+        AudioFormat::Alac => match extension {
             "m4a" | "mp4" => Ok(()),
             _ => Err(PlanningError::invalid_settings(
                 "output_path",
@@ -2009,7 +2058,7 @@ mod tests {
     use crate::settings::{DsdSettings, PipelineSettings};
     use crate::enums::SsrcPdfType;
     use crate::source::SourceInfo;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn ssrc_resample_command_with(
         settings: PipelineSettings,
@@ -2884,6 +2933,25 @@ mod tests {
         );
 
         let command = FfmpegPlugin.build_command(&context, &step).unwrap();
+        let shared = build_ffmpeg_source_metadata_transfer_command(
+            Path::new("encoded.flac"),
+            Path::new("source.dsf"),
+            Path::new("tagged.flac"),
+            &AudioFormat::Flac,
+            "flac",
+            &[],
+            true,
+            true,
+            None,
+            "Apply metadata and artwork policy",
+        )
+        .unwrap()
+        .with_metadata_effect(FfmpegPlugin.metadata_effect(&context, &step));
+
+        assert_eq!(
+            command, shared,
+            "planner and explicit source-authority metadata rewrites must share one complete planned command shape"
+        );
 
         assert_eq!(
             command.metadata_effect,
@@ -2893,6 +2961,35 @@ mod tests {
                 ..MetadataPlanEffect::none()
             }
         );
+    }
+
+    #[test]
+    fn shared_ffmpeg_metadata_rewrite_does_not_open_source_for_strip_only_operation() {
+        let command = build_ffmpeg_source_metadata_transfer_command(
+            Path::new("encoded.flac"),
+            Path::new("source.dsf"),
+            Path::new("stripped.flac"),
+            &AudioFormat::Flac,
+            "flac",
+            &[],
+            false,
+            false,
+            None,
+            "Strip source metadata",
+        )
+        .unwrap();
+
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-i" && window[1] == "encoded.flac"
+        }));
+        assert!(
+            !command.args.iter().any(|arg| arg == "source.dsf"),
+            "strip-only metadata rewrites must preserve the prior no-source-read behavior"
+        );
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-map_metadata" && window[1] == "-1"
+        }));
+        assert!(command.args.iter().any(|arg| arg == "-vn"));
     }
 
     #[test]
