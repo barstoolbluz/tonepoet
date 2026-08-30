@@ -1002,3 +1002,66 @@ resolution, since that invariant is currently unguarded.
 
 **Related:** issue #7 (file-task startup recovery: supersession still open), issue #14,
 and the 2026-08-17 multi-session research recorded in operator memory.
+
+---
+
+## 16. WORK ORDER — regression test for the live-owner journal skip (the invariant is unguarded)
+
+**Status:** open work item, not a defect. Small, self-contained; fold into a coming batch.
+
+**What is missing.** `pending_journals` (`src/tui/file_task_runtime.rs:1548`) omits a
+journal from startup recovery when its coordination descriptor classifies as
+`ClaimAvailability::Live` (`:1598`):
+
+```rust
+Ok((_family, ClaimAvailability::Live)) => {
+    log::debug!("file-operation journal {} remains live-owned; omit from recovery");
+    None
+}
+```
+
+This is the gate that stops a second session from adopting a live peer's in-flight
+cut/paste journal, bumping its generation, and failing the first session's next
+checkpoint — the cross-session theft described in the 2026-08-17 multi-session research
+and closed by `a6d7e33` (2026-08-20).
+
+**`ClaimAvailability::Live` appears exactly once in that file — in production code, never
+in a test.** The three startup-recovery tests are:
+
+- `startup_recovery_restores_exact_copy_plan` (`:2994`)
+- `startup_recovery_surfaces_cleanup_only_obligations` (`:3028`)
+- `startup_recovery_inventory_surfaces_every_pending_journal` (`:3075`)
+
+The third codifies the **pre-gate** contract ("return every pending journal"), so the
+existing suite would not catch a regression that reintroduces the theft — and might even
+be read as licensing it.
+
+**What we want.** A regression test asserting the invariant directly: a journal whose
+descriptor is live-owned must not appear in the startup recovery inventory, while a
+journal whose owner is gone must still appear. It should fail if the `Live` arm is
+removed or inverted.
+
+**Seams that already exist** (offered so this is not re-derived; the shape of the test is
+the implementer's call):
+
+- `scoped_test_coordination_root` (`src/concurrency.rs:2327`) — per-test coordination
+  root, and the pattern issue #12 exists because other modules skipped it. Use it.
+- `descriptor_availability` (`src/concurrency.rs:1855`) and
+  `descriptor_recovery_availability_with_local_handoff` (`:1875`) — the two classifiers
+  `pending_journals` calls.
+- `permits_same_process_recovery_handoff` (`src/tui/file_task_runtime.rs:498`) selects
+  between them, which matters because a same-process test holding a live lease is not
+  automatically the same case as a live *peer* process.
+
+That last point is the one to get right: the interesting invariant is about a **live peer**,
+and a naive same-process test may take the handoff path instead and prove something
+weaker than intended.
+
+**Also worth considering while in here.** Whether
+`startup_recovery_inventory_surfaces_every_pending_journal` should be renamed or its
+doc-comment amended to say "every pending journal *that is not live-owned*", so the
+suite stops asserting a contract the gate deliberately narrowed.
+
+**Related:** issue #15 (the unexplained cut/paste blocking, where this gate is discussed),
+issue #7 (same subsystem, supersession still open), issue #12 (unscoped coordination
+roots in tests).
