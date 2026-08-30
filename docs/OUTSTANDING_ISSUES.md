@@ -725,3 +725,96 @@ that is what makes the test environment-dependent.
 **Related.** Same root class as the `dsf_tags` coordination-scoping gap in `983fa0c`:
 tests reaching global state *indirectly* through a constructor or authority path, where
 nothing in the local file signals that a scoping rule applies.
+
+---
+
+## 13. Browse info pane reports some 32-bit float sources as plain `32-bit` — cause unknown, several theories eliminated
+
+**Status:** open, **undiagnosed**. Observed 2026-08-29. This entry records what was
+measured and what was ruled out; it does not contain a working theory.
+
+**Symptom.** In the Browse info pane, four WavPack files that are all 32-bit float show
+two different codec labels, stably and reproducibly per file:
+
+```
+~/torrents/Led Zeppelin/1969 Led Zeppelin II
+    (Side A).wv    "WavPack 32-bit float"
+    (Side B).wv    "WavPack 32-bit"        ← wrong
+~/torrents/Led Zeppelin/1970 Led Zeppelin III
+    (Side A).wv    "WavPack 32-bit"        ← wrong
+    (Side B).wv    "WavPack 32-bit float"
+```
+
+The affected side differs per album, so it is not "Side B" or any per-position rule. The
+user reports the labels are stable across sessions — the same file shows the same label
+every time.
+
+**This is not an integer misclassification.** `SourceInfo::codec_display`
+(`src/tui/probe.rs:257-270`) renders three arms:
+
+```rust
+Some(true)  => "{codec} {depth}-bit float"
+Some(false) => "{codec} {depth}-bit int"
+None        => "{codec} {depth}-bit"        // ← what the screenshots show
+```
+
+So `sample_format_is_float` is `None` for the affected files: float-ness is **unknown**,
+not decided as integer. Anything classified integer would print `32-bit int` explicitly.
+
+**Ground truth — all four files are identical and all are float.**
+
+```
+wvunpack -s   "source: 32-bit floats at 384000 Hz"          (all four)
+ffprobe       sample_fmt=fltp  bits_per_raw_sample=32
+              bits_per_sample=0  extradata_size=2           (all four)
+```
+
+Side A and Side B are indistinguishable in every ffprobe codec field, so nothing in the
+stream metadata can justify different classification. foobar2000 also reports all four as
+32-bit float.
+
+### Theories tested and eliminated
+
+1. **`probe_audio()` misdetects the format.** Ruled out. Calling
+   `crate::tui::probe::probe_audio` directly on all four files returns
+   `depth=Some(32) is_float=Some(true)` and `codec_display() == "WavPack 32-bit float"`
+   for every one.
+
+2. **`MediaFacts` loses the flag in transit.** Ruled out by reading:
+   `impl From<&SourceInfo> for MediaFacts` (`src/tui/app.rs:6643`) copies
+   `sample_format_is_float` through unchanged, as does the reverse conversion.
+
+3. **The metadata-editor Details overlay is the wrong display.** Ruled out.
+   `apply_metadata_sample_format_label` (`src/tui/draw_overlays.rs:5926`) blanks the row
+   when files disagree rather than showing divergent values, and the screenshots are the
+   Browse info pane, not that overlay.
+
+4. **The persistent probe cache drops the flag.** *Partially true but eliminated as the
+   cause of this split.* The `probe_cache` table (`src/db.rs:1183`) genuinely has **no
+   column** for float-ness, and `CachedProbeRow::to_cached_info` (`src/db.rs:6023-6026`)
+   hard-codes `sample_format_is_float: None`. A cache hit also returns before any ffmpeg
+   probe runs (`src/tui/browse.rs:9631-9647`), and the only follow-up task,
+   `spawn_cached_audio_probe_metadata_completion` (`browse.rs:10355`), calls
+   `read_metadata` for tags and never re-probes media facts.
+
+   **But this cannot explain the observed split:** all four files have *valid* cache rows
+   — verified against the live database, with `file_mtime` and `file_size` matching disk
+   exactly for every one. If the cache were the cause, all four would render plain
+   `32-bit`. Two do not.
+
+   The missing column is still a real defect worth fixing on its own; it is simply not
+   the mechanism here.
+
+**What this means.** Two different producers appear to be supplying `SourceInfo` for
+rows in this pane, and one of them yields `sample_format_is_float: None`. We have not
+found the second producer. Reading has now produced three wrong theories, so the next
+step should be instrumentation — log which code path supplies the `SourceInfo` for each
+row and what the flag holds at that moment — rather than further static analysis.
+
+**Open question beyond display.** Whether anything other than the label consumes
+`sample_format_is_float` from a possibly-`None` `SourceInfo`. Conversion planning cares
+about float-ness; if a `None` reaches it, the consequence is larger than a cosmetic
+label. Not investigated.
+
+**Incidental, unverified.** These files probe at 384 kHz while their CUE titles say
+`32-176.4`. Noted only so it is not lost; no bearing on this issue established.
