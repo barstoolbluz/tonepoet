@@ -900,3 +900,105 @@ until one reproduces, with the panic text preserved — the method that worked f
 (`memory_budget.rs:131`), during scratch-directory setup. Whether a real job and the
 cleaner can run in the same process — which is what would make the eliminated theory
 matter outside tests — was not determined.
+
+---
+
+## 15. A second concurrent tonepoet session blocked the first session's cut/paste — reproduced over days, no longer reproducing, cause never established
+
+**Status:** open, **cause unknown, currently not reproducing.** Logged 2026-08-30 because
+a defect that stops occurring without an identified fix has nothing preventing its
+return.
+
+**Symptom (field report, reproduced repeatedly over several days, most recently
+2026-08-29).** With one tonepoet session already open, launching a second, separate
+session caused the **first** session's cut/paste operations to fail. The workarounds the
+user found were to switch to the newer session, or to quit the first session and remove
+the journal entries/leases by hand.
+
+The user's framing: *"we need an ability for multiple, concurrent users to run sessions
+at the same time without invalidating one another's sessions for cut/paste."*
+
+**The refusal.** Not captured verbatim at the time. It is almost certainly
+`MutationClaimGuard::acquire` (`src/concurrency.rs:1675`) failing at
+`src/concurrency.rs:1731`:
+
+```rust
+"filesystem mutation conflicts with {owner}: '{}' overlaps '{}'"
+//                                  ^ "live owner" | "recovery reservation"
+```
+
+A cut/paste takes a `LeaseFamily::JournalOperation` lease with path claims over its
+source and destination (`src/tui/file_task_runtime.rs:586`). Any overlapping claim from
+another session — live **or** left behind as a recovery reservation — refuses the new
+mutation. That is correct when two sessions genuinely contend for the same files; it is
+not correct when a second session merely exists.
+
+**Which of the two owners appeared matters and is unknown.** "live owner" would mean the
+second session claims paths it should not while running. "recovery reservation" would
+mean a startup path leaves reservations over another session's paths. These are different
+defects.
+
+### Verified 2026-08-30: not currently reproducing
+
+The user attempted to replicate and could not. At the time of writing, **two tonepoet
+processes are running concurrently** and cut/paste works.
+
+### Two candidate explanations, neither confirmed
+
+**(1) `983fa0c` fixed it.** The coordination-descriptor reclamation race landed
+2026-08-28 19:21 and is in exactly this area: a scanner could lock an ownerless inode and
+then `lstat` a deliberately retired pathname, aborting legitimate mutation admission. A
+long-running TUI started before that commit would still have been running the old binary
+on 2026-08-29, which is consistent with the symptom persisting past the fix date.
+
+**(2) A stale reservation was the real blocker.** Earlier on 2026-08-30 this session
+inspected a leftover `journal-operation` lease owned by a dead PID, with claims over
+`~/temp/tunez/Led Zeppelin - Presence …` and `~/library/zeppelin/Led Zeppelin - Presence …`.
+It was created by a CTRL+X that failed to spawn its helper, and the *next* cut was refused
+with `conflicts with recovery reservation`. That lease has since been cleared: the
+`journal-operation` directory is now empty and there are **0 pending journals**.
+
+If (2) is the explanation, the symptom was never "a second session invalidates the first"
+— it was "a dead session's reservation blocks these paths", with the second session
+merely being how it was noticed. **That defect would still be latent** and would return
+the next time a session dies mid-operation.
+
+Explanation (2) fits what was directly observed on 2026-08-30. Explanation (1) fits the
+timeline. They are not mutually exclusive.
+
+### What is already implemented (so it is not re-derived)
+
+The startup-recovery liveness gate **does** exist, added in `a6d7e33` (2026-08-20).
+`pending_journals` (`src/tui/file_task_runtime.rs:1548`) classifies each journal's
+descriptor and omits live-owned ones from recovery
+(`src/tui/file_task_runtime.rs:1598`):
+
+```rust
+Ok((_family, ClaimAvailability::Live)) => {
+    log::debug!("file-operation journal {} remains live-owned; omit from recovery");
+    None
+}
+```
+
+That closes the cross-session *journal theft* described in the 2026-08-17 research — a
+second session adopting a live peer's journal and bumping its generation. It does **not**
+obviously explain the reported symptom, which is why this entry exists.
+
+**Coverage gap:** `ClaimAvailability::Live` appears exactly once in
+`file_task_runtime.rs` — in production code, never in a test. The three startup-recovery
+tests cover restore, cleanup-only, and `startup_recovery_inventory_surfaces_every_pending_journal`,
+which codifies the pre-gate behaviour. Nothing would catch a regression that reintroduces
+the theft.
+
+### Next step
+
+The decisive evidence is the verbatim refusal text — specifically whether it names a
+**live owner** or a **recovery reservation**, and which two paths it reports. Without
+that, the mechanism is unconstrained. If the symptom returns, capture the status line
+before doing anything else.
+
+A regression test for the live-owner skip is worth adding regardless of this issue's
+resolution, since that invariant is currently unguarded.
+
+**Related:** issue #7 (file-task startup recovery: supersession still open), issue #14,
+and the 2026-08-17 multi-session research recorded in operator memory.
