@@ -21568,6 +21568,8 @@ mod split_cue_source_coverage_tests {
                         date: None,
                         genre: None,
                         catalog: None,
+                        user_metadata: Default::default(),
+                        tonepoet_metadata_present: false,
                         tracks: vec![
                             crate::tui::cue_parser::CueTrack {
                                 number: 1,
@@ -21577,6 +21579,7 @@ mod split_cue_source_coverage_tests {
                                 index01_frames: Some(0),
                                 index00_frames: None,
                                 isrc: None,
+                                user_metadata: Default::default(),
                                 directives: Vec::new(),
                             },
                             crate::tui::cue_parser::CueTrack {
@@ -21587,6 +21590,7 @@ mod split_cue_source_coverage_tests {
                                 index01_frames: Some(4500),
                                 index00_frames: None,
                                 isrc: None,
+                                user_metadata: Default::default(),
                                 directives: Vec::new(),
                             },
                         ],

@@ -1876,6 +1876,8 @@ mod tests {
             date: Some("1980".to_string()),
             genre: Some("Rock".to_string()),
             catalog: Some("CAT-7".to_string()),
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
             tracks: vec![
                 crate::convert::cue_parser::CueTrack {
                     number: 7,
@@ -2170,6 +2172,8 @@ mod tests {
     fn embedded_cue_writes_fail_closed_for_read_only_targets() {
         let source = vec![entry("TITLE", &["One", "Two"])];
         let sheet = crate::convert::cue_parser::CueSheet {
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
             tracks: vec![
                 crate::convert::cue_parser::CueTrack {
                     number: 1,

@@ -45,12 +45,22 @@ pub struct NamingConfig {
     pub windows_portable: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CueTonepoetMetadataPreference {
+    Never,
+    AskEachTime,
+    Always,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataConfig {
-    /// When a sidecar-authoritative save includes changed fields the CUE
-    /// representation cannot persist, proceed with the save anyway: persist
-    /// every representable field, revert the unrepresentable ones (named in
-    /// the status line), and warn — instead of refusing the entire save.
+    /// Compatibility fallback for a sidecar-authoritative save that encounters
+    /// a field rejected by the concrete CUE projection: persist the fields that
+    /// are representable, visibly revert the rejected ones, and warn instead of
+    /// refusing the entire save. Tonepoet sidecars can represent every non-empty
+    /// metadata key through the inert metadata block, so this is not a legacy
+    /// fixed-field whitelist and ordinary custom keys do not reach this path.
     /// Structural refusals (e.g. CUESHEET-row deletion, PERFORMER-inheritance
     /// conflicts) still block regardless of this setting. Default: false.
     #[serde(default)]
@@ -61,6 +71,12 @@ pub struct MetadataConfig {
     /// retains per-side provenance for save routing. Default: true.
     #[serde(default = "default_synthetic_album_view")]
     pub synthetic_album_view: bool,
+    /// Consent policy for metadata that needs Tonepoet's inert CUE namespace
+    /// because standard CUE syntax cannot represent it losslessly. `None` is
+    /// intentionally distinct from every policy: an unstated preference asks.
+    /// TODO(config-screen): expose this preference when the Config screen exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_tonepoet_metadata: Option<CueTonepoetMetadataPreference>,
 }
 
 const fn default_synthetic_album_view() -> bool {
@@ -72,6 +88,7 @@ impl Default for MetadataConfig {
         Self {
             sidecar_save_with_warnings: false,
             synthetic_album_view: default_synthetic_album_view(),
+            cue_tonepoet_metadata: None,
         }
     }
 }
@@ -2356,6 +2373,68 @@ mod theme_config_tests {
         )
         .expect("deserialize disabled config");
         assert!(!round_trip.metadata.synthetic_album_view);
+    }
+
+    #[test]
+    fn cue_tonepoet_metadata_preference_preserves_undefined_and_all_three_states() {
+        let default = TonepoetConfig::default();
+        assert_eq!(default.metadata.cue_tonepoet_metadata, None);
+        let serialized = toml::to_string_pretty(&default).expect("serialize config");
+        assert!(!serialized.contains("cue_tonepoet_metadata"));
+
+        for (preference, spelling) in [
+            (CueTonepoetMetadataPreference::Never, "never"),
+            (CueTonepoetMetadataPreference::AskEachTime, "ask-each-time"),
+            (CueTonepoetMetadataPreference::Always, "always"),
+        ] {
+            let mut config = default.clone();
+            config.metadata.cue_tonepoet_metadata = Some(preference);
+            let serialized = toml::to_string_pretty(&config).expect("serialize preference");
+            assert!(serialized.contains(&format!("cue_tonepoet_metadata = \"{spelling}\"")));
+            let round_trip: TonepoetConfig =
+                toml::from_str(&serialized).expect("round-trip preference");
+            assert_eq!(round_trip.metadata.cue_tonepoet_metadata, Some(preference));
+        }
+    }
+
+    #[test]
+    fn cue_tonepoet_metadata_preference_narrow_update_persists_without_clobbering() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let _override = ConfigPathOverrideGuard::install(path.clone());
+
+        let mut initial = TonepoetConfig::default();
+        initial.browsing.show_hidden = true;
+        initial.save().expect("save initial config");
+
+        let mut config = TonepoetConfig::load().expect("load initial config");
+        config
+            .update(|latest| {
+                latest.metadata.cue_tonepoet_metadata =
+                    Some(CueTonepoetMetadataPreference::Always);
+            })
+            .expect("persist remembered allow choice");
+
+        let reloaded = TonepoetConfig::load().expect("reload remembered allow choice");
+        assert_eq!(
+            reloaded.metadata.cue_tonepoet_metadata,
+            Some(CueTonepoetMetadataPreference::Always),
+        );
+        assert!(reloaded.browsing.show_hidden);
+
+        let once = std::fs::read(&path).expect("first serialized preference");
+        config
+            .update(|latest| {
+                latest.metadata.cue_tonepoet_metadata =
+                    Some(CueTonepoetMetadataPreference::Always);
+            })
+            .expect("repeat remembered allow choice");
+        let twice = std::fs::read(&path).expect("second serialized preference");
+        assert_eq!(
+            twice,
+            once,
+            "an identical remembered choice must be byte-idempotent"
+        );
     }
 
     struct ConfigPathOverrideGuard;

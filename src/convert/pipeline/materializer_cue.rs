@@ -3694,7 +3694,7 @@ fn cue_track_metadata(
         image.genre.clone()
     };
 
-    TrackMetadata {
+    let mut metadata = TrackMetadata {
         title: cue_track.title.clone(),
         artist: performer.clone(),
         album_artist,
@@ -3714,6 +3714,68 @@ fn cue_track_metadata(
         comment: image.comment.clone(),
         pre_emphasis,
         extra,
+    };
+    apply_cue_user_metadata_to_track(&mut metadata, &cue_track.user_metadata);
+    metadata
+}
+
+fn apply_cue_user_metadata_to_track(
+    metadata: &mut TrackMetadata,
+    user_metadata: &crate::tui::cue_parser::CueUserMetadata,
+) {
+    for (key, values) in user_metadata {
+        insert_cue_user_metadata(&mut metadata.extra, key, values);
+        let Some(first) = values.first().cloned() else { continue };
+        match key.trim().to_ascii_uppercase().as_str() {
+            "TITLE" => metadata.title = Some(first),
+            "ARTIST" => metadata.artist = MetadataValueList::from_values(values.clone()),
+            "ALBUMARTIST" => {
+                metadata.album_artist = MetadataValueList::from_values(values.clone())
+            }
+            "COMPOSER" => metadata.composer = MetadataValueList::from_values(values.clone()),
+            "PERFORMER" => metadata.performer = MetadataValueList::from_values(values.clone()),
+            "ARRANGER" => metadata.arranger = MetadataValueList::from_values(values.clone()),
+            "GENRE" => metadata.genre = MetadataValueList::from_values(values.clone()),
+            "DATE" => metadata.date = Some(first),
+            "ISRC" => metadata.isrc = Some(first),
+            "PUBLISHER" => metadata.publisher = Some(first),
+            "COPYRIGHT" => metadata.copyright = Some(first),
+            "COMMENT" => metadata.comment = Some(first),
+            "ALBUM" => {
+                metadata.extra.insert("album".to_string(), first);
+            }
+            "TRACKNUMBER" => {
+                // Keep the structural numeric ordinal in `track_number`, but
+                // expose the authored lexical value to filename rendering and
+                // let the exact CUE metadata overlay replace the output tag.
+                insert_source_text_tag(&mut metadata.extra, "TRACKNUMBER", &first);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_cue_user_metadata_to_album(
+    metadata: &mut AlbumMetadata,
+    user_metadata: &crate::tui::cue_parser::CueUserMetadata,
+) {
+    for (key, values) in user_metadata {
+        insert_cue_user_metadata(&mut metadata.extra, key, values);
+        let Some(first) = values.first().cloned() else { continue };
+        match key.trim().to_ascii_uppercase().as_str() {
+            "ALBUM" => metadata.album = Some(first),
+            "ALBUMARTIST" => {
+                metadata.album_artist = MetadataValueList::from_values(values.clone())
+            }
+            "GENRE" => metadata.genre = MetadataValueList::from_values(values.clone()),
+            "DATE" => metadata.date = Some(first),
+            "DISCNUMBER" => {
+                if let Ok(number) = first.trim().parse::<u32>() {
+                    metadata.disc_number = Some(number);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3769,7 +3831,7 @@ fn cue_album_metadata(
         image.genre.clone()
     };
 
-    AlbumMetadata {
+    let mut metadata = AlbumMetadata {
         album: sheet.title.clone().or_else(|| image.album.clone()),
         album_artist,
         genre,
@@ -3778,7 +3840,9 @@ fn cue_album_metadata(
         total_discs: image.total_discs,
         disc_number: image.disc_number,
         extra,
-    }
+    };
+    apply_cue_user_metadata_to_album(&mut metadata, &sheet.user_metadata);
+    metadata
 }
 
 /// Read metadata for one already-split carrier from the exact sidecar-CUE

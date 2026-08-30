@@ -87,6 +87,12 @@ pub(crate) fn metadata_field_taxonomy(
             release_scoped: true,
             unified_cue_scope: Cue::File,
         },
+        // These are ordered lists for inline editing, but they are not
+        // intrinsically track-scoped in a unified CUE presentation. Existing
+        // carrier/tag surfaces legitimately declare them at File or Track
+        // scope. Keep that declared shape rather than forcing every occurrence
+        // through the unified-CUE Track invariant. Tonepoet's inert sidecar
+        // serializer remains able to persist either declared scope.
         "COMPOSER" | "PERFORMER" | "LYRICIST" | "ARRANGER" => {
             MetadataFieldTaxonomy {
                 inline_class: Inline::OrderedList,
@@ -2305,6 +2311,13 @@ mod tests {
         assert_eq!(metadata_field_taxonomy("ARTIST").unified_cue_scope, Declared);
         assert_eq!(metadata_field_taxonomy("ALBUM").unified_cue_scope, File);
         assert_eq!(metadata_field_taxonomy("TITLE").unified_cue_scope, Track);
+        for field in ["COMPOSER", "PERFORMER", "LYRICIST", "ARRANGER"] {
+            assert_eq!(
+                metadata_field_taxonomy(field).unified_cue_scope,
+                None,
+                "{field} must retain the surface-declared CUE row scope",
+            );
+        }
         assert_eq!(metadata_field_taxonomy("DISCNUMBER").unified_cue_scope, None);
     }
 

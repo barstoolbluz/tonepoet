@@ -6927,6 +6927,11 @@ pub struct MetadataEditorWriteResult {
     /// Semantic fidelity warnings associated with a successful non-sidecar
     /// carrier write. Kept separate from durability warnings in `outcome`.
     pub fidelity_warnings: Vec<String>,
+    /// This successful file result came from a carrier transaction that
+    /// committed an embedded-CUE projection of the editor's CUE-owned rows.
+    /// Completion reduction uses this only to avoid preserving stale
+    /// sidecar-authority dirt after an explicit EmbeddedCue override.
+    pub embedded_cue_projection_committed: bool,
 }
 
 impl MetadataEditorWriteResult {
@@ -6935,6 +6940,7 @@ impl MetadataEditorWriteResult {
             path,
             outcome: MetadataEditorWriteOutcome::Saved,
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
@@ -6946,6 +6952,7 @@ impl MetadataEditorWriteResult {
                 path,
                 outcome: MetadataEditorWriteOutcome::SavedWithWarnings { warnings },
                 fidelity_warnings: Vec::new(),
+                embedded_cue_projection_committed: false,
             }
         }
     }
@@ -6957,6 +6964,7 @@ impl MetadataEditorWriteResult {
                 reason: reason.into(),
             },
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
@@ -6967,11 +6975,17 @@ impl MetadataEditorWriteResult {
                 reason: reason.into(),
             },
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
     pub fn with_fidelity_warnings(mut self, warnings: Vec<String>) -> Self {
         self.fidelity_warnings = warnings;
+        self
+    }
+
+    pub fn with_embedded_cue_projection_committed(mut self) -> Self {
+        self.embedded_cue_projection_committed = true;
         self
     }
 
@@ -7010,6 +7024,7 @@ impl MetadataEditorWriteResult {
                 fidelity_warnings,
             },
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
@@ -7025,6 +7040,7 @@ impl MetadataEditorWriteResult {
                 reason: reason.into(),
             },
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
@@ -7036,6 +7052,7 @@ impl MetadataEditorWriteResult {
             path,
             outcome: MetadataEditorWriteOutcome::InvalidApeRepair(outcome),
             fidelity_warnings: Vec::new(),
+            embedded_cue_projection_committed: false,
         }
     }
 
@@ -7830,6 +7847,20 @@ pub struct CueAlbumTrackSource {
     pub index00_frames: Option<u32>,
     pub index01_frames: Option<u32>,
     pub isrc: Option<String>,
+    /// Tonepoet-owned inert album metadata from the same physical CUE as this
+    /// track. Keeping it alongside the track's source identity preserves
+    /// per-side provenance in synthetic multi-part Album views.
+    pub album_user_metadata: crate::convert::cue_parser::CueUserMetadata,
+    /// Tonepoet-owned inert CUE metadata captured from this physical track.
+    /// Save regeneration starts from this map and applies only editor changes,
+    /// so fallback tags from member files are never promoted into CUE authority
+    /// merely because another field was edited.
+    pub user_metadata: crate::convert::cue_parser::CueUserMetadata,
+    /// The source CUE contained a Tonepoet metadata block, even if that block
+    /// is now empty after editor deletions. This intent bit is required so a
+    /// synthetic/unified save can replace the last old record rather than
+    /// accidentally treating an absent replacement block as “not managed.”
+    pub tonepoet_metadata_present: bool,
     /// Track-scoped CUE directives retained verbatim in parse-normal form
     /// (for example `FLAGS PRE` and track-level `REM` lines).
     pub directives: Vec<String>,
@@ -7850,6 +7881,8 @@ pub struct CueAlbumSyntheticSheet {
     pub album_date: Option<String>,
     pub album_genre: Option<String>,
     pub album_catalog: Option<String>,
+    /// Tonepoet-owned inert album metadata from the authoritative CUE input.
+    pub user_metadata: crate::convert::cue_parser::CueUserMetadata,
 }
 
 /// One independently-authored physical side/member represented by a
@@ -9637,6 +9670,39 @@ fn apply_write_results_to_tab(
         .map(|(idx, path)| (path, idx))
         .collect();
 
+    let album_view_sidecars_fully_saved = if tab.cue_album_view_sides.is_empty() {
+        false
+    } else {
+        // Album-view execution reports the original logical sidecar paths from
+        // the same retained side descriptors used to build the transaction.
+        // Compare those stable identities directly: save completion reduction
+        // runs on the UI thread and must not add filesystem canonicalization.
+        let successful_sidecars = results
+            .iter()
+            .filter_map(|result| match &result.outcome {
+                MetadataEditorWriteOutcome::SidecarCueSaved { cue_path, .. } => {
+                    Some(cue_path.clone())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        tab.cue_album_view_sides.iter().all(|side| {
+            side.authoritative_target == crate::config::AggregateMetadataTarget::SidecarCue
+                && side
+                    .sidecar_path
+                    .as_ref()
+                    .is_some_and(|path| successful_sidecars.contains(path))
+        })
+    };
+
+    let embedded_cue_projection_committed = results.iter().any(|result| {
+        result.embedded_cue_projection_committed
+            && matches!(
+                &result.outcome,
+                MetadataEditorWriteOutcome::Saved
+                    | MetadataEditorWriteOutcome::SavedWithWarnings { .. }
+            )
+    });
     let mut summary = MetadataEditorWriteSummary::default();
     let mut saved_slots = std::collections::BTreeSet::new();
 
@@ -9644,6 +9710,7 @@ fn apply_write_results_to_tab(
         path,
         outcome,
         fidelity_warnings: result_fidelity_warnings,
+        embedded_cue_projection_committed: _,
     } in results
     {
         if path_to_index.contains_key(&path) {
@@ -9796,7 +9863,12 @@ fn apply_write_results_to_tab(
         }
     }
 
-    reduce_saved_slots(tab, &saved_slots);
+    reduce_saved_slots(
+        tab,
+        &saved_slots,
+        album_view_sidecars_fully_saved,
+        embedded_cue_projection_committed,
+    );
     if tab.pending_embedded_cuesheet_delete
         && pending_embedded_cuesheet_delete_fully_saved(tab, &saved_slots)
     {
@@ -9841,6 +9913,154 @@ fn cue_sidecar_standard_owned_entry(entry: &crate::tui::probe::TagEntry) -> bool
     crate::tui::probe::cue_sidecar_standard_owned_key(&entry.display_key)
 }
 
+fn cue_sidecar_user_metadata_contains_key(
+    metadata: &crate::convert::cue_parser::CueUserMetadata,
+    display_key: &str,
+) -> bool {
+    let canonical = crate::tui::probe::canonical_metadata_display_key(display_key);
+    metadata
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(&canonical))
+}
+
+fn taggable_metadata_sidecar_dual_authority_for_reduction(tab: &PresentationTab) -> bool {
+    if tab.paths.len() <= 1 || !dedicated_cue_sidecar_authority(tab) {
+        return false;
+    }
+    let Some(sheet) = tab.cue_album_synthetic_sheet.as_ref() else {
+        return false;
+    };
+    if sheet.track_sources.len() != tab.paths.len()
+        || sheet.audio_paths.len() != tab.paths.len()
+    {
+        return false;
+    }
+    if !tab.technical_details.files.is_empty()
+        && tab.technical_details.files.iter().all(|file| {
+            matches!(&file.file_facts.read_state, FileReadState::Unsupported { .. })
+        })
+    {
+        return false;
+    }
+
+    // Save planning performs the stronger canonicalized path proof before it
+    // dispatches I/O. Completion reduction must stay filesystem-I/O-free, but
+    // it can still require the retained logical identities to describe the
+    // same one-track-per-file set exactly. This makes a malformed/stale model
+    // fail closed instead of classifying by cardinality alone.
+    let path_set = tab
+        .paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let save_path_set = sheet
+        .audio_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if path_set.len() != tab.paths.len()
+        || save_path_set.len() != sheet.audio_paths.len()
+        || save_path_set != path_set
+    {
+        return false;
+    }
+    let mut covered = std::collections::BTreeSet::new();
+    sheet.track_sources.iter().all(|source| {
+        path_set.contains(&source.audio_path) && covered.insert(source.audio_path.clone())
+    }) && covered.len() == path_set.len()
+}
+
+fn cue_sidecar_entry_has_inert_provenance(
+    tab: &PresentationTab,
+    entry: &crate::tui::probe::TagEntry,
+) -> bool {
+    // Source provenance is the common case and avoids reparsing the generated
+    // CUE for metadata that was already present when the editor opened. It is
+    // also intentionally retained through a staged deletion so deleting the
+    // last inert value remains a sidecar operation until that save commits.
+    let source_model_has_key = tab
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .is_some_and(|sheet| {
+            sheet.track_sources.iter().any(|source| {
+                cue_sidecar_user_metadata_contains_key(
+                    &source.album_user_metadata,
+                    &entry.display_key,
+                ) || cue_sidecar_user_metadata_contains_key(
+                    &source.user_metadata,
+                    &entry.display_key,
+                )
+            })
+        });
+    if source_model_has_key {
+        return true;
+    }
+
+    // The staged CUESHEET is newer than the source model. Consult it as a
+    // second source of provenance so a newly-authored arbitrary key remains
+    // sidecar-owned on a second save in the same editor session. This is an
+    // in-memory parse only; save completion must not introduce filesystem I/O.
+    tab.entries
+        .iter()
+        .find(|candidate| candidate.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|candidate| candidate.per_file_values.first())
+        .is_some_and(|cuesheet| {
+            let parsed = crate::tui::cue_parser::parse_cue(cuesheet.as_str());
+            cue_sidecar_user_metadata_contains_key(&parsed.user_metadata, &entry.display_key)
+                || parsed.tracks.iter().any(|track| {
+                    cue_sidecar_user_metadata_contains_key(
+                        &track.user_metadata,
+                        &entry.display_key,
+                    )
+                })
+        })
+}
+
+pub(super) fn sidecar_writeback_owns_metadata_entry(
+    tab: &PresentationTab,
+    entry: &crate::tui::probe::TagEntry,
+    dual_authority: bool,
+) -> bool {
+    if entry.display_key.eq_ignore_ascii_case("CUESHEET")
+        || !cue_sidecar_representable_entry(entry)
+    {
+        return false;
+    }
+    if !dedicated_cue_sidecar_authority(tab) || !dual_authority {
+        return true;
+    }
+    let key = crate::tui::probe::canonical_metadata_display_key(&entry.display_key);
+    if entry.is_track_scoped(tab.paths.len()) {
+        if matches!(key.as_str(), "TITLE" | "ARTIST" | "ISRC") {
+            return true;
+        }
+    } else if matches!(
+        key.as_str(),
+        "ALBUM" | "ALBUMARTIST" | "DATE" | "GENRE" | "CATALOGNUMBER"
+    ) && entry
+        .per_file_values
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+    {
+        return true;
+    }
+    if cue_sidecar_entry_has_inert_provenance(tab, entry) {
+        return true;
+    }
+
+    // Preserve existing native-field authority, but do not make that rule a
+    // new ceiling on the R2 feature: a genuinely new arbitrary row authored
+    // while the sidecar is selected has no native provenance to preserve and
+    // belongs in the inert sidecar metadata.
+    let has_native_original = entry
+        .per_file_originals
+        .iter()
+        .any(|values| values.value_count() > 0)
+        || entry.per_file_stored_value_counts.iter().any(|count| *count > 0)
+        || !entry.original.trim().is_empty();
+    !has_native_original
+}
+
 fn mark_tag_entry_saved_empty(entry: &mut crate::tui::probe::TagEntry) {
     for value in &mut entry.per_file_values {
         value.clear();
@@ -9855,10 +10075,54 @@ fn mark_tag_entry_saved_empty(entry: &mut crate::tui::probe::TagEntry) {
     entry.mb_proposed_per_file = None;
 }
 
+/// Advance the retained one-sidecar source model to the projection that was
+/// just durably committed. This keeps repeated saves in one editor session
+/// idempotent: a newly-authored inert key remains sidecar provenance on a
+/// later edit/delete, and generator fallback uses the last committed CUE
+/// rather than the editor-open snapshot. Completion reduction stays entirely
+/// in memory. Multi-part Album views keep per-side models elsewhere and are
+/// deliberately not collapsed here.
+fn refresh_single_sidecar_cue_source_model_from_staged_projection(tab: &mut PresentationTab) {
+    if !dedicated_cue_sidecar_authority(tab) {
+        return;
+    }
+    let Some(cuesheet_text) = tab
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+        .and_then(|entry| entry.per_file_values.first())
+        .map(|value| value.as_str().to_string())
+    else {
+        return;
+    };
+    let parsed = crate::tui::cue_parser::parse_cue(&cuesheet_text);
+    let Some(sheet) = tab.cue_album_synthetic_sheet.as_mut() else {
+        return;
+    };
+    if sheet.cue_paths.len() != 1 || parsed.tracks.len() != sheet.track_sources.len() {
+        return;
+    }
+
+    sheet.album_title = parsed.title.clone();
+    sheet.album_performer = parsed.performer.clone();
+    sheet.album_date = parsed.date.clone();
+    sheet.album_genre = parsed.genre.clone();
+    sheet.album_catalog = parsed.catalog.clone();
+    sheet.user_metadata = parsed.user_metadata.clone();
+    for (source, track) in sheet.track_sources.iter_mut().zip(parsed.tracks.iter()) {
+        source.isrc = track.isrc.clone();
+        source.album_user_metadata = parsed.user_metadata.clone();
+        source.user_metadata = track.user_metadata.clone();
+        source.tonepoet_metadata_present = parsed.tonepoet_metadata_present;
+    }
+}
+
 fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
     let path_count = tab.paths.len();
     tab.pending_sidecar_cue_creation = false;
-    if !dedicated_cue_sidecar_authority(tab) {
+    let dedicated_sidecar = dedicated_cue_sidecar_authority(tab);
+    let selected_sidecar = matches!(&tab.cue_source, Some(MetadataCueSource::Sidecar(_)));
+    if !dedicated_sidecar && !selected_sidecar {
         for entry in &mut tab.entries {
             let is_cuesheet_shadow = tab.sidecar_cuesheet_shadow_present
                 && entry.display_key.eq_ignore_ascii_case("CUESHEET");
@@ -9873,35 +10137,93 @@ fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
         return;
     }
 
-    // A native multi-FILE sidecar-authoritative save deliberately produces no
-    // image results. Consume exactly the CUE-representable edits here after the
-    // sidecar write succeeds; unsupported changes are rejected before I/O.
+    // A successful selected-sidecar write makes the staged generated CUESHEET
+    // durable. Flat one-track surfaces expose it as a read-only shadow; unified
+    // dedicated-sidecar surfaces also need their synthetic CUESHEET baseline
+    // advanced when the save is sidecar-only (there may be no native saved slot
+    // for `reduce_saved_slots` to consume). Album views are different: one
+    // completion represents only one physical side, so their CUESHEET baseline
+    // advances only after the existing all-sidecars-saved reduction proves the
+    // whole aggregate committed.
+    let mark_cuesheet_projection_saved =
+        (!dedicated_sidecar && tab.sidecar_cuesheet_shadow_present)
+            || (dedicated_sidecar && tab.cue_album_view_sides.is_empty());
+    if mark_cuesheet_projection_saved {
+        for entry in &mut tab.entries {
+            if entry.display_key.eq_ignore_ascii_case("CUESHEET") {
+                mark_tag_entry_saved(entry);
+            }
+        }
+    }
+
+    // A selected sidecar write commits the rows owned by that sidecar. On
+    // taggable one-track-per-file metadata-sidecar surfaces, representability
+    // alone does not transfer unrelated native-field authority to the CUE.
+    // For flat carriers the sidecar result is released only after any required
+    // image write succeeds. Consume only the delta the sidecar actually owned.
     let deleted = tab
         .deleted
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
+    let dual_authority = taggable_metadata_sidecar_dual_authority_for_reduction(tab);
+    let sidecar_owned_entries = tab
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            sidecar_writeback_owns_metadata_entry(tab, entry, dual_authority).then_some(index)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     let consumed_deletions = deleted
+        .iter()
+        .copied()
+        .filter(|index| sidecar_owned_entries.contains(index))
+        .collect::<std::collections::BTreeSet<_>>();
+    let removed_custom_deletions = consumed_deletions
         .iter()
         .copied()
         .filter(|index| {
             tab.entries
                 .get(*index)
-                .is_some_and(|entry| cue_sidecar_standard_owned_entry(entry))
+                .is_some_and(|entry| !cue_sidecar_standard_owned_entry(entry))
         })
         .collect::<std::collections::BTreeSet<_>>();
     for (index, entry) in tab.entries.iter_mut().enumerate() {
-        if !cue_sidecar_representable_entry(entry) {
+        if !sidecar_owned_entries.contains(&index)
+            || removed_custom_deletions.contains(&index)
+        {
             continue;
         }
         if consumed_deletions.contains(&index) {
             // Standard sidecar-owned rows remain present as an editable empty
             // surface after deletion. This allows users to repopulate an
             // initially absent or just-deleted CUE field without reopening or
-            // relying on carrier-image writability.
+            // relying on carrier-image writability. User-defined rows are
+            // removed below once their deletion has been committed to the CUE.
             mark_tag_entry_saved_empty(entry);
         } else if !deleted.contains(&index) {
             mark_tag_entry_saved(entry);
+        }
+    }
+
+    // Custom rows do not have a permanent schema-backed editor slot. Once a
+    // sidecar save commits their deletion, remove them exactly as the ordinary
+    // tag-write reducer would, while keeping selection/deletion indices valid.
+    if !removed_custom_deletions.is_empty() {
+        tab.selected_rows = tab
+            .selected_rows
+            .iter()
+            .filter_map(|index| {
+                if removed_custom_deletions.contains(index) {
+                    None
+                } else {
+                    Some(*index - removed_custom_deletions.range(..*index).count())
+                }
+            })
+            .collect();
+        for index in removed_custom_deletions.iter().rev() {
+            tab.entries.remove(*index);
         }
     }
     tab.deleted = tab
@@ -9909,7 +10231,9 @@ fn mark_sidecar_cue_writeback_saved(tab: &mut PresentationTab) {
         .iter()
         .copied()
         .filter(|index| !consumed_deletions.contains(index))
+        .map(|index| index - removed_custom_deletions.range(..index).count())
         .collect();
+    refresh_single_sidecar_cue_source_model_from_staged_projection(tab);
     tab.cue_album_forced_cleanup.clear();
 }
 
@@ -9951,8 +10275,13 @@ fn unified_cue_album_fully_saved_for_dirty_clear(
     })
 }
 
-fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections::BTreeSet<usize>) {
-    if saved_slots.is_empty() {
+fn reduce_saved_slots(
+    tab: &mut PresentationTab,
+    saved_slots: &std::collections::BTreeSet<usize>,
+    album_view_sidecars_fully_saved: bool,
+    embedded_cue_projection_committed: bool,
+) {
+    if saved_slots.is_empty() && !album_view_sidecars_fully_saved {
         return;
     }
 
@@ -9962,7 +10291,7 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
     let album_view_track_indices_by_path = tab
         .cue_album_synthetic_sheet
         .as_ref()
-        .filter(|_| !tab.cue_album_view_sides.is_empty())
+        .filter(|_| !saved_slots.is_empty() && !tab.cue_album_view_sides.is_empty())
         .map(|sheet| {
             tab.paths
                 .iter()
@@ -9986,10 +10315,146 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
         .as_ref()
         .filter(|_| !tab.cue_album_view_sides.is_empty())
         .map(|sheet| sheet.track_sources.len());
+    let metadata_sidecar_dual_authority = dedicated_cue_sidecar_authority(tab)
+        && tab.cue_album_view_sides.is_empty()
+        && taggable_metadata_sidecar_dual_authority_for_reduction(tab);
+    let sidecar_reduction_owned_entries = if dedicated_cue_sidecar_authority(tab)
+        && tab.cue_album_view_sides.is_empty()
+        && !embedded_cue_projection_committed
+    {
+        tab.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                (entry.display_key.eq_ignore_ascii_case("CUESHEET")
+                    || sidecar_writeback_owns_metadata_entry(
+                        tab,
+                        entry,
+                        metadata_sidecar_dual_authority,
+                    ))
+                .then_some(index)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let metadata_sidecar_track_indices_by_path = metadata_sidecar_dual_authority
+        .then(|| {
+            tab.cue_album_synthetic_sheet.as_ref().map(|sheet| {
+                tab.paths
+                    .iter()
+                    .map(|path| {
+                        sheet
+                            .track_sources
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(track_index, source)| {
+                                (source.audio_path.as_path() == path.as_path()).then_some(track_index)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten();
     let mut remove_entries = Vec::new();
     let mut retained_deleted = Vec::new();
 
     for (entry_idx, entry) in tab.entries.iter_mut().enumerate() {
+        // Ordinary native-file successes cannot commit selected-sidecar state.
+        // If the sidecar commit succeeded, its result already advanced/removed
+        // these rows before this reducer runs; if it failed, preserve the
+        // remaining sidecar delta for retry. An explicit EmbeddedCue carrier
+        // transaction is the intentional exception: after its atomic commit,
+        // the worker marks the successful logical results so this editor can
+        // advance the CUE-owned baseline without pretending the sidecar changed.
+        if sidecar_reduction_owned_entries.contains(&entry_idx) {
+            if deleted.contains(&entry_idx) {
+                retained_deleted.push(entry_idx);
+            }
+            continue;
+        }
+        let native_metadata_sidecar_track_row = metadata_sidecar_track_indices_by_path
+            .as_ref()
+            .is_some_and(|track_indices_by_path| {
+                entry.is_track_scoped(path_count)
+                    && entry.per_file_values.len()
+                        == track_indices_by_path
+                            .iter()
+                            .map(Vec::len)
+                            .sum::<usize>()
+                    && entry.per_file_originals.len() == entry.per_file_values.len()
+            });
+        if native_metadata_sidecar_track_row {
+            let track_indices_by_path = metadata_sidecar_track_indices_by_path
+                .as_ref()
+                .expect("metadata-sidecar track mapping checked above");
+            if deleted.contains(&entry_idx) {
+                for (path_slot, track_indices) in track_indices_by_path.iter().enumerate() {
+                    for &track_index in track_indices {
+                        if saved_slots.contains(&path_slot) {
+                            if let Some(value) = entry.per_file_values.get_mut(track_index) {
+                                value.clear();
+                            }
+                            if let Some(original) = entry.per_file_originals.get_mut(track_index) {
+                                original.clear();
+                            }
+                            if entry.per_file_stored_value_counts.len()
+                                == entry.per_file_values.len()
+                            {
+                                entry.per_file_stored_value_counts[track_index] = 0;
+                            }
+                        } else if let Some(value) = entry.per_file_values.get_mut(track_index) {
+                            // Convert the row tombstone into an empty-value
+                            // retry for member files that did not save.
+                            value.clear();
+                        }
+                    }
+                }
+            } else {
+                for &path_slot in saved_slots {
+                    let Some(track_indices) = track_indices_by_path.get(path_slot) else {
+                        continue;
+                    };
+                    for &track_index in track_indices {
+                        if let (Some(value), Some(original)) = (
+                            entry.per_file_values.get(track_index).cloned(),
+                            entry.per_file_originals.get_mut(track_index),
+                        ) {
+                            let changed = *original != value;
+                            *original = value.clone();
+                            if changed
+                                && entry.per_file_stored_value_counts.len()
+                                    == entry.per_file_values.len()
+                            {
+                                entry.per_file_stored_value_counts[track_index] =
+                                    value.value_count();
+                            }
+                        }
+                    }
+                }
+            }
+            refresh_stored_value_summary(entry);
+            recompute_tag_entry_display(entry);
+            if !deleted.contains(&entry_idx)
+                && entry.per_file_values == entry.per_file_originals
+            {
+                entry.original = entry.value.clone();
+                entry.mb_proposed_value = None;
+                entry.mb_proposed_per_file = None;
+            }
+            if deleted.contains(&entry_idx)
+                && entry.per_file_values.iter().all(|value| value.trim().is_empty())
+                && entry
+                    .per_file_originals
+                    .iter()
+                    .all(|value| value.trim().is_empty())
+            {
+                remove_entries.push(entry_idx);
+            }
+            continue;
+        }
+
         let file_aligned = !entry.is_track_scoped(path_count)
             && entry.per_file_values.len() == path_count
             && entry.per_file_originals.len() == path_count;
@@ -10055,14 +10520,16 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
 
             let unified_row_persistable = unified_cue_album_per_track_key_is_persistable_for_dirty_clear(
                 &entry.display_key,
-            );
+            ) || (album_view_sidecars_fully_saved
+                && !entry.display_key.eq_ignore_ascii_case("CUESHEET")
+                && cue_sidecar_representable_entry(entry));
             if deleted.contains(&entry_idx) {
                 if unified_cue_album_fully_saved && unified_row_persistable {
                     // Unified CUE-album per-track rows are not written as
-                    // independent tag vectors; their delete operation is
-                    // consumed by the regenerated embedded CUESHEET that was
-                    // just written to every member image.  Only rows with a
-                    // defined generator mapping may clear their tombstone here.
+                    // independent tag vectors. Their delete operation is
+                    // consumed by the regenerated authoritative CUE carrier.
+                    // Only rows proven persistable by that carrier may clear
+                    // their tombstone here.
                     remove_entries.push(entry_idx);
                 } else {
                     // A row-level delete for a non-file-aligned entry cannot be
@@ -10077,11 +10544,11 @@ fn reduce_saved_slots(tab: &mut PresentationTab, saved_slots: &std::collections:
                 // advance their originals with the rest of the surface.
                 mark_tag_entry_saved(entry);
             } else if unified_cue_album_fully_saved && unified_row_persistable {
-                // Unified CUE-album per-track rows with a defined CUE mapping
-                // persist through the regenerated embedded CUESHEET that was
-                // just written to every member image. Unknown row-dimensioned
-                // keys must stay dirty; otherwise edits would appear saved
-                // while being skipped by both the tag writer and CUE generator.
+                // Unified CUE-album per-track rows persist through their
+                // regenerated authoritative CUE carrier. For embedded CUEs
+                // that remains the small native mapping above; an Album view
+                // may additionally prove that every physical sidecar committed
+                // its open-ended inert metadata projection.
                 mark_tag_entry_saved(entry);
             }
             continue;
@@ -11261,9 +11728,30 @@ pub enum BulkGuardCommand {
     DetectPreemphasis,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueTonepoetMetadataConsentResume {
+    Save,
+    WriteSidecarCue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueTonepoetMetadataRevert {
+    pub entry_index: usize,
+    pub slots: Vec<usize>,
+    pub key: String,
+}
+
 /// What action a confirmation dialog will perform
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
+    /// Decide whether an editor save may persist values that require
+    /// Tonepoet's inert CUE namespace. The editor is parked in
+    /// `AppState::pending_metadata_editor` while this dialog is open.
+    CueTonepoetMetadataConsent {
+        resume: CueTonepoetMetadataConsentResume,
+        edits: Vec<CueTonepoetMetadataRevert>,
+        remember_choice: bool,
+    },
     /// Return from the metadata editor to the MbSelect picker,
     /// discarding any edits. Carries the cached release list + paths
     /// so the picker can be reconstructed.
@@ -17474,7 +17962,7 @@ mod metadata_presentation_tab_tests {
         surface.deleted = vec![1];
         surface.selected_rows.extend([0, 1, 2]);
 
-        reduce_saved_slots(&mut surface, &[0].into_iter().collect());
+        reduce_saved_slots(&mut surface, &[0].into_iter().collect(), false, false);
 
         assert_eq!(surface.entries.len(), 2);
         assert_eq!(surface.entries[0].display_key, "TITLE");
@@ -18011,6 +18499,171 @@ mod metadata_presentation_tab_tests {
     }
 
     #[test]
+    fn album_view_sidecar_success_clears_custom_track_row_after_every_side_commits() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: vec![
+                std::path::PathBuf::from("/tmp/side-a.cue"),
+                std::path::PathBuf::from("/tmp/side-b.cue"),
+            ],
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+            user_metadata: Default::default(),
+        });
+        state.active_surface_mut().cue_album_view_sides = vec![
+            CueAlbumViewSide {
+                sidecar_path: Some(std::path::PathBuf::from("/tmp/side-a.cue")),
+                sidecar_present: true,
+                audio_paths: vec![std::path::PathBuf::from("/tmp/one.flac")],
+                embedded_cuesheet_snapshots: Vec::new(),
+                authoritative_target: crate::config::AggregateMetadataTarget::SidecarCue,
+            },
+            CueAlbumViewSide {
+                sidecar_path: Some(std::path::PathBuf::from("/tmp/side-b.cue")),
+                sidecar_present: true,
+                audio_paths: vec![std::path::PathBuf::from("/tmp/two.flac")],
+                embedded_cuesheet_snapshots: Vec::new(),
+                authoritative_target: crate::config::AggregateMetadataTarget::SidecarCue,
+            },
+        ];
+        state
+            .active_surface_mut()
+            .entries
+            .push(tag("CUESHEET", "[CUE sheet]", vec!["SHEET-A", "SHEET-B"]));
+        let mut tracknumber = tag(
+            "TRACKNUMBER",
+            "<multiple values>",
+            vec!["01", "02", "03", "04"],
+        );
+        tracknumber.row_scope = crate::tui::probe::RowScope::Track;
+        for (slot, value) in ["A1", "A2", "B1", "B2"].into_iter().enumerate() {
+            tracknumber.per_file_values[slot].replace_scalar(value.to_string());
+        }
+        state.active_surface_mut().entries.push(tracknumber);
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+        let paths = state.active_surface().paths.clone();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::sidecar_cue_saved(
+                        paths[0].clone(),
+                        std::path::PathBuf::from("/tmp/side-a.cue"),
+                        false,
+                        false,
+                        false,
+                    ),
+                    MetadataEditorWriteResult::sidecar_cue_saved(
+                        paths[1].clone(),
+                        std::path::PathBuf::from("/tmp/side-b.cue"),
+                        false,
+                        false,
+                        false,
+                    ),
+                ],
+            )
+            .expect("matching Album-view transaction should reduce");
+
+        assert!(!summary.remaining_dirty);
+        assert_eq!(
+            state.active_surface().entries[row_idx].per_file_originals,
+            state.active_surface().entries[row_idx].per_file_values,
+            "an open-ended per-track row is saved only after every physical sidecar reports commit"
+        );
+        assert!(!state.active_surface().dirty);
+    }
+
+    #[test]
+    fn album_view_custom_track_row_stays_dirty_without_every_sidecar_success() {
+        let mut state = write_state();
+        state.active_surface_mut().cue_album_synthetic_sheet = Some(CueAlbumSyntheticSheet {
+            cue_paths: vec![
+                std::path::PathBuf::from("/tmp/side-a.cue"),
+                std::path::PathBuf::from("/tmp/side-b.cue"),
+            ],
+            audio_paths: vec![
+                std::path::PathBuf::from("/tmp/one.flac"),
+                std::path::PathBuf::from("/tmp/two.flac"),
+            ],
+            track_sources: Vec::new(),
+            album_title: None,
+            album_performer: None,
+            album_date: None,
+            album_genre: None,
+            album_catalog: None,
+            user_metadata: Default::default(),
+        });
+        state.active_surface_mut().cue_album_view_sides = vec![
+            CueAlbumViewSide {
+                sidecar_path: Some(std::path::PathBuf::from("/tmp/side-a.cue")),
+                sidecar_present: true,
+                audio_paths: vec![std::path::PathBuf::from("/tmp/one.flac")],
+                embedded_cuesheet_snapshots: Vec::new(),
+                authoritative_target: crate::config::AggregateMetadataTarget::SidecarCue,
+            },
+            CueAlbumViewSide {
+                sidecar_path: Some(std::path::PathBuf::from("/tmp/side-b.cue")),
+                sidecar_present: true,
+                audio_paths: vec![std::path::PathBuf::from("/tmp/two.flac")],
+                embedded_cuesheet_snapshots: Vec::new(),
+                authoritative_target: crate::config::AggregateMetadataTarget::SidecarCue,
+            },
+        ];
+        state
+            .active_surface_mut()
+            .entries
+            .push(tag("CUESHEET", "[CUE sheet]", vec!["SHEET-A", "SHEET-B"]));
+        let mut producer = tag(
+            "PRODUCER",
+            "<multiple values>",
+            vec!["Old A", "Old B", "Old C", "Old D"],
+        );
+        producer.row_scope = crate::tui::probe::RowScope::Track;
+        producer.per_file_values[2].replace_scalar("New C".to_string());
+        state.active_surface_mut().entries.push(producer);
+        let row_idx = state.active_surface().entries.len() - 1;
+        state.active_surface_mut().dirty = true;
+        let (session_id, generation) = state.begin_write();
+        let paths = state.active_surface().paths.clone();
+
+        let summary = state
+            .apply_write_results(
+                session_id,
+                generation,
+                vec![
+                    MetadataEditorWriteResult::sidecar_cue_saved(
+                        paths[0].clone(),
+                        std::path::PathBuf::from("/tmp/side-a.cue"),
+                        false,
+                        false,
+                        false,
+                    ),
+                ],
+            )
+            .expect("partial sidecar evidence should still reduce conservatively");
+
+        assert!(summary.remaining_dirty);
+        assert_eq!(
+            state.active_surface().entries[row_idx].per_file_originals[2].as_str(),
+            "Old C",
+            "partial sidecar success cannot claim an inert per-track row saved without every sidecar commit"
+        );
+        assert!(state.active_surface().dirty);
+    }
+
+    #[test]
     fn unified_cue_album_row_entries_clear_dirty_after_all_member_images_save() {
         let mut state = write_state();
         // Unified surface: 2 member images, but per-track rows dimensioned by
@@ -18027,6 +18680,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state
             .active_surface_mut()
@@ -18080,6 +18734,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state
             .active_surface_mut()
@@ -18140,6 +18795,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
@@ -18234,6 +18890,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
@@ -18312,6 +18969,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().entries.push(tag(
             "TRACKNUMBER",
@@ -18359,6 +19017,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().entries.push(tag(
             "COMPOSER",
@@ -18410,6 +19069,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().cue_album_forced_cleanup = vec![
             (0, lofty::tag::ItemKey::Isrc),
@@ -18452,6 +19112,7 @@ mod metadata_presentation_tab_tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().cue_album_forced_cleanup = vec![
             (0, lofty::tag::ItemKey::Isrc),

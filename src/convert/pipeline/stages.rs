@@ -5201,6 +5201,7 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
         || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        || key.starts_with(CUE_USER_METADATA_EXTRA_PREFIX)
         || key.starts_with(SOURCE_TEXT_TAG_EXTRA_PREFIX)
         || key == "image_metadata_source"
 }
@@ -5687,6 +5688,38 @@ pub(crate) fn authoritative_metadata_tags(
             }
             let tag_key = cue_extra_tag_key("TRACK", key);
             push_tag_value(&mut tags, &tag_key, value);
+        }
+    }
+
+    // The inert CUE block is the user's lossless definition. Apply it last so
+    // it overrides both the standard CUE compatibility projection and any
+    // image/tag fallback for the same logical key. Track scope overrides album
+    // scope. Repeated values are appended directly instead of going through
+    // `push_tag_value`, because arbitrary custom fields can be ordered lists
+    // even when they are not in the built-in set-valued taxonomy.
+    let mut cue_user_metadata = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (key, values) in cue_user_metadata_from_extra(&album.extra) {
+        cue_user_metadata.insert(key, values);
+    }
+    for (key, values) in cue_user_metadata_from_extra(&meta.extra) {
+        let existing = cue_user_metadata
+            .keys()
+            .find(|candidate| candidate.eq_ignore_ascii_case(&key))
+            .cloned();
+        if let Some(existing) = existing {
+            cue_user_metadata.remove(&existing);
+        }
+        cue_user_metadata.insert(key, values);
+    }
+    for (key, values) in cue_user_metadata {
+        let Some(tag_key) = source_text_tag_output_key(&key) else {
+            continue;
+        };
+        tags.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(&tag_key));
+        for value in values {
+            if !value.trim().is_empty() {
+                tags.push((tag_key.clone(), value));
+            }
         }
     }
 
@@ -8172,6 +8205,78 @@ mod metadata_writer_command_tests {
                 .filter(|(key, _)| key == "TONEPOET_SOURCE_TEXT_TAG:USER_NOTE")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn cue_user_metadata_overlay_wins_and_preserves_ordered_values() {
+        let mut track = TrackMetadata {
+            title: Some("Compatibility title".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        insert_cue_user_metadata(
+            &mut track.extra,
+            "TRACKNUMBER",
+            &["A1".to_string()],
+        );
+        insert_source_text_tag(&mut track.extra, "TRACKNUMBER", "A1");
+        assert_eq!(source_side_prefixed_track_number(&track), Some(("A1", 1)));
+        insert_cue_user_metadata(
+            &mut track.extra,
+            "PERFORMER",
+            &["Alice".to_string(), "Bob".to_string()],
+        );
+        insert_cue_user_metadata(
+            &mut track.extra,
+            "PRODUCER",
+            &["Jane".to_string(), "John".to_string()],
+        );
+        let mut album = AlbumMetadata::default();
+        insert_cue_user_metadata(
+            &mut album.extra,
+            "GENRE",
+            &["Progressive Rock".to_string(), "Art Rock".to_string()],
+        );
+
+        let tags = authoritative_metadata_tags(&track, &album);
+        let values = |key: &str| {
+            tags.iter()
+                .filter(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("TRACKNUMBER"), vec!["A1"]);
+        assert_eq!(values("PERFORMER"), vec!["Alice", "Bob"]);
+        assert_eq!(values("PRODUCER"), vec!["Jane", "John"]);
+        assert_eq!(values("GENRE"), vec!["Progressive Rock", "Art Rock"]);
+        assert!(tags.iter().all(|(key, _)| {
+            !key.contains("TONEPOET_CUE_USER_METADATA")
+                && !key.starts_with(CUE_USER_METADATA_EXTRA_PREFIX)
+        }));
+
+        let (command, _) = metadata_tag_command(
+            Path::new("track.flac"),
+            "flac",
+            &tags,
+            &BTreeSet::new(),
+        )
+        .expect("native FLAC metadata command");
+        assert_eq!(
+            command
+                .args
+                .iter()
+                .filter(|arg| arg.as_str() == "--set-tag=PRODUCER=Jane")
+                .count(),
+            1,
+        );
+        assert_eq!(
+            command
+                .args
+                .iter()
+                .filter(|arg| arg.as_str() == "--set-tag=PRODUCER=John")
+                .count(),
+            1,
         );
     }
 

@@ -2387,6 +2387,9 @@ mod tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: None,
+                    album_user_metadata: Default::default(),
+                    user_metadata: Default::default(),
+                    tonepoet_metadata_present: false,
                     directives: Vec::new(),
                 })
                 .collect(),
@@ -2395,6 +2398,7 @@ mod tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
         state.active_surface_mut().cue_source = Some(MetadataCueSource::Sidecar(cue1));
 

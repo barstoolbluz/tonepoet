@@ -14476,6 +14476,8 @@ mod musicbrainz_completion_dispatch_tests {
                 date: None,
                 genre: None,
                 catalog: None,
+                user_metadata: Default::default(),
+                tonepoet_metadata_present: false,
                 tracks: vec![crate::tui::cue_parser::CueTrack {
                     number: 1,
                     title: Some("Track".to_string()),
@@ -14484,6 +14486,7 @@ mod musicbrainz_completion_dispatch_tests {
                     index01_frames: Some(0),
                     index00_frames: None,
                     isrc: None,
+                    user_metadata: Default::default(),
                     directives: Vec::new(),
                 }],
             },

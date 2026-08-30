@@ -7,9 +7,17 @@
 //! TUI dependencies. Single-image *detection* (which probes audio and
 //! resolves file references) lives in `crate::tui::cue_parser`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use encoding_rs::{BIG5, EUC_JP, GBK, SHIFT_JIS, WINDOWS_1252};
+
+/// Open-ended metadata carried inside a CUE using Tonepoet-owned inert REM
+/// records. Values are ordered because several editor fields are ordered
+/// lists rather than scalars.
+pub type CueUserMetadata = BTreeMap<String, Vec<String>>;
+
+const TONEPOET_METADATA_NAMESPACE: &str = "TONEPOET_META_V1";
 
 /// A parsed CUE sheet.
 #[derive(Debug, Clone, Default)]
@@ -24,6 +32,14 @@ pub struct CueSheet {
     pub genre: Option<String>,
     /// Album catalog identifier from a `CATALOG` line.
     pub catalog: Option<String>,
+    /// Tonepoet-owned album metadata that standard CUE syntax cannot express
+    /// losslessly. When a field also has a standard CUE projection, this is
+    /// the fidelity-preserving authoritative representation for Tonepoet.
+    pub user_metadata: CueUserMetadata,
+    /// Whether the parsed source contained a Tonepoet metadata block. This is
+    /// retained separately from the maps so deleting the last authored field
+    /// can still emit an empty authoritative block and remove stale records.
+    pub tonepoet_metadata_present: bool,
     /// Tracks in order.
     pub tracks: Vec<CueTrack>,
 }
@@ -49,10 +65,319 @@ pub struct CueTrack {
     pub index00_frames: Option<u32>,
     /// CD ISRC code from an `ISRC` line inside the TRACK block.
     pub isrc: Option<String>,
+    /// Tonepoet-owned metadata for this physical track ordinal. The CUE
+    /// `TRACK NN` value remains structural; custom identifiers such as A1/B2
+    /// live here and therefore cannot change CUE geometry.
+    pub user_metadata: CueUserMetadata,
     /// Ordered track-level directives that Tonepoet does not interpret but
     /// must preserve across parse/regenerate cycles. This includes `FLAGS`
     /// (notably `FLAGS PRE`) and track-scoped `REM` lines.
     pub directives: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedTonepoetMetadata {
+    present: bool,
+    album: CueUserMetadata,
+    /// 1-based physical track ordinal -> metadata.
+    tracks: BTreeMap<usize, CueUserMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TonepoetMetadataLine {
+    Begin,
+    End,
+    Album { key: String, value: String },
+    Track {
+        ordinal: usize,
+        key: String,
+        value: String,
+    },
+}
+
+fn tonepoet_metadata_component_requires_quotes(value: &str, key: bool) -> bool {
+    if value.is_empty() || value.starts_with('"') {
+        return true;
+    }
+    if key && value.chars().any(char::is_whitespace) {
+        return true;
+    }
+    if !key
+        && (value
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+            || value
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace))
+    {
+        return true;
+    }
+    value.chars().any(char::is_control)
+}
+
+fn format_tonepoet_metadata_component(value: &str, key: bool) -> String {
+    if !tonepoet_metadata_component_requires_quotes(value, key) {
+        return value.to_string();
+    }
+
+    let mut out = String::with_capacity(value.len().saturating_add(2));
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{{{:X}}}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn parse_tonepoet_metadata_quoted_component(input: &str) -> Option<(String, &str)> {
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '"' {
+        return None;
+    }
+
+    let mut out = String::new();
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '"' => return Some((out, &input[offset + ch.len_utf8()..])),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                match escaped {
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let (_, open) = chars.next()?;
+                        if open != '{' {
+                            return None;
+                        }
+                        let mut hex = String::new();
+                        let mut closed = false;
+                        for (_, digit) in chars.by_ref() {
+                            if digit == '}' {
+                                closed = true;
+                                break;
+                            }
+                            if !digit.is_ascii_hexdigit() || hex.len() >= 6 {
+                                return None;
+                            }
+                            hex.push(digit);
+                        }
+                        if !closed || hex.is_empty() {
+                            return None;
+                        }
+                        let scalar = u32::from_str_radix(&hex, 16).ok()?;
+                        out.push(char::from_u32(scalar)?);
+                    }
+                    _ => return None,
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    None
+}
+
+fn tonepoet_metadata_payload(line: &str) -> Option<&str> {
+    let rem = strip_keyword_ci(line.trim_start(), "REM")?.trim_start();
+    let payload = strip_keyword_ci(rem, TONEPOET_METADATA_NAMESPACE)?;
+    Some(payload.trim_start())
+}
+
+fn is_tonepoet_metadata_namespace_line(line: &str) -> bool {
+    tonepoet_metadata_payload(line).is_some()
+}
+
+fn take_tonepoet_metadata_token(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    (end > 0).then(|| (&input[..end], &input[end..]))
+}
+
+fn take_tonepoet_metadata_component(input: &str, key: bool) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if input.starts_with('"') {
+        return parse_tonepoet_metadata_quoted_component(input);
+    }
+    if key {
+        let (token, rest) = take_tonepoet_metadata_token(input)?;
+        return Some((token.to_string(), rest));
+    }
+    Some((input.to_string(), ""))
+}
+
+fn parse_tonepoet_metadata_record_component(input: &str, key: bool) -> Option<(String, &str)> {
+    let (value, rest) = take_tonepoet_metadata_component(input, key)?;
+    if key && value.trim().is_empty() {
+        return None;
+    }
+    Some((value, rest))
+}
+
+fn parse_tonepoet_metadata_value(input: &str) -> Option<String> {
+    let first = input.chars().next()?;
+    if !first.is_whitespace() {
+        return None;
+    }
+    let input = &input[first.len_utf8()..];
+    let input = input.trim_start_matches([' ', '\t']);
+    if input.starts_with('"') {
+        let (value, rest) = parse_tonepoet_metadata_quoted_component(input)?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        Some(value)
+    } else {
+        Some(input.to_string())
+    }
+}
+
+fn parse_tonepoet_metadata_line(line: &str) -> Option<TonepoetMetadataLine> {
+    let payload = tonepoet_metadata_payload(line)?;
+    if payload.trim().eq_ignore_ascii_case("BEGIN") {
+        return Some(TonepoetMetadataLine::Begin);
+    }
+    if payload.trim().eq_ignore_ascii_case("END") {
+        return Some(TonepoetMetadataLine::End);
+    }
+
+    let (scope, rest) = take_tonepoet_metadata_token(payload)?;
+    if scope.eq_ignore_ascii_case("A") {
+        let (key, rest) = parse_tonepoet_metadata_record_component(rest, true)?;
+        let value = parse_tonepoet_metadata_value(rest)?;
+        return Some(TonepoetMetadataLine::Album { key, value });
+    }
+    if scope.eq_ignore_ascii_case("T") {
+        let (ordinal, rest) = take_tonepoet_metadata_token(rest)?;
+        let ordinal = ordinal.parse::<usize>().ok()?;
+        if ordinal == 0 {
+            return None;
+        }
+        let (key, rest) = parse_tonepoet_metadata_record_component(rest, true)?;
+        let value = parse_tonepoet_metadata_value(rest)?;
+        return Some(TonepoetMetadataLine::Track {
+            ordinal,
+            key,
+            value,
+        });
+    }
+    None
+}
+
+fn parse_tonepoet_metadata(content: &str) -> ParsedTonepoetMetadata {
+    let mut parsed = ParsedTonepoetMetadata::default();
+    let mut in_block = false;
+
+    for line in content.lines() {
+        match parse_tonepoet_metadata_line(line) {
+            Some(TonepoetMetadataLine::Begin) => {
+                parsed.present = true;
+                in_block = true;
+            }
+            Some(TonepoetMetadataLine::End) => {
+                if in_block {
+                    in_block = false;
+                }
+            }
+            Some(TonepoetMetadataLine::Album { key, value }) if in_block => {
+                cue_user_metadata_push(&mut parsed.album, key, value);
+            }
+            Some(TonepoetMetadataLine::Track {
+                ordinal,
+                key,
+                value,
+            }) if in_block => {
+                cue_user_metadata_push(
+                    parsed.tracks.entry(ordinal).or_default(),
+                    key,
+                    value,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    parsed
+}
+
+pub(crate) fn cue_user_metadata_values<'a>(
+    metadata: &'a CueUserMetadata,
+    key: &str,
+) -> Option<&'a [String]> {
+    metadata
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, values)| values.as_slice())
+}
+
+fn cue_user_metadata_first(metadata: &CueUserMetadata, key: &str) -> Option<String> {
+    cue_user_metadata_values(metadata, key)
+        .and_then(|values| values.first())
+        .cloned()
+}
+
+fn cue_user_metadata_push(metadata: &mut CueUserMetadata, key: String, value: String) {
+    let canonical_spelling = metadata
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(&key))
+        .cloned()
+        .unwrap_or(key);
+    metadata.entry(canonical_spelling).or_default().push(value);
+}
+
+/// Render the complete Tonepoet metadata block. Ordinary keys and values are
+/// literal. Only components that need an escape convention use a familiar
+/// C-style quoted form, keeping the on-disk block readable without sacrificing
+/// round-trip fidelity.
+pub(crate) fn format_tonepoet_metadata_block(
+    album: &CueUserMetadata,
+    tracks: &[CueUserMetadata],
+) -> Vec<String> {
+    let mut lines = vec![format!("REM {TONEPOET_METADATA_NAMESPACE} BEGIN")];
+    for (key, values) in album {
+        if key.trim().is_empty() {
+            continue;
+        }
+        let rendered_key = format_tonepoet_metadata_component(key, true);
+        for value in values {
+            lines.push(format!(
+                "REM {TONEPOET_METADATA_NAMESPACE} A {rendered_key} {}",
+                format_tonepoet_metadata_component(value, false)
+            ));
+        }
+    }
+    for (index, metadata) in tracks.iter().enumerate() {
+        for (key, values) in metadata {
+            if key.trim().is_empty() {
+                continue;
+            }
+            let rendered_key = format_tonepoet_metadata_component(key, true);
+            for value in values {
+                lines.push(format!(
+                    "REM {TONEPOET_METADATA_NAMESPACE} T {} {rendered_key} {}",
+                    index + 1,
+                    format_tonepoet_metadata_component(value, false)
+                ));
+            }
+        }
+    }
+    lines.push(format!("REM {TONEPOET_METADATA_NAMESPACE} END"));
+    lines
 }
 
 /// Parse a CUE sheet from a file path.
@@ -1472,6 +1797,7 @@ fn acquire_cue_sidecar_write_claim(
 struct ExplicitCueMetadata {
     album: ExplicitCueScopeMetadata,
     tracks: Vec<ExplicitCueScopeMetadata>,
+    tonepoet_metadata: Option<ParsedTonepoetMetadata>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1558,6 +1884,10 @@ fn validate_replacement_quoted_tail(rest: &str, field: &str, line_number: usize)
 
 fn explicit_cue_metadata(text: &str) -> ExplicitCueMetadata {
     let mut metadata = ExplicitCueMetadata::default();
+    let tonepoet_metadata = parse_tonepoet_metadata(text);
+    if tonepoet_metadata.present {
+        metadata.tonepoet_metadata = Some(tonepoet_metadata);
+    }
     let mut current_track: Option<usize> = None;
     let mut ignored_track_block = false;
 
@@ -1715,6 +2045,115 @@ fn pair_cue_track_metadata<'a>(
     Ok(paired)
 }
 
+fn tonepoet_metadata_owned_line_indices(
+    lines: &[CueTextLine],
+    track_count: usize,
+) -> Result<Vec<usize>, String> {
+    let mut owned = Vec::new();
+    let mut current = Vec::new();
+    let mut in_block = false;
+    let mut block_count = 0usize;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let body = line.body.as_str();
+        if !is_tonepoet_metadata_namespace_line(body) {
+            if in_block {
+                if body.trim().is_empty() {
+                    current.push(idx);
+                    continue;
+                }
+                return Err(format!(
+                    "sidecar CUE has non-Tonepoet content inside a {TONEPOET_METADATA_NAMESPACE} block at line {}; sidecar left unchanged",
+                    idx + 1
+                ));
+            }
+            continue;
+        }
+
+        let parsed = parse_tonepoet_metadata_line(body).ok_or_else(|| {
+            format!(
+                "sidecar CUE has a malformed {TONEPOET_METADATA_NAMESPACE} record at line {}; sidecar left unchanged",
+                idx + 1
+            )
+        })?;
+        match parsed {
+            TonepoetMetadataLine::Begin => {
+                if in_block {
+                    return Err(format!(
+                        "sidecar CUE has a nested {TONEPOET_METADATA_NAMESPACE} block at line {}; sidecar left unchanged",
+                        idx + 1
+                    ));
+                }
+                block_count += 1;
+                if block_count > 1 {
+                    return Err(format!(
+                        "sidecar CUE has multiple {TONEPOET_METADATA_NAMESPACE} blocks; sidecar left unchanged"
+                    ));
+                }
+                in_block = true;
+                current.clear();
+                current.push(idx);
+            }
+            TonepoetMetadataLine::End => {
+                if !in_block {
+                    return Err(format!(
+                        "sidecar CUE has a stray {TONEPOET_METADATA_NAMESPACE} END at line {}; sidecar left unchanged",
+                        idx + 1
+                    ));
+                }
+                current.push(idx);
+                owned.append(&mut current);
+                in_block = false;
+            }
+            TonepoetMetadataLine::Track { ordinal, .. } => {
+                if !in_block {
+                    return Err(format!(
+                        "sidecar CUE has a {TONEPOET_METADATA_NAMESPACE} track record outside its block at line {}; sidecar left unchanged",
+                        idx + 1
+                    ));
+                }
+                if ordinal > track_count {
+                    return Err(format!(
+                        "sidecar CUE {TONEPOET_METADATA_NAMESPACE} track ordinal {ordinal} exceeds its {track_count} audio tracks; sidecar left unchanged"
+                    ));
+                }
+                current.push(idx);
+            }
+            TonepoetMetadataLine::Album { .. } => {
+                if !in_block {
+                    return Err(format!(
+                        "sidecar CUE has a {TONEPOET_METADATA_NAMESPACE} album record outside its block at line {}; sidecar left unchanged",
+                        idx + 1
+                    ));
+                }
+                current.push(idx);
+            }
+        }
+    }
+
+    if in_block {
+        return Err(format!(
+            "sidecar CUE has an unterminated {TONEPOET_METADATA_NAMESPACE} block; sidecar left unchanged"
+        ));
+    }
+    Ok(owned)
+}
+
+fn explicit_tonepoet_metadata_block_lines(
+    metadata: &ParsedTonepoetMetadata,
+    track_count: usize,
+) -> Result<Vec<String>, String> {
+    if let Some(ordinal) = metadata.tracks.keys().copied().find(|ordinal| *ordinal > track_count) {
+        return Err(format!(
+            "replacement CUESHEET {TONEPOET_METADATA_NAMESPACE} track ordinal {ordinal} exceeds its {track_count} audio tracks"
+        ));
+    }
+    let tracks = (1..=track_count)
+        .map(|ordinal| metadata.tracks.get(&ordinal).cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    Ok(format_tonepoet_metadata_block(&metadata.album, &tracks))
+}
+
 fn normalized_authoritative_value(value: Option<&str>) -> Option<&str> {
     value.and_then(|value| (!value.trim().is_empty()).then_some(value))
 }
@@ -1724,6 +2163,20 @@ fn validate_authoritative_cue_projection(
     desired: &ExplicitCueMetadata,
 ) -> Result<(), String> {
     let actual = explicit_cue_metadata(rewritten_text);
+    if let Some(desired_tonepoet) = desired.tonepoet_metadata.as_ref() {
+        let actual_tonepoet = actual.tonepoet_metadata.as_ref().ok_or_else(|| {
+            "sidecar CUE authoritative write verification lost the Tonepoet metadata block; sidecar left unchanged"
+                .to_string()
+        })?;
+        if actual_tonepoet.album != desired_tonepoet.album
+            || actual_tonepoet.tracks != desired_tonepoet.tracks
+        {
+            return Err(
+                "sidecar CUE authoritative write verification failed for Tonepoet metadata; sidecar left unchanged"
+                    .to_string(),
+            );
+        }
+    }
     let album_matches = normalized_authoritative_value(actual.album.title.as_deref())
         == normalized_authoritative_value(desired.album.title.as_deref())
         && normalized_authoritative_value(actual.album.performer.as_deref())
@@ -1805,6 +2258,16 @@ fn rewrite_cue_metadata_text(
     let mut deletions = std::collections::BTreeSet::<usize>::new();
     let mut album_insertions = Vec::<String>::new();
     let mut track_insertions = std::collections::BTreeMap::<usize, Vec<String>>::new();
+
+    if let Some(tonepoet_metadata) = desired.tonepoet_metadata.as_ref() {
+        for idx in tonepoet_metadata_owned_line_indices(&lines, layout.tracks.len())? {
+            deletions.insert(idx);
+        }
+        album_insertions.extend(explicit_tonepoet_metadata_block_lines(
+            tonepoet_metadata,
+            desired.tracks.len(),
+        )?);
+    }
 
     queue_scope_metadata_edits(
         &lines,
@@ -1963,6 +2426,21 @@ fn rewrite_cue_metadata_preserving_bytes(
     let mut album_insertions = Vec::<Vec<u8>>::new();
     let mut track_insertions = std::collections::BTreeMap::<usize, Vec<Vec<u8>>>::new();
     let mut need_utf8_fallback = false;
+
+    if let Some(tonepoet_metadata) = desired.tonepoet_metadata.as_ref() {
+        for idx in tonepoet_metadata_owned_line_indices(&text_lines, layout.tracks.len())? {
+            deletions.insert(idx);
+        }
+        for line in
+            explicit_tonepoet_metadata_block_lines(tonepoet_metadata, desired.tracks.len())?
+        {
+            let Some(encoded) = encode_text_for_source_line(&line, decoded.encoding) else {
+                need_utf8_fallback = true;
+                break;
+            };
+            album_insertions.push(encoded);
+        }
+    }
 
     queue_scope_metadata_byte_edits(
         &raw_lines,
@@ -3468,6 +3946,7 @@ pub fn find_sidecar_cue(audio_path: &Path) -> Option<PathBuf> {
 /// Parse CUE sheet content from a string.
 pub fn parse_cue(content: &str) -> CueSheet {
     let mut sheet = CueSheet::default();
+    let tonepoet_metadata = parse_tonepoet_metadata(content);
 
     // State: are we inside a TRACK block?
     let mut current_track: Option<CueTrack> = None;
@@ -3602,6 +4081,9 @@ pub fn parse_cue(content: &str) -> CueSheet {
             // Preserve semantically significant or unknown track-level
             // directives that the structured model does not otherwise own.
             // Keep their relative order and normalized source spelling.
+            if is_tonepoet_metadata_namespace_line(trimmed) {
+                continue;
+            }
             if strip_keyword_ci(trimmed, "FLAGS").is_some()
                 || strip_keyword_ci(trimmed, "REM").is_some()
             {
@@ -3616,6 +4098,46 @@ pub fn parse_cue(content: &str) -> CueSheet {
     // Commit the last track.
     if let Some(track) = current_track {
         sheet.tracks.push(track);
+    }
+
+    // The inert Tonepoet block is a lossless fidelity overlay. Standard CUE
+    // directives remain as a compatibility projection for other tools; when
+    // both exist, Tonepoet's explicit overlay wins for the fields it owns.
+    sheet.tonepoet_metadata_present = tonepoet_metadata.present;
+    sheet.user_metadata = tonepoet_metadata.album;
+    for (ordinal, metadata) in tonepoet_metadata.tracks {
+        if let Some(track) = ordinal
+            .checked_sub(1)
+            .and_then(|index| sheet.tracks.get_mut(index))
+        {
+            track.user_metadata = metadata;
+        }
+    }
+    if let Some(value) = cue_user_metadata_first(&sheet.user_metadata, "ALBUM") {
+        sheet.title = Some(value);
+    }
+    if let Some(value) = cue_user_metadata_first(&sheet.user_metadata, "ALBUMARTIST") {
+        sheet.performer = Some(value);
+    }
+    if let Some(value) = cue_user_metadata_first(&sheet.user_metadata, "DATE") {
+        sheet.date = Some(value);
+    }
+    if let Some(value) = cue_user_metadata_first(&sheet.user_metadata, "GENRE") {
+        sheet.genre = Some(value);
+    }
+    if let Some(value) = cue_user_metadata_first(&sheet.user_metadata, "CATALOGNUMBER") {
+        sheet.catalog = Some(value);
+    }
+    for track in &mut sheet.tracks {
+        if let Some(value) = cue_user_metadata_first(&track.user_metadata, "TITLE") {
+            track.title = Some(value);
+        }
+        if let Some(value) = cue_user_metadata_first(&track.user_metadata, "ARTIST") {
+            track.performer = Some(value);
+        }
+        if let Some(value) = cue_user_metadata_first(&track.user_metadata, "ISRC") {
+            track.isrc = Some(value);
+        }
     }
 
     // For tracks without an explicit performer, inherit album performer.
@@ -4697,6 +5219,125 @@ FILE \"generated.flac\" FLAC\n\
     }
 
     #[test]
+    fn tonepoet_metadata_writeback_uses_legacy_encoding_when_readable_text_is_representable() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("tonepoet_metadata_sjis_representable");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "TITLE \"日本\"\n",
+            "FILE \"image.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"日本一\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let (encoded, _encoding, had_errors) = SHIFT_JIS.encode(original);
+        assert!(!had_errors);
+        std::fs::write(&cue_path, encoded.as_ref()).expect("write Shift-JIS cue");
+        std::fs::write(dir.join("image.wav"), b"").expect("write referenced image fixture");
+
+        let mut album_metadata = CueUserMetadata::new();
+        album_metadata.insert("PRODUCER".to_string(), vec!["東京".to_string()]);
+        let block = format_tonepoet_metadata_block(&album_metadata, &[CueUserMetadata::new()])
+            .join("\n");
+        let replacement = format!(
+            concat!(
+                "{block}\n",
+                "TITLE \"日本\"\n",
+                "FILE \"image.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    TITLE \"日本一\"\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+            block = block,
+        );
+
+        let outcome = rewrite_cue_sidecar_metadata_from_cuesheet(&cue_path, &replacement)
+            .expect("write readable Tonepoet metadata in Shift-JIS");
+        assert_eq!(
+            outcome,
+            CueSidecarWritebackOutcome::Rewritten {
+                encoding: "CP932/Shift-JIS".to_string(),
+            }
+        );
+
+        let raw = std::fs::read(&cue_path).expect("read rewritten Shift-JIS cue");
+        assert!(std::str::from_utf8(&raw).is_err(), "source encoding should be retained");
+        let expected_line = "REM TONEPOET_META_V1 A PRODUCER 東京";
+        let (encoded_line, _encoding, had_errors) = SHIFT_JIS.encode(expected_line);
+        assert!(!had_errors);
+        assert!(
+            raw.windows(encoded_line.len())
+                .any(|window| window == encoded_line.as_ref()),
+            "readable inert line must be encoded coherently with the source CUE"
+        );
+        let decoded = decode_cue_bytes_for_path(&raw, &cue_path).expect("decode rewritten cue");
+        let reparsed = parse_cue(&decoded);
+        assert_eq!(
+            cue_user_metadata_values(&reparsed.user_metadata, "PRODUCER"),
+            Some(&["東京".to_string()][..])
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tonepoet_metadata_writeback_falls_back_whole_cue_to_utf8_when_needed() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("tonepoet_metadata_sjis_utf8_fallback");
+        let cue_path = dir.join("album.cue");
+        let original = concat!(
+            "TITLE \"日本\"\n",
+            "FILE \"image.wav\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"日本一\"\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let (encoded, _encoding, had_errors) = SHIFT_JIS.encode(original);
+        assert!(!had_errors);
+        std::fs::write(&cue_path, encoded.as_ref()).expect("write Shift-JIS cue");
+        std::fs::write(dir.join("image.wav"), b"").expect("write referenced image fixture");
+
+        let custom_value = "Björk – 東京";
+        let (_encoded_custom, _encoding, had_errors) = SHIFT_JIS.encode(custom_value);
+        assert!(had_errors, "fixture must require UTF-8 fallback");
+        let mut album_metadata = CueUserMetadata::new();
+        album_metadata.insert("PRODUCER".to_string(), vec![custom_value.to_string()]);
+        let block = format_tonepoet_metadata_block(&album_metadata, &[CueUserMetadata::new()])
+            .join("\n");
+        let replacement = format!(
+            concat!(
+                "{block}\n",
+                "TITLE \"日本\"\n",
+                "FILE \"image.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    TITLE \"日本一\"\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+            block = block,
+        );
+
+        let outcome = rewrite_cue_sidecar_metadata_from_cuesheet(&cue_path, &replacement)
+            .expect("write readable Tonepoet metadata with coherent UTF-8 fallback");
+        assert_eq!(
+            outcome,
+            CueSidecarWritebackOutcome::RewrittenUtf8Fallback {
+                source_encoding: "CP932/Shift-JIS".to_string(),
+            }
+        );
+
+        let raw = std::fs::read(&cue_path).expect("read UTF-8 fallback cue");
+        let decoded = std::str::from_utf8(&raw).expect("entire fallback output must be UTF-8");
+        assert!(decoded.contains("REM TONEPOET_META_V1 A PRODUCER Björk – 東京"));
+        let reparsed = parse_cue(decoded);
+        assert_eq!(
+            cue_user_metadata_values(&reparsed.user_metadata, "PRODUCER"),
+            Some(&[custom_value.to_string()][..])
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sidecar_writeback_falls_back_to_utf8_when_legacy_encoding_cannot_represent_text() {
         let _coordination = crate::concurrency::scoped_test_coordination_root();
         let dir = unique_cue_parser_test_dir("sidecar_writeback_utf8_fallback");
@@ -5202,6 +5843,176 @@ FILE "current.wav" WAVE
         assert!(composed.contains(
             "TRACK 01 AUDIO\n    TITLE \"New One\"\n    INDEX 01 03:00:00"
         ));
+    }
+
+    #[test]
+    fn tonepoet_inert_metadata_round_trips_arbitrary_lists_and_custom_track_ids() {
+        let mut album = CueUserMetadata::new();
+        album.insert(
+            "PRODUCER".to_string(),
+            vec!["Jane \"Q\" Producer\nSecond line".to_string()],
+        );
+        album.insert(
+            "GENRE".to_string(),
+            vec!["Progressive Rock".to_string(), "Art Rock".to_string()],
+        );
+        let mut first = CueUserMetadata::new();
+        first.insert("TRACKNUMBER".to_string(), vec!["A1".to_string()]);
+        first.insert(
+            "PERFORMER".to_string(),
+            vec!["Alice".to_string(), "Bob".to_string()],
+        );
+        let mut second = CueUserMetadata::new();
+        second.insert("TRACKNUMBER".to_string(), vec!["B1".to_string()]);
+        second.insert("MATRIX".to_string(), vec!["ABC-123-X".to_string()]);
+        let block = format_tonepoet_metadata_block(&album, &[first, second]).join("\n");
+        let text = format!(
+            "TITLE \"Compatibility Title\"\nREM GENRE \"Compatibility Genre\"\n{block}\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 03:00:00\n"
+        );
+
+        let parsed = parse_cue(&text);
+        assert_eq!(
+            cue_user_metadata_values(&parsed.user_metadata, "PRODUCER").unwrap(),
+            &["Jane \"Q\" Producer\nSecond line".to_string()]
+        );
+        assert_eq!(
+            cue_user_metadata_values(&parsed.user_metadata, "GENRE").unwrap(),
+            &["Progressive Rock".to_string(), "Art Rock".to_string()]
+        );
+        assert_eq!(parsed.genre.as_deref(), Some("Progressive Rock"));
+        assert_eq!(parsed.tracks[0].number, 1, "custom id must not alter CUE geometry");
+        assert_eq!(
+            cue_user_metadata_values(&parsed.tracks[0].user_metadata, "TRACKNUMBER")
+                .unwrap(),
+            &["A1".to_string()]
+        );
+        assert_eq!(
+            cue_user_metadata_values(&parsed.tracks[0].user_metadata, "PERFORMER").unwrap(),
+            &["Alice".to_string(), "Bob".to_string()]
+        );
+        assert_eq!(
+            cue_user_metadata_values(&parsed.tracks[1].user_metadata, "MATRIX").unwrap(),
+            &["ABC-123-X".to_string()]
+        );
+    }
+
+    #[test]
+    fn tonepoet_inert_metadata_is_literal_by_default_and_escapes_only_edge_cases() {
+        let mut album = CueUserMetadata::new();
+        album.insert("DISCNUMBER".to_string(), vec!["1".to_string()]);
+        album.insert("PRODUCER".to_string(), vec!["Jimmy Page".to_string()]);
+        album.insert(
+            "GENRE".to_string(),
+            vec!["Rock; Blues; 70s".to_string()],
+        );
+        album.insert("LEADING_QUOTE".to_string(), vec!["\"quoted\"".to_string()]);
+        album.insert("EDGE_SPACE".to_string(), vec![" padded ".to_string()]);
+        album.insert("EMPTY".to_string(), vec![String::new()]);
+        album.insert("MULTILINE".to_string(), vec!["first\nsecond".to_string()]);
+        album.insert("UNICODE".to_string(), vec!["Björk – 東京".to_string()]);
+        album.insert("BACKSLASH".to_string(), vec![r"C:\path\to".to_string()]);
+        album.insert("EMBEDDED_QUOTE".to_string(), vec!["He said \"hi\"".to_string()]);
+        let mut track = CueUserMetadata::new();
+        track.insert("TRACKNUMBER".to_string(), vec!["A1".to_string()]);
+
+        let block = format_tonepoet_metadata_block(&album, &[track.clone()]).join("\n");
+        assert!(block.contains("REM TONEPOET_META_V1 A DISCNUMBER 1"));
+        assert!(block.contains("REM TONEPOET_META_V1 A PRODUCER Jimmy Page"));
+        assert!(block.contains("REM TONEPOET_META_V1 A GENRE Rock; Blues; 70s"));
+        assert!(block.contains("REM TONEPOET_META_V1 A LEADING_QUOTE \"\\\"quoted\\\"\""));
+        assert!(block.contains("REM TONEPOET_META_V1 A EDGE_SPACE \" padded \""));
+        assert!(block.contains("REM TONEPOET_META_V1 A EMPTY \"\""));
+        assert!(block.contains("REM TONEPOET_META_V1 A MULTILINE \"first\\nsecond\""));
+        assert!(block.contains("REM TONEPOET_META_V1 A UNICODE Björk – 東京"));
+        assert!(block.contains(r"REM TONEPOET_META_V1 A BACKSLASH C:\path\to"));
+        assert!(block.contains("REM TONEPOET_META_V1 A EMBEDDED_QUOTE He said \"hi\""));
+        assert!(block.contains("REM TONEPOET_META_V1 T 1 TRACKNUMBER A1"));
+
+        let parsed = parse_tonepoet_metadata(&block);
+        assert!(parsed.present);
+        assert_eq!(parsed.album, album);
+        assert_eq!(parsed.tracks.get(&1), Some(&track));
+    }
+
+    #[test]
+    fn metadata_rewriter_replaces_only_owned_tonepoet_block_and_is_idempotent() {
+        let mut old_album = CueUserMetadata::new();
+        old_album.insert("PRODUCER".to_string(), vec!["Old".to_string()]);
+        let old_block = format_tonepoet_metadata_block(&old_album, &[CueUserMetadata::new()])
+            .join("\r\n");
+        let template = format!(
+            "REM COMMENT keep-me\r\n{old_block}\r\nFILE \"album.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    REM REPLAYGAIN_TRACK_GAIN -1.0 dB\r\n    TITLE \"Old title\"\r\n    INDEX 01 00:00:00\r\n"
+        );
+        let mut new_album = CueUserMetadata::new();
+        new_album.insert(
+            "PRODUCER".to_string(),
+            vec!["New".to_string(), "Second".to_string()],
+        );
+        let mut track = CueUserMetadata::new();
+        track.insert("TRACKNUMBER".to_string(), vec!["A1".to_string()]);
+        let new_block = format_tonepoet_metadata_block(&new_album, &[track]).join("\n");
+        let replacement = format!(
+            "{new_block}\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"New title\"\n    INDEX 01 00:00:00\n"
+        );
+
+        let composed = compose_cue_metadata_replacement(&template, &replacement)
+            .expect("Tonepoet metadata composition");
+        assert!(composed.contains("REM COMMENT keep-me\r\n"));
+        assert!(composed.contains("REM REPLAYGAIN_TRACK_GAIN -1.0 dB\r\n"));
+        assert!(!composed.contains("REM TONEPOET_META_V1 A PRODUCER Old"));
+        assert!(composed.contains("REM TONEPOET_META_V1 A PRODUCER New"));
+        assert_eq!(
+            compose_cue_metadata_replacement(&composed, &replacement)
+                .expect("second composition"),
+            composed
+        );
+    }
+
+    #[test]
+    fn metadata_rewriter_empty_owned_block_deletes_last_tonepoet_record() {
+        let mut old_album = CueUserMetadata::new();
+        old_album.insert("PRODUCER".to_string(), vec!["Old".to_string()]);
+        let old_block = format_tonepoet_metadata_block(&old_album, &[CueUserMetadata::new()])
+            .join("\n");
+        let template = format!(
+            "REM COMMENT keep-me\n{old_block}\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+        );
+        let empty_block =
+            format_tonepoet_metadata_block(&CueUserMetadata::new(), &[CueUserMetadata::new()])
+                .join("\n");
+        let replacement = format!(
+            "{empty_block}\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n"
+        );
+
+        let composed = compose_cue_metadata_replacement(&template, &replacement)
+            .expect("empty owned block should replace the populated block");
+        assert!(composed.contains("REM COMMENT keep-me\n"));
+        assert!(!composed.contains("REM TONEPOET_META_V1 A PRODUCER Old"));
+        let reparsed = parse_cue(&composed);
+        assert!(reparsed.tonepoet_metadata_present);
+        assert!(reparsed.user_metadata.is_empty());
+    }
+
+    #[test]
+    fn metadata_rewriter_fails_closed_on_malformed_tonepoet_block() {
+        let template = concat!(
+            "REM TONEPOET_META_V1 BEGIN\n",
+            "REM TONEPOET_META_V1 T nope invalid invalid\n",
+            "REM TONEPOET_META_V1 END\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let replacement = concat!(
+            "REM TONEPOET_META_V1 BEGIN\n",
+            "REM TONEPOET_META_V1 END\n",
+            "FILE \"album.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n",
+        );
+        let error = compose_cue_metadata_replacement(template, replacement)
+            .expect_err("malformed owned block must not be rewritten");
+        assert!(error.contains("malformed TONEPOET_META_V1 record"));
     }
 
     #[test]

@@ -6714,8 +6714,13 @@ pub struct TagEntry {
 /// the single source of truth for edit guards, save preflight, and completion
 /// accounting so those stages cannot drift.
 pub(crate) fn cue_sidecar_representable_key(display_key: &str) -> bool {
+    !canonical_metadata_display_key(display_key).trim().is_empty()
+}
+
+/// Whether a metadata row is owned by the standard generated CUE projection.
+/// CUESHEET itself is the projection container, not one of its source fields.
+pub(crate) fn cue_sidecar_standard_owned_key(display_key: &str) -> bool {
     [
-        "CUESHEET",
         "TITLE",
         "ARTIST",
         "ISRC",
@@ -6727,13 +6732,6 @@ pub(crate) fn cue_sidecar_representable_key(display_key: &str) -> bool {
     ]
     .iter()
     .any(|key| display_key.eq_ignore_ascii_case(key))
-}
-
-/// Whether a metadata row is owned by the standard generated CUE projection.
-/// CUESHEET itself is the projection container, not one of its source fields.
-pub(crate) fn cue_sidecar_standard_owned_key(display_key: &str) -> bool {
-    !display_key.eq_ignore_ascii_case("CUESHEET")
-        && cue_sidecar_representable_key(display_key)
 }
 
 impl TagEntry {
@@ -31169,10 +31167,13 @@ mod cue_sidecar_contract_tests {
             assert!(cue_sidecar_representable_key(key), "{key}");
         }
         assert!(cue_sidecar_representable_key("album"));
-        assert!(!cue_sidecar_representable_key("PERFORMER"));
-        assert!(!cue_sidecar_representable_key("COMMENT"));
+        assert!(cue_sidecar_representable_key("PERFORMER"));
+        assert!(cue_sidecar_representable_key("COMMENT"));
+        assert!(cue_sidecar_representable_key("MATRIX"));
+        assert!(!cue_sidecar_representable_key("   "));
         assert!(!cue_sidecar_standard_owned_key("CUESHEET"));
         assert!(cue_sidecar_standard_owned_key("ALBUM"));
+        assert!(!cue_sidecar_standard_owned_key("MATRIX"));
     }
 }
 

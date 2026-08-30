@@ -149,6 +149,7 @@ pub enum TuiButton {
     // Overlay buttons
     OverlayConfirm,
     OverlayCancel,
+    CueMetadataConsentRemember,
     /// Active single-line input in FileInput, CommandInput, or TextEdit.
     OverlayTextInput,
 
@@ -424,6 +425,7 @@ impl TuiButton {
             | Self::FileTaskMessages
             | Self::OverlayConfirm
             | Self::OverlayCancel
+            | Self::CueMetadataConsentRemember
             | Self::OverlayTextInput
             | Self::MetadataEditorInput
             | Self::MetadataEditorTitle

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::{PcmBitDepth, PipelineSettings};
 
@@ -1960,6 +1961,50 @@ pub fn fallback_source_tag_value<'a>(
 /// lowercased key remains alongside this marker for templates, and writers
 /// additionally require the paired plain key to carry the same value.
 pub const SOURCE_TEXT_TAG_EXTRA_PREFIX: &str = "\0tonepoet_source_text_tag:";
+
+/// Reserved extra namespace for exact user-authored metadata recovered from a
+/// Tonepoet CUE REM block. The key suffix is base64url UTF-8 and the value is a
+/// JSON array so ordered repeated values survive the scalar `extra` transport.
+/// This namespace is internal and must never be emitted verbatim.
+pub const CUE_USER_METADATA_EXTRA_PREFIX: &str = "\0tonepoet_cue_user_metadata:";
+
+pub fn insert_cue_user_metadata(
+    extra: &mut BTreeMap<String, String>,
+    key: &str,
+    values: &[String],
+) {
+    if key.trim().is_empty() || values.is_empty() {
+        return;
+    }
+    let encoded_key = URL_SAFE_NO_PAD.encode(key.as_bytes());
+    if let Ok(encoded_values) = serde_json::to_string(values) {
+        extra.insert(
+            format!("{CUE_USER_METADATA_EXTRA_PREFIX}{encoded_key}"),
+            encoded_values,
+        );
+    }
+}
+
+#[must_use]
+pub fn cue_user_metadata_from_extra(
+    extra: &BTreeMap<String, String>,
+) -> Vec<(String, Vec<String>)> {
+    extra
+        .iter()
+        .filter_map(|(marker, encoded_values)| {
+            let encoded_key = marker.strip_prefix(CUE_USER_METADATA_EXTRA_PREFIX)?;
+            let key = URL_SAFE_NO_PAD
+                .decode(encoded_key.as_bytes())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())?;
+            if key.trim().is_empty() {
+                return None;
+            }
+            let values = serde_json::from_str::<Vec<String>>(encoded_values).ok()?;
+            (!values.is_empty()).then_some((key, values))
+        })
+        .collect()
+}
 
 pub fn insert_source_text_tag(
     extra: &mut BTreeMap<String, String>,

@@ -1526,28 +1526,76 @@ fn draw_confirmation(
     let area = f.size();
     let hints = super::app::confirmation_footer_hints(action);
     let footer_w = confirmation_footer_hints_width(hints);
-    let popup_w = 50u16
+    let cue_consent = matches!(
+        action,
+        super::app::ConfirmAction::CueTonepoetMetadataConsent { .. }
+    );
+    let popup_w = (if cue_consent { 66u16 } else { 50u16 })
         .max(footer_w.saturating_add(4))
         .min(area.width.saturating_sub(2).max(1));
-    let popup = centered_rect(popup_w, 9, area);
+    let popup_h = if cue_consent { 14u16 } else { 9u16 };
+    let popup = centered_rect(
+        popup_w,
+        popup_h.min(area.height.saturating_sub(2).max(1)),
+        area,
+    );
 
     f.render_widget(Clear, popup);
-    let block = super::draw::solid_title_block(popup, " Confirm ", theme.amber, theme);
+    let title = if cue_consent {
+        " Tonepoet CUE metadata "
+    } else {
+        " Confirm "
+    };
+    let block = super::draw::solid_title_block(popup, title, theme.amber, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // message
-            Constraint::Length(1), // buttons
-        ])
-        .split(inner);
+    let chunks = if cue_consent {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner)
+    };
 
     let msg = Paragraph::new(message.to_string())
         .wrap(Wrap { trim: true })
         .alignment(Alignment::Center);
     f.render_widget(msg, chunks[0]);
+
+    let buttons_chunk = if cue_consent {
+        let remember = matches!(
+            action,
+            super::app::ConfirmAction::CueTonepoetMetadataConsent {
+                remember_choice: true,
+                ..
+            }
+        );
+        let label = if remember {
+            "[x] Remember my choice"
+        } else {
+            "[ ] Remember my choice"
+        };
+        let checkbox = Paragraph::new(label).alignment(Alignment::Center);
+        f.render_widget(checkbox, chunks[1]);
+        let width = (super::display_width::width(label) as u16).min(chunks[1].width);
+        let start_x = chunks[1].x + chunks[1].width.saturating_sub(width) / 2;
+        app.button_map.record_button(
+            TuiButton::CueMetadataConsentRemember,
+            Rect::new(start_x, chunks[1].y, width, 1),
+        );
+        chunks[2]
+    } else {
+        chunks[1]
+    };
 
     // Pill-styled buttons using action-specific labels. Archive recovery has
     // more than a generic Yes/No decision, so the renderer must derive these
@@ -1582,14 +1630,14 @@ fn draw_confirmation(
 
     let line = Line::from(spans);
     let buttons = Paragraph::new(line).alignment(Alignment::Center);
-    f.render_widget(buttons, chunks[1]);
+    f.render_widget(buttons, buttons_chunk);
 
     // Record button areas matching the centered layout. Only the semantic
     // confirm action and the mouse-accessible cancel/discard action are
     // clickable because the existing button map has exactly those two overlay
     // actions; every footer hint remains keyboard-accessible.
-    let btn_y = chunks[1].y;
-    let start_x = chunks[1].x + chunks[1].width.saturating_sub(total_w) / 2;
+    let btn_y = buttons_chunk.y;
+    let start_x = buttons_chunk.x + buttons_chunk.width.saturating_sub(total_w) / 2;
     if let Some((offset, width)) = confirm_rect {
         app.button_map.record_button(
             TuiButton::OverlayConfirm,
@@ -8863,6 +8911,62 @@ mod tests {
     }
 
     #[test]
+    fn cue_metadata_consent_dialog_fits_and_exposes_all_controls_at_ordinary_size() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let mut app = super::super::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default(),
+        );
+        let action = super::super::app::ConfirmAction::CueTonepoetMetadataConsent {
+            resume: super::super::app::CueTonepoetMetadataConsentResume::Save,
+            edits: Vec::new(),
+            remember_choice: false,
+        };
+        let message = concat!(
+            "These edits need Tonepoet-only CUE metadata: PRODUCER, DISCNUMBER. ",
+            "Other CUE software will not read these values. ",
+            "Choose No to copy these edits to the clipboard and revert them; ",
+            "other saveable edits are kept."
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_confirmation(frame, message, &action, &mut app, theme))
+            .expect("draw CUE metadata consent");
+
+        let rendered = (0..24).fold(String::new(), |mut text, y| {
+            for x in 0..80 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push('\n');
+            text
+        });
+        for expected in [
+            "Tonepoet CUE metadata",
+            "Tonepoet-only CUE metadata",
+            "Other CUE software",
+            "Remember my choice",
+            "Y yes",
+            "N no",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "ordinary terminal must render {expected:?} without clipping: {rendered}",
+            );
+        }
+
+        let remember_hit = (0..24).any(|y| {
+            (0..80).any(|x| {
+                app.button_map.find_button_at(x, y)
+                    == Some(super::super::button_map::TuiButton::CueMetadataConsentRemember)
+            })
+        });
+        assert!(remember_hit, "remember-choice checkbox must be mouse-accessible");
+    }
+
+    #[test]
     fn metadata_autonumber_border_tracks_owner_dirty_state() {
         let theme = crate::tui::theme::theme_by_slug_or_default(
             crate::tui::theme::default_theme_slug(),
@@ -9123,6 +9227,9 @@ mod tests {
                     index00_frames: None,
                     index01_frames: Some(0),
                     isrc: None,
+                    album_user_metadata: Default::default(),
+                    user_metadata: Default::default(),
+                    tonepoet_metadata_present: false,
                     directives: Vec::new(),
                 }],
                 album_title: None,
@@ -9130,6 +9237,7 @@ mod tests {
                 album_date: None,
                 album_genre: None,
                 album_catalog: None,
+                user_metadata: Default::default(),
             });
         }
         state
@@ -9258,6 +9366,9 @@ mod tests {
                 index00_frames: None,
                 index01_frames: Some(0),
                 isrc: None,
+                album_user_metadata: Default::default(),
+                user_metadata: Default::default(),
+                tonepoet_metadata_present: false,
                 directives: Vec::new(),
             }],
             album_title: None,
@@ -9265,6 +9376,7 @@ mod tests {
             album_date: None,
             album_genre: None,
             album_catalog: None,
+            user_metadata: Default::default(),
         });
 
         assert_eq!(metadata_editor_detail_slot_block_reason(&state, 0, 1), None);

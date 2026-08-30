@@ -14389,6 +14389,8 @@ mod tests {
 
     fn transfer_test_sheet(track_count: usize) -> crate::convert::cue_parser::CueSheet {
         crate::convert::cue_parser::CueSheet {
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
             tracks: (0..track_count)
                 .map(|index| crate::convert::cue_parser::CueTrack {
                     number: (index + 1) as u32,

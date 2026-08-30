@@ -224,21 +224,58 @@ pub fn regenerate_cue_with_overrides(
 ) -> String {
     let mut cue = String::new();
 
-    // Album-level header — preserve what the parsed sheet had.
-    if let Some(genre) = parsed.genre.as_deref().filter(|s| !s.is_empty()) {
-        cue.push_str(&format!("REM GENRE \"{}\"\n", escape(genre)));
+    // Album-level header. Preserve the pre-feature generator behavior unless
+    // the exact value is owned by Tonepoet's inert metadata block. In that
+    // case the standard directive is compatibility-only and may be omitted
+    // when CUE syntax cannot represent it losslessly. This keeps embedded-CUE
+    // regeneration (out of scope for inert metadata) behavior unchanged.
+    if let Some(genre) = compatibility_rem_value(
+        parsed.genre.as_deref(),
+        cue_user_metadata_owns_any(&parsed.user_metadata, &["GENRE"]),
+    ) {
+        cue.push_str(&format!("REM GENRE {genre}\n"));
     }
-    if let Some(date) = parsed.date.as_deref().filter(|s| !s.is_empty()) {
-        cue.push_str(&format!("REM DATE \"{}\"\n", escape(date)));
+    if let Some(date) = compatibility_rem_value(
+        parsed.date.as_deref(),
+        cue_user_metadata_owns_any(&parsed.user_metadata, &["DATE"]),
+    ) {
+        cue.push_str(&format!("REM DATE {date}\n"));
     }
-    if let Some(catalog) = parsed.catalog.as_deref().filter(|s| !s.is_empty()) {
-        cue.push_str(&format!("CATALOG {}\n", escape(catalog)));
+    if let Some(catalog) = compatibility_token_value(
+        parsed.catalog.as_deref(),
+        cue_user_metadata_owns_any(&parsed.user_metadata, &["CATALOGNUMBER"]),
+    ) {
+        cue.push_str(&format!("CATALOG {}\n", catalog));
     }
-    if let Some(title) = parsed.title.as_deref().filter(|s| !s.is_empty()) {
-        cue.push_str(&format!("TITLE \"{}\"\n", escape(title)));
+    if let Some(title) = compatibility_quoted_value(
+        parsed.title.as_deref(),
+        cue_user_metadata_owns_any(&parsed.user_metadata, &["ALBUM"]),
+    ) {
+        cue.push_str(&format!("TITLE \"{}\"\n", title));
     }
-    if let Some(performer) = parsed.performer.as_deref().filter(|s| !s.is_empty()) {
-        cue.push_str(&format!("PERFORMER \"{}\"\n", escape(performer)));
+    if let Some(performer) = compatibility_quoted_value(
+        parsed.performer.as_deref(),
+        cue_user_metadata_owns_any(&parsed.user_metadata, &["ALBUMARTIST", "ARTIST"]),
+    ) {
+        cue.push_str(&format!("PERFORMER \"{}\"\n", performer));
+    }
+
+    let track_user_metadata = parsed
+        .tracks
+        .iter()
+        .map(|track| track.user_metadata.clone())
+        .collect::<Vec<_>>();
+    if parsed.tonepoet_metadata_present
+        || !parsed.user_metadata.is_empty()
+        || track_user_metadata.iter().any(|metadata| !metadata.is_empty())
+    {
+        for line in super::cue_parser::format_tonepoet_metadata_block(
+            &parsed.user_metadata,
+            &track_user_metadata,
+        ) {
+            cue.push_str(&line);
+            cue.push('\n');
+        }
     }
 
     cue.push_str(&format!(
@@ -255,24 +292,33 @@ pub fn regenerate_cue_with_overrides(
             .and_then(|o| o.title.as_deref())
             .or(track.title.as_deref())
             .filter(|s| !s.is_empty());
-        if let Some(t) = title {
-            cue.push_str(&format!("    TITLE \"{}\"\n", escape(t)));
+        if let Some(t) = compatibility_quoted_value(
+            title,
+            cue_user_metadata_owns_any(&track.user_metadata, &["TITLE"]),
+        ) {
+            cue.push_str(&format!("    TITLE \"{}\"\n", t));
         }
         let performer = track_overrides
             .get(i)
             .and_then(|o| o.performer.as_deref())
             .or(track.performer.as_deref())
             .filter(|s| !s.is_empty());
-        if let Some(p) = performer {
-            cue.push_str(&format!("    PERFORMER \"{}\"\n", escape(p)));
+        if let Some(p) = compatibility_quoted_value(
+            performer,
+            cue_user_metadata_owns_any(&track.user_metadata, &["ARTIST"]),
+        ) {
+            cue.push_str(&format!("    PERFORMER \"{}\"\n", p));
         }
         let isrc = track_overrides
             .get(i)
             .and_then(|o| o.isrc.as_deref())
             .or(track.isrc.as_deref())
             .filter(|s| !s.is_empty());
-        if let Some(c) = isrc {
-            cue.push_str(&format!("    ISRC {}\n", escape(c)));
+        if let Some(c) = compatibility_token_value(
+            isrc,
+            cue_user_metadata_owns_any(&track.user_metadata, &["ISRC"]),
+        ) {
+            cue.push_str(&format!("    ISRC {}\n", c));
         }
         for directive in &track.directives {
             let directive = directive.trim();
@@ -352,6 +398,91 @@ fn write_header(cue: &mut String, album: &CueAlbumInfo) {
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn cue_user_metadata_owns_any(
+    metadata: &super::cue_parser::CueUserMetadata,
+    keys: &[&str],
+) -> bool {
+    keys.iter().any(|key| {
+        super::cue_parser::cue_user_metadata_values(metadata, key).is_some()
+    })
+}
+
+/// Return a value only when it can be represented losslessly in one quoted
+/// standard CUE directive. Richer values are still retained exactly in the
+/// Tonepoet-owned inert metadata block emitted by `regenerate_cue_with_overrides`.
+fn cue_quoted_projection(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && !value.contains('"')
+        && !value.contains('\r')
+        && !value.contains('\n'))
+    .then_some(value)
+}
+
+fn cue_rem_projection(value: &str) -> Option<String> {
+    if value.is_empty() || value.contains('\r') || value.contains('\n') {
+        return None;
+    }
+    if value.contains('"') {
+        (!value.starts_with('"') && value == value.trim()).then(|| value.to_string())
+    } else {
+        Some(format!("\"{value}\""))
+    }
+}
+
+/// Return a value only when it is safe as a single CUE token. Exact values
+/// that need richer syntax remain available through the inert metadata block.
+fn cue_token_projection(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value == value.trim()
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('"'))
+    .then_some(value)
+}
+
+fn compatibility_quoted_value(value: Option<&str>, inert_owned: bool) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty())?;
+    if let Some(projected) = cue_quoted_projection(value) {
+        return Some(projected.to_string());
+    }
+    if inert_owned {
+        None
+    } else {
+        // Preserve the pre-inert fallback only for legacy values that the
+        // standard quoted field cannot represent losslessly. In particular,
+        // a literal backslash is already safe CUE text and must not be doubled.
+        Some(escape(value))
+    }
+}
+
+fn compatibility_rem_value(value: Option<&str>, inert_owned: bool) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty())?;
+    if let Some(projected) = cue_rem_projection(value) {
+        return Some(projected);
+    }
+    if inert_owned {
+        None
+    } else {
+        // Preserve the pre-inert generator fallback for legacy values that
+        // still cannot be represented losslessly. New sidecar edits route
+        // such values through the inert namespace before reaching here.
+        Some(format!("\"{}\"", escape(value)))
+    }
+}
+
+fn compatibility_token_value(value: Option<&str>, inert_owned: bool) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty())?;
+    if let Some(projected) = cue_token_projection(value) {
+        return Some(projected.to_string());
+    }
+    if inert_owned {
+        None
+    } else {
+        // Preserve the legacy fallback for already-existing values outside the
+        // sidecar inert-metadata path; lossless standard tokens stay literal.
+        Some(escape(value))
+    }
 }
 
 /// Emit an `ISRC <code>` line under a TRACK block when the tag holds a
@@ -1289,6 +1420,8 @@ mod tests {
             date: Some("1977".into()),
             genre: None,
             catalog: None,
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
             tracks: vec![
                 CueTrack {
                     number: 1,
@@ -1298,6 +1431,7 @@ mod tests {
                     index01_frames: Some(0),
                     index00_frames: None,
                     isrc: Some("USRC0000001".into()),
+                    user_metadata: Default::default(),
                     directives: Vec::new(),
                 },
                 CueTrack {
@@ -1308,6 +1442,7 @@ mod tests {
                     index01_frames: Some(18000), // 4:00:00
                     index00_frames: Some(17925), // 3:59:00 (75-frame pregap)
                     isrc: None,
+                    user_metadata: Default::default(),
                     directives: Vec::new(),
                 },
             ],
@@ -1385,6 +1520,185 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_uses_lossless_standard_rem_form_for_embedded_quotes() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+
+        let original = "He said \"hi\"";
+        let parsed = CueSheet {
+            title: None,
+            performer: None,
+            date: None,
+            genre: Some(original.to_string()),
+            catalog: None,
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
+            tracks: vec![CueTrack {
+                number: 1,
+                title: None,
+                performer: None,
+                file: Some("image.flac".into()),
+                index01_frames: Some(0),
+                index00_frames: None,
+                isrc: None,
+                user_metadata: Default::default(),
+                directives: Vec::new(),
+            }],
+        };
+        let regenerated = regenerate_cue_with_overrides(
+            &parsed,
+            &[TrackOverride {
+                title: None,
+                performer: None,
+                isrc: None,
+            }],
+            "image.flac",
+            "FLAC",
+        );
+        assert!(regenerated.contains("REM GENRE He said \"hi\""));
+        let reparsed = super::super::cue_parser::parse_cue(&regenerated);
+        assert_eq!(reparsed.genre.as_deref(), Some(original));
+    }
+
+    #[test]
+    fn regenerate_keeps_lossless_standard_backslashes_literal() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+
+        let parsed = CueSheet {
+            title: Some(r"C:\Album".to_string()),
+            performer: None,
+            date: None,
+            genre: None,
+            catalog: Some(r"CAT\01".to_string()),
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
+            tracks: vec![CueTrack {
+                number: 1,
+                title: Some(r"C:\Track".to_string()),
+                performer: None,
+                file: Some("image.flac".into()),
+                index01_frames: Some(0),
+                index00_frames: None,
+                isrc: Some(r"ISRC\01".to_string()),
+                user_metadata: Default::default(),
+                directives: Vec::new(),
+            }],
+        };
+        let regenerated = regenerate_cue_with_overrides(
+            &parsed,
+            &[TrackOverride {
+                title: None,
+                performer: None,
+                isrc: None,
+            }],
+            "image.flac",
+            "FLAC",
+        );
+
+        assert!(regenerated.contains(r#"TITLE "C:\Album""#), "{regenerated}");
+        assert!(regenerated.contains(r"CATALOG CAT\01"), "{regenerated}");
+        assert!(regenerated.contains(r#"    TITLE "C:\Track""#), "{regenerated}");
+        assert!(regenerated.contains(r"    ISRC ISRC\01"), "{regenerated}");
+
+        let reparsed = super::super::cue_parser::parse_cue(&regenerated);
+        assert_eq!(reparsed.title.as_deref(), Some(r"C:\Album"));
+        assert_eq!(reparsed.catalog.as_deref(), Some(r"CAT\01"));
+        assert_eq!(reparsed.tracks[0].title.as_deref(), Some(r"C:\Track"));
+        assert_eq!(reparsed.tracks[0].isrc.as_deref(), Some(r"ISRC\01"));
+    }
+
+    #[test]
+    fn regenerate_preserves_legacy_quoted_projection_without_inert_metadata() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+        let parsed = CueSheet {
+            title: Some("A \"Quoted\" Album".into()),
+            performer: Some("Artist".into()),
+            date: None,
+            genre: None,
+            catalog: None,
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
+            tracks: vec![CueTrack {
+                number: 1,
+                title: Some("A \"Quoted\" Track".into()),
+                performer: None,
+                file: Some("image.flac".into()),
+                index01_frames: Some(0),
+                index00_frames: None,
+                isrc: None,
+                user_metadata: Default::default(),
+                directives: Vec::new(),
+            }],
+        };
+
+        let cue = regenerate_cue_with_overrides(
+            &parsed,
+            &[TrackOverride {
+                title: None,
+                performer: None,
+                isrc: None,
+            }],
+            "image.flac",
+            "FLAC",
+        );
+
+        assert!(cue.contains("TITLE \"A \\\"Quoted\\\" Album\""));
+        assert!(cue.contains("    TITLE \"A \\\"Quoted\\\" Track\""));
+        assert!(!cue.contains("TONEPOET_META_V1"));
+    }
+
+    #[test]
+    fn regenerate_omits_lossy_standard_projection_when_inert_metadata_owns_value() {
+        use super::super::cue_parser::{CueSheet, CueTrack};
+
+        let rich_title = "A \"Quoted\" Album\nDeluxe";
+        let mut parsed = CueSheet {
+            title: Some(rich_title.to_string()),
+            performer: Some("Artist".into()),
+            date: None,
+            genre: None,
+            catalog: None,
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: true,
+            tracks: vec![CueTrack {
+                number: 1,
+                title: Some("Track One".into()),
+                performer: None,
+                file: Some("image.flac".into()),
+                index01_frames: Some(0),
+                index00_frames: None,
+                isrc: None,
+                user_metadata: Default::default(),
+                directives: Vec::new(),
+            }],
+        };
+        parsed
+            .user_metadata
+            .insert("ALBUM".to_string(), vec![rich_title.to_string()]);
+
+        let cue = regenerate_cue_with_overrides(
+            &parsed,
+            &[TrackOverride {
+                title: None,
+                performer: None,
+                isrc: None,
+            }],
+            "image.flac",
+            "FLAC",
+        );
+
+        assert!(cue.contains("REM TONEPOET_META_V1 A "));
+        assert!(!cue.lines().any(|line| line.starts_with("TITLE \"")));
+        let reparsed = super::super::cue_parser::parse_cue(&cue);
+        assert_eq!(reparsed.title.as_deref(), Some(rich_title));
+        let values = super::super::cue_parser::cue_user_metadata_values(
+            &reparsed.user_metadata,
+            "ALBUM",
+        )
+        .expect("ALBUM inert metadata should survive regeneration");
+        assert_eq!(values, &[rich_title.to_string()]);
+    }
+
+    #[test]
     fn regenerate_with_no_overrides_preserves_parsed_track_titles() {
         use super::super::cue_parser::{CueSheet, CueTrack};
         let parsed = CueSheet {
@@ -1393,6 +1707,8 @@ mod tests {
             date: None,
             genre: None,
             catalog: None,
+            user_metadata: Default::default(),
+            tonepoet_metadata_present: false,
             tracks: vec![CueTrack {
                 number: 1,
                 title: Some("Original Title".into()),
@@ -1401,6 +1717,7 @@ mod tests {
                 index01_frames: Some(0),
                 index00_frames: None,
                 isrc: None,
+                user_metadata: Default::default(),
                 directives: Vec::new(),
             }],
         };
