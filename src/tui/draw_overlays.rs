@@ -8923,11 +8923,13 @@ mod tests {
             edits: Vec::new(),
             remember_choice: false,
         };
+        // Mirrors the production copy built in
+        // `keybindings::metadata_editor_tonepoet_metadata_consent_gate`.
         let message = concat!(
-            "These edits need Tonepoet-only CUE metadata: PRODUCER, DISCNUMBER. ",
-            "Other CUE software will not read these values. ",
-            "Choose No to copy these edits to the clipboard and revert them; ",
-            "other saveable edits are kept."
+            "These edits include metadata not supported by standard CUE: ",
+            "PRODUCER and DISCNUMBER. ",
+            "Tonepoet can preserve them in a human-readable REM block that other ",
+            "CUE software will ignore."
         );
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -8945,8 +8947,9 @@ mod tests {
         });
         for expected in [
             "Tonepoet CUE metadata",
-            "Tonepoet-only CUE metadata",
-            "Other CUE software",
+            "not supported by standard CUE",
+            "PRODUCER and DISCNUMBER",
+            "human-readable REM block",
             "Remember my choice",
             "Y yes",
             "N no",

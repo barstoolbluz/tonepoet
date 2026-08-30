@@ -13694,9 +13694,23 @@ fn cue_tonepoet_metadata_key_summary(keys: &[String]) -> String {
         }
         labels.push(label);
     }
-    let mut summary = labels.join(", ");
-    if keys.len() > MAX_KEYS {
-        summary.push_str(&format!(" (+{} more)", keys.len() - MAX_KEYS));
+    // Join for prose, not for a log line. When the list is truncated the trailing
+    // "and N more" carries the conjunction, so the listed names stay comma-separated
+    // and "and" never appears twice.
+    let truncated = keys.len() > MAX_KEYS;
+    let mut summary = match (labels.len(), truncated) {
+        (0, _) => String::new(),
+        (1, false) => labels[0].clone(),
+        (2, false) => format!("{} and {}", labels[0], labels[1]),
+        (_, false) => {
+            let (last, rest) = labels.split_last().expect("labels is non-empty");
+            format!("{}, and {}", rest.join(", "), last)
+        }
+        (_, true) => labels.join(", "),
+    };
+    if truncated {
+        let remaining = keys.len() - MAX_KEYS;
+        summary.push_str(&format!(", and {remaining} more"));
     }
     summary
 }
@@ -13752,11 +13766,10 @@ fn metadata_editor_tonepoet_metadata_consent_gate(
             app.pending_metadata_editor = Some(Box::new(state.clone()));
             app.active_overlay = ActiveOverlay::Confirmation {
                 message: format!(
-                    "These edits need Tonepoet-only CUE metadata: {summary}. {}",
+                    "These edits include metadata not supported by standard CUE: {summary}. {}",
                     concat!(
-                        "Other CUE software will not read these values. ",
-                        "Choose No to copy these edits to the clipboard and revert them; ",
-                        "other saveable edits are kept."
+                        "Tonepoet can preserve them in a human-readable REM block that other ",
+                        "CUE software will ignore."
                     )
                 ),
                 action: ConfirmAction::CueTonepoetMetadataConsent {
