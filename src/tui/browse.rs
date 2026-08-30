@@ -14992,7 +14992,11 @@ mod tests {
     async fn sqlite_probe_hit_is_debounced_not_raw_cursor_work() {
         let (_dir, path, entry, identity, mtime) = probe_file_fixture("sqlite.flac", b"cached db");
         let db = crate::db::Database::open_memory().expect("db");
-        let info = test_cached_info(identity.size, "sqlite");
+        let mut info = test_cached_info(identity.size, "sqlite");
+        info.source.format_name = "WavPack".to_string();
+        info.source.codec = "WavPack".to_string();
+        info.source.bit_depth = Some(32);
+        info.source.sample_format_is_float = Some(true);
         let row = crate::db::CachedProbeRow::from_cached_info(&info);
         db.store_probe(&path.display().to_string(), mtime, identity.size, &row)
             .expect("store probe");
@@ -15020,6 +15024,12 @@ mod tests {
         assert_eq!(
             state.current_cached_info().and_then(|info| info.metadata.title.as_deref()),
             Some("sqlite")
+        );
+        assert_eq!(
+            state
+                .current_cached_info()
+                .map(|info| info.source.codec_display()),
+            Some("WavPack 32-bit float".to_string()),
         );
     }
 

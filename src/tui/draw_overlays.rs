@@ -5933,7 +5933,7 @@ fn apply_metadata_sample_format_label(
             continue;
         };
         let Some(is_float) = facts.sample_format_is_float else {
-            continue;
+            return;
         };
         let current = (facts.bit_depth, is_float);
         if sample_format.is_some_and(|seen| seen != current) {
@@ -5951,7 +5951,7 @@ fn apply_metadata_sample_format_label(
     let Some(row) = vm
         .general
         .iter_mut()
-        .find(|row| row.key.eq_ignore_ascii_case("bit depth"))
+        .find(|row| row.key.eq_ignore_ascii_case("bits per sample"))
     else {
         return;
     };
@@ -9396,6 +9396,144 @@ mod tests {
             Some("32-bit int"),
         );
         assert_eq!(metadata_sample_format_label(None, true), None);
+    }
+
+    fn metadata_state_with_sample_formats(
+        formats: &[(Option<u32>, Option<bool>)],
+    ) -> MetadataEditorState {
+        let mut paths = Vec::with_capacity(formats.len());
+        let mut files = Vec::with_capacity(formats.len());
+        for (index, &(bit_depth, sample_format_is_float)) in formats.iter().enumerate() {
+            let is_dsd = bit_depth == Some(1) && sample_format_is_float.is_none();
+            let codec = if is_dsd { "DSD" } else { "WavPack" };
+            let sample_rate = if is_dsd { 2_822_400 } else { 384_000 };
+            let path = PathBuf::from(format!(
+                "/album/source-{index}.{}",
+                if is_dsd { "dsf" } else { "wv" },
+            ));
+            let mut file = super::super::app::MetadataFileDetails::from_open_cache(
+                path.clone(),
+                Some(4096),
+                None,
+                None,
+                None,
+                None,
+                super::super::app::FileReadState::Readable,
+                super::super::app::FileWriteEligibility::Writable,
+                super::super::probe::SourceMetadata::default(),
+            );
+            file.set_probe_ready(super::super::probe::SourceInfo {
+                format_name: codec.to_string(),
+                codec: codec.to_string(),
+                bit_depth,
+                sample_format_is_float,
+                sample_rate,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 60.0,
+                file_size: 4096,
+            });
+            paths.push(path);
+            files.push(file);
+        }
+        MetadataEditorState::for_files(
+            paths,
+            Vec::new(),
+            Vec::new(),
+            super::super::app::MetadataTechnicalDetails::from_files(files),
+        )
+    }
+
+    fn metadata_state_with_sample_format(is_float: bool) -> MetadataEditorState {
+        metadata_state_with_sample_formats(&[(Some(32), Some(is_float))])
+    }
+
+    #[test]
+    fn metadata_sample_format_label_reaches_the_bits_per_sample_row() {
+        for (is_float, expected) in [(true, "32-bit float"), (false, "32-bit int")] {
+            let state = metadata_state_with_sample_format(is_float);
+            let mut vm = super::super::metadata_view_models::build_details_view_model(&state);
+            let depth_row = vm
+                .general
+                .iter()
+                .find(|row| row.key == "Bits per sample")
+                .expect("Bits per sample row");
+            assert_eq!(
+                depth_row.value, "32",
+                "view-model baseline should remain numeric",
+            );
+
+            apply_metadata_sample_format_label(&state, &mut vm);
+
+            let depth_row = vm
+                .general
+                .iter()
+                .find(|row| row.key == "Bits per sample")
+                .expect("Bits per sample row");
+            assert_eq!(depth_row.value, expected);
+        }
+    }
+
+    #[test]
+    fn metadata_sample_format_label_keeps_neutral_baseline_when_ready_fact_is_unknown() {
+        for (formats, expected_baseline) in [
+            (
+                vec![(Some(32), Some(true)), (Some(1), None)],
+                "«multiple values»",
+            ),
+            (
+                vec![(Some(32), Some(true)), (Some(32), None)],
+                "32",
+            ),
+        ] {
+            let state = metadata_state_with_sample_formats(&formats);
+            let mut vm = super::super::metadata_view_models::build_details_view_model(&state);
+            let depth_row = vm
+                .general
+                .iter()
+                .find(|row| row.key == "Bits per sample")
+                .expect("Bits per sample row");
+            assert_eq!(depth_row.value, expected_baseline);
+
+            apply_metadata_sample_format_label(&state, &mut vm);
+
+            let depth_row = vm
+                .general
+                .iter()
+                .find(|row| row.key == "Bits per sample")
+                .expect("Bits per sample row");
+            assert_eq!(
+                depth_row.value, expected_baseline,
+                "a ready source with unknown storage class must suppress aggregate decoration",
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_sample_format_label_keeps_neutral_baseline_for_mixed_storage_classes() {
+        let state = metadata_state_with_sample_formats(&[
+            (Some(32), Some(true)),
+            (Some(32), Some(false)),
+        ]);
+        let mut vm = super::super::metadata_view_models::build_details_view_model(&state);
+        let depth_row = vm
+            .general
+            .iter()
+            .find(|row| row.key == "Bits per sample")
+            .expect("Bits per sample row");
+        assert_eq!(depth_row.value, "32");
+
+        apply_metadata_sample_format_label(&state, &mut vm);
+
+        let depth_row = vm
+            .general
+            .iter()
+            .find(|row| row.key == "Bits per sample")
+            .expect("Bits per sample row");
+        assert_eq!(
+            depth_row.value, "32",
+            "mixed integer/float sources must retain the neutral depth baseline",
+        );
     }
 
     #[test]

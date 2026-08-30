@@ -16472,7 +16472,7 @@ mod app_startup_options_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
         assert_eq!(
-            version, 25,
+            version, 26,
             "quiescent startup must durably advance through the current schema"
         );
         let protocol_version: u32 = conn

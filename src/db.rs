@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 25;
+const CURRENT_VERSION: u32 = 26;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -1002,6 +1002,10 @@ impl Database {
         }
         if version < 25 {
             self.run_migration_step(25, Self::migrate_v25)?;
+            version = 25;
+        }
+        if version < 26 {
+            self.run_migration_step(26, Self::migrate_v26)?;
         }
 
         Ok(())
@@ -2119,6 +2123,31 @@ impl Database {
             );",
         )
         .map_err(|error| format!("v25 migration create metadata completion corpus: {error}"))?;
+        Ok(())
+    }
+
+    /// v26: preserve the probed integer/float storage class in the persistent
+    /// Browse probe cache. Rows written by earlier versions cannot supply this
+    /// fact, so invalidate only this derived cache once rather than serving a
+    /// legacy NULL as authoritative "unknown" media information.
+    fn migrate_v26(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v26",
+            "probe_cache",
+            "sample_format_is_float",
+            "INTEGER",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE probe_cache ADD COLUMN sample_format_is_float INTEGER;",
+            )
+            .map_err(|error| format!("v26 migration add probe sample format: {error}"))?;
+        }
+
+        conn.execute("DELETE FROM probe_cache", [])
+            .map_err(|error| format!("v26 migration invalidate legacy probe cache: {error}"))?;
         Ok(())
     }
 
@@ -4795,16 +4824,16 @@ impl Database {
             .execute(
                 "INSERT OR REPLACE INTO probe_cache (
                 file_path, file_mtime, file_size,
-                format_name, codec, bit_depth, sample_rate, channels,
+                format_name, codec, bit_depth, sample_format_is_float, sample_rate, channels,
                 channel_layout, duration_secs,
                 title, artist, album, genre, year, track_number, catalog_number,
                 rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak,
                 r128_track_gain, r128_album_gain,
                 probed_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21, ?22, ?23, ?24, ?25
             )",
                 params![
                     file_path,
@@ -4813,6 +4842,7 @@ impl Database {
                     row.format_name,
                     row.codec,
                     row.bit_depth,
+                    row.sample_format_is_float,
                     row.sample_rate,
                     row.channels,
                     row.channel_layout,
@@ -5922,6 +5952,7 @@ pub struct CachedProbeRow {
     pub format_name: Option<String>,
     pub codec: Option<String>,
     pub bit_depth: Option<u32>,
+    pub sample_format_is_float: Option<bool>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
@@ -5995,6 +6026,7 @@ fn cached_probe_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cached
         format_name: row.get("format_name")?,
         codec: row.get("codec")?,
         bit_depth: row.get("bit_depth")?,
+        sample_format_is_float: row.get("sample_format_is_float")?,
         sample_rate: row.get("sample_rate")?,
         channels: row.get("channels")?,
         channel_layout: row.get("channel_layout")?,
@@ -6023,7 +6055,7 @@ impl CachedProbeRow {
     pub fn to_cached_info(&self, file_size: u64) -> Option<crate::tui::browse::CachedInfo> {
         use crate::tui::probe::{SourceInfo, SourceMetadata};
         let source = SourceInfo {
-            sample_format_is_float: None,
+            sample_format_is_float: self.sample_format_is_float,
             format_name: self.format_name.clone()?,
             codec: self.codec.clone().unwrap_or_default(),
             bit_depth: self.bit_depth,
@@ -6064,6 +6096,7 @@ impl CachedProbeRow {
             format_name: Some(info.source.format_name.clone()),
             codec: Some(info.source.codec.clone()),
             bit_depth: info.source.bit_depth,
+            sample_format_is_float: info.source.sample_format_is_float,
             sample_rate: Some(info.source.sample_rate),
             channels: Some(info.source.channels),
             channel_layout: Some(info.source.channel_layout.clone()),
@@ -6341,7 +6374,40 @@ impl Database {
 mod tests {
     use super::*;
 
+    fn create_pre_v26_probe_cache_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE probe_cache (
+                file_path       TEXT PRIMARY KEY,
+                file_mtime      INTEGER NOT NULL,
+                file_size       INTEGER NOT NULL,
+                format_name     TEXT,
+                codec           TEXT,
+                bit_depth       INTEGER,
+                sample_rate     INTEGER,
+                channels        INTEGER,
+                channel_layout  TEXT,
+                duration_secs   REAL,
+                title           TEXT,
+                artist          TEXT,
+                album           TEXT,
+                genre           TEXT,
+                year            TEXT,
+                track_number    INTEGER,
+                catalog_number  TEXT,
+                rg_track_gain   TEXT,
+                rg_track_peak   TEXT,
+                rg_album_gain   TEXT,
+                rg_album_peak   TEXT,
+                r128_track_gain TEXT,
+                r128_album_gain TEXT,
+                probed_at       TEXT NOT NULL
+             );",
+        )
+        .expect("create pre-v26 probe cache table");
+    }
+
     fn create_v23_prerequisite_tables(conn: &Connection) {
+        create_pre_v26_probe_cache_table(conn);
         conn.execute_batch(
             "CREATE TABLE conversion_queue (
                 id        TEXT PRIMARY KEY,
@@ -6546,7 +6612,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version");
-        assert_eq!(version, 25);
+        assert_eq!(version, CURRENT_VERSION);
         let completion_columns = table_columns(&migrated.conn, "metadata_completion_values");
         assert_eq!(
             completion_columns
@@ -6564,6 +6630,87 @@ mod tests {
             )
             .expect("query pre-existing v24 data");
         assert_eq!(existing, 1, "v25 migration must preserve existing rows");
+    }
+
+    #[test]
+    fn v26_adds_sample_format_to_probe_cache_and_invalidates_legacy_rows_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("v25-to-v26.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("create v25 database fixture");
+            conn.execute_batch(
+                "CREATE TABLE probe_cache (
+                    file_path       TEXT PRIMARY KEY,
+                    file_mtime      INTEGER NOT NULL,
+                    file_size       INTEGER NOT NULL,
+                    format_name     TEXT,
+                    codec           TEXT,
+                    bit_depth       INTEGER,
+                    sample_rate     INTEGER,
+                    channels        INTEGER,
+                    channel_layout  TEXT,
+                    duration_secs   REAL,
+                    title           TEXT,
+                    artist          TEXT,
+                    album           TEXT,
+                    genre           TEXT,
+                    year            TEXT,
+                    track_number    INTEGER,
+                    catalog_number  TEXT,
+                    rg_track_gain   TEXT,
+                    rg_track_peak   TEXT,
+                    rg_album_gain   TEXT,
+                    rg_album_peak   TEXT,
+                    r128_track_gain TEXT,
+                    r128_album_gain TEXT,
+                    probed_at       TEXT NOT NULL
+                );
+                INSERT INTO probe_cache (
+                    file_path, file_mtime, file_size, format_name, codec, bit_depth,
+                    sample_rate, channels, channel_layout, duration_secs, probed_at
+                ) VALUES (
+                    '/music/legacy-float.wv', 1000, 5000000, 'WavPack', 'WavPack', 32,
+                    384000, 2, 'stereo', 60.0, '2026-08-30T00:00:00Z'
+                );
+                CREATE TABLE migration_sentinel(value TEXT NOT NULL);
+                INSERT INTO migration_sentinel(value) VALUES ('keep');
+                PRAGMA user_version = 25;",
+            )
+            .expect("seed v25 probe cache");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v25 database to v26");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, CURRENT_VERSION);
+
+        let probe_columns = table_columns(&db.conn, "probe_cache");
+        assert!(
+            probe_columns
+                .iter()
+                .any(|(name, declared_type)| {
+                    name == "sample_format_is_float" && declared_type == "INTEGER"
+                }),
+            "v26 must persist integer/float source classification",
+        );
+        let legacy_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM probe_cache", [], |row| row.get(0))
+            .expect("count legacy probe rows");
+        assert_eq!(
+            legacy_rows, 0,
+            "rows from schemas that could not store sample format must not be served as complete media facts",
+        );
+        let sentinel: String = db
+            .conn
+            .query_row("SELECT value FROM migration_sentinel", [], |row| row.get(0))
+            .expect("read unrelated sentinel");
+        assert_eq!(
+            sentinel, "keep",
+            "v26 must invalidate only the derived probe cache",
+        );
     }
 
     const CROSS_PROCESS_DB_PATH_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_PATH";
@@ -7856,6 +8003,7 @@ mod tests {
         let path = temp.path().join("tonepoet.db");
         {
             let conn = Connection::open(&path).expect("create partial v23 database");
+            create_pre_v26_probe_cache_table(&conn);
             conn.execute_batch(
                 "CREATE TABLE conversion_queue (
                     id        TEXT PRIMARY KEY,
@@ -9261,30 +9409,37 @@ mod tests {
         let db = Database::open_memory().unwrap();
 
         let row = CachedProbeRow {
-            format_name: Some("flac".into()),
-            codec: Some("flac".into()),
-            sample_rate: Some(44100),
+            format_name: Some("WavPack".into()),
+            codec: Some("WavPack".into()),
+            bit_depth: Some(32),
+            sample_format_is_float: Some(true),
+            sample_rate: Some(384000),
             channels: Some(2),
             title: Some("Test Song".into()),
             artist: Some("Test Artist".into()),
             ..Default::default()
         };
 
-        db.store_probe("/music/song.mp3", 1000, 5000000, &row)
+        db.store_probe("/music/float.wv", 1000, 5000000, &row)
             .unwrap();
 
         // Hit: same mtime + size.
-        let cached = db.get_cached_probe("/music/song.mp3", 1000, 5000000);
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().title, Some("Test Song".into()));
+        let cached = db
+            .get_cached_probe("/music/float.wv", 1000, 5000000)
+            .expect("probe cache hit");
+        assert_eq!(cached.title, Some("Test Song".into()));
+        assert_eq!(cached.sample_format_is_float, Some(true));
+        let cached_info = cached.to_cached_info(5000000).expect("cached info");
+        assert_eq!(cached_info.source.sample_format_is_float, Some(true));
+        assert_eq!(cached_info.source.codec_display(), "WavPack 32-bit float");
 
         // Miss: different mtime.
-        let cached = db.get_cached_probe("/music/song.mp3", 2000, 5000000);
+        let cached = db.get_cached_probe("/music/float.wv", 2000, 5000000);
         assert!(cached.is_none());
 
         // Invalidate.
-        db.invalidate_probe("/music/song.mp3").unwrap();
-        let cached = db.get_cached_probe("/music/song.mp3", 1000, 5000000);
+        db.invalidate_probe("/music/float.wv").unwrap();
+        let cached = db.get_cached_probe("/music/float.wv", 1000, 5000000);
         assert!(cached.is_none());
     }
 
