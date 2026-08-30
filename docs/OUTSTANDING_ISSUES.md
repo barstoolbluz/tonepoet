@@ -108,6 +108,15 @@ when the user edited a field that only lives in the image, not the CUE. A test (
 
 ## 2. Confirmation dialog is fixed-height (9 rows) — long recovery prompts clip their text and buttons
 
+> **STILL OPEN 2026-08-29 — re-verified after `c4bab5b`.** That commit's message claims it
+> "resolves OUTSTANDING_ISSUES #2". **That claim is wrong.** `draw_confirmation`
+> (`src/tui/draw_overlays.rs:1519`) now sizes with
+> `let popup_h = if cue_consent { 14u16 } else { 9u16 };` (`:1536`) — two fixed heights
+> instead of one, not content measurement. The new CUE-consent dialog gets 14 rows; every
+> other confirmation, including the four-button startup recovery prompt this issue was
+> filed against, still gets 9. The function still contains no line counting, no wrap
+> measurement, and no scroll offset, so overflow clips exactly as before.
+>
 > **Verified STILL OPEN 2026-08-25** (read, not grepped). `draw_confirmation` is now at `src/tui/draw_overlays.rs:1519`; the fixed height is `centered_rect(popup_w, 9, area)` at `:1532`. Width DOES adapt (`50.max(footer_w+4).min(area.width-2)`); height has no content measurement, the message `Paragraph` has `Wrap` but **no scroll offset** so overflow is clipped, and the buttons are a single `Constraint::Length(1)` row with no wrap. Anchor `:1428` in the text below has drifted.
 
 **Discovered:** 2026-08-09, on a startup archive-recovery prompt in a second tonepoet instance.
