@@ -8167,10 +8167,14 @@ fn sort_entries_by_standard_order(entries: &mut Vec<TagEntry>) {
 /// populated). Used by `read_all_tags_merged` and the main MusicBrainz /
 /// GNUDB populate paths so post-populate entries fall into their
 /// logical positions instead of trailing.
+fn sort_entries_standard_first_with_file_count(entries: &mut Vec<TagEntry>, n_files: usize) {
+    ensure_standard_fields_present(entries, n_files.max(1));
+    sort_entries_by_standard_order(entries);
+}
+
 pub fn sort_entries_standard_first(entries: &mut Vec<TagEntry>) {
     let n_files = entries.first().map(|e| e.per_file_values.len()).unwrap_or(1);
-    ensure_standard_fields_present(entries, n_files);
-    sort_entries_by_standard_order(entries);
+    sort_entries_standard_first_with_file_count(entries, n_files);
 }
 
 /// Sort existing entries without synthesizing missing core editor fields.
@@ -9292,7 +9296,7 @@ pub fn read_all_tags_merged(paths: &[std::path::PathBuf]) -> Result<Vec<TagEntry
             entry.is_binary = true;
         }
     }
-    sort_entries_standard_first(&mut entries);
+    sort_entries_standard_first_with_file_count(&mut entries, n);
     Ok(entries)
 }
 
@@ -9544,7 +9548,7 @@ where
             entry.is_binary = true;
         }
     }
-    sort_entries_standard_first(&mut entries);
+    sort_entries_standard_first_with_file_count(&mut entries, n);
 
     if cancelled() {
         return Err(cancelled_message());
@@ -22187,6 +22191,38 @@ mod tests {
                 | crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { .. }
         ));
         assert_eq!(editor_value(&path, "MOOD").as_deref(), Some("Restless"));
+    }
+
+    #[test]
+    fn merged_untagged_carriers_keep_core_rows_at_input_file_dimension() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("side-a.wav");
+        let second = temp.path().join("side-b.wav");
+        write_minimal_pcm_wav(&first);
+        write_minimal_pcm_wav(&second);
+
+        let paths = vec![first, second];
+        let assert_core_dimension = |entries: &[TagEntry]| {
+            for key in ["PERFORMER", "COMMENT"] {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.display_key == key)
+                    .unwrap_or_else(|| panic!("missing synthesized {key} row"));
+                assert_eq!(
+                    entry.per_file_values.len(),
+                    2,
+                    "{key} placeholder must match the two-file editor dimension"
+                );
+                assert_eq!(entry.per_file_originals.len(), 2);
+                assert_eq!(entry.per_file_stored_value_counts, vec![0, 0]);
+            }
+        };
+
+        let entries = read_all_tags_merged(&paths).expect("merge untagged WAV carriers");
+        assert_core_dimension(&entries);
+        let merged = read_all_tags_merged_with_metadata(&paths)
+            .expect("merge untagged WAV carriers with source metadata");
+        assert_core_dimension(&merged.entries);
     }
 
     #[test]

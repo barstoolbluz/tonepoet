@@ -27229,18 +27229,25 @@ fn cue_album_user_metadata_for_track_indices(
             cue_user_metadata_replace(&mut album, &key, None);
             continue;
         }
-        let first = entry.per_file_values.get(relevant_slots[0]).ok_or_else(|| {
-            format!("save aborted: album-scoped {key} has no value for its CUE side")
-        })?;
-        if relevant_slots.iter().skip(1).any(|slot| {
-            entry
+        let missing_slot_error = || {
+            format!(
+                "save aborted: the editor did not load album-scoped {key} for every audio file in this CUE; reopen the metadata editor and retry; no carrier was changed"
+            )
+        };
+        let first = entry
+            .per_file_values
+            .get(relevant_slots[0])
+            .ok_or_else(|| missing_slot_error())?;
+        for slot in relevant_slots.iter().skip(1) {
+            let value = entry
                 .per_file_values
                 .get(*slot)
-                .is_none_or(|value| value != first)
-        }) {
-            return Err(format!(
-                "save aborted: album-scoped {key} differs within one physical CUE side; apply one value to the side before saving"
-            ));
+                .ok_or_else(|| missing_slot_error())?;
+            if value != first {
+                return Err(format!(
+                    "save aborted: album-scoped {key} has different values on audio files covered by the same CUE; make the {key} values match before saving; no carrier was changed"
+                ));
+            }
         }
         let inert_values = (first.value_count() > 0
             && !cue_standard_metadata_values_are_lossless(
@@ -91286,6 +91293,119 @@ mod untaggable_carrier_sidecar_regression_tests {
             status,
             "Metadata saved (0 files; 1 CUE sidecar created)",
             "sidecar-create success accounting must be exact",
+        );
+    }
+
+    #[tokio::test]
+    async fn multifile_sidecar_untagged_carriers_save_album_performer_and_comment() {
+        fn write_minimal_pcm_wav(path: &std::path::Path) {
+            let mut wav = Vec::with_capacity(46);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&38u32.to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&44_100u32.to_le_bytes());
+            wav.extend_from_slice(&88_200u32.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&2u32.to_le_bytes());
+            wav.extend_from_slice(&0i16.to_le_bytes());
+            std::fs::write(path, wav).expect("minimal WAV fixture");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("Led Zeppelin II (Side A).wav");
+        let second = temp.path().join("Led Zeppelin II (Side B).wav");
+        let cue_path = temp.path().join("Led Zeppelin II.cue");
+        write_minimal_pcm_wav(&first);
+        write_minimal_pcm_wav(&second);
+        let cue_text = concat!(
+            "REM COMMENT RUTRACKER.ORG - VINYL RIP Dymokust\r\n",
+            "REM LABEL  Atlantic P-10101A, Japan\r\n",
+            "REM GENRE Rock\r\n",
+            "PERFORMER \"Led Zeppelin\"\r\n",
+            "TITLE \"Led Zeppelin II\"\r\n",
+            "FILE \"Led Zeppelin II (Side A).wav\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"Whole Lotta Love\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "FILE \"Led Zeppelin II (Side B).wav\" WAVE\r\n",
+            "  TRACK 02 AUDIO\r\n",
+            "    TITLE \"Heartbreaker\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+        );
+        std::fs::write(&cue_path, cue_text).expect("multi-FILE sidecar fixture");
+        let first_before = std::fs::read(&first).expect("first carrier before save");
+        let second_before = std::fs::read(&second).expect("second carrier before save");
+
+        let surface = resolve_metadata_cue_surface(&cue_path).expect("resolve multi-FILE sidecar");
+        assert_eq!(surface.audio_paths.len(), 2);
+        let mut config = TonepoetConfig::default();
+        config.metadata.cue_tonepoet_metadata =
+            Some(crate::config::CueTonepoetMetadataPreference::Always);
+        let mut app = AppState::new_for_test(config);
+        let (mut state, tracks) = build_metadata_editor_for_cue_surfaces_with_policy(
+            &mut app,
+            std::slice::from_ref(&surface),
+            0,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("open one-CUE/two-file album");
+        assert_eq!(tracks, 2);
+
+        for key in ["PERFORMER", "COMMENT"] {
+            let entry = state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key.eq_ignore_ascii_case(key))
+                .unwrap_or_else(|| panic!("missing {key} row"));
+            assert_eq!(
+                entry.per_file_values.len(),
+                2,
+                "{key} must be sized to the two audio-file slots before editing"
+            );
+        }
+
+        edit_key(
+            &mut state,
+            "PERFORMER",
+            "John Bonham; John Paul Jones; Jimmy Page; Robert Plant",
+            2,
+        );
+        edit_key(&mut state, "COMMENT", "vinyl rip provenance", 2);
+        recalc_dirty(&mut state);
+        assert!(state.active_surface().dirty);
+
+        let (_state, results, status) = save_through_production_path(&mut app, state).await;
+        assert_sidecar_updated_once(&results, &cue_path);
+        assert_sidecar_only_success_status(&status);
+        assert_eq!(std::fs::read(&first).expect("first carrier after save"), first_before);
+        assert_eq!(std::fs::read(&second).expect("second carrier after save"), second_before);
+
+        let saved = std::fs::read_to_string(&cue_path).expect("saved sidecar");
+        let parsed = crate::tui::cue_parser::parse_cue(&saved);
+        assert_eq!(
+            crate::convert::cue_parser::cue_user_metadata_values(
+                &parsed.user_metadata,
+                "PERFORMER",
+            )
+            .map(|values| values.to_vec()),
+            Some(vec![
+                "John Bonham".to_string(),
+                "John Paul Jones".to_string(),
+                "Jimmy Page".to_string(),
+                "Robert Plant".to_string(),
+            ]),
+            "the complete ordered PERFORMER list must survive in the inert album block"
+        );
+        assert_eq!(
+            crate::convert::cue_parser::cue_user_metadata_values(&parsed.user_metadata, "COMMENT")
+                .map(|values| values.to_vec()),
+            Some(vec!["vinyl rip provenance".to_string()]),
         );
     }
 
