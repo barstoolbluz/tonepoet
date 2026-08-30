@@ -1516,6 +1516,54 @@ fn confirmation_footer_hints_width(hints: &[super::app::ConfirmationFooterHint])
 }
 
 /// Draw a confirmation dialog
+/// Count the rows a centered, word-wrapped `Paragraph` needs at `width`.
+///
+/// Mirrors ratatui's `Wrap { trim: true }`: hard newlines always break, words
+/// are kept whole, and a word longer than the line is split across rows. Used
+/// to size the confirmation popup to its content instead of a fixed height —
+/// OUTSTANDING_ISSUES #2, where a 9-row popup clipped longer prompts because
+/// the message has no scroll offset.
+fn wrapped_row_count(message: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let width = width as usize;
+    let mut rows: usize = 0;
+    for hard_line in message.split('\n') {
+        let mut used = 0usize;
+        let mut line_started = false;
+        for word in hard_line.split_whitespace() {
+            let w = super::display_width::width(word);
+            if !line_started {
+                rows += 1;
+                line_started = true;
+                used = 0;
+            } else if used + 1 + w > width {
+                rows += 1;
+                used = 0;
+            } else {
+                used += 1; // the separating space
+            }
+            if w > width {
+                // A single word wider than the line wraps across further rows.
+                let mut remaining = w;
+                remaining = remaining.saturating_sub(width);
+                while remaining > 0 {
+                    rows += 1;
+                    remaining = remaining.saturating_sub(width);
+                }
+                used = width;
+            } else {
+                used += w;
+            }
+        }
+        if !line_started {
+            rows += 1; // a blank hard line still occupies a row
+        }
+    }
+    rows.clamp(1, u16::MAX as usize) as u16
+}
+
 fn draw_confirmation(
     f: &mut Frame,
     message: &str,
@@ -1533,12 +1581,18 @@ fn draw_confirmation(
     let popup_w = (if cue_consent { 66u16 } else { 50u16 })
         .max(footer_w.saturating_add(4))
         .min(area.width.saturating_sub(2).max(1));
-    let popup_h = if cue_consent { 14u16 } else { 9u16 };
-    let popup = centered_rect(
-        popup_w,
-        popup_h.min(area.height.saturating_sub(2).max(1)),
-        area,
-    );
+    // Size to content rather than a fixed height. Chrome is the two block
+    // borders plus one button row, plus the consent checkbox row when present.
+    // Without this the popup clipped longer prompts, because the message
+    // paragraph wraps but has no scroll offset (OUTSTANDING_ISSUES #2).
+    let chrome_h = 2 + 1 + if cue_consent { 1 } else { 0 };
+    let text_w = popup_w.saturating_sub(2).max(1);
+    let message_h = wrapped_row_count(message, text_w);
+    let desired_h = message_h.saturating_add(chrome_h);
+    let max_h = area.height.saturating_sub(2).max(1);
+    let min_h = (if cue_consent { 14u16 } else { 9u16 }).min(max_h);
+    let popup_h = desired_h.clamp(min_h, max_h);
+    let popup = centered_rect(popup_w, popup_h, area);
 
     f.render_widget(Clear, popup);
     let title = if cue_consent {
@@ -8908,6 +8962,72 @@ mod tests {
         assert_eq!(rect.height, 1);
         assert!(rect.width < 80, "popup borders must not be editor-active");
         assert!(rect.y > 0);
+    }
+
+    /// OUTSTANDING_ISSUES #2: the confirmation popup was a fixed 9 rows with no
+    /// scroll offset, so a long prompt — notably the four-button archive startup
+    /// recovery message — had its tail and buttons clipped. The popup now sizes to
+    /// its wrapped content.
+    #[test]
+    fn long_confirmation_message_is_not_clipped() {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        let mut app = super::super::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default(),
+        );
+        let action = super::super::app::ConfirmAction::DiscardMetadataEditorChanges;
+        let message = concat!(
+            "Recovered staged archive edits from a previous run:\n",
+            "/home/user/torrents/Some Album (1977) [24-96].zip\n\n",
+            "Staging: /home/user/.cache/tonepoet/archive-staging/job-1234\n",
+            "Edits: 7\n",
+            "Conflict: archive changed externally\n\n",
+            "Y/Enter resumes the staged archive view. N/No opens a discard ",
+            "confirmation. D also opens discard confirmation. Esc keeps them ",
+            "for next startup.",
+        );
+
+        // The message alone needs more rows than the old fixed inner height (7).
+        let rows = wrapped_row_count(message, 48);
+        assert!(rows > 7, "fixture must exceed the old fixed height: {rows} rows");
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_confirmation(frame, message, &action, &mut app, theme))
+            .expect("draw long confirmation");
+        let rendered = (0..40).fold(String::new(), |mut text, y| {
+            for x in 0..100 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push('\n');
+            text
+        });
+
+        // The paragraph wraps, so assert on fragments that survive a line break
+        // rather than on phrases that may straddle two rows. The final word of
+        // the message and both buttons are the clipping canaries.
+        for expected in ["Recovered staged archive edits", "Conflict:", "startup.", "Y yes", "N no"] {
+            assert!(
+                rendered.contains(expected),
+                "long confirmation must render {expected:?} without clipping: {rendered}",
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_row_count_matches_hard_and_soft_breaks() {
+        assert_eq!(wrapped_row_count("", 20), 1);
+        assert_eq!(wrapped_row_count("short", 20), 1);
+        assert_eq!(wrapped_row_count("a\nb\nc", 20), 3);
+        assert_eq!(wrapped_row_count("one two three", 20), 1);
+        // Word-aware: "three" moves to its own row rather than being split.
+        assert_eq!(wrapped_row_count("one two three", 9), 2);
+        // A blank hard line still occupies a row.
+        assert_eq!(wrapped_row_count("a\n\nb", 20), 3);
+        // A single word wider than the line wraps onto further rows.
+        assert_eq!(wrapped_row_count("aaaaaaaaaa", 4), 3);
     }
 
     #[test]

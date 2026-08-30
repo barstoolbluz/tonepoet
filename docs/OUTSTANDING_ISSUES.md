@@ -108,6 +108,33 @@ when the user edited a field that only lives in the image, not the CUE. A test (
 
 ## 2. Confirmation dialog is fixed-height (9 rows) — long recovery prompts clip their text and buttons
 
+> **RESOLVED 2026-08-30.** `draw_confirmation` now sizes to its wrapped content instead of
+> a fixed height. A new `wrapped_row_count` helper (`src/tui/draw_overlays.rs:1526`) counts
+> the rows a word-wrapped paragraph needs — ratatui 0.26's own `Paragraph::line_count` is
+> private, and the pre-existing `wrap_to_visual_rows` is character-level, which would pack
+> more per line than `Wrap { trim: true }` does and undersize the popup. Height is now
+> `message_rows + chrome` (two borders, one button row, plus the consent checkbox row when
+> present), with the former fixed heights kept as **floors** so short prompts are unchanged,
+> clamped to the terminal.
+>
+> Measured on the archive startup-recovery message this issue was filed against: it needs
+> **14 rows at width 50**, and the old fixed height gave it **7**. It now renders complete —
+> message, `Conflict:` line, final `startup.` and both buttons — in an 18-row popup.
+>
+> Regressions: `long_confirmation_message_is_not_clipped` (renders the real prompt shape and
+> asserts its tail and buttons survive) and `wrapped_row_count_matches_hard_and_soft_breaks`
+> (hard newlines, word-boundary wrapping, blank lines, over-long words). Gate run 1 green,
+> 6496 passed.
+>
+> **Residual, deliberately not fixed:** a message taller than the terminal still clips,
+> because the paragraph has no scroll offset — the popup clamps to the screen rather than
+> overflowing it. Adding scroll state to the confirmation overlay is a larger change than
+> the fixed-height defect filed here.
+>
+> Note the earlier `STILL OPEN 2026-08-29` correction below is now itself superseded; it was
+> accurate when written, and recorded that `c4bab5b`'s commit message wrongly claimed to
+> resolve this issue.
+
 > **STILL OPEN 2026-08-29 — re-verified after `c4bab5b`.** That commit's message claims it
 > "resolves OUTSTANDING_ISSUES #2". **That claim is wrong.** `draw_confirmation`
 > (`src/tui/draw_overlays.rs:1519`) now sizes with
@@ -854,7 +881,37 @@ while the unlocked tree and lock are gone.
 session. The module holds a `scoped_test_coordination_root`, so it is not the
 unscoped-coordination pattern behind issue #12.
 
-### Theory tested and eliminated
+### 2026-08-30 update — a second test in this module failed, and the panic was captured
+
+While gating the #2 fix, gate run 2 failed on a **different** test in the same module:
+
+```
+convert::pipeline::memory_budget::tests::
+  execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired
+
+memory_budget.rs:1494
+retire_descriptor_after_lifecycle_release(&descriptor, &family)
+  → "persistent lease is live-owned:
+     /tmp/nix-shell.WYucNL/.tmphyiIZT/claims/execution-staging/….lease"
+```
+
+A lease is retired after its lifecycle released, and retirement is refused because the
+lease still classifies as **live-owned**. `memory_budget.rs` was unmodified by that
+commit and the test passes in isolation.
+
+**This invalidates the elimination recorded below.** That reasoning rested on this very
+test passing while exercising the same-process held-lock case. It no longer does.
+
+Note the direction is inverted relative to the original theory: that theory was a *held*
+lock reporting unlocked (a live tree wrongly reaped); this is a *released* lease reporting
+live (retirement wrongly refused). Both are same-process lock-state visibility problems,
+which is consistent with `flock` semantics — two separate `open()` calls create distinct
+open file descriptions that conflict with each other **even within one process**, so a
+release that drops one handle while another remains open would leave a probe seeing
+`WouldBlock` and concluding "live-owned". That is a mechanism both failing tests fit; it
+has **not** been confirmed.
+
+### Theory tested and eliminated (superseded by the update above)
 
 **Same-process `flock` re-acquisition.** `probe_existing_run_lock`
 (`memory_budget.rs:1075`) decides liveness by opening the lock path and calling
