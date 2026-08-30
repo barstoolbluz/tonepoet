@@ -818,3 +818,85 @@ label. Not investigated.
 
 **Incidental, unverified.** These files probe at 384 kHz while their CUE titles say
 `32-176.4`. Noted only so it is not lost; no bearing on this issue established.
+
+---
+
+## 14. `memory_budget::held_run_lock_skips_only_active_tree` fails intermittently under the full workspace gate — cause unknown
+
+**Status:** open, **undiagnosed**. Observed 2026-08-30 while gating `0f92b5f`.
+
+**Symptom.** One failure in a full `cargo test --workspace --no-fail-fast` run:
+
+```
+convert::pipeline::memory_budget::tests::held_run_lock_skips_only_active_tree
+```
+
+Rate: **1 occurrence in 3 full gate runs** on 2026-08-30. The failing assertion was
+**not captured** — only the test name from the gate's failure list is known, which
+leaves the mechanism unconstrained.
+
+**What the test asserts** (`src/convert/pipeline/memory_budget.rs:1522`). Scratch-staging
+cleanup must reap abandoned job trees while leaving alone any tree whose run-lock is
+still held. It creates two staging trees in a private `tempfile::tempdir()` — one whose
+`.run.lock` it holds via `try_lock_exclusive`, one unlocked — calls
+`cleanup_stale_staging_trees` (`:847`), then asserts the locked tree and its lock survive
+while the unlocked tree and lock are gone.
+
+### Measurements
+
+| condition | result |
+|---|---|
+| the single test, isolated | 1/1 pass |
+| the whole `memory_budget::` module, 60 consecutive runs | **0 failures** |
+| full workspace gate | 1 failure in 3 runs |
+
+`memory_budget.rs` was **not modified** by `0f92b5f` or any recent commit in this
+session. The module holds a `scoped_test_coordination_root`, so it is not the
+unscoped-coordination pattern behind issue #12.
+
+### Theory tested and eliminated
+
+**Same-process `flock` re-acquisition.** `probe_existing_run_lock`
+(`memory_budget.rs:1075`) decides liveness by opening the lock path and calling
+`try_lock_exclusive()`:
+
+```rust
+match file.try_lock_exclusive() {
+    Ok(())  => Ok(RunLockProbe::Unlocked(file)),   // caller may reap the tree
+    Err(err) if is_lock_contention(&err) => Ok(RunLockProbe::Held),
+    Err(err) => Err(err),
+}
+```
+
+On Linux, `flock` locks attach to the open file description and a process can re-acquire
+a lock it already holds. Since the test holds the "active" lock in the same process that
+runs the cleaner, the probe could in principle report `Unlocked` and the active tree
+could be reaped — failing `assert!(active_dir.exists())`.
+
+**This is not supported by the evidence.** If that were the mechanism the test would fail
+constantly rather than once in three gates; it passed 60/60. The same-process held-lock
+case is also deliberately exercised by
+`execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired`
+(`:1438`, calling cleanup at `:1480` and `:1486` with "cleanup while live" and "cleanup
+while recovery reserved"), and that test passes.
+
+### What this means
+
+The failure requires full-suite conditions — something outside the module. That is the
+same signature as the `dsf_tags` coordination-descriptor intermittent investigated
+earlier in this session, which needed roughly 120 full-binary runs to characterise and
+**turned out to be a genuine production defect**, shipped as `983fa0c`. This one should
+therefore not be assumed cosmetic on the strength of "it passes in isolation".
+
+### Next step
+
+Capture the actual failing assertion. That means repeated full-binary runs (~104s each)
+until one reproduces, with the panic text preserved — the method that worked for
+`dsf_tags`. Static reading has produced one theory and it was wrong.
+
+### Production reachability, unassessed
+
+`cleanup_stale_staging_trees` has exactly one production call site
+(`memory_budget.rs:131`), during scratch-directory setup. Whether a real job and the
+cleaner can run in the same process — which is what would make the eliminated theory
+matter outside tests — was not determined.
