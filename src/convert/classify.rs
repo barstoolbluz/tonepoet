@@ -163,8 +163,12 @@ pub fn audio_format_from_extension(extension: &str) -> Option<AudioFormat> {
 }
 
 pub fn classify_file(path: &Path) -> EntryKind {
-    // Check for double-extension archives first (e.g., .tar.gz).
-    if is_tar_compound(path) {
+    // Check for double-extension containers before final-extension audio
+    // classification. `.iso.wv` is an ISO 9660 image whose trailing `.wv` is
+    // only a release-group naming convention, just as `.tar.gz` is not a gzip
+    // audio/source file. Keep this lexical check narrow so ordinary WavPack
+    // remains on the direct-audio path.
+    if is_tar_compound(path) || is_iso_wv_container(path) {
         return EntryKind::Archive;
     }
 
@@ -182,6 +186,23 @@ pub fn classify_file(path: &Path) -> EntryKind {
         | Some("dmg") | Some("tgz") | Some("tbz2") | Some("txz") => EntryKind::Archive,
         _ => EntryKind::OtherFile,
     }
+}
+
+
+/// Return true for the release convention `<name>.iso.wv`.
+///
+/// This is intentionally lexical rather than a generic `.wv` content probe: the
+/// convention is unambiguous at the routing boundary and preserves the zero-I/O
+/// Browse classifier. The archive extractor remains authoritative for whether
+/// the named file is actually a readable ISO filesystem.
+pub fn is_iso_wv_container(path: &Path) -> bool {
+    const SUFFIX: &[u8] = b".iso.wv";
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.len() >= SUFFIX.len()
+        && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 /// Public accessor for compound tar check (used by keybindings file-routing).
@@ -260,6 +281,24 @@ mod tests {
         ] {
             assert_eq!(classify_file(Path::new(name)), EntryKind::Archive, "{name}");
         }
+    }
+
+    #[test]
+    fn classify_file_detects_iso_wv_container_before_wavpack_extension() {
+        for name in ["album.iso.wv", "ALBUM.ISO.WV", "album.Iso.Wv"] {
+            let path = Path::new(name);
+            assert!(is_iso_wv_container(path), "{name}");
+            assert_eq!(classify_file(path), EntryKind::Archive, "{name}");
+            assert!(!is_audio_file_path(path), "{name}");
+        }
+
+        for name in ["album.wv", "album.iso.flac", "iso.wv"] {
+            assert!(!is_iso_wv_container(Path::new(name)), "{name}");
+        }
+        assert_eq!(
+            classify_file(Path::new("album.wv")),
+            EntryKind::AudioFile(AudioFormat::WavPack)
+        );
     }
 
     #[test]

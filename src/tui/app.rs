@@ -729,6 +729,7 @@ mod direct_source_probe_policy_tests {
             "album.tar.zst",
             "album.tar.lz",
             "album.tar.lzma",
+            "album.iso.wv",
         ] {
             assert!(is_nonprobeable_source_for_probe(Path::new(name)), "{name}");
         }
@@ -1241,6 +1242,133 @@ where
     })
 }
 
+
+fn iso_wv_cue_preview_tracks(
+    cue_path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<PreviewTrack>, String> {
+    use crate::tui::browse::CueReferenceResolution;
+
+    let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
+        .map_err(|err| format!("failed to parse ISO-WV CUE: {err}"))?;
+    if sheet.tracks.is_empty() {
+        return Err("ISO-WV CUE sheet has no audio tracks".to_string());
+    }
+    let parent = cue_path
+        .parent()
+        .ok_or_else(|| "ISO-WV CUE path has no parent directory".to_string())?;
+
+    let mut probe_cache = std::collections::HashMap::<PathBuf, (SourceInfo, SourceMetadata)>::new();
+    let mut resolved_paths = Vec::with_capacity(sheet.tracks.len());
+    for track in &sheet.tracks {
+        if cancel.is_cancelled() {
+            return Err("archive preview cancelled".to_string());
+        }
+        let file_ref = track
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("CUE track {} has no FILE reference", track.number))?;
+        let path = match crate::tui::browse::resolve_cue_file_reference_for_queue(parent, file_ref) {
+            CueReferenceResolution::Resolved(path) => path,
+            CueReferenceResolution::Missing => {
+                return Err(format!("CUE FILE {:?} was not found inside ISO-WV", file_ref));
+            }
+            CueReferenceResolution::Ambiguous(candidates) => {
+                return Err(format!(
+                    "CUE FILE {:?} is ambiguous inside ISO-WV ({} candidates)",
+                    file_ref,
+                    candidates.len()
+                ));
+            }
+            CueReferenceResolution::UnsupportedTarget(path) => {
+                return Err(format!(
+                    "CUE FILE {:?} is not supported audio ({})",
+                    file_ref,
+                    path.display()
+                ));
+            }
+        };
+        if !probe_cache.contains_key(&path) {
+            let info = crate::tui::probe::probe_audio(&path)
+                .map_err(|err| format!("probe failed for {}: {err}", path.display()))?;
+            let metadata = crate::tui::probe::read_metadata(&path).unwrap_or_default();
+            probe_cache.insert(path.clone(), (info, metadata));
+        }
+        resolved_paths.push(path);
+    }
+
+    let mut tracks = Vec::with_capacity(sheet.tracks.len());
+    for (idx, track) in sheet.tracks.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("archive preview cancelled".to_string());
+        }
+        let image_path = &resolved_paths[idx];
+        let (image_info, image_metadata) = probe_cache
+            .get(image_path)
+            .ok_or_else(|| format!("missing ISO-WV probe for {}", image_path.display()))?;
+        let start_frames = track.index01_frames.ok_or_else(|| {
+            format!("CUE track {} has no INDEX 01", track.number)
+        })?;
+        let start_secs = f64::from(start_frames) / 75.0;
+        let end_secs = if sheet.tracks.get(idx + 1).is_some()
+            && resolved_paths.get(idx + 1) == Some(image_path)
+        {
+            let next = &sheet.tracks[idx + 1];
+            let end_frames = next.index01_frames.ok_or_else(|| {
+                format!("CUE track {} has no INDEX 01", next.number)
+            })?;
+            f64::from(end_frames) / 75.0
+        } else {
+            image_info.duration_secs
+        };
+        if end_secs < start_secs {
+            return Err(format!(
+                "CUE track {} INDEX 01 is beyond its track end",
+                track.number
+            ));
+        }
+        let duration_secs = end_secs - start_secs;
+        let mut info = image_info.clone();
+        info.duration_secs = duration_secs;
+        if image_info.duration_secs > 0.0 {
+            info.file_size = ((image_info.file_size as f64)
+                * (duration_secs / image_info.duration_secs))
+                .round()
+                .clamp(0.0, image_info.file_size as f64) as u64;
+        }
+
+        let mut metadata = image_metadata.clone();
+        metadata.title = track.title.clone().or_else(|| metadata.title.take());
+        metadata.artist = track
+            .performer
+            .clone()
+            .or_else(|| sheet.performer.clone())
+            .or_else(|| metadata.artist.take());
+        metadata.album = sheet.title.clone().or_else(|| metadata.album.take());
+        metadata.genre = sheet.genre.clone().or_else(|| metadata.genre.take());
+        metadata.year = sheet.date.clone().or_else(|| metadata.year.take());
+        metadata.catalog_number = sheet
+            .catalog
+            .clone()
+            .or_else(|| metadata.catalog_number.take());
+        metadata.track_number = Some(track.number);
+
+        let original_name = track
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("Track {:02}", track.number));
+        tracks.push(PreviewTrack {
+            path: cue_path.to_path_buf(),
+            original_name,
+            info,
+            original_metadata: metadata.clone(),
+            metadata,
+        });
+    }
+    Ok(tracks)
+}
+
 pub(crate) fn spawn_archive_preview(
     runtime: &tokio::runtime::Handle,
     generation: u64,
@@ -1280,6 +1408,24 @@ pub(crate) fn spawn_archive_preview(
             )
             .await
             .map_err(|err| format!("{err}"))?;
+
+            if crate::convert::classify::is_iso_wv_container(&archive_path) {
+                let cue_path = crate::convert::pipeline::materializer_archive::find_single_visible_cue(&staging_dir)
+                    .map_err(|err| format!("{err}"))?;
+                let cancel_for_probe = cancel.clone();
+                let tracks = tokio::task::spawn_blocking(move || {
+                    iso_wv_cue_preview_tracks(&cue_path, &cancel_for_probe)
+                })
+                .await
+                .map_err(|err| format!("ISO-WV preview task failed: {err}"))??;
+                let album_metadata = archive_preview_album_metadata(&tracks);
+                return Ok(ArchivePreview {
+                    staging_dir: staging_dir.clone(),
+                    archive_path,
+                    tracks,
+                    album_metadata,
+                });
+            }
 
             let audio_files = crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_dir)
                 .map_err(|err| format!("audio discovery failed: {err}"))?;

@@ -100,6 +100,7 @@ mod tests {
         "album.tar.zst",
         "album.tar.lz",
         "album.tar.lzma",
+        "album.iso.wv",
     ];
 
     #[test]

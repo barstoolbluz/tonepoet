@@ -23,6 +23,7 @@ use super::progress::{heartbeat, OperationProgressTracker};
 use super::reporter::PipelineReporter;
 use super::tool::{RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
+use super::materializer_cue::CueImageMaterializer;
 
 // =========================================================================
 // Audio file extensions accepted from extracted archives
@@ -60,17 +61,57 @@ impl super::stages::Materializer for ArchiveMaterializer {
         // 1. Reuse a queue-time archive preview extraction when possible.
         // If the preview directory was removed or is empty, fall back to the
         // ordinary extraction path so persisted queue entries remain recoverable.
-        let extraction_root = reusable_pre_extracted_staging(req, &staging.root)
+        // ISO-WV keeps original payload and CUE work in sibling trees: generated
+        // segment carriers must never become eligible companion artifacts.
+        let is_iso_wv = crate::convert::classify::is_iso_wv_container(&req.container);
+        let materializer_extraction_root = if is_iso_wv {
+            staging.root.join("iso-wv-payload")
+        } else {
+            staging.root.clone()
+        };
+        let extraction_root = reusable_pre_extracted_staging(req, &materializer_extraction_root)
             .transpose()?
-            .unwrap_or_else(|| staging.root.clone());
+            .unwrap_or_else(|| materializer_extraction_root.clone());
 
-        if extraction_root == staging.root {
-            extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+        if extraction_root == materializer_extraction_root {
+            if is_iso_wv {
+                std::fs::create_dir_all(&extraction_root)?;
+                extract_archive_to_staging(
+                    &req.container,
+                    &extraction_root,
+                    req.item_id.as_str(),
+                    req.source.archive_password.as_ref().map(|pw| pw.expose()),
+                    runner,
+                    reporter,
+                    cancel,
+                )
+                .await?;
+            } else {
+                extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+            }
         }
 
         // Check cancellation between major steps.
         if cancel.is_cancelled() {
             return Err(MaterializeError::Cancelled);
+        }
+
+        // `.iso.wv` is an ISO filesystem image, not WavPack. Its payload is
+        // interpreted by the existing CUE materializer after extraction so CUE
+        // track geometry, WavPack fallback decoding, metadata, and artwork
+        // semantics remain singular. Generic archives deliberately retain their
+        // historical independent-audio-member behavior.
+        if is_iso_wv {
+            return materialize_iso_wv_cue_payload(
+                req,
+                &extraction_root,
+                staging,
+                runner,
+                reporter,
+                tool_paths,
+                cancel,
+            )
+            .await;
         }
 
         // 2. Discover audio files in the extraction tree.
@@ -172,6 +213,103 @@ impl super::stages::Materializer for ArchiveMaterializer {
     }
 }
 
+
+
+async fn materialize_iso_wv_cue_payload(
+    req: &PipelineRequest,
+    extraction_root: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    reporter: Option<&dyn PipelineReporter>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<PreparedSource, MaterializeError> {
+    let cue_path = find_single_visible_cue(extraction_root)?;
+    let mut cue_req = req.clone();
+    cue_req.container = cue_path;
+    cue_req.pre_extracted_staging = None;
+    // A visible CUE is the authority inside this container. Do not let an
+    // external per-image sidecar policy accidentally disable the container's
+    // own sheet.
+    cue_req.source.cue_sidecar = CueSidecarPolicy::PreferSidecar;
+
+    let mut prepared = super::stages::Materializer::materialize(
+        &CueImageMaterializer,
+        &cue_req,
+        staging,
+        runner,
+        reporter,
+        tool_paths,
+        cancel,
+    )
+    .await?;
+
+    // Archive-preview metadata edits are keyed by displayed track ordinal for
+    // ISO-WV because all CUE tracks can share one physical image. Preserve that
+    // established editor behavior without teaching the CUE materializer about
+    // archive UI state.
+    for track in &mut prepared.tracks {
+        if let Some(override_set) = req
+            .archive_metadata_overrides
+            .iter()
+            .find(|override_set| override_set.source_ordinal == track.id.source_ordinal)
+        {
+            apply_archive_metadata_override(&mut track.metadata, override_set);
+        }
+    }
+    if !req.archive_metadata_overrides.is_empty() {
+        let edited_album = derive_album_metadata(&prepared.tracks);
+        prepared.album_metadata.album = edited_album.album;
+        prepared.album_metadata.album_artist = edited_album.album_artist;
+        prepared.album_metadata.genre = edited_album.genre;
+        prepared.album_metadata.date = edited_album.date;
+    }
+
+    // Keep the outer source kind/container identity as Archive so companion
+    // payload under Artwork/, Readme/, Graphs/, etc. is snapshotted from the
+    // extracted ISO tree before staging cleanup. Track refs remain the CUE
+    // materializer's exact segment refs, so audio realization is unchanged.
+    prepared.container = req.container.clone();
+    prepared.kind = SourceKind::Archive;
+    prepared.provenance.source_kind = SourceKind::Archive;
+    if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
+        prepared.provenance.tool_versions.insert("7z".to_string(), version);
+    }
+    Ok(prepared)
+}
+
+/// Locate the single user-visible CUE authority in a self-contained ISO-WV
+/// payload. Refuse ambiguity rather than selecting by directory order.
+pub(crate) fn find_single_visible_cue(root: &Path) -> Result<PathBuf, MaterializeError> {
+    let mut cues = Vec::new();
+    collect_visible_cues(root, &mut cues)?;
+    cues.sort();
+    cues.dedup();
+    match cues.as_slice() {
+        [cue] => Ok(cue.clone()),
+        [] => Err(MaterializeError::Extraction(
+            "ISO-WV payload contains no user-visible CUE sheet".to_string(),
+        )),
+        _ => Err(MaterializeError::Extraction(format!(
+            "ISO-WV payload contains {} user-visible CUE sheets; album authority is ambiguous",
+            cues.len()
+        ))),
+    }
+}
+
+fn collect_visible_cues(dir: &Path, cues: &mut Vec<PathBuf>) -> Result<(), MaterializeError> {
+    for entry in fs::read_dir(dir).map_err(MaterializeError::Io)? {
+        let entry = entry.map_err(MaterializeError::Io)?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(MaterializeError::Io)?;
+        if file_type.is_dir() {
+            collect_visible_cues(&path, cues)?;
+        } else if file_type.is_file() && crate::convert::classify::is_cue_sheet_path(&path) {
+            cues.push(path);
+        }
+    }
+    Ok(())
+}
 
 fn reusable_pre_extracted_staging(
     req: &PipelineRequest,
@@ -1915,6 +2053,30 @@ mod tests {
     use std::io::Write;
     use std::process::Command;
     use std::sync::Mutex;
+
+    #[test]
+    fn iso_wv_cue_discovery_accepts_one_visible_sheet_and_ignores_hidden_scratch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("Disc");
+        fs::create_dir_all(&nested).expect("nested");
+        let cue = nested.join("Album.CUE");
+        fs::write(&cue, b"FILE \"album.wv\" WAVE\n").expect("visible cue");
+        fs::write(temp.path().join("._Album.cue"), b"scratch").expect("hidden cue");
+
+        assert_eq!(find_single_visible_cue(temp.path()).unwrap(), cue);
+    }
+
+    #[test]
+    fn iso_wv_cue_discovery_refuses_missing_or_ambiguous_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = find_single_visible_cue(temp.path()).unwrap_err().to_string();
+        assert!(missing.contains("no user-visible CUE"));
+
+        fs::write(temp.path().join("a.cue"), b"FILE \"a.wv\" WAVE\n").expect("cue a");
+        fs::write(temp.path().join("b.cue"), b"FILE \"b.wv\" WAVE\n").expect("cue b");
+        let ambiguous = find_single_visible_cue(temp.path()).unwrap_err().to_string();
+        assert!(ambiguous.contains("2 user-visible CUE sheets"));
+    }
 
     #[test]
     fn archived_source_text_items_preserve_custom_tag_provenance_and_promote_pre_emphasis() {

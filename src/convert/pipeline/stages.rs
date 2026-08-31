@@ -588,6 +588,12 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
     if is_bluray_candidate(req)? {
         return Ok(SourceKind::BluRay);
     }
+    // `.iso.wv` is an ISO filesystem container despite its audio-looking final
+    // extension. Route it before CUE-image/audio detection so no adjacent-CUE or
+    // embedded-WavPack probe can reinterpret the outer container.
+    if crate::convert::classify::is_iso_wv_container(&req.container) {
+        return Ok(SourceKind::Archive);
+    }
     if !matches!(req.source.cue_sidecar, CueSidecarPolicy::IgnoreCue) && is_cue_image_candidate(req)? {
         return Ok(SourceKind::CueImage);
     }
@@ -48433,6 +48439,8 @@ mod bluray_routing_tests {
             "album.tar.zst",
             "album.tar.lz",
             "album.tar.lzma",
+            "album.iso.wv",
+            "ALBUM.ISO.WV",
         ] {
             let mut req = log_test_request();
             req.container = PathBuf::from("/tmp").join(name);
@@ -54582,6 +54590,129 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(
             !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
             "MD5-only satisfaction must not skip authoritative SACD metadata application"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_wrapped_cue_carrier_keeps_authoritative_flac_metadata_stage() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = PlannerAudioFormat::Flac;
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.metadata.preserve_artwork = true;
+        fixture.album.req.settings.metadata.store_source_audio_md5 = false;
+        fixture.album.source.kind = SourceKind::Archive;
+        fixture.album.source.provenance.source_kind = SourceKind::Archive;
+        let artwork = fixture._temp.path().join("iso-payload").join("front.jpg");
+        std::fs::create_dir_all(artwork.parent().expect("artwork parent"))
+            .expect("create artwork parent");
+        std::fs::write(&artwork, b"jpeg fixture").expect("write artwork fixture");
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("Eliminator".to_string()),
+            album_artist: Some("ZZ Top".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
+            date: Some("1983".to_string()),
+            total_tracks: 1,
+            extra: BTreeMap::from([
+                (
+                    CUE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+                    artwork.display().to_string(),
+                ),
+                (
+                    CUE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+                    "image/jpeg".to_string(),
+                ),
+            ]),
+            ..AlbumMetadata::default()
+        };
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Gimme All Your Lovin'".to_string()),
+            artist: Some("ZZ Top".to_string()).into(),
+            genre: Some("Rock".to_string()).into(),
+            date: Some("1983".to_string()),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::CueSegmentCarrier {
+            path: fixture._temp.path().join("cue-work").join("track-01.wav"),
+            source_image: fixture._temp.path().join("iso-payload").join("ZZ Top - Eliminator.wv"),
+            start_sample: 0,
+            samples: 44_100,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+        };
+
+        let artifact = successful_output(&fixture, 0)
+            .artifact
+            .expect("successful FLAC artifact");
+        assert_eq!(artifact.metadata_required, PlannedMetadataSatisfaction::none());
+        assert_eq!(artifact.metadata_satisfaction, PlannedMetadataSatisfaction::none());
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "Archive-wrapped CUE carriers must not let an empty concrete planner obligation skip authoritative CUE metadata"
+        );
+
+        let runner = BlockingToolRunner::with_behaviors([
+            ToolBehavior::Succeed, // inspect existing FLAC tags
+            ToolBehavior::Succeed, // write authoritative CUE tags
+            ToolBehavior::Succeed, // remove existing FLAC picture block on rewrite temp
+            ToolBehavior::Succeed, // import the CUE-extracted artwork on rewrite temp
+        ]);
+        let record = apply_metadata(
+            &artifacts,
+            &fixture.album.source,
+            &fixture.album.req,
+            &runner,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("Archive-wrapped CUE authoritative metadata stage");
+        assert!(matches!(record.outcome, StageOutcome::Ok));
+
+        let transcript = runner.transcript();
+        assert_eq!(
+            transcript.len(),
+            4,
+            "the FLAC metadata stage should write prepared CUE tags and preserve CUE-extracted artwork"
+        );
+        assert_eq!(transcript[0].binary, ToolBinary::Metaflac);
+        assert_eq!(transcript[1].binary, ToolBinary::Metaflac);
+        let tags = set_tag_values(&transcript[1].sanitized_args);
+        for (key, value) in [
+            ("TITLE", "Gimme All Your Lovin'"),
+            ("ARTIST", "ZZ Top"),
+            ("ALBUM", "Eliminator"),
+            ("ALBUMARTIST", "ZZ Top"),
+            ("GENRE", "Rock"),
+            ("DATE", "1983"),
+            ("TRACKNUMBER", "1"),
+        ] {
+            assert_eq!(
+                tags.get(key).map(String::as_str),
+                Some(value),
+                "authoritative Archive-wrapped CUE tag {key} must reach the FLAC output"
+            );
+        }
+        assert_eq!(transcript[2].binary, ToolBinary::Metaflac);
+        assert_eq!(transcript[3].binary, ToolBinary::Metaflac);
+        assert!(
+            transcript[3]
+                .sanitized_args
+                .iter()
+                .any(|arg| arg.starts_with("--import-picture-from=") && arg.contains("front.jpg")),
+            "CUE-extracted artwork must follow the same post-encode metadata path"
         );
     }
 

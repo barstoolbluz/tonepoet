@@ -746,10 +746,22 @@ pub fn orchestrator_metadata_stage_required(
 
 #[must_use]
 pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
+    // `.iso.wv` keeps its outer Archive identity after delegating payload
+    // interpretation to CueImageMaterializer. Its CUE carriers are audio-only,
+    // so the existing post-encode CUE metadata stage remains authoritative.
+    let archive_wrapped_cue = matches!(source.kind, SourceKind::Archive)
+        && source.tracks.iter().any(|track| {
+            matches!(
+                &track.source_ref,
+                TrackSourceRef::CueSegmentCarrier { .. }
+                    | TrackSourceRef::CueStreamSegment { .. }
+            )
+        });
+
     (matches!(
         source.kind,
         SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo | SourceKind::BluRay
-    )
+    ) || archive_wrapped_cue
         || (matches!(source.kind, SourceKind::SingleFile)
             && source
                 .album_metadata
@@ -2686,6 +2698,71 @@ mod tests {
         assert!(
             !source_needs_authoritative_metadata(&marker_only),
             "the recovery marker must not bypass the existing metadata-present conjunct"
+        );
+    }
+
+    #[test]
+    fn ordinary_archive_staged_file_is_not_materializer_authoritative() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let src = source(
+            SourceKind::Archive,
+            track(TrackSourceRef::StagedFile(temp.path().join("track.flac"))),
+            temp.path(),
+        );
+
+        assert!(!source_needs_authoritative_metadata(&src));
+        assert!(
+            !metadata_obligations_for_request(&req, &src).authoritative_tags_applied,
+            "ordinary archive tracks keep their existing planner-owned metadata path"
+        );
+    }
+
+    #[test]
+    fn archive_wrapped_cue_segment_carrier_is_materializer_authoritative() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let src = source(
+            SourceKind::Archive,
+            track(cue_carrier(
+                temp.path().join("track-01.wav"),
+                temp.path().join("album.wv"),
+                0,
+                44_100,
+            )),
+            temp.path(),
+        );
+
+        assert!(source_needs_authoritative_metadata(&src));
+        assert!(
+            metadata_obligations_for_request(&req, &src).authoritative_tags_applied,
+            "an Archive wrapper around a file-backed CUE carrier retains CUE metadata authority"
+        );
+    }
+
+    #[test]
+    fn archive_wrapped_cue_stream_segment_is_materializer_authoritative() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let src = source(
+            SourceKind::Archive,
+            track(TrackSourceRef::CueStreamSegment {
+                fallback_path: temp.path().join("track-01.wav"),
+                source_image: temp.path().join("disc-1.flac"),
+                decode_path: temp.path().join("disc-1.flac"),
+                start_sample: 0,
+                samples: 44_100,
+                image_samples: 88_200,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+                channels: 2,
+            }),
+            temp.path(),
+        );
+
+        assert!(source_needs_authoritative_metadata(&src));
+        assert!(
+            metadata_obligations_for_request(&req, &src).authoritative_tags_applied,
+            "an Archive wrapper around a streaming CUE carrier retains CUE metadata authority"
         );
     }
 
