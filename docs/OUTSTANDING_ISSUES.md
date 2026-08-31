@@ -848,9 +848,11 @@ label. Not investigated.
 
 ---
 
-## 14. `memory_budget::held_run_lock_skips_only_active_tree` fails intermittently under the full workspace gate — cause unknown
+## 14. `memory_budget` staging-cleanup tests intermittently judge a dead lock live — 3 failures in 4 gate runs
 
-**Status:** open, **undiagnosed**. Observed 2026-08-30 while gating `0f92b5f`.
+**Status:** open, **failure mode identified, mechanism unconfirmed**. First observed
+2026-08-30 while gating `0f92b5f`; both affected tests' panics captured later the same
+day (see the 2026-08-30 updates below). Originally filed as "cause unknown".
 
 **Symptom.** One failure in a full `cargo test --workspace --no-fail-fast` run:
 
@@ -881,7 +883,45 @@ while the unlocked tree and lock are gone.
 session. The module holds a `scoped_test_coordination_root`, so it is not the
 unscoped-coordination pattern behind issue #12.
 
-### 2026-08-30 update — a second test in this module failed, and the panic was captured
+### 2026-08-30 update (2) — both tests' panics captured; the failure mode is now named
+
+Two further gate runs, while gating `22f32b1`, failed on the **original** test with its
+panic preserved:
+
+```
+convert::pipeline::memory_budget::tests::held_run_lock_skips_only_active_tree
+memory_budget.rs:1548
+assertion failed: !stale_dir.exists()
+```
+
+**The stale tree was not reaped.** That is the opposite of the theory recorded further
+below, which predicted the *active* tree being wrongly deleted
+(`assert!(active_dir.exists())` failing). Cleanup is skipping a tree it should remove.
+
+Set beside the sibling test's panic, one failure mode explains both:
+
+| test | observed |
+|---|---|
+| `execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired` | a released lease still classifies **live-owned**, so retirement is refused |
+| `held_run_lock_skips_only_active_tree` | a stale tree is **not reaped**, so cleanup skipped it |
+
+Both are **something judged live when it is not**. The original theory had the polarity
+backwards in both cases.
+
+A mechanism consistent with both, still unconfirmed: `flock` locks attach to the open
+file description, and two separate `open()` calls on the same file conflict **even within
+one process**. `probe_existing_run_lock` (`memory_budget.rs:1075`) reads `WouldBlock` as
+`RunLockProbe::Held`, so any other handle open anywhere in the test binary against the
+same lock path — or a handle not yet dropped after a release — produces a false "live"
+and the tree is skipped. That would explain why these tests pass alone and fail only
+under the parallel gate.
+
+**Rate: 3 occurrences in 4 gate runs on 2026-08-30**, alternating between the two tests.
+This is frequent enough, and now well-enough characterised, to brief as a defect rather
+than track as a flaky test. Note the precedent: the `dsf_tags` intermittent with this same
+signature earlier in the session was a genuine production defect, shipped as `983fa0c`.
+
+### 2026-08-30 update (1) — a second test in this module failed, and the panic was captured
 
 While gating the #2 fix, gate run 2 failed on a **different** test in the same module:
 
