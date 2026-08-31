@@ -1189,3 +1189,91 @@ suite stops asserting a contract the gate deliberately narrowed.
 **Related:** issue #15 (the unexplained cut/paste blocking, where this gate is discussed),
 issue #7 (same subsystem, supersession still open), issue #12 (unscoped coordination
 roots in tests).
+
+---
+
+## 17. "Completed (1 warning)" never says what the warning was — and the warning it fired here was wrong
+
+**Status:** open. Reported 2026-08-31 after converting
+`Lionel Richie - Can't Slow Down (1983)`, 8 DSF sources → FLAC.
+
+Two problems, related but separable.
+
+### (a) The warning text never reaches the user
+
+The queue shows `Completed (1 warning)` per item and nothing more. To learn what the
+warning was, the user must know a per-album `conversion.log` exists, locate it inside the
+output folder, and search it. Nothing in the UI names the file or the text.
+
+**This is structural**, visible in the status type (`src/convert/queue.rs:104-112`):
+
+```rust
+Completed {
+    output_path: PathBuf,
+    log_path: Option<PathBuf>,
+    warning_count: u32,          // ← only a count survives
+},
+CompletedWithActionErrors {
+    output_path: PathBuf,
+    log_path: Option<PathBuf>,
+    errors: Vec<String>,         // ← the sibling variant keeps its text
+},
+```
+
+`source_warning_count` (`src/convert/processor.rs:2788`) walks `track.warnings` purely to
+take `.len()`:
+
+```rust
+source.tracks.iter().fold(0_u32, |total, track| {
+    total.saturating_add(u32::try_from(track.warnings.len()).unwrap_or(u32::MAX))
+})
+```
+
+The strings exist at that moment and are discarded. `CompletedWithActionErrors` already
+demonstrates the pattern for carrying text into a terminal queue status; `Completed` does
+not use it.
+
+**Correction to the original report:** the per-album `conversion.log` *does* record the
+text — once per track, 8 occurrences in this job's log, first at line 53. The defect is
+discoverability, not absence.
+
+### (b) The warning appears to be a false positive
+
+The text was:
+
+```
+Warning: Track ordering unavailable; album publication is shared and the conversion
+log records tracks in completion order; filenames numbered by …
+```
+
+But the output is correctly ordered. Verified against the source side/position encoded in
+the DSF filenames:
+
+```
+01  A1  Can't Slow Down            05  B1  Love Will Find a Way
+02  A2  All Night Long             06  B2  The Only One
+03  A3  Penny Lover                07  B3  Running with the Night
+04  A4  Stuck on You               08  B4  Hello
+```
+
+Filenames are sequential `01`–`08` and the user reports `TRACKNUMBER` matches. So
+"ordering unavailable" fired on an album whose ordering was in fact fully recovered and
+correct — and it fired identically for all eight tracks.
+
+Whether the warning's condition is too broad, or ordering genuinely was unavailable at the
+point it was raised and recovered later by another path, was not determined.
+
+### Why this pairing matters
+
+A warning that cannot be read and is also wrong trains the user to ignore the warning
+count entirely. That devalues the mechanism for the cases where it is right.
+
+### Notes
+
+- The album in question is the same one whose queue was interrupted in the
+  concurrent-session scenario recorded as #15; no connection established, but the jobs are
+  from the same session.
+- The user checked `~/.cache/tonepoet.log` as well and did not find it there. Worth noting
+  that file **does not exist** on this machine, so its silence is not evidence about
+  warning routing — it is a separate question whether a general application log is
+  expected to be written there at all.
