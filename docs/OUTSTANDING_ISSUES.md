@@ -1282,3 +1282,97 @@ count entirely. That devalues the mechanism for the cases where it is right.
   that file **does not exist** on this machine, so its silence is not evidence about
   warning routing — it is a separate question whether a general application log is
   expected to be written there at all.
+
+---
+
+## 18. Two concurrent conversions into one album directory refuse each other — including the one that started first
+
+**Status:** open, **reproduced deterministically from the CLI**. 2026-08-31.
+
+### Reproduction
+
+Two `tonepoet convert` runs, **different tracks of the same album**, same `--output`
+directory, the second started ~8s after the first:
+
+```
+A: convert "…/B1 Round And Round.dsf" --format flac --output <dir>
+B: convert "…/B2 Truly.dsf"           --format flac --output <dir>   # 8s later
+```
+
+Both fail:
+
+```
+Conversion complete: 0/1 succeeded, 1 failed
+  failed: … — PlanOutputs: output concurrency admission failed:
+  filesystem mutation conflicts with live owner:
+  '<dir>/Lionel Richie,(Motown - VIL-6011,Japan)'
+  overlaps '<dir>/Lionel Richie,(Motown - VIL-6011,Japan)'
+```
+
+**Control:** the same single conversion with no competitor succeeds — `1/1 succeeded`.
+Same binary, same source album, same output directory. Concurrency is the only variable.
+
+### Two observations, stated separately
+
+**(a) The claim is taken on the album directory, not the output files.**
+`admit_planned_output_claim` (`src/convert/pipeline/stages.rs:30018`) resolves a
+`ClaimMode::Write` / `ClaimScope::Subtree` claim on `plan.album_dir`
+(`:30026-30030`). Two conversions of different tracks therefore collide even though
+their destination files do not overlap. Whether album-directory granularity is the
+intended boundary is a design question we are not answering here — a shared album
+namespace may well need coordinating; the observation is only that track-disjoint work
+is currently refused.
+
+**(b) The incumbent is refused too.** A had held the claim for ~8 seconds and still
+failed with the same error. Note the message reports the path as overlapping *itself* —
+the same string on both sides — which is what a process colliding with a claim it cannot
+distinguish from its own would look like. Whether (b) is a consequence of (a) or an
+independent defect, we did not determine.
+
+### Why this matters beyond the CLI
+
+This is the mechanism behind the `Interrupted — Retry` queue state reported from the TUI,
+and the chain is now fully traced:
+
+1. two sessions target the same album output directory;
+2. output-claim admission refuses both;
+3. no run starts, so **no `conversion_queue_executions` row is ever created**;
+4. the crash fence in `run_convert` (`src/main.rs:1826`) — which writes every `Queued`
+   item as `Interrupted` *before* `process_queue_with_progress`, so a crash cannot leave a
+   false "queued" record — is never lifted by the post-run `sync_queue`
+   (`src/main.rs:1923`);
+5. the queue displays `Interrupted — Retry`.
+
+Verified against the live database: the 8 stuck items carry `execution_id` null, the
+executions table held 0 rows, and the rows remained under their **own** session's scope
+(`e601f9e8`) throughout. A separate mid-flight snapshot of a healthy single conversion
+shows the fence lifting correctly — `Processing`, `exec=y`, 1 execution row — so the fence
+machinery itself works.
+
+### Theories eliminated
+
+Recorded so they are not re-derived. All three were proposed during investigation and are
+contradicted by the evidence above:
+
+- **queue-scope theft** — the rows were never reassigned; the
+  `UPDATE … WHERE id=? AND owner_scope=?` guard (`src/db.rs:3732`) held;
+- **a live session's scope misclassified as dead** — `/proc/locks` confirmed the older
+  session held a valid `flock` on its own queue-scope lease throughout;
+- **`recover_dead_queue_scopes` interrupting a live peer** — that path skips
+  `ClaimAvailability::Live` and the older session classified as live.
+
+### Relationship to #15
+
+#15 records a second session blocking the first session's **cut/paste**, refused with a
+`filesystem mutation conflicts with …` message from the same `MutationClaimGuard`
+admission family. This entry is **conversion** admission. They may share a root or may
+not — we have not established that either way, and are cross-referencing rather than
+merging them.
+
+### Snapshot tooling
+
+`/home/daedalus/.cache/tonepoet-snap.sh` captures, in one shot: live tonepoet processes
+with ages, every queue-scope lease with owner liveness and whether the `flock` is actually
+held, other populated lease families, and all `conversion_queue_v24` rows with owner
+scope, position, execution flag, status and source filename. That combination is what made
+this diagnosable; earlier attempts failed because a session exited between checks.
