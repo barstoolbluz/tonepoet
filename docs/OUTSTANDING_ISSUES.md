@@ -1246,8 +1246,9 @@ Warning: Track ordering unavailable; album publication is shared and the convers
 log records tracks in completion order; filenames numbered by …
 ```
 
-But the output is correctly ordered. Verified against the source side/position encoded in
-the DSF filenames:
+But the output is correctly ordered. The conversion log records the sources tonepoet
+actually consumed — `A1 Can't Slow Down.dsf` … `B4 Hello.dsf` — and the published FLACs
+correspond to them in order:
 
 ```
 01  A1  Can't Slow Down            05  B1  Love Will Find a Way
@@ -1262,6 +1263,10 @@ correct — and it fired identically for all eight tracks.
 
 Whether the warning's condition is too broad, or ordering genuinely was unavailable at the
 point it was raised and recovered later by another path, was not determined.
+
+Note the source files have since been renamed by the user to drop the `A1`/`B4` side
+prefixes, so the current on-disk names no longer match the log. Any future investigation
+should take source identity from the conversion log rather than from the directory.
 
 ### Why this pairing matters
 
