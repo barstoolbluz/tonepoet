@@ -27,8 +27,7 @@ use tonepoet_pipeline::{CommandEnvironmentPolicy, Sha256Digest};
 use super::errors::ToolRunnerError;
 use super::types::SecretString;
 
-/// Closed set of every external tool the pipeline invokes. No later
-/// PR adds a variant.
+/// Closed set of every external tool the pipeline invokes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolBinary {
     SevenZip,
@@ -49,6 +48,10 @@ pub enum ToolBinary {
     Tar,
     /// RAR archiver used for archive repackaging.
     Rar,
+    /// Unprivileged ISO 9660 FUSE reader used by `.iso.wv`.
+    FuseIso,
+    /// ISO 9660 authoring/verification tool used when `.iso.wv` is repackaged.
+    Xorriso,
 }
 
 impl ToolBinary {
@@ -70,6 +73,8 @@ impl ToolBinary {
             Self::AtomicParsley => "AtomicParsley",
             Self::Tar => "tar",
             Self::Rar => "rar",
+            Self::FuseIso => "fuseiso",
+            Self::Xorriso => "xorriso",
         }
     }
 
@@ -755,7 +760,8 @@ fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
     match binary {
         ToolBinary::SevenZip | ToolBinary::Ssrc => &[],
         ToolBinary::Tar | ToolBinary::Rar => &["--version"],
-        ToolBinary::Sox | ToolBinary::Opustags => &["--help"],
+        ToolBinary::Xorriso => &["-version"],
+        ToolBinary::Sox | ToolBinary::Opustags | ToolBinary::FuseIso => &["--help"],
         // AtomicParsley emits its version banner on the zero-argument path;
         // `--version` is not its canonical identity probe.
         ToolBinary::AtomicParsley => &[],
@@ -819,7 +825,9 @@ pub(crate) fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr
             | ToolBinary::Wvtag
             | ToolBinary::AtomicParsley
             | ToolBinary::Tar
-            | ToolBinary::Rar => first_version_like_token(line),
+            | ToolBinary::Rar
+            | ToolBinary::FuseIso
+            | ToolBinary::Xorriso => first_version_like_token(line),
         };
         if parsed.is_some() {
             return parsed;

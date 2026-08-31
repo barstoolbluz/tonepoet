@@ -558,6 +558,12 @@ fn defer_quit_for_browse_archive_metadata(
         app.set_status("quit deferred: waiting for archive delete to finish".to_string());
         return true;
     }
+    if app.pending_browse_archive_create.is_some() {
+        app.should_quit = false;
+        app.quit_after_browse_archive_create = true;
+        app.set_status("quit deferred: waiting for archive create to finish".to_string());
+        return true;
+    }
 
     // Metadata preparation has not committed user edits yet. Cancel it before
     // draining tab-owned staging so `exit_browse_archive` cannot keep refusing
@@ -3012,6 +3018,1162 @@ fn handle_archive_metadata_editor_prepared(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsoWvPersistencePromptKind {
+    MetadataOnly,
+    Structural,
+    SidecarUnsupported,
+}
+
+fn iso_wv_persistence_prompt_kind(
+    app: &AppState,
+    context: &super::app::ArchiveMetadataEditContext,
+) -> IsoWvPersistencePromptKind {
+    if let Some(staging) = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == context.archive_path)
+        .and_then(|archive| archive.staging.as_ref())
+        .filter(|staging| staging.staging_dir == context.staging_dir)
+    {
+        if staging.edits.iter().any(|edit| {
+            matches!(
+                edit,
+                crate::tui::browse::ArchiveEdit::Rename { .. }
+                    | crate::tui::browse::ArchiveEdit::Delete { .. }
+                    | crate::tui::browse::ArchiveEdit::Create { .. }
+            )
+        }) {
+            return IsoWvPersistencePromptKind::Structural;
+        }
+        // Field-level text edits are the only staged mutations for which the
+        // sidecar path has an exact, replayable delta. A ContentModified marker
+        // can represent artwork, ReplayGain, or another writer whose complete
+        // mutation is not expressible in CUE text. Never discard such staged
+        // bytes by treating them as sidecar-safe metadata.
+        if staging.edits.iter().any(|edit| {
+            matches!(edit, crate::tui::browse::ArchiveEdit::ContentModified { .. })
+        }) {
+            return IsoWvPersistencePromptKind::SidecarUnsupported;
+        }
+        return IsoWvPersistencePromptKind::MetadataOnly;
+    }
+
+    // Editor-owned staging is created only by the metadata editor. A detached
+    // Browse-owned staging directory, by contrast, can be a recovery/retry of
+    // structural work; fail toward the mandatory hash-change warning.
+    if context.editor_owns_staging {
+        if context.iso_wv_metadata_fields.is_empty() {
+            // An editor-owned staging tree with no field-level deltas can still
+            // contain binary artwork or other tag-writer mutations. The CUE
+            // sidecar cannot prove it represents those bytes losslessly.
+            IsoWvPersistencePromptKind::SidecarUnsupported
+        } else {
+            IsoWvPersistencePromptKind::MetadataOnly
+        }
+    } else {
+        IsoWvPersistencePromptKind::Structural
+    }
+}
+
+fn open_iso_wv_persistence_prompt(
+    app: &mut AppState,
+    context: super::app::ArchiveMetadataEditContext,
+) {
+    let archive_label = context
+        .archive_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| context.archive_path.display().to_string());
+    match iso_wv_persistence_prompt_kind(app, &context) {
+        IsoWvPersistencePromptKind::MetadataOnly => {
+            app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                message: format!(
+                    "Save metadata changes for {archive_label} as a sidecar CUE, or repackage the ISO?\n\nThe sidecar keeps the ISO byte-for-byte unchanged. Repackaging writes the changes into the image and changes its hash."
+                ),
+                action: super::app::ConfirmAction::IsoWvMetadataPersistence { context },
+            };
+            app.set_status("ISO-WV metadata save: choose sidecar CUE or repackage ISO");
+        }
+        IsoWvPersistencePromptKind::Structural => {
+            app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                message: format!(
+                    "This structural edit cannot be stored in a sidecar CUE. Continuing rebuilds {archive_label} and changes its hash.\n\nRepackage the ISO now?"
+                ),
+                action: super::app::ConfirmAction::IsoWvStructuralRepackage { context },
+            };
+            app.set_status("ISO-WV structural save requires a hash-changing repackage");
+        }
+        IsoWvPersistencePromptKind::SidecarUnsupported => {
+            app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                message: format!(
+                    "This edit includes changes that a CUE sidecar cannot represent losslessly. Continuing rebuilds {archive_label} and changes its hash.\n\nRepackage the ISO now?"
+                ),
+                action: super::app::ConfirmAction::IsoWvStructuralRepackage { context },
+            };
+            app.set_status("ISO-WV save requires repackaging because the staged change is not sidecar-representable");
+        }
+    }
+}
+
+fn cue_user_metadata_set(
+    metadata: &mut crate::convert::cue_parser::CueUserMetadata,
+    key: &str,
+    values: Vec<String>,
+) {
+    let existing = metadata
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .cloned();
+    if let Some(existing) = existing {
+        metadata.remove(&existing);
+    }
+    if !key.trim().is_empty() && !values.is_empty() {
+        metadata.insert(key.to_string(), values);
+    }
+}
+
+fn cue_user_metadata_set_scalar(
+    metadata: &mut crate::convert::cue_parser::CueUserMetadata,
+    key: &str,
+    value: Option<String>,
+) {
+    cue_user_metadata_set(
+        metadata,
+        key,
+        value.filter(|value| !value.is_empty()).into_iter().collect(),
+    );
+}
+
+fn iso_wv_image_tag_is_track_scoped(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "cuesheet"
+            | "tracknumber"
+            | "track"
+            | "tracktotal"
+            | "totaltracks"
+            | "musicbrainztrackid"
+            | "musicbrainzrecordingid"
+            | "musicbrainzreleasetrackid"
+    ) || normalized.starts_with("replaygaintrack")
+        || normalized.starts_with("r128track")
+}
+
+fn iso_wv_image_tag_snapshot(
+    entries: &[crate::tui::probe::TagEntry],
+) -> crate::convert::cue_parser::CueUserMetadata {
+    let mut snapshot = crate::convert::cue_parser::CueUserMetadata::new();
+    for entry in entries {
+        if entry.is_binary || entry.per_file_values.len() != 1 {
+            continue;
+        }
+        let key = crate::tui::probe::canonical_metadata_display_key(&entry.display_key);
+        if key.trim().is_empty() || key.eq_ignore_ascii_case("CUESHEET") {
+            continue;
+        }
+        let values = entry.per_file_values[0].to_texts();
+        if values.is_empty() {
+            continue;
+        }
+        cue_user_metadata_set(&mut snapshot, &key, values);
+    }
+    snapshot
+}
+
+fn iso_wv_track_snapshot(
+    base: &crate::convert::cue_parser::CueUserMetadata,
+    track: &crate::convert::pipeline::TrackMetadata,
+    album: &crate::convert::pipeline::AlbumMetadata,
+) -> crate::convert::cue_parser::CueUserMetadata {
+    let mut snapshot = base.clone();
+    snapshot.retain(|key, _| !iso_wv_image_tag_is_track_scoped(key));
+
+    cue_user_metadata_set_scalar(&mut snapshot, "TITLE", track.title.clone());
+    cue_user_metadata_set(&mut snapshot, "ARTIST", track.artist.to_vec());
+    cue_user_metadata_set(&mut snapshot, "ALBUMARTIST", track.album_artist.to_vec());
+    cue_user_metadata_set(&mut snapshot, "COMPOSER", track.composer.to_vec());
+    cue_user_metadata_set(&mut snapshot, "PERFORMER", track.performer.to_vec());
+    cue_user_metadata_set(&mut snapshot, "ARRANGER", track.arranger.to_vec());
+    cue_user_metadata_set(&mut snapshot, "GENRE", track.genre.to_vec());
+    cue_user_metadata_set_scalar(&mut snapshot, "DATE", track.date.clone());
+    cue_user_metadata_set_scalar(&mut snapshot, "ISRC", track.isrc.clone());
+    cue_user_metadata_set_scalar(&mut snapshot, "PUBLISHER", track.publisher.clone());
+    cue_user_metadata_set_scalar(&mut snapshot, "COPYRIGHT", track.copyright.clone());
+    cue_user_metadata_set_scalar(&mut snapshot, "COMMENT", track.comment.clone());
+    cue_user_metadata_set_scalar(
+        &mut snapshot,
+        "ALBUM",
+        track
+            .extra
+            .get("album")
+            .cloned()
+            .or_else(|| album.album.clone()),
+    );
+    cue_user_metadata_set_scalar(
+        &mut snapshot,
+        "DISCNUMBER",
+        album.disc_number.map(|value| value.to_string()),
+    );
+    cue_user_metadata_set_scalar(
+        &mut snapshot,
+        "DISCTOTAL",
+        album.total_discs.map(|value| value.to_string()),
+    );
+    if let Some(catalog) = album
+        .extra
+        .get("catalognumber")
+        .or_else(|| album.extra.get("catalog"))
+        .cloned()
+    {
+        cue_user_metadata_set_scalar(&mut snapshot, "CATALOGNUMBER", Some(catalog));
+    }
+    snapshot
+}
+
+fn iso_wv_album_snapshot(
+    base: &crate::convert::cue_parser::CueUserMetadata,
+    album: &crate::convert::pipeline::AlbumMetadata,
+) -> crate::convert::cue_parser::CueUserMetadata {
+    let mut snapshot = base.clone();
+    snapshot.retain(|key, _| !iso_wv_image_tag_is_track_scoped(key));
+    cue_user_metadata_set_scalar(&mut snapshot, "ALBUM", album.album.clone());
+    cue_user_metadata_set(&mut snapshot, "ALBUMARTIST", album.album_artist.to_vec());
+    cue_user_metadata_set(&mut snapshot, "GENRE", album.genre.to_vec());
+    cue_user_metadata_set_scalar(&mut snapshot, "DATE", album.date.clone());
+    cue_user_metadata_set_scalar(
+        &mut snapshot,
+        "DISCNUMBER",
+        album.disc_number.map(|value| value.to_string()),
+    );
+    cue_user_metadata_set_scalar(
+        &mut snapshot,
+        "DISCTOTAL",
+        album.total_discs.map(|value| value.to_string()),
+    );
+    if let Some(catalog) = album
+        .extra
+        .get("catalognumber")
+        .or_else(|| album.extra.get("catalog"))
+        .cloned()
+    {
+        cue_user_metadata_set_scalar(&mut snapshot, "CATALOGNUMBER", Some(catalog));
+    }
+    cue_user_metadata_set(
+        &mut snapshot,
+        crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY,
+        vec!["1".to_string()],
+    );
+    snapshot
+}
+
+fn iso_wv_single_image_path(
+    cue_path: &std::path::Path,
+    sheet: &crate::convert::cue_parser::CueSheet,
+) -> Result<std::path::PathBuf, String> {
+    use crate::tui::browse::CueReferenceResolution;
+
+    let parent = cue_path
+        .parent()
+        .ok_or_else(|| "ISO-WV CUE path has no parent directory".to_string())?;
+    let mut image: Option<std::path::PathBuf> = None;
+    for track in &sheet.tracks {
+        let file_ref = track
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("CUE track {} has no FILE reference", track.number))?;
+        let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(parent, file_ref) {
+            CueReferenceResolution::Resolved(path) => path,
+            CueReferenceResolution::Missing => {
+                return Err(format!("CUE FILE {:?} was not found in ISO-WV staging", file_ref));
+            }
+            CueReferenceResolution::Ambiguous(candidates) => {
+                return Err(format!(
+                    "CUE FILE {:?} is ambiguous in ISO-WV staging ({} candidates)",
+                    file_ref,
+                    candidates.len()
+                ));
+            }
+            CueReferenceResolution::UnsupportedTarget(path) => {
+                return Err(format!("CUE FILE {:?} is not supported audio ({})", file_ref, path.display()));
+            }
+        };
+        let identity = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        if let Some(existing) = &image {
+            let existing_identity =
+                std::fs::canonicalize(existing).unwrap_or_else(|_| existing.clone());
+            if existing_identity != identity {
+                return Err(
+                    "ISO-WV metadata sidecar currently requires a single-image CUE; choose Repackage ISO for a multi-image layout"
+                        .to_string(),
+                );
+            }
+        } else {
+            image = Some(resolved);
+        }
+    }
+    image.ok_or_else(|| "ISO-WV CUE has no audio tracks".to_string())
+}
+
+fn iso_wv_snapshot_values(
+    snapshot: &crate::convert::cue_parser::CueUserMetadata,
+    field: &str,
+) -> Vec<String> {
+    snapshot
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(field))
+        .map(|(_, values)| values.clone())
+        .unwrap_or_default()
+}
+
+fn iso_wv_explicit_field_is_album_only(field: &str) -> bool {
+    let normalized = field
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "title"
+            | "tracktitle"
+            | "tracknumber"
+            | "track"
+            | "tracktotal"
+            | "totaltracks"
+            | "musicbrainztrackid"
+            | "musicbrainzrecordingid"
+            | "musicbrainzreleasetrackid"
+    ) || normalized.starts_with("replaygaintrack")
+        || normalized.starts_with("r128track")
+}
+
+fn iso_wv_first_snapshot_value(values: &[String]) -> Option<String> {
+    values
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .cloned()
+}
+
+fn apply_iso_wv_explicit_image_metadata_fields(
+    sheet: &mut crate::convert::cue_parser::CueSheet,
+    snapshot: &crate::convert::cue_parser::CueUserMetadata,
+    fields: &[String],
+) {
+    for field in fields {
+        let key = crate::tui::probe::canonical_metadata_display_key(field);
+        if key.trim().is_empty() || key.eq_ignore_ascii_case("CUESHEET") {
+            continue;
+        }
+        let values = iso_wv_snapshot_values(snapshot, &key);
+        let first = iso_wv_first_snapshot_value(&values);
+        cue_user_metadata_set(&mut sheet.user_metadata, &key, values.clone());
+        if !iso_wv_explicit_field_is_album_only(&key) {
+            for track in &mut sheet.tracks {
+                cue_user_metadata_set(&mut track.user_metadata, &key, values.clone());
+            }
+        }
+
+        // A Tonepoet metadata block is authoritative only when it contains a
+        // value. Explicit deletion therefore also has to clear the standard CUE
+        // projection that would otherwise spring back to life after the inert
+        // metadata entry disappears. Keep this mapping deliberately limited to
+        // fields whose normal CueImage precedence can shadow the WavPack tag.
+        match key.trim().to_ascii_uppercase().as_str() {
+            "ALBUM" => sheet.title = first,
+            "ALBUMARTIST" => sheet.performer = first,
+            "GENRE" => sheet.genre = first,
+            "DATE" | "YEAR" => sheet.date = first,
+            "CATALOG" | "CATALOGNUMBER" => sheet.catalog = first,
+            "ARTIST" | "PERFORMER" => {
+                for track in &mut sheet.tracks {
+                    track.performer = first.clone();
+                }
+                if first.is_none() {
+                    // With no track-level performer, CueImage falls back to the
+                    // album PERFORMER. Clear it as well for an explicit artist
+                    // deletion so the old CUE value cannot resurrect.
+                    sheet.performer = None;
+                }
+            }
+            "ISRC" => {
+                for track in &mut sheet.tracks {
+                    track.isrc = first.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsoWvSidecarLoadMode {
+    SidecarSave,
+    Repackage,
+}
+
+fn iso_wv_cue_track_layout_matches_ignoring_files(
+    expected: &crate::convert::cue_parser::CueSheet,
+    candidate: &crate::convert::cue_parser::CueSheet,
+) -> bool {
+    expected.tracks.len() == candidate.tracks.len()
+        && expected
+            .tracks
+            .iter()
+            .zip(candidate.tracks.iter())
+            .all(|(expected, candidate)| {
+                expected.number == candidate.number
+                    && expected.index00_frames == candidate.index00_frames
+                    && expected.index01_frames == candidate.index01_frames
+            })
+}
+
+fn is_tonepoet_iso_wv_metadata_snapshot(
+    sheet: &crate::convert::cue_parser::CueSheet,
+) -> bool {
+    crate::convert::cue_parser::cue_user_metadata_values(
+        &sheet.user_metadata,
+        crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY,
+    )
+    .is_some_and(|values| values.iter().any(|value| value.trim() == "1"))
+}
+
+fn load_existing_iso_wv_metadata_sidecar(
+    sidecar_path: &std::path::Path,
+    internal_sheet: &crate::convert::cue_parser::CueSheet,
+    mode: IsoWvSidecarLoadMode,
+) -> Result<Option<crate::convert::cue_parser::CueSheet>, String> {
+    if !sidecar_path.exists() {
+        return Ok(None);
+    }
+    let sidecar = crate::tui::cue_parser::parse_cue_file(sidecar_path)
+        .map_err(|err| format!("failed to parse existing ISO-WV sidecar {}: {err}", sidecar_path.display()))?;
+    let is_tonepoet_snapshot = is_tonepoet_iso_wv_metadata_snapshot(&sidecar);
+    if !is_tonepoet_snapshot {
+        return match mode {
+            IsoWvSidecarLoadMode::SidecarSave => Err(format!(
+                "{} already exists but is not a Tonepoet ISO-WV metadata sidecar; refusing to overwrite an unrelated CUE. Choose Repackage ISO or move that file first",
+                sidecar_path.display()
+            )),
+            IsoWvSidecarLoadMode::Repackage => Ok(None),
+        };
+    }
+
+    let geometry_matches =
+        crate::convert::pipeline::materializer_archive::iso_wv_cue_geometry_matches(
+            internal_sheet,
+            &sidecar,
+        );
+    let structural_rename_only_drift = mode == IsoWvSidecarLoadMode::Repackage
+        && iso_wv_cue_track_layout_matches_ignoring_files(internal_sheet, &sidecar);
+    if !geometry_matches && !structural_rename_only_drift {
+        return Err(
+            "existing ISO-WV metadata sidecar no longer matches the image track geometry; refusing to merge metadata onto stale geometry"
+                .to_string(),
+        );
+    }
+    Ok(Some(sidecar))
+}
+
+struct IsoWvMetadataProjection {
+    cue_path: std::path::PathBuf,
+    internal_text: String,
+    internal_sheet: crate::convert::cue_parser::CueSheet,
+    authoritative_sheet: crate::convert::cue_parser::CueSheet,
+    sidecar_path: std::path::PathBuf,
+    existing_tonepoet_sidecar: bool,
+}
+
+fn compute_iso_wv_metadata_projection(
+    context: &super::app::ArchiveMetadataEditContext,
+    mode: IsoWvSidecarLoadMode,
+) -> Result<IsoWvMetadataProjection, String> {
+    let cue_path = crate::convert::pipeline::materializer_archive::find_single_visible_cue(
+        &context.staging_dir,
+    )
+    .map_err(|err| format!("locate staged ISO-WV CUE: {err}"))?;
+    let internal_text = std::fs::read(&cue_path)
+        .map_err(|err| format!("read staged ISO-WV CUE '{}': {err}", cue_path.display()))
+        .and_then(|raw| {
+            crate::convert::cue_parser::decode_cue_bytes_for_path(&raw, &cue_path)
+                .map_err(|err| format!("decode staged ISO-WV CUE '{}': {err}", cue_path.display()))
+        })?;
+    let internal_sheet = crate::convert::cue_parser::parse_cue(&internal_text);
+    if internal_sheet.tracks.is_empty() {
+        return Err("staged ISO-WV CUE has no audio tracks".to_string());
+    }
+
+    let sidecar_path =
+        crate::convert::pipeline::materializer_archive::iso_wv_metadata_sidecar_path(
+            &context.archive_path,
+        );
+    let existing_sidecar = load_existing_iso_wv_metadata_sidecar(
+        &sidecar_path,
+        &internal_sheet,
+        mode,
+    )?;
+    let existing_tonepoet_sidecar = existing_sidecar.is_some();
+
+    if existing_tonepoet_sidecar && context.iso_wv_metadata_fields.is_empty()
+        && mode == IsoWvSidecarLoadMode::SidecarSave
+    {
+        return Err(
+            "the existing ISO-WV sidecar contains prior sidecar-only metadata, but this staged save has no field-level delta to merge safely; choose Repackage ISO rather than replacing prior sidecar metadata"
+                .to_string(),
+        );
+    }
+
+    let mut authoritative_sheet = if let Some(existing) = existing_sidecar {
+        existing
+    } else {
+        let image_path = iso_wv_single_image_path(&cue_path, &internal_sheet)?;
+        let merged = crate::tui::probe::read_all_tags_merged_with_metadata(&[image_path])?;
+        let image_snapshot = iso_wv_image_tag_snapshot(&merged.entries);
+        let (effective_tracks, effective_album) =
+            crate::convert::pipeline::materializer_cue::cue_sheet_metadata_from_image_user_snapshot(
+                &internal_sheet,
+                &image_snapshot,
+            );
+        if effective_tracks.len() != internal_sheet.tracks.len() {
+            return Err("ISO-WV metadata snapshot lost CUE track alignment".to_string());
+        }
+
+        let mut sheet = internal_sheet.clone();
+        sheet.user_metadata = iso_wv_album_snapshot(&image_snapshot, &effective_album);
+        sheet.tonepoet_metadata_present = true;
+        for (side_track, effective_track) in sheet.tracks.iter_mut().zip(effective_tracks.iter()) {
+            side_track.user_metadata =
+                iso_wv_track_snapshot(&image_snapshot, effective_track, &effective_album);
+        }
+        sheet
+    };
+
+    // The staged WavPack file contains the user's newest explicit edits. Only
+    // those fields override the previous complete snapshot; every other field
+    // keeps the existing sidecar/internal CUE authority exactly as before.
+    if !context.iso_wv_metadata_fields.is_empty() {
+        let image_path = iso_wv_single_image_path(&cue_path, &internal_sheet)?;
+        let merged = crate::tui::probe::read_all_tags_merged_with_metadata(&[image_path])?;
+        let image_snapshot = iso_wv_image_tag_snapshot(&merged.entries);
+        apply_iso_wv_explicit_image_metadata_fields(
+            &mut authoritative_sheet,
+            &image_snapshot,
+            &context.iso_wv_metadata_fields,
+        );
+    }
+
+    Ok(IsoWvMetadataProjection {
+        cue_path,
+        internal_text,
+        internal_sheet,
+        authoritative_sheet,
+        sidecar_path,
+        existing_tonepoet_sidecar,
+    })
+}
+
+fn render_iso_wv_metadata_projection(
+    projection: &IsoWvMetadataProjection,
+    include_external_snapshot_marker: bool,
+) -> Result<String, String> {
+    let mut sheet = projection.authoritative_sheet.clone();
+    cue_user_metadata_set(
+        &mut sheet.user_metadata,
+        crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY,
+        if include_external_snapshot_marker {
+            vec!["1".to_string()]
+        } else {
+            Vec::new()
+        },
+    );
+    sheet.tonepoet_metadata_present = true;
+
+    let image_ref = projection
+        .internal_sheet
+        .tracks
+        .first()
+        .and_then(|track| track.file.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "staged ISO-WV CUE has no FILE reference".to_string())?;
+    let image_ext = std::path::Path::new(image_ref)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("wv");
+    let overrides = sheet
+        .tracks
+        .iter()
+        .map(|_| crate::tui::cue_generate::TrackOverride {
+            title: None,
+            performer: None,
+            isrc: None,
+        })
+        .collect::<Vec<_>>();
+    let replacement = crate::tui::cue_generate::regenerate_cue_with_overrides(
+        &sheet,
+        &overrides,
+        image_ref,
+        crate::tui::cue_generate::cue_format_tag(image_ext),
+    );
+    crate::tui::cue_generate::validate_cue_content(&replacement)
+        .map_err(|err| format!("generated ISO-WV metadata CUE is invalid: {err}"))?;
+    Ok(replacement)
+}
+
+fn build_iso_wv_metadata_sidecar(
+    context: &super::app::ArchiveMetadataEditContext,
+) -> Result<std::path::PathBuf, String> {
+    if context.archive_conflict()? {
+        return Err(format!(
+            "{} changed externally after the edit staging was created; sidecar save refused so metadata cannot be attached to stale CUE geometry",
+            context.archive_path.display()
+        ));
+    }
+
+    let projection = compute_iso_wv_metadata_projection(
+        context,
+        IsoWvSidecarLoadMode::SidecarSave,
+    )?;
+    let replacement = render_iso_wv_metadata_projection(&projection, true)?;
+
+    if projection.existing_tonepoet_sidecar {
+        let expected_geometry = projection.internal_sheet.clone();
+        crate::convert::cue_parser::rewrite_cue_sidecar_metadata_authoritative_from_cuesheet_validated(
+            &projection.sidecar_path,
+            &replacement,
+            move |_raw, decoded| {
+                let candidate = crate::convert::cue_parser::parse_cue(decoded);
+                if crate::convert::pipeline::materializer_archive::iso_wv_cue_geometry_matches(
+                    &expected_geometry,
+                    &candidate,
+                ) {
+                    Ok(())
+                } else {
+                    Err("existing ISO-WV metadata sidecar changed track geometry; left it unchanged".to_string())
+                }
+            },
+        )?;
+    } else {
+        let composed = crate::convert::cue_parser::compose_cue_metadata_authoritative_replacement(
+            &projection.internal_text,
+            &replacement,
+        )?;
+        let composed_sheet = crate::convert::cue_parser::parse_cue(&composed);
+        if !crate::convert::pipeline::materializer_archive::iso_wv_cue_geometry_matches(
+            &projection.internal_sheet,
+            &composed_sheet,
+        ) {
+            return Err("generated ISO-WV metadata sidecar changed track geometry".to_string());
+        }
+        crate::convert::cue_parser::create_cue_sidecar_from_cuesheet(
+            &projection.sidecar_path,
+            &composed,
+        )?;
+    }
+    Ok(projection.sidecar_path)
+}
+
+fn validate_iso_wv_repackage_staging(staging_dir: &std::path::Path) -> Result<(), String> {
+    use crate::tui::browse::CueReferenceResolution;
+
+    let cue_path = crate::convert::pipeline::materializer_archive::find_single_visible_cue(
+        staging_dir,
+    )
+    .map_err(|err| format!("ISO-WV repackage validation failed: {err}"))?;
+    let sheet = crate::tui::cue_parser::parse_cue_file(&cue_path)
+        .map_err(|err| format!("ISO-WV repackage validation could not parse {}: {err}", cue_path.display()))?;
+    if sheet.tracks.is_empty() {
+        return Err("ISO-WV repackage validation found no audio tracks in the authoritative CUE".to_string());
+    }
+
+    let cue_parent = cue_path
+        .parent()
+        .ok_or_else(|| "ISO-WV authoritative CUE has no parent directory".to_string())?;
+    let staging_identity = std::fs::canonicalize(staging_dir)
+        .map_err(|err| format!("canonicalize ISO-WV staging root failed: {err}"))?;
+
+    for track in &sheet.tracks {
+        let file_ref = track
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("ISO-WV CUE track {} has no FILE reference", track.number))?;
+        let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(
+            cue_parent,
+            file_ref,
+        ) {
+            CueReferenceResolution::Resolved(path) => path,
+            CueReferenceResolution::Missing => {
+                return Err(format!(
+                    "ISO-WV CUE track {} FILE {:?} does not exist in staging",
+                    track.number, file_ref
+                ));
+            }
+            CueReferenceResolution::Ambiguous(candidates) => {
+                return Err(format!(
+                    "ISO-WV CUE track {} FILE {:?} is ambiguous in staging ({} candidates)",
+                    track.number,
+                    file_ref,
+                    candidates.len()
+                ));
+            }
+            CueReferenceResolution::UnsupportedTarget(path) => {
+                return Err(format!(
+                    "ISO-WV CUE track {} FILE {:?} resolves to unsupported audio source {}",
+                    track.number,
+                    file_ref,
+                    path.display()
+                ));
+            }
+        };
+        let resolved_identity = std::fs::canonicalize(&resolved).map_err(|err| {
+            format!(
+                "canonicalize ISO-WV CUE target {} failed: {err}",
+                resolved.display()
+            )
+        })?;
+        if !resolved_identity.starts_with(&staging_identity) {
+            return Err(format!(
+                "ISO-WV CUE track {} FILE {:?} resolves outside archive staging ({})",
+                track.number,
+                file_ref,
+                resolved.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_iso_wv_repackage_staging(
+    context: &super::app::ArchiveMetadataEditContext,
+) -> Result<(), String> {
+    let sidecar_path =
+        crate::convert::pipeline::materializer_archive::iso_wv_metadata_sidecar_path(
+            &context.archive_path,
+        );
+    let existing_tonepoet_snapshot = if sidecar_path.exists() {
+        let sidecar = crate::tui::cue_parser::parse_cue_file(&sidecar_path).map_err(|err| {
+            format!(
+                "could not inspect adjacent ISO-WV sidecar {} before repackage: {err}",
+                sidecar_path.display()
+            )
+        })?;
+        is_tonepoet_iso_wv_metadata_snapshot(&sidecar)
+    } else {
+        false
+    };
+    let may_need_metadata_internalization =
+        !context.iso_wv_metadata_fields.is_empty() || existing_tonepoet_snapshot;
+
+    if may_need_metadata_internalization {
+        let projection = compute_iso_wv_metadata_projection(
+            context,
+            IsoWvSidecarLoadMode::Repackage,
+        )?;
+        if !context.iso_wv_metadata_fields.is_empty() || projection.existing_tonepoet_sidecar {
+            let replacement = render_iso_wv_metadata_projection(&projection, false)?;
+            crate::convert::cue_parser::rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
+                &projection.cue_path,
+                &replacement,
+            )?;
+            let rewritten = crate::tui::cue_parser::parse_cue_file(&projection.cue_path)
+                .map_err(|err| format!("re-read internalized ISO-WV CUE failed: {err}"))?;
+            if !crate::convert::pipeline::materializer_archive::iso_wv_cue_geometry_matches(
+                &projection.internal_sheet,
+                &rewritten,
+            ) {
+                return Err(
+                    "ISO-WV metadata internalization changed FILE/TRACK/INDEX geometry; repackage refused"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // Run after metadata internalization so the exact staged tree handed to
+    // xorriso is proven consumable. This catches destructive Delete/rename
+    // cases before the expensive image build and, critically, before install.
+    validate_iso_wv_repackage_staging(&context.staging_dir)
+}
+
+fn retire_tonepoet_iso_wv_metadata_sidecar(
+    archive_path: &std::path::Path,
+) -> Result<bool, String> {
+    let sidecar_path =
+        crate::convert::pipeline::materializer_archive::iso_wv_metadata_sidecar_path(archive_path);
+    if !sidecar_path.exists() {
+        return Ok(false);
+    }
+    let sidecar = crate::tui::cue_parser::parse_cue_file(&sidecar_path).map_err(|err| {
+        format!(
+            "could not inspect adjacent ISO-WV sidecar {} after repackage: {err}",
+            sidecar_path.display()
+        )
+    })?;
+    let is_tonepoet_snapshot = is_tonepoet_iso_wv_metadata_snapshot(&sidecar);
+    if !is_tonepoet_snapshot {
+        return Ok(false);
+    }
+    std::fs::remove_file(&sidecar_path).map_err(|err| {
+        format!(
+            "repackaged ISO-WV is self-contained, but retiring old Tonepoet metadata sidecar {} failed: {err}",
+            sidecar_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod iso_wv_repackage_corrective_tests {
+    use super::{
+        apply_iso_wv_explicit_image_metadata_fields, render_iso_wv_metadata_projection,
+        load_existing_iso_wv_metadata_sidecar, retire_tonepoet_iso_wv_metadata_sidecar,
+        validate_iso_wv_repackage_staging, IsoWvMetadataProjection, IsoWvSidecarLoadMode,
+    };
+
+    fn cue_text(album: &str, album_artist: &str) -> String {
+        format!(
+            "TITLE \"{album}\"\nPERFORMER \"{album_artist}\"\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track One\"\n    PERFORMER \"{album_artist}\"\n    INDEX 01 00:00:00\n"
+        )
+    }
+
+    fn projection_with_authority(
+        internal_text: String,
+        authoritative_sheet: crate::convert::cue_parser::CueSheet,
+    ) -> IsoWvMetadataProjection {
+        let internal_sheet = crate::convert::cue_parser::parse_cue(&internal_text);
+        IsoWvMetadataProjection {
+            cue_path: std::path::PathBuf::from("album.cue"),
+            internal_text,
+            internal_sheet,
+            authoritative_sheet,
+            sidecar_path: std::path::PathBuf::from("album.iso.wv.cue"),
+            existing_tonepoet_sidecar: false,
+        }
+    }
+
+    fn materialized_metadata(
+        projection: &IsoWvMetadataProjection,
+    ) -> (
+        Vec<crate::convert::pipeline::TrackMetadata>,
+        crate::convert::pipeline::AlbumMetadata,
+        crate::convert::cue_parser::CueSheet,
+    ) {
+        let replacement = render_iso_wv_metadata_projection(projection, false).unwrap();
+        let composed = crate::convert::cue_parser::compose_cue_metadata_authoritative_replacement(
+            &projection.internal_text,
+            &replacement,
+        )
+        .unwrap();
+        let sheet = crate::convert::cue_parser::parse_cue(&composed);
+        let (tracks, album) =
+            crate::convert::pipeline::materializer_cue::cue_sheet_metadata_from_image_user_snapshot(
+                &sheet,
+                &crate::convert::cue_parser::CueUserMetadata::new(),
+            );
+        (tracks, album, sheet)
+    }
+
+    #[test]
+    fn iso_wv_repackage_projection_makes_edited_album_authoritative_inside_cue() {
+        let internal_text = cue_text("Old Album", "Old Artist");
+        let mut authority = crate::convert::cue_parser::parse_cue(&internal_text);
+        let mut image = crate::convert::cue_parser::CueUserMetadata::new();
+        image.insert("ALBUM".to_string(), vec!["New Album".to_string()]);
+        apply_iso_wv_explicit_image_metadata_fields(
+            &mut authority,
+            &image,
+            &["ALBUM".to_string()],
+        );
+
+        let projection = projection_with_authority(internal_text, authority);
+        let (_tracks, album, sheet) = materialized_metadata(&projection);
+        assert_eq!(album.album.as_deref(), Some("New Album"));
+        assert_eq!(sheet.title.as_deref(), Some("New Album"));
+    }
+
+    #[test]
+    fn iso_wv_repackage_projection_makes_edited_artist_authoritative_inside_cue() {
+        let internal_text = cue_text("Album", "Old Artist");
+        let mut authority = crate::convert::cue_parser::parse_cue(&internal_text);
+        let mut image = crate::convert::cue_parser::CueUserMetadata::new();
+        image.insert("ARTIST".to_string(), vec!["New Artist".to_string()]);
+        apply_iso_wv_explicit_image_metadata_fields(
+            &mut authority,
+            &image,
+            &["ARTIST".to_string()],
+        );
+
+        let projection = projection_with_authority(internal_text, authority);
+        let (tracks, _album, _sheet) = materialized_metadata(&projection);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].artist.to_vec(), vec!["New Artist".to_string()]);
+    }
+
+    #[test]
+    fn iso_wv_repackage_projection_preserves_explicit_album_deletion() {
+        let internal_text = cue_text("Old Album", "Artist");
+        let mut authority = crate::convert::cue_parser::parse_cue(&internal_text);
+        apply_iso_wv_explicit_image_metadata_fields(
+            &mut authority,
+            &crate::convert::cue_parser::CueUserMetadata::new(),
+            &["ALBUM".to_string()],
+        );
+
+        let projection = projection_with_authority(internal_text, authority);
+        let (_tracks, album, sheet) = materialized_metadata(&projection);
+        assert!(album.album.is_none(), "old CUE TITLE must not resurrect");
+        assert!(sheet.title.is_none(), "authoritative internal CUE TITLE must be deleted");
+    }
+
+    #[test]
+    fn iso_wv_repackage_projection_merges_new_edit_over_prior_snapshot_baseline() {
+        let internal_text = cue_text("Original Album", "Artist");
+        let mut authority = crate::convert::cue_parser::parse_cue(&internal_text);
+        authority.title = Some("Prior Sidecar Album".to_string());
+        authority.genre = Some("Prior Sidecar Genre".to_string());
+        authority.user_metadata.insert(
+            "ALBUM".to_string(),
+            vec!["Prior Sidecar Album".to_string()],
+        );
+        authority.user_metadata.insert(
+            "GENRE".to_string(),
+            vec!["Prior Sidecar Genre".to_string()],
+        );
+        authority.user_metadata.insert(
+            crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY
+                .to_string(),
+            vec!["1".to_string()],
+        );
+        let mut image = crate::convert::cue_parser::CueUserMetadata::new();
+        image.insert("ALBUM".to_string(), vec!["Newest Album".to_string()]);
+        apply_iso_wv_explicit_image_metadata_fields(
+            &mut authority,
+            &image,
+            &["ALBUM".to_string()],
+        );
+
+        let projection = projection_with_authority(internal_text, authority);
+        let (_tracks, album, sheet) = materialized_metadata(&projection);
+        assert_eq!(album.album.as_deref(), Some("Newest Album"));
+        assert_eq!(album.genre.to_vec(), vec!["Prior Sidecar Genre".to_string()]);
+        assert!(
+            crate::convert::cue_parser::cue_user_metadata_values(
+                &sheet.user_metadata,
+                crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY,
+            )
+            .is_none(),
+            "the external-snapshot marker must not travel inside the repackaged ISO"
+        );
+    }
+
+    #[test]
+    fn iso_wv_repackage_validation_rejects_deleted_audio_before_xorriso() {
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&cue, cue_text("Album", "Artist")).unwrap();
+        let audio = temp.path().join("album.wv");
+        std::fs::write(&audio, b"wv").unwrap();
+        validate_iso_wv_repackage_staging(temp.path()).expect("valid staged CUE must pass");
+
+        std::fs::remove_file(&audio).unwrap();
+        let err = validate_iso_wv_repackage_staging(temp.path())
+            .expect_err("deleting the referenced audio must refuse repackage");
+        assert!(err.contains("does not exist"), "unexpected validation error: {err}");
+    }
+
+    #[test]
+    fn iso_wv_repackage_validation_rejects_missing_cue_authority_before_xorriso() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("album.wv"), b"wv").unwrap();
+        assert!(validate_iso_wv_repackage_staging(temp.path()).is_err());
+    }
+
+    #[test]
+    fn iso_wv_repackage_accepts_prior_tonepoet_snapshot_after_file_only_geometry_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("album.iso.wv.cue");
+        let mut metadata = crate::convert::cue_parser::CueUserMetadata::new();
+        metadata.insert(
+            crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY
+                .to_string(),
+            vec!["1".to_string()],
+        );
+        let block = crate::convert::cue_parser::format_tonepoet_metadata_block(&metadata, &[])
+            .join("\n");
+        std::fs::write(
+            &sidecar,
+            format!(
+                "{block}\nTITLE \"Prior Album\"\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"
+            ),
+        )
+        .unwrap();
+        let internal = crate::convert::cue_parser::parse_cue(
+            "TITLE \"Prior Album\"\nFILE \"renamed.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        );
+
+        let loaded = load_existing_iso_wv_metadata_sidecar(
+            &sidecar,
+            &internal,
+            IsoWvSidecarLoadMode::Repackage,
+        )
+        .expect("file-only geometry drift must be mergeable during structural repackage");
+        assert!(loaded.is_some());
+    }
+
+    #[test]
+    fn iso_wv_repackage_retires_only_tonepoet_owned_external_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("album.iso.wv");
+        std::fs::write(&archive, b"iso").unwrap();
+        let sidecar = crate::convert::pipeline::materializer_archive::iso_wv_metadata_sidecar_path(
+            &archive,
+        );
+        let mut metadata = crate::convert::cue_parser::CueUserMetadata::new();
+        metadata.insert(
+            crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY
+                .to_string(),
+            vec!["1".to_string()],
+        );
+        let block = crate::convert::cue_parser::format_tonepoet_metadata_block(&metadata, &[])
+            .join("\n");
+        std::fs::write(
+            &sidecar,
+            format!(
+                "{block}\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"
+            ),
+        )
+        .unwrap();
+        assert!(retire_tonepoet_iso_wv_metadata_sidecar(&archive).unwrap());
+        assert!(!sidecar.exists());
+
+        std::fs::write(
+            &sidecar,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        assert!(!retire_tonepoet_iso_wv_metadata_sidecar(&archive).unwrap());
+        assert!(sidecar.exists(), "unrelated adjacent CUE must remain untouched");
+    }
+}
+
+fn complete_iso_wv_sidecar_save(
+    app: &mut AppState,
+    context: &super::app::ArchiveMetadataEditContext,
+    sidecar_path: &std::path::Path,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let archive_path = context.archive_path.clone();
+    let staging_dir = context.staging_dir.clone();
+    clear_preserved_editor_archive_repackage_context(app, context);
+    context.cleanup_staging();
+    let _ = app.db.delete_pending_archive_session(&archive_path);
+    app.invalidate_archive_listing_cache_for_path(&archive_path);
+    app.browse.invalidate_archive_probe_cache_for(&archive_path);
+    let _ = app.db.invalidate_probe(&archive_path.display().to_string());
+
+    if let Some(archive) = app.browse.archive.as_mut() {
+        if archive.listing.archive_path == archive_path
+            && archive
+                .staging
+                .as_ref()
+                .is_some_and(|staging| staging.staging_dir == staging_dir)
+        {
+            archive.staging = None;
+        }
+    }
+
+    if app.deferred_browse_archive_exit {
+        app.deferred_browse_archive_exit = false;
+        if app
+            .browse
+            .archive
+            .as_ref()
+            .is_some_and(|archive| archive.listing.archive_path == archive_path)
+        {
+            app.browse.exit_archive();
+        }
+    }
+
+    if let Some((closing_tab_id, return_tab_id, archive_restore)) =
+        app.pending_browse_tab_close_after_archive_repackage.take()
+    {
+        let focus_before_close = app.browse.active_tab_id();
+        let _ = app.browse.switch_to_tab_id(closing_tab_id);
+        if let Some(target) = app.browse.tab_mut(closing_tab_id) {
+            if let Some(archive) = target.archive.as_mut() {
+                if archive.listing.archive_path == archive_path {
+                    archive.staging = None;
+                }
+            }
+        }
+        let closed = match app.browse.tab_index_by_id(closing_tab_id) {
+            Some(index) => app
+                .browse
+                .close_tab_with_archive_restore(index, Some(archive_restore.clone())),
+            None => true,
+        };
+        if closed {
+            if let Some(resume) = return_tab_id.or(
+                (focus_before_close != closing_tab_id).then_some(focus_before_close),
+            ) {
+                let _ = app.browse.switch_to_tab_id(resume);
+            }
+        } else {
+            app.pending_browse_tab_close_after_archive_repackage =
+                Some((closing_tab_id, return_tab_id, archive_restore));
+        }
+    }
+
+    let quit_after_save = app.quit_after_browse_archive_repackage;
+    app.quit_after_browse_archive_repackage = false;
+    if quit_after_save {
+        app.should_quit = true;
+        app.deferred_browse_archive_screen_switch = None;
+    } else if let Some(target) = app.deferred_browse_archive_screen_switch.take() {
+        app.current_screen = target;
+    }
+    app.browse.refresh_with_search(Some(tx));
+    app.browse.probe_current_with_db(tx, Some(&app.db));
+    app.set_status(format!(
+        "ISO-WV metadata saved to sidecar CUE: {} (ISO unchanged)",
+        sidecar_path.display()
+    ));
+}
+
+pub(super) fn save_iso_wv_metadata_sidecar(
+    app: &mut AppState,
+    context: super::app::ArchiveMetadataEditContext,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    if iso_wv_persistence_prompt_kind(app, &context) != IsoWvPersistencePromptKind::MetadataOnly {
+        // Re-check at execution time as well as prompt construction time. A
+        // recovered/live staging record is the source of truth; never let a
+        // stale confirmation action erase non-CUE-representable staged bytes.
+        open_iso_wv_persistence_prompt(app, context);
+        return;
+    }
+    match build_iso_wv_metadata_sidecar(&context) {
+        Ok(sidecar_path) => complete_iso_wv_sidecar_save(app, &context, &sidecar_path, tx),
+        Err(error) => {
+            app.active_overlay = super::app::ActiveOverlay::Confirmation {
+                message: format!(
+                    "Could not save ISO-WV metadata as a sidecar CUE. The staged edits are still preserved.\n\nY retries Sidecar CUE. R repackages the ISO instead. Esc keeps the staged edits for later.\n\n{error}"
+                ),
+                action: super::app::ConfirmAction::IsoWvMetadataPersistence { context },
+            };
+            app.set_status(format!(
+                "ISO-WV sidecar save failed; staged edits preserved: {error}"
+            ));
+        }
+    }
+}
+
 pub(super) fn start_browse_archive_repackage(
     app: &mut AppState,
     context: super::app::ArchiveMetadataEditContext,
@@ -3075,13 +4237,39 @@ mod browse_archive_mutation_claim_tests {
 
 fn start_browse_archive_repackage_inner(
     app: &mut AppState,
-    context: super::app::ArchiveMetadataEditContext,
+    mut context: super::app::ArchiveMetadataEditContext,
     tx: &mpsc::Sender<AppMessage>,
     overwrite_external_change: bool,
 ) {
     if app.browse_archive_repackage.is_some() {
         app.set_status("archive save already running; staged edits were preserved");
         return;
+    }
+
+    if crate::convert::classify::is_iso_wv_container(&context.archive_path) {
+        if context.iso_wv_metadata_fields.is_empty() {
+            let fields = app
+                .browse
+                .archive
+                .as_ref()
+                .filter(|archive| archive.listing.archive_path == context.archive_path)
+                .and_then(|archive| archive.staging.as_ref())
+                .filter(|staging| staging.staging_dir == context.staging_dir)
+                .into_iter()
+                .flat_map(|staging| staging.edits.iter())
+                .filter_map(|edit| match edit {
+                    crate::tui::browse::ArchiveEdit::MetadataWrite { field, .. } => {
+                        Some(field.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            context = context.with_iso_wv_metadata_fields(fields);
+        }
+        if !context.iso_wv_persistence_confirmed {
+            open_iso_wv_persistence_prompt(app, context);
+            return;
+        }
     }
 
     if let Some(preserved) = app.preserved_editor_archive_repackage.clone() {
@@ -3202,6 +4390,9 @@ fn start_browse_archive_repackage_inner(
     let progress_session_id = session.session_id;
     app.install_file_task_progress(session);
     clear_preserved_editor_archive_repackage_context(app, &context);
+    let iso_wv_repackage_context =
+        crate::convert::classify::is_iso_wv_container(&context.archive_path)
+            .then(|| context.clone());
     app.browse_archive_repackage = Some(context);
     app.browse_archive_repackage_progress_session_id = Some(progress_session_id);
     app.set_status(format!("Saving archive changes: {archive_label}"));
@@ -3233,24 +4424,47 @@ fn start_browse_archive_repackage_inner(
             }
         });
 
-        let progress_tx = tx.clone();
-        let archive_for_progress = logical_archive_path.clone();
-        let staging_for_progress = staging_dir.clone();
-        let result = crate::convert::pipeline::materializer_archive::repackage_archive_with_progress_and_cancel(
-            &staging_dir,
-            &admitted_archive_path,
-            &tool_paths,
-            &cancel,
-            move |snapshot| {
-                let _ = progress_tx.try_send(AppMessage::ArchiveRepackageProgress {
-                    archive_path: archive_for_progress.clone(),
-                    staging_dir: staging_for_progress.clone(),
-                    progress_session_id,
-                    snapshot,
-                });
-            },
-        )
-        .await;
+        let preparation = if let Some(context) = iso_wv_repackage_context {
+            if cancel.is_cancelled() {
+                Err(crate::convert::pipeline::materializer_archive::ARCHIVE_REPACKAGE_CANCELLED
+                    .to_string())
+            } else {
+                tokio::task::spawn_blocking(move || prepare_iso_wv_repackage_staging(&context))
+                    .await
+                    .map_err(|err| format!("ISO-WV repackage preparation worker failed: {err}"))
+                    .and_then(|result| result)
+            }
+        } else {
+            Ok(())
+        };
+
+        let result = match preparation {
+            Err(error) => Err(error),
+            Ok(()) if cancel.is_cancelled() => Err(
+                crate::convert::pipeline::materializer_archive::ARCHIVE_REPACKAGE_CANCELLED
+                    .to_string(),
+            ),
+            Ok(()) => {
+                let progress_tx = tx.clone();
+                let archive_for_progress = logical_archive_path.clone();
+                let staging_for_progress = staging_dir.clone();
+                crate::convert::pipeline::materializer_archive::repackage_archive_with_progress_and_cancel(
+                    &staging_dir,
+                    &admitted_archive_path,
+                    &tool_paths,
+                    &cancel,
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::ArchiveRepackageProgress {
+                            archive_path: archive_for_progress.clone(),
+                            staging_dir: staging_for_progress.clone(),
+                            progress_session_id,
+                            snapshot,
+                        });
+                    },
+                )
+                .await
+            }
+        };
         control_done.cancel();
         let _ = control_task.await;
         let _ = tx
@@ -3541,19 +4755,110 @@ fn clear_preserved_editor_archive_repackage_context(
     }
 }
 
+#[derive(Debug, Clone)]
+struct MetadataEditorArchiveFieldDelta {
+    path: std::path::PathBuf,
+    field: String,
+    value: String,
+}
+
+fn metadata_editor_archive_field_deltas(
+    state: &super::app::MetadataEditorState,
+    session_id: u64,
+) -> Vec<MetadataEditorArchiveFieldDelta> {
+    let Some(surface) = state.surface_for_session(session_id) else {
+        return Vec::new();
+    };
+    let file_count = surface.paths.len();
+    let deleted = surface.deleted.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let mut deltas = Vec::new();
+
+    for (entry_index, entry) in surface.entries.iter().enumerate() {
+        if entry.is_binary
+            || entry.effective_row_scope(file_count) != crate::tui::probe::RowScope::File
+        {
+            continue;
+        }
+        let field = crate::tui::probe::canonical_metadata_display_key(&entry.display_key);
+        if field.trim().is_empty() {
+            continue;
+        }
+        for (slot, path) in surface.paths.iter().enumerate() {
+            let current = entry.per_file_values.get(slot);
+            let original = entry.per_file_originals.get(slot);
+            let is_deleted = deleted.contains(&entry_index);
+            let changed = if is_deleted {
+                original.is_some_and(|value| value.value_count() > 0)
+            } else {
+                current != original
+            };
+            if !changed {
+                continue;
+            }
+            deltas.push(MetadataEditorArchiveFieldDelta {
+                path: path.clone(),
+                field: field.clone(),
+                value: if is_deleted {
+                    String::new()
+                } else {
+                    current.map(|value| value.as_str().to_string()).unwrap_or_default()
+                },
+            });
+        }
+    }
+
+    deltas.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.field.to_ascii_uppercase().cmp(&right.field.to_ascii_uppercase()))
+    });
+    deltas.dedup_by(|left, right| {
+        left.path == right.path && left.field.eq_ignore_ascii_case(&right.field)
+    });
+    deltas
+}
+
 fn complete_browse_archive_metadata_save(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     context: super::app::ArchiveMetadataEditContext,
     saved_paths: &[std::path::PathBuf],
+    field_deltas: &[MetadataEditorArchiveFieldDelta],
 ) -> Result<(), String> {
-    super::keybindings::record_staged_archive_metadata_write(
+    let saved = saved_paths.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let mut changes = field_deltas
+        .iter()
+        .filter(|delta| saved.contains(&delta.path))
+        .map(|delta| {
+            super::keybindings::StagedArchiveMetadataChange::field(
+                delta.path.clone(),
+                delta.field.clone(),
+                delta.value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for path in saved_paths {
+        if !field_deltas.iter().any(|delta| delta.path == *path) {
+            changes.push(super::keybindings::StagedArchiveMetadataChange::content_modified(
+                path.clone(),
+                "metadata-editor-save",
+            ));
+        }
+    }
+    super::keybindings::record_staged_archive_metadata_changes(
         app,
         &context.archive_path,
         &context.staging_dir,
         super::keybindings::archive_metadata_context_baseline(&context),
-        saved_paths,
+        &changes,
     )?;
+
+    let context = context.with_iso_wv_metadata_fields(
+        field_deltas
+            .iter()
+            .filter(|delta| saved.contains(&delta.path))
+            .map(|delta| delta.field.clone()),
+    );
     if context.editor_owns_staging {
         start_browse_archive_repackage(app, context, tx);
     } else {
@@ -3655,6 +4960,12 @@ fn handle_archive_repackage_result(
                     .archive
                     .as_ref()
                     .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            let iso_wv_sidecar_retirement =
+                if crate::convert::classify::is_iso_wv_container(&archive_path) {
+                    retire_tonepoet_iso_wv_metadata_sidecar(&archive_path)
+                } else {
+                    Ok(false)
+                };
             clear_preserved_editor_archive_repackage_context(app, &context);
             context.cleanup_staging();
             app.invalidate_archive_listing_cache_for_path(&archive_path);
@@ -3720,13 +5031,21 @@ fn handle_archive_repackage_result(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| archive_path.display().to_string());
+            let mut warnings = Vec::new();
             if let Some(warning) = report.warning_summary() {
+                warnings.push(warning);
+            }
+            if let Err(error) = iso_wv_sidecar_retirement {
+                warnings.push(error);
+            }
+            if warnings.is_empty() {
                 app.set_status(format!(
-                    "Archive changes saved and repackaged: {archive_label}; warning: {warning}"
+                    "Archive changes saved and repackaged: {archive_label}"
                 ));
             } else {
                 app.set_status(format!(
-                    "Archive changes saved and repackaged: {archive_label}"
+                    "Archive changes saved and repackaged: {archive_label}; warning: {}",
+                    warnings.join("; ")
                 ));
             }
         }
@@ -4152,6 +5471,180 @@ fn handle_archive_entry_delete_result(
                 app.set_status(format!("archive delete failed; quit cancelled: {err}"));
             } else {
                 app.set_status(format!("archive delete failed: {err}"));
+            }
+        }
+    }
+}
+
+fn handle_archive_entry_create_progress(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    message: String,
+) {
+    let pending_matches = app
+        .pending_browse_archive_create
+        .as_ref()
+        .is_some_and(|pending| pending.matches(&archive_path, &staging_dir));
+    if pending_matches && app.current_screen == AppScreen::Browse {
+        app.set_status(message);
+    }
+}
+
+fn handle_archive_entry_create_result(
+    app: &mut AppState,
+    archive_path: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    inner_path: String,
+    kind: super::app::BrowseCreateKind,
+    result: Result<(), String>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let pending_matches = app
+        .pending_browse_archive_create
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.matches(&archive_path, &staging_dir)
+                && pending.inner_path == inner_path
+                && pending.kind == kind
+        });
+    if !pending_matches {
+        super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+        app.set_status("archive create: ignored stale result");
+        return;
+    }
+
+    let pending = app.pending_browse_archive_create.take();
+    let pending_baseline = pending.as_ref().map(|pending| {
+        (
+            pending.archive_mtime_secs,
+            pending.archive_mtime_nanos,
+            pending.archive_size,
+        )
+    });
+    let quit_after_create = app.quit_after_browse_archive_create;
+    app.quit_after_browse_archive_create = false;
+
+    match result {
+        Ok(()) => {
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            let browse_holds_same_archive = app
+                .browse
+                .archive
+                .as_ref()
+                .is_some_and(|archive| archive.listing.archive_path == archive_path);
+            let (secs, nanos, size) = pending_baseline
+                .unwrap_or_else(|| super::app::archive_fingerprint(&archive_path).unwrap_or((0, 0, 0)));
+
+            if browse_holds_same_archive {
+                if let Some(archive) = app.browse.archive.as_mut() {
+                    archive.staging = Some(super::browse::ArchiveStagingSession::new(
+                        staging_dir.clone(),
+                        archive_path.clone(),
+                        secs,
+                        nanos,
+                        size,
+                    ));
+                }
+                if let Err(err) = super::keybindings::create_staged_archive_entry_transactional(
+                    app,
+                    &staging_dir,
+                    &inner_path,
+                    kind,
+                ) {
+                    if let Some(archive) = app.browse.archive.as_mut() {
+                        if archive
+                            .staging
+                            .as_ref()
+                            .is_some_and(|staging| staging.staging_dir == staging_dir)
+                        {
+                            archive.staging = None;
+                        }
+                    }
+                    super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+                    super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+                    app.deferred_browse_archive_exit = false;
+                    app.deferred_browse_archive_screen_switch = None;
+                    if quit_after_create {
+                        app.set_status(format!("archive create failed; quit cancelled: {err}"));
+                    } else {
+                        app.set_status(format!("archive create failed: {err}"));
+                    }
+                    return;
+                }
+
+                if quit_after_create
+                    || app.deferred_browse_archive_screen_switch.is_some()
+                    || app.deferred_browse_archive_exit
+                {
+                    let context = super::app::ArchiveMetadataEditContext::browse_active_staging_with_fingerprint(
+                        archive_path.clone(),
+                        staging_dir.clone(),
+                        secs,
+                        nanos,
+                        size,
+                        None,
+                    );
+                    app.quit_after_browse_archive_repackage = quit_after_create;
+                    start_browse_archive_repackage(app, context, tx);
+                } else {
+                    app.browse.refresh_with_search(Some(tx));
+                    let target = archive_path.join(&inner_path);
+                    if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target) {
+                        app.browse.selected_index = index;
+                        app.browse.ensure_visible();
+                    }
+                }
+            } else if quit_after_create {
+                // As with first rename/delete, never apply a structural mutation
+                // off-screen after navigation. Keep the pre-registered extracted
+                // snapshot for startup recovery and allow the requested quit.
+                app.should_quit = true;
+            }
+
+            let archive_label = archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            let created_name = inner_path.rsplit('/').next().unwrap_or(inner_path.as_str());
+            if app
+                .browse_archive_repackage
+                .as_ref()
+                .is_some_and(|context| context.archive_path == archive_path && context.staging_dir == staging_dir)
+            {
+                app.set_status(format!(
+                    "created staged archive {} {created_name} in {archive_label}; saving archive changes",
+                    match kind {
+                        super::app::BrowseCreateKind::File => "file",
+                        super::app::BrowseCreateKind::Folder => "folder",
+                    }
+                ));
+            } else if browse_holds_same_archive {
+                app.set_status(format!(
+                    "created staged archive {} {created_name} in {archive_label}; archive changes pending",
+                    match kind {
+                        super::app::BrowseCreateKind::File => "file",
+                        super::app::BrowseCreateKind::Folder => "folder",
+                    }
+                ));
+            } else {
+                app.set_status(format!(
+                    "archive create for {archive_label} was extracted after navigation; staged snapshot preserved for recovery without applying the create"
+                ));
+            }
+            if quit_after_create && app.browse_archive_repackage.is_none() {
+                app.should_quit = true;
+            }
+        }
+        Err(err) => {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+            app.deferred_browse_archive_exit = false;
+            app.deferred_browse_archive_screen_switch = None;
+            if quit_after_create {
+                app.set_status(format!("archive create failed; quit cancelled: {err}"));
+            } else {
+                app.set_status(format!("archive create failed: {err}"));
             }
         }
     }
@@ -5153,6 +6646,30 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             result,
         } => {
             handle_archive_entry_delete_result(app, archive_path, staging_dir, inner_paths, result, tx);
+        }
+        AppMessage::ArchiveEntryCreateProgress {
+            archive_path,
+            staging_dir,
+            message,
+        } => {
+            handle_archive_entry_create_progress(app, archive_path, staging_dir, message);
+        }
+        AppMessage::ArchiveEntryCreateResult {
+            archive_path,
+            staging_dir,
+            inner_path,
+            kind,
+            result,
+        } => {
+            handle_archive_entry_create_result(
+                app,
+                archive_path,
+                staging_dir,
+                inner_path,
+                kind,
+                result,
+                tx,
+            );
         }
         AppMessage::ConvertAudioProbeComplete {
             generation,
@@ -6768,6 +8285,8 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     return;
                 }
                 let mut restore_editor = true;
+                let archive_field_deltas =
+                    metadata_editor_archive_field_deltas(&taken.state, session_id);
                 if let Some(summary) =
                     taken
                         .state
@@ -6832,6 +8351,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                         tx,
                                         context,
                                         &summary.saved_paths,
+                                        &archive_field_deltas,
                                     ) {
                                         restore_editor = true;
                                         app.set_status(format!(
@@ -12973,6 +14493,7 @@ mod browse_archive_quit_lifecycle_tests {
             &tx(),
             context,
             &[track],
+            &[],
         )
         .expect("metadata save should durably register editor-owned staging");
 

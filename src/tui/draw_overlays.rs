@@ -1474,6 +1474,7 @@ fn confirmation_footer_hint_bg(
             _ => theme.green,
         },
         "d" => theme.destructive,
+        "r" => theme.amber,
         "n" => match action {
             super::app::ConfirmAction::ArchiveStartupRecovery { .. } => theme.destructive,
             super::app::ConfirmAction::ArchiveDiscardStartupRecovery { .. }
@@ -1489,6 +1490,11 @@ fn confirmation_footer_hint_bg(
 
 fn confirmation_mouse_cancel_hint_key(action: &super::app::ConfirmAction) -> Option<&'static str> {
     match action {
+        // The metadata persistence dialog has two constructive choices. Map
+        // the second mouse slot to Repackage rather than pretending it is a
+        // destructive/cancel action. The mouse dispatcher special-cases the
+        // same ConfirmAction and executes that exact branch.
+        super::app::ConfirmAction::IsoWvMetadataPersistence { .. } => Some("r"),
         // Mouse cancel is routed through `open_archive_staging_discard_confirmation`
         // for these first-stage archive dialogs, so make the clickable cancel
         // chip the visible destructive/discard chip, not the non-destructive

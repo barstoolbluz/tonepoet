@@ -9680,9 +9680,17 @@ fn execute_commit_with_source_options_transform(
         }
     }
 
-    // Clear source pane so a subsequent `:queue` arrives fresh. Transfer any
-    // archive preview staging to the queued item before dropping the source.
-    let _ = app.convert.source.mode.disarm_archive_preview_cleanup();
+    // Clear source pane so a subsequent `:queue` arrives fresh. Extraction-
+    // backed generic archive previews are transferred to the queued item. A
+    // mounted ISO-WV preview is deliberately not transferable: disarming it
+    // drops the FUSE lease, so remove its empty mount point and let the queued
+    // materializer establish a fresh mount under its own staging owner.
+    let preview_staging = app.convert.source.mode.disarm_archive_preview_cleanup();
+    if archive_preview_staging.is_none() {
+        if let Some(staging_dir) = preview_staging {
+            let _ = std::fs::remove_dir_all(staging_dir);
+        }
+    }
     app.convert.source.cleanup_synthetic_cue_artifacts();
     app.convert.set_source_mode(SourceMode::Empty);
     app.convert.source.cue_artifact_audio.clear();

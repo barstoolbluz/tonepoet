@@ -90,8 +90,11 @@
           monkeys-audio
           lame
           _7zz
+          xorriso
           atomicparsley
           bat
+        ] ++ lib.optionals stdenv.isLinux [
+          fuseiso
         ]);
 
       in

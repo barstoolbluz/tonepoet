@@ -1244,6 +1244,7 @@ where
 
 
 fn iso_wv_cue_preview_tracks(
+    archive_path: &Path,
     cue_path: &Path,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<PreviewTrack>, String> {
@@ -1254,6 +1255,38 @@ fn iso_wv_cue_preview_tracks(
     if sheet.tracks.is_empty() {
         return Err("ISO-WV CUE sheet has no audio tracks".to_string());
     }
+    let sidecar_sheet = {
+        let sidecar_path = crate::convert::pipeline::materializer_archive::iso_wv_metadata_sidecar_path(archive_path);
+        if sidecar_path.is_file() {
+            let candidate = crate::tui::cue_parser::parse_cue_file(&sidecar_path)
+                .map_err(|err| format!("failed to parse ISO-WV metadata sidecar {}: {err}", sidecar_path.display()))?;
+            let is_tonepoet_snapshot = crate::convert::cue_parser::cue_user_metadata_values(
+                &candidate.user_metadata,
+                crate::convert::pipeline::materializer_archive::ISO_WV_METADATA_SNAPSHOT_KEY,
+            )
+            .is_some_and(|values| values.iter().any(|value| value.trim() == "1"));
+            if is_tonepoet_snapshot {
+                if !crate::convert::pipeline::materializer_archive::iso_wv_cue_geometry_matches(
+                    &sheet,
+                    &candidate,
+                ) {
+                    return Err(format!(
+                        "ISO-WV metadata sidecar {} no longer matches the image CUE geometry",
+                        sidecar_path.display()
+                    ));
+                }
+                Some(candidate)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let metadata_sheet = sidecar_sheet.as_ref().unwrap_or(&sheet);
+    let authoritative_sidecar_metadata = sidecar_sheet.is_some();
+    let sidecar_album_metadata = authoritative_sidecar_metadata
+        .then(|| crate::convert::pipeline::materializer_cue::cue_sheet_album_metadata_for_conversion(metadata_sheet));
     let parent = cue_path
         .parent()
         .ok_or_else(|| "ISO-WV CUE path has no parent directory".to_string())?;
@@ -1339,25 +1372,60 @@ fn iso_wv_cue_preview_tracks(
         }
 
         let mut metadata = image_metadata.clone();
-        metadata.title = track.title.clone().or_else(|| metadata.title.take());
-        metadata.artist = track
-            .performer
-            .clone()
-            .or_else(|| sheet.performer.clone())
-            .or_else(|| metadata.artist.take());
-        metadata.album = sheet.title.clone().or_else(|| metadata.album.take());
-        metadata.genre = sheet.genre.clone().or_else(|| metadata.genre.take());
-        metadata.year = sheet.date.clone().or_else(|| metadata.year.take());
-        metadata.catalog_number = sheet
-            .catalog
-            .clone()
-            .or_else(|| metadata.catalog_number.take());
-        metadata.track_number = Some(track.number);
+        if authoritative_sidecar_metadata {
+            let effective_track = crate::convert::pipeline::materializer_cue::cue_sheet_track_metadata_for_conversion(
+                metadata_sheet,
+                idx,
+                false,
+            )
+            .ok_or_else(|| format!("ISO-WV metadata sidecar lost track {}", track.number))?;
+            let effective_album = sidecar_album_metadata
+                .as_ref()
+                .ok_or_else(|| "ISO-WV metadata sidecar lost album metadata".to_string())?;
+            metadata.title = effective_track.title;
+            metadata.artist = effective_track.artist.first().cloned();
+            metadata.album = effective_album.album.clone();
+            metadata.genre = effective_track
+                .genre
+                .first()
+                .cloned()
+                .or_else(|| effective_album.genre.first().cloned());
+            metadata.year = effective_track.date.or_else(|| effective_album.date.clone());
+            metadata.catalog_number = effective_track
+                .extra
+                .get("catalognumber")
+                .cloned()
+                .or_else(|| effective_album.extra.get("catalognumber").cloned());
+            metadata.track_number = effective_track.track_number;
+        } else {
+            metadata.title = track.title.clone().or_else(|| metadata.title.take());
+            metadata.artist = track
+                .performer
+                .clone()
+                .or_else(|| sheet.performer.clone())
+                .or_else(|| metadata.artist.take());
+            metadata.album = sheet.title.clone().or_else(|| metadata.album.take());
+            metadata.genre = sheet.genre.clone().or_else(|| metadata.genre.take());
+            metadata.year = sheet.date.clone().or_else(|| metadata.year.take());
+            metadata.catalog_number = sheet
+                .catalog
+                .clone()
+                .or_else(|| metadata.catalog_number.take());
+            metadata.track_number = Some(track.number);
+        }
 
-        let original_name = track
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("Track {:02}", track.number));
+        let original_name = if authoritative_sidecar_metadata {
+            metadata
+                .title
+                .clone()
+                .or_else(|| track.title.clone())
+                .unwrap_or_else(|| format!("Track {:02}", track.number))
+        } else {
+            track
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Track {:02}", track.number))
+        };
         tracks.push(PreviewTrack {
             path: cue_path.to_path_buf(),
             original_name,
@@ -1397,24 +1465,41 @@ pub(crate) fn spawn_archive_preview(
                 return Err("archive preview cancelled".to_string());
             }
 
-            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
-                &archive_path,
-                &staging_dir,
-                item_id.as_str(),
-                archive_password.as_deref(),
-                &runner,
-                None,
-                &cancel,
-            )
-            .await
-            .map_err(|err| format!("{err}"))?;
+            let is_iso_wv = crate::convert::classify::is_iso_wv_container(&archive_path);
+            let mount_lease = if is_iso_wv {
+                crate::convert::pipeline::materializer_archive::try_mount_iso_wv_readonly(
+                    &archive_path,
+                    &staging_dir,
+                    &runner,
+                    &cancel,
+                )
+                .await
+                .map_err(|err| format!("{err}"))?
+            } else {
+                None
+            };
 
-            if crate::convert::classify::is_iso_wv_container(&archive_path) {
+            if mount_lease.is_none() {
+                crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+                    &archive_path,
+                    &staging_dir,
+                    item_id.as_str(),
+                    archive_password.as_deref(),
+                    &runner,
+                    None,
+                    &cancel,
+                )
+                .await
+                .map_err(|err| format!("{err}"))?;
+            }
+
+            if is_iso_wv {
                 let cue_path = crate::convert::pipeline::materializer_archive::find_single_visible_cue(&staging_dir)
                     .map_err(|err| format!("{err}"))?;
                 let cancel_for_probe = cancel.clone();
+                let archive_for_sidecar = archive_path.clone();
                 let tracks = tokio::task::spawn_blocking(move || {
-                    iso_wv_cue_preview_tracks(&cue_path, &cancel_for_probe)
+                    iso_wv_cue_preview_tracks(&archive_for_sidecar, &cue_path, &cancel_for_probe)
                 })
                 .await
                 .map_err(|err| format!("ISO-WV preview task failed: {err}"))??;
@@ -1424,6 +1509,7 @@ pub(crate) fn spawn_archive_preview(
                     archive_path,
                     tracks,
                     album_metadata,
+                    mount_lease,
                 });
             }
 
@@ -1484,6 +1570,7 @@ pub(crate) fn spawn_archive_preview(
                 archive_path,
                 tracks,
                 album_metadata,
+                mount_lease: None,
             })
         }
         .await;
@@ -1635,6 +1722,11 @@ pub struct ArchivePreview {
     pub archive_path: PathBuf,
     pub tracks: Vec<PreviewTrack>,
     pub album_metadata: SourceMetadata,
+    /// Present only when `.iso.wv` preview paths live on a FUSE mount. The
+    /// last owner tears the mount down before staging cleanup. Mounted preview
+    /// staging is never transferred to a queued conversion; conversion mounts
+    /// the container afresh at its own staging lifetime boundary.
+    pub mount_lease: Option<std::sync::Arc<crate::convert::pipeline::types::FuseMountLease>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1936,6 +2028,70 @@ impl PendingBrowseArchiveDelete {
     }
 }
 
+/// Lifecycle handle for Browse-screen ISO-WV archive-entry creation. The
+/// operation extracts the image into deferred-save staging when needed, then
+/// creates the requested empty file or directory transactionally on the event
+/// loop side so recovery registration and filesystem state cannot diverge.
+#[derive(Clone)]
+pub struct PendingBrowseArchiveCreate {
+    pub archive_path: PathBuf,
+    pub staging_dir: PathBuf,
+    pub inner_path: String,
+    pub kind: BrowseCreateKind,
+    pub archive_mtime_secs: i64,
+    pub archive_mtime_nanos: u32,
+    pub archive_size: u64,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for PendingBrowseArchiveCreate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingBrowseArchiveCreate")
+            .field("archive_path", &self.archive_path)
+            .field("staging_dir", &self.staging_dir)
+            .field("inner_path", &self.inner_path)
+            .field("kind", &self.kind)
+            .field("archive_mtime_secs", &self.archive_mtime_secs)
+            .field("archive_mtime_nanos", &self.archive_mtime_nanos)
+            .field("archive_size", &self.archive_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingBrowseArchiveCreate {
+    pub fn new(
+        archive_path: PathBuf,
+        inner_path: String,
+        kind: BrowseCreateKind,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            archive_path,
+            staging_dir: std::env::temp_dir().join(format!(
+                "tonepoet-archive-create-{}",
+                uuid::Uuid::new_v4()
+            )),
+            inner_path,
+            kind,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn matches(&self, archive_path: &Path, staging_dir: &Path) -> bool {
+        self.archive_path.as_path() == archive_path && self.staging_dir.as_path() == staging_dir
+    }
+
+    pub fn cancel_and_cleanup(self) {
+        self.cancel.cancel();
+        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+    }
+}
+
 pub fn archive_fingerprint(path: &std::path::Path) -> Result<(i64, u32, u64), String> {
     let meta = std::fs::metadata(path)
         .map_err(|err| format!("stat archive for conflict detection failed: {err}"))?;
@@ -1974,6 +2130,15 @@ pub struct ArchiveMetadataEditContext {
     /// already-active ArchiveBrowseState staging session, Browse owns the
     /// directory and the editor must never remove it on cancel/close.
     pub editor_owns_staging: bool,
+    /// Set only after the ISO-WV persistence choice/warning has been accepted.
+    /// Retries carry this bit so a failed xorriso run does not re-prompt for
+    /// the same already-authorized hash-changing operation.
+    pub iso_wv_persistence_confirmed: bool,
+    /// Canonical tag fields changed by this metadata save. ISO-WV sidecar
+    /// persistence uses these deltas to preserve prior sidecar-only edits and
+    /// to make an explicit user edit override the internal CUE's normal
+    /// image-tag precedence without reinterpreting unrelated fields.
+    pub iso_wv_metadata_fields: Vec<String>,
 }
 
 impl ArchiveMetadataEditContext {
@@ -1990,6 +2155,8 @@ impl ArchiveMetadataEditContext {
             archive_size,
             target_inner_paths: None,
             editor_owns_staging: true,
+            iso_wv_persistence_confirmed: false,
+            iso_wv_metadata_fields: Vec::new(),
         }
     }
 
@@ -2016,6 +2183,8 @@ impl ArchiveMetadataEditContext {
             archive_size: Some(archive_size),
             target_inner_paths,
             editor_owns_staging: true,
+            iso_wv_persistence_confirmed: false,
+            iso_wv_metadata_fields: Vec::new(),
         }
     }
 
@@ -2036,6 +2205,8 @@ impl ArchiveMetadataEditContext {
             archive_size: Some(archive_size),
             target_inner_paths,
             editor_owns_staging: false,
+            iso_wv_persistence_confirmed: false,
+            iso_wv_metadata_fields: Vec::new(),
         }
     }
 
@@ -2049,7 +2220,30 @@ impl ArchiveMetadataEditContext {
             archive_size: None,
             target_inner_paths: None,
             editor_owns_staging: true,
+            iso_wv_persistence_confirmed: false,
+            iso_wv_metadata_fields: Vec::new(),
         }
+    }
+
+    pub fn with_iso_wv_persistence_confirmed(mut self) -> Self {
+        self.iso_wv_persistence_confirmed = true;
+        self
+    }
+
+    pub fn with_iso_wv_metadata_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut fields = fields
+            .into_iter()
+            .map(Into::into)
+            .filter(|field: &String| !field.trim().is_empty())
+            .collect::<Vec<_>>();
+        fields.sort_by_key(|field| field.to_ascii_uppercase());
+        fields.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        self.iso_wv_metadata_fields = fields;
+        self
     }
 
     pub fn archive_conflict(&self) -> Result<bool, String> {
@@ -2341,7 +2535,9 @@ impl SourceMode {
     }
 
     pub fn archive_preview_staging_dir(&self) -> Option<&PathBuf> {
-        self.archive_preview().map(|preview| &preview.staging_dir)
+        self.archive_preview()
+            .filter(|preview| preview.mount_lease.is_none())
+            .map(|preview| &preview.staging_dir)
     }
 
     pub fn disarm_archive_preview_cleanup(&mut self) -> Option<PathBuf> {
@@ -8934,6 +9130,21 @@ impl MetadataEditorState {
         }
     }
 
+    pub fn surface_for_session(&self, session_id: u64) -> Option<&PresentationTab> {
+        if self.model.presentation_tabs.is_empty() {
+            if self.model.file_surface.technical_details.session_id == session_id {
+                Some(&self.model.file_surface)
+            } else {
+                None
+            }
+        } else {
+            self.model
+                .presentation_tabs
+                .iter()
+                .find(|tab| tab.technical_details.session_id == session_id)
+        }
+    }
+
     pub fn surface_mut_for_session(&mut self, session_id: u64) -> Option<&mut PresentationTab> {
         if self.model.presentation_tabs.is_empty() {
             if self.model.file_surface.technical_details.session_id == session_id {
@@ -12018,6 +12229,17 @@ pub enum ConfirmAction {
         context: ArchiveMetadataEditContext,
         error: String,
     },
+    /// ISO-WV metadata-only saves have two legitimate persistence targets.
+    /// Confirm/Y chooses a sidecar CUE; R chooses an ISO rebuild; Esc keeps
+    /// the staged edits without mutating either destination.
+    IsoWvMetadataPersistence {
+        context: ArchiveMetadataEditContext,
+    },
+    /// ISO-WV structural edits cannot be represented by a sidecar. The user
+    /// must explicitly acknowledge that rebuilding changes the image hash.
+    IsoWvStructuralRepackage {
+        context: ArchiveMetadataEditContext,
+    },
     /// Mouse-accessible destructive discard confirmation for a staged Browse
     /// archive session. This exists because the generic confirmation overlay
     /// exposes only confirm/cancel buttons; the primary conflict/failure
@@ -12073,6 +12295,16 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmationFooterHint { label: "N keep", key: "n" },
         ConfirmationFooterHint { label: "Esc keep", key: "esc" },
     ];
+    const ISO_WV_METADATA_PERSISTENCE: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y sidecar CUE", key: "y" },
+        ConfirmationFooterHint { label: "R repackage ISO", key: "r" },
+        ConfirmationFooterHint { label: "Esc keep", key: "esc" },
+    ];
+    const ISO_WV_STRUCTURAL_REPACKAGE: &[ConfirmationFooterHint] = &[
+        ConfirmationFooterHint { label: "Y repackage ISO", key: "y" },
+        ConfirmationFooterHint { label: "N keep", key: "n" },
+        ConfirmationFooterHint { label: "Esc keep", key: "esc" },
+    ];
     const ARCHIVE_DISCARD_STAGING: &[ConfirmationFooterHint] = &[
         ConfirmationFooterHint { label: "Y discard", key: "y" },
         ConfirmationFooterHint { label: "N keep", key: "n" },
@@ -12104,6 +12336,8 @@ pub fn confirmation_footer_hints(action: &ConfirmAction) -> &'static [Confirmati
         ConfirmAction::ArchiveDiscardStartupRecovery { .. } => ARCHIVE_DISCARD_STARTUP_RECOVERY,
         ConfirmAction::ArchiveExternalConflict { .. }
         | ConfirmAction::ArchiveRepackageFailure { .. } => ARCHIVE_RETRY_OR_DISCARD,
+        ConfirmAction::IsoWvMetadataPersistence { .. } => ISO_WV_METADATA_PERSISTENCE,
+        ConfirmAction::IsoWvStructuralRepackage { .. } => ISO_WV_STRUCTURAL_REPACKAGE,
         ConfirmAction::ArchiveDiscardStaging { .. } => ARCHIVE_DISCARD_STAGING,
         ConfirmAction::DeleteEmbeddedCueSheet { .. } => DELETE_EMBEDDED_CUESHEET,
         ConfirmAction::RemoveInvalidApeKeys { .. } => REMOVE_INVALID_APE_KEYS,
@@ -12531,6 +12765,9 @@ pub struct AppState {
     /// it as the active deferred-save session or cleans it on failure.
     pub pending_browse_archive_delete: Option<PendingBrowseArchiveDelete>,
 
+    /// Browse-screen ISO-WV archive-entry create currently in flight.
+    pub pending_browse_archive_create: Option<PendingBrowseArchiveCreate>,
+
     /// Browse-screen archive repackage currently in flight for deferred archive
     /// saves. Staging is removed only after a successful archive replacement;
     /// failures keep staged edits available for retry/discard.
@@ -12602,6 +12839,9 @@ pub struct AppState {
     /// finish. Successful delete completion resumes quit, which then runs the
     /// normal dirty-staging repackage path; failure cancels quit.
     pub quit_after_browse_archive_delete: bool,
+
+    /// True when quit is waiting for an in-flight ISO-WV archive-entry create.
+    pub quit_after_browse_archive_create: bool,
 
     /// Target screen requested while a first archive edit is still extracting.
     /// The screen switch is not considered complete until the edit is either
@@ -13127,6 +13367,9 @@ impl AppState {
         if let Some(pending) = self.pending_browse_archive_delete.take() {
             pending.cancel_and_cleanup();
         }
+        if let Some(pending) = self.pending_browse_archive_create.take() {
+            pending.cancel_and_cleanup();
+        }
         if let Some(context) = self.preserved_editor_archive_repackage.take() {
             context.cleanup_staging();
             if let Err(err) = self.db.delete_pending_archive_session(&context.archive_path) {
@@ -13624,6 +13867,7 @@ impl AppState {
             pending_browse_archive_metadata: None,
             pending_browse_archive_rename: None,
             pending_browse_archive_delete: None,
+            pending_browse_archive_create: None,
             browse_archive_repackage: None,
             browse_archive_repackage_progress_session_id: None,
             preserved_editor_archive_repackage: None,
@@ -13637,6 +13881,7 @@ impl AppState {
             pending_browse_archive_tab_restores: std::collections::HashMap::new(),
             quit_after_browse_archive_rename: false,
             quit_after_browse_archive_delete: false,
+            quit_after_browse_archive_create: false,
             deferred_browse_archive_screen_switch: None,
             deferred_browse_archive_exit: false,
             pending_cue_preview: None,

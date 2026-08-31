@@ -770,6 +770,30 @@ pub fn compose_cue_metadata_replacement(
     )
 }
 
+/// Apply a complete metadata projection to a CUE template while preserving its
+/// FILE/INDEX geometry and unmodeled directives. Unlike
+/// `compose_cue_metadata_replacement`, absent modeled fields are deletions.
+/// ISO-WV uses this for first-time external sidecar creation so a user-cleared
+/// field cannot be resurrected from the internal CUE template.
+pub fn compose_cue_metadata_authoritative_replacement(
+    template_cuesheet: &str,
+    replacement_cuesheet: &str,
+) -> Result<String, String> {
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, false)?;
+    let desired = explicit_cue_metadata(replacement_cuesheet);
+    if desired.tracks.is_empty() {
+        return Err("replacement CUESHEET has no audio tracks".to_string());
+    }
+    let rewritten = rewrite_cue_metadata_text(
+        template_cuesheet,
+        &desired,
+        CueMetadataRewriteMode::AuthoritativeProjection,
+        None,
+    )?;
+    validate_authoritative_cue_projection(&rewritten, &desired)?;
+    Ok(rewritten)
+}
+
 /// Merge one synthetic Album-view projection into an existing embedded
 /// CUESHEET while preserving unsupported/unmodeled directives from the
 /// physical carrier. Modeled metadata and structural CUE provenance are owned
@@ -1165,6 +1189,28 @@ pub fn rewrite_cue_sidecar_metadata_authoritative_from_cuesheet(
         cue_path,
         replacement_cuesheet,
         |_raw, _decoded| Ok(()),
+        CueMetadataRewriteMode::AuthoritativeProjection,
+        None,
+    )
+}
+
+/// Authoritative sidecar metadata rewrite with validation against the exact
+/// byte snapshot consumed by the mutator. This is the ISO-WV sidecar path's
+/// change detector: track geometry is checked under the same mutation claim
+/// as the read/compose/replace operation, so a concurrent sidecar rewrite
+/// cannot pass an earlier validation and then be clobbered.
+pub fn rewrite_cue_sidecar_metadata_authoritative_from_cuesheet_validated<F>(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+    validate_snapshot: F,
+) -> Result<CueSidecarWritebackOutcome, String>
+where
+    F: FnOnce(&[u8], &str) -> Result<(), String>,
+{
+    rewrite_cue_sidecar_metadata_from_cuesheet_validated_with_mode(
+        cue_path,
+        replacement_cuesheet,
+        validate_snapshot,
         CueMetadataRewriteMode::AuthoritativeProjection,
         None,
     )
@@ -4172,6 +4218,133 @@ fn parse_file_line(line: &str) -> Option<String> {
     }
 }
 
+fn cue_file_reference_span(line: &str) -> Option<(String, usize, usize)> {
+    let trimmed = line.trim_start();
+    let leading = line.len().checked_sub(trimmed.len())?;
+    strip_keyword_ci(trimmed, "FILE")?;
+
+    let mut cursor = leading + "FILE".len();
+    while cursor < line.len() {
+        let ch = line[cursor..].chars().next()?;
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    if cursor >= line.len() {
+        return None;
+    }
+
+    if line[cursor..].starts_with('"') {
+        let value_start = cursor + 1;
+        let relative_end = line[value_start..].find('"')?;
+        let value_end = value_start + relative_end;
+        return Some((line[value_start..value_end].to_string(), value_start, value_end));
+    }
+
+    let rest = &line[cursor..];
+    // Match parse_file_line(): trailing layout whitespace is not part of the
+    // FILE type token. Search for the filename/type separator only within the
+    // significant (non-trailing-whitespace) portion of the directive so
+    // legacy unquoted FILE lines remain rewritable without normalizing bytes.
+    let significant = rest.trim_end_matches(char::is_whitespace);
+    let split = significant.rfind(char::is_whitespace)?;
+    let filename = significant[..split].trim_end();
+    let file_type = significant[split..].trim();
+    if filename.is_empty() || file_type.is_empty() {
+        return None;
+    }
+    Some((
+        filename.to_string(),
+        cursor,
+        cursor + filename.len(),
+    ))
+}
+
+/// Rewrite only the filename token of matching CUE `FILE` directives.
+///
+/// This exists for the ISO-WV staged structural-rename transaction. It leaves
+/// TRACK/INDEX geometry, metadata, comments, indentation, FILE type tokens and
+/// line endings untouched; callers supply exact decoded references captured
+/// from the pre-rename CUE.
+pub(crate) fn compose_cue_file_reference_replacement(
+    template_cuesheet: &str,
+    replacements: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if replacements.is_empty() {
+        return Ok(template_cuesheet.to_string());
+    }
+    for replacement in replacements.values() {
+        if replacement.chars().any(|ch| matches!(ch, '\r' | '\n' | '"')) {
+            return Err(format!(
+                "CUE FILE reference {:?} cannot be represented safely",
+                replacement
+            ));
+        }
+    }
+
+    let lines = split_cue_lines_preserving_eol(template_cuesheet);
+    let mut output = String::with_capacity(template_cuesheet.len());
+    for line in lines {
+        if let Some((reference, start, end)) = cue_file_reference_span(&line.body) {
+            if let Some(replacement) = replacements.get(&reference) {
+                output.push_str(&line.body[..start]);
+                output.push_str(replacement);
+                output.push_str(&line.body[end..]);
+                output.push_str(&line.eol);
+                continue;
+            }
+        }
+        output.push_str(&line.body);
+        output.push_str(&line.eol);
+    }
+    Ok(output)
+}
+
+/// Atomically apply an ISO-WV structural FILE-reference rewrite while
+/// preserving the CUE's original encoding whenever representable.
+pub(crate) fn rewrite_cue_file_references(
+    cue_path: &Path,
+    replacements: &BTreeMap<String, String>,
+) -> Result<(CueSidecarWritebackOutcome, Vec<u8>), String> {
+    if replacements.is_empty() {
+        let raw = std::fs::read(cue_path).map_err(|err| {
+            format!(
+                "failed to read CUE '{}' for no-op FILE-reference rewrite: {err}",
+                cue_path.display()
+            )
+        })?;
+        return Ok((CueSidecarWritebackOutcome::Unchanged, raw));
+    }
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    let raw = std::fs::read(&admitted_cue_path).map_err(|err| {
+        format!(
+            "failed to read CUE '{}' for FILE-reference rewrite: {err}",
+            cue_path.display()
+        )
+    })?;
+    let decoded = decode_cue_bytes_with_context_for_write(&raw, cue_path.parent())?;
+    let rewritten = compose_cue_file_reference_replacement(&decoded.text, replacements)?;
+    if rewritten == decoded.text {
+        return Ok((CueSidecarWritebackOutcome::Unchanged, raw));
+    }
+    let (bytes, outcome) = encode_cue_text_for_write(&rewritten, decoded.encoding);
+    atomic_replace_if_unchanged(&admitted_cue_path, &bytes, Some(&raw))?;
+    Ok((outcome, bytes))
+}
+
+/// Exact rollback helper for the ISO-WV staged rename transaction. The restore
+/// is refused if the CUE changed after the rewrite rather than clobbering an
+/// unexpected concurrent mutation.
+pub(crate) fn restore_cue_bytes_if_unchanged(
+    cue_path: &Path,
+    expected_current: &[u8],
+    original: &[u8],
+) -> Result<(), String> {
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    atomic_replace_if_unchanged(&admitted_cue_path, original, Some(expected_current))
+}
+
 /// Parse a `TRACK NN AUDIO` line, returning the track number.
 #[cfg(test)]
 fn parse_track_line(line: &str) -> Option<u32> {
@@ -4362,6 +4535,67 @@ pub fn parse_cue_timestamp(ts: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_wv_file_reference_rewrite_changes_only_matching_file_tokens() {
+        let original = concat!(
+            "REM COMMENT keep-me\r\n",
+            "FILE \"album.wv\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"One\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "FILE \"Artwork/front.jpg\" BINARY\r\n",
+        );
+        let replacements = BTreeMap::from([(
+            "album.wv".to_string(),
+            "renamed.wv".to_string(),
+        )]);
+        let rewritten = compose_cue_file_reference_replacement(original, &replacements)
+            .expect("rewrite FILE token");
+        assert_eq!(
+            rewritten,
+            original.replace("FILE \"album.wv\"", "FILE \"renamed.wv\"")
+        );
+    }
+
+    #[test]
+    fn iso_wv_file_reference_rewrite_preserves_unquoted_layout_and_directory_paths() {
+        let original = "FILE Disc 1/album.wv WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let replacements = BTreeMap::from([(
+            "Disc 1/album.wv".to_string(),
+            "Side A/album.wv".to_string(),
+        )]);
+        let rewritten = compose_cue_file_reference_replacement(original, &replacements)
+            .expect("rewrite unquoted FILE token");
+        assert_eq!(
+            rewritten,
+            "FILE Side A/album.wv WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n"
+        );
+    }
+
+    #[test]
+    fn iso_wv_file_reference_rewrite_preserves_unquoted_trailing_whitespace_exactly() {
+        let original = "FILE album.wv WAVE   \r\n";
+        let replacements = BTreeMap::from([(
+            "album.wv".to_string(),
+            "renamed.wv".to_string(),
+        )]);
+        let rewritten = compose_cue_file_reference_replacement(original, &replacements)
+            .expect("rewrite unquoted FILE token with trailing whitespace");
+        assert_eq!(rewritten, "FILE renamed.wv WAVE   \r\n");
+    }
+
+    #[test]
+    fn iso_wv_file_reference_rewrite_preserves_unquoted_path_and_trailing_whitespace() {
+        let original = "FILE Disc 1/album.wv WAVE   \r\n";
+        let replacements = BTreeMap::from([(
+            "Disc 1/album.wv".to_string(),
+            "Disc 1/renamed.wv".to_string(),
+        )]);
+        let rewritten = compose_cue_file_reference_replacement(original, &replacements)
+            .expect("rewrite legacy unquoted FILE token with trailing whitespace");
+        assert_eq!(rewritten, "FILE Disc 1/renamed.wv WAVE   \r\n");
+    }
 
     #[test]
     fn validated_sidecar_rewrite_refuses_a_change_after_snapshot_validation() {

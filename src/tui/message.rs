@@ -444,6 +444,21 @@ pub enum AppMessage {
         inner_paths: Vec<String>,
         result: Result<(), String>,
     },
+    /// Milestone from Browse-screen ISO-WV archive-entry creation.
+    ArchiveEntryCreateProgress {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        message: String,
+    },
+    /// Completed Browse-screen ISO-WV archive-entry creation. On success the
+    /// staging tree becomes the active deferred-save session.
+    ArchiveEntryCreateResult {
+        archive_path: std::path::PathBuf,
+        staging_dir: std::path::PathBuf,
+        inner_path: String,
+        kind: crate::tui::app::BrowseCreateKind,
+        result: Result<(), String>,
+    },
     /// Chunk of valid SQLite probe-cache rows warmed after a Browse directory
     /// scan. The reducer merges rows only while the same generation/path is
     /// still current. Large bursts are queued and merged in bounded frame-sized

@@ -21619,6 +21619,8 @@ fn conversion_log_tool_name(binary: ToolBinary) -> Option<&'static str> {
         ToolBinary::AtomicParsley => Some("AtomicParsley"),
         ToolBinary::Tar => Some("tar"),
         ToolBinary::Rar => Some("rar"),
+        ToolBinary::FuseIso => Some("fuseiso"),
+        ToolBinary::Xorriso => Some("xorriso"),
     }
 }
 

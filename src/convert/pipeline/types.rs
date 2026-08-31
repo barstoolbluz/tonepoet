@@ -1985,6 +1985,17 @@ pub fn insert_cue_user_metadata(
     }
 }
 
+/// Remove one exact user-authored CUE metadata key from the internal scalar
+/// transport namespace. Used for reserved control records that participate in
+/// sidecar admission but must never be emitted as user metadata.
+pub fn remove_cue_user_metadata(extra: &mut BTreeMap<String, String>, key: &str) {
+    if key.trim().is_empty() {
+        return;
+    }
+    let encoded_key = URL_SAFE_NO_PAD.encode(key.as_bytes());
+    extra.remove(&format!("{CUE_USER_METADATA_EXTRA_PREFIX}{encoded_key}"));
+}
+
 #[must_use]
 pub fn cue_user_metadata_from_extra(
     extra: &BTreeMap<String, String>,
@@ -2908,12 +2919,127 @@ pub struct PipelineReport {
     pub action_reports: Vec<super::actions::ActionPhaseReport>,
 }
 
+/// Lifetime owner for a foreground FUSE mount used by a materialized source.
+///
+/// `fuseiso -o auto_unmount` releases the kernel mount when its foreground
+/// process exits.  Keeping the child here ties that process to the same RAII
+/// boundary that owns conversion staging; dropping the lease terminates and
+/// reaps the child before staging cleanup touches the mount point.
+pub struct FuseMountLease {
+    mount_point: PathBuf,
+    child: std::sync::Mutex<Option<std::process::Child>>,
+}
+
+impl FuseMountLease {
+    pub fn new(mount_point: PathBuf, child: std::process::Child) -> Self {
+        Self {
+            mount_point,
+            child: std::sync::Mutex::new(Some(child)),
+        }
+    }
+
+    pub fn mount_point(&self) -> &std::path::Path {
+        &self.mount_point
+    }
+}
+
+impl std::fmt::Debug for FuseMountLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(std::process::Child::id));
+        f.debug_struct("FuseMountLease")
+            .field("mount_point", &self.mount_point)
+            .field("pid", &pid)
+            .finish()
+    }
+}
+
+impl Drop for FuseMountLease {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut child) = slot.take() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+        }
+
+        // libfuse's auto_unmount helper may finish just after the foreground
+        // process is reaped.  Give it a short bounded grace period so callers
+        // can immediately remove the now-unmounted staging directory.
+        #[cfg(target_os = "linux")]
+        {
+            for _ in 0..40 {
+                if !linux_mountinfo_contains(&self.mount_point) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            log::warn!(
+                "FUSE mount still present after fuseiso termination: {}",
+                self.mount_point.display()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_mountinfo_contains(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let target = path.to_string_lossy();
+    text.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(decode_mountinfo_field)
+            .is_some_and(|mount_point| mount_point == target)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_field(field: &str) -> std::borrow::Cow<'_, str> {
+    if !field.as_bytes().contains(&b'\\') {
+        return std::borrow::Cow::Borrowed(field);
+    }
+    let mut out = String::with_capacity(field.len());
+    let bytes = field.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            match &field[index + 1..index + 4] {
+                "040" => { out.push(' '); index += 4; continue; }
+                "011" => { out.push('\t'); index += 4; continue; }
+                "012" => { out.push('\n'); index += 4; continue; }
+                "134" => { out.push('\\'); index += 4; continue; }
+                _ => {}
+            }
+        }
+        let ch = field[index..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[derive(Debug)]
 pub struct StagingDir {
     pub root: PathBuf,
     pub job_id: String,
     armed: bool,
     scratch_reservation: Option<ScratchReservation>,
+    fuse_mounts: std::sync::Mutex<Vec<std::sync::Arc<FuseMountLease>>>,
 }
 
 impl StagingDir {
@@ -2923,6 +3049,7 @@ impl StagingDir {
             job_id,
             armed: true,
             scratch_reservation: None,
+            fuse_mounts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -2936,6 +3063,7 @@ impl StagingDir {
             job_id,
             armed: true,
             scratch_reservation: Some(scratch_reservation),
+            fuse_mounts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -2956,12 +3084,23 @@ impl StagingDir {
             job_id,
             armed: false,
             scratch_reservation: None,
+            fuse_mounts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Retain a FUSE mount for at least as long as this staging owner.
+    pub fn retain_fuse_mount(&self, lease: std::sync::Arc<FuseMountLease>) {
+        if let Ok(mut mounts) = self.fuse_mounts.lock() {
+            mounts.push(lease);
         }
     }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
+        if let Ok(mut mounts) = self.fuse_mounts.lock() {
+            mounts.clear();
+        }
         if self.armed {
             let _ = std::fs::remove_dir_all(&self.root);
             if let Some(parent) = self.root.parent() {

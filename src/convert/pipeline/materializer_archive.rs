@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,12 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "wav", "aiff", "aif", "wv", "mp3", "m4a", "aac", "opus", "ogg", "ape", "dsf", "dff",
     "w64", "rf64",
 ];
+
+/// Reserved album-level Tonepoet record identifying an adjacent ISO-WV CUE as
+/// a complete effective metadata snapshot rather than an ordinary unrelated
+/// CUE file. The value is deliberately simple and human-readable.
+pub(crate) const ISO_WV_METADATA_SNAPSHOT_KEY: &str =
+    "TONEPOET_ISO_WV_METADATA_SNAPSHOT_V1";
 
 fn is_audio_extension(ext: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
@@ -69,23 +77,38 @@ impl super::stages::Materializer for ArchiveMaterializer {
         } else {
             staging.root.clone()
         };
-        let extraction_root = reusable_pre_extracted_staging(req, &materializer_extraction_root)
-            .transpose()?
+        let reused_extraction = reusable_pre_extracted_staging(req, &materializer_extraction_root)
+            .transpose()?;
+        let extraction_root = reused_extraction
+            .clone()
             .unwrap_or_else(|| materializer_extraction_root.clone());
+        let mut iso_wv_access = IsoWvPayloadAccess::Extracted;
 
-        if extraction_root == materializer_extraction_root {
+        if reused_extraction.is_none() {
             if is_iso_wv {
                 std::fs::create_dir_all(&extraction_root)?;
-                extract_archive_to_staging(
+                if let Some(lease) = try_mount_iso_wv_readonly(
                     &req.container,
                     &extraction_root,
-                    req.item_id.as_str(),
-                    req.source.archive_password.as_ref().map(|pw| pw.expose()),
                     runner,
-                    reporter,
                     cancel,
                 )
-                .await?;
+                .await?
+                {
+                    staging.retain_fuse_mount(lease);
+                    iso_wv_access = IsoWvPayloadAccess::Mounted;
+                } else {
+                    extract_archive_to_staging(
+                        &req.container,
+                        &extraction_root,
+                        req.item_id.as_str(),
+                        req.source.archive_password.as_ref().map(|pw| pw.expose()),
+                        runner,
+                        reporter,
+                        cancel,
+                    )
+                    .await?;
+                }
             } else {
                 extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
             }
@@ -110,6 +133,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 reporter,
                 tool_paths,
                 cancel,
+                iso_wv_access,
             )
             .await;
         }
@@ -215,6 +239,129 @@ impl super::stages::Materializer for ArchiveMaterializer {
 
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsoWvPayloadAccess {
+    Mounted,
+    Extracted,
+}
+
+/// Mount an ISO-WV payload without copying it.  Failure to acquire FUSE is a
+/// soft capability miss: callers deliberately fall back to the established 7z
+/// extraction path.  Cancellation remains terminal.
+#[allow(unsafe_code)] // libc::getpid + pre_exec(prctl PR_SET_PDEATHSIG) for the foreground FUSE child
+pub(crate) async fn try_mount_iso_wv_readonly(
+    iso_path: &Path,
+    mount_point: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<std::sync::Arc<FuseMountLease>>, MaterializeError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (iso_path, mount_point, runner, cancel);
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if cancel.is_cancelled() {
+            return Err(MaterializeError::Cancelled);
+        }
+        let Some(fuseiso) = runner.resolved_tool_path(ToolBinary::FuseIso) else {
+            return Ok(None);
+        };
+        if !Path::new("/dev/fuse").exists() {
+            return Ok(None);
+        }
+        fs::create_dir_all(mount_point).map_err(MaterializeError::Io)?;
+        if fs::read_dir(mount_point)
+            .map_err(MaterializeError::Io)?
+            .next()
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let parent_pid = unsafe { libc::getpid() };
+        let mut command = std::process::Command::new(fuseiso);
+        command
+            .arg("-n")
+            .arg("-f")
+            .arg("-o")
+            .arg("auto_unmount")
+            .arg(iso_path)
+            .arg(mount_point)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        // A foreground FUSE child would otherwise survive a SIGKILL of the
+        // parent.  PDEATHSIG closes that gap; auto_unmount then releases the
+        // mount when the child terminates.  Re-check PPID after prctl to cover
+        // the parent-death race between fork and the pre-exec hook.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "tonepoet parent exited before fuseiso supervision was armed",
+                    ));
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                log::debug!("ISO-WV mount unavailable; falling back to extraction: {err}");
+                return Ok(None);
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if cancel.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MaterializeError::Cancelled);
+            }
+            if super::types::linux_mountinfo_contains(mount_point) {
+                return Ok(Some(std::sync::Arc::new(FuseMountLease::new(
+                    mount_point.to_path_buf(),
+                    child,
+                ))));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    log::debug!(
+                        "ISO-WV mount exited before becoming ready ({status}); falling back to extraction"
+                    );
+                    return Ok(None);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log::debug!(
+                        "ISO-WV mount readiness check failed; falling back to extraction: {err}"
+                    );
+                    return Ok(None);
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                log::debug!("ISO-WV mount timed out; falling back to extraction");
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
 async fn materialize_iso_wv_cue_payload(
     req: &PipelineRequest,
     extraction_root: &Path,
@@ -223,10 +370,11 @@ async fn materialize_iso_wv_cue_payload(
     reporter: Option<&dyn PipelineReporter>,
     tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
+    access: IsoWvPayloadAccess,
 ) -> Result<PreparedSource, MaterializeError> {
     let cue_path = find_single_visible_cue(extraction_root)?;
     let mut cue_req = req.clone();
-    cue_req.container = cue_path;
+    cue_req.container = cue_path.clone();
     cue_req.pre_extracted_staging = None;
     // A visible CUE is the authority inside this container. Do not let an
     // external per-image sidecar policy accidentally disable the container's
@@ -243,6 +391,12 @@ async fn materialize_iso_wv_cue_payload(
         cancel,
     )
     .await?;
+
+    // A Tonepoet-owned adjacent CUE is an external metadata persistence layer.
+    // Apply it before queue-time preview overrides so unsaved Convert edits
+    // remain the last writer, exactly as they were before sidecar persistence
+    // existed. The internal CUE still owns geometry and audio realization.
+    apply_iso_wv_metadata_sidecar(&req.container, &cue_path, &mut prepared)?;
 
     // Archive-preview metadata edits are keyed by displayed track ordinal for
     // ISO-WV because all CUE tracks can share one physical image. Preserve that
@@ -272,10 +426,152 @@ async fn materialize_iso_wv_cue_payload(
     prepared.container = req.container.clone();
     prepared.kind = SourceKind::Archive;
     prepared.provenance.source_kind = SourceKind::Archive;
-    if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
-        prepared.provenance.tool_versions.insert("7z".to_string(), version);
+    match access {
+        IsoWvPayloadAccess::Mounted => {
+            if let Some(version) = runner.tool_version(ToolBinary::FuseIso) {
+                prepared
+                    .provenance
+                    .tool_versions
+                    .insert("fuseiso".to_string(), version);
+            }
+        }
+        IsoWvPayloadAccess::Extracted => {
+            if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
+                prepared
+                    .provenance
+                    .tool_versions
+                    .insert("7z".to_string(), version);
+            }
+        }
     }
     Ok(prepared)
+}
+
+/// Adjacent metadata companion used only for ISO-WV persistence. Appending the
+/// suffix keeps the compound source name intact (`album.iso.wv.cue`) and
+/// cannot collide with ordinary `album.cue` sidecars for a neighboring audio
+/// file.
+pub(crate) fn iso_wv_metadata_sidecar_path(archive_path: &Path) -> PathBuf {
+    let mut name = archive_path.as_os_str().to_os_string();
+    name.push(".cue");
+    PathBuf::from(name)
+}
+
+/// Structural identity required before an external metadata snapshot can be
+/// applied to an ISO-WV. Metadata fields may differ by design; FILE/TRACK/index
+/// geometry may not. This prevents a stale sidecar from shifting metadata onto
+/// a different release that happens to reuse the same filename.
+pub(crate) fn iso_wv_cue_geometry_matches(
+    expected: &crate::tui::cue_parser::CueSheet,
+    candidate: &crate::tui::cue_parser::CueSheet,
+) -> bool {
+    expected.tracks.len() == candidate.tracks.len()
+        && expected
+            .tracks
+            .iter()
+            .zip(candidate.tracks.iter())
+            .all(|(expected, candidate)| {
+                expected.number == candidate.number
+                    && expected.file == candidate.file
+                    && expected.index00_frames == candidate.index00_frames
+                    && expected.index01_frames == candidate.index01_frames
+            })
+}
+
+fn apply_iso_wv_metadata_sidecar(
+    archive_path: &Path,
+    internal_cue_path: &Path,
+    prepared: &mut PreparedSource,
+) -> Result<(), MaterializeError> {
+    let sidecar_path = iso_wv_metadata_sidecar_path(archive_path);
+    if !sidecar_path.exists() {
+        return Ok(());
+    }
+
+    let internal = crate::tui::cue_parser::parse_cue_file(internal_cue_path)
+        .map_err(|err| MaterializeError::Parse(format!(
+            "failed to re-read internal ISO-WV CUE for sidecar admission: {err}"
+        )))?;
+    let sidecar = crate::tui::cue_parser::parse_cue_file(&sidecar_path)
+        .map_err(|err| MaterializeError::Parse(format!(
+            "failed to parse ISO-WV metadata sidecar '{}': {err}",
+            sidecar_path.display()
+        )))?;
+
+    // The appended filename is intentionally private to this feature, but a
+    // pre-existing user file with that name must not silently become metadata
+    // authority. Only sidecars carrying our explicit snapshot marker opt in.
+    let is_tonepoet_snapshot = crate::convert::cue_parser::cue_user_metadata_values(
+        &sidecar.user_metadata,
+        ISO_WV_METADATA_SNAPSHOT_KEY,
+    )
+    .is_some_and(|values| values.iter().any(|value| value.trim() == "1"));
+    if !is_tonepoet_snapshot {
+        log::debug!(
+            "ignoring adjacent ISO-WV CUE without Tonepoet snapshot marker: {}",
+            sidecar_path.display()
+        );
+        return Ok(());
+    }
+
+    if !iso_wv_cue_geometry_matches(&internal, &sidecar) {
+        return Err(MaterializeError::Parse(format!(
+            "ISO-WV metadata sidecar '{}' no longer matches the image CUE track geometry; refusing stale metadata authority",
+            sidecar_path.display()
+        )));
+    }
+    if sidecar.tracks.len() != prepared.tracks.len() {
+        return Err(MaterializeError::Parse(format!(
+            "ISO-WV metadata sidecar '{}' has {} tracks but materialization produced {}; refusing positional metadata overlay",
+            sidecar_path.display(),
+            sidecar.tracks.len(),
+            prepared.tracks.len()
+        )));
+    }
+
+    for (index, prepared_track) in prepared.tracks.iter_mut().enumerate() {
+        let old_extra = prepared_track.metadata.extra.clone();
+        let mut mapped = super::materializer_cue::cue_sheet_track_metadata_for_conversion(
+            &sidecar,
+            index,
+            prepared_track.metadata.pre_emphasis,
+        )
+        .ok_or_else(|| MaterializeError::Parse(format!(
+            "ISO-WV metadata sidecar '{}' lost track position {} during mapping",
+            sidecar_path.display(),
+            index + 1
+        )))?;
+
+        // Raw REM annotations are not part of CueSheet's typed metadata model.
+        // They came from the same internal CUE whose geometry was just proven
+        // equal, so preserve only that annotation namespace; do not merge the
+        // old image-tag extras, because absence in the snapshot represents an
+        // intentional metadata deletion.
+        for (key, value) in old_extra {
+            if key.starts_with("rem_") && !mapped.extra.contains_key(&key) {
+                mapped.extra.insert(key, value);
+            }
+        }
+        prepared_track.metadata = mapped;
+    }
+
+    let old_album_extra = prepared.album_metadata.extra.clone();
+    let mut mapped_album =
+        super::materializer_cue::cue_sheet_album_metadata_for_conversion(&sidecar);
+    remove_cue_user_metadata(
+        &mut mapped_album.extra,
+        ISO_WV_METADATA_SNAPSHOT_KEY,
+    );
+    for (key, value) in old_album_extra {
+        if key.starts_with("rem_") && !mapped_album.extra.contains_key(&key) {
+            mapped_album.extra.insert(key, value);
+        }
+    }
+    for track in &mut prepared.tracks {
+        track.metadata.disc_number = mapped_album.disc_number;
+    }
+    prepared.album_metadata = mapped_album;
+    Ok(())
 }
 
 /// Locate the single user-visible CUE authority in a self-contained ISO-WV
@@ -460,6 +756,7 @@ enum RepackageArchiveFormat {
     Tar,
     TarGz,
     Rar,
+    IsoWv,
 }
 
 /// Non-fatal details from a successful archive repackage. The most important
@@ -635,6 +932,11 @@ fn require_repackage_format_tool_available(
             tool_paths,
             &["rar"],
             "RAR archive creation requires the `rar` executable; install rar or convert the archive to 7z before editing metadata",
+        ),
+        RepackageArchiveFormat::IsoWv => require_repackage_tool_available(
+            tool_paths,
+            &["xorriso"],
+            "ISO-WV repackaging requires the `xorriso` executable",
         ),
     }
 }
@@ -887,6 +1189,9 @@ fn human_bytes(bytes: u64) -> String {
 
 
 fn repackage_archive_format(path: &Path) -> Result<RepackageArchiveFormat, String> {
+    if crate::convert::classify::is_iso_wv_container(path) {
+        return Ok(RepackageArchiveFormat::IsoWv);
+    }
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -916,6 +1221,7 @@ fn repackage_format_suffix(format: RepackageArchiveFormat) -> &'static str {
         RepackageArchiveFormat::Tar => ".tar",
         RepackageArchiveFormat::TarGz => ".tar.gz",
         RepackageArchiveFormat::Rar => ".rar",
+        RepackageArchiveFormat::IsoWv => ".iso.wv",
     }
 }
 
@@ -989,6 +1295,31 @@ where
                     }
                 })
         }
+        RepackageArchiveFormat::IsoWv => {
+            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            run_repackage_command(
+                ToolBinary::Xorriso,
+                xorriso,
+                vec![
+                    "-as".into(),
+                    "mkisofs".into(),
+                    "-iso-level".into(),
+                    "3".into(),
+                    "-full-iso9660-filenames".into(),
+                    "-J".into(),
+                    "-r".into(),
+                    "-o".into(),
+                    temp_archive.display().to_string(),
+                    ".".into(),
+                ],
+                Some(staging_dir.to_path_buf()),
+                "create ISO-WV image",
+                cancel,
+                monitor,
+                progress,
+            )
+            .await
+        }
     }
 }
 
@@ -1033,6 +1364,30 @@ where
                 ToolBinary::Rar, rar, vec!["t".into(), temp_archive.display().to_string()],
                 None, "verify repackaged rar archive", cancel, monitor, progress
             ).await
+        }
+        RepackageArchiveFormat::IsoWv => {
+            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            run_repackage_command(
+                ToolBinary::Xorriso,
+                xorriso,
+                vec![
+                    "-indev".into(),
+                    temp_archive.display().to_string(),
+                    "-find".into(),
+                    "/".into(),
+                    "-type".into(),
+                    "f".into(),
+                    "-exec".into(),
+                    "report_lba".into(),
+                    "--".into(),
+                ],
+                None,
+                "verify repackaged ISO-WV image",
+                cancel,
+                monitor,
+                progress,
+            )
+            .await
         }
     }
 }
@@ -2053,6 +2408,54 @@ mod tests {
     use std::io::Write;
     use std::process::Command;
     use std::sync::Mutex;
+
+    #[test]
+    fn iso_wv_repackage_classification_is_compound_suffix_specific() {
+        assert_eq!(
+            repackage_archive_format(Path::new("Album.ISO.WV")).expect("ISO-WV format"),
+            RepackageArchiveFormat::IsoWv,
+        );
+        assert!(
+            repackage_archive_format(Path::new("Album.wv")).is_err(),
+            "ordinary WavPack must not become an archive repackage target",
+        );
+        assert_eq!(
+            iso_wv_metadata_sidecar_path(Path::new("Album.iso.wv")),
+            PathBuf::from("Album.iso.wv.cue"),
+        );
+    }
+
+    #[test]
+    fn iso_wv_repackage_preflight_reports_missing_xorriso() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.iso.wv");
+        fs::write(&original, b"iso placeholder").expect("archive placeholder");
+        let missing_xorriso = temp.path().join("definitely-missing-xorriso-binary");
+        let tool_paths = HashMap::from([("xorriso".to_string(), missing_xorriso)]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("missing xorriso must be reported before extraction");
+        assert!(
+            err.contains("ISO-WV repackaging requires the `xorriso` executable"),
+            "missing xorriso preflight error should be actionable: {err}",
+        );
+    }
+
+    #[test]
+    fn iso_wv_sidecar_geometry_ignores_metadata_but_rejects_track_drift() {
+        let base = crate::convert::cue_parser::parse_cue(
+            "TITLE \"Album A\"\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 04:00:00\n",
+        );
+        let metadata_only = crate::convert::cue_parser::parse_cue(
+            "TITLE \"Album B\"\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Uno\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Dos\"\n    INDEX 01 04:00:00\n",
+        );
+        assert!(iso_wv_cue_geometry_matches(&base, &metadata_only));
+
+        let drifted = crate::convert::cue_parser::parse_cue(
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 04:00:01\n",
+        );
+        assert!(!iso_wv_cue_geometry_matches(&base, &drifted));
+    }
 
     #[test]
     fn iso_wv_cue_discovery_accepts_one_visible_sheet_and_ignores_hidden_scratch() {
@@ -3123,6 +3526,154 @@ mod tests {
                 .iter()
                 .any(|snapshot| snapshot.stage == ArchiveRepackageStage::Validating),
             "cancel should still emit the initial validating snapshot"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn iso_wv_real_repackage_mount_resolve_and_decode_after_payload_rename() {
+        let required = std::env::var_os("TONEPOET_REQUIRE_TOOLS")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false);
+        let tools = (
+            find_executable(&["xorriso"]),
+            find_executable(&["fuseiso"]),
+            find_executable(&["wavpack"]),
+            find_executable(&["ffmpeg"]),
+        );
+        let (Some(xorriso), Some(fuseiso), Some(wavpack), Some(ffmpeg)) = tools else {
+            if required {
+                panic!(
+                    "ISO-WV real acceptance requires xorriso, fuseiso, wavpack, and ffmpeg because TONEPOET_REQUIRE_TOOLS=1"
+                );
+            }
+            eprintln!(
+                "skipping ISO-WV real repackage acceptance; xorriso, fuseiso, wavpack, and ffmpeg are required"
+            );
+            return;
+        };
+        if !Path::new("/dev/fuse").exists() {
+            if required {
+                panic!("ISO-WV real acceptance requires /dev/fuse because TONEPOET_REQUIRE_TOOLS=1");
+            }
+            eprintln!("skipping ISO-WV real repackage acceptance; /dev/fuse is unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging).expect("staging dir");
+
+        // Build a tiny deterministic PCM fixture without depending on a media
+        // generator, then encode it with the same WavPack CLI shipped by the
+        // runtime environment.
+        let wav = temp.path().join("fixture.wav");
+        let frames = 4_410u32;
+        let channels = 1u16;
+        let sample_rate = 44_100u32;
+        let bits_per_sample = 16u16;
+        let data_len = frames * u32::from(channels) * u32::from(bits_per_sample / 8);
+        let mut wav_file = fs::File::create(&wav).expect("create WAV fixture");
+        wav_file.write_all(b"RIFF").unwrap();
+        wav_file.write_all(&(36u32 + data_len).to_le_bytes()).unwrap();
+        wav_file.write_all(b"WAVEfmt ").unwrap();
+        wav_file.write_all(&16u32.to_le_bytes()).unwrap();
+        wav_file.write_all(&1u16.to_le_bytes()).unwrap();
+        wav_file.write_all(&channels.to_le_bytes()).unwrap();
+        wav_file.write_all(&sample_rate.to_le_bytes()).unwrap();
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample / 8);
+        wav_file.write_all(&byte_rate.to_le_bytes()).unwrap();
+        let block_align = channels * (bits_per_sample / 8);
+        wav_file.write_all(&block_align.to_le_bytes()).unwrap();
+        wav_file.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+        wav_file.write_all(b"data").unwrap();
+        wav_file.write_all(&data_len.to_le_bytes()).unwrap();
+        wav_file.write_all(&vec![0u8; data_len as usize]).unwrap();
+        drop(wav_file);
+
+        let renamed_wv = staging.join("renamed.wv");
+        run_fixture_command(
+            &wavpack,
+            &[
+                OsStr::new("-q"),
+                OsStr::new("-y"),
+                wav.as_os_str(),
+                OsStr::new("-o"),
+                renamed_wv.as_os_str(),
+            ],
+            None,
+        )
+        .expect("encode WavPack fixture");
+        fs::write(
+            staging.join("album.cue"),
+            "TITLE \"Renamed Album\"\nFILE \"renamed.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track\"\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write corrected CUE fixture");
+
+        let archive = temp.path().join("Album.iso.wv");
+        fs::write(&archive, b"pre-repackage placeholder").expect("original placeholder");
+        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso)]);
+        repackage_archive(&staging, &archive, &tool_paths)
+            .await
+            .expect("rebuild renamed ISO-WV fixture");
+
+        let mount_point = temp.path().join("mounted");
+        let runner = RealToolRunner::new(HashMap::from([("fuseiso".to_string(), fuseiso)]));
+        let cancel = CancellationToken::new();
+        let lease = match try_mount_iso_wv_readonly(&archive, &mount_point, &runner, &cancel)
+            .await
+            .expect("attempt corrected ISO-WV mount")
+        {
+            Some(lease) => lease,
+            None if required => {
+                panic!("ISO-WV real acceptance could not acquire an unprivileged FUSE mount")
+            }
+            None => {
+                eprintln!("skipping ISO-WV real repackage acceptance; FUSE mount was unavailable");
+                return;
+            }
+        };
+
+        let mounted_cue = find_single_visible_cue(lease.mount_point())
+            .expect("mounted rebuilt ISO must contain one CUE authority");
+        let sheet = crate::tui::cue_parser::parse_cue_file(&mounted_cue)
+            .expect("parse mounted rebuilt CUE");
+        let file_ref = sheet
+            .tracks
+            .first()
+            .and_then(|track| track.file.as_deref())
+            .expect("mounted rebuilt CUE FILE reference");
+        assert_eq!(file_ref, "renamed.wv");
+        let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(
+            mounted_cue.parent().unwrap(),
+            file_ref,
+        ) {
+            crate::tui::browse::CueReferenceResolution::Resolved(path) => path,
+            other => panic!("mounted rebuilt CUE did not resolve renamed payload: {other:?}"),
+        };
+
+        let decode = Command::new(&ffmpeg)
+            .arg("-v")
+            .arg("error")
+            .arg("-i")
+            .arg(&resolved)
+            .arg("-t")
+            .arg("0.05")
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .output()
+            .expect("run ffmpeg decode against mounted renamed payload");
+        assert!(
+            decode.status.success(),
+            "mounted renamed WavPack did not decode: {}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
+
+        drop(lease);
+        assert!(
+            !super::super::types::linux_mountinfo_contains(&mount_point),
+            "real ISO-WV acceptance leaked its FUSE mount"
         );
     }
 

@@ -3774,9 +3774,117 @@ fn apply_cue_user_metadata_to_album(
                     metadata.disc_number = Some(number);
                 }
             }
+            "DISCTOTAL" | "TOTALDISCS" => {
+                if let Ok(number) = first.trim().parse::<u32>() {
+                    metadata.total_discs = Some(number);
+                }
+            }
             _ => {}
         }
     }
+}
+
+fn cue_image_metadata_from_user_snapshot(
+    snapshot: &crate::tui::cue_parser::CueUserMetadata,
+) -> ImageAlbumMetadata {
+    let mut image = ImageAlbumMetadata::default();
+    for (key, values) in snapshot {
+        if key.trim().is_empty() || values.is_empty() {
+            continue;
+        }
+        let normalized = normalize_tag_key(key);
+        let first = values
+            .iter()
+            .find(|value| !value.trim().is_empty())
+            .cloned();
+        match cue_image_tag_field(&normalized) {
+            Some(ImageTagField::Album) => image.album = first.clone(),
+            Some(ImageTagField::AlbumArtist) => {
+                image.album_artist = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Artist) => {
+                image.artist = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Genre) => {
+                image.genre = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Date) => image.date = first.clone(),
+            Some(ImageTagField::Composer) => {
+                image.composer = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Performer) => {
+                image.performer = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Arranger) => {
+                image.arranger = MetadataValueList::from_values(values.clone())
+            }
+            Some(ImageTagField::Isrc) => image.isrc = first.clone(),
+            Some(ImageTagField::Publisher) => image.publisher = first.clone(),
+            Some(ImageTagField::Copyright) => image.copyright = first.clone(),
+            Some(ImageTagField::Comment) => image.comment = first.clone(),
+            Some(ImageTagField::DiscNumber) => {
+                image.disc_number = first.as_deref().and_then(parse_tag_number)
+            }
+            Some(ImageTagField::TotalDiscs) => {
+                image.total_discs = first.as_deref().and_then(parse_tag_number)
+            }
+            None => {}
+        }
+        if !cue_image_tag_is_structural_or_track_scoped(&normalized) {
+            if let Some(value) = first.as_deref() {
+                let extra_key = cue_image_extra_key(&normalized)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| key.trim().to_ascii_lowercase());
+                set_extra_if_empty(&mut image.extra, &extra_key, value);
+            }
+        }
+    }
+    if image.artist.is_empty() && !image.performer.is_empty() {
+        image.artist = image.performer.clone();
+    }
+    image
+}
+
+/// Reproduce the CueImage materializer's metadata precedence from an explicit
+/// image-tag snapshot without touching the audio carrier. ISO-WV uses this
+/// when the user chooses an external metadata sidecar: the staged WavPack tags
+/// are projected through the exact same CUE-vs-image precedence before the
+/// complete effective result is serialized.
+pub(crate) fn cue_sheet_metadata_from_image_user_snapshot(
+    sheet: &CueSheet,
+    snapshot: &crate::tui::cue_parser::CueUserMetadata,
+) -> (Vec<TrackMetadata>, AlbumMetadata) {
+    let image = cue_image_metadata_from_user_snapshot(snapshot);
+    let numbering = cue_track_number_plan(sheet);
+    let image_is_track_unique = sheet.tracks.len() == 1;
+    let tracks = sheet
+        .tracks
+        .iter()
+        .zip(numbering.iter().copied())
+        .map(|(track, numbering)| {
+            cue_track_metadata(
+                track,
+                sheet,
+                &image,
+                image_is_track_unique,
+                false,
+                numbering,
+            )
+        })
+        .collect::<Vec<_>>();
+    let album = cue_album_metadata(sheet, &image, sheet.tracks.len() as u32);
+    (tracks, album)
+}
+
+/// Album half of the canonical CUE mapping with no image-tag fallback.
+/// External ISO-WV metadata sidecars carry a complete effective snapshot in
+/// their Tonepoet block, so this is sufficient to reconstruct that authority.
+pub(crate) fn cue_sheet_album_metadata_for_conversion(sheet: &CueSheet) -> AlbumMetadata {
+    cue_album_metadata(
+        sheet,
+        &ImageAlbumMetadata::default(),
+        sheet.tracks.len() as u32,
+    )
 }
 
 /// Canonical CUE-sheet-to-track-metadata mapping for conversion planning and

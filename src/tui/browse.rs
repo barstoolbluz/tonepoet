@@ -3001,6 +3001,8 @@ pub enum ArchiveEdit {
     /// content changed instead of fabricating a fake `metadata=updated` edit.
     ContentModified { inner_path: String, kind: String },
     Delete { inner_path: String },
+    /// New file or directory created inside deferred archive staging.
+    Create { inner_path: String, is_dir: bool },
 }
 
 #[derive(Debug, Clone)]

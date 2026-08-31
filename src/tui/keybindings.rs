@@ -6990,6 +6990,7 @@ pub(super) fn browse_tab_action_ready(app: &mut AppState, tx: &mpsc::Sender<AppM
         || app.pending_browse_archive_metadata.is_some()
         || app.pending_browse_archive_rename.is_some()
         || app.pending_browse_archive_delete.is_some()
+        || app.pending_browse_archive_create.is_some()
     {
         app.set_status("tab action deferred: finish the active archive operation first");
         return false;
@@ -9426,6 +9427,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     if matches!(action, ConfirmAction::CueTonepoetMetadataConsent { .. }) =>
                 {
                     cancel_cue_tonepoet_metadata_consent_prompt(app);
+                }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if matches!(action, ConfirmAction::IsoWvMetadataPersistence { .. }) =>
+                {
+                    let ConfirmAction::IsoWvMetadataPersistence { context } = &action else {
+                        unreachable!("guarded above")
+                    };
+                    let context = context.clone().with_iso_wv_persistence_confirmed();
+                    app.active_overlay = ActiveOverlay::None;
+                    super::event_loop::start_browse_archive_repackage(app, context, tx);
                 }
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.active_overlay = ActiveOverlay::None;
@@ -33350,6 +33361,193 @@ fn append_archive_rename_edit_and_persist(
     }
 }
 
+
+#[derive(Debug)]
+struct IsoWvCueRenamePlan {
+    cue_after: std::path::PathBuf,
+    original_cue_bytes: Vec<u8>,
+    replacements: std::collections::BTreeMap<String, String>,
+}
+
+fn remap_staged_relative_path_for_rename(
+    path: &std::path::Path,
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Ok(suffix) = path.strip_prefix(old_path) {
+        new_path.join(suffix)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn normalized_cue_reference_for_rename(value: &str) -> String {
+    let mut normalized = value.replace('\\', "/");
+    while let Some(rest) = normalized.strip_prefix("./") {
+        normalized = rest.to_string();
+    }
+    normalized
+}
+
+fn relative_cue_reference(
+    cue_parent: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<String, String> {
+    use std::path::Component;
+
+    let collect = |path: &std::path::Path| -> Result<Vec<String>, String> {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(
+                    part.to_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "ISO-WV CUE path is not valid UTF-8".to_string()),
+                ),
+                Component::CurDir => None,
+                _ => Some(Err("ISO-WV CUE path escaped archive staging".to_string())),
+            })
+            .collect()
+    };
+    let from = collect(cue_parent)?;
+    let to = collect(target)?;
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = Vec::new();
+    parts.extend(std::iter::repeat("..".to_string()).take(from.len() - common));
+    parts.extend(to.into_iter().skip(common));
+    if parts.is_empty() {
+        return Err("ISO-WV CUE FILE target collapsed to the CUE directory".to_string());
+    }
+    Ok(parts.join("/"))
+}
+
+fn prepare_iso_wv_cue_rename_plan(
+    staging_dir: &std::path::Path,
+    old_staged: &std::path::Path,
+    new_staged: &std::path::Path,
+) -> Result<Option<IsoWvCueRenamePlan>, String> {
+    use crate::tui::browse::CueReferenceResolution;
+
+    let cue_before = crate::convert::pipeline::materializer_archive::find_single_visible_cue(
+        staging_dir,
+    )
+    .map_err(|err| format!("ISO-WV rename could not identify its CUE authority: {err}"))?;
+    let original_cue_bytes = std::fs::read(&cue_before)
+        .map_err(|err| format!("read ISO-WV CUE before rename failed: {err}"))?;
+    let cue_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &original_cue_bytes,
+        &cue_before,
+    )?;
+    let sheet = crate::convert::cue_parser::parse_cue(&cue_text);
+    if sheet.tracks.is_empty() {
+        return Err("ISO-WV rename refused because the authoritative CUE has no audio tracks".to_string());
+    }
+
+    let staging_identity = std::fs::canonicalize(staging_dir)
+        .map_err(|err| format!("canonicalize ISO-WV staging root failed: {err}"))?;
+    let old_relative = old_staged
+        .strip_prefix(staging_dir)
+        .map_err(|_| "ISO-WV rename source escaped staging".to_string())?;
+    let new_relative = new_staged
+        .strip_prefix(staging_dir)
+        .map_err(|_| "ISO-WV rename target escaped staging".to_string())?;
+    let cue_relative = cue_before
+        .strip_prefix(staging_dir)
+        .map_err(|_| "ISO-WV CUE escaped staging".to_string())?;
+    let cue_after_relative =
+        remap_staged_relative_path_for_rename(cue_relative, old_relative, new_relative);
+    let cue_after = staging_dir.join(&cue_after_relative);
+    let cue_after_parent = cue_after_relative.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let cue_before_parent = cue_before
+        .parent()
+        .ok_or_else(|| "ISO-WV CUE has no parent directory".to_string())?;
+
+    let mut replacements = std::collections::BTreeMap::<String, String>::new();
+    for track in &sheet.tracks {
+        let Some(file_ref) = track.file.as_deref().filter(|value| !value.trim().is_empty()) else {
+            return Err(format!("ISO-WV CUE track {} has no FILE reference", track.number));
+        };
+        if replacements.contains_key(file_ref) {
+            continue;
+        }
+        let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(
+            cue_before_parent,
+            file_ref,
+        ) {
+            CueReferenceResolution::Resolved(path) => path,
+            CueReferenceResolution::Missing => {
+                return Err(format!("ISO-WV CUE FILE {:?} is already missing before rename", file_ref));
+            }
+            CueReferenceResolution::Ambiguous(candidates) => {
+                return Err(format!(
+                    "ISO-WV CUE FILE {:?} is ambiguous before rename ({} candidates)",
+                    file_ref,
+                    candidates.len()
+                ));
+            }
+            CueReferenceResolution::UnsupportedTarget(path) => {
+                return Err(format!(
+                    "ISO-WV CUE FILE {:?} is not a supported audio source ({})",
+                    file_ref,
+                    path.display()
+                ));
+            }
+        };
+        let resolved_identity = std::fs::canonicalize(&resolved).map_err(|err| {
+            format!("canonicalize ISO-WV CUE target {} failed: {err}", resolved.display())
+        })?;
+        let target_relative = resolved_identity
+            .strip_prefix(&staging_identity)
+            .map_err(|_| format!("ISO-WV CUE FILE {:?} resolves outside staging", file_ref))?;
+        let target_after_relative = remap_staged_relative_path_for_rename(
+            target_relative,
+            old_relative,
+            new_relative,
+        );
+        let mut new_ref = relative_cue_reference(cue_after_parent, &target_after_relative)?;
+        if file_ref.contains('\\') && !file_ref.contains('/') {
+            new_ref = new_ref.replace('/', "\\");
+        }
+        if normalized_cue_reference_for_rename(file_ref)
+            != normalized_cue_reference_for_rename(&new_ref)
+        {
+            if file_ref.contains('"') || new_ref.contains('"') {
+                return Err("ISO-WV rename would require a CUE FILE name containing a quote".to_string());
+            }
+            replacements.insert(file_ref.to_string(), new_ref);
+        }
+    }
+
+    if replacements.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(IsoWvCueRenamePlan {
+            cue_after,
+            original_cue_bytes,
+            replacements,
+        }))
+    }
+}
+
+fn rollback_iso_wv_cue_rename(
+    plan: Option<&IsoWvCueRenamePlan>,
+    rewritten_cue_bytes: Option<&[u8]>,
+    new_staged: &std::path::Path,
+    old_staged: &std::path::Path,
+) -> Result<(), String> {
+    if let (Some(plan), Some(current)) = (plan, rewritten_cue_bytes) {
+        crate::convert::cue_parser::restore_cue_bytes_if_unchanged(
+            &plan.cue_after,
+            current,
+            &plan.original_cue_bytes,
+        )?;
+    }
+    std::fs::rename(new_staged, old_staged)
+        .map_err(|err| format!("staged filesystem rename rollback failed: {err}"))
+}
 pub(super) fn rename_staged_archive_entry_transactional(
     app: &mut AppState,
     staging_dir: &std::path::Path,
@@ -33358,12 +33556,32 @@ pub(super) fn rename_staged_archive_entry_transactional(
 ) -> Result<(), String> {
     let old_staged = staging_path_for_archive_inner(staging_dir, old_inner_path)?;
     let new_staged = staging_path_for_archive_inner(staging_dir, new_inner_path)?;
-    if !old_staged.is_file() {
-        return Err(format!("archive entry was not staged as a file: {old_inner_path}"));
+    if !old_staged.exists() {
+        return Err(format!("archive entry was not present in staging: {old_inner_path}"));
     }
     if new_staged.exists() {
         return Err(format!("rename target already exists in staging: {new_inner_path}"));
     }
+
+    let is_iso_wv = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| {
+            archive
+                .staging
+                .as_ref()
+                .is_some_and(|staging| staging.staging_dir == staging_dir)
+        })
+        .is_some_and(|archive| {
+            crate::convert::classify::is_iso_wv_container(&archive.listing.archive_path)
+        });
+    let cue_rename_plan = if is_iso_wv {
+        prepare_iso_wv_cue_rename_plan(staging_dir, &old_staged, &new_staged)?
+    } else {
+        None
+    };
+
     if let Some(parent) = new_staged.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("rename failed: create target parent: {err}"))?;
@@ -33372,13 +33590,86 @@ pub(super) fn rename_staged_archive_entry_transactional(
     std::fs::rename(&old_staged, &new_staged)
         .map_err(|err| format!("rename in archive staging failed: {err}"))?;
 
+    let mut rewritten_cue_bytes = None;
+    if let Some(plan) = cue_rename_plan.as_ref() {
+        let current = match crate::convert::cue_parser::rewrite_cue_file_references(
+            &plan.cue_after,
+            &plan.replacements,
+        ) {
+            Ok((_outcome, current)) => current,
+            Err(err) => {
+                return match rollback_iso_wv_cue_rename(None, None, &new_staged, &old_staged) {
+                    Ok(()) => Err(format!(
+                        "ISO-WV rename could not update its CUE FILE reference; staged rename was rolled back: {err}"
+                    )),
+                    Err(rollback_err) => Err(format!(
+                        "ISO-WV rename could not update its CUE FILE reference: {err}; rollback also failed: {rollback_err}"
+                    )),
+                };
+            }
+        };
+        let rewritten_sheet = match crate::convert::cue_parser::decode_cue_bytes_for_path(
+            &current,
+            &plan.cue_after,
+        ) {
+            Ok(text) => crate::convert::cue_parser::parse_cue(&text),
+            Err(err) => {
+                let rollback = rollback_iso_wv_cue_rename(
+                    Some(plan),
+                    Some(&current),
+                    &new_staged,
+                    &old_staged,
+                );
+                return Err(match rollback {
+                    Ok(()) => format!(
+                        "decode rewritten ISO-WV CUE failed; staged filesystem/CUE rename was rolled back: {err}"
+                    ),
+                    Err(rollback_err) => format!(
+                        "decode rewritten ISO-WV CUE failed: {err}; rollback also failed: {rollback_err}"
+                    ),
+                });
+            }
+        };
+        for replacement in plan.replacements.values() {
+            let expected = normalized_cue_reference_for_rename(replacement);
+            if !rewritten_sheet.tracks.iter().any(|track| {
+                track.file.as_deref().is_some_and(|file_ref| {
+                    normalized_cue_reference_for_rename(file_ref) == expected
+                })
+            }) {
+                let rollback = rollback_iso_wv_cue_rename(
+                    Some(plan),
+                    Some(&current),
+                    &new_staged,
+                    &old_staged,
+                );
+                return Err(match rollback {
+                    Ok(()) => format!(
+                        "ISO-WV CUE rewrite did not retain expected FILE reference {:?}; staged rename was rolled back",
+                        replacement
+                    ),
+                    Err(rollback_err) => format!(
+                        "ISO-WV CUE rewrite did not retain expected FILE reference {:?}; rollback also failed: {rollback_err}",
+                        replacement
+                    ),
+                });
+            }
+        }
+        rewritten_cue_bytes = Some(current);
+    }
+
     if let Err(err) = append_archive_rename_edit_and_persist(app, old_inner_path, new_inner_path) {
-        match std::fs::rename(&new_staged, &old_staged) {
+        match rollback_iso_wv_cue_rename(
+            cue_rename_plan.as_ref(),
+            rewritten_cue_bytes.as_deref(),
+            &new_staged,
+            &old_staged,
+        ) {
             Ok(()) => Err(format!(
-                "rename recovery tracking failed; staged rename was rolled back: {err}"
+                "rename recovery tracking failed; staged filesystem/CUE rename was rolled back: {err}"
             )),
             Err(rollback_err) => Err(format!(
-                "rename recovery tracking failed after staged filesystem rename; rollback also failed: {rollback_err}; original persistence error: {err}"
+                "rename recovery tracking failed after staged mutation; rollback also failed: {rollback_err}; original persistence error: {err}"
             )),
         }
     } else {
@@ -33386,9 +33677,238 @@ pub(super) fn rename_staged_archive_entry_transactional(
     }
 }
 
+#[cfg(test)]
+mod iso_wv_structural_rename_tests {
+    use super::{
+        prepare_iso_wv_cue_rename_plan, rollback_iso_wv_cue_rename,
+        normalized_cue_reference_for_rename,
+    };
+
+    fn write_cue(path: &std::path::Path, file_ref: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "TITLE \"Album\"\nFILE \"{file_ref}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track\"\n    INDEX 01 00:00:00\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn iso_wv_payload_rename_repairs_cue_file_reference() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        let old_audio = temp.path().join("album.wv");
+        let new_audio = temp.path().join("renamed.wv");
+        write_cue(&cue, "album.wv");
+        std::fs::write(&old_audio, b"wv").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_audio, &new_audio)
+            .unwrap()
+            .expect("renaming the referenced image must rewrite FILE");
+        assert_eq!(
+            plan.replacements.get("album.wv").map(String::as_str),
+            Some("renamed.wv")
+        );
+        std::fs::rename(&old_audio, &new_audio).unwrap();
+        crate::convert::cue_parser::rewrite_cue_file_references(
+            &plan.cue_after,
+            &plan.replacements,
+        )
+        .unwrap();
+        let rewritten = crate::tui::cue_parser::parse_cue_file(&cue).unwrap();
+        let file_ref = rewritten.tracks[0].file.as_deref().unwrap();
+        assert_eq!(file_ref, "renamed.wv");
+        match crate::tui::browse::resolve_cue_file_reference_for_queue(
+            cue.parent().unwrap(),
+            file_ref,
+        ) {
+            crate::tui::browse::CueReferenceResolution::Resolved(path) => {
+                assert_eq!(std::fs::canonicalize(path).unwrap(), std::fs::canonicalize(&new_audio).unwrap());
+            }
+            other => panic!("rewritten CUE did not resolve renamed payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iso_wv_unquoted_payload_rename_with_trailing_whitespace_repairs_and_resolves() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        let old_audio = temp.path().join("album.wv");
+        let new_audio = temp.path().join("renamed.wv");
+        let original = concat!(
+            "FILE album.wv WAVE   \r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    INDEX 01 00:00:00\r\n",
+        );
+        std::fs::write(&cue, original.as_bytes()).unwrap();
+        std::fs::write(&old_audio, b"wv").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_audio, &new_audio)
+            .unwrap()
+            .expect("legacy unquoted FILE reference must participate in rename planning");
+        assert_eq!(
+            plan.replacements.get("album.wv").map(String::as_str),
+            Some("renamed.wv")
+        );
+
+        std::fs::rename(&old_audio, &new_audio).unwrap();
+        crate::convert::cue_parser::rewrite_cue_file_references(
+            &plan.cue_after,
+            &plan.replacements,
+        )
+        .unwrap();
+        assert!(!old_audio.exists(), "successful rename must not be rolled back");
+        assert!(new_audio.exists(), "renamed payload must remain staged");
+
+        assert_eq!(
+            std::fs::read(&cue).unwrap(),
+            concat!(
+                "FILE renamed.wv WAVE   \r\n",
+                "  TRACK 01 AUDIO\r\n",
+                "    INDEX 01 00:00:00\r\n",
+            )
+            .as_bytes()
+            .to_vec()
+        );
+        let rewritten = crate::tui::cue_parser::parse_cue_file(&cue).unwrap();
+        let file_ref = rewritten.tracks[0].file.as_deref().unwrap();
+        assert_eq!(file_ref, "renamed.wv");
+        assert!(matches!(
+            crate::tui::browse::resolve_cue_file_reference_for_queue(
+                cue.parent().unwrap(),
+                file_ref,
+            ),
+            crate::tui::browse::CueReferenceResolution::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn iso_wv_payload_directory_rename_repairs_relative_cue_reference() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        let old_dir = temp.path().join("Disc 1");
+        let new_dir = temp.path().join("Side A");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_cue(&cue, "Disc 1/album.wv");
+        std::fs::write(old_dir.join("album.wv"), b"wv").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_dir, &new_dir)
+            .unwrap()
+            .expect("renaming the referenced directory must rewrite FILE");
+        assert_eq!(
+            plan.replacements
+                .get("Disc 1/album.wv")
+                .map(String::as_str),
+            Some("Side A/album.wv")
+        );
+        std::fs::rename(&old_dir, &new_dir).unwrap();
+        crate::convert::cue_parser::rewrite_cue_file_references(
+            &plan.cue_after,
+            &plan.replacements,
+        )
+        .unwrap();
+        let rewritten = crate::tui::cue_parser::parse_cue_file(&cue).unwrap();
+        let file_ref = rewritten.tracks[0].file.as_deref().unwrap();
+        assert_eq!(file_ref, "Side A/album.wv");
+        assert!(matches!(
+            crate::tui::browse::resolve_cue_file_reference_for_queue(cue.parent().unwrap(), file_ref),
+            crate::tui::browse::CueReferenceResolution::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn iso_wv_unrelated_artwork_rename_does_not_churn_cue() {
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        let audio = temp.path().join("album.wv");
+        let artwork = temp.path().join("Artwork");
+        std::fs::create_dir_all(&artwork).unwrap();
+        write_cue(&cue, "album.wv");
+        let original_cue = std::fs::read(&cue).unwrap();
+        std::fs::write(&audio, b"wv").unwrap();
+        let old_art = artwork.join("front.jpg");
+        let new_art = artwork.join("cover.jpg");
+        std::fs::write(&old_art, b"jpg").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_art, &new_art).unwrap();
+        assert!(plan.is_none(), "unrelated rename must not modify CUE bytes");
+        std::fs::rename(&old_art, &new_art).unwrap();
+        assert_eq!(std::fs::read(&cue).unwrap(), original_cue);
+    }
+
+    #[test]
+    fn iso_wv_cue_and_audio_moving_together_preserves_relative_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_dir = temp.path().join("Disc 1");
+        let new_dir = temp.path().join("Side A");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let old_cue = old_dir.join("album.cue");
+        write_cue(&old_cue, "album.wv");
+        let original_cue = std::fs::read(&old_cue).unwrap();
+        std::fs::write(old_dir.join("album.wv"), b"wv").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_dir, &new_dir).unwrap();
+        assert!(
+            plan.is_none(),
+            "moving CUE and audio together must not churn an unchanged relative FILE reference"
+        );
+        std::fs::rename(&old_dir, &new_dir).unwrap();
+        assert_eq!(std::fs::read(new_dir.join("album.cue")).unwrap(), original_cue);
+    }
+
+    #[test]
+    fn iso_wv_cue_and_filesystem_rename_can_be_rolled_back_exactly() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().unwrap();
+        let cue = temp.path().join("album.cue");
+        let old_audio = temp.path().join("album.wv");
+        let new_audio = temp.path().join("renamed.wv");
+        write_cue(&cue, "album.wv");
+        let original_cue = std::fs::read(&cue).unwrap();
+        std::fs::write(&old_audio, b"wv").unwrap();
+
+        let plan = prepare_iso_wv_cue_rename_plan(temp.path(), &old_audio, &new_audio)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&old_audio, &new_audio).unwrap();
+        let (_outcome, rewritten) = crate::convert::cue_parser::rewrite_cue_file_references(
+            &plan.cue_after,
+            &plan.replacements,
+        )
+        .unwrap();
+        let rewritten_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+            &rewritten,
+            &plan.cue_after,
+        )
+        .unwrap();
+        let rewritten_sheet = crate::convert::cue_parser::parse_cue(&rewritten_text);
+        assert!(rewritten_sheet.tracks.iter().all(|track| {
+            track.file.as_deref().is_some_and(|file_ref| {
+                normalized_cue_reference_for_rename(file_ref) == "renamed.wv"
+            })
+        }));
+
+        rollback_iso_wv_cue_rename(
+            Some(&plan),
+            Some(&rewritten),
+            &new_audio,
+            &old_audio,
+        )
+        .unwrap();
+        assert!(old_audio.exists());
+        assert!(!new_audio.exists());
+        assert_eq!(std::fs::read(&cue).unwrap(), original_cue);
+    }
+}
+
 pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     if app.pending_browse_archive_rename.is_some()
         || app.pending_browse_archive_delete.is_some()
+        || app.pending_browse_archive_create.is_some()
         || app.pending_browse_archive_metadata.is_some()
     {
         app.deferred_browse_archive_exit = true;
@@ -33462,8 +33982,8 @@ fn open_browse_archive_metadata_editor_for_entries(
             return;
         }
     }
-    if app.pending_browse_archive_rename.is_some() {
-        app.set_status("metadata: wait for the current archive rename to finish before editing metadata");
+    if app.pending_browse_archive_rename.is_some() || app.pending_browse_archive_create.is_some() {
+        app.set_status("metadata: wait for the current archive structural edit to finish before editing metadata");
         return;
     }
 
@@ -34278,6 +34798,7 @@ pub(super) fn start_browse_archive_entry_delete(
         return;
     }
     if app.pending_browse_archive_rename.is_some()
+        || app.pending_browse_archive_create.is_some()
         || app.pending_browse_archive_metadata.is_some()
         || app.browse_archive_repackage.is_some()
     {
@@ -58258,8 +58779,8 @@ fn start_browse_archive_entry_rename(
     new_name: &str,
     tx: &mpsc::Sender<AppMessage>,
 ) -> Result<(), String> {
-    if app.pending_browse_archive_rename.is_some() {
-        let message = "rename: wait for the current archive rename to finish".to_string();
+    if app.pending_browse_archive_rename.is_some() || app.pending_browse_archive_create.is_some() {
+        let message = "rename: wait for the current archive structural edit to finish".to_string();
         app.set_status(message.clone());
         return Err(message);
     }
@@ -58470,6 +58991,317 @@ fn start_browse_archive_entry_rename(
     Ok(())
 }
 
+fn archive_create_inner_path_for_name(app: &AppState, name: &str) -> Result<(std::path::PathBuf, String), String> {
+    let archive = app
+        .browse
+        .archive
+        .as_ref()
+        .ok_or_else(|| "create: no archive is active".to_string())?;
+    if !crate::convert::classify::is_iso_wv_container(&archive.listing.archive_path) {
+        return Err("create: unavailable inside archive listings".to_string());
+    }
+    let inner_path = if archive.inner_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", archive.inner_path, name)
+    };
+    // Reuse the staging-path validator as the canonical traversal/absolute-path
+    // guard even though the visible name has already passed file-name validation.
+    if let Some(staging) = archive.staging.as_ref() {
+        let _ = staging_path_for_archive_inner(&staging.staging_dir, &inner_path)?;
+    } else {
+        let probe_root = std::path::Path::new(".");
+        let _ = staging_path_for_archive_inner(probe_root, &inner_path)?;
+    }
+    Ok((archive.listing.archive_path.clone(), inner_path))
+}
+
+fn iso_wv_archive_create_target_exists(app: &AppState, inner_path: &str) -> bool {
+    let Some(archive) = app.browse.archive.as_ref() else {
+        return true;
+    };
+    if let Some(staging) = archive.staging.as_ref() {
+        return staging_path_for_archive_inner(&staging.staging_dir, inner_path)
+            .map(|path| path.exists())
+            .unwrap_or(true);
+    }
+    archive
+        .listing
+        .entries
+        .iter()
+        .any(|entry| entry.path == inner_path)
+}
+
+fn unique_browse_archive_create_name(app: &AppState, kind: BrowseCreateKind) -> String {
+    let base = match kind {
+        BrowseCreateKind::File => "New File",
+        BrowseCreateKind::Folder => "New Folder",
+    };
+    for suffix in 1usize..=10_000 {
+        let name = if suffix == 1 {
+            base.to_string()
+        } else {
+            format!("{base} {suffix}")
+        };
+        if archive_create_inner_path_for_name(app, &name)
+            .ok()
+            .is_some_and(|(_, inner)| !iso_wv_archive_create_target_exists(app, &inner))
+        {
+            return name;
+        }
+    }
+    loop {
+        let name = format!("{base} {}", uuid::Uuid::new_v4());
+        if archive_create_inner_path_for_name(app, &name)
+            .ok()
+            .is_some_and(|(_, inner)| !iso_wv_archive_create_target_exists(app, &inner))
+        {
+            return name;
+        }
+    }
+}
+
+fn append_archive_create_edit_and_persist(
+    app: &mut AppState,
+    inner_path: &str,
+    kind: BrowseCreateKind,
+) -> Result<(), String> {
+    let Some(session) = app.browse.active_archive_staging_mut() else {
+        return Err("archive create failed: active staging session disappeared".to_string());
+    };
+    let prior_len = session.edits.len();
+    let prior_dirty = session.dirty;
+    session.append_edit(super::browse::ArchiveEdit::Create {
+        inner_path: inner_path.to_string(),
+        is_dir: matches!(kind, BrowseCreateKind::Folder),
+    });
+
+    if let Err(err) = persist_active_archive_staging_session(app) {
+        if let Some(session) = app.browse.active_archive_staging_mut() {
+            session.edits.truncate(prior_len);
+            session.dirty = prior_dirty;
+        }
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn create_staged_archive_entry_transactional(
+    app: &mut AppState,
+    staging_dir: &std::path::Path,
+    inner_path: &str,
+    kind: BrowseCreateKind,
+) -> Result<(), String> {
+    let target = staging_path_for_archive_inner(staging_dir, inner_path)?;
+    if target.exists() {
+        return Err(format!("create: target already exists in archive: {inner_path}"));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("create: target has no parent: {inner_path}"))?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "create: archive target directory no longer exists: {}",
+            parent.display()
+        ));
+    }
+
+    match kind {
+        BrowseCreateKind::File => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map(|_| ())
+            .map_err(|err| format!("create staged archive file failed: {err}"))?,
+        BrowseCreateKind::Folder => std::fs::create_dir(&target)
+            .map_err(|err| format!("create staged archive folder failed: {err}"))?,
+    }
+
+    if let Err(err) = append_archive_create_edit_and_persist(app, inner_path, kind) {
+        let rollback = match kind {
+            BrowseCreateKind::File => std::fs::remove_file(&target),
+            BrowseCreateKind::Folder => std::fs::remove_dir(&target),
+        };
+        return match rollback {
+            Ok(()) => Err(format!(
+                "archive create recovery tracking failed; staged create was rolled back: {err}"
+            )),
+            Err(rollback_err) => Err(format!(
+                "archive create recovery tracking failed after staged filesystem create; rollback also failed: {rollback_err}; original persistence error: {err}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn start_browse_iso_wv_archive_create(
+    app: &mut AppState,
+    kind: BrowseCreateKind,
+    name: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) -> Result<(), String> {
+    if app.pending_browse_archive_create.is_some() {
+        return Err("create: wait for the current archive create to finish".to_string());
+    }
+    if app.pending_browse_archive_rename.is_some()
+        || app.pending_browse_archive_delete.is_some()
+        || app.pending_browse_archive_metadata.is_some()
+        || app.browse_archive_repackage.is_some()
+    {
+        return Err("create: wait for the current archive edit operation to finish".to_string());
+    }
+
+    let (archive_path, inner_path) = archive_create_inner_path_for_name(app, name)?;
+    if iso_wv_archive_create_target_exists(app, &inner_path) {
+        return Err(format!("create: target already exists in archive: {name}"));
+    }
+
+    if let Some(staging_dir) = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == archive_path)
+        .and_then(|archive| archive.staging.as_ref().map(|staging| staging.staging_dir.clone()))
+    {
+        create_staged_archive_entry_transactional(app, &staging_dir, &inner_path, kind)?;
+        app.browse.invalidate_archive_probe_cache_for(&archive_path);
+        app.browse.refresh_with_search(Some(tx));
+        let target_path = archive_path.join(&inner_path);
+        if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
+            app.browse.selected_index = index;
+            app.browse.ensure_visible();
+        }
+        app.set_status(format!(
+            "created staged archive {}: {name}; archive changes pending",
+            match kind {
+                BrowseCreateKind::File => "file",
+                BrowseCreateKind::Folder => "folder",
+            }
+        ));
+        return Ok(());
+    }
+
+    let tool_paths = app.manager.config.tool_paths.clone();
+    crate::convert::pipeline::materializer_archive::preflight_archive_repackage_capability(
+        &archive_path,
+        &tool_paths,
+    )
+    .map_err(|err| format!("create: archive cannot be edited: {err}"))?;
+
+    let (archive_mtime_secs, archive_mtime_nanos, archive_size) =
+        super::app::archive_fingerprint(&archive_path)
+            .map_err(|err| format!("create: cannot establish archive conflict baseline: {err}"))?;
+    let pending = PendingBrowseArchiveCreate::new(
+        archive_path.clone(),
+        inner_path.clone(),
+        kind,
+        archive_mtime_secs,
+        archive_mtime_nanos,
+        archive_size,
+    );
+    let staging_dir = pending.staging_dir.clone();
+    persist_empty_archive_staging_registration(
+        app,
+        &archive_path,
+        &staging_dir,
+        archive_mtime_secs,
+        archive_mtime_nanos,
+        archive_size,
+    )
+    .map_err(|err| format!(
+        "create: cannot register archive recovery session before extraction: {err}"
+    ))?;
+
+    let cancel = pending.cancel.clone();
+    let password = match app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == archive_path)
+        .and_then(|archive| archive.password.clone())
+    {
+        Some(password) => Some(password),
+        None => match archive_listing_password_for_path(app, &archive_path) {
+            Ok(password) => password,
+            Err(error) => {
+                let _ = app.db.delete_pending_archive_session(&archive_path);
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(error);
+            }
+        },
+    };
+    let tx_for_task = tx.clone();
+    app.browse.bump_archive_probe_epoch_for(&archive_path);
+    app.pending_browse_archive_create = Some(pending);
+    app.set_status(format!("Preparing archive create: {name}"));
+
+    tokio::spawn(async move {
+        let archive_for_result = archive_path.clone();
+        let staging_for_result = staging_dir.clone();
+        let inner_for_result = inner_path.clone();
+        let result: Result<(), String> = async {
+            let _ = tx_for_task
+                .send(AppMessage::ArchiveEntryCreateProgress {
+                    archive_path: archive_path.clone(),
+                    staging_dir: staging_dir.clone(),
+                    message: "Preparing ISO-WV edit staging directory...".to_string(),
+                })
+                .await;
+            std::fs::create_dir_all(&staging_dir)
+                .map_err(|err| format!("create archive edit staging failed: {err}"))?;
+            let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths.clone());
+            let _ = tx_for_task
+                .send(AppMessage::ArchiveEntryCreateProgress {
+                    archive_path: archive_path.clone(),
+                    staging_dir: staging_dir.clone(),
+                    message: "Extracting ISO-WV for structural edit...".to_string(),
+                })
+                .await;
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+                &archive_path,
+                &staging_dir,
+                "browse-iso-wv-entry-create",
+                password.as_deref(),
+                &runner,
+                None,
+                &cancel,
+            )
+            .await
+            .map_err(|err| format!("archive create extraction failed: {err}"))?;
+
+            if archive_fingerprint_changed(
+                &archive_path,
+                archive_mtime_secs,
+                archive_mtime_nanos,
+                archive_size,
+            )? {
+                return Err("archive changed externally while create staging was being extracted; staged edit was rejected before modification".to_string());
+            }
+            if cancel.is_cancelled() {
+                return Err("archive create was cancelled".to_string());
+            }
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
+        }
+        let _ = tx_for_task
+            .send(AppMessage::ArchiveEntryCreateResult {
+                archive_path: archive_for_result,
+                staging_dir: staging_for_result,
+                inner_path: inner_for_result,
+                kind,
+                result,
+            })
+            .await;
+    });
+
+    Ok(())
+}
+
 fn unique_browse_create_name(dir: &std::path::Path, kind: BrowseCreateKind) -> String {
     let base = match kind {
         BrowseCreateKind::File => "New File",
@@ -58495,6 +59327,23 @@ fn unique_browse_create_name(dir: &std::path::Path, kind: BrowseCreateKind) -> S
 
 pub(super) fn begin_browse_create(app: &mut AppState, kind: BrowseCreateKind) -> bool {
     let dir = app.browse.current_dir.clone();
+    if app.browse.is_in_archive() {
+        let is_iso_wv = app
+            .browse
+            .archive
+            .as_ref()
+            .is_some_and(|archive| crate::convert::classify::is_iso_wv_container(&archive.listing.archive_path));
+        if !is_iso_wv {
+            app.set_status("create: unavailable inside archive listings");
+            return false;
+        }
+        let initial = unique_browse_archive_create_name(app, kind);
+        app.browse_inline_edit = Some(BrowseInlineEditState {
+            target: BrowseInlineEditTarget::Create { dir, kind },
+            input: super::text_input::TextInputState::new_selected(initial),
+        });
+        return true;
+    }
     begin_browse_create_in(app, dir, kind)
 }
 
@@ -58534,10 +59383,6 @@ pub(super) fn commit_browse_create(
         app.set_status("create: available only on the browse screen");
         return false;
     }
-    if app.browse.is_in_archive() {
-        app.set_status("create: unavailable inside archive listings");
-        return false;
-    }
     let name = match tui_file_picker::validate_file_name(name) {
         Ok(name) => name,
         Err(error) => {
@@ -58545,6 +59390,20 @@ pub(super) fn commit_browse_create(
             return false;
         }
     };
+    if app.browse.is_in_archive() {
+        if dir != app.browse.current_dir {
+            app.set_status("create: archive directory changed while editing the new entry name");
+            return false;
+        }
+        return match start_browse_iso_wv_archive_create(app, kind, name, tx) {
+            Ok(()) => true,
+            Err(error) => {
+                app.set_status(error);
+                false
+            }
+        };
+    }
+
     let target = dir.join(name);
     let scope = match kind {
         BrowseCreateKind::File => crate::concurrency::ClaimScope::Exact,
@@ -58656,13 +59515,15 @@ pub(super) fn commit_browse_rename(
             app.set_status("rename: could not resolve archive entry");
             return false;
         };
-        if app
+        let selected_is_directory = app
             .browse
             .archive
             .as_ref()
             .filter(|arc| arc.listing.archive_path == archive_path)
             .and_then(|arc| arc.listing.entries.iter().find(|entry| entry.path == inner_path))
-            .is_some_and(|entry| entry.is_dir)
+            .is_some_and(|entry| entry.is_dir);
+        if selected_is_directory
+            && !crate::convert::classify::is_iso_wv_container(&archive_path)
         {
             app.set_status(
                 "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
@@ -59443,6 +60304,7 @@ pub(super) fn switch_screen_reconciling_browse_archive(
     if leaving_browse {
         if app.pending_browse_archive_rename.is_some()
             || app.pending_browse_archive_delete.is_some()
+            || app.pending_browse_archive_create.is_some()
             || app.pending_browse_archive_metadata.is_some()
         {
             app.deferred_browse_archive_exit = false;
@@ -59912,6 +60774,21 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
                 app.preserved_editor_archive_repackage = Some(context.clone());
             }
             app.set_status("archive save conflict: staged edits kept; navigation cancelled; leave the archive again to retry or choose D in the dialog to discard".to_string());
+        }
+        Some(ConfirmAction::IsoWvMetadataPersistence { context })
+        | Some(ConfirmAction::IsoWvStructuralRepackage { context }) => {
+            app.should_quit = false;
+            app.quit_after_browse_archive_repackage = false;
+            app.deferred_browse_archive_screen_switch = None;
+            app.deferred_browse_archive_exit = false;
+            app.pending_browse_tab_close_after_archive_repackage = None;
+            if context.editor_owns_staging {
+                app.preserved_editor_archive_repackage = Some(context.clone());
+            }
+            app.set_status(
+                "ISO-WV save deferred; staged edits kept unchanged for retry or discard"
+                    .to_string(),
+            );
         }
         Some(ConfirmAction::ArchiveRepackageFailure { context, error }) => {
             app.should_quit = false;
@@ -60659,6 +61536,16 @@ fn execute_confirm_action(
         ConfirmAction::ArchiveRepackageFailure { context, .. } => {
             let context = context.clone();
             super::event_loop::start_browse_archive_repackage(app, context, tx);
+        }
+        ConfirmAction::IsoWvMetadataPersistence { context } => {
+            super::event_loop::save_iso_wv_metadata_sidecar(app, context.clone(), tx);
+        }
+        ConfirmAction::IsoWvStructuralRepackage { context } => {
+            super::event_loop::start_browse_archive_repackage(
+                app,
+                context.clone().with_iso_wv_persistence_confirmed(),
+                tx,
+            );
         }
         ConfirmAction::ArchiveDiscardStaging {
             context,
@@ -62586,6 +63473,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             ActiveOverlay::Confirmation { action, .. } => Some(action.clone()),
                             _ => None,
                         };
+                        if let Some(ConfirmAction::IsoWvMetadataPersistence { context }) = action.as_ref() {
+                            let context = context.clone().with_iso_wv_persistence_confirmed();
+                            app.active_overlay = ActiveOverlay::None;
+                            super::event_loop::start_browse_archive_repackage(app, context, tx);
+                            return;
+                        }
                         if let Some(action) = action.as_ref() {
                             if open_archive_staging_discard_confirmation(app, action) {
                                 return;
@@ -63489,6 +64382,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     ActiveOverlay::Confirmation { action, .. } => Some(action.clone()),
                     _ => None,
                 };
+                if let Some(ConfirmAction::IsoWvMetadataPersistence { context }) = action.as_ref() {
+                    let context = context.clone().with_iso_wv_persistence_confirmed();
+                    app.active_overlay = ActiveOverlay::None;
+                    super::event_loop::start_browse_archive_repackage(app, context, tx);
+                    return;
+                }
                 if let Some(action) = action.as_ref() {
                     if open_archive_staging_discard_confirmation(app, action) {
                         return;

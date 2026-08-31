@@ -1483,3 +1483,84 @@ one.
   used only to warn.
 - What the interaction is with the existing 0.01 dB `ALBUM_SOX_STATS_REPORTING_UNCERTAINTY`
   reserve, which currently applies even when no attenuation is needed.
+
+## 20. Low-rate gate flake: `cancel_abandons_a_wedged_helper_without_waiting_for_it`
+
+**Status:** open. Observed 2026-08-31 during the `.iso.wv` mount+edit gate.
+
+Not a blocker for that delivery — see "Why this is not that delivery's regression" below —
+but it fails a full-workspace gate often enough to cost a re-run, so it should be settled.
+
+### The failure
+
+```
+---- tui::keybindings::file_task_supervisor_tests::cancel_abandons_a_wedged_helper_without_waiting_for_it stdout ----
+thread '...' panicked at src/tui/keybindings.rs:53901:
+assertion `left == right` failed
+  left: 0
+ right: 1
+```
+
+That line is `assert_eq!(pending.len(), 1)` on the result of
+`file_task_runtime::pending_journals()`. The observed count was zero — the journal the test
+expects to be awaiting reconciliation was not visible to that call.
+
+### Observed rate
+
+| Condition | Runs | Result |
+|---|---|---|
+| Test alone (`--exact`) | 20 | 20 clean |
+| Full lib binary (5,324 tests, internally parallel) | 4 | 4 clean, `5324 passed; 0 failed` each |
+| Full workspace gate (`--workspace --no-fail-fast`) | 3 | 2 clean, 1 failure |
+
+So it needs *something* the lib binary alone does not provide. The distinguishing feature of
+the workspace gate is that cargo runs multiple test **binaries** concurrently; internal
+multi-threading within one binary was not sufficient to reproduce it in 4 attempts.
+
+### Theories eliminated
+
+- **Env-guard gap.** `pending_journals()` resolves its directory through
+  `file_task_journal_base_dir()`, which reads the process-global
+  `TONEPOET_FILE_OPERATION_JOURNAL_DIR` and otherwise falls back to the real user config
+  directory. That is the shape that caused earlier cross-test contamination, so it was the
+  first suspect. All 17 mutation sites of that variable were audited: every one is inside an
+  RAII `install()` helper, and all 14 `JournalDirGuard::install` callers in
+  `file_task_runtime.rs` hold `test_environment_lock()`, as does the failing test itself.
+  No unguarded mutator was found.
+- **A regression in the test's own logic.** 20/20 in isolation.
+- **Ordinary CPU load.** 4 consecutive full-lib runs under the same machine conditions were
+  clean.
+
+### One candidate shape, offered as context and not as a diagnosis
+
+The assert sits *inside* a five-second deadline retry loop:
+
+```rust
+let journal_deadline = Instant::now() + Duration::from_secs(5);
+loop {
+    let pending = super::super::file_task_runtime::pending_journals();
+    assert_eq!(pending.len(), 1);
+```
+
+The loop exists to tolerate the record not yet having reached
+`AwaitingReconciliation`, but the length assert fires on the very first poll and so
+tolerates no transient state at all. If the journal is not yet visible, or momentarily does
+not satisfy `needs_reconciliation()` (which is the filter `pending_journals()` applies), the
+count reads 0 and the test fails immediately rather than retrying within its own deadline.
+
+Whether that is the actual mechanism, and whether the right fix is in the test or in the
+runtime, is for the implementer to determine. Note also that `pending_journals()` is not a
+pure read: it calls `cleanup_setup_orphan_journal_descriptors()`, which retires setup-orphan
+descriptors as a side effect. Whether that side effect can reach a journal belonging to a
+concurrently-running test has not been established either way.
+
+### Why this is not the `.iso.wv` delivery's regression
+
+That delivery's `keybindings.rs` change is six new `.iso.wv` CUE-rename tests; its diff
+contains zero lines matching `file_task`/`FileTask`/`supervisor`/`journal`, and
+`file_task_runtime.rs` and `concurrency.rs` are unmodified. The production path this test
+exercises was untouched.
+
+One honest caveat: that delivery adds roughly 76 tests to the workspace (6,526 vs a 6,450
+baseline), increasing total parallel load. That could raise this flake's exposure rate
+without being its cause.
