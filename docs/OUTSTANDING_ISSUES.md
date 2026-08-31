@@ -1564,3 +1564,74 @@ exercises was untouched.
 One honest caveat: that delivery adds roughly 76 tests to the workspace (6,526 vs a 6,450
 baseline), increasing total parallel load. That could raise this flake's exposure rate
 without being its cause.
+
+## 21. WORK ORDER — archive listing can be refused with no way for the user to override it
+
+**Status:** open work item. Raised 2026-08-31 while field-testing `.iso.wv` support.
+
+Predates the `.iso.wv` work; the messages below come from `2de6bdb` ("Phase 4: Archive
+metadata editing + archive listing robustness"). Surfaced because an `.iso.wv` image on a
+network mount cannot be opened at all.
+
+### The dead end
+
+`start_browse_archive_listing_inner` refuses in two cases and tells the user to press `l`:
+
+```rust
+// src/tui/keybindings.rs:8140
+app.set_status("archive listing is disabled; press l to list this archive");
+// src/tui/keybindings.rs:8148
+app.set_status("archive is on a network mount; press l to list contents");
+```
+
+There is no bare `l` binding in Browse. The `KeyCode::Char('l')` bindings that exist belong
+to the Config screen (`Right | l`) and the metadata editor (`Alt+l`). Even if one were
+added, Browse ends its dispatch with a catch-all that routes every bare letter to
+type-ahead:
+
+```rust
+(KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+    app.browse.commit_range_selection();
+    app.browse.type_ahead_push(c);
+```
+
+That catch-all is correct and must stay: bare letters in Browse are reserved for type-ahead.
+So the instruction names a key that is both unbound and unreachable.
+
+### There is no other way out either
+
+Every caller that reaches the listing with `force = true` is internal — reopen-closed tab
+restore, the password-entry retry, and session restore. None is user-invocable. With
+`archive_listing = "auto"` (whose display label is "Auto (skip remote)") and an archive on a
+network mount, the only escape is hand-editing `config.toml` to `"always"`. The Config
+screen that would otherwise expose this setting does not exist yet, so the setting is not
+reachable from the UI at all.
+
+### Direction the user has chosen
+
+Use the existing vi-style command mode: **`:l`**. Both `"l"` and `"list"` are unclaimed in
+`command.rs`, and single-letter commands are already the convention there (`a`, `c`, `d`,
+`e`, `g`, `h`, `o`, `q`, `u`, `w`).
+
+Two alternatives were considered and rejected:
+
+- **Bare `l`** — violates the standing rule that plain letters in Browse are type-ahead only.
+- **`Alt+L`** — already bound to select-all in the metadata editor, which exists precisely
+  because tmux users have `Ctrl+A` taken by the tmux prefix.
+
+### Outcomes wanted
+
+- A user-invocable way to force a listing that the refusal messages actually name.
+- Both refusal messages updated so their instruction matches the real affordance; today the
+  disabled-listing message at 8140 is the same dead end as the network-mount one at 8148.
+- The implementer decides scope and shape — whether the command takes an argument, whether
+  it also belongs in the Alt+M Browse context menu, and whether forcing should be
+  remembered for that archive or that session.
+
+### Related
+
+The user believes they had previously opted into `"always"` and found the setting back at
+`"auto"`. `[performance.browsing]` is exactly the section covered by the open
+browsing-config-reset-on-recompile defect. Not established for this specific file, but the
+section and the symptom match; worth checking whether that defect is the reason a user's
+opt-in did not survive.
