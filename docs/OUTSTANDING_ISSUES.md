@@ -1376,3 +1376,110 @@ with ages, every queue-scope lease with owner liveness and whether the `flock` i
 held, other populated lease families, and all `conversion_queue_v24` rows with owner
 scope, position, execution flag, status and source filename. That combination is what made
 this diagnosable; earlier attempts failed because a session exited between checks.
+
+---
+
+## 19. WORK ORDER — a "preserve original peaks" DSD auto-gain option, and true-peak-informed headroom
+
+**Status:** open work item. Raised 2026-08-31.
+
+### What the user wants
+
+An option that **preserves the source's original peaks** — apply gain only when it would
+raise level, never attenuate. Today both auto-gain scopes will turn an album down if its
+loudest peak already exceeds the configured margin.
+
+### Current behaviour, both scopes
+
+**Album-scoped** (`tonepoet-pipeline/src/dsd_album_gain.rs:70`) computes one gain for the
+submitted batch:
+
+```rust
+gain_db = target_dbfs - (loudest_peak + ALBUM_SOX_STATS_REPORTING_UNCERTAINTY)
+```
+
+Plain subtraction with **no clamp to non-negative**, so a hot album is attenuated
+uniformly. This is deliberate — the doc comment at `:67` says *"if the source already
+exceeds the selected target, album mode attenuates the complete set instead of clipping or
+silently clamping"*, and `album_gain_attenuates_when_loudest_peak_exceeds_target` tests it.
+Inter-track relationships are preserved because one gain applies to the whole batch.
+
+**Track-scoped** emits SoX **`norm <target>`** (`tonepoet-pipeline/src/dsd_reference.rs:3621`)
+under `ResolvedGainPolicy::NormalizePeak`. `norm` moves each track's peak *to* the target —
+up or down — so it also attenuates hot material, and additionally **flattens level
+differences between tracks**, which album scope exists to avoid.
+
+Worth stating plainly since it came up: `gain`/`norm` are linear amplitude scaling. A track
+peaking at −13 dBFS with a −79 dBFS noise floor, boosted 6 dB, becomes −7 dBFS peak and
+−73 dBFS floor; dynamic range is unchanged at 60 dB. Neither effect performs dynamics
+processing. The only floor that does not move is the output format's quantisation floor,
+fixed by target bit depth — relevant at 16-bit, academic at 24/32.
+
+### Why a margin exists at all: intersample peaks
+
+Album mode measures SoX `stats` → `Pk lev dB`
+(`tonepoet-pipeline/src/dsd_album_gain.rs:50-55`), which is a **sample peak**. A signal
+whose stored samples peak at −0.30 dBFS can reconstruct **above 0 dBFS** in a DAC's
+analogue output or a lossy transcode, because the true waveform overshoots between
+samples. A blanket 1 dB margin is conventional headroom against that.
+
+Detecting it requires **true-peak measurement**, not sample-peak: an oversampling meter
+reconstructs an approximation of the inter-sample waveform and reports the highest
+reconstructed peak in dBTP. The same album might report:
+
+```
+sample peak   −0.30 dBFS
+true peak     +0.15 dBTP
+```
+
+— stored samples below full scale, reconstructed waveform above it. `Pk lev dB` cannot see
+this. An ITU-R BS.1770-compatible oversampling measurement is what can (FFmpeg's
+`ebur128` true-peak mode being one implementation).
+
+**This changes the design space.** With true-peak available, headroom need not be inferred
+from a blanket rule — tonepoet could know whether a particular album actually exceeds, say,
+−1 dBTP or 0 dBTP, and attenuate only when it does.
+
+### Relevant: true-peak measurement already exists in this codebase
+
+Not wired into auto-gain, but present and **oversampling**:
+
+- `build_true_peak_measurement` (`tonepoet-pipeline/src/dsd_reference.rs:3476`) takes both
+  `sample_rate_hz` and `oversampled_rate_hz` (`:3482`, used at `:3505`, `:3562`)
+- `parse_reference_true_peak_measurement` (`:2514`) and
+  `parse_reference_sox_stats_true_peak_measurement` (`:2452`)
+- `validate_post_final_true_peak` (`:2793`), consumed by
+  `src/convert/pipeline/track_executor.rs:7283`
+- planned as measurement steps at `dsd_reference.rs:3276` and `:3310`
+
+It appears confined to the DSD *reference* path. Whether it can be reused for auto-gain
+generally, and at what cost — it is an extra analysis pass over the decoded audio — was not
+determined.
+
+### The trade to be explicit about
+
+"Preserve original peaks" and "guarantee headroom against intersample overs" are in genuine
+tension on the attenuation side only. A boost case is unaffected: tonight's Led Zeppelin
+*Presence* run measured a loudest peak of −2.72 dBFS against a −1.00 target and applied
+**+1.71 dB**, which "preserve" would also apply. The conflict is a hot needledrop:
+
+```
+loudest sample peak  −0.30 dBFS,  target −1.00 dBFS
+  current album mode:  −0.71 dB  → peak lands at −1.00
+  "preserve peaks":     0 dB     → peak stays at −0.30, headroom guarantee given up
+```
+
+That is a legitimate choice — preserving the master's intent — but it is a trade, not a
+free option. With true-peak measurement it becomes an *informed* trade rather than a blind
+one.
+
+### Open questions, not answered here
+
+- Whether "preserve" is a third gain policy alongside the existing normalize/headroom
+  behaviours, or a modifier on the existing ones.
+- Whether track scope should stop using `norm` when preserve is selected, given `norm`
+  performs the attenuation inside SoX rather than in a computed value.
+- Whether true-peak analysis becomes the default basis for the margin, an opt-in, or is
+  used only to warn.
+- What the interaction is with the existing 0.01 dB `ALBUM_SOX_STATS_REPORTING_UNCERTAINTY`
+  reserve, which currently applies even when no attenuation is needed.
