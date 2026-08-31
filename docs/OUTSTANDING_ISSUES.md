@@ -848,9 +848,36 @@ label. Not investigated.
 
 ---
 
-## 14. `memory_budget` staging-cleanup tests intermittently judge a dead lock live — 3 failures in 4 gate runs
+## 14. `memory_budget` staging-cleanup tests intermittently judge a dead lock live — RESOLVED
 
-**Status:** open, **failure mode identified, mechanism unconfirmed**. First observed
+> **RESOLVED 2026-08-30 @ `fb69544`.** Two distinct causes shared the one visible symptom.
+>
+> **Test contamination.** `cleanup_stale_staging_dir` does not delete on the `.run.lock`
+> probe alone — it enters shared mutation admission, which scans legacy file-operation
+> journals rooted at the process-global `TONEPOET_FILE_OPERATION_JOURNAL_DIR`. File-task
+> tests serialize that variable behind an existing lock with per-test roots; the
+> scratch-cleanup tests did not join that protocol, so under the full binary they could see
+> another test's deliberately nonterminal journal, admission correctly failed closed, and
+> the stale tree survived. **This explains the isolation boundary recorded below** — the
+> module alone never runs the fixtures that swap that variable, which is why 60 consecutive
+> module runs were clean while the full gate failed 3 times in 4.
+>
+> **A production race.** `O_CLOEXEC` closes an inherited descriptor at *exec*, not at
+> *fork*, so a child forked while an `ExecutionStaging` lease is live can transiently retain
+> the locked open file description after the parent drops its handle. Retirement had no
+> tolerance for that window and reported `persistent lease is live-owned`. Conversion
+> execution holds these leases while launching subprocesses, so this was reachable outside
+> tests — answering the reachability question this entry left open. Retirement now has a
+> bounded 250 ms contention grace, gated on Unix + `ExecutionStaging` + actual contention,
+> which never reinterprets contention as death.
+>
+> `probe_existing_run_lock` was deliberately left unchanged; the captured panics refute the
+> same-process re-acquisition theory recorded below.
+>
+> Gate green ×2, 6504 passed. The scoping gap noted in #16 is closed for these tests.
+
+**Status:** RESOLVED. History below is retained because two theories recorded here were
+wrong, and the record of how they died is useful. First observed
 2026-08-30 while gating `0f92b5f`; both affected tests' panics captured later the same
 day (see the 2026-08-30 updates below). Originally filed as "cause unknown".
 
