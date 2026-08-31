@@ -14,13 +14,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DESCRIPTOR_SCHEMA: u32 = 1;
 const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
+const EXECUTION_STAGING_RETIRE_CONTENTION_BUDGET: Duration = Duration::from_millis(250);
+const EXECUTION_STAGING_RETIRE_CONTENTION_SLEEP: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerProcessIdentity {
@@ -1502,15 +1502,57 @@ impl PersistentLease {
     }
 
     pub fn acquire_existing(path: &Path, expected_family: &LeaseFamily) -> Result<Self, String> {
+        Self::acquire_existing_with_transient_contention(path, expected_family, false)
+    }
+
+    /// Execution-staging retirement happens immediately after the owning
+    /// subsystem has dropped its final Rust lease. On Unix, an unrelated
+    /// concurrent fork can still transiently co-hold that lease's `CLOEXEC`
+    /// open-file description until the child reaches exec. Treat only that
+    /// staging handoff window as retryable contention, but never as permission
+    /// to unlink a still-locked descriptor: a genuine supervisor/peer holder
+    /// remains fail-closed after the bounded wait. Other lease families retain
+    /// the existing immediate-contention behavior.
+    fn acquire_existing_for_lifecycle_retirement(
+        path: &Path,
+        expected_family: &LeaseFamily,
+    ) -> Result<Self, String> {
+        let retry_transient_contention =
+            cfg!(unix) && matches!(expected_family, LeaseFamily::ExecutionStaging { .. });
+        Self::acquire_existing_with_transient_contention(
+            path,
+            expected_family,
+            retry_transient_contention,
+        )
+    }
+
+    fn acquire_existing_with_transient_contention(
+        path: &Path,
+        expected_family: &LeaseFamily,
+        retry_transient_contention: bool,
+    ) -> Result<Self, String> {
         let mut file = open_existing_descriptor(path)
             .map_err(|e| format!("open persistent lease {}: {e}", path.display()))?;
-        file.try_lock_exclusive().map_err(|e| {
-            if is_lock_contended(&e) {
-                format!("persistent lease is live-owned: {}", path.display())
-            } else {
-                format!("lock persistent lease {}: {e}", path.display())
+        let retry_deadline = if retry_transient_contention {
+            Some(Instant::now() + EXECUTION_STAGING_RETIRE_CONTENTION_BUDGET)
+        } else {
+            None
+        };
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if is_lock_contended(&error) => {
+                    if retry_deadline.is_some_and(|deadline| Instant::now() < deadline) {
+                        std::thread::sleep(EXECUTION_STAGING_RETIRE_CONTENTION_SLEEP);
+                        continue;
+                    }
+                    return Err(format!("persistent lease is live-owned: {}", path.display()));
+                }
+                Err(error) => {
+                    return Err(format!("lock persistent lease {}: {error}", path.display()));
+                }
             }
-        })?;
+        }
         let descriptor = read_descriptor_from(&mut file, path)?;
         if &descriptor.family != expected_family {
             return Err(format!(
@@ -1902,7 +1944,7 @@ pub fn retire_descriptor_after_lifecycle_release(path: &Path, expected_family: &
     let root = coordination_root();
     create_private_dir(&root)?;
     let _registry = RegistryLock::acquire(&root)?;
-    let lease = PersistentLease::acquire_existing(path, expected_family)?;
+    let lease = PersistentLease::acquire_existing_for_lifecycle_retirement(path, expected_family)?;
     let metadata_before = std::fs::symlink_metadata(path)
         .map_err(|e| format!("lstat persistent lease before retirement {}: {e}", path.display()))?;
     if !metadata_before.file_type().is_file() {
@@ -3683,6 +3725,74 @@ mod tests {
                     "fork-time CLOEXEC inheritance must not create a same-path self-overlap after guard teardown",
                 );
             drop(replacement);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_retirement_waits_out_accidental_cloexec_coholder_but_not_live_authority() {
+        use std::os::fd::AsRawFd;
+
+        with_root(|_| {
+            let transient_family = LeaseFamily::ExecutionStaging {
+                execution_id: Uuid::new_v4(),
+            };
+            let transient = MutationClaimGuard::acquire(transient_family.clone(), Vec::new())
+                .expect("create durable staging lease");
+            let transient_path = transient.lease().descriptor_path().to_path_buf();
+            let accidental_fork_copy = transient
+                .lease()
+                .file
+                .try_clone()
+                .expect("duplicate production CLOEXEC lease fd");
+            let fd_flags = unsafe { libc::fcntl(accidental_fork_copy.as_raw_fd(), libc::F_GETFD) };
+            assert!(fd_flags >= 0, "inspect duplicated lease fd flags");
+            assert_ne!(
+                fd_flags & libc::FD_CLOEXEC,
+                0,
+                "regression requires the production CLOEXEC lease fd"
+            );
+            drop(transient);
+
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                drop(accidental_fork_copy);
+            });
+            retire_descriptor_after_lifecycle_release(&transient_path, &transient_family)
+                .expect("retirement must wait out a transient fork-time co-holder");
+            release.join().expect("release transient co-holder");
+            assert!(
+                !transient_path.exists(),
+                "retirement should remove the descriptor only after the lock becomes acquirable"
+            );
+
+            let live_family = LeaseFamily::ExecutionStaging {
+                execution_id: Uuid::new_v4(),
+            };
+            let live = MutationClaimGuard::acquire(live_family.clone(), Vec::new())
+                .expect("create second durable staging lease");
+            let live_path = live.lease().descriptor_path().to_path_buf();
+            let exported_authority = live
+                .lease()
+                .duplicate_lifetime_file()
+                .expect("export deliberate lifetime authority");
+            drop(live);
+
+            let error = retire_descriptor_after_lifecycle_release(&live_path, &live_family)
+                .expect_err("a persistent exported holder must remain fail-closed");
+            assert!(
+                error.contains("live-owned"),
+                "unexpected retirement error: {error}"
+            );
+            assert!(
+                live_path.exists(),
+                "bounded retry must never hide a descriptor while authority remains live"
+            );
+
+            drop(exported_authority);
+            retire_descriptor_after_lifecycle_release(&live_path, &live_family)
+                .expect("retirement should succeed after deliberate authority closes");
+            assert!(!live_path.exists());
         });
     }
 

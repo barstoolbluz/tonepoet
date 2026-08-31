@@ -1187,6 +1187,42 @@ fn decode_mount_escape(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Stale-staging cleanup enters the ordinary mutation-admission path, so
+    /// these tests consume the process-visible legacy file-task journal root.
+    /// Own the existing file-task environment lock and point that scanner at an
+    /// empty per-test root. Coordination scoping stays explicit in each test so
+    /// the repository's isolation auditor can verify it statically.
+    struct ScratchCleanupJournalEnvironment {
+        previous_journal_root: Option<std::ffi::OsString>,
+        _journal_environment_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchCleanupJournalEnvironment {
+        fn install(root: &Path) -> Self {
+            let journal_environment_lock = crate::tui::file_task_runtime::test_environment_lock();
+            let previous_journal_root =
+                std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+            let journal_root = root.join("file-operation-journal");
+            fs::create_dir_all(&journal_root).expect("isolated legacy journal root");
+            std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", &journal_root);
+            Self {
+                previous_journal_root,
+                _journal_environment_lock: journal_environment_lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchCleanupJournalEnvironment {
+        fn drop(&mut self) {
+            match self.previous_journal_root.take() {
+                Some(previous) => {
+                    std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", previous)
+                }
+                None => std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR"),
+            }
+        }
+    }
+
     #[test]
     fn budget_reservations_release_on_drop() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1337,6 +1373,10 @@ mod tests {
     #[test]
     fn stale_unlocked_run_lock_does_not_block_cleanup() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
         let staging_parent = temp.path().join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
         let stale_dir = staging_parent.join("job-item");
@@ -1353,6 +1393,10 @@ mod tests {
     #[test]
     fn corrupt_owner_marker_falls_back_to_inferred_legacy_lock_name() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
         let staging_parent = temp.path().join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
 
@@ -1394,6 +1438,10 @@ mod tests {
     #[test]
     fn stale_cleanup_handles_legacy_markerless_tree_and_orphan_lock() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
         let staging_parent = temp.path().join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
 
@@ -1418,6 +1466,10 @@ mod tests {
     #[test]
     fn ensure_usable_runs_stale_cleanup_once_for_configured_scratch_parent() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
         let scratch_root = temp.path().join("scratch");
         let staging_parent = scratch_root.join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
@@ -1437,7 +1489,8 @@ mod tests {
     #[test]
     fn execution_staging_live_and_recovery_reserved_block_stale_cleanup_until_retired() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let _concurrency = crate::concurrency::install_scoped_test_coordination_root(
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
             &temp.path().join("claims"),
         );
 
@@ -1521,6 +1574,10 @@ mod tests {
     #[test]
     fn held_run_lock_skips_only_active_tree() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let _journal_environment = ScratchCleanupJournalEnvironment::install(temp.path());
+        let _coordination = crate::concurrency::install_scoped_test_coordination_root(
+            &temp.path().join("claims"),
+        );
         let staging_parent = temp.path().join(".tonepoet-staging");
         fs::create_dir_all(&staging_parent).expect("staging parent");
 
