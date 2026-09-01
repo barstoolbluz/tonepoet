@@ -1,19 +1,22 @@
 //! PR 3 — `ArchiveMaterializer` implementation.
 //!
-//! Extracts generic archives via the 7z/7zz `ToolRunner` backend, discovers audio files,
-//! probes them with ffprobe, reads metadata with lofty, and returns
-//! a `PreparedSource` with `TrackSourceRef::StagedFile` entries.
+//! Materializes generic archives through a read-only lazy FUSE view when available,
+//! falling back to the established 7z/7zz extraction backend on capability misses;
+//! discovers audio files, probes them with ffprobe, reads metadata with lofty, and
+//! returns a `PreparedSource` with `TrackSourceRef::StagedFile` entries.
 //!
 //! Does not convert, tag, merge, run ReplayGain, generate feature
 //! files, publish, write durable logs, or emit terminal events.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
@@ -44,6 +47,139 @@ pub(crate) const ISO_WV_METADATA_SNAPSHOT_KEY: &str =
 
 fn is_audio_extension(ext: &str) -> bool {
     AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+/// Archive-relative CUE repair produced for an ISO-WV structural rename.
+///
+/// Resolution of a `FILE` reference is intentionally supplied by the caller:
+/// the established staged path resolves against real extracted files, while
+/// the native path resolves against the archive member table. Both paths then
+/// share the exact same remapping and replacement semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IsoWvCueReferenceRenamePlan {
+    pub(crate) cue_after_relative: PathBuf,
+    pub(crate) replacements: BTreeMap<String, String>,
+}
+
+fn remap_archive_relative_path_for_rename(
+    path: &Path,
+    old_path: &Path,
+    new_path: &Path,
+) -> PathBuf {
+    if let Ok(suffix) = path.strip_prefix(old_path) {
+        new_path.join(suffix)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn normalized_cue_reference_for_archive_rename(value: &str) -> String {
+    let mut normalized = value.replace('\\', "/");
+    while let Some(rest) = normalized.strip_prefix("./") {
+        normalized = rest.to_string();
+    }
+    normalized
+}
+
+fn archive_relative_cue_reference(cue_parent: &Path, target: &Path) -> Result<String, String> {
+    use std::path::Component;
+
+    let collect = |path: &Path| -> Result<Vec<String>, String> {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(
+                    part.to_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "ISO-WV CUE path is not valid UTF-8".to_string()),
+                ),
+                Component::CurDir => None,
+                _ => Some(Err("ISO-WV CUE path escaped archive staging".to_string())),
+            })
+            .collect()
+    };
+    let from = collect(cue_parent)?;
+    let to = collect(target)?;
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = Vec::new();
+    parts.extend(std::iter::repeat("..".to_string()).take(from.len() - common));
+    parts.extend(to.into_iter().skip(common));
+    if parts.is_empty() {
+        return Err("ISO-WV CUE FILE target collapsed to the CUE directory".to_string());
+    }
+    Ok(parts.join("/"))
+}
+
+pub(crate) fn plan_iso_wv_cue_reference_rename<F>(
+    cue_text: &str,
+    cue_before_relative: &Path,
+    old_relative: &Path,
+    new_relative: &Path,
+    mut resolve_target_relative: F,
+) -> Result<IsoWvCueReferenceRenamePlan, String>
+where
+    F: FnMut(&str) -> Result<PathBuf, String>,
+{
+    let sheet = crate::convert::cue_parser::parse_cue(cue_text);
+    if sheet.tracks.is_empty() {
+        return Err(
+            "ISO-WV rename refused because the authoritative CUE has no audio tracks".to_string(),
+        );
+    }
+
+    let cue_after_relative = remap_archive_relative_path_for_rename(
+        cue_before_relative,
+        old_relative,
+        new_relative,
+    );
+    let cue_after_parent = cue_after_relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let mut replacements = BTreeMap::<String, String>::new();
+    for track in &sheet.tracks {
+        let Some(file_ref) = track
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Err(format!(
+                "ISO-WV CUE track {} has no FILE reference",
+                track.number
+            ));
+        };
+        if replacements.contains_key(file_ref) {
+            continue;
+        }
+        let target_relative = resolve_target_relative(file_ref)?;
+        let target_after_relative = remap_archive_relative_path_for_rename(
+            &target_relative,
+            old_relative,
+            new_relative,
+        );
+        let mut new_ref =
+            archive_relative_cue_reference(cue_after_parent, &target_after_relative)?;
+        if file_ref.contains('\\') && !file_ref.contains('/') {
+            new_ref = new_ref.replace('/', "\\");
+        }
+        if normalized_cue_reference_for_archive_rename(file_ref)
+            != normalized_cue_reference_for_archive_rename(&new_ref)
+        {
+            if file_ref.contains('"') || new_ref.contains('"') {
+                return Err(
+                    "ISO-WV rename would require a CUE FILE name containing a quote".to_string(),
+                );
+            }
+            replacements.insert(file_ref.to_string(), new_ref);
+        }
+    }
+
+    Ok(IsoWvCueReferenceRenamePlan {
+        cue_after_relative,
+        replacements,
+    })
 }
 
 // =========================================================================
@@ -79,7 +215,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
         };
         let reused_extraction = reusable_pre_extracted_staging(req, &materializer_extraction_root)
             .transpose()?;
-        let extraction_root = reused_extraction
+        let mut extraction_root = reused_extraction
             .clone()
             .unwrap_or_else(|| materializer_extraction_root.clone());
         let mut iso_wv_access = IsoWvPayloadAccess::Extracted;
@@ -110,7 +246,36 @@ impl super::stages::Materializer for ArchiveMaterializer {
                     .await?;
                 }
             } else {
-                extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+                // Generic archives get the same read-in-place shape as ISO-WV:
+                // prefer a read-only lazy FUSE view and fall back to the
+                // established password-aware extraction path on any capability
+                // miss. fuse-archive cannot consume Tonepoet's stored password
+                // noninteractively for every format (notably encrypted 7z/RAR),
+                // so encrypted requests deliberately keep the proven fallback.
+                let archive_mount_root = staging.root.join("archive-payload");
+                let mounted = if req.source.archive_password.is_none() {
+                    try_mount_archive_readonly(
+                        &req.container,
+                        &archive_mount_root,
+                        runner,
+                        cancel,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(lease) = mounted {
+                    extraction_root = archive_mount_root;
+                    staging.retain_fuse_mount(lease);
+                } else {
+                    // Keep the historical extraction layout on fallback and
+                    // for reusable queue-time previews. The dedicated mount
+                    // child exists only to keep later pipeline scratch writes
+                    // off the read-only FUSE filesystem.
+                    let _ = fs::remove_dir(&archive_mount_root);
+                    extract_archive(req, staging, runner, reporter, tool_paths, cancel).await?;
+                    extraction_root = staging.root.clone();
+                }
             }
         }
 
@@ -138,7 +303,7 @@ impl super::stages::Materializer for ArchiveMaterializer {
             .await;
         }
 
-        // 2. Discover audio files in the extraction tree.
+        // 2. Discover audio files in the mounted or extracted archive tree.
         let audio_files = discover_audio_files(&extraction_root)?;
         if audio_files.is_empty() {
             return Err(MaterializeError::Extraction(
@@ -237,12 +402,157 @@ impl super::stages::Materializer for ArchiveMaterializer {
     }
 }
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IsoWvPayloadAccess {
     Mounted,
     Extracted,
+}
+
+fn fuse_archive_mount_options_for_version(version: &str) -> Option<&'static str> {
+    let numeric = version
+        .trim()
+        .trim_start_matches(|ch: char| !ch.is_ascii_digit());
+    let mut components = numeric.split(|ch: char| !ch.is_ascii_digit());
+    let major = components.next()?.parse::<u32>().ok()?;
+    let minor = components.next()?.parse::<u32>().ok()?;
+
+    // Incremental caching arrived in 1.14. Tree trimming was introduced only
+    // in 1.20, together with `notrim`. Older supported releases already expose
+    // archive paths verbatim and reject an unknown `notrim` option, so select
+    // the option set by capability version rather than forcing a lockfile bump.
+    if major == 0 || (major == 1 && minor < 14) {
+        return None;
+    }
+    if major > 1 || (major == 1 && minor >= 20) {
+        Some("lazycache,notrim,auto_unmount")
+    } else {
+        Some("lazycache,auto_unmount")
+    }
+}
+
+/// Mount a generic archive as a read-only lazy FUSE view. A missing binary,
+/// unavailable FUSE device, unsupported archive, or mount failure is a soft
+/// capability miss; callers fall back to the established extraction path.
+/// Cancellation is terminal. Lazy caching is mandatory here: fuse-archive's
+/// eager cache mode can otherwise perform the same whole-archive work this
+/// path exists to avoid.
+#[allow(unsafe_code)] // libc::getpid + pre_exec(prctl PR_SET_PDEATHSIG) for the foreground FUSE child
+pub(crate) async fn try_mount_archive_readonly(
+    archive_path: &Path,
+    mount_point: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<std::sync::Arc<FuseMountLease>>, MaterializeError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (archive_path, mount_point, runner, cancel);
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if cancel.is_cancelled() {
+            return Err(MaterializeError::Cancelled);
+        }
+        let Some(fuse_archive) = runner.resolved_tool_path(ToolBinary::FuseArchive) else {
+            return Ok(None);
+        };
+        let Some(fuse_archive_version) = runner.tool_version(ToolBinary::FuseArchive) else {
+            log::debug!("archive mount version is unknown; falling back to extraction");
+            return Ok(None);
+        };
+        let Some(mount_options) = fuse_archive_mount_options_for_version(&fuse_archive_version) else {
+            log::debug!(
+                "fuse-archive {fuse_archive_version} is too old for lazy caching; falling back to extraction"
+            );
+            return Ok(None);
+        };
+        if !Path::new("/dev/fuse").exists() {
+            return Ok(None);
+        }
+        fs::create_dir_all(mount_point).map_err(MaterializeError::Io)?;
+        if fs::read_dir(mount_point)
+            .map_err(MaterializeError::Io)?
+            .next()
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let parent_pid = unsafe { libc::getpid() };
+        let mut command = std::process::Command::new(fuse_archive);
+        command
+            .arg("-f")
+            .arg("-o")
+            .arg(mount_options)
+            .arg(archive_path)
+            .arg(mount_point)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "tonepoet parent exited before archive FUSE supervision was armed",
+                    ));
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                log::debug!("archive mount unavailable; falling back to extraction: {err}");
+                return Ok(None);
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if cancel.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MaterializeError::Cancelled);
+            }
+            if super::types::linux_mountinfo_contains(mount_point) {
+                return Ok(Some(std::sync::Arc::new(FuseMountLease::new(
+                    mount_point.to_path_buf(),
+                    child,
+                ))));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    log::debug!(
+                        "archive mount exited before becoming ready ({status}); falling back to extraction"
+                    );
+                    return Ok(None);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log::debug!(
+                        "archive mount readiness check failed; falling back to extraction: {err}"
+                    );
+                    return Ok(None);
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                log::debug!("archive mount timed out; falling back to extraction");
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 /// Mount an ISO-WV payload without copying it.  Failure to acquire FUSE is a
@@ -694,6 +1004,9 @@ fn archive_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
     if let Some(version) = runner.tool_version(ToolBinary::SevenZip) {
         tool_versions.insert("7z".to_string(), version);
     }
+    if let Some(version) = runner.tool_version(ToolBinary::FuseArchive) {
+        tool_versions.insert("fuse-archive".to_string(), version);
+    }
     tool_versions
 }
 
@@ -757,6 +1070,145 @@ enum RepackageArchiveFormat {
     TarGz,
     Rar,
     IsoWv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ZipEncryptionMethod {
+    ZipCrypto,
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl ZipEncryptionMethod {
+    fn seven_zip_method_switch(self) -> &'static str {
+        match self {
+            Self::ZipCrypto => "-mem=ZipCrypto",
+            Self::Aes128 => "-mem=AES128",
+            Self::Aes192 => "-mem=AES192",
+            Self::Aes256 => "-mem=AES256",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveRepackageEncryptionPolicy {
+    password: SecretString,
+    header_encryption: bool,
+    zip_method: Option<ZipEncryptionMethod>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ArchiveEncryptionProbeFacts {
+    any_encrypted: bool,
+    any_unencrypted: bool,
+    zip_methods: BTreeSet<ZipEncryptionMethod>,
+    unknown_encrypted_zip_method: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveEncryptionProbeResult {
+    success: bool,
+    facts: ArchiveEncryptionProbeFacts,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveEncryptionListingParser {
+    facts: ArchiveEncryptionProbeFacts,
+    in_entries: bool,
+    have_entry: bool,
+    current_encrypted: Option<bool>,
+    current_is_dir: Option<bool>,
+    current_attributes_is_dir: Option<bool>,
+    current_method: Option<String>,
+}
+
+impl ArchiveEncryptionListingParser {
+    fn finish_current(&mut self, format: RepackageArchiveFormat) {
+        if !self.have_entry {
+            return;
+        }
+        // ZIP listings expose `Folder = +/-`, while current 7-Zip 7z
+        // listings may omit that field and identify directories only via
+        // `Attributes = D ...`. Prefer the explicit Folder field when it is
+        // present and otherwise fall back to the attributes classification.
+        let current_is_dir = self
+            .current_is_dir
+            .unwrap_or(self.current_attributes_is_dir == Some(true));
+        if !current_is_dir {
+            match self.current_encrypted {
+                Some(true) => {
+                    self.facts.any_encrypted = true;
+                    if format == RepackageArchiveFormat::Zip {
+                        match self
+                            .current_method
+                            .as_deref()
+                            .and_then(zip_encryption_method_from_listing)
+                        {
+                            Some(method) => {
+                                self.facts.zip_methods.insert(method);
+                            }
+                            None => self.facts.unknown_encrypted_zip_method = true,
+                        }
+                    }
+                }
+                Some(false) => self.facts.any_unencrypted = true,
+                None => {}
+            }
+        }
+        self.have_entry = false;
+        self.current_encrypted = None;
+        self.current_is_dir = None;
+        self.current_attributes_is_dir = None;
+        self.current_method = None;
+    }
+
+    fn push_line(&mut self, format: RepackageArchiveFormat, line: &str) {
+        if line.trim() == "----------" {
+            self.finish_current(format);
+            self.in_entries = true;
+            return;
+        }
+        if !self.in_entries {
+            // `7z l -slt` emits archive-level Path/Method fields before
+            // the dashed item-list delimiter. They describe the container,
+            // not a member, and must not participate in encryption policy.
+            return;
+        }
+        let Some((key, value)) = line.split_once(" = ") else {
+            return;
+        };
+        let key = key.trim();
+        if key == "Path" {
+            // Item records are introduced by successive `Path = ...` fields;
+            // blank lines are presentation only.
+            self.finish_current(format);
+            self.have_entry = true;
+            return;
+        }
+        if !self.have_entry {
+            return;
+        }
+        match key {
+            "Encrypted" => self.current_encrypted = Some(value.trim() == "+"),
+            "Folder" => self.current_is_dir = Some(value.trim() == "+"),
+            "Attributes" => {
+                self.current_attributes_is_dir = Some(
+                    value
+                        .split_ascii_whitespace()
+                        .next()
+                        .is_some_and(|flags| flags.starts_with('D')),
+                )
+            }
+            "Method" => self.current_method = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    fn finish(mut self, format: RepackageArchiveFormat) -> ArchiveEncryptionProbeFacts {
+        self.finish_current(format);
+        self.facts
+    }
 }
 
 /// Non-fatal details from a successful archive repackage. The most important
@@ -941,6 +1393,1103 @@ fn require_repackage_format_tool_available(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveNativeRenameProgressSnapshot {
+    pub status: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+impl ArchiveNativeRenameProgressSnapshot {
+    fn new(status: impl Into<String>, bytes_done: u64, bytes_total: u64) -> Self {
+        Self {
+            status: status.into(),
+            bytes_done,
+            bytes_total,
+        }
+    }
+}
+
+/// Return whether the format has a format-native rename primitive that
+/// Tonepoet can use without extracting the archive. RAR deliberately keeps
+/// the established exact repackage fallback when a configured writer exists;
+/// Tonepoet never changes its container format implicitly.
+pub fn archive_native_rename_available(
+    original_archive: &Path,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<bool, String> {
+    let format = repackage_archive_format(original_archive)?;
+    match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "archive rename requires `7zz` or `7z`",
+            )?;
+            Ok(true)
+        }
+        RepackageArchiveFormat::IsoWv => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["xorriso"],
+                "ISO-WV rename requires the `xorriso` executable",
+            )?;
+            Ok(true)
+        }
+        RepackageArchiveFormat::Tar
+        | RepackageArchiveFormat::TarGz
+        | RepackageArchiveFormat::Rar => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveNativeRenamePair {
+    pub(crate) old_inner_path: String,
+    pub(crate) new_inner_path: String,
+}
+
+impl ArchiveNativeRenamePair {
+    pub(crate) fn new(old_inner_path: impl Into<String>, new_inner_path: impl Into<String>) -> Self {
+        Self {
+            old_inner_path: old_inner_path.into(),
+            new_inner_path: new_inner_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveNativeMember {
+    pub(crate) path: String,
+    pub(crate) is_dir: bool,
+}
+
+fn normalize_archive_relative_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("archive-relative path escapes the archive root".to_string());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("absolute CUE FILE references are not valid inside ISO-WV".to_string());
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err("archive-relative path resolved to the archive root".to_string());
+    }
+    Ok(normalized)
+}
+
+fn archive_member_is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(is_audio_extension)
+}
+
+fn resolve_iso_wv_cue_reference_from_members(
+    cue_before_relative: &Path,
+    file_ref: &str,
+    member_files: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let normalized_ref = file_ref.replace('\\', "/");
+    let raw = PathBuf::from(&normalized_ref);
+    if raw.is_absolute() {
+        return Err(format!(
+            "ISO-WV CUE FILE {:?} resolves outside the archive",
+            file_ref
+        ));
+    }
+    let cue_parent = cue_before_relative.parent().unwrap_or_else(|| Path::new(""));
+    let direct = normalize_archive_relative_path(&cue_parent.join(&raw)).map_err(|_| {
+        format!(
+            "ISO-WV CUE FILE {:?} resolves outside the archive",
+            file_ref
+        )
+    })?;
+    if member_files.iter().any(|candidate| candidate == &direct) {
+        return if archive_member_is_audio(&direct) {
+            Ok(direct)
+        } else {
+            Err(format!(
+                "ISO-WV CUE FILE {:?} is not a supported audio source ({})",
+                file_ref,
+                direct.display()
+            ))
+        };
+    }
+
+    let search_dir = direct.parent().unwrap_or_else(|| Path::new(""));
+    let wanted_name = raw.file_name().and_then(|value| value.to_str());
+    if let Some(wanted_name) = wanted_name {
+        let mut matches = member_files
+            .iter()
+            .filter(|candidate| archive_member_is_audio(candidate))
+            .filter(|candidate| candidate.parent().unwrap_or_else(|| Path::new("")) == search_dir)
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(wanted_name))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [only] => return Ok(only.clone()),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "ISO-WV CUE FILE {:?} is ambiguous before rename ({} candidates)",
+                    file_ref,
+                    matches.len()
+                ));
+            }
+        }
+    }
+
+    if let Some(wanted_stem) = raw.file_stem().and_then(|value| value.to_str()) {
+        let mut matches = member_files
+            .iter()
+            .filter(|candidate| archive_member_is_audio(candidate))
+            .filter(|candidate| candidate.parent().unwrap_or_else(|| Path::new("")) == search_dir)
+            .filter(|candidate| {
+                candidate
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(wanted_stem))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [only] => return Ok(only.clone()),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "ISO-WV CUE FILE {:?} is ambiguous before rename ({} candidates)",
+                    file_ref,
+                    matches.len()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "ISO-WV CUE FILE {:?} is already missing before rename",
+        file_ref
+    ))
+}
+
+fn native_member_files(members: &[ArchiveNativeMember]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for member in members.iter().filter(|member| !member.is_dir) {
+        let normalized = normalize_archive_relative_path(Path::new(&member.path)).map_err(|err| {
+            format!("invalid archive member path {:?}: {err}", member.path)
+        })?;
+        files.push(normalized);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn single_iso_wv_cue_member(member_files: &[PathBuf]) -> Result<PathBuf, String> {
+    let mut cues = member_files
+        .iter()
+        .filter(|path| crate::convert::classify::is_cue_sheet_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    cues.sort();
+    cues.dedup();
+    match cues.as_slice() {
+        [cue] => Ok(cue.clone()),
+        [] => Err("ISO-WV payload contains no user-visible CUE sheet".to_string()),
+        _ => Err(format!(
+            "ISO-WV payload contains {} user-visible CUE sheets; album authority is ambiguous",
+            cues.len()
+        )),
+    }
+}
+
+fn remap_member_path_through_native_pairs(
+    path: &Path,
+    rename_pairs: &[ArchiveNativeRenamePair],
+) -> PathBuf {
+    for pair in rename_pairs {
+        let old = Path::new(&pair.old_inner_path);
+        if path == old {
+            return PathBuf::from(&pair.new_inner_path);
+        }
+        if let Ok(suffix) = path.strip_prefix(old) {
+            return PathBuf::from(&pair.new_inner_path).join(suffix);
+        }
+    }
+    path.to_path_buf()
+}
+
+struct NativeIsoWvCueTempGuard {
+    path: PathBuf,
+}
+
+impl NativeIsoWvCueTempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for NativeIsoWvCueTempGuard {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct NativeIsoWvCueRepair {
+    cue_before_relative: PathBuf,
+    cue_after_relative: PathBuf,
+    original_bytes: Vec<u8>,
+    rewritten_bytes: Vec<u8>,
+    replacements: BTreeMap<String, String>,
+    disk_path: PathBuf,
+}
+
+impl Drop for NativeIsoWvCueRepair {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.disk_path);
+    }
+}
+
+async fn target_read_iso_member(
+    archive: &Path,
+    member: &Path,
+    disk_path: &Path,
+    xorriso: &Path,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, String> {
+    let iso_path = format!("/{}", member.to_string_lossy().trim_start_matches('/'));
+    let _ = fs::remove_file(disk_path);
+    run_native_archive_edit_command(
+        ToolBinary::Xorriso,
+        xorriso.to_path_buf(),
+        vec![
+            "-osirrox".into(),
+            "on".into(),
+            "-indev".into(),
+            archive.display().to_string(),
+            "-extract_single".into(),
+            iso_path,
+            disk_path.display().to_string(),
+        ],
+        Vec::new(),
+        "target-read ISO-WV CUE",
+        cancel,
+    )
+    .await?;
+    fs::read(disk_path).map_err(|err| {
+        format!(
+            "read target-extracted ISO-WV CUE '{}' failed: {err}",
+            disk_path.display()
+        )
+    })
+}
+
+async fn prepare_native_iso_wv_cue_repair(
+    transactional_archive: &Path,
+    rename_pairs: &[ArchiveNativeRenamePair],
+    members: &[ArchiveNativeMember],
+    xorriso: &Path,
+    cancel: &CancellationToken,
+) -> Result<NativeIsoWvCueRepair, String> {
+    if rename_pairs.len() != 1 {
+        return Err("ISO-WV native rename requires exactly one rename pair".to_string());
+    }
+    let member_files = native_member_files(members)?;
+    let cue_before_relative = single_iso_wv_cue_member(&member_files)?;
+    let parent = transactional_archive
+        .parent()
+        .ok_or_else(|| "transactional ISO-WV copy has no parent directory".to_string())?;
+    // xorriso restores the member's recorded mode on target-read. ISO files
+    // are commonly mode 0444, so never reuse that extracted path as the map
+    // source for a rewritten CUE. Keep the read target and writable rewrite
+    // staging path separate; this also avoids chmod semantics on sshfs and
+    // other remote filesystems.
+    let read_path_guard = NativeIsoWvCueTempGuard::new(parent.join(format!(
+        ".tonepoet-native-cue-read-{}.tmp",
+        uuid::Uuid::new_v4()
+    )));
+    let original_bytes = target_read_iso_member(
+        transactional_archive,
+        &cue_before_relative,
+        read_path_guard.path(),
+        xorriso,
+        cancel,
+    )
+    .await?;
+    let disk_path_guard = NativeIsoWvCueTempGuard::new(parent.join(format!(
+        ".tonepoet-native-cue-write-{}.tmp",
+        uuid::Uuid::new_v4()
+    )));
+    let cue_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &original_bytes,
+        &cue_before_relative,
+    )?;
+    let pair = &rename_pairs[0];
+    let shared_plan = plan_iso_wv_cue_reference_rename(
+        &cue_text,
+        &cue_before_relative,
+        Path::new(&pair.old_inner_path),
+        Path::new(&pair.new_inner_path),
+        |file_ref| {
+            resolve_iso_wv_cue_reference_from_members(
+                &cue_before_relative,
+                file_ref,
+                &member_files,
+            )
+        },
+    )?;
+    let (_outcome, rewritten_bytes) = crate::convert::cue_parser::rewrite_cue_file_reference_bytes(
+        &original_bytes,
+        &cue_before_relative,
+        &shared_plan.replacements,
+    )?;
+    if rewritten_bytes != original_bytes {
+        fs::write(disk_path_guard.path(), &rewritten_bytes)
+            .map_err(|err| format!("write rewritten ISO-WV CUE staging file failed: {err}"))?;
+    }
+
+    // Validate the rewritten authority against the post-rename member tree
+    // before asking xorriso to modify the transactional copy. This is the
+    // archive-member equivalent of the staged resolver's post-write proof.
+    let post_member_files = member_files
+        .iter()
+        .map(|path| remap_member_path_through_native_pairs(path, rename_pairs))
+        .collect::<Vec<_>>();
+    let rewritten_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &rewritten_bytes,
+        &shared_plan.cue_after_relative,
+    )?;
+    let rewritten_sheet = crate::convert::cue_parser::parse_cue(&rewritten_text);
+    if rewritten_sheet.tracks.is_empty() {
+        return Err("rewritten ISO-WV CUE has no audio tracks".to_string());
+    }
+    for track in &rewritten_sheet.tracks {
+        let file_ref = track
+            .file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("rewritten ISO-WV CUE track {} has no FILE reference", track.number))?;
+        resolve_iso_wv_cue_reference_from_members(
+            &shared_plan.cue_after_relative,
+            file_ref,
+            &post_member_files,
+        )?;
+    }
+
+    Ok(NativeIsoWvCueRepair {
+        cue_before_relative,
+        cue_after_relative: shared_plan.cue_after_relative,
+        original_bytes,
+        rewritten_bytes,
+        replacements: shared_plan.replacements,
+        disk_path: disk_path_guard.into_path(),
+    })
+}
+
+struct NativeIsoWvSidecarRewrite {
+    _claim: Option<crate::concurrency::MutationClaimGuard>,
+    admitted_path: PathBuf,
+    original_bytes: Vec<u8>,
+    rewritten_bytes: Vec<u8>,
+}
+
+fn prepare_and_apply_native_iso_wv_sidecar_rewrite(
+    logical_archive_path: &Path,
+    cue_repair: &NativeIsoWvCueRepair,
+) -> Result<Option<NativeIsoWvSidecarRewrite>, String> {
+    if cue_repair.replacements.is_empty() {
+        return Ok(None);
+    }
+    let sidecar_path = iso_wv_metadata_sidecar_path(logical_archive_path);
+    if !sidecar_path.exists() {
+        return Ok(None);
+    }
+    let (claim, admitted_path) =
+        crate::convert::cue_parser::acquire_cue_sidecar_write_claim(&sidecar_path)?;
+    let original_bytes = fs::read(&admitted_path).map_err(|err| {
+        format!(
+            "read adjacent ISO-WV metadata CUE '{}' failed: {err}",
+            sidecar_path.display()
+        )
+    })?;
+    let original_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &original_bytes,
+        &sidecar_path,
+    )?;
+    let original_sidecar = crate::convert::cue_parser::parse_cue(&original_text);
+    let is_tonepoet_snapshot = crate::convert::cue_parser::cue_user_metadata_values(
+        &original_sidecar.user_metadata,
+        ISO_WV_METADATA_SNAPSHOT_KEY,
+    )
+    .is_some_and(|values| values.iter().any(|value| value.trim() == "1"));
+    if !is_tonepoet_snapshot {
+        return Ok(None);
+    }
+    let internal_before_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &cue_repair.original_bytes,
+        &cue_repair.cue_before_relative,
+    )?;
+    let internal_before = crate::convert::cue_parser::parse_cue(&internal_before_text);
+    if !iso_wv_cue_geometry_matches(&internal_before, &original_sidecar) {
+        return Err(format!(
+            "Tonepoet ISO-WV metadata snapshot '{}' is already geometry-stale; native rename declined",
+            sidecar_path.display()
+        ));
+    }
+
+    let (_outcome, rewritten_bytes) = crate::convert::cue_parser::rewrite_cue_file_reference_bytes(
+        &original_bytes,
+        &sidecar_path,
+        &cue_repair.replacements,
+    )?;
+    let rewritten_sidecar_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &rewritten_bytes,
+        &sidecar_path,
+    )?;
+    let rewritten_sidecar = crate::convert::cue_parser::parse_cue(&rewritten_sidecar_text);
+    let internal_after_text = crate::convert::cue_parser::decode_cue_bytes_for_path(
+        &cue_repair.rewritten_bytes,
+        &cue_repair.cue_after_relative,
+    )?;
+    let internal_after = crate::convert::cue_parser::parse_cue(&internal_after_text);
+    if !iso_wv_cue_geometry_matches(&internal_after, &rewritten_sidecar) {
+        return Err(format!(
+            "Tonepoet ISO-WV metadata snapshot '{}' could not be kept geometry-compatible; native rename declined",
+            sidecar_path.display()
+        ));
+    }
+    if rewritten_bytes == original_bytes {
+        return Err(format!(
+            "Tonepoet ISO-WV metadata snapshot '{}' required a FILE rewrite but remained unchanged; native rename declined",
+            sidecar_path.display()
+        ));
+    }
+    crate::convert::cue_parser::atomic_replace_if_unchanged(
+        &admitted_path,
+        &rewritten_bytes,
+        Some(&original_bytes),
+    )?;
+    Ok(Some(NativeIsoWvSidecarRewrite {
+        _claim: claim,
+        admitted_path,
+        original_bytes,
+        rewritten_bytes,
+    }))
+}
+
+fn rollback_native_iso_wv_sidecar_rewrite(
+    rewrite: &NativeIsoWvSidecarRewrite,
+) -> Result<(), String> {
+    crate::convert::cue_parser::atomic_replace_if_unchanged(
+        &rewrite.admitted_path,
+        &rewrite.original_bytes,
+        Some(&rewrite.rewritten_bytes),
+    )
+}
+
+/// Apply one or more archive-member rename pairs without extracting payload data
+/// while preserving the existing exact install/restore transaction semantics.
+///
+/// The user's original is never mutated in place. Tonepoet first creates a
+/// sibling transactional copy (Linux reflink first, then kernel/server-side
+/// copy offload when available, then a cancellable buffered fallback), applies
+/// the format-native header edit to that
+/// copy, rechecks the original fingerprint, preserves install metadata, and
+/// then uses the same backup/install/restore swap as full repackaging.
+///
+/// `Ok(None)` means the native path deliberately declined this request
+/// (unsupported/encrypted format or an ISO-WV CUE safety check) and the caller
+/// should use the existing extract/edit/repackage fallback.
+pub async fn rename_archive_entry_native_transactional<F>(
+    original_archive: &Path,
+    logical_archive_path: &Path,
+    rename_pairs: &[ArchiveNativeRenamePair],
+    archive_members: &[ArchiveNativeMember],
+    expected_fingerprint: (i64, u32, u64),
+    archive_password: Option<&str>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+    progress: F,
+) -> Result<Option<ArchiveRepackageReport>, String>
+where
+    F: FnMut(ArchiveNativeRenameProgressSnapshot) + Send + 'static,
+{
+    if rename_pairs.is_empty() {
+        return Err("native archive rename plan is empty".to_string());
+    }
+    if archive_password.is_some() {
+        // Encrypted and header-encrypted containers keep the established
+        // password-aware extract/repackage path until native header-only
+        // mutation semantics are explicitly validated for those cases.
+        return Ok(None);
+    }
+
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
+    let emit_progress = |snapshot| {
+        if let Ok(mut callback) = progress.lock() {
+            (*callback)(snapshot);
+        }
+    };
+    if !archive_native_rename_available(original_archive, tool_paths)? {
+        return Ok(None);
+    }
+    check_repackage_cancelled(cancel)?;
+    if archive_fingerprint_for_native_edit(original_archive)? != expected_fingerprint {
+        return Err("archive changed externally before rename began; rename was not applied".to_string());
+    }
+
+    let format = repackage_archive_format(original_archive)?;
+    let parent = original_archive.parent().ok_or_else(|| {
+        format!("archive has no parent directory: {}", original_archive.display())
+    })?;
+    let file_name = original_archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("archive name is not valid Unicode: {}", original_archive.display()))?;
+    let install_metadata = capture_archive_install_metadata(original_archive)?;
+    let archive_size = expected_fingerprint.2;
+    let nonce = uuid::Uuid::new_v4();
+    let temp_archive = parent.join(format!(
+        ".{file_name}.tonepoet-native-rename-{nonce}{}",
+        repackage_format_suffix(format)
+    ));
+    let backup_archive = parent.join(format!(".{file_name}.tonepoet-backup-{nonce}"));
+
+    let source = original_archive.to_path_buf();
+    let temp_for_copy = temp_archive.clone();
+    let copy_cancel = cancel.clone();
+    emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+        "Preparing transactional archive copy...",
+        0,
+        archive_size,
+    ));
+    let copy_progress = std::sync::Arc::clone(&progress);
+    let copy_result = tokio::task::spawn_blocking(move || {
+        copy_archive_for_native_edit(
+            &source,
+            &temp_for_copy,
+            archive_size,
+            &copy_cancel,
+            |bytes_done| {
+                if let Ok(mut callback) = copy_progress.lock() {
+                    (*callback)(ArchiveNativeRenameProgressSnapshot::new(
+                        "Copying archive transactionally...",
+                        bytes_done,
+                        archive_size,
+                    ));
+                }
+            },
+        )
+    })
+    .await
+    .map_err(|err| format!("archive rename copy worker failed: {err}"))?;
+    if let Err(err) = copy_result {
+        let _ = fs::remove_file(&temp_archive);
+        return Err(err);
+    }
+    emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+        "Transactional archive copy ready",
+        archive_size,
+        archive_size,
+    ));
+    check_repackage_cancelled(cancel).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_archive);
+    })?;
+
+    let mut iso_cue_repair = if format == RepackageArchiveFormat::IsoWv {
+        let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+        match prepare_native_iso_wv_cue_repair(
+            &temp_archive,
+            rename_pairs,
+            archive_members,
+            &xorriso,
+            cancel,
+        )
+        .await
+        {
+            Ok(repair) => Some(repair),
+            Err(err) => {
+                let _ = fs::remove_file(&temp_archive);
+                if cancel.is_cancelled() {
+                    return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+                }
+                log::debug!(
+                    "native ISO-WV rename declined before mutation; using extraction fallback: {err}"
+                );
+                return Ok(None);
+            }
+        }
+    } else {
+        None
+    };
+
+    let command_result = match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            // Archive member names are user data. Disable 7-Zip wildcard
+            // parsing so names containing `*` or `?` are renamed literally
+            // rather than being interpreted as masks.
+            let mut args = vec!["rn".to_string(), "-spd".to_string()];
+            let mut secret_args = Vec::new();
+            if let Some(password) = archive_password {
+                secret_args.push(args.len());
+                args.push(format!("-p{password}"));
+            }
+            args.push("--".to_string());
+            args.push(temp_archive.display().to_string());
+            for pair in rename_pairs {
+                args.push(pair.old_inner_path.clone());
+                args.push(pair.new_inner_path.clone());
+            }
+            emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+                "Applying native archive rename...",
+                archive_size,
+                archive_size,
+            ));
+            run_native_archive_edit_command(
+                ToolBinary::SevenZip,
+                seven_zip,
+                args,
+                secret_args,
+                "native 7z/zip rename",
+                cancel,
+            )
+            .await
+        }
+        RepackageArchiveFormat::IsoWv => {
+            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            let pair = rename_pairs
+                .first()
+                .ok_or_else(|| "native ISO-WV rename plan is empty".to_string())?;
+            if rename_pairs.len() != 1 {
+                let _ = fs::remove_file(&temp_archive);
+                return Ok(None);
+            }
+            let old_path = format!("/{}", pair.old_inner_path.trim_start_matches('/'));
+            let new_path = format!("/{}", pair.new_inner_path.trim_start_matches('/'));
+            emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+                "Applying native ISO rename...",
+                archive_size,
+                archive_size,
+            ));
+            let mut args = vec![
+                "-dev".into(),
+                temp_archive.display().to_string(),
+                "-mv".into(),
+                old_path,
+                new_path,
+                "--".into(),
+            ];
+            if let Some(repair) = iso_cue_repair.as_ref() {
+                if !repair.replacements.is_empty() {
+                    let cue_after = format!(
+                        "/{}",
+                        repair
+                            .cue_after_relative
+                            .to_string_lossy()
+                            .trim_start_matches('/')
+                    );
+                    args.extend([
+                        "-overwrite".into(),
+                        "nondir".into(),
+                        "-map".into(),
+                        repair.disk_path.display().to_string(),
+                        cue_after,
+                    ]);
+                }
+            }
+            args.push("-commit".into());
+            run_native_archive_edit_command(
+                ToolBinary::Xorriso,
+                xorriso,
+                args,
+                Vec::new(),
+                "native ISO-WV rename",
+                cancel,
+            )
+            .await
+        }
+        RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => return Ok(None),
+        RepackageArchiveFormat::Rar => unreachable!("RAR rejected by native rename preflight"),
+    };
+    if let Err(err) = command_result {
+        let _ = fs::remove_file(&temp_archive);
+        return Err(err);
+    }
+
+    if let Some(repair) = iso_cue_repair.as_mut() {
+        let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+        let actual = match target_read_iso_member(
+            &temp_archive,
+            &repair.cue_after_relative,
+            &repair.disk_path,
+            &xorriso,
+            cancel,
+        )
+        .await
+        {
+            Ok(actual) => actual,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_archive);
+                if cancel.is_cancelled() {
+                    return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+                }
+                log::debug!(
+                    "native ISO-WV rename could not re-read rewritten CUE; using extraction fallback: {err}"
+                );
+                return Ok(None);
+            }
+        };
+        if actual != repair.rewritten_bytes {
+            let _ = fs::remove_file(&temp_archive);
+            log::debug!(
+                "native ISO-WV rename CUE target-read did not match planned bytes; using extraction fallback"
+            );
+            return Ok(None);
+        }
+    }
+
+    emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+        "Verifying renamed archive header...",
+        archive_size,
+        archive_size,
+    ));
+    if let Err(err) = verify_native_archive_header(
+        format,
+        &temp_archive,
+        archive_password,
+        tool_paths,
+        cancel,
+    )
+    .await
+    {
+        let _ = fs::remove_file(&temp_archive);
+        return Err(err);
+    }
+
+    check_repackage_cancelled(cancel).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_archive);
+    })?;
+    if archive_fingerprint_for_native_edit(original_archive)? != expected_fingerprint {
+        let _ = fs::remove_file(&temp_archive);
+        return Err("archive changed externally while rename was being prepared; original was left untouched".to_string());
+    }
+    if fs::metadata(&temp_archive)
+        .map_err(|err| format!("inspect native-rename archive failed: {err}"))?
+        .len()
+        == 0
+    {
+        let _ = fs::remove_file(&temp_archive);
+        return Err("native archive rename produced an empty archive".to_string());
+    }
+
+    let install_metadata_warning = apply_archive_install_metadata(&temp_archive, &install_metadata);
+    if let Ok(file) = fs::OpenOptions::new().read(true).open(&temp_archive) {
+        let _ = file.sync_all();
+    }
+
+    // If Tonepoet owns an adjacent ISO-WV metadata snapshot, keep its FILE
+    // geometry synchronized before the archive install. The sidecar mutation
+    // claim is held through the archive swap, and an install failure restores
+    // the exact original sidecar bytes before returning.
+    let sidecar_rewrite = if let Some(repair) = iso_cue_repair.as_ref() {
+        match prepare_and_apply_native_iso_wv_sidecar_rewrite(logical_archive_path, repair) {
+            Ok(rewrite) => rewrite,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_archive);
+                log::debug!(
+                    "native ISO-WV rename could not safely synchronize metadata snapshot; using extraction fallback: {err}"
+                );
+                return Ok(None);
+            }
+        }
+    } else {
+        None
+    };
+    emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+        "Installing renamed archive...",
+        archive_size,
+        archive_size,
+    ));
+    let report = replace_archive_atomically(
+        original_archive,
+        &temp_archive,
+        &backup_archive,
+        install_metadata_warning,
+    );
+    if report.is_err() {
+        let _ = fs::remove_file(&temp_archive);
+        if backup_archive.exists() && !original_archive.exists() {
+            let _ = fs::rename(&backup_archive, original_archive);
+        }
+        if let Some(rewrite) = sidecar_rewrite.as_ref() {
+            if let Err(restore_err) = rollback_native_iso_wv_sidecar_rewrite(rewrite) {
+                let install_err = report
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .unwrap_or_else(|| "archive install failed".to_string());
+                return Err(format!(
+                    "{install_err}; adjacent ISO-WV metadata snapshot rollback also failed: {restore_err}"
+                ));
+            }
+        }
+    }
+    report.map(Some)
+}
+
+async fn verify_native_archive_header(
+    format: RepackageArchiveFormat,
+    archive: &Path,
+    archive_password: Option<&str>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
+            // `7z t` would decompress payload data and can turn a header-only
+            // rename on a solid archive back into a full-archive operation.
+            // A structured listing validates that the rewritten container
+            // header/tree remains readable without paying that cost.
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut args = vec!["l".to_string(), "-slt".to_string()];
+            let mut secret_args = Vec::new();
+            if let Some(password) = archive_password {
+                secret_args.push(args.len());
+                args.push(format!("-p{password}"));
+            }
+            args.push(archive.display().to_string());
+            run_native_archive_edit_command(
+                ToolBinary::SevenZip,
+                seven_zip,
+                args,
+                secret_args,
+                "verify native 7z/zip rename header",
+                cancel,
+            )
+            .await
+        }
+        RepackageArchiveFormat::IsoWv => {
+            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            run_native_archive_edit_command(
+                ToolBinary::Xorriso,
+                xorriso,
+                vec![
+                    "-indev".into(),
+                    archive.display().to_string(),
+                    "-find".into(),
+                    "/".into(),
+                    "-exec".into(),
+                    "report_lba".into(),
+                    "--".into(),
+                ],
+                Vec::new(),
+                "verify native ISO-WV rename header",
+                cancel,
+            )
+            .await
+        }
+        RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => Ok(()),
+        RepackageArchiveFormat::Rar => unreachable!("RAR rejected by native rename preflight"),
+    }
+}
+
+async fn run_native_archive_edit_command(
+    binary: ToolBinary,
+    binary_path: PathBuf,
+    args: Vec<String>,
+    secret_args: Vec<usize>,
+    label: &str,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let runner = RealToolRunner::new(HashMap::new());
+    let command = ToolCommand {
+        binary,
+        args,
+        secret_args,
+        cwd: None,
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        env: Vec::new(),
+        timeout: Duration::from_secs(24 * 60 * 60),
+    };
+    match runner.run_with_binary_path(command, binary_path, cancel).await {
+        Ok(_) => Ok(()),
+        Err(ToolRunnerError::Cancelled { .. }) => Err(ARCHIVE_REPACKAGE_CANCELLED.to_string()),
+        Err(error) => Err(format!("{label}: {error}")),
+    }
+}
+
+fn archive_fingerprint_for_native_edit(path: &Path) -> Result<(i64, u32, u64), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("stat archive for conflict detection failed: {err}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|err| format!("read archive mtime for conflict detection failed: {err}"))?;
+    let duration = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| "archive mtime predates UNIX epoch".to_string())?;
+    Ok((duration.as_secs() as i64, duration.subsec_nanos(), metadata.len()))
+}
+
+#[allow(unsafe_code)] // Linux FICLONE/copy_file_range for transactional archive preparation
+fn copy_archive_for_native_edit<F>(
+    source: &Path,
+    destination: &Path,
+    total: u64,
+    cancel: &CancellationToken,
+    mut progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64),
+{
+    if cancel.is_cancelled() {
+        return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+    }
+    let mut source_file = fs::File::open(source)
+        .map_err(|err| format!("open archive for transactional copy failed: {err}"))?;
+    let mut destination_file = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(destination)
+        .map_err(|err| format!("create transactional archive copy failed: {err}"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
+        // SAFETY: both descriptors are valid open regular files owned by this
+        // function; FICLONE only asks the kernel to clone source extents into
+        // the newly-created empty destination.
+        if unsafe {
+            libc::ioctl(
+                destination_file.as_raw_fd(),
+                FICLONE_IOCTL,
+                source_file.as_raw_fd(),
+            )
+        } == 0
+        {
+            progress(total);
+            return Ok(());
+        }
+    }
+
+    destination_file
+        .set_len(0)
+        .map_err(|err| format!("reset transactional archive copy failed: {err}"))?;
+
+    let mut copied = 0u64;
+    #[cfg(target_os = "linux")]
+    {
+        // copy_file_range can be satisfied entirely inside the kernel and,
+        // for supporting NFS/SMB servers, by server-side copy offload.  That
+        // preserves the exact rollback copy without unnecessarily pulling a
+        // multi-gigabyte archive through Tonepoet's userspace buffers.
+        while copied < total {
+            if cancel.is_cancelled() {
+                return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+            }
+            let remaining = total.saturating_sub(copied).min(64 * 1024 * 1024) as usize;
+            // SAFETY: both descriptors are valid regular files owned by this
+            // function. Null offsets request that the kernel advance the file
+            // descriptions' current offsets, exactly like read/write.
+            let count = unsafe {
+                libc::copy_file_range(
+                    source_file.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    destination_file.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    remaining,
+                    0,
+                )
+            };
+            if count > 0 {
+                copied = copied.saturating_add(count as u64);
+                progress(copied.min(total));
+                continue;
+            }
+            if count == 0 {
+                break;
+            }
+
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                // These mean copy offload is unavailable for this filesystem
+                // or source/destination pair. Continue from the current file
+                // offsets with the portable buffered copy below.
+                Some(libc::EXDEV)
+                | Some(libc::EINVAL)
+                | Some(libc::ENOSYS)
+                | Some(libc::EOPNOTSUPP) => break,
+                _ => {
+                    return Err(format!(
+                        "kernel-assisted transactional archive copy failed: {error}"
+                    ))
+                }
+            }
+        }
+        if copied == total {
+            destination_file
+                .sync_all()
+                .map_err(|err| format!("sync transactional archive copy failed: {err}"))?;
+            return Ok(());
+        }
+    }
+
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    while copied < total {
+        if cancel.is_cancelled() {
+            return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+        }
+        let count = source_file
+            .read(&mut buffer)
+            .map_err(|err| format!("read archive during transactional copy failed: {err}"))?;
+        if count == 0 {
+            break;
+        }
+        destination_file
+            .write_all(&buffer[..count])
+            .map_err(|err| format!("write transactional archive copy failed: {err}"))?;
+        copied = copied.saturating_add(count as u64);
+        progress(copied.min(total));
+    }
+    destination_file
+        .sync_all()
+        .map_err(|err| format!("sync transactional archive copy failed: {err}"))?;
+    if copied != total {
+        return Err(format!(
+            "transactional archive copy size mismatch: expected {total} bytes, copied {copied}"
+        ));
+    }
+    Ok(())
+}
+
 /// Re-create an archive from an extracted staging tree and atomically replace
 /// the original archive only after the new container is successfully created
 /// and verified.
@@ -1000,6 +2549,34 @@ pub async fn repackage_archive_with_progress_and_cancel<F>(
     original_archive: &Path,
     tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
+    progress: F,
+) -> Result<ArchiveRepackageReport, String>
+where
+    F: FnMut(ArchiveRepackageProgressSnapshot) + Send,
+{
+    repackage_archive_with_progress_and_cancel_with_password(
+        staging_dir,
+        original_archive,
+        None,
+        tool_paths,
+        cancel,
+        progress,
+    )
+    .await
+}
+
+/// Password-aware archive repackage used by Browse edit sessions.
+///
+/// The raw password is strictly in-memory and is never copied into recovery
+/// state. Before any replacement archive is created, Tonepoet establishes the
+/// original container's reproducible encryption policy. If that cannot be
+/// done, writeback fails closed and the staged edit remains available.
+pub async fn repackage_archive_with_progress_and_cancel_with_password<F>(
+    staging_dir: &Path,
+    original_archive: &Path,
+    archive_password: Option<&str>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
     mut progress: F,
 ) -> Result<ArchiveRepackageReport, String>
 where
@@ -1020,6 +2597,14 @@ where
     // when ToolRunner intentionally redacts spawn details.
     let format = repackage_archive_format(original_archive)?;
     require_repackage_format_tool_available(format, tool_paths)?;
+    let encryption_policy = detect_repackage_encryption_policy(
+        format,
+        original_archive,
+        archive_password,
+        tool_paths,
+        cancel,
+    )
+    .await?;
 
     let archive_label = original_archive
         .file_name()
@@ -1073,6 +2658,7 @@ where
             format,
             staging_dir,
             &temp_archive,
+            encryption_policy.as_ref(),
             tool_paths,
             cancel,
             &archive_label,
@@ -1096,11 +2682,20 @@ where
         verify_repackaged_archive(
             format,
             &temp_archive,
+            encryption_policy.as_ref(),
             tool_paths,
             cancel,
             &archive_label,
             created_size.max(1),
             &mut progress,
+        )
+        .await?;
+        verify_repackaged_encryption_policy(
+            format,
+            &temp_archive,
+            encryption_policy.as_ref(),
+            tool_paths,
+            cancel,
         )
         .await?;
         if created_size == 0 {
@@ -1225,10 +2820,233 @@ fn repackage_format_suffix(format: RepackageArchiveFormat) -> &'static str {
     }
 }
 
+fn zip_encryption_method_from_listing(method: &str) -> Option<ZipEncryptionMethod> {
+    let normalized = method.to_ascii_lowercase();
+    if normalized.contains("zipcrypto") {
+        Some(ZipEncryptionMethod::ZipCrypto)
+    } else if normalized.contains("aes-128") || normalized.contains("aes128") {
+        Some(ZipEncryptionMethod::Aes128)
+    } else if normalized.contains("aes-192") || normalized.contains("aes192") {
+        Some(ZipEncryptionMethod::Aes192)
+    } else if normalized.contains("aes-256") || normalized.contains("aes256") {
+        Some(ZipEncryptionMethod::Aes256)
+    } else {
+        None
+    }
+}
+
+async fn probe_archive_encryption_listing(
+    format: RepackageArchiveFormat,
+    archive: &Path,
+    password: Option<&SecretString>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<ArchiveEncryptionProbeResult, String> {
+    if !matches!(
+        format,
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip | RepackageArchiveFormat::Rar
+    ) {
+        return Ok(ArchiveEncryptionProbeResult {
+            success: true,
+            facts: ArchiveEncryptionProbeFacts::default(),
+        });
+    }
+
+    let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+    if !command_path_available(&seven_zip) {
+        return Err(
+            "cannot establish archive encryption policy because `7zz`/`7z` is unavailable"
+                .to_string(),
+        );
+    }
+
+    let mut command = tokio::process::Command::new(&seven_zip);
+    command
+        .arg("l")
+        .arg("-slt")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // Listing failures are interpreted only as a capability/authentication
+        // boundary here. Do not retain stderr: it can contain tool-specific
+        // password diagnostics, while the caller already has a safe error.
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(password) = password {
+        command.arg(format!("-p{}", password.expose()));
+    }
+    command.arg("--").arg(archive);
+
+    let mut child = command.spawn().map_err(|err| {
+        format!(
+            "cannot establish archive encryption policy: failed to start 7-Zip listing probe: {err}"
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "cannot establish archive encryption policy: 7-Zip probe stdout unavailable".to_string())?;
+
+    let parser = tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        let mut parser = ArchiveEncryptionListingParser::default();
+        while let Some(line) = reader.next_line().await.map_err(|err| {
+            format!("read archive encryption listing probe failed: {err}")
+        })? {
+            parser.push_line(format, &line);
+        }
+        Ok::<_, String>(parser.finish(format))
+    });
+
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(|err| {
+            format!("wait for archive encryption listing probe failed: {err}")
+        })?,
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            let _ = parser.await;
+            return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
+        }
+    };
+    let facts = parser
+        .await
+        .map_err(|err| format!("archive encryption listing parser failed: {err}"))??;
+    Ok(ArchiveEncryptionProbeResult {
+        success: status.success(),
+        facts,
+    })
+}
+
+fn visible_header_encryption_policy(
+    format: RepackageArchiveFormat,
+    facts: &ArchiveEncryptionProbeFacts,
+    password: &SecretString,
+) -> Result<ArchiveRepackageEncryptionPolicy, String> {
+    if !facts.any_encrypted {
+        return Err(
+            "archive encryption probe did not identify encrypted payload entries".to_string(),
+        );
+    }
+    if facts.any_unencrypted {
+        return Err(
+            "archive mixes encrypted and unencrypted members; Tonepoet cannot reproduce that per-member encryption policy safely"
+                .to_string(),
+        );
+    }
+    let zip_method = if format == RepackageArchiveFormat::Zip {
+        if facts.unknown_encrypted_zip_method || facts.zip_methods.len() != 1 {
+            return Err(
+                "ZIP encryption method is mixed or unsupported; refusing to replace it with a different protection policy"
+                    .to_string(),
+            );
+        }
+        facts.zip_methods.iter().next().copied()
+    } else {
+        None
+    };
+    Ok(ArchiveRepackageEncryptionPolicy {
+        password: password.clone(),
+        header_encryption: false,
+        zip_method,
+    })
+}
+
+async fn detect_repackage_encryption_policy(
+    format: RepackageArchiveFormat,
+    original_archive: &Path,
+    archive_password: Option<&str>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<Option<ArchiveRepackageEncryptionPolicy>, String> {
+    if !matches!(
+        format,
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip | RepackageArchiveFormat::Rar
+    ) {
+        return Ok(None);
+    }
+
+    let without_password = probe_archive_encryption_listing(
+        format,
+        original_archive,
+        None,
+        tool_paths,
+        cancel,
+    )
+    .await?;
+
+    if without_password.success {
+        if !without_password.facts.any_encrypted {
+            return Ok(None);
+        }
+        let password = archive_password
+            .filter(|value| !value.is_empty())
+            .map(SecretString::new)
+            .ok_or_else(|| {
+                "archive contains encrypted members, but no in-memory password is available for protection-preserving writeback; staged edits were left untouched"
+                    .to_string()
+            })?;
+        return visible_header_encryption_policy(format, &without_password.facts, &password)
+            .map(Some);
+    }
+
+    let password = archive_password
+        .filter(|value| !value.is_empty())
+        .map(SecretString::new)
+        .ok_or_else(|| {
+            "archive headers cannot be listed without authentication and no in-memory password is available; refusing a writeback that could remove encryption"
+                .to_string()
+        })?;
+    let with_password = probe_archive_encryption_listing(
+        format,
+        original_archive,
+        Some(&password),
+        tool_paths,
+        cancel,
+    )
+    .await?;
+    if !with_password.success {
+        return Err(
+            "archive encryption policy could not be established with the supplied password; staged edits were left untouched"
+                .to_string(),
+        );
+    }
+
+    match format {
+        RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Rar => {
+            if !with_password.facts.any_encrypted {
+                return Err(
+                    "archive member encryption could not be confirmed after authenticated header listing; refusing protection-changing writeback"
+                        .to_string(),
+                );
+            }
+            if with_password.facts.any_unencrypted {
+                return Err(
+                    "archive mixes encrypted and unencrypted members; Tonepoet cannot reproduce that per-member encryption policy safely"
+                        .to_string(),
+                );
+            }
+            Ok(Some(ArchiveRepackageEncryptionPolicy {
+                password,
+                header_encryption: true,
+                zip_method: None,
+            }))
+        }
+        RepackageArchiveFormat::Zip => Err(
+            "ZIP member headers are not readable without authentication; Tonepoet cannot reliably reproduce that encryption policy with the configured writer, so the archive was not replaced"
+                .to_string(),
+        ),
+        RepackageArchiveFormat::Tar
+        | RepackageArchiveFormat::TarGz
+        | RepackageArchiveFormat::IsoWv => unreachable!("non-encrypting formats returned above"),
+    }
+}
+
 async fn create_repackaged_archive<F>(
     format: RepackageArchiveFormat,
     staging_dir: &Path,
     temp_archive: &Path,
+    encryption_policy: Option<&ArchiveRepackageEncryptionPolicy>,
     tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
     archive_label: &str,
@@ -1249,17 +3067,50 @@ where
     match format {
         RepackageArchiveFormat::SevenZip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut args = vec![
+                "a".into(),
+                "-t7z".into(),
+                temp_archive.display().to_string(),
+                "-mmt=on".into(),
+            ];
+            let mut secret_args = Vec::new();
+            if let Some(policy) = encryption_policy {
+                secret_args.push(args.len());
+                args.push(format!("-p{}", policy.password.expose()));
+                args.push(if policy.header_encryption {
+                    "-mhe=on".into()
+                } else {
+                    "-mhe=off".into()
+                });
+            }
+            args.push(".".into());
             run_repackage_command(
                 ToolBinary::SevenZip, seven_zip,
-                vec!["a".into(), "-t7z".into(), temp_archive.display().to_string(), "-mmt=on".into(), ".".into()],
+                args, secret_args,
                 Some(staging_dir.to_path_buf()), "create 7z archive", cancel, monitor, progress
             ).await
         }
         RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut args = vec![
+                "a".into(),
+                "-tzip".into(),
+                temp_archive.display().to_string(),
+            ];
+            let mut secret_args = Vec::new();
+            if let Some(policy) = encryption_policy {
+                let method = policy.zip_method.ok_or_else(|| {
+                    "ZIP encryption policy is missing its established encryption method"
+                        .to_string()
+                })?;
+                secret_args.push(args.len());
+                args.push(format!("-p{}", policy.password.expose()));
+                args.push(method.seven_zip_method_switch().to_string());
+            }
+            args.push(".".into());
             run_repackage_command(
                 ToolBinary::SevenZip, seven_zip,
-                vec!["a".into(), "-tzip".into(), temp_archive.display().to_string(), ".".into()],
+                args, secret_args,
                 Some(staging_dir.to_path_buf()), "create zip archive", cancel, monitor, progress
             ).await
         }
@@ -1268,6 +3119,7 @@ where
             run_repackage_command(
                 ToolBinary::Tar, tar,
                 vec!["cf".into(), temp_archive.display().to_string(), "-C".into(), staging_dir.display().to_string(), ".".into()],
+                Vec::new(),
                 None, "create tar archive", cancel, monitor, progress
             ).await
         }
@@ -1276,14 +3128,27 @@ where
             run_repackage_command(
                 ToolBinary::Tar, tar,
                 vec!["czf".into(), temp_archive.display().to_string(), "-C".into(), staging_dir.display().to_string(), ".".into()],
+                Vec::new(),
                 None, "create tar.gz archive", cancel, monitor, progress
             ).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
+            let mut args = vec!["a".into(), "-r".into()];
+            let mut secret_args = Vec::new();
+            if let Some(policy) = encryption_policy {
+                secret_args.push(args.len());
+                args.push(if policy.header_encryption {
+                    format!("-hp{}", policy.password.expose())
+                } else {
+                    format!("-p{}", policy.password.expose())
+                });
+            }
+            args.push(temp_archive.display().to_string());
+            args.push(".".into());
             run_repackage_command(
                 ToolBinary::Rar, rar,
-                vec!["a".into(), "-r".into(), temp_archive.display().to_string(), ".".into()],
+                args, secret_args,
                 Some(staging_dir.to_path_buf()), "create rar archive", cancel, monitor, progress
             )
                 .await
@@ -1312,6 +3177,7 @@ where
                     temp_archive.display().to_string(),
                     ".".into(),
                 ],
+                Vec::new(),
                 Some(staging_dir.to_path_buf()),
                 "create ISO-WV image",
                 cancel,
@@ -1326,6 +3192,7 @@ where
 async fn verify_repackaged_archive<F>(
     format: RepackageArchiveFormat,
     temp_archive: &Path,
+    encryption_policy: Option<&ArchiveRepackageEncryptionPolicy>,
     tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
     archive_label: &str,
@@ -1346,8 +3213,15 @@ where
     match format {
         RepackageArchiveFormat::SevenZip | RepackageArchiveFormat::Zip => {
             let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
+            let mut args = vec!["t".into()];
+            let mut secret_args = Vec::new();
+            if let Some(policy) = encryption_policy {
+                secret_args.push(args.len());
+                args.push(format!("-p{}", policy.password.expose()));
+            }
+            args.push(temp_archive.display().to_string());
             run_repackage_command(
-                ToolBinary::SevenZip, seven_zip, vec!["t".into(), temp_archive.display().to_string()],
+                ToolBinary::SevenZip, seven_zip, args, secret_args,
                 None, "verify repackaged archive", cancel, monitor, progress
             ).await
         }
@@ -1355,13 +3229,21 @@ where
             let tar = repackage_tool_path(tool_paths, &["tar"]);
             run_repackage_command(
                 ToolBinary::Tar, tar, vec!["tf".into(), temp_archive.display().to_string()],
+                Vec::new(),
                 None, "verify repackaged tar archive", cancel, monitor, progress
             ).await
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
+            let mut args = vec!["t".into()];
+            let mut secret_args = Vec::new();
+            if let Some(policy) = encryption_policy {
+                secret_args.push(args.len());
+                args.push(format!("-p{}", policy.password.expose()));
+            }
+            args.push(temp_archive.display().to_string());
             run_repackage_command(
-                ToolBinary::Rar, rar, vec!["t".into(), temp_archive.display().to_string()],
+                ToolBinary::Rar, rar, args, secret_args,
                 None, "verify repackaged rar archive", cancel, monitor, progress
             ).await
         }
@@ -1381,6 +3263,7 @@ where
                     "report_lba".into(),
                     "--".into(),
                 ],
+                Vec::new(),
                 None,
                 "verify repackaged ISO-WV image",
                 cancel,
@@ -1390,6 +3273,77 @@ where
             .await
         }
     }
+}
+
+async fn verify_repackaged_encryption_policy(
+    format: RepackageArchiveFormat,
+    temp_archive: &Path,
+    encryption_policy: Option<&ArchiveRepackageEncryptionPolicy>,
+    tool_paths: &HashMap<String, PathBuf>,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let Some(policy) = encryption_policy else {
+        return Ok(());
+    };
+
+    let authenticated = probe_archive_encryption_listing(
+        format,
+        temp_archive,
+        Some(&policy.password),
+        tool_paths,
+        cancel,
+    )
+    .await?;
+    if !authenticated.success || !authenticated.facts.any_encrypted {
+        return Err(
+            "repackaged archive did not verify as encrypted with the supplied password; original archive was left untouched"
+                .to_string(),
+        );
+    }
+    if authenticated.facts.any_unencrypted {
+        return Err(
+            "repackaged archive contains unexpected unencrypted members; original archive was left untouched"
+                .to_string(),
+        );
+    }
+    if format == RepackageArchiveFormat::Zip {
+        let expected = policy.zip_method.ok_or_else(|| {
+            "ZIP encryption verification is missing the established encryption method".to_string()
+        })?;
+        if authenticated.facts.unknown_encrypted_zip_method
+            || authenticated.facts.zip_methods.len() != 1
+            || !authenticated.facts.zip_methods.contains(&expected)
+        {
+            return Err(
+                "repackaged ZIP did not preserve its established encryption method; original archive was left untouched"
+                    .to_string(),
+            );
+        }
+    }
+
+    let unauthenticated = probe_archive_encryption_listing(
+        format,
+        temp_archive,
+        None,
+        tool_paths,
+        cancel,
+    )
+    .await?;
+    if policy.header_encryption {
+        if unauthenticated.success {
+            return Err(
+                "repackaged archive unexpectedly exposes its member headers without a password; original archive was left untouched"
+                    .to_string(),
+            );
+        }
+    } else if !unauthenticated.success || !unauthenticated.facts.any_encrypted {
+        return Err(
+            "repackaged archive no longer matches the original visible-header encryption policy; original archive was left untouched"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 
@@ -1466,6 +3420,7 @@ async fn run_repackage_command<F>(
     binary: ToolBinary,
     binary_path: PathBuf,
     args: Vec<String>,
+    secret_args: Vec<usize>,
     cwd: Option<PathBuf>,
     label: &str,
     cancel: &CancellationToken,
@@ -1479,7 +3434,7 @@ where
     let command = ToolCommand {
         binary,
         args,
-        secret_args: Vec::new(),
+        secret_args,
         cwd,
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         env: Vec::new(),
@@ -1794,6 +3749,103 @@ pub(crate) async fn extract_archive_to_staging(
         cancel,
     )
     .await
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveExtractionProgressSnapshot {
+    pub status: String,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub elapsed: Duration,
+}
+
+/// Browse-facing extraction wrapper that preserves the established extraction
+/// implementation while adding coarse, low-overhead progress from the staged
+/// byte count. This is intentionally used only on edit slow paths; conversion
+/// keeps its existing PipelineReporter contract.
+pub(crate) async fn extract_archive_to_staging_with_progress<F>(
+    archive_path: &Path,
+    staging_root: &Path,
+    item_id: &str,
+    archive_password: Option<&str>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    expected_bytes: Option<u64>,
+    mut progress: F,
+) -> Result<(), MaterializeError>
+where
+    F: FnMut(ArchiveExtractionProgressSnapshot) + Send,
+{
+    let started = Instant::now();
+    progress(ArchiveExtractionProgressSnapshot {
+        status: "Extracting archive...".to_string(),
+        bytes_done: 0,
+        bytes_total: expected_bytes,
+        elapsed: Duration::ZERO,
+    });
+    let future = extract_archive_to_staging(
+        archive_path,
+        staging_root,
+        item_id,
+        archive_password,
+        runner,
+        None,
+        cancel,
+    );
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                if result.is_ok() {
+                    let done = expected_bytes.unwrap_or_else(|| staged_regular_file_bytes(staging_root));
+                    progress(ArchiveExtractionProgressSnapshot {
+                        status: "Archive extraction complete".to_string(),
+                        bytes_done: done,
+                        bytes_total: expected_bytes.or(Some(done.max(1))),
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return result;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(750)) => {
+                let observed = staged_regular_file_bytes(staging_root);
+                let done = expected_bytes.map(|total| observed.min(total)).unwrap_or(observed);
+                progress(ArchiveExtractionProgressSnapshot {
+                    status: "Extracting archive...".to_string(),
+                    bytes_done: done,
+                    bytes_total: expected_bytes,
+                    elapsed: started.elapsed(),
+                });
+            }
+        }
+    }
+}
+
+fn staged_regular_file_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 async fn extract_compressed_tar_payloads(
@@ -2410,6 +4462,28 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn fuse_archive_mount_options_track_versioned_tree_semantics() {
+        assert_eq!(fuse_archive_mount_options_for_version("1.13"), None);
+        assert_eq!(
+            fuse_archive_mount_options_for_version("1.14"),
+            Some("lazycache,auto_unmount"),
+        );
+        assert_eq!(
+            fuse_archive_mount_options_for_version("fuse-archive 1.19.0"),
+            Some("lazycache,auto_unmount"),
+        );
+        assert_eq!(
+            fuse_archive_mount_options_for_version("1.20"),
+            Some("lazycache,notrim,auto_unmount"),
+        );
+        assert_eq!(
+            fuse_archive_mount_options_for_version("2.0"),
+            Some("lazycache,notrim,auto_unmount"),
+        );
+        assert_eq!(fuse_archive_mount_options_for_version("unknown"), None);
+    }
+
+    #[test]
     fn iso_wv_repackage_classification_is_compound_suffix_specific() {
         assert_eq!(
             repackage_archive_format(Path::new("Album.ISO.WV")).expect("ISO-WV format"),
@@ -2423,6 +4497,288 @@ mod tests {
             iso_wv_metadata_sidecar_path(Path::new("Album.iso.wv")),
             PathBuf::from("Album.iso.wv.cue"),
         );
+    }
+
+    fn native_iso_cue_plan(
+        cue_text: &str,
+        cue_path: &str,
+        old_path: &str,
+        new_path: &str,
+        members: &[&str],
+    ) -> IsoWvCueReferenceRenamePlan {
+        let member_files = members.iter().map(PathBuf::from).collect::<Vec<_>>();
+        plan_iso_wv_cue_reference_rename(
+            cue_text,
+            Path::new(cue_path),
+            Path::new(old_path),
+            Path::new(new_path),
+            |file_ref| {
+                resolve_iso_wv_cue_reference_from_members(
+                    Path::new(cue_path),
+                    file_ref,
+                    &member_files,
+                )
+            },
+        )
+        .expect("native ISO-WV CUE rename plan")
+    }
+
+    #[test]
+    fn native_iso_wv_audio_rename_repairs_authoritative_cue_reference() {
+        let cue = "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let plan = native_iso_cue_plan(
+            cue,
+            "album.cue",
+            "album.wv",
+            "renamed.wv",
+            &["album.cue", "album.wv"],
+        );
+        assert_eq!(plan.cue_after_relative, PathBuf::from("album.cue"));
+        assert_eq!(
+            plan.replacements.get("album.wv").map(String::as_str),
+            Some("renamed.wv")
+        );
+    }
+
+    #[test]
+    fn native_iso_wv_unquoted_file_rewrite_preserves_trailing_whitespace_and_crlf() {
+        let raw = b"FILE album.wv WAVE   \r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+        let text = crate::convert::cue_parser::decode_cue_bytes_for_path(raw, Path::new("album.cue"))
+            .expect("decode fixture");
+        let plan = native_iso_cue_plan(
+            &text,
+            "album.cue",
+            "album.wv",
+            "renamed.wv",
+            &["album.cue", "album.wv"],
+        );
+        let (_outcome, rewritten) = crate::convert::cue_parser::rewrite_cue_file_reference_bytes(
+            raw,
+            Path::new("album.cue"),
+            &plan.replacements,
+        )
+        .expect("byte-preserving CUE rewrite");
+        assert_eq!(
+            rewritten,
+            b"FILE renamed.wv WAVE   \r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n"
+        );
+    }
+
+    #[test]
+    fn native_iso_wv_directory_rename_recalculates_cue_geometry() {
+        let cue = "FILE \"Disc 1/album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let plan = native_iso_cue_plan(
+            cue,
+            "album.cue",
+            "Disc 1",
+            "CD 1",
+            &["album.cue", "Disc 1/album.wv"],
+        );
+        assert_eq!(
+            plan.replacements.get("Disc 1/album.wv").map(String::as_str),
+            Some("CD 1/album.wv")
+        );
+    }
+
+    #[test]
+    fn native_iso_wv_moving_cue_and_audio_together_leaves_file_line_unchanged() {
+        let cue = "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let plan = native_iso_cue_plan(
+            cue,
+            "Disc 1/album.cue",
+            "Disc 1",
+            "CD 1",
+            &["Disc 1/album.cue", "Disc 1/album.wv"],
+        );
+        assert_eq!(plan.cue_after_relative, PathBuf::from("CD 1/album.cue"));
+        assert!(plan.replacements.is_empty());
+    }
+
+    #[test]
+    fn native_iso_wv_moving_only_cue_recalculates_relative_audio_reference() {
+        let cue = "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let plan = native_iso_cue_plan(
+            cue,
+            "album.cue",
+            "album.cue",
+            "Cues/album.cue",
+            &["album.cue", "album.wv"],
+        );
+        assert_eq!(plan.cue_after_relative, PathBuf::from("Cues/album.cue"));
+        assert_eq!(
+            plan.replacements.get("album.wv").map(String::as_str),
+            Some("../album.wv")
+        );
+    }
+
+    #[test]
+    fn native_iso_wv_unrelated_artwork_rename_does_not_touch_cue() {
+        let cue = "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let plan = native_iso_cue_plan(
+            cue,
+            "album.cue",
+            "front.jpg",
+            "cover.jpg",
+            &["album.cue", "album.wv", "front.jpg"],
+        );
+        assert_eq!(plan.cue_after_relative, PathBuf::from("album.cue"));
+        assert!(plan.replacements.is_empty());
+    }
+
+    #[test]
+    fn native_iso_wv_snapshot_rewrite_preserves_metadata_and_rolls_back_exactly() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("Album.iso.wv");
+        fs::write(&archive, b"fixture archive identity").expect("archive fixture");
+        let sidecar = iso_wv_metadata_sidecar_path(&archive);
+        let original_sidecar = concat!(
+            "REM TONEPOET_META_V1 BEGIN\n",
+            "REM TONEPOET_META_V1 A TONEPOET_ISO_WV_METADATA_SNAPSHOT_V1 1\n",
+            "REM TONEPOET_META_V1 A ALBUM \"Snapshot Title\"\n",
+            "REM TONEPOET_META_V1 END\n",
+            "FILE \"album.wv\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"Track Title\"\n",
+            "    INDEX 01 00:00:00\n"
+        )
+        .as_bytes()
+        .to_vec();
+        fs::write(&sidecar, &original_sidecar).expect("sidecar fixture");
+
+        let internal_before = b"FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".to_vec();
+        let replacements = BTreeMap::from([("album.wv".to_string(), "renamed.wv".to_string())]);
+        let (_outcome, internal_after) = crate::convert::cue_parser::rewrite_cue_file_reference_bytes(
+            &internal_before,
+            Path::new("album.cue"),
+            &replacements,
+        )
+        .expect("internal rewrite");
+        let repair = NativeIsoWvCueRepair {
+            cue_before_relative: PathBuf::from("album.cue"),
+            cue_after_relative: PathBuf::from("album.cue"),
+            original_bytes: internal_before,
+            rewritten_bytes: internal_after,
+            replacements,
+            disk_path: temp.path().join("unused-native-cue.tmp"),
+        };
+
+        let rewrite = prepare_and_apply_native_iso_wv_sidecar_rewrite(&archive, &repair)
+            .expect("snapshot rewrite")
+            .expect("Tonepoet snapshot should be rewritten");
+        let rewritten = fs::read(&sidecar).expect("rewritten sidecar");
+        let rewritten_text = String::from_utf8(rewritten).expect("UTF-8 sidecar fixture");
+        assert!(rewritten_text.contains("FILE \"renamed.wv\" WAVE"));
+        assert!(rewritten_text.contains("Snapshot Title"));
+        assert!(rewritten_text.contains("Track Title"));
+
+        rollback_native_iso_wv_sidecar_rewrite(&rewrite).expect("exact sidecar rollback");
+        assert_eq!(
+            fs::read(&sidecar).expect("restored sidecar"),
+            original_sidecar,
+            "rollback must restore the exact pre-rename metadata snapshot bytes"
+        );
+    }
+
+    #[test]
+    fn zip_encryption_method_parser_accepts_supported_7zip_spellings() {
+        assert_eq!(
+            zip_encryption_method_from_listing("ZipCrypto Deflate"),
+            Some(ZipEncryptionMethod::ZipCrypto)
+        );
+        assert_eq!(
+            zip_encryption_method_from_listing("AES-128 Deflate"),
+            Some(ZipEncryptionMethod::Aes128)
+        );
+        assert_eq!(
+            zip_encryption_method_from_listing("AES192 Store"),
+            Some(ZipEncryptionMethod::Aes192)
+        );
+        assert_eq!(
+            zip_encryption_method_from_listing("AES-256 Deflate"),
+            Some(ZipEncryptionMethod::Aes256)
+        );
+        assert_eq!(zip_encryption_method_from_listing("StrongCrypto42"), None);
+    }
+
+    #[test]
+    fn encryption_listing_parser_keeps_multiple_slt_members_distinct() {
+        let mut parser = ArchiveEncryptionListingParser::default();
+        for line in [
+            "Path = Album.zip",
+            "Type = zip",
+            "Method = Deflate",
+            "----------",
+            "Path = encrypted.flac",
+            "Folder = -",
+            "Encrypted = +",
+            "Method = AES-256 Deflate",
+            "",
+            "Path = plain.jpg",
+            "Folder = -",
+            "Encrypted = -",
+            "Method = Deflate",
+        ] {
+            parser.push_line(RepackageArchiveFormat::Zip, line);
+        }
+        let facts = parser.finish(RepackageArchiveFormat::Zip);
+        assert!(facts.any_encrypted, "first member must remain visible to policy detection");
+        assert!(facts.any_unencrypted, "second member must remain a distinct plaintext member");
+        assert_eq!(
+            facts.zip_methods,
+            BTreeSet::from([ZipEncryptionMethod::Aes256]),
+            "archive-level Method and later member fields must not overwrite the encrypted member method"
+        );
+        assert!(!facts.unknown_encrypted_zip_method);
+    }
+
+    #[test]
+    fn encryption_listing_parser_uses_attributes_when_7z_omits_folder_field() {
+        let mut parser = ArchiveEncryptionListingParser::default();
+        for line in [
+            "Path = Visible.7z",
+            "Type = 7z",
+            "----------",
+            "Path = Disc 1",
+            "Attributes = D drwxrwxr-x",
+            "Encrypted = -",
+            "Path = Disc 1/01.txt",
+            "Attributes = A -rw-rw-r--",
+            "Encrypted = +",
+            "Method = LZMA2:12",
+            "Path = manifest.txt",
+            "Attributes = A -rw-rw-r--",
+            "Encrypted = +",
+            "Method = LZMA2:12",
+        ] {
+            parser.push_line(RepackageArchiveFormat::SevenZip, line);
+        }
+        let facts = parser.finish(RepackageArchiveFormat::SevenZip);
+        assert!(
+            facts.any_encrypted,
+            "encrypted files must remain visible to policy detection"
+        );
+        assert!(
+            !facts.any_unencrypted,
+            "the unencrypted directory record must not be mistaken for a plaintext member"
+        );
+    }
+
+    #[test]
+    fn encryption_policy_refuses_mixed_member_protection() {
+        let facts = ArchiveEncryptionProbeFacts {
+            any_encrypted: true,
+            any_unencrypted: true,
+            zip_methods: BTreeSet::from([ZipEncryptionMethod::Aes256]),
+            unknown_encrypted_zip_method: false,
+        };
+        let err = visible_header_encryption_policy(
+            RepackageArchiveFormat::Zip,
+            &facts,
+            &SecretString::new("test-password"),
+        )
+        .expect_err("mixed encrypted/plain members must fail closed");
+        assert!(err.contains("mixes encrypted and unencrypted"));
     }
 
     #[test]
@@ -3133,6 +5489,25 @@ mod tests {
         }
     }
 
+    fn run_secret_fixture_output(
+        program: &Path,
+        args: &[String],
+        cwd: Option<&Path>,
+    ) -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        // Deliberately do not format `args` into any error: test passwords are
+        // secrets for the same logging-contract purposes as production ones.
+        command.output()
+    }
+
     fn write_pcm_wav(path: &Path) -> std::io::Result<()> {
         let sample_rate = 44_100u32;
         let samples = 2_205u32;
@@ -3687,10 +6062,27 @@ mod tests {
         for archive_name in ["Album.zip", "Album.7z"] {
             let temp = tempfile::tempdir().expect("temp dir");
             let original = temp.path().join(archive_name);
-            fs::write(&original, b"old archive bytes").expect("original archive placeholder");
             let expected = format!("edited payload for {archive_name}");
-            let staging = write_repackage_staging(temp.path(), &expected)
+            let staging = write_repackage_staging(temp.path(), "original payload")
                 .expect("write repackage staging");
+            let archive_type = if archive_name.ends_with(".zip") {
+                OsStr::new("-tzip")
+            } else {
+                OsStr::new("-t7z")
+            };
+            run_fixture_command(
+                &seven_zip,
+                &[
+                    OsStr::new("a"),
+                    archive_type,
+                    original.as_os_str(),
+                    OsStr::new("."),
+                ],
+                Some(&staging),
+            )
+            .unwrap_or_else(|err| panic!("create original {archive_name}: {err}"));
+            fs::write(staging.join("Disc 1").join("01.txt"), &expected)
+                .expect("edit staged nested payload");
             let tool_paths = HashMap::from([
                 ("7zz".to_string(), seven_zip.clone()),
                 ("7z".to_string(), seven_zip.clone()),
@@ -3707,45 +6099,641 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn repackage_archive_preserves_real_7z_and_zip_encryption_when_7z_is_available() {
+        let Some(seven_zip) = find_executable(&["7zz", "7z"]) else {
+            eprintln!("skipping encrypted zip/7z repackage integration test: 7z/7zz is required");
+            return;
+        };
+        let password = "tonepoet-encryption-test";
+        let cases = [
+            ("Visible.7z", "-t7z", Some("-mhe=off"), false),
+            ("HeaderEncrypted.7z", "-t7z", Some("-mhe=on"), true),
+            ("Encrypted.zip", "-tzip", Some("-mem=AES256"), false),
+        ];
+
+        for (archive_name, archive_type, encryption_switch, header_encrypted) in cases {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let original = temp.path().join(archive_name);
+            let staging = write_repackage_staging(temp.path(), "original encrypted payload")
+                .expect("write encrypted repackage staging");
+            let mut create_args = vec![
+                "a".to_string(),
+                archive_type.to_string(),
+                original.display().to_string(),
+                format!("-p{password}"),
+            ];
+            if let Some(switch) = encryption_switch {
+                create_args.push(switch.to_string());
+            }
+            create_args.push(".".to_string());
+            let create = run_secret_fixture_output(&seven_zip, &create_args, Some(&staging))
+                .expect("create encrypted archive fixture");
+            assert!(create.status.success(), "encrypted archive fixture creation failed");
+
+            let expected = format!("edited encrypted payload for {archive_name}");
+            fs::write(staging.join("Disc 1").join("01.txt"), &expected)
+                .expect("edit encrypted staged payload");
+            let tool_paths = HashMap::from([
+                ("7zz".to_string(), seven_zip.clone()),
+                ("7z".to_string(), seven_zip.clone()),
+            ]);
+            let cancel = CancellationToken::new();
+            repackage_archive_with_progress_and_cancel_with_password(
+                &staging,
+                &original,
+                Some(password),
+                &tool_paths,
+                &cancel,
+                |_| {},
+            )
+            .await
+            .unwrap_or_else(|err| panic!("encrypted repackage {archive_name}: {err}"));
+
+            let authenticated_test = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "t".to_string(),
+                    format!("-p{password}"),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("test encrypted archive with correct password");
+            assert!(authenticated_test.status.success(), "correct password must verify {archive_name}");
+            let wrong_test = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "t".to_string(),
+                    "-pdefinitely-wrong".to_string(),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("test encrypted archive with wrong password");
+            assert!(!wrong_test.status.success(), "wrong password must fail for {archive_name}");
+
+            let unauthenticated_listing = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "l".to_string(),
+                    "-slt".to_string(),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("list encrypted archive without password");
+            if header_encrypted {
+                assert!(
+                    !unauthenticated_listing.status.success(),
+                    "header-encrypted archive must not expose its member tree without authentication"
+                );
+            } else {
+                assert!(
+                    unauthenticated_listing.status.success(),
+                    "visible-header encrypted archive must remain listable without authentication"
+                );
+                assert!(
+                    String::from_utf8_lossy(&unauthenticated_listing.stdout)
+                        .contains("Encrypted = +"),
+                    "visible headers must still identify encrypted payload members"
+                );
+            }
+
+            let extract_dir = temp.path().join("decrypted");
+            fs::create_dir(&extract_dir).expect("decrypted output dir");
+            let extract = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "x".to_string(),
+                    "-y".to_string(),
+                    format!("-p{password}"),
+                    format!("-o{}", extract_dir.display()),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("extract encrypted replacement");
+            assert!(extract.status.success(), "correct password must extract {archive_name}");
+            assert_repackaged_content(&extract_dir, &expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn repackage_archive_preserves_real_rar_password_scope_when_tools_are_available() {
+        let (Some(seven_zip), Some(rar)) = (
+            find_executable(&["7zz", "7z"]),
+            find_executable(&["rar"]),
+        ) else {
+            eprintln!("skipping encrypted RAR repackage integration test: 7z/7zz and rar are required");
+            return;
+        };
+        let password = "tonepoet-rar-encryption-test";
+
+        for (archive_name, password_switch, header_encrypted) in [
+            ("Visible.rar", format!("-p{password}"), false),
+            ("HeaderEncrypted.rar", format!("-hp{password}"), true),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let original = temp.path().join(archive_name);
+            let staging = write_repackage_staging(temp.path(), "original encrypted RAR payload")
+                .expect("write RAR repackage staging");
+            let create = run_secret_fixture_output(
+                &rar,
+                &[
+                    "a".to_string(),
+                    "-r".to_string(),
+                    password_switch,
+                    original.display().to_string(),
+                    ".".to_string(),
+                ],
+                Some(&staging),
+            )
+            .expect("create encrypted RAR fixture");
+            assert!(create.status.success(), "encrypted RAR fixture creation failed");
+
+            let expected = format!("edited encrypted RAR payload for {archive_name}");
+            fs::write(staging.join("Disc 1").join("01.txt"), &expected)
+                .expect("edit encrypted RAR staged payload");
+            let tool_paths = HashMap::from([
+                ("7zz".to_string(), seven_zip.clone()),
+                ("7z".to_string(), seven_zip.clone()),
+                ("rar".to_string(), rar.clone()),
+            ]);
+            let cancel = CancellationToken::new();
+            repackage_archive_with_progress_and_cancel_with_password(
+                &staging,
+                &original,
+                Some(password),
+                &tool_paths,
+                &cancel,
+                |_| {},
+            )
+            .await
+            .unwrap_or_else(|err| panic!("encrypted RAR repackage {archive_name}: {err}"));
+
+            let correct = run_secret_fixture_output(
+                &rar,
+                &[
+                    "t".to_string(),
+                    format!("-p{password}"),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("test RAR with correct password");
+            assert!(correct.status.success(), "correct password must verify {archive_name}");
+            let wrong = run_secret_fixture_output(
+                &rar,
+                &[
+                    "t".to_string(),
+                    "-pdefinitely-wrong".to_string(),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("test RAR with wrong password");
+            assert!(!wrong.status.success(), "wrong password must fail for {archive_name}");
+
+            let unauthenticated_listing = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "l".to_string(),
+                    "-slt".to_string(),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("list RAR without password");
+            assert_eq!(
+                unauthenticated_listing.status.success(),
+                !header_encrypted,
+                "RAR header visibility must be preserved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_iso_wv_real_rename_repairs_cue_and_snapshot_without_extracting_audio() {
+        let Some(xorriso) = find_executable(&["xorriso"]) else {
+            eprintln!("skipping native ISO-WV rename integration test: xorriso is required");
+            return;
+        };
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("iso-source");
+        fs::create_dir(&source).expect("ISO source dir");
+        fs::write(source.join("album.wv"), b"opaque wavpack fixture payload")
+            .expect("audio payload fixture");
+        fs::write(
+            source.join("album.cue"),
+            b"FILE \"album.wv\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n",
+        )
+        .expect("CUE fixture");
+        let archive = temp.path().join("Album.iso.wv");
+        run_fixture_command(
+            &xorriso,
+            &[
+                OsStr::new("-as"),
+                OsStr::new("mkisofs"),
+                OsStr::new("-iso-level"),
+                OsStr::new("3"),
+                OsStr::new("-full-iso9660-filenames"),
+                OsStr::new("-J"),
+                OsStr::new("-r"),
+                OsStr::new("-o"),
+                archive.as_os_str(),
+                OsStr::new("."),
+            ],
+            Some(&source),
+        )
+        .expect("create ISO-WV fixture");
+
+        let snapshot = iso_wv_metadata_sidecar_path(&archive);
+        let snapshot_before = concat!(
+            "REM TONEPOET_META_V1 BEGIN\r\n",
+            "REM TONEPOET_META_V1 A TONEPOET_ISO_WV_METADATA_SNAPSHOT_V1 1\r\n",
+            "REM TONEPOET_META_V1 A ALBUM \"Preserved Metadata\"\r\n",
+            "REM TONEPOET_META_V1 END\r\n",
+            "FILE \"album.wv\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    INDEX 01 00:00:00\r\n"
+        );
+        fs::write(&snapshot, snapshot_before.as_bytes()).expect("snapshot fixture");
+
+        let fingerprint = archive_fingerprint_for_native_edit(&archive).expect("fingerprint");
+        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso.clone())]);
+        let cancel = CancellationToken::new();
+        let report = rename_archive_entry_native_transactional(
+            &archive,
+            &archive,
+            &[ArchiveNativeRenamePair::new("album.wv", "renamed.wv")],
+            &[
+                ArchiveNativeMember {
+                    path: "album.cue".to_string(),
+                    is_dir: false,
+                },
+                ArchiveNativeMember {
+                    path: "album.wv".to_string(),
+                    is_dir: false,
+                },
+            ],
+            fingerprint,
+            None,
+            &tool_paths,
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect("native ISO-WV rename")
+        .expect("ISO-WV native path should be admitted");
+        assert!(!report.has_warnings(), "fixture rename should install cleanly");
+
+        let extracted_cue = temp.path().join("result.cue");
+        run_fixture_command(
+            &xorriso,
+            &[
+                OsStr::new("-osirrox"),
+                OsStr::new("on"),
+                OsStr::new("-indev"),
+                archive.as_os_str(),
+                OsStr::new("-extract_single"),
+                OsStr::new("/album.cue"),
+                extracted_cue.as_os_str(),
+            ],
+            None,
+        )
+        .expect("target-read repaired CUE");
+        assert_eq!(
+            fs::read(&extracted_cue).expect("repaired CUE bytes"),
+            b"FILE \"renamed.wv\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n",
+            "native path must preserve CUE byte style while repairing FILE geometry"
+        );
+        let extracted_audio = temp.path().join("renamed.wv");
+        run_fixture_command(
+            &xorriso,
+            &[
+                OsStr::new("-osirrox"),
+                OsStr::new("on"),
+                OsStr::new("-indev"),
+                archive.as_os_str(),
+                OsStr::new("-extract_single"),
+                OsStr::new("/renamed.wv"),
+                extracted_audio.as_os_str(),
+            ],
+            None,
+        )
+        .expect("target-read renamed audio");
+        assert_eq!(
+            fs::read(&extracted_audio).expect("renamed audio bytes"),
+            b"opaque wavpack fixture payload"
+        );
+        let snapshot_after = fs::read_to_string(&snapshot).expect("rewritten snapshot");
+        assert!(snapshot_after.contains("FILE \"renamed.wv\" WAVE"));
+        assert!(snapshot_after.contains("Preserved Metadata"));
+    }
+
+    #[tokio::test]
+    async fn native_iso_wv_real_cue_planning_failure_leaves_archive_and_snapshot_byte_exact() {
+        let Some(xorriso) = find_executable(&["xorriso"]) else {
+            eprintln!("skipping native ISO-WV failure integration test: xorriso is required");
+            return;
+        };
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("iso-source");
+        fs::create_dir(&source).expect("ISO source dir");
+        fs::write(source.join("album.wv"), b"opaque payload").expect("audio payload");
+        fs::write(
+            source.join("album.cue"),
+            b"FILE \"missing.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("malformed authority fixture");
+        let archive = temp.path().join("Broken.iso.wv");
+        run_fixture_command(
+            &xorriso,
+            &[
+                OsStr::new("-as"),
+                OsStr::new("mkisofs"),
+                OsStr::new("-iso-level"),
+                OsStr::new("3"),
+                OsStr::new("-full-iso9660-filenames"),
+                OsStr::new("-J"),
+                OsStr::new("-r"),
+                OsStr::new("-o"),
+                archive.as_os_str(),
+                OsStr::new("."),
+            ],
+            Some(&source),
+        )
+        .expect("create malformed ISO-WV fixture");
+        let snapshot = iso_wv_metadata_sidecar_path(&archive);
+        let snapshot_bytes = concat!(
+            "REM TONEPOET_META_V1 BEGIN\n",
+            "REM TONEPOET_META_V1 A TONEPOET_ISO_WV_METADATA_SNAPSHOT_V1 1\n",
+            "REM TONEPOET_META_V1 A ALBUM \"Must Survive Decline\"\n",
+            "REM TONEPOET_META_V1 END\n",
+            "FILE \"missing.wv\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    INDEX 01 00:00:00\n"
+        )
+        .as_bytes()
+        .to_vec();
+        fs::write(&snapshot, &snapshot_bytes).expect("Tonepoet metadata snapshot fixture");
+        let archive_before = fs::read(&archive).expect("archive before native decline");
+        let fingerprint = archive_fingerprint_for_native_edit(&archive).expect("fingerprint");
+        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso)]);
+        let cancel = CancellationToken::new();
+        let result = rename_archive_entry_native_transactional(
+            &archive,
+            &archive,
+            &[ArchiveNativeRenamePair::new("album.wv", "renamed.wv")],
+            &[
+                ArchiveNativeMember {
+                    path: "album.cue".to_string(),
+                    is_dir: false,
+                },
+                ArchiveNativeMember {
+                    path: "album.wv".to_string(),
+                    is_dir: false,
+                },
+            ],
+            fingerprint,
+            None,
+            &tool_paths,
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect("native path should decline safely rather than fail the operation");
+        assert!(result.is_none(), "unsafe native CUE repair must fall back");
+        assert_eq!(fs::read(&archive).expect("archive after decline"), archive_before);
+        assert_eq!(fs::read(&snapshot).expect("snapshot after decline"), snapshot_bytes);
+    }
+
+    #[tokio::test]
+    async fn native_zip_real_multi_pair_rename_handles_archive_without_directory_records() {
+        let (Some(seven_zip), Some(zip)) = (
+            find_executable(&["7zz", "7z"]),
+            find_executable(&["zip"]),
+        ) else {
+            eprintln!("skipping implicit-directory ZIP rename integration test: 7z/7zz and zip are required");
+            return;
+        };
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        let disc = source.join("Disc 1");
+        let nested = disc.join("Live");
+        fs::create_dir_all(&nested).expect("nested source dirs");
+        fs::write(disc.join("01.flac"), b"track-one-payload").expect("track one");
+        fs::write(disc.join("cover.jpg"), b"cover-payload").expect("cover");
+        fs::write(nested.join("02.flac"), b"track-two-payload").expect("track two");
+        let archive = temp.path().join("Album.zip");
+        run_fixture_command(
+            &zip,
+            &[
+                OsStr::new("-D"),
+                OsStr::new("-r"),
+                archive.as_os_str(),
+                OsStr::new("Disc 1"),
+            ],
+            Some(&source),
+        )
+        .expect("create ZIP without directory entries");
+
+        let before_listing = run_secret_fixture_output(
+            &seven_zip,
+            &[
+                "l".to_string(),
+                "-slt".to_string(),
+                archive.display().to_string(),
+            ],
+            None,
+        )
+        .expect("list implicit-directory ZIP");
+        assert!(before_listing.status.success());
+        let before_text = String::from_utf8_lossy(&before_listing.stdout);
+        assert!(before_text.contains("Path = Disc 1/01.flac"));
+        assert!(before_text.contains("Path = Disc 1/Live/02.flac"));
+        assert!(
+            !before_text.lines().any(|line| line.trim() == "Path = Disc 1"),
+            "fixture must omit the synthesized root directory record"
+        );
+
+        let pairs = vec![
+            ArchiveNativeRenamePair::new("Disc 1/01.flac", "CD 1/01.flac"),
+            ArchiveNativeRenamePair::new("Disc 1/cover.jpg", "CD 1/cover.jpg"),
+            ArchiveNativeRenamePair::new("Disc 1/Live/02.flac", "CD 1/Live/02.flac"),
+        ];
+        let members = vec![
+            ArchiveNativeMember {
+                path: "Disc 1/01.flac".to_string(),
+                is_dir: false,
+            },
+            ArchiveNativeMember {
+                path: "Disc 1/cover.jpg".to_string(),
+                is_dir: false,
+            },
+            ArchiveNativeMember {
+                path: "Disc 1/Live/02.flac".to_string(),
+                is_dir: false,
+            },
+        ];
+        let fingerprint = archive_fingerprint_for_native_edit(&archive).expect("fingerprint");
+        let tool_paths = HashMap::from([
+            ("7zz".to_string(), seven_zip.clone()),
+            ("7z".to_string(), seven_zip.clone()),
+        ]);
+        let cancel = CancellationToken::new();
+        rename_archive_entry_native_transactional(
+            &archive,
+            &archive,
+            &pairs,
+            &members,
+            fingerprint,
+            None,
+            &tool_paths,
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect("native multi-pair ZIP rename")
+        .expect("ZIP native path");
+
+        let after_listing = run_secret_fixture_output(
+            &seven_zip,
+            &[
+                "l".to_string(),
+                "-slt".to_string(),
+                archive.display().to_string(),
+            ],
+            None,
+        )
+        .expect("list renamed ZIP");
+        assert!(after_listing.status.success());
+        let after_text = String::from_utf8_lossy(&after_listing.stdout);
+        assert!(!after_text.contains("Path = Disc 1/"));
+        assert!(after_text.contains("Path = CD 1/01.flac"));
+        assert!(after_text.contains("Path = CD 1/cover.jpg"));
+        assert!(after_text.contains("Path = CD 1/Live/02.flac"));
+
+        let extracted = temp.path().join("renamed-extract");
+        extract_seven_zip_archive(&seven_zip, &archive, &extracted)
+            .expect("extract renamed ZIP");
+        assert_eq!(fs::read(extracted.join("CD 1/01.flac")).unwrap(), b"track-one-payload");
+        assert_eq!(fs::read(extracted.join("CD 1/cover.jpg")).unwrap(), b"cover-payload");
+        assert_eq!(
+            fs::read(extracted.join("CD 1/Live/02.flac")).unwrap(),
+            b"track-two-payload"
+        );
+    }
+
     #[test]
-    fn preflight_reports_missing_rar_creator_before_extraction_work() {
+    fn native_rename_capability_is_format_explicit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let seven_zip = temp.path().join("7zz");
+        let xorriso = temp.path().join("xorriso");
+        fs::write(&seven_zip, b"tool").expect("fake 7zz");
+        fs::write(&xorriso, b"tool").expect("fake xorriso");
+        let tool_paths = HashMap::from([
+            ("7zz".to_string(), seven_zip),
+            ("xorriso".to_string(), xorriso),
+        ]);
+
+        assert!(archive_native_rename_available(&temp.path().join("Album.7z"), &tool_paths)
+            .expect("7z native rename capability"));
+        assert!(archive_native_rename_available(&temp.path().join("Album.zip"), &tool_paths)
+            .expect("zip native rename capability"));
+        assert!(archive_native_rename_available(&temp.path().join("Album.iso.wv"), &tool_paths)
+            .expect("ISO-WV native rename capability"));
+        assert!(!archive_native_rename_available(&temp.path().join("Album.tar"), &tool_paths)
+            .expect("tar fallback capability"));
+        assert!(!archive_native_rename_available(&temp.path().join("Album.rar"), &tool_paths)
+            .expect("RAR has no native rename path"));
+    }
+
+    #[test]
+    fn transactional_native_copy_is_exact_and_precancel_is_side_effect_free() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source.7z");
+        let destination = temp.path().join("destination.7z");
+        let payload: Vec<u8> = (0..(1024 * 1024 + 137))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&source, &payload).expect("source payload");
+        let cancel = CancellationToken::new();
+        let mut observed = Vec::new();
+
+        copy_archive_for_native_edit(
+            &source,
+            &destination,
+            payload.len() as u64,
+            &cancel,
+            |bytes| observed.push(bytes),
+        )
+        .expect("transactional copy");
+
+        assert_eq!(fs::read(&destination).expect("copied payload"), payload);
+        assert_eq!(observed.last().copied(), Some(payload.len() as u64));
+
+        let cancelled_destination = temp.path().join("cancelled.7z");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let err = copy_archive_for_native_edit(
+            &source,
+            &cancelled_destination,
+            payload.len() as u64,
+            &cancelled,
+            |_| {},
+        )
+        .expect_err("pre-cancelled copy must stop before creating a destination");
+        assert_eq!(err, ARCHIVE_REPACKAGE_CANCELLED);
+        assert!(!cancelled_destination.exists());
+    }
+
+    #[test]
+    fn preflight_refuses_rar_writes_without_a_configured_writer_before_extraction_work() {
         let temp = tempfile::tempdir().expect("temp dir");
         let original = temp.path().join("Album.rar");
         fs::write(&original, b"rar placeholder").expect("archive placeholder");
-        let missing_rar = temp.path().join("definitely-missing-rar-binary");
-        let tool_paths = HashMap::from([("rar".to_string(), missing_rar)]);
 
+        let tool_paths = HashMap::from([
+            ("rar".to_string(), temp.path().join("missing-rar")),
+        ]);
         let err = preflight_archive_repackage_capability(&original, &tool_paths)
-            .expect_err("missing rar creator must be reported before extraction");
+            .expect_err("RAR mutation must be refused before extraction when no writer is available");
 
         assert!(
-            err.contains("RAR archive creation requires the `rar` executable"),
-            "missing rar preflight error should be actionable: {err}"
+            err.contains("RAR archive creation requires the `rar` executable")
+                && err.contains("convert the archive to 7z"),
+            "RAR refusal should explain the missing writer without changing formats: {err}"
         );
     }
 
     #[tokio::test]
-    async fn repackage_archive_reports_missing_rar_creator_without_replacing_original() {
+    async fn repackage_archive_refuses_rar_without_writer_without_replacing_original() {
         let temp = tempfile::tempdir().expect("temp dir");
         let original = temp.path().join("Album.rar");
         fs::write(&original, b"original rar placeholder").expect("original archive placeholder");
         let staging = write_repackage_staging(temp.path(), "edited rar payload")
             .expect("write repackage staging");
-        let missing_rar = temp.path().join("definitely-missing-rar-binary");
-        let tool_paths = HashMap::from([("rar".to_string(), missing_rar)]);
 
+        let tool_paths = HashMap::from([
+            ("rar".to_string(), temp.path().join("missing-rar")),
+        ]);
         let err = repackage_archive(&staging, &original, &tool_paths)
             .await
-            .expect_err("missing rar tool should fail");
+            .expect_err("RAR mutation must be refused when no writer is available");
 
         assert!(
-            err.contains("RAR archive creation requires the `rar` executable"),
-            "missing rar error should be actionable: {err}"
+            err.contains("RAR archive creation requires the `rar` executable")
+                && err.contains("convert the archive to 7z"),
+            "RAR refusal should be actionable: {err}"
         );
         assert_eq!(
-            fs::read(&original).expect("original archive after failed rar repackage"),
+            fs::read(&original).expect("original archive after refused RAR repackage"),
             b"original rar placeholder",
-            "failed rar creation must not replace the original archive"
+            "refused RAR mutation must not replace the original archive"
         );
     }
 

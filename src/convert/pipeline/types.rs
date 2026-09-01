@@ -2921,8 +2921,9 @@ pub struct PipelineReport {
 
 /// Lifetime owner for a foreground FUSE mount used by a materialized source.
 ///
-/// `fuseiso -o auto_unmount` releases the kernel mount when its foreground
-/// process exits.  Keeping the child here ties that process to the same RAII
+/// The archive FUSE helpers run in the foreground with `auto_unmount`, so the
+/// kernel mount is released when the child exits. Keeping the child here ties
+/// that process to the same RAII
 /// boundary that owns conversion staging; dropping the lease terminates and
 /// reaps the child before staging cleanup touches the mount point.
 pub struct FuseMountLease {
@@ -2987,7 +2988,7 @@ impl Drop for FuseMountLease {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             log::warn!(
-                "FUSE mount still present after fuseiso termination: {}",
+                "FUSE mount still present after archive reader termination: {}",
                 self.mount_point.display()
             );
         }

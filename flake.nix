@@ -94,6 +94,7 @@
           atomicparsley
           bat
         ] ++ lib.optionals stdenv.isLinux [
+          fuse-archive
           fuseiso
         ]);
 

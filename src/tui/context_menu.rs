@@ -626,7 +626,7 @@ fn push_properties_footer(items: &mut Vec<ContextMenuEntry>) {
 /// tagging utilities, analysis) must stay hidden so they cannot feed synthetic
 /// paths into filesystem code.
 fn archive_entry_can_rename(entry: &BrowseEntry) -> bool {
-    !matches!(entry.kind, EntryKind::Directory | EntryKind::ParentDir)
+    !matches!(entry.kind, EntryKind::ParentDir)
 }
 
 fn archive_file_ops_submenu(entry: &BrowseEntry) -> Option<ContextMenuEntry> {
@@ -657,6 +657,10 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(separator());
             items.push(build_select_submenu(true));
+            if let Some(file_ops) = archive_file_ops_submenu(entry) {
+                items.push(separator());
+                items.push(file_ops);
+            }
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::ParentDir => {
@@ -6795,15 +6799,15 @@ mod tests {
     }
 
     #[test]
-    fn archive_directory_menu_exposes_metadata_but_hides_rename() {
+    fn archive_directory_menu_exposes_archive_aware_rename_only() {
         let entry = archive_test_entry(EntryKind::Directory);
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
         assert!(labels.iter().any(|label| label == "Open"));
         assert!(labels.iter().any(|label| label == "Properties"));
+        assert!(labels.iter().any(|label| label == "File operations"));
+        assert!(labels.iter().any(|label| label == "Rename"));
         for forbidden in [
-            "File operations",
-            "Rename",
             "Bulk Rename",
             "Copy to...",
             "Move to...",

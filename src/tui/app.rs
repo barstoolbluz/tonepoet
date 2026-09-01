@@ -693,11 +693,11 @@ pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeRes
 
 /// Durable source-pane text used while a Convert-source probe is in flight.
 pub(crate) const PROBE_IN_PROGRESS_NOTICE: &str = "Probing...";
-pub(crate) const ARCHIVE_PREVIEW_EXTRACTING_NOTICE: &str = "Extracting archive...";
+pub(crate) const ARCHIVE_PREVIEW_EXTRACTING_NOTICE: &str = "Preparing archive...";
 
 
 /// Return true when the authoritative source-admission policy routes `path`
-/// through archive extraction/preview rather than ordinary audio probing.
+/// through archive materialization/preview rather than ordinary audio probing.
 ///
 /// This wrapper exists for the probe scheduler; it deliberately owns no
 /// extension list so `:e`, Browse, recent-source, file-input, and queue paths
@@ -1232,7 +1232,7 @@ where
     // never recorded when preflight says that no operation started.
     app.recent.record_use_with_db(&path, &app.db);
     app.set_status(format!(
-        "Extracting archive: {}",
+        "Preparing archive: {}",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
 
@@ -1475,7 +1475,23 @@ pub(crate) fn spawn_archive_preview(
                 )
                 .await
                 .map_err(|err| format!("{err}"))?
+            } else if archive_password.is_none() {
+                // Convert preview is part of archive source materialization.
+                // Prefer the same read-only lazy view as the pipeline itself;
+                // otherwise TUI preview would still pay for a whole extraction
+                // before ArchiveMaterializer ever gets a chance to mount.
+                crate::convert::pipeline::materializer_archive::try_mount_archive_readonly(
+                    &archive_path,
+                    &staging_dir,
+                    &runner,
+                    &cancel,
+                )
+                .await
+                .map_err(|err| format!("{err}"))?
             } else {
+                // Stored passwords deliberately keep the proven 7z extraction
+                // path; fuse-archive cannot accept them noninteractively for
+                // every supported archive format.
                 None
             };
 
@@ -1570,7 +1586,7 @@ pub(crate) fn spawn_archive_preview(
                 archive_path,
                 tracks,
                 album_metadata,
-                mount_lease: None,
+                mount_lease,
             })
         }
         .await;
@@ -1713,7 +1729,7 @@ pub struct MultiTrackEntry {
     pub duration_display: Option<String>,
 }
 
-/// Queue-time preview of an archive extraction. The staging directory is owned
+/// Queue-time preview of an archive source. The staging directory is owned
 /// by the Convert source until commit transfers ownership to the queue or a
 /// source change removes it.
 #[derive(Debug, Clone)]
@@ -1722,8 +1738,8 @@ pub struct ArchivePreview {
     pub archive_path: PathBuf,
     pub tracks: Vec<PreviewTrack>,
     pub album_metadata: SourceMetadata,
-    /// Present only when `.iso.wv` preview paths live on a FUSE mount. The
-    /// last owner tears the mount down before staging cleanup. Mounted preview
+    /// Present when preview paths live on a read-only FUSE mount. The last
+    /// owner tears the mount down before staging cleanup. Mounted preview
     /// staging is never transferred to a queued conversion; conversion mounts
     /// the container afresh at its own staging lifetime boundary.
     pub mount_lease: Option<std::sync::Arc<crate::convert::pipeline::types::FuseMountLease>>,
@@ -1741,10 +1757,10 @@ pub struct PreviewTrack {
     pub metadata: SourceMetadata,
 }
 
-/// Convert-owned handle for an archive preview that is still extracting or
-/// probing. Unlike a completed `ArchivePreview`, this exists before the worker
+/// Convert-owned handle for an archive preview that is still mounting, extracting,
+/// or probing. Unlike a completed `ArchivePreview`, this exists before the worker
 /// can return a populated track list, so it is the only app-state owner that
-/// can cancel extraction and remove the temporary staging directory on source
+/// can cancel materialization and remove the temporary staging directory on source
 /// replacement, navigation away, or shutdown.
 #[derive(Clone)]
 pub struct PendingArchivePreview {
@@ -1897,10 +1913,9 @@ impl PendingBrowseArchiveMetadataEdit {
 
 
 /// Lifecycle handle for Browse-screen archive-entry rename. The operation
-/// captures the archive fingerprint, extracts into staging, and performs the
-/// filesystem rename inside staging. The deferred-save lifecycle owns the later
-/// archive repackage/cleanup step after navigation, screen switch, quit, or an
-/// explicit retry/overwrite action.
+/// captures the archive fingerprint and either runs a transaction-safe native
+/// container rename or prepares the established extracted staging fallback.
+/// Fallback edits join the deferred-save lifecycle for repackage/cleanup.
 #[derive(Clone)]
 pub struct PendingBrowseArchiveRename {
     pub archive_path: PathBuf,
@@ -2322,7 +2337,7 @@ pub enum SourceMode {
         cursor: usize,
         /// Per-track selection (all true initially).
         selected: Vec<bool>,
-        /// Queue-time archive preview extraction, if this multi-track source came
+        /// Queue-time archive preview materialization, if this multi-track source came
         /// from a generic archive rather than a CUE/SACD/DVD/Blu-ray model.
         archive_preview: Option<ArchivePreview>,
         /// Full parsed disc model for selected disc-stream sources.
@@ -12843,7 +12858,7 @@ pub struct AppState {
     /// True when quit is waiting for an in-flight ISO-WV archive-entry create.
     pub quit_after_browse_archive_create: bool,
 
-    /// Target screen requested while a first archive edit is still extracting.
+    /// Target screen requested while a first archive edit is still being prepared.
     /// The screen switch is not considered complete until the edit is either
     /// saved, discarded, or cancelled without staged changes.
     pub deferred_browse_archive_screen_switch: Option<AppScreen>,
@@ -15008,7 +15023,7 @@ impl AppState {
                     );
                     if skipped > 0 {
                         self.set_status(format!(
-                            "Extracting archive: {} ({} skipped, see log)",
+                            "Preparing archive: {} ({} skipped, see log)",
                             archive_name, skipped
                         ));
                     }
@@ -15438,7 +15453,10 @@ mod cli_seed_admission_tests {
             .unwrap_or("");
         assert!(status.contains("injected secret-store failure"), "{status}");
         assert!(status.contains("operation was not started"), "{status}");
+        // The archive-preparation notice was renamed from "Extracting archive" to
+        // "Preparing archive"; exclude both so this guard cannot go vacuous again.
         assert!(!status.contains("Extracting archive"), "{status}");
+        assert!(!status.contains("Preparing archive"), "{status}");
         assert!(!status.contains("skipped"), "{status}");
     }
 

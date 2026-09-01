@@ -48,6 +48,8 @@ pub enum ToolBinary {
     Tar,
     /// RAR archiver used for archive repackaging.
     Rar,
+    /// Read-only FUSE reader used for generic archive materialization.
+    FuseArchive,
     /// Unprivileged ISO 9660 FUSE reader used by `.iso.wv`.
     FuseIso,
     /// ISO 9660 authoring/verification tool used when `.iso.wv` is repackaged.
@@ -73,6 +75,7 @@ impl ToolBinary {
             Self::AtomicParsley => "AtomicParsley",
             Self::Tar => "tar",
             Self::Rar => "rar",
+            Self::FuseArchive => "fuse-archive",
             Self::FuseIso => "fuseiso",
             Self::Xorriso => "xorriso",
         }
@@ -761,6 +764,7 @@ fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
         ToolBinary::SevenZip | ToolBinary::Ssrc => &[],
         ToolBinary::Tar | ToolBinary::Rar => &["--version"],
         ToolBinary::Xorriso => &["-version"],
+        ToolBinary::FuseArchive => &["--version"],
         ToolBinary::Sox | ToolBinary::Opustags | ToolBinary::FuseIso => &["--help"],
         // AtomicParsley emits its version banner on the zero-argument path;
         // `--version` is not its canonical identity probe.
@@ -826,6 +830,7 @@ pub(crate) fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr
             | ToolBinary::AtomicParsley
             | ToolBinary::Tar
             | ToolBinary::Rar
+            | ToolBinary::FuseArchive
             | ToolBinary::FuseIso
             | ToolBinary::Xorriso => first_version_like_token(line),
         };

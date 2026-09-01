@@ -3065,6 +3065,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "sortdir",
     "filter",
     "refresh",
+    "l",
+    "list",
     "messages",
     "task-messages",
     "file-notices",
@@ -3334,6 +3336,10 @@ pub enum Command {
     Filter(Option<String>),
     /// Refresh the current browse directory from the filesystem.
     Refresh,
+    /// Force-list the selected archive, bypassing the remote/disabled listing
+    /// policy gate. Command-mode is used because plain letters remain reserved
+    /// for Browse type-ahead.
+    ArchiveList,
     /// Reopen the full retained warning/failure text for the most recent file task.
     FileTaskMessages,
     /// Query or set routine file-operation capability-notice verbosity.
@@ -3586,6 +3592,7 @@ impl std::fmt::Debug for Command {
             Command::SortDir => f.write_str("SortDir"),
             Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
             Command::Refresh => f.write_str("Refresh"),
+            Command::ArchiveList => f.write_str("ArchiveList"),
             Command::NewFile(arg) => f.debug_tuple("NewFile").field(arg).finish(),
             Command::NewFolder(arg) => f.debug_tuple("NewFolder").field(arg).finish(),
             Command::Rename(arg) => f.debug_tuple("Rename").field(arg).finish(),
@@ -3869,6 +3876,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "refresh" => Command::Refresh,
+        "l" | "list" => Command::ArchiveList,
         "messages" | "task-messages" => Command::FileTaskMessages,
         "file-notices" => Command::FileTaskNotices(
             (!args.is_empty()).then(|| args.to_string()),
@@ -4907,6 +4915,22 @@ Native helper failures, missing displays, denied clipboard access, and oversized
                 app.set_status("browse refreshed");
             } else {
                 app.set_status(":refresh is available on the browse screen");
+            }
+        }
+        Command::ArchiveList => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":l is available on the browse screen");
+            } else if app.browse.is_in_archive() {
+                app.set_status(":l is for opening a selected archive from the filesystem");
+            } else if let Some(entry) = app.browse.selected_entry() {
+                if matches!(entry.kind, crate::convert::classify::EntryKind::Archive) {
+                    let path = entry.path.clone();
+                    super::keybindings::start_browse_archive_listing(app, path, tx, true);
+                } else {
+                    app.set_status(":l requires an archive selection");
+                }
+            } else {
+                app.set_status(":l requires an archive selection");
             }
         }
         Command::Delete => {
@@ -8578,7 +8602,7 @@ pub(crate) fn install_browse_convert_source_paths(
                     .save_batch_state(&batch_paths, None, None, None, None, None);
                 app.previous_screen = Some(AppScreen::Browse);
                 let mut status = format!(
-                    "Extracting archive: {} — review settings, then :commit or :Commit",
+                    "Preparing archive: {} — review settings, then :commit or :Commit",
                     first.file_name().unwrap_or_default().to_string_lossy()
                 );
                 if let Some(warning) = expansion_warning.as_deref() {
@@ -9681,9 +9705,9 @@ fn execute_commit_with_source_options_transform(
     }
 
     // Clear source pane so a subsequent `:queue` arrives fresh. Extraction-
-    // backed generic archive previews are transferred to the queued item. A
-    // mounted ISO-WV preview is deliberately not transferable: disarming it
-    // drops the FUSE lease, so remove its empty mount point and let the queued
+    // backed archive previews are transferred to the queued item. Mounted
+    // previews are deliberately not transferable: disarming one drops its FUSE
+    // lease, so remove its empty mount point and let the queued
     // materializer establish a fresh mount under its own staging owner.
     let preview_staging = app.convert.source.mode.disarm_archive_preview_cleanup();
     if archive_preview_staging.is_none() {
@@ -15766,6 +15790,8 @@ mod completion_tests {
             Command::Help(Some(topic)) if topic == "clipboard"
         ));
         assert!(matches!(parse_command("clipboard"), Command::Clipboard));
+        assert!(matches!(parse_command("l"), Command::ArchiveList));
+        assert!(matches!(parse_command("list"), Command::ArchiveList));
         assert!(matches!(parse_command("messages"), Command::FileTaskMessages));
         assert!(matches!(parse_command("task-messages"), Command::FileTaskMessages));
         assert!(matches!(

@@ -426,7 +426,10 @@ pub enum AppMessage {
         staging_dir: std::path::PathBuf,
         old_inner_path: String,
         new_inner_path: String,
-        result: Result<(), String>,
+        /// `Some(report)` means a format-native transactional rename was
+        /// committed directly; `None` means extraction completed and the
+        /// event-loop must apply the staged rename as before.
+        result: Result<Option<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport>, String>,
     },
     /// Milestone from Browse-screen archive-entry delete. Displayed only while
     /// it matches the current pending delete handle.

@@ -1635,3 +1635,157 @@ The user believes they had previously opted into `"always"` and found the settin
 browsing-config-reset-on-recompile defect. Not established for this specific file, but the
 section and the symptom match; worth checking whether that defect is the reason a user's
 opt-in did not survive.
+
+## 22. The transactional archive copy's fast paths are unavailable on the most common configurations
+
+**Status:** open. Raised 2026-08-31 against the archive native-rename delivery.
+
+The native rename path deliberately avoids mutating the user's only archive copy. It creates
+a transactional sibling copy, renames inside that, and installs it through the existing
+backup/install/restore swap. That choice is sound and preserves exact rollback.
+
+The copy tries, in order: Linux `FICLONE` reflink, `copy_file_range`, then a buffered copy.
+The concern is that neither accelerated path engages on several very common setups, so the
+common case silently degrades to a full sequential copy of the whole archive.
+
+### macOS: the filesystem supports cloning, the code cannot use it
+
+APFS has supported copy-on-write cloning since introduction, exposed as `clonefile(2)`, as
+`copyfile(3)` with `COPYFILE_CLONE`, and as `cp -c`. It is semantically what this path wants.
+
+Neither primitive the implementation uses exists on macOS:
+
+- `FICLONE` is a Linux ioctl (btrfs, XFS, bcachefs).
+- `copy_file_range` is a Linux (and FreeBSD) syscall, not a macOS one.
+
+Both call sites in `src/convert/pipeline/materializer_archive.rs` are
+`#[cfg(target_os = "linux")]`. `flake.nix` builds via `flake-utils.lib.eachDefaultSystem`,
+which includes `x86_64-darwin` and `aarch64-darwin`, so a macOS build compiles cleanly and
+falls through to the buffered copy without any diagnostic.
+
+This is the inverted case: macOS is the platform where cloning is *most* reliably available,
+because APFS is the default and always supports it, and it is the platform that currently
+cannot use it. On Linux the fast path depends on the user's filesystem choice.
+
+### Linux: the default filesystem on most desktop distributions has no reflink
+
+Measured on this machine (Debian 13, kernel 6.12):
+
+```
+/home/daedalus/dev          ext4         cp --reflink=always -> Operation not supported
+/home/daedalus/livetorrents fuse.sshfs   (network mount; no reflink, no expected offload)
+```
+
+ext4 has no shipped reflink support. It remains the installer default on Debian, Ubuntu,
+Linux Mint, and is the common choice on Arch. Distributions that *do* get the fast path:
+Fedora (btrfs default since F33), openSUSE (btrfs), and the RHEL family (XFS with
+`reflink=1` default since RHEL 8).
+
+So for a Debian/Ubuntu user on ext4, and for any archive on an sshfs/NFS/SMB mount, every
+native rename performs a full read-plus-write copy of the archive before the cheap header
+operation runs.
+
+### Why this still beats the old behaviour, and by how much
+
+This is a regression in *expectations*, not in behaviour. Rough passes over the payload for a
+2.7 GB archive:
+
+| Path | Passes over the data |
+|---|---|
+| Old: extract, modify, repackage | ~4 (read archive, write members, read members, write archive) |
+| New, no reflink: copy then header rename | ~2 |
+| New, with reflink/clone: header rename only | ~0 |
+
+The delivery is still a clear improvement everywhere. The point of this entry is that the
+headline "renames no longer move the payload" is only true on reflink-capable storage, which
+excludes this user's own disk, this user's NAS, and every macOS install.
+
+### Outcomes wanted
+
+- macOS should use `clonefile`/`COPYFILE_CLONE` so APFS gets the fast path it can support.
+- Consider whether the user should be able to tell, from the UI, that a rename is about to
+  copy several gigabytes rather than complete instantly — the progress reporting added in
+  the same delivery may already be sufficient, which is worth checking before adding
+  anything.
+- Whether any additional offload is worth attempting on network filesystems (for example
+  server-side copy where the protocol supports it) is an open question, not a requirement.
+
+Mechanism, scope, and whether the macOS branch is worth the platform-specific code are the
+implementer's call.
+
+## 23. Native archive rename commits immediately, breaking the deferred-batch model the other edits use
+
+**Status:** open. Raised 2026-08-31 against the archive native-rename delivery.
+
+Tonepoet's established model for archive edits is *extract once, accumulate edits in staging,
+repackage once* when the user navigates away or quits. The new native rename path does not
+participate in it: each rename is its own complete transaction against the archive.
+
+### Confirmed behaviour
+
+| Operation | Commit timing | Status text |
+|---|---|---|
+| Delete | staged, deferred | `deleted N staged archive entries in X; archive changes pending` |
+| Rename, extraction fallback | staged, deferred | `renamed archive entry ...; archive changes pending` |
+| Rename, native path | **immediate install** | `renamed archive entry in X: old -> new` (no pending/saving wording) |
+
+The deferred paths repackage only when
+`quit_after_* || deferred_browse_archive_screen_switch.is_some() || deferred_browse_archive_exit`
+(`src/tui/event_loop.rs`, delete success branch and the rename `Ok(None)` fallback branch).
+The native branch is the rename `Ok(Some(report))` arm, which reports a completed rename with
+no staging session and no pending state.
+
+### Why this matters: the fast path can lose to the path it replaced
+
+Passes over the payload for an archive of size S, performing N renames in one session:
+
+| Path | Cost |
+|---|---|
+| Old / fallback: extract, N staged renames, repackage | ~4 passes **total**, independent of N |
+| Native, reflink available | ~0 |
+| Native, no reflink (ext4, sshfs, macOS today) | ~2 passes **per rename** = 2N |
+
+So on storage without reflink — which is this user's ext4 disk, this user's sshfs NAS, and
+every macOS install per issue #22 — the native path is better for one rename, break-even at
+two, and **worse from three onward**. A user renaming several entries in a 2.7 GB album would
+move more data than the old extract-once path did.
+
+### The batching primitive already exists in this delivery
+
+`7z rn` accepts multiple source/destination pairs, and the implementation already exploits
+exactly that to rename a synthesized directory's descendants in a single invocation. A
+session-level batch of user renames would reuse the same primitive rather than needing a new
+one. `xorriso` likewise accepts multiple commands before `-commit`.
+
+### Open question, not a finding
+
+The native gate checks password, format capability, and implicit-directory shape. It does not
+appear to consider whether a dirty staging session already exists for the archive. What
+happens when a user stages a delete (repackage pending) and then performs a native rename
+that installs a new archive immediately underneath that pending staging has not been traced
+and may be fine — the pending-owner and fingerprint re-checks may already cover it. It should
+be established either way rather than assumed.
+
+### Outcomes wanted
+
+- One consistent commit model for structural archive edits, so a user does not have some
+  operations commit instantly and others sit pending in the same archive session.
+- Multiple structural edits in a session should cost one repackage/copy, not N.
+- Whichever model wins, the status wording should tell the user truthfully whether their
+  change is already on disk or still pending.
+
+Mechanism and scope are the implementer's call, including whether the native path should be
+deferred into the staging model or the staging model should learn to flush a batch of native
+operations at commit time.
+
+### Related
+
+- #22 — the transactional copy's fast paths are unavailable on common configurations, which
+  is what makes the per-operation cost of this issue material.
+- Measured for context: on a 306 MB album archive built with default (solid) 7z settings,
+  every member shares one solid block, so deleting even a 4-byte cue costs a full repack
+  (~10s, against ~11s to build the archive). Note that delete *already* batches, so that
+  repack is paid once per session rather than once per deletion — no change is needed there.
+  The point is that no cheap per-operation delete primitive exists for solid archives, so
+  the deferred model is what makes delete affordable, and it is exactly that model the
+  native rename path opted out of.

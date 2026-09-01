@@ -4284,9 +4284,11 @@ pub(super) fn begin_browse_inline_rename(app: &mut AppState, path: std::path::Pa
     });
 }
 
-fn browse_entry_supports_inline_rename(app: &AppState, kind: &crate::convert::classify::EntryKind) -> bool {
+fn browse_entry_supports_inline_rename(
+    _app: &AppState,
+    kind: &crate::convert::classify::EntryKind,
+) -> bool {
     !matches!(kind, crate::convert::classify::EntryKind::ParentDir)
-        && !(app.browse.is_in_archive() && matches!(kind, crate::convert::classify::EntryKind::Directory))
 }
 
 fn current_browse_metadata_value(app: &AppState, field: crate::tui::probe::MetadataField) -> String {
@@ -6986,23 +6988,28 @@ fn browse_context_menu_keyboard_anchor(app: &AppState) -> (u16, u16) {
 }
 
 pub(super) fn browse_tab_action_ready(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) -> bool {
-    if app.browse_archive_repackage.is_some()
-        || app.pending_browse_archive_metadata.is_some()
-        || app.pending_browse_archive_rename.is_some()
-        || app.pending_browse_archive_delete.is_some()
-        || app.pending_browse_archive_create.is_some()
-    {
-        app.set_status("tab action deferred: finish the active archive operation first");
+    if app.browse_archive_repackage.is_some() {
+        app.set_status("tab action deferred: finish saving archive changes first");
         return false;
     }
+    let mut cancelled_archive_preparation =
+        cancel_and_detach_pending_browse_archive_edit_staging(app);
     if app.browse_inline_edit.is_some() {
         finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
         if app.browse_inline_edit.is_some() {
             return false;
         }
+        // Committing an archive inline rename can itself start asynchronous
+        // extraction/native-rename preparation. Navigation still wins: detach
+        // that newly-started preparation before changing tabs.
+        cancelled_archive_preparation |=
+            cancel_and_detach_pending_browse_archive_edit_staging(app);
     }
     app.browse.close_options_menu();
     app.bookmarks.close_dropdown();
+    if cancelled_archive_preparation {
+        app.set_status("tab changed; cancelling in-flight archive edit preparation");
+    }
     true
 }
 
@@ -8137,7 +8144,7 @@ fn start_browse_archive_listing_inner(
     );
 
     if !force && matches!(mode, super::archive_listing::ArchiveListingMode::Never) {
-        app.set_status("archive listing is disabled; press l to list this archive");
+        app.set_status("archive listing is disabled; use :l to list this archive");
         return;
     }
 
@@ -8145,7 +8152,7 @@ fn start_browse_archive_listing_inner(
         && matches!(mode, super::archive_listing::ArchiveListingMode::Auto)
         && super::archive_listing::is_remote_filesystem(&path)
     {
-        app.set_status("archive is on a network mount; press l to list contents");
+        app.set_status("archive is on a network mount; use :l to list contents");
         return;
     }
 
@@ -8693,7 +8700,7 @@ mod browse_convert_queue_return_worker_tests {
         assert!(app.db.load_batch_state().is_none());
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Extracting archive: nonexistent-album.zip"),
+            Some("Preparing archive: nonexistent-album.zip"),
         );
     }
 
@@ -33369,59 +33376,12 @@ struct IsoWvCueRenamePlan {
     replacements: std::collections::BTreeMap<String, String>,
 }
 
-fn remap_staged_relative_path_for_rename(
-    path: &std::path::Path,
-    old_path: &std::path::Path,
-    new_path: &std::path::Path,
-) -> std::path::PathBuf {
-    if let Ok(suffix) = path.strip_prefix(old_path) {
-        new_path.join(suffix)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 fn normalized_cue_reference_for_rename(value: &str) -> String {
     let mut normalized = value.replace('\\', "/");
     while let Some(rest) = normalized.strip_prefix("./") {
         normalized = rest.to_string();
     }
     normalized
-}
-
-fn relative_cue_reference(
-    cue_parent: &std::path::Path,
-    target: &std::path::Path,
-) -> Result<String, String> {
-    use std::path::Component;
-
-    let collect = |path: &std::path::Path| -> Result<Vec<String>, String> {
-        path.components()
-            .filter_map(|component| match component {
-                Component::Normal(part) => Some(
-                    part.to_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| "ISO-WV CUE path is not valid UTF-8".to_string()),
-                ),
-                Component::CurDir => None,
-                _ => Some(Err("ISO-WV CUE path escaped archive staging".to_string())),
-            })
-            .collect()
-    };
-    let from = collect(cue_parent)?;
-    let to = collect(target)?;
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut parts = Vec::new();
-    parts.extend(std::iter::repeat("..".to_string()).take(from.len() - common));
-    parts.extend(to.into_iter().skip(common));
-    if parts.is_empty() {
-        return Err("ISO-WV CUE FILE target collapsed to the CUE directory".to_string());
-    }
-    Ok(parts.join("/"))
 }
 
 fn prepare_iso_wv_cue_rename_plan(
@@ -33441,11 +33401,6 @@ fn prepare_iso_wv_cue_rename_plan(
         &original_cue_bytes,
         &cue_before,
     )?;
-    let sheet = crate::convert::cue_parser::parse_cue(&cue_text);
-    if sheet.tracks.is_empty() {
-        return Err("ISO-WV rename refused because the authoritative CUE has no audio tracks".to_string());
-    }
-
     let staging_identity = std::fs::canonicalize(staging_dir)
         .map_err(|err| format!("canonicalize ISO-WV staging root failed: {err}"))?;
     let old_relative = old_staged
@@ -33457,77 +33412,65 @@ fn prepare_iso_wv_cue_rename_plan(
     let cue_relative = cue_before
         .strip_prefix(staging_dir)
         .map_err(|_| "ISO-WV CUE escaped staging".to_string())?;
-    let cue_after_relative =
-        remap_staged_relative_path_for_rename(cue_relative, old_relative, new_relative);
-    let cue_after = staging_dir.join(&cue_after_relative);
-    let cue_after_parent = cue_after_relative.parent().unwrap_or_else(|| std::path::Path::new(""));
     let cue_before_parent = cue_before
         .parent()
         .ok_or_else(|| "ISO-WV CUE has no parent directory".to_string())?;
 
-    let mut replacements = std::collections::BTreeMap::<String, String>::new();
-    for track in &sheet.tracks {
-        let Some(file_ref) = track.file.as_deref().filter(|value| !value.trim().is_empty()) else {
-            return Err(format!("ISO-WV CUE track {} has no FILE reference", track.number));
-        };
-        if replacements.contains_key(file_ref) {
-            continue;
-        }
-        let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(
-            cue_before_parent,
-            file_ref,
-        ) {
-            CueReferenceResolution::Resolved(path) => path,
-            CueReferenceResolution::Missing => {
-                return Err(format!("ISO-WV CUE FILE {:?} is already missing before rename", file_ref));
-            }
-            CueReferenceResolution::Ambiguous(candidates) => {
-                return Err(format!(
-                    "ISO-WV CUE FILE {:?} is ambiguous before rename ({} candidates)",
-                    file_ref,
-                    candidates.len()
-                ));
-            }
-            CueReferenceResolution::UnsupportedTarget(path) => {
-                return Err(format!(
-                    "ISO-WV CUE FILE {:?} is not a supported audio source ({})",
-                    file_ref,
-                    path.display()
-                ));
-            }
-        };
-        let resolved_identity = std::fs::canonicalize(&resolved).map_err(|err| {
-            format!("canonicalize ISO-WV CUE target {} failed: {err}", resolved.display())
-        })?;
-        let target_relative = resolved_identity
-            .strip_prefix(&staging_identity)
-            .map_err(|_| format!("ISO-WV CUE FILE {:?} resolves outside staging", file_ref))?;
-        let target_after_relative = remap_staged_relative_path_for_rename(
-            target_relative,
+    let shared_plan =
+        crate::convert::pipeline::materializer_archive::plan_iso_wv_cue_reference_rename(
+            &cue_text,
+            cue_relative,
             old_relative,
             new_relative,
-        );
-        let mut new_ref = relative_cue_reference(cue_after_parent, &target_after_relative)?;
-        if file_ref.contains('\\') && !file_ref.contains('/') {
-            new_ref = new_ref.replace('/', "\\");
-        }
-        if normalized_cue_reference_for_rename(file_ref)
-            != normalized_cue_reference_for_rename(&new_ref)
-        {
-            if file_ref.contains('"') || new_ref.contains('"') {
-                return Err("ISO-WV rename would require a CUE FILE name containing a quote".to_string());
-            }
-            replacements.insert(file_ref.to_string(), new_ref);
-        }
-    }
+            |file_ref| {
+                let resolved = match crate::tui::browse::resolve_cue_file_reference_for_queue(
+                    cue_before_parent,
+                    file_ref,
+                ) {
+                    CueReferenceResolution::Resolved(path) => path,
+                    CueReferenceResolution::Missing => {
+                        return Err(format!(
+                            "ISO-WV CUE FILE {:?} is already missing before rename",
+                            file_ref
+                        ));
+                    }
+                    CueReferenceResolution::Ambiguous(candidates) => {
+                        return Err(format!(
+                            "ISO-WV CUE FILE {:?} is ambiguous before rename ({} candidates)",
+                            file_ref,
+                            candidates.len()
+                        ));
+                    }
+                    CueReferenceResolution::UnsupportedTarget(path) => {
+                        return Err(format!(
+                            "ISO-WV CUE FILE {:?} is not a supported audio source ({})",
+                            file_ref,
+                            path.display()
+                        ));
+                    }
+                };
+                let resolved_identity = std::fs::canonicalize(&resolved).map_err(|err| {
+                    format!(
+                        "canonicalize ISO-WV CUE target {} failed: {err}",
+                        resolved.display()
+                    )
+                })?;
+                resolved_identity
+                    .strip_prefix(&staging_identity)
+                    .map(std::path::Path::to_path_buf)
+                    .map_err(|_| {
+                        format!("ISO-WV CUE FILE {:?} resolves outside staging", file_ref)
+                    })
+            },
+        )?;
 
-    if replacements.is_empty() {
+    if shared_plan.replacements.is_empty() {
         Ok(None)
     } else {
         Ok(Some(IsoWvCueRenamePlan {
-            cue_after,
+            cue_after: staging_dir.join(shared_plan.cue_after_relative),
             original_cue_bytes,
-            replacements,
+            replacements: shared_plan.replacements,
         }))
     }
 }
@@ -33905,19 +33848,86 @@ mod iso_wv_structural_rename_tests {
     }
 }
 
-pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    if app.pending_browse_archive_rename.is_some()
-        || app.pending_browse_archive_delete.is_some()
-        || app.pending_browse_archive_create.is_some()
-        || app.pending_browse_archive_metadata.is_some()
-    {
-        app.deferred_browse_archive_exit = true;
-        app.set_status(
-            "archive exit deferred: waiting for in-flight archive edit staging to reconcile"
-                .to_string(),
-        );
-        return;
+fn browse_archive_expected_extract_bytes(app: &AppState, archive_path: &std::path::Path) -> Option<u64> {
+    let total = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == archive_path)
+        .map(|archive| {
+            archive
+                .listing
+                .entries
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size))
+        })?;
+    (total > 0).then_some(total)
+}
+
+fn archive_extract_progress_message(
+    label: &str,
+    snapshot: &crate::convert::pipeline::materializer_archive::ArchiveExtractionProgressSnapshot,
+) -> String {
+    let elapsed = snapshot.elapsed.as_secs();
+    match snapshot.bytes_total.filter(|total| *total > 0) {
+        Some(total) => {
+            let percent = snapshot.bytes_done.saturating_mul(100).min(total.saturating_mul(100)) / total;
+            format!("{label}: ~{percent}% ({elapsed}s)")
+        }
+        None => format!(
+            "{label}: {:.1} MiB extracted ({elapsed}s)",
+            snapshot.bytes_done as f64 / (1024.0 * 1024.0)
+        ),
     }
+}
+
+pub(super) fn cancel_and_detach_pending_browse_archive_edit_staging(
+    app: &mut AppState,
+) -> bool {
+    let mut cancelled = false;
+
+    if let Some(pending) = app.pending_browse_archive_rename.take() {
+        let archive_path = pending.archive_path.clone();
+        pending.cancel_and_cleanup();
+        delete_pending_archive_session_best_effort(app, &archive_path);
+        app.quit_after_browse_archive_rename = false;
+        cancelled = true;
+    }
+    if let Some(pending) = app.pending_browse_archive_delete.take() {
+        let archive_path = pending.archive_path.clone();
+        pending.cancel_and_cleanup();
+        delete_pending_archive_session_best_effort(app, &archive_path);
+        app.quit_after_browse_archive_delete = false;
+        cancelled = true;
+    }
+    if let Some(pending) = app.pending_browse_archive_create.take() {
+        let archive_path = pending.archive_path.clone();
+        pending.cancel_and_cleanup();
+        delete_pending_archive_session_best_effort(app, &archive_path);
+        app.quit_after_browse_archive_create = false;
+        cancelled = true;
+    }
+    if let Some(pending) = app.pending_browse_archive_metadata.take() {
+        let archive_path = pending.archive_path.clone();
+        let owns_staging = pending.owns_staging;
+        pending.cancel_and_cleanup();
+        if owns_staging {
+            delete_pending_archive_session_best_effort(app, &archive_path);
+        }
+        cancelled = true;
+    }
+
+    cancelled
+}
+
+pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    // Extraction/native-rename preparation has no user edit to preserve yet.
+    // Request cooperative cancellation but do not trap navigation waiting for
+    // the worker. Result reducers own late cleanup and never apply an edit once
+    // this archive view has been left.
+    let cancelled_pending = cancel_and_detach_pending_browse_archive_edit_staging(app);
+    app.deferred_browse_archive_exit = false;
 
     let staging = app.browse.active_archive_staging().cloned();
     if let Some(staging) = staging {
@@ -33943,6 +33953,9 @@ pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         let _ = app.db.delete_pending_archive_session(&staging.archive_path);
     }
     app.browse.exit_archive();
+    if cancelled_pending {
+        app.set_status("left archive; cancelling in-flight archive edit preparation");
+    }
 }
 
 fn open_browse_archive_metadata_editor(app: &mut AppState, archive_path: std::path::PathBuf) {
@@ -34125,6 +34138,7 @@ fn open_browse_archive_metadata_editor_for_entries(
         }
     };
     let target_count = target_inner_paths.as_ref().map(|paths| paths.len());
+    let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
     app.pending_browse_archive_metadata = Some(pending);
     app.set_status(match target_count {
         Some(1) => format!(
@@ -34170,14 +34184,26 @@ fn open_browse_archive_metadata_editor_for_entries(
                 staging_dir: staging_dir.clone(),
                 message: "Extracting archive for metadata editing...".to_string(),
             }).await;
-            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging_with_progress(
                 &archive_path,
                 &staging_dir,
                 "browse-archive-metadata-edit",
                 password.as_deref(),
                 &runner,
-                None,
                 &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::ArchiveMetadataEditorProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message("Extracting archive for metadata editing", &snapshot),
+                        });
+                    }
+                },
             )
             .await
             .map_err(|err| format!("archive extraction failed: {err}"))?;
@@ -34890,6 +34916,7 @@ pub(super) fn start_browse_archive_entry_delete(
             }
         },
     };
+    let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
     let tx = tx.clone();
 
     app.browse.bump_archive_probe_epoch_for(&archive_path);
@@ -34919,14 +34946,26 @@ pub(super) fn start_browse_archive_entry_delete(
                     message: "Extracting archive for deferred delete...".to_string(),
                 })
                 .await;
-            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging_with_progress(
                 &archive_path,
                 &staging_dir,
                 "browse-archive-entry-delete",
                 password.as_deref(),
                 &runner,
-                None,
                 &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryDeleteProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message("Extracting archive for delete", &snapshot),
+                        });
+                    }
+                },
             )
             .await
             .map_err(|err| format!("archive delete extraction failed: {err}"))?;
@@ -46641,7 +46680,7 @@ mod batch_removal_archive_atomicity_tests {
             Some(ARCHIVE_PREVIEW_EXTRACTING_NOTICE.to_string()),
         ));
         app.current_screen = AppScreen::Convert;
-        app.set_status(format!("Extracting archive: {}", path.display()));
+        app.set_status(format!("Preparing archive: {}", path.display()));
         Ok(ArchivePreviewStarted {
             generation,
             archive_path: path,
@@ -46668,7 +46707,7 @@ mod batch_removal_archive_atomicity_tests {
         assert!(app.convert.source.batch_probe_debounce.is_none());
         assert!(app.convert.source.mode.current_metadata().title.is_none());
         let status = app.status_message.as_ref().map(|(message, _)| message.as_str()).unwrap_or("");
-        assert!(status.contains("Extracting archive"), "{status}");
+        assert!(status.contains("Preparing archive"), "{status}");
     }
 
     #[test]
@@ -46691,7 +46730,7 @@ mod batch_removal_archive_atomicity_tests {
         assert!(app.convert.source.batch_probe_debounce.is_none());
         assert!(app.convert.source.mode.current_metadata().title.is_none());
         let status = app.status_message.as_ref().map(|(message, _)| message.as_str()).unwrap_or("");
-        assert!(status.contains("Extracting archive"), "{status}");
+        assert!(status.contains("Preparing archive"), "{status}");
     }
 
     #[test]
@@ -58769,8 +58808,97 @@ mod file_operation_safety_tests {
             "planning must not create the unsafe nested destination"
         );
     }
+
+    #[test]
+    fn implicit_zip_directory_rename_builds_native_pairs_for_real_descendants_only() {
+        let listing = crate::tui::archive_listing::ArchiveListing {
+            archive_path: std::path::PathBuf::from("Album.zip"),
+            format: "zip".to_string(),
+            physical_size: 123,
+            entries: vec![
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/01.flac".to_string(),
+                    size: 10,
+                    packed_size: 10,
+                    is_dir: false,
+                    encrypted: false,
+                },
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/cover.jpg".to_string(),
+                    size: 5,
+                    packed_size: 5,
+                    is_dir: false,
+                    encrypted: false,
+                },
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/Live/02.flac".to_string(),
+                    size: 11,
+                    packed_size: 11,
+                    is_dir: false,
+                    encrypted: false,
+                },
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "booklet.pdf".to_string(),
+                    size: 3,
+                    packed_size: 3,
+                    is_dir: false,
+                    encrypted: false,
+                },
+            ],
+        };
+
+        assert!(
+            listing
+                .entries
+                .iter()
+                .all(|entry| entry.path != "Disc 1" || !entry.is_dir),
+            "fixture must not contain an explicit Disc 1 directory record"
+        );
+        let pairs = native_implicit_directory_rename_pairs(&listing, "Disc 1", "CD 1")
+            .expect("ZIP implicit directory should use native multi-member rename");
+        let rendered = pairs
+            .iter()
+            .map(|pair| (pair.old_inner_path.as_str(), pair.new_inner_path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            vec![
+                ("Disc 1/01.flac", "CD 1/01.flac"),
+                ("Disc 1/cover.jpg", "CD 1/cover.jpg"),
+                ("Disc 1/Live/02.flac", "CD 1/Live/02.flac"),
+            ]
+        );
+        assert!(
+            rendered.iter().all(|(old, new)| old.starts_with("Disc 1/") && new.starts_with("CD 1/")),
+            "every real descendant must be re-parented by prefix"
+        );
+    }
 }
 
+
+fn native_implicit_directory_rename_pairs(
+    listing: &super::archive_listing::ArchiveListing,
+    old_inner_path: &str,
+    new_inner_path: &str,
+) -> Option<Vec<crate::convert::pipeline::materializer_archive::ArchiveNativeRenamePair>> {
+    if !(listing.format.eq_ignore_ascii_case("7z") || listing.format.eq_ignore_ascii_case("zip")) {
+        return None;
+    }
+    let old_prefix = format!("{old_inner_path}/");
+    let pairs = listing
+        .entries
+        .iter()
+        .filter(|entry| entry.path.starts_with(&old_prefix))
+        .map(|entry| {
+            let suffix = &entry.path[old_inner_path.len()..];
+            crate::convert::pipeline::materializer_archive::ArchiveNativeRenamePair::new(
+                entry.path.clone(),
+                format!("{new_inner_path}{suffix}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    (!pairs.is_empty()).then_some(pairs)
+}
 
 fn start_browse_archive_entry_rename(
     app: &mut AppState,
@@ -58801,6 +58929,7 @@ fn start_browse_archive_entry_rename(
         _ => new_name.to_string(),
     };
 
+    let target_prefix = format!("{new_inner_path}/");
     if app
         .browse
         .archive
@@ -58812,7 +58941,9 @@ fn start_browse_archive_entry_rename(
                     .map(|path| path.exists())
                     .unwrap_or(true)
             } else {
-                arc.listing.entries.iter().any(|entry| entry.path == new_inner_path)
+                arc.listing.entries.iter().any(|entry| {
+                    entry.path == new_inner_path || entry.path.starts_with(&target_prefix)
+                })
             }
         })
     {
@@ -58872,29 +59003,6 @@ fn start_browse_archive_entry_rename(
         }
     };
 
-    let pending = PendingBrowseArchiveRename::new(
-        archive_path.clone(),
-        old_inner_path.clone(),
-        new_inner_path.clone(),
-        archive_mtime_secs,
-        archive_mtime_nanos,
-        archive_size,
-        Some(vec![old_inner_path.clone()]),
-    );
-    let staging_dir = pending.staging_dir.clone();
-    if let Err(err) = persist_empty_archive_staging_registration(
-        app,
-        &archive_path,
-        &staging_dir,
-        archive_mtime_secs,
-        archive_mtime_nanos,
-        archive_size,
-    ) {
-        let message = format!("rename: cannot register archive recovery session before extraction: {err}");
-        app.set_status(message.clone());
-        return Err(message);
-    }
-    let cancel = pending.cancel.clone();
     let password = match app
         .browse
         .archive
@@ -58906,13 +59014,135 @@ fn start_browse_archive_entry_rename(
         None => match archive_listing_password_for_path(app, &archive_path) {
             Ok(password) => password,
             Err(error) => {
-                let _ = app.db.delete_pending_archive_session(&archive_path);
-                let _ = std::fs::remove_dir_all(&staging_dir);
                 app.set_status(error.clone());
                 return Err(error);
             }
         },
     };
+    let old_prefix = format!("{old_inner_path}/");
+    let archive_listing = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|arc| arc.listing.archive_path == archive_path)
+        .map(|arc| arc.listing.clone())
+        .ok_or_else(|| "rename: active archive listing disappeared".to_string())?;
+    let old_is_implicit_directory = {
+        let has_descendants = archive_listing
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with(&old_prefix));
+        let has_explicit_directory_entry = archive_listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == old_inner_path && entry.is_dir);
+        has_descendants && !has_explicit_directory_entry
+    };
+    let archive_members = archive_listing
+        .entries
+        .iter()
+        .map(|entry| crate::convert::pipeline::materializer_archive::ArchiveNativeMember {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+        })
+        .collect::<Vec<_>>();
+    let native_rename_available = if password.is_some() {
+        // Keep encrypted/header-encrypted containers on the established
+        // password-aware extract/repackage path until native header-only
+        // rename semantics are proven for those cases.
+        false
+    } else {
+        match crate::convert::pipeline::materializer_archive::archive_native_rename_available(
+            &archive_path,
+            &tool_paths,
+        ) {
+            Ok(available) => available,
+            Err(err) => {
+                let message = format!("rename: archive cannot be edited: {err}");
+                app.set_status(message.clone());
+                return Err(message);
+            }
+        }
+    };
+    let native_rename_pairs = if !native_rename_available {
+        None
+    } else if old_is_implicit_directory {
+        // 7-Zip's `rn` command accepts multiple source/destination pairs. A
+        // synthesized directory therefore needs no invented directory entry
+        // and no extraction: rename every real descendant member by prefix in
+        // one native transaction. ISO keeps the established fallback for this
+        // unusual shape because xorriso has no member record to target.
+        native_implicit_directory_rename_pairs(
+            &archive_listing,
+            &old_inner_path,
+            &new_inner_path,
+        )
+    } else {
+        Some(vec![
+            crate::convert::pipeline::materializer_archive::ArchiveNativeRenamePair::new(
+                old_inner_path.clone(),
+                new_inner_path.clone(),
+            ),
+        ])
+    };
+    let native_rename = native_rename_pairs.is_some();
+    let pending = PendingBrowseArchiveRename::new(
+        archive_path.clone(),
+        old_inner_path.clone(),
+        new_inner_path.clone(),
+        archive_mtime_secs,
+        archive_mtime_nanos,
+        archive_size,
+        Some(vec![old_inner_path.clone()]),
+    );
+    let staging_dir = pending.staging_dir.clone();
+    let cancel = pending.cancel.clone();
+    let native_rename_admission = if native_rename {
+        let claim = match crate::concurrency::PathClaim::resolve_with_semantics(
+            &archive_path,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Exact,
+            crate::concurrency::PathResolutionSemantics::NamespaceObject,
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                let message = format!("rename: archive mutation admission failed: {error}");
+                app.set_status(message.clone());
+                return Err(message);
+            }
+        };
+        let admitted_archive_path = claim.identity.resolved_io_path.clone();
+        let guard = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim]) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let message = format!("rename: archive is busy: {error}");
+                app.set_status(message.clone());
+                return Err(message);
+            }
+        };
+        Some((admitted_archive_path, guard))
+    } else {
+        None
+    };
+    // Register a lightweight recovery owner before the worker starts even for
+    // a native attempt. ISO-WV may deliberately decline the fast path after a
+    // target-read CUE safety check; the same worker can then enter the proven
+    // extract/edit/repackage fallback without a recovery-registration race.
+    // Successful native renames remove this empty staging registration in the
+    // existing result handler and never extract payload data.
+    if let Err(err) = persist_empty_archive_staging_registration(
+        app,
+        &archive_path,
+        &staging_dir,
+        archive_mtime_secs,
+        archive_mtime_nanos,
+        archive_size,
+    ) {
+        let message = format!("rename: cannot register archive recovery session before operation: {err}");
+        app.set_status(message.clone());
+        return Err(message);
+    }
+    let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
     let tx = tx.clone();
 
     // Mutation is now in progress. Reject any archive-entry info-pane probe
@@ -58927,7 +59157,43 @@ fn start_browse_archive_entry_rename(
         let staging_for_result = staging_dir.clone();
         let old_for_result = old_inner_path.clone();
         let new_for_result = new_inner_path.clone();
-        let result: Result<(), String> = async {
+        let result: Result<Option<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport>, String> = async {
+            if native_rename {
+                let (admitted_archive_path, _archive_mutation_claim) = native_rename_admission
+                    .expect("native archive rename admission must accompany the native path");
+                let progress_tx = tx.clone();
+                let progress_archive = archive_path.clone();
+                let progress_staging = staging_dir.clone();
+                let native_result = crate::convert::pipeline::materializer_archive::rename_archive_entry_native_transactional(
+                    &admitted_archive_path,
+                    &archive_path,
+                    native_rename_pairs
+                        .as_deref()
+                        .expect("native rename plan must accompany native admission"),
+                    &archive_members,
+                    (archive_mtime_secs, archive_mtime_nanos, archive_size),
+                    password.as_deref(),
+                    &tool_paths,
+                    &cancel,
+                    move |snapshot| {
+                        let percent = if snapshot.bytes_total == 0 {
+                            0
+                        } else {
+                            snapshot.bytes_done.saturating_mul(100) / snapshot.bytes_total
+                        };
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: format!("{} {percent}%", snapshot.status),
+                        });
+                    },
+                )
+                .await?;
+                if let Some(report) = native_result {
+                    return Ok(Some(report));
+                }
+            }
+
             let _ = tx.send(AppMessage::ArchiveEntryRenameProgress {
                 archive_path: archive_path.clone(),
                 staging_dir: staging_dir.clone(),
@@ -58942,14 +59208,26 @@ fn start_browse_archive_entry_rename(
                 staging_dir: staging_dir.clone(),
                 message: "Extracting archive for rename...".to_string(),
             }).await;
-            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging_with_progress(
                 &archive_path,
                 &staging_dir,
                 "browse-archive-entry-rename",
                 password.as_deref(),
                 &runner,
-                None,
                 &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message("Extracting archive for rename", &snapshot),
+                        });
+                    }
+                },
             )
             .await
             .map_err(|err| format!("archive extraction failed: {err}"))?;
@@ -58967,11 +59245,9 @@ fn start_browse_archive_entry_rename(
                 return Err("archive rename cancelled".to_string());
             }
 
-            // The worker only extracts and validates the archive snapshot.
-            // The filesystem rename and durable edit-log update run together
-            // on the event-loop side so persistence failure can roll the
-            // staged mutation back instead of stranding an untracked edit.
-            Ok(())
+            // None means the event-loop should apply the filesystem rename to
+            // the extracted staging tree and persist the edit journal.
+            Ok(None)
         }
         .await;
 
@@ -59231,6 +59507,7 @@ fn start_browse_iso_wv_archive_create(
             }
         },
     };
+    let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
     let tx_for_task = tx.clone();
     app.browse.bump_archive_probe_epoch_for(&archive_path);
     app.pending_browse_archive_create = Some(pending);
@@ -59258,14 +59535,26 @@ fn start_browse_iso_wv_archive_create(
                     message: "Extracting ISO-WV for structural edit...".to_string(),
                 })
                 .await;
-            crate::convert::pipeline::materializer_archive::extract_archive_to_staging(
+            crate::convert::pipeline::materializer_archive::extract_archive_to_staging_with_progress(
                 &archive_path,
                 &staging_dir,
                 "browse-iso-wv-entry-create",
                 password.as_deref(),
                 &runner,
-                None,
                 &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx_for_task.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryCreateProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message("Extracting ISO-WV for structural edit", &snapshot),
+                        });
+                    }
+                },
             )
             .await
             .map_err(|err| format!("archive create extraction failed: {err}"))?;
@@ -59515,21 +59804,6 @@ pub(super) fn commit_browse_rename(
             app.set_status("rename: could not resolve archive entry");
             return false;
         };
-        let selected_is_directory = app
-            .browse
-            .archive
-            .as_ref()
-            .filter(|arc| arc.listing.archive_path == archive_path)
-            .and_then(|arc| arc.listing.entries.iter().find(|entry| entry.path == inner_path))
-            .is_some_and(|entry| entry.is_dir);
-        if selected_is_directory
-            && !crate::convert::classify::is_iso_wv_container(&archive_path)
-        {
-            app.set_status(
-                "rename: archive directory rename is unavailable; rename files with archive-aware Rename",
-            );
-            return false;
-        }
         return start_browse_archive_entry_rename(app, archive_path, inner_path, new_name, tx).is_ok();
     }
 
@@ -60302,16 +60576,11 @@ pub(super) fn switch_screen_reconciling_browse_archive(
         .is_some_and(|staging| staging.dirty);
 
     if leaving_browse {
-        if app.pending_browse_archive_rename.is_some()
-            || app.pending_browse_archive_delete.is_some()
-            || app.pending_browse_archive_create.is_some()
-            || app.pending_browse_archive_metadata.is_some()
-        {
-            app.deferred_browse_archive_exit = false;
-            app.deferred_browse_archive_screen_switch = Some(target);
-            app.set_status("screen switch deferred: waiting for in-flight archive edit staging to reconcile".to_string());
-            return;
-        }
+        // In-flight preparation is cancellable and must never pin the user to
+        // Browse. Late completions are rejected by archive ownership checks.
+        cancel_and_detach_pending_browse_archive_edit_staging(app);
+        app.deferred_browse_archive_exit = false;
+        app.deferred_browse_archive_screen_switch = None;
 
         if dirty_archive_staging {
             app.quit_after_browse_archive_repackage = false;

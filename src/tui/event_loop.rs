@@ -97,11 +97,10 @@ pub async fn run_app(
         if app.current_screen != AppScreen::Browse && app.cancel_browse_convert_expansion() {
             app.set_status("folder expansion cancelled: Browse screen changed");
         }
-        if app.current_screen != AppScreen::Browse {
-            if let Some(pending) = app.pending_browse_archive_metadata.take() {
-                pending.cancel_and_cleanup();
-                app.set_status("archive metadata editor cancelled: Browse screen changed before extraction finished");
-            }
+        if app.current_screen != AppScreen::Browse
+            && super::keybindings::cancel_and_detach_pending_browse_archive_edit_staging(app)
+        {
+            app.set_status("archive edit preparation cancelled: Browse screen changed");
         }
         if app.current_screen != AppScreen::Convert {
             let archive_preview_owned_or_pending = app.convert.pending_archive_preview.is_some()
@@ -2679,7 +2678,9 @@ fn handle_archive_preview_result(
         || !pending_matches
     {
         if let Ok(preview) = result {
-            let _ = std::fs::remove_dir_all(preview.staging_dir);
+            let staging_dir = preview.staging_dir.clone();
+            drop(preview);
+            let _ = std::fs::remove_dir_all(staging_dir);
         }
         return;
     }
@@ -2886,6 +2887,11 @@ fn handle_archive_metadata_editor_prepared(
         .and_then(|pending| pending.target_inner_paths.clone());
     let deferred_screen_switch = app.deferred_browse_archive_screen_switch;
     let deferred_archive_exit = app.deferred_browse_archive_exit;
+    let password_error = result
+        .as_ref()
+        .err()
+        .filter(|err| super::app::looks_like_archive_password_error(err))
+        .cloned();
 
     if app.current_screen != AppScreen::Browse {
         let _pending = app.pending_browse_archive_metadata.take();
@@ -2895,7 +2901,48 @@ fn handle_archive_metadata_editor_prepared(
         }
         app.deferred_browse_archive_screen_switch = None;
         app.deferred_browse_archive_exit = false;
-        app.set_status("archive metadata editor cancelled: Browse screen changed before extraction finished");
+        if let Some(err) = password_error.as_deref() {
+            if prompt_overlay_slot_is_unobstructed(app) {
+                app.set_status(format!(
+                    "archive metadata editor needs a password, but Browse screen changed before extraction finished: {err}; retry metadata edit from the archive"
+                ));
+            } else {
+                app.set_status(format!(
+                    "archive metadata editor needs a password, but the current editor or overlay was preserved: {err}; retry metadata edit after closing it"
+                ));
+            }
+        } else {
+            app.set_status("archive metadata editor cancelled: Browse screen changed before extraction finished");
+        }
+        return;
+    }
+
+    let browse_holds_same_archive = app
+        .browse
+        .archive
+        .as_ref()
+        .is_some_and(|archive| archive.listing.archive_path == archive_path);
+    if !browse_holds_same_archive {
+        let _pending = app.pending_browse_archive_metadata.take();
+        if pending_owns_staging {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+        }
+        app.deferred_browse_archive_screen_switch = None;
+        app.deferred_browse_archive_exit = false;
+        if let Some(err) = password_error.as_deref() {
+            if prompt_overlay_slot_is_unobstructed(app) {
+                app.set_status(format!(
+                    "archive metadata editor needs a password, but the archive view changed before extraction finished: {err}; retry metadata edit from the archive"
+                ));
+            } else {
+                app.set_status(format!(
+                    "archive metadata editor needs a password, but the current editor or overlay was preserved: {err}; retry metadata edit after closing it"
+                ));
+            }
+        } else {
+            app.set_status("archive metadata editor cancelled: archive view changed before extraction finished");
+        }
         return;
     }
 
@@ -2907,7 +2954,13 @@ fn handle_archive_metadata_editor_prepared(
         }
         app.deferred_browse_archive_screen_switch = None;
         app.deferred_browse_archive_exit = false;
-        app.set_status("archive metadata editor cancelled: another overlay opened before extraction finished");
+        if let Some(err) = password_error.as_deref() {
+            app.set_status(format!(
+                "archive metadata editor needs a password, but the current editor or overlay was preserved: {err}; retry metadata edit after closing it"
+            ));
+        } else {
+            app.set_status("archive metadata editor cancelled: another overlay opened before extraction finished");
+        }
         return;
     }
 
@@ -4296,6 +4349,36 @@ fn start_browse_archive_repackage_inner(
         }
     }
 
+    // Passwords are intentionally not persisted in ArchiveMetadataEditContext
+    // or the recovery row. Carry only the live in-memory secret into this save
+    // worker. If the active listing proves the archive is encrypted but its
+    // session-local password was lost, resolve the configured secret now; an
+    // unavailable password will later fail closed before replacement creation.
+    let active_archive_requires_password = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == context.archive_path)
+        .is_some_and(|archive| archive.listing.entries.iter().any(|entry| entry.encrypted));
+    let mut archive_repackage_password = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| archive.listing.archive_path == context.archive_path)
+        .and_then(|archive| archive.password.clone())
+        .or_else(|| app.archive_passwords.get(&context.archive_path).cloned());
+    if archive_repackage_password.is_none() && active_archive_requires_password {
+        match super::app::archive_password_for_path(app, &context.archive_path) {
+            Ok(password) => archive_repackage_password = password,
+            Err(error) => {
+                app.set_status(format!(
+                    "archive save cannot resolve encryption password; staged edits were preserved: {error}"
+                ));
+                return;
+            }
+        }
+    }
+
     // The archive itself is the shared user-library mutation boundary. Admit
     // it before the final baseline recheck so another session cannot pass the
     // same check and install a competing replacement. Keep the live guard in
@@ -4448,9 +4531,10 @@ fn start_browse_archive_repackage_inner(
                 let progress_tx = tx.clone();
                 let archive_for_progress = logical_archive_path.clone();
                 let staging_for_progress = staging_dir.clone();
-                crate::convert::pipeline::materializer_archive::repackage_archive_with_progress_and_cancel(
+                crate::convert::pipeline::materializer_archive::repackage_archive_with_progress_and_cancel_with_password(
                     &staging_dir,
                     &admitted_archive_path,
+                    archive_repackage_password.as_deref(),
                     &tool_paths,
                     &cancel,
                     move |snapshot| {
@@ -5176,7 +5260,7 @@ fn handle_archive_entry_rename_result(
     staging_dir: std::path::PathBuf,
     old_inner_path: String,
     new_inner_path: String,
-    result: Result<(), String>,
+    result: Result<Option<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport>, String>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let pending_matches = app
@@ -5189,7 +5273,43 @@ fn handle_archive_entry_rename_result(
         });
     if !pending_matches {
         super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
-        app.set_status("archive rename: ignored stale result");
+        // The pending owner removes its own durable recovery row when it is
+        // detached. A stale worker must not delete by archive path here: the
+        // same archive may already have a newer edit session using that row.
+        if let Ok(Some(report)) = &result {
+            // Cancellation is cooperative. If a native rename had already
+            // crossed the install point of no return, its exact swap must
+            // finish rather than strand a half-installed archive. Treat that
+            // completion as globally real, but never attach stale staging.
+            app.invalidate_archive_listing_cache_for_path(&archive_path);
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            app.browse.bump_archive_probe_epoch_for(&archive_path);
+            let browse_holds_same_archive = app.current_screen == AppScreen::Browse
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|archive| archive.listing.archive_path == archive_path);
+            if browse_holds_same_archive {
+                super::keybindings::start_browse_archive_listing(
+                    app,
+                    archive_path.clone(),
+                    tx,
+                    true,
+                );
+            } else {
+                app.browse.refresh_with_search(Some(tx));
+            }
+            let suffix = report
+                .warning_summary()
+                .map(|warning| format!("; {warning}"))
+                .unwrap_or_default();
+            app.set_status(format!(
+                "archive rename completed before cancellation reached the install boundary{suffix}"
+            ));
+        } else if app.current_screen == AppScreen::Browse {
+            app.set_status("archive rename: ignored stale result");
+        }
         return;
     }
 
@@ -5205,7 +5325,46 @@ fn handle_archive_entry_rename_result(
     app.quit_after_browse_archive_rename = false;
 
     match result {
-        Ok(()) => {
+        Ok(Some(report)) => {
+            // Native rename already committed through the same exact
+            // install/restore transaction used by repackaging. No staging
+            // mutation or second save is required.
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+            app.invalidate_archive_listing_cache_for_path(&archive_path);
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            app.browse.bump_archive_probe_epoch_for(&archive_path);
+            let archive_label = archive_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| archive_path.display().to_string());
+            let old_name = old_inner_path.rsplit('/').next().unwrap_or(old_inner_path.as_str());
+            let new_name = new_inner_path.rsplit('/').next().unwrap_or(new_inner_path.as_str());
+            let browse_holds_same_archive = app.current_screen == AppScreen::Browse
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            if browse_holds_same_archive && app.current_screen == AppScreen::Browse {
+                super::keybindings::start_browse_archive_listing(app, archive_path.clone(), tx, true);
+            } else {
+                app.browse.refresh_with_search(Some(tx));
+            }
+            if quit_after_rename {
+                app.should_quit = true;
+            }
+            if let Some(warning) = report.warning_summary() {
+                app.set_status(format!(
+                    "renamed archive entry in {archive_label}: {old_name} -> {new_name}; {warning}"
+                ));
+            } else {
+                app.set_status(format!(
+                    "renamed archive entry in {archive_label}: {old_name} -> {new_name}"
+                ));
+            }
+        }
+        Ok(None) => {
             app.browse.invalidate_archive_probe_cache_for(&archive_path);
             let archive_label = archive_path
                 .file_name()
@@ -5213,11 +5372,12 @@ fn handle_archive_entry_rename_result(
                 .unwrap_or_else(|| archive_path.display().to_string());
             let old_name = old_inner_path.rsplit('/').next().unwrap_or(old_inner_path.as_str());
             let new_name = new_inner_path.rsplit('/').next().unwrap_or(new_inner_path.as_str());
-            let browse_holds_same_archive = app
-                .browse
-                .archive
-                .as_ref()
-                .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            let browse_holds_same_archive = app.current_screen == AppScreen::Browse
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|arc| arc.listing.archive_path == archive_path);
             let (secs, nanos, size) = pending_baseline
                 .unwrap_or_else(|| super::app::archive_fingerprint(&archive_path).unwrap_or((0, 0, 0)));
 
@@ -5289,14 +5449,16 @@ fn handle_archive_entry_rename_result(
                     start_browse_archive_repackage(app, context, tx);
                 }
             } else {
-                // Browse no longer owns the archive view. Do not mutate the
-                // extracted staging tree off-screen; keep the pre-registered
-                // empty session for startup recovery rather than silently
-                // applying a hidden rename.
-                app.browse.refresh_with_search(Some(tx));
-                app.set_status(format!(
-                    "archive rename for {archive_label} was extracted after navigation; staged snapshot preserved for recovery without applying the rename"
-                ));
+                // Navigation wins. No user mutation was applied to this fresh
+                // extraction, so there is nothing to recover or save.
+                super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+                super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+                if app.current_screen == AppScreen::Browse {
+                    app.browse.refresh_with_search(Some(tx));
+                    app.set_status(format!(
+                        "archive rename cancelled after leaving {archive_label}"
+                    ));
+                }
                 if quit_after_rename {
                     app.should_quit = true;
                 }
@@ -5347,7 +5509,12 @@ fn handle_archive_entry_delete_result(
         });
     if !pending_matches {
         super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
-        app.set_status("archive delete: ignored stale result");
+        // Durable recovery belongs to the current pending owner, if any. A
+        // stale worker cannot delete it by archive path without racing a newer
+        // edit session for the same archive.
+        if app.current_screen == AppScreen::Browse {
+            app.set_status("archive delete: ignored stale result");
+        }
         return;
     }
 
@@ -5364,11 +5531,12 @@ fn handle_archive_entry_delete_result(
     match result {
         Ok(()) => {
             app.browse.invalidate_archive_probe_cache_for(&archive_path);
-            let browse_holds_same_archive = app
-                .browse
-                .archive
-                .as_ref()
-                .is_some_and(|arc| arc.listing.archive_path == archive_path);
+            let browse_holds_same_archive = app.current_screen == AppScreen::Browse
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|arc| arc.listing.archive_path == archive_path);
             let (secs, nanos, size) = pending_baseline
                 .unwrap_or_else(|| super::app::archive_fingerprint(&archive_path).unwrap_or((0, 0, 0)));
 
@@ -5454,9 +5622,11 @@ fn handle_archive_entry_delete_result(
                     if count == 1 { "y" } else { "ies" }
                 ));
             } else {
-                app.set_status(format!(
-                    "archive delete for {archive_label} was extracted after navigation; staged snapshot preserved for recovery without applying the delete"
-                ));
+                super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+                super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+                if app.current_screen == AppScreen::Browse {
+                    app.set_status(format!("archive delete cancelled after leaving {archive_label}"));
+                }
             }
             if quit_after_delete && app.browse_archive_repackage.is_none() {
                 app.should_quit = true;
@@ -5510,7 +5680,12 @@ fn handle_archive_entry_create_result(
         });
     if !pending_matches {
         super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
-        app.set_status("archive create: ignored stale result");
+        // Durable recovery belongs to the current pending owner, if any. A
+        // stale worker cannot delete it by archive path without racing a newer
+        // edit session for the same archive.
+        if app.current_screen == AppScreen::Browse {
+            app.set_status("archive create: ignored stale result");
+        }
         return;
     }
 
@@ -5528,11 +5703,12 @@ fn handle_archive_entry_create_result(
     match result {
         Ok(()) => {
             app.browse.invalidate_archive_probe_cache_for(&archive_path);
-            let browse_holds_same_archive = app
-                .browse
-                .archive
-                .as_ref()
-                .is_some_and(|archive| archive.listing.archive_path == archive_path);
+            let browse_holds_same_archive = app.current_screen == AppScreen::Browse
+                && app
+                    .browse
+                    .archive
+                    .as_ref()
+                    .is_some_and(|archive| archive.listing.archive_path == archive_path);
             let (secs, nanos, size) = pending_baseline
                 .unwrap_or_else(|| super::app::archive_fingerprint(&archive_path).unwrap_or((0, 0, 0)));
 
@@ -5628,9 +5804,11 @@ fn handle_archive_entry_create_result(
                     }
                 ));
             } else {
-                app.set_status(format!(
-                    "archive create for {archive_label} was extracted after navigation; staged snapshot preserved for recovery without applying the create"
-                ));
+                super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+                super::keybindings::delete_pending_archive_session_best_effort(app, &archive_path);
+                if app.current_screen == AppScreen::Browse {
+                    app.set_status(format!("archive create cancelled after leaving {archive_label}"));
+                }
             }
             if quit_after_create && app.browse_archive_repackage.is_none() {
                 app.should_quit = true;
@@ -12995,6 +13173,42 @@ mod archive_listing_overlay_authority_tests {
             message.contains("current editor or overlay was preserved")
         }));
     }
+
+    #[test]
+    fn archive_metadata_password_failure_is_reported_after_archive_view_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("encrypted.7z");
+        let staging = temp.path().join("staging");
+        std::fs::write(&archive, b"archive").expect("archive");
+        std::fs::create_dir_all(&staging).expect("staging");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let mut pending = super::super::app::PendingBrowseArchiveMetadataEdit::from_existing(
+            archive.clone(),
+            staging.clone(),
+            None,
+        );
+        pending.owns_staging = true;
+        app.pending_browse_archive_metadata = Some(pending);
+
+        handle_archive_metadata_editor_prepared(
+            &mut app,
+            archive,
+            staging.clone(),
+            Err("Wrong password".to_string()),
+            &tx(),
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.pending_browse_archive_metadata.is_none());
+        assert!(!staging.exists(), "owned preparation staging must still be cleaned up");
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("needs a password")
+                && message.contains("archive view changed")
+                && message.contains("Wrong password")
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -13853,7 +14067,7 @@ mod browse_archive_quit_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn completed_initial_rename_after_screen_switch_attaches_and_schedules_repackage() {
+    async fn detached_initial_rename_after_screen_switch_stays_stale_on_late_completion() {
         let temp = tempfile::tempdir().expect("tempdir");
         let archive = temp.path().join("album.zip");
         fs::write(&archive, b"archive").expect("archive");
@@ -13869,6 +14083,7 @@ mod browse_archive_quit_lifecycle_tests {
             None,
         );
         let staging = pending.staging_dir.clone();
+        let cancel = pending.cancel.clone();
         fs::create_dir_all(&staging).expect("staging");
         fs::write(staging.join("old.flac"), b"audio").expect("old staged file");
 
@@ -13881,41 +14096,64 @@ mod browse_archive_quit_lifecycle_tests {
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
-        app.deferred_browse_archive_screen_switch = Some(AppScreen::Convert);
         app.browse.enter_archive(listing, None);
         app.pending_browse_archive_rename = Some(pending);
 
+        super::super::keybindings::switch_screen_reconciling_browse_archive(
+            &mut app,
+            AppScreen::Convert,
+            &tx(),
+        );
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert!(cancel.is_cancelled(), "screen switch must cancel preparation");
+        assert!(app.pending_browse_archive_rename.is_none());
+        assert!(!staging.exists(), "detached preparation staging should be cleaned eagerly");
+
+        // Return to the same Browse archive before the worker completes. A
+        // path-only ownership check would incorrectly accept the old result;
+        // detaching the pending handle makes it irrevocably stale instead.
+        app.current_screen = AppScreen::Browse;
+
+        // A newer edit for the same archive may already have replaced the
+        // archive-keyed recovery row by the time the old worker reports back.
+        // The stale completion must not delete that newer owner's row.
+        let newer_staging = temp.path().join("newer-staging");
+        fs::create_dir_all(&newer_staging).expect("newer staging");
+        app.db
+            .upsert_pending_archive_session(
+                &archive,
+                &newer_staging,
+                secs,
+                nanos,
+                size,
+                "[]",
+            )
+            .expect("newer recovery row");
+
+        // Model a worker that raced with cancellation and recreated/wrote its
+        // staging tree before observing the token.
+        fs::create_dir_all(&staging).expect("late staging");
+        fs::write(staging.join("old.flac"), b"audio").expect("late staged file");
         handle_archive_entry_rename_result(
             &mut app,
             archive.clone(),
             staging.clone(),
             "old.flac".to_string(),
             "new.flac".to_string(),
-            Ok(()),
+            Ok(None),
             &tx(),
         );
 
         assert_eq!(app.current_screen, AppScreen::Browse);
-        assert_eq!(app.deferred_browse_archive_screen_switch, Some(AppScreen::Convert));
-        assert!(
-            app.browse.active_archive_staging().is_some_and(|session| {
-                session.staging_dir == staging
-                    && session.archive_path == archive
-                    && session.dirty
-                    && session.edits.iter().any(|edit| matches!(
-                        edit,
-                        crate::tui::browse::ArchiveEdit::Rename { from, to }
-                            if from == "old.flac" && to == "new.flac"
-                    ))
-            }),
-            "completed initial rename must remain attached to Browse after screen switch"
+        assert!(!staging.exists(), "late stale result must clean staging again");
+        assert_eq!(
+            app.db.pending_archive_session_count_for_tests().unwrap(),
+            1,
+            "stale completion must preserve a newer recovery row for the same archive"
         );
-        assert!(
-            app.browse_archive_repackage
-                .as_ref()
-                .is_some_and(|context| context.archive_path == archive && context.staging_dir == staging),
-            "completed initial rename after screen switch must immediately schedule deferred save"
-        );
+        assert!(app.browse.active_archive_staging().is_none());
+        assert!(app.browse_archive_repackage.is_none());
     }
 
     #[test]

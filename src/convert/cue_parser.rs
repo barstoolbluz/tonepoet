@@ -1821,7 +1821,7 @@ where
     Ok(encoding_outcome)
 }
 
-fn acquire_cue_sidecar_write_claim(
+pub(crate) fn acquire_cue_sidecar_write_claim(
     cue_path: &Path,
 ) -> Result<(Option<crate::concurrency::MutationClaimGuard>, PathBuf), String> {
     let claim = crate::concurrency::PathClaim::resolve_with_semantics(
@@ -3752,7 +3752,7 @@ fn ensure_sidecar_snapshot_unchanged(
     Ok(())
 }
 
-fn atomic_replace_if_unchanged(
+pub(crate) fn atomic_replace_if_unchanged(
     path: &Path,
     bytes: &[u8],
     expected_original: Option<&[u8]>,
@@ -4323,13 +4323,33 @@ pub(crate) fn rewrite_cue_file_references(
             cue_path.display()
         )
     })?;
-    let decoded = decode_cue_bytes_with_context_for_write(&raw, cue_path.parent())?;
-    let rewritten = compose_cue_file_reference_replacement(&decoded.text, replacements)?;
-    if rewritten == decoded.text {
+    let (outcome, bytes) = rewrite_cue_file_reference_bytes(&raw, cue_path, replacements)?;
+    if bytes == raw {
         return Ok((CueSidecarWritebackOutcome::Unchanged, raw));
     }
-    let (bytes, outcome) = encode_cue_text_for_write(&rewritten, decoded.encoding);
     atomic_replace_if_unchanged(&admitted_cue_path, &bytes, Some(&raw))?;
+    Ok((outcome, bytes))
+}
+
+/// Compose a byte-preserving CUE `FILE` rewrite without touching the
+/// filesystem. Native ISO-WV transactions use this for a target-read CUE and
+/// for an already-claimed adjacent metadata snapshot before either is
+/// installed. Encoding, BOM, line endings, quoting, and legacy unquoted FILE
+/// handling therefore stay identical to [`rewrite_cue_file_references`].
+pub(crate) fn rewrite_cue_file_reference_bytes(
+    raw: &[u8],
+    cue_path: &Path,
+    replacements: &BTreeMap<String, String>,
+) -> Result<(CueSidecarWritebackOutcome, Vec<u8>), String> {
+    if replacements.is_empty() {
+        return Ok((CueSidecarWritebackOutcome::Unchanged, raw.to_vec()));
+    }
+    let decoded = decode_cue_bytes_with_context_for_write(raw, cue_path.parent())?;
+    let rewritten = compose_cue_file_reference_replacement(&decoded.text, replacements)?;
+    if rewritten == decoded.text {
+        return Ok((CueSidecarWritebackOutcome::Unchanged, raw.to_vec()));
+    }
+    let (bytes, outcome) = encode_cue_text_for_write(&rewritten, decoded.encoding);
     Ok((outcome, bytes))
 }
 
