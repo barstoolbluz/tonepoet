@@ -608,6 +608,9 @@ pub enum AppMessage {
         path: std::path::PathBuf,
         field: crate::tui::probe::MetadataField,
         value: String,
+        original_value: Option<String>,
+        ordered_values: Option<Vec<String>>,
+        original_ordered_values: Option<Vec<String>>,
         result: Result<crate::tui::probe::MetadataWriteCommitReport, String>,
     },
     /// Results of an async recursive search. Carries the launch identity so
@@ -719,6 +722,12 @@ pub enum AppMessage {
     FileTaskProgress {
         session_id: u64,
         update: tui_file_picker::FileTaskProgressUpdate,
+    },
+    /// Presentation cleanup for Browse archive staging tasks that borrow the
+    /// shared file-task progress surface without joining the transfer queue.
+    ArchiveStagingProgressTerminal {
+        session_id: u64,
+        requires_attention: bool,
     },
     /// Structured top-level completion accounting for a hosted file task.
     /// This is separate from progress presentation so callers can repair

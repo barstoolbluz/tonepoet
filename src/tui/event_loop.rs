@@ -1624,6 +1624,33 @@ fn reduce_file_task_progress(
         }
     }
 
+    if !handled_background_session
+        && app
+            .file_task_preempted_overlay
+            .as_deref()
+            .is_some_and(|overlay| {
+                matches!(
+                    overlay,
+                    ActiveOverlay::FileTaskProgress(session)
+                        if session.session_id == session_id && session.is_live_task()
+                )
+            })
+    {
+        if let Some(ActiveOverlay::FileTaskProgress(session)) =
+            app.file_task_preempted_overlay.as_deref_mut()
+        {
+            session.progress.apply_update(update.clone());
+            live_progress_snapshot = Some(session.progress.clone());
+            status_to_set = status.clone();
+            refresh_after_terminal = terminal;
+            handled_background_session = true;
+        }
+        // This slot is parked behind an attention-demanding active surface.
+        // Even if the parked task now also needs attention, update it in place
+        // and let normal restoration expose the newest state after the current
+        // attention owner is resolved.
+    }
+
     if !handled_background_session {
         match &mut app.active_overlay {
             ActiveOverlay::FileTaskProgress(session)
@@ -1719,6 +1746,40 @@ fn reduce_file_task_progress(
         app.browse.refresh_with_search(Some(tx));
         app.browse.probe_current_with_db(tx, Some(&app.db));
         super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
+    }
+}
+
+fn finalize_archive_staging_progress_surface(
+    app: &mut AppState,
+    session_id: u64,
+    requires_attention: bool,
+) {
+    if requires_attention {
+        return;
+    }
+    if app
+        .minimized_file_task_progress
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id)
+    {
+        app.minimized_file_task_progress = None;
+    }
+    if matches!(
+        &app.active_overlay,
+        ActiveOverlay::FileTaskProgress(session) if session.session_id == session_id
+    ) {
+        app.active_overlay = ActiveOverlay::None;
+    }
+    if matches!(
+        app.file_task_preempted_overlay.as_deref(),
+        Some(ActiveOverlay::FileTaskProgress(session)) if session.session_id == session_id
+    ) {
+        app.file_task_preempted_overlay = None;
+    }
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        if let Some(preempted) = app.file_task_preempted_overlay.take() {
+            app.active_overlay = *preempted;
+        }
     }
 }
 
@@ -4844,6 +4905,9 @@ struct MetadataEditorArchiveFieldDelta {
     path: std::path::PathBuf,
     field: String,
     value: String,
+    original_value: String,
+    ordered_values: Option<Vec<String>>,
+    original_ordered_values: Option<Vec<String>>,
 }
 
 fn metadata_editor_archive_field_deltas(
@@ -4879,6 +4943,7 @@ fn metadata_editor_archive_field_deltas(
             if !changed {
                 continue;
             }
+            let ordered_field = crate::tui::probe::metadata_field_is_set_valued(&field);
             deltas.push(MetadataEditorArchiveFieldDelta {
                 path: path.clone(),
                 field: field.clone(),
@@ -4887,6 +4952,19 @@ fn metadata_editor_archive_field_deltas(
                 } else {
                     current.map(|value| value.as_str().to_string()).unwrap_or_default()
                 },
+                original_value: original
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_default(),
+                ordered_values: ordered_field.then(|| {
+                    if is_deleted {
+                        Vec::new()
+                    } else {
+                        current.map(|value| value.to_texts()).unwrap_or_default()
+                    }
+                }),
+                original_ordered_values: ordered_field.then(|| {
+                    original.map(|value| value.to_texts()).unwrap_or_default()
+                }),
             });
         }
     }
@@ -4914,11 +4992,27 @@ fn complete_browse_archive_metadata_save(
         .iter()
         .filter(|delta| saved.contains(&delta.path))
         .map(|delta| {
-            super::keybindings::StagedArchiveMetadataChange::field(
-                delta.path.clone(),
-                delta.field.clone(),
-                delta.value.clone(),
-            )
+            match (
+                delta.ordered_values.as_ref(),
+                delta.original_ordered_values.as_ref(),
+            ) {
+                (Some(ordered_values), Some(original_ordered_values)) => {
+                    super::keybindings::StagedArchiveMetadataChange::field_with_ordered_values(
+                        delta.path.clone(),
+                        delta.field.clone(),
+                        delta.value.clone(),
+                        Some(delta.original_value.clone()),
+                        ordered_values.clone(),
+                        original_ordered_values.clone(),
+                    )
+                }
+                _ => super::keybindings::StagedArchiveMetadataChange::field(
+                    delta.path.clone(),
+                    delta.field.clone(),
+                    delta.value.clone(),
+                    Some(delta.original_value.clone()),
+                ),
+            }
         })
         .collect::<Vec<_>>();
     for path in saved_paths {
@@ -7688,6 +7782,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             path,
             field,
             value,
+            original_value,
+            ordered_values,
+            original_ordered_values,
             result,
         } => {
             if !app.complete_inline_metadata_write(operation_id, &path) {
@@ -7713,11 +7810,28 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         let staging = app.browse.active_archive_staging().cloned();
                         if let Some(staging) = staging {
                             if path.strip_prefix(&staging.staging_dir).is_ok() {
-                                let change = super::keybindings::StagedArchiveMetadataChange::field(
-                                    path.clone(),
-                                    field.label().to_string(),
-                                    value.clone(),
-                                );
+                                let change = match (
+                                    crate::tui::probe::metadata_field_is_set_valued(field.label()),
+                                    ordered_values.clone(),
+                                    original_ordered_values.clone(),
+                                ) {
+                                    (true, Some(ordered), Some(original_ordered)) => {
+                                        super::keybindings::StagedArchiveMetadataChange::field_with_ordered_values(
+                                            path.clone(),
+                                            field.label().to_string(),
+                                            value.clone(),
+                                            original_value.clone(),
+                                            ordered,
+                                            original_ordered,
+                                        )
+                                    }
+                                    _ => super::keybindings::StagedArchiveMetadataChange::field(
+                                        path.clone(),
+                                        field.label().to_string(),
+                                        value.clone(),
+                                        original_value.clone(),
+                                    ),
+                                };
                                 super::keybindings::record_staged_archive_metadata_changes(
                                     app,
                                     &staging.archive_path,
@@ -8104,6 +8218,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
         }
         AppMessage::FileTaskProgress { session_id, update } => {
             reduce_file_task_progress(app, session_id, update, tx);
+        }
+        AppMessage::ArchiveStagingProgressTerminal {
+            session_id,
+            requires_attention,
+        } => {
+            finalize_archive_staging_progress_surface(app, session_id, requires_attention);
         }
         AppMessage::FileTaskComplete {
             session_id,
@@ -10279,6 +10399,43 @@ mod metadata_detail_paste_tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn archive_field_delta_preserves_ordered_identity_when_display_strings_collide() {
+        let original = crate::tui::probe::MetadataFieldValues::from_stored_texts(["Alice; Bob"]);
+        let current = crate::tui::probe::MetadataFieldValues::from_stored_texts(["Alice", "Bob"]);
+        assert_eq!(original.as_str(), current.as_str());
+        assert_ne!(original, current);
+
+        let mut entry = set_valued_entry(
+            "ARTIST",
+            ItemKey::TrackArtist,
+            &[&["Alice; Bob"]],
+        );
+        entry.per_file_values[0] = current;
+
+        let state = MetadataEditorState::for_files(
+            vec!["/tmp/track.flac".into()],
+            vec![entry],
+            vec!["track".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        let session_id = state.active_surface().technical_details.session_id;
+        let deltas = metadata_editor_archive_field_deltas(&state, session_id);
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].field, "ARTIST");
+        assert_eq!(deltas[0].value, "Alice; Bob");
+        assert_eq!(deltas[0].original_value, "Alice; Bob");
+        assert_eq!(
+            deltas[0].ordered_values.clone(),
+            Some(vec!["Alice".to_string(), "Bob".to_string()]),
+        );
+        assert_eq!(
+            deltas[0].original_ordered_values.clone(),
+            Some(vec!["Alice; Bob".to_string()]),
+        );
     }
 
     #[test]
@@ -13514,6 +13671,9 @@ mod metadata_write_completion_tests {
                 path: path.clone(),
                 field: MetadataField::Title,
                 value: "new title".to_string(),
+                original_value: Some("old value".to_string()),
+                ordered_values: None,
+                original_ordered_values: None,
                 result: Err(
                     "write failed (rolled back): synthetic writer failure".to_string(),
                 ),
@@ -13550,6 +13710,9 @@ mod metadata_write_completion_tests {
                 path: path.clone(),
                 field: MetadataField::Title,
                 value: "new title".to_string(),
+                original_value: Some("old value".to_string()),
+                ordered_values: None,
+                original_ordered_values: None,
                 result: Err("native writer failure".to_string()),
             },
             &tx(),
@@ -13590,6 +13753,9 @@ mod metadata_write_completion_tests {
                 path: stale_path,
                 field: MetadataField::Title,
                 value: "stale".to_string(),
+                original_value: Some("old value".to_string()),
+                ordered_values: None,
+                original_ordered_values: None,
                 result: Ok(crate::tui::probe::MetadataWriteCommitReport::default()),
             },
             &tx(),
@@ -13617,6 +13783,9 @@ mod metadata_write_completion_tests {
                 path: path.clone(),
                 field: MetadataField::Title,
                 value: "new title".to_string(),
+                original_value: Some("old value".to_string()),
+                ordered_values: None,
+                original_ordered_values: None,
                 result: Ok(crate::tui::probe::MetadataWriteCommitReport {
                     durability_warnings: vec!["journal retirement could not be confirmed".to_string()],
                 }),
@@ -13816,9 +13985,18 @@ mod browse_archive_quit_lifecycle_tests {
             archive_path: archive.clone(),
             format: "zip".to_string(),
             physical_size: 7,
-            entries: Vec::new(),
+            entries: vec![crate::tui::archive_listing::ArchiveEntry {
+                path: "old.flac".to_string(),
+                size: 100,
+                packed_size: 80,
+                is_dir: false,
+                encrypted: false,
+            }],
         };
         app.browse.enter_archive(listing, None);
+        // Dirtiness is derived by comparing the staged tree with the listing, so
+        // the recorded Rename must correspond to a real staged result.
+        fs::write(staging.join("new.flac"), b"renamed").expect("staged rename target");
         let (secs, nanos, size) = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
         let mut session_guard = crate::tui::browse::ArchiveStagingSession::new_test_owned(
             staging,
@@ -19789,6 +19967,59 @@ mod minimized_file_transfer_attention_tests {
         ActiveOverlay, AppState, ConfirmAction, FileTaskProgressSession,
     };
 
+    fn park_archive_behind_transfer_attention(
+        app: &mut AppState,
+        tx: &mpsc::Sender<AppMessage>,
+    ) -> (u64, u64) {
+        let transfer_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Copying files",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (transfer_tx, _transfer_rx) = std::sync::mpsc::channel();
+        let transfer_session = FileTaskProgressSession::new(transfer_progress, transfer_tx);
+        let transfer_session_id = transfer_session.session_id;
+        app.file_transfers.active_session_id = Some(transfer_session_id);
+        app.file_transfers.keep_minimized_across_jobs = true;
+        app.install_file_task_progress_with_visibility(transfer_session, true);
+
+        let archive_progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Archive,
+            "Preparing archive",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (archive_tx, _archive_rx) = std::sync::mpsc::channel();
+        let archive_session = FileTaskProgressSession::new(archive_progress, archive_tx);
+        let archive_session_id = archive_session.session_id;
+        app.install_file_task_progress(archive_session);
+
+        reduce_file_task_progress(
+            app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+                conflict: tui_file_picker::ConflictPromptState::new(
+                    193,
+                    "Destination changed",
+                    "Choose how to continue",
+                    tui_file_picker::ConflictItemKind::File,
+                ),
+            },
+            tx,
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == transfer_session_id
+        ));
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+        ));
+        (transfer_session_id, archive_session_id)
+    }
+
     #[test]
     fn minimized_footer_state_tracks_live_progress_and_fifo_depth() {
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
@@ -20038,6 +20269,170 @@ mod minimized_file_transfer_attention_tests {
                 if session.session_id == archive_session_id
                     && matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive)
         ));
+    }
+
+    #[test]
+    fn parked_archive_staging_success_is_updated_then_discarded_without_resurrection() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let (transfer_session_id, archive_session_id) =
+            park_archive_behind_transfer_attention(&mut app, &tx);
+
+        reduce_file_task_progress(
+            &mut app,
+            archive_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                phase: tui_file_picker::FileTaskPhase::Running,
+                status: "extracting while parked".to_string(),
+                current_item: None,
+                totals: tui_file_picker::ProgressTotals {
+                    bytes_done: 40,
+                    bytes_total: Some(100),
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+                rate_bytes_per_sec: Some(10),
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+                    && session.progress.status == "extracting while parked"
+                    && session.progress.totals.bytes_done == 40
+        ));
+
+        reduce_file_task_progress(
+            &mut app,
+            archive_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Finished {
+                status: "Archive staging complete".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    bytes_done: 100,
+                    bytes_total: Some(100),
+                    completed: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveStagingProgressTerminal {
+                session_id: archive_session_id,
+                requires_attention: false,
+            },
+            &tx,
+        );
+
+        assert!(app.file_task_preempted_overlay.is_none());
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == transfer_session_id
+        ));
+
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::ClearConflict,
+            &tx,
+        );
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Finished {
+                status: "Transfer complete".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    completed: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        finalize_file_transfer_scheduler(&mut app, transfer_session_id, false, &tx);
+
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(app.file_task_preempted_overlay.is_none());
+    }
+
+    #[test]
+    fn parked_archive_staging_failure_updates_in_place_and_restores_terminal_failure() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let (transfer_session_id, archive_session_id) =
+            park_archive_behind_transfer_attention(&mut app, &tx);
+
+        reduce_file_task_progress(
+            &mut app,
+            archive_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: "Archive extraction failed".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    errors: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        handle_message(
+            &mut app,
+            AppMessage::ArchiveStagingProgressTerminal {
+                session_id: archive_session_id,
+                requires_attention: true,
+            },
+            &tx,
+        );
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == transfer_session_id
+        ));
+        assert!(matches!(
+            app.file_task_preempted_overlay.as_deref(),
+            Some(ActiveOverlay::FileTaskProgress(session))
+                if session.session_id == archive_session_id
+                    && session.progress.is_terminal()
+                    && session.progress.status == "Archive extraction failed"
+        ));
+
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::ClearConflict,
+            &tx,
+        );
+        reduce_file_task_progress(
+            &mut app,
+            transfer_session_id,
+            tui_file_picker::FileTaskProgressUpdate::Finished {
+                status: "Transfer complete".to_string(),
+                totals: tui_file_picker::ProgressTotals {
+                    completed: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        finalize_file_transfer_scheduler(&mut app, transfer_session_id, false, &tx);
+
+        assert!(matches!(
+            &app.active_overlay,
+            ActiveOverlay::FileTaskProgress(session)
+                if session.session_id == archive_session_id
+                    && session.progress.is_terminal()
+                    && session.progress.status == "Archive extraction failed"
+        ));
+        assert!(app.file_task_preempted_overlay.is_none());
     }
 
     #[test]

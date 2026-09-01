@@ -5968,6 +5968,428 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
+    fn archive_inline_metadata_original_uses_virtual_browse_path_before_staging_translation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("album.zip");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        let staging_path = staging_dir.join("track.flac");
+        std::fs::write(&staging_path, b"staged bytes").expect("staged track");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: vec![crate::tui::archive_listing::ArchiveEntry {
+                    path: "track.flac".to_string(),
+                    size: 4096,
+                    packed_size: 2048,
+                    is_dir: false,
+                    encrypted: false,
+                }],
+            },
+            None,
+        );
+        app.browse.archive.as_mut().expect("archive").staging =
+            Some(crate::tui::browse::ArchiveStagingSession::new(
+                staging_dir,
+                archive_path.clone(),
+                0,
+                0,
+                0,
+            ));
+        app.browse.refresh_archive_view();
+
+        let browse_path = archive_path.join("track.flac");
+        app.browse.insert_probe_for_identity(
+            browse_path.clone(),
+            crate::tui::browse::ProbeCacheIdentity {
+                modified: None,
+                size: 4096,
+            },
+            Some(std::sync::Arc::new(crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_format_is_float: None,
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: 4096,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    title: Some("Original".to_string()),
+                    ..Default::default()
+                },
+            })),
+        );
+
+        assert_ne!(browse_path, staging_path);
+        let original = cached_browse_metadata_value(
+            &app,
+            &browse_path,
+            crate::tui::probe::MetadataField::Title,
+        );
+        assert_eq!(original.as_deref(), Some("Original"));
+        assert_eq!(
+            cached_browse_metadata_value(
+                &app,
+                &staging_path,
+                crate::tui::probe::MetadataField::Title,
+            ),
+            None,
+            "the real staging path is not the Browse/probe-cache identity",
+        );
+
+        let staging = app.browse.active_archive_staging_mut().expect("staging");
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "title".to_string(),
+            "Changed".to_string(),
+            original,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Original".to_string(),
+            Some("Changed".to_string()),
+        );
+        assert!(!app.browse.reconcile_active_archive_staging_dirty());
+    }
+
+    #[test]
+    fn archive_inline_metadata_original_survives_staged_rename_probe_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("album.zip");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        let renamed_staging_path = staging_dir.join("renamed.flac");
+        std::fs::write(&renamed_staging_path, b"staged bytes").expect("renamed staged track");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: vec![crate::tui::archive_listing::ArchiveEntry {
+                    path: "track.flac".to_string(),
+                    size: 4096,
+                    packed_size: 2048,
+                    is_dir: false,
+                    encrypted: false,
+                }],
+            },
+            None,
+        );
+        let mut staging = crate::tui::browse::ArchiveStagingSession::new(
+            staging_dir,
+            archive_path.clone(),
+            0,
+            0,
+            0,
+        );
+        staging.append_edit(crate::tui::browse::ArchiveEdit::Rename {
+            from: "track.flac".to_string(),
+            to: "renamed.flac".to_string(),
+        });
+        app.browse.archive.as_mut().expect("archive").staging = Some(staging);
+        app.browse.refresh_archive_view();
+
+        let browse_path = archive_path.join("renamed.flac");
+        let entry = app
+            .browse
+            .entries
+            .iter()
+            .find(|entry| entry.path == browse_path)
+            .expect("renamed staged Browse entry")
+            .clone();
+        let probe_identity = crate::tui::browse::ProbeCacheIdentity::from_entry(&entry);
+        app.browse.insert_probe_for_identity(
+            browse_path.clone(),
+            probe_identity,
+            Some(std::sync::Arc::new(crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_format_is_float: None,
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: entry.size,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    title: Some("Original".to_string()),
+                    ..Default::default()
+                },
+            })),
+        );
+
+        assert!(app.browse.valid_probe_for_entry(&entry).is_some());
+        let original = cached_browse_metadata_value(
+            &app,
+            &browse_path,
+            crate::tui::probe::MetadataField::Title,
+        );
+        assert_eq!(original.as_deref(), Some("Original"));
+
+        let staging = app.browse.active_archive_staging_mut().expect("staging");
+        staging.append_metadata_write(
+            "renamed.flac".to_string(),
+            "title".to_string(),
+            "Changed".to_string(),
+            original,
+        );
+        staging.append_metadata_write(
+            "renamed.flac".to_string(),
+            "TITLE".to_string(),
+            "Original".to_string(),
+            Some("Changed".to_string()),
+        );
+        staging.append_edit(crate::tui::browse::ArchiveEdit::Rename {
+            from: "renamed.flac".to_string(),
+            to: "track.flac".to_string(),
+        });
+
+        assert!(
+            !app.browse.reconcile_active_archive_staging_dirty(),
+            "rename + metadata revert + inverse rename must be net-clean",
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_inline_artist_producer_tracks_exact_ordered_values_and_real_revert_is_clean() {
+        if !super::single_image_metadata_editor_regression_tests::fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("album.zip");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        let staging_path = staging_dir.join("track.flac");
+        assert!(
+            super::single_image_metadata_editor_regression_tests::create_flac_fixture(
+                &staging_path,
+            ),
+            "FLAC fixture"
+        );
+        crate::tui::probe::write_metadata_field_transactional(
+            &staging_path,
+            crate::tui::probe::MetadataField::Artist,
+            "Alice",
+        )
+        .expect("seed ARTIST");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let staged_size = std::fs::metadata(&staging_path).expect("metadata").len();
+        app.browse.enter_archive(
+            crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: vec![crate::tui::archive_listing::ArchiveEntry {
+                    path: "track.flac".to_string(),
+                    size: staged_size,
+                    packed_size: 2048,
+                    is_dir: false,
+                    encrypted: false,
+                }],
+            },
+            None,
+        );
+        app.browse.archive.as_mut().expect("archive").staging =
+            Some(crate::tui::browse::ArchiveStagingSession::new(
+                staging_dir.clone(),
+                archive_path.clone(),
+                0,
+                0,
+                0,
+            ));
+        app.browse.refresh_archive_view();
+
+        let browse_path = archive_path.join("track.flac");
+        let browse_entry = app
+            .browse
+            .entries
+            .iter()
+            .find(|entry| entry.path == browse_path)
+            .expect("archive Browse entry")
+            .clone();
+        let probe_identity = crate::tui::browse::ProbeCacheIdentity::from_entry(&browse_entry);
+        let cached_info = |artist: &str| {
+            std::sync::Arc::new(crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".to_string(),
+                    codec: "flac".to_string(),
+                    bit_depth: Some(16),
+                    sample_format_is_float: None,
+                    sample_rate: 44_100,
+                    channels: 2,
+                    channel_layout: "stereo".to_string(),
+                    duration_secs: 1.0,
+                    file_size: staged_size,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    artist: Some(artist.to_string()),
+                    ..Default::default()
+                },
+            })
+        };
+        app.browse.insert_probe_for_identity(
+            browse_path.clone(),
+            probe_identity.clone(),
+            Some(cached_info("Alice")),
+        );
+
+        assert!(crate::tui::probe::metadata_field_is_set_valued(
+            crate::tui::probe::MetadataField::Artist.label(),
+        ));
+        assert!(crate::tui::probe::metadata_field_is_set_valued(
+            crate::tui::probe::MetadataField::Genre.label(),
+        ));
+        assert_eq!(
+            inline_archive_metadata_final_ordered_values(
+                crate::tui::probe::MetadataField::Genre,
+                "Jazz",
+                true,
+            ),
+            Some(vec!["Jazz".to_string()]),
+            "GENRE shares the same scalar-inline exact-value producer",
+        );
+
+        let (tx, mut rx) = channel();
+        apply_text_edit(
+            &mut app,
+            TextEditTarget::BrowseMetadata {
+                path: browse_path.clone(),
+                field: crate::tui::probe::MetadataField::Artist,
+            },
+            "Bob",
+            &tx,
+        );
+        let first_complete = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("first inline metadata worker timed out")
+                .expect("first inline metadata worker channel closed");
+            if matches!(message, AppMessage::MetadataWriteComplete { .. }) {
+                break message;
+            }
+        };
+        match &first_complete {
+            AppMessage::MetadataWriteComplete {
+                field,
+                value,
+                original_value,
+                ordered_values,
+                original_ordered_values,
+                result,
+                ..
+            } => {
+                assert_eq!(*field, crate::tui::probe::MetadataField::Artist);
+                assert_eq!(value, "Bob");
+                assert_eq!(original_value.as_deref(), Some("Alice"));
+                assert_eq!(
+                    original_ordered_values.as_deref(),
+                    Some(["Alice".to_string()].as_slice()),
+                );
+                assert_eq!(
+                    ordered_values.as_deref(),
+                    Some(["Bob".to_string()].as_slice()),
+                );
+                assert!(result.is_ok(), "first inline write failed: {result:?}");
+            }
+            other => panic!("expected first MetadataWriteComplete, got {other:?}"),
+        }
+        super::super::event_loop::handle_message(&mut app, first_complete, &tx);
+
+        app.browse.insert_probe_for_identity(
+            browse_path.clone(),
+            probe_identity,
+            Some(cached_info("Bob")),
+        );
+        apply_text_edit(
+            &mut app,
+            TextEditTarget::BrowseMetadata {
+                path: browse_path,
+                field: crate::tui::probe::MetadataField::Artist,
+            },
+            "Alice",
+            &tx,
+        );
+        let second_complete = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("second inline metadata worker timed out")
+                .expect("second inline metadata worker channel closed");
+            if matches!(message, AppMessage::MetadataWriteComplete { .. }) {
+                break message;
+            }
+        };
+        match &second_complete {
+            AppMessage::MetadataWriteComplete {
+                field,
+                value,
+                original_value,
+                ordered_values,
+                original_ordered_values,
+                result,
+                ..
+            } => {
+                assert_eq!(*field, crate::tui::probe::MetadataField::Artist);
+                assert_eq!(value, "Alice");
+                assert_eq!(original_value.as_deref(), Some("Bob"));
+                assert_eq!(
+                    original_ordered_values.as_deref(),
+                    Some(["Bob".to_string()].as_slice()),
+                );
+                assert_eq!(
+                    ordered_values.as_deref(),
+                    Some(["Alice".to_string()].as_slice()),
+                );
+                assert!(result.is_ok(), "second inline write failed: {result:?}");
+            }
+            other => panic!("expected second MetadataWriteComplete, got {other:?}"),
+        }
+        super::super::event_loop::handle_message(&mut app, second_complete, &tx);
+
+        assert_eq!(
+            crate::tui::probe::read_inline_metadata_ordered_values(
+                &staging_path,
+                crate::tui::probe::MetadataField::Artist,
+            )
+            .expect("read restored ARTIST"),
+            vec!["Alice".to_string()],
+        );
+        assert!(
+            !app.browse.reconcile_active_archive_staging_dirty(),
+            "an inline ARTIST edit followed by an exact inline revert must be net-clean",
+        );
+        assert!(matches!(
+            &app.browse.active_archive_staging().expect("staging").edits[0],
+            crate::tui::browse::ArchiveEdit::MetadataWrite {
+                field,
+                ordered_values: Some(ordered_values),
+                original_ordered_values: Some(original_ordered_values),
+                ..
+            } if field == "ARTIST"
+                && ordered_values == &vec!["Alice".to_string()]
+                && original_ordered_values == &vec!["Alice".to_string()]
+        ));
+    }
+
+    #[test]
     fn browse_metadata_text_edit_refuses_non_filesystem_paths() {
         let (tx, _rx) = channel();
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -19277,7 +19699,7 @@ fn handle_file_task_user_action(
         tui_file_picker::FileTaskUserAction::None => {}
         tui_file_picker::FileTaskUserAction::Pause => {
             if matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive) {
-                app.set_status("archive repackage cannot be paused; use Esc/Ctrl-C/q to abort safely");
+                app.set_status("archive operation cannot be paused; use Esc/Ctrl-C/q to abort safely");
             } else {
                 let _ = session.controls.send(FileTaskControl::Pause);
                 app.set_status("pause requested");
@@ -19285,7 +19707,7 @@ fn handle_file_task_user_action(
         }
         tui_file_picker::FileTaskUserAction::Resume => {
             if matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive) {
-                app.set_status("archive repackage is not paused");
+                app.set_status("archive operation is not paused");
             } else {
                 let _ = session.controls.send(FileTaskControl::Resume);
                 app.set_status("resume requested");
@@ -19293,7 +19715,7 @@ fn handle_file_task_user_action(
         }
         tui_file_picker::FileTaskUserAction::SkipCurrent => {
             if matches!(&session.progress.kind, tui_file_picker::FileTaskKind::Archive) {
-                app.set_status("archive repackage has no skippable item; use Esc/Ctrl-C/q to abort safely");
+                app.set_status("archive operation has no skippable item; use Esc/Ctrl-C/q to abort safely");
             } else {
                 let _ = session.controls.send(FileTaskControl::SkipCurrent);
                 app.set_status("skip requested");
@@ -33114,7 +33536,11 @@ fn serialize_archive_staging_edits(
 }
 
 pub(super) fn persist_active_archive_staging_session(app: &mut AppState) -> Result<(), String> {
+    app.browse.reconcile_active_archive_staging_dirty();
     let Some(staging) = app.browse.active_archive_staging() else { return Ok(()); };
+    if !staging.dirty {
+        return app.db.delete_pending_archive_session(&staging.archive_path);
+    }
     let edits_json = serialize_archive_staging_edits(staging)?;
     app.db.upsert_pending_archive_session(
         &staging.archive_path,
@@ -33200,6 +33626,9 @@ pub(super) struct StagedArchiveMetadataChange {
     path: std::path::PathBuf,
     field: Option<String>,
     value: Option<String>,
+    original_value: Option<String>,
+    ordered_values: Option<Vec<String>>,
+    original_ordered_values: Option<Vec<String>>,
     kind: String,
 }
 
@@ -33208,12 +33637,35 @@ impl StagedArchiveMetadataChange {
         path: std::path::PathBuf,
         field: impl Into<String>,
         value: impl Into<String>,
+        original_value: Option<String>,
     ) -> Self {
         Self {
             path,
             field: Some(field.into()),
             value: Some(value.into()),
+            original_value,
+            ordered_values: None,
+            original_ordered_values: None,
             kind: "inline-metadata-field".to_string(),
+        }
+    }
+
+    pub(super) fn field_with_ordered_values(
+        path: std::path::PathBuf,
+        field: impl Into<String>,
+        value: impl Into<String>,
+        original_value: Option<String>,
+        ordered_values: Vec<String>,
+        original_ordered_values: Vec<String>,
+    ) -> Self {
+        Self {
+            path,
+            field: Some(field.into()),
+            value: Some(value.into()),
+            original_value,
+            ordered_values: Some(ordered_values),
+            original_ordered_values: Some(original_ordered_values),
+            kind: "metadata-editor-field".to_string(),
         }
     }
 
@@ -33225,6 +33677,9 @@ impl StagedArchiveMetadataChange {
             path,
             field: None,
             value: None,
+            original_value: None,
+            ordered_values: None,
+            original_ordered_values: None,
             kind: kind.into(),
         }
     }
@@ -33238,7 +33693,14 @@ fn append_staged_archive_metadata_changes(
         let inner = staged_archive_inner_path_for_metadata_path(&staging.staging_dir, &change.path)?;
         match (&change.field, &change.value) {
             (Some(field), Some(value)) => {
-                staging.append_metadata_write(inner, field.clone(), value.clone());
+                staging.append_metadata_write_with_ordered_values(
+                    inner,
+                    field.clone(),
+                    value.clone(),
+                    change.original_value.clone(),
+                    change.ordered_values.clone(),
+                    change.original_ordered_values.clone(),
+                );
             }
             _ => {
                 staging.append_content_modified(inner, change.kind.clone());
@@ -33865,6 +34327,124 @@ fn browse_archive_expected_extract_bytes(app: &AppState, archive_path: &std::pat
     (total > 0).then_some(total)
 }
 
+fn start_browse_archive_staging_progress(
+    app: &mut AppState,
+    archive_path: &std::path::Path,
+    staging_dir: &std::path::Path,
+    title: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (u64, tokio_util::sync::CancellationToken) {
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        tui_file_picker::FileTaskKind::Archive,
+        title,
+        file_picker_theme_from_theme(&app.theme),
+    );
+    progress.set_minimize_available(true);
+    progress.set_scope(tui_file_picker::FileTaskScope {
+        source_root: Some(archive_path.to_path_buf()),
+        source_summary: archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.display().to_string()),
+        destination: Some(staging_dir.to_path_buf()),
+        destination_summary: Some("local archive staging".to_string()),
+    });
+    progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+        phase: tui_file_picker::FileTaskPhase::Preparing,
+        status: "Preparing archive staging...".to_string(),
+        current_item: None,
+        totals: tui_file_picker::ProgressTotals {
+            items_total: Some(1),
+            item_unit: tui_file_picker::ProgressUnit::Files,
+            ..tui_file_picker::ProgressTotals::default()
+        },
+        rate_bytes_per_sec: None,
+    });
+    let session = super::app::FileTaskProgressSession::new(progress, control_tx);
+    let session_id = session.session_id;
+    let start_minimized = app.minimized_file_task_progress.is_none();
+    app.install_file_task_progress_with_visibility(session, start_minimized);
+
+    let control_done = tokio_util::sync::CancellationToken::new();
+    let done_for_controls = control_done.clone();
+    tokio::task::spawn_blocking(move || {
+        while !done_for_controls.is_cancelled() {
+            match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(super::app::FileTaskControl::Abort) => {
+                    cancel.cancel();
+                    break;
+                }
+                Ok(super::app::FileTaskControl::Pause)
+                | Ok(super::app::FileTaskControl::Resume)
+                | Ok(super::app::FileTaskControl::SkipCurrent)
+                | Ok(super::app::FileTaskControl::ConflictResolution { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    (session_id, control_done)
+}
+
+fn archive_extraction_file_task_update(
+    snapshot: &crate::convert::pipeline::materializer_archive::ArchiveExtractionProgressSnapshot,
+) -> tui_file_picker::FileTaskProgressUpdate {
+    let status = snapshot.status.clone();
+    tui_file_picker::FileTaskProgressUpdate::Snapshot {
+        phase: tui_file_picker::FileTaskPhase::Running,
+        status: status.clone(),
+        current_item: Some(tui_file_picker::ProgressItem {
+            label: status,
+            source: None,
+            destination: None,
+            bytes_done: snapshot.bytes_done,
+            bytes_total: snapshot.bytes_total,
+        }),
+        totals: tui_file_picker::ProgressTotals {
+            items_done: 0,
+            items_total: Some(1),
+            item_unit: tui_file_picker::ProgressUnit::Files,
+            bytes_done: snapshot.bytes_done,
+            bytes_total: snapshot.bytes_total,
+            ..tui_file_picker::ProgressTotals::default()
+        },
+        rate_bytes_per_sec: None,
+    }
+}
+
+fn archive_staging_terminal_update(
+    ok: bool,
+    cancelled: bool,
+) -> tui_file_picker::FileTaskProgressUpdate {
+    let totals = tui_file_picker::ProgressTotals {
+        items_done: u64::from(!cancelled),
+        items_total: Some(1),
+        item_unit: tui_file_picker::ProgressUnit::Files,
+        completed: u64::from(ok),
+        errors: u64::from(!ok && !cancelled),
+        not_attempted: u64::from(cancelled),
+        ..tui_file_picker::ProgressTotals::default()
+    };
+    if ok {
+        tui_file_picker::FileTaskProgressUpdate::Finished {
+            status: "Archive staging ready".to_string(),
+            totals,
+        }
+    } else if cancelled {
+        tui_file_picker::FileTaskProgressUpdate::Aborted {
+            status: "Archive staging cancelled".to_string(),
+            totals,
+        }
+    } else {
+        tui_file_picker::FileTaskProgressUpdate::Failed {
+            status: "Archive staging failed".to_string(),
+            totals,
+        }
+    }
+}
+
 fn archive_extract_progress_message(
     label: &str,
     snapshot: &crate::convert::pipeline::materializer_archive::ArchiveExtractionProgressSnapshot,
@@ -33933,6 +34513,7 @@ pub(super) fn cancel_and_detach_pending_browse_archive_edit_staging(
 }
 
 pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    app.browse.reconcile_active_archive_staging_dirty();
     // Extraction/native-rename preparation has no user edit to preserve yet.
     // Request cooperative cancellation but do not trap navigation waiting for
     // the worker. Result reducers own late cleanup and never apply an edit once
@@ -34150,6 +34731,13 @@ fn open_browse_archive_metadata_editor_for_entries(
     };
     let target_count = target_inner_paths.as_ref().map(|paths| paths.len());
     let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+    let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+        app,
+        &archive_path,
+        &staging_dir,
+        "Preparing archive metadata edit",
+        cancel.clone(),
+    );
     app.pending_browse_archive_metadata = Some(pending);
     app.set_status(match target_count {
         Some(1) => format!(
@@ -34209,6 +34797,10 @@ fn open_browse_archive_metadata_editor_for_entries(
                     let progress_archive = archive_path.clone();
                     let progress_staging = staging_dir.clone();
                     move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
                         let _ = progress_tx.try_send(AppMessage::ArchiveMetadataEditorProgress {
                             archive_path: progress_archive.clone(),
                             staging_dir: progress_staging.clone(),
@@ -34287,6 +34879,16 @@ fn open_browse_archive_metadata_editor_for_entries(
             super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
         }
 
+        let cancelled = cancel.is_cancelled();
+        progress_control_done.cancel();
+        let _ = tx.send(AppMessage::FileTaskProgress {
+            session_id: progress_session_id,
+            update: archive_staging_terminal_update(result.is_ok(), cancelled),
+        }).await;
+        let _ = tx.send(AppMessage::ArchiveStagingProgressTerminal {
+            session_id: progress_session_id,
+            requires_attention: result.is_err() && !cancelled,
+        }).await;
         let _ = tx
             .send(AppMessage::ArchiveMetadataEditorPrepared {
                 archive_path: archive_for_result,
@@ -34929,6 +35531,13 @@ pub(super) fn start_browse_archive_entry_delete(
         },
     };
     let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+    let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+        app,
+        &archive_path,
+        &staging_dir,
+        "Preparing archive delete",
+        cancel.clone(),
+    );
     let tx = tx.clone();
 
     app.browse.bump_archive_probe_epoch_for(&archive_path);
@@ -34972,6 +35581,10 @@ pub(super) fn start_browse_archive_entry_delete(
                     let progress_archive = archive_path.clone();
                     let progress_staging = staging_dir.clone();
                     move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
                         let _ = progress_tx.try_send(AppMessage::ArchiveEntryDeleteProgress {
                             archive_path: progress_archive.clone(),
                             staging_dir: progress_staging.clone(),
@@ -35003,6 +35616,16 @@ pub(super) fn start_browse_archive_entry_delete(
             Ok(())
         }
         .await;
+        let cancelled = cancel.is_cancelled();
+        progress_control_done.cancel();
+        let _ = tx.send(AppMessage::FileTaskProgress {
+            session_id: progress_session_id,
+            update: archive_staging_terminal_update(result.is_ok(), cancelled),
+        }).await;
+        let _ = tx.send(AppMessage::ArchiveStagingProgressTerminal {
+            session_id: progress_session_id,
+            requires_attention: result.is_err() && !cancelled,
+        }).await;
         let _ = tx
             .send(AppMessage::ArchiveEntryDeleteResult {
                 archive_path: archive_for_result,
@@ -46812,6 +47435,56 @@ fn store_archive_password_for_path(
     app.keychain.reload()?;
     Ok(())
 }
+fn cached_browse_metadata_value(
+    app: &AppState,
+    browse_path: &std::path::Path,
+    field: crate::tui::probe::MetadataField,
+) -> Option<String> {
+    let entry = app
+        .browse
+        .entries
+        .iter()
+        .find(|entry| entry.path == browse_path)?;
+    let cached = app.browse.valid_archive_probe_for_entry(entry)?;
+    Some(match field {
+        crate::tui::probe::MetadataField::Title => {
+            cached.metadata.title.clone().unwrap_or_default()
+        }
+        crate::tui::probe::MetadataField::Artist => {
+            cached.metadata.artist.clone().unwrap_or_default()
+        }
+        crate::tui::probe::MetadataField::Album => {
+            cached.metadata.album.clone().unwrap_or_default()
+        }
+        crate::tui::probe::MetadataField::Genre => {
+            cached.metadata.genre.clone().unwrap_or_default()
+        }
+        crate::tui::probe::MetadataField::Year => {
+            cached.metadata.year.clone().unwrap_or_default()
+        }
+    })
+}
+
+fn inline_archive_metadata_original_ordered_values(
+    path: &std::path::Path,
+    field: crate::tui::probe::MetadataField,
+    track_exact_ordered_values: bool,
+) -> Option<Vec<String>> {
+    track_exact_ordered_values
+        .then(|| crate::tui::probe::read_inline_metadata_ordered_values(path, field).ok())
+        .flatten()
+}
+
+fn inline_archive_metadata_final_ordered_values(
+    field: crate::tui::probe::MetadataField,
+    value: &str,
+    track_exact_ordered_values: bool,
+) -> Option<Vec<String>> {
+    (track_exact_ordered_values
+        && crate::tui::probe::metadata_field_is_set_valued(field.label()))
+    .then(|| crate::tui::probe::inline_metadata_scalar_ordered_values(value))
+}
+
 fn apply_text_edit(
     app: &mut AppState,
     target: TextEditTarget,
@@ -46854,7 +47527,14 @@ fn apply_text_edit(
             do_file_op(app, &sources, trimmed, force, true, tx, None);
         }
         TextEditTarget::BrowseMetadata { path, field } => {
-            let write_path = if app.browse.is_in_archive() {
+            // Capture from the logical Browse entry before translating an
+            // archive member to its extracted staging path. Archive probe
+            // cache entries are keyed by the virtual archive-child path.
+            let original_value = cached_browse_metadata_value(app, &path, field);
+            let is_archive_edit = app.browse.is_in_archive();
+            let track_exact_ordered_values = is_archive_edit
+                && crate::tui::probe::metadata_field_is_set_valued(field.label());
+            let write_path = if is_archive_edit {
                 let Some(staging) = app.browse.active_archive_staging().cloned() else {
                     browse_archive_inline_metadata_status(app);
                     return;
@@ -46920,26 +47600,47 @@ fn apply_text_edit(
             tokio::spawn(async move {
                 let value_for_write = write_value.clone();
                 let progress_tx = tx.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let report_progress = |path: &std::path::Path,
-                                           update: crate::dsf_tags::DsfWriteProgress| {
-                        let _ = progress_tx.blocking_send(AppMessage::MetadataWriteProgress {
-                            operation_id,
-                            path: path.to_path_buf(),
-                            detail: metadata_save_progress_detail(1, 1, path, update),
+                let (result, original_ordered_values, ordered_values) =
+                    tokio::task::spawn_blocking(move || {
+                        let original_ordered_values =
+                            inline_archive_metadata_original_ordered_values(
+                                &write_path,
+                                write_field,
+                                track_exact_ordered_values,
+                            );
+                        let report_progress = |path: &std::path::Path,
+                                               update: crate::dsf_tags::DsfWriteProgress| {
+                            let _ = progress_tx.blocking_send(AppMessage::MetadataWriteProgress {
+                                operation_id,
+                                path: path.to_path_buf(),
+                                detail: metadata_save_progress_detail(1, 1, path, update),
+                            });
+                        };
+                        let result = crate::tui::probe::write_metadata_field_transactional_with_control_at_verification(
+                            &write_path,
+                            write_field,
+                            &value_for_write,
+                            Some(&cancel),
+                            Some(&report_progress),
+                            verification,
+                        );
+                        let ordered_values = result.as_ref().ok().and_then(|_| {
+                            inline_archive_metadata_final_ordered_values(
+                                write_field,
+                                &value_for_write,
+                                track_exact_ordered_values,
+                            )
                         });
-                    };
-                    crate::tui::probe::write_metadata_field_transactional_with_control_at_verification(
-                        &write_path,
-                        write_field,
-                        &value_for_write,
-                        Some(&cancel),
-                        Some(&report_progress),
-                        verification,
-                    )
-                })
+                        (result, original_ordered_values, ordered_values)
+                    })
                 .await
-                .unwrap_or_else(|e| Err(format!("write failed before completion: task panic: {e}")));
+                .unwrap_or_else(|e| {
+                    (
+                        Err(format!("write failed before completion: task panic: {e}")),
+                        None,
+                        None,
+                    )
+                });
 
                 let _ = tx
                     .send(AppMessage::MetadataWriteComplete {
@@ -46947,6 +47648,9 @@ fn apply_text_edit(
                         path,
                         field: write_field,
                         value: write_value,
+                        original_value,
+                        ordered_values,
+                        original_ordered_values,
                         result,
                     })
                     .await;
@@ -59156,6 +59860,13 @@ fn start_browse_archive_entry_rename(
         return Err(message);
     }
     let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+    let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+        app,
+        &archive_path,
+        &staging_dir,
+        "Preparing archive rename",
+        cancel.clone(),
+    );
     let tx = tx.clone();
 
     // Mutation is now in progress. Reject any archive-entry info-pane probe
@@ -59195,6 +59906,31 @@ fn start_browse_archive_entry_rename(
                         } else {
                             snapshot.bytes_done.saturating_mul(100) / snapshot.bytes_total
                         };
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                                phase: tui_file_picker::FileTaskPhase::Running,
+                                status: snapshot.status.clone(),
+                                current_item: Some(tui_file_picker::ProgressItem {
+                                    label: snapshot.status.clone(),
+                                    source: None,
+                                    destination: None,
+                                    bytes_done: snapshot.bytes_done,
+                                    bytes_total: Some(snapshot.bytes_total),
+                                }),
+                                // ArchiveNativeRenameProgressSnapshot carries only
+                                // status/bytes_done/bytes_total, so item counts and a
+                                // transfer rate are left at their defaults rather than
+                                // fabricated here.
+                                totals: tui_file_picker::ProgressTotals {
+                                    item_unit: tui_file_picker::ProgressUnit::Files,
+                                    bytes_done: snapshot.bytes_done,
+                                    bytes_total: Some(snapshot.bytes_total),
+                                    ..tui_file_picker::ProgressTotals::default()
+                                },
+                                rate_bytes_per_sec: None,
+                            },
+                        });
                         let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
                             archive_path: progress_archive.clone(),
                             staging_dir: progress_staging.clone(),
@@ -59236,6 +59972,10 @@ fn start_browse_archive_entry_rename(
                     let progress_archive = archive_path.clone();
                     let progress_staging = staging_dir.clone();
                     move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
                         let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
                             archive_path: progress_archive.clone(),
                             staging_dir: progress_staging.clone(),
@@ -59270,6 +60010,16 @@ fn start_browse_archive_entry_rename(
             super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
         }
 
+        let cancelled = cancel.is_cancelled();
+        progress_control_done.cancel();
+        let _ = tx.send(AppMessage::FileTaskProgress {
+            session_id: progress_session_id,
+            update: archive_staging_terminal_update(result.is_ok(), cancelled),
+        }).await;
+        let _ = tx.send(AppMessage::ArchiveStagingProgressTerminal {
+            session_id: progress_session_id,
+            requires_attention: result.is_err() && !cancelled,
+        }).await;
         let _ = tx.send(AppMessage::ArchiveEntryRenameResult {
             archive_path: archive_for_result,
             staging_dir: staging_for_result,
@@ -59523,6 +60273,13 @@ fn start_browse_iso_wv_archive_create(
         },
     };
     let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+    let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+        app,
+        &archive_path,
+        &staging_dir,
+        "Preparing archive create",
+        cancel.clone(),
+    );
     let tx_for_task = tx.clone();
     app.browse.bump_archive_probe_epoch_for(&archive_path);
     app.pending_browse_archive_create = Some(pending);
@@ -59564,6 +60321,10 @@ fn start_browse_iso_wv_archive_create(
                     let progress_archive = archive_path.clone();
                     let progress_staging = staging_dir.clone();
                     move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
                         let _ = progress_tx.try_send(AppMessage::ArchiveEntryCreateProgress {
                             archive_path: progress_archive.clone(),
                             staging_dir: progress_staging.clone(),
@@ -59593,6 +60354,16 @@ fn start_browse_iso_wv_archive_create(
         if result.is_err() {
             super::app::cleanup_archive_metadata_staging_dir(&staging_for_result);
         }
+        let cancelled = cancel.is_cancelled();
+        progress_control_done.cancel();
+        let _ = tx_for_task.send(AppMessage::FileTaskProgress {
+            session_id: progress_session_id,
+            update: archive_staging_terminal_update(result.is_ok(), cancelled),
+        }).await;
+        let _ = tx_for_task.send(AppMessage::ArchiveStagingProgressTerminal {
+            session_id: progress_session_id,
+            requires_attention: result.is_err() && !cancelled,
+        }).await;
         let _ = tx_for_task
             .send(AppMessage::ArchiveEntryCreateResult {
                 archive_path: archive_for_result,
@@ -60586,6 +61357,7 @@ pub(super) fn switch_screen_reconciling_browse_archive(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let leaving_browse = app.current_screen == AppScreen::Browse && target != AppScreen::Browse;
+    app.browse.reconcile_active_archive_staging_dirty();
     let dirty_archive_staging = app
         .browse
         .active_archive_staging()
@@ -78837,8 +79609,18 @@ mod staged_archive_metadata_path_tests {
         fs::write(&track, b"audio").expect("track");
         let baseline = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
         let changes = vec![
-            StagedArchiveMetadataChange::field(track.clone(), "TITLE", "Draft"),
-            StagedArchiveMetadataChange::field(track.clone(), "TITLE", "Final"),
+            StagedArchiveMetadataChange::field(
+                track.clone(),
+                "TITLE",
+                "Draft",
+                Some("Original".to_string()),
+            ),
+            StagedArchiveMetadataChange::field(
+                track.clone(),
+                "TITLE",
+                "Final",
+                Some("Draft".to_string()),
+            ),
         ];
 
         let session = archive_metadata_session_from_changes(
@@ -78853,7 +79635,12 @@ mod staged_archive_metadata_path_tests {
             .edits
             .iter()
             .filter_map(|edit| match edit {
-                crate::tui::browse::ArchiveEdit::MetadataWrite { inner_path, field, value } => {
+                crate::tui::browse::ArchiveEdit::MetadataWrite {
+                    inner_path,
+                    field,
+                    value,
+                    ..
+                } => {
                     Some((inner_path.as_str(), field.as_str(), value.as_str()))
                 }
                 _ => None,
@@ -78862,6 +79649,50 @@ mod staged_archive_metadata_path_tests {
         assert_eq!(writes, vec![("track.flac", "TITLE", "Final")]);
     }
 
+
+    #[test]
+    fn editor_owned_archive_metadata_session_preserves_exact_ordered_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.zip");
+        let staging = temp.path().join("staging");
+        fs::write(&archive, b"archive").expect("archive");
+        fs::create_dir_all(&staging).expect("staging");
+        let track = staging.join("track.flac");
+        fs::write(&track, b"audio").expect("track");
+        let baseline = crate::tui::app::archive_fingerprint(&archive).expect("fingerprint");
+        let changes = vec![StagedArchiveMetadataChange::field_with_ordered_values(
+            track,
+            "ARTIST",
+            "Alice; Bob",
+            Some("Alice; Bob".to_string()),
+            vec!["Alice".to_string(), "Bob".to_string()],
+            vec!["Alice; Bob".to_string()],
+        )];
+
+        let session = archive_metadata_session_from_changes(
+            &archive,
+            &staging,
+            Some(baseline),
+            &changes,
+        )
+        .expect("metadata session");
+
+        assert!(matches!(
+            &session.edits[0],
+            crate::tui::browse::ArchiveEdit::MetadataWrite {
+                field,
+                value,
+                original_value: Some(original_value),
+                ordered_values: Some(ordered_values),
+                original_ordered_values: Some(original_ordered_values),
+                ..
+            } if field == "ARTIST"
+                && value == "Alice; Bob"
+                && original_value == "Alice; Bob"
+                && ordered_values == &vec!["Alice".to_string(), "Bob".to_string()]
+                && original_ordered_values == &vec!["Alice; Bob".to_string()]
+        ));
+    }
 
     #[test]
     fn preserved_active_browse_context_does_not_block_archive_metadata_editor_open() {

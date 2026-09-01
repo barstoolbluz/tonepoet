@@ -1789,3 +1789,166 @@ operations at commit time.
   The point is that no cheap per-operation delete primitive exists for solid archives, so
   the deferred model is what makes delete affordable, and it is exactly that model the
   native rename path opted out of.
+
+## 24. A staged rename leaves the pre-rename name visible beside the new one
+
+**Status:** open. Reported from field use 2026-09-01, after `653cb1e`.
+
+Renaming a folder inside an archive to a case-only variant — `Artwork` to `artwork` — leaves
+**both** entries visible in the in-archive view. The packaged archive is correct: the
+duplicate is never persisted, and saving produces the intended single directory. The defect
+is confined to what Browse displays while edits are staged, but it reads as data corruption
+to the user, who cannot tell that one of the two is a ghost.
+
+This is the same observation recorded earlier as unexplained. It now has a reproduction: a
+case-only rename of an existing archive directory.
+
+### Mechanism
+
+`BrowseState`'s archive row construction (`src/tui/browse.rs`, around the
+`arc.listing.entries_at(&arc.inner_path)` call) does two passes:
+
+1. It renders **every** entry returned by `entries_at`, which comes from
+   `arc.listing.entries` — the listing captured from the archive *before* any edits. The loop
+   looks up staged metadata to refine kind/size/mtime, but there is no guard that skips an
+   entry whose staged path no longer exists.
+2. It then scans the staging directory for that inner path and appends any child not already
+   present, gated by `listing_paths.contains(&inner)` — an exact string comparison.
+
+After renaming `Artwork` to `artwork`, the staging tree holds only `artwork`. Pass 1 still
+emits `Artwork` from the stale listing; pass 2 sees `artwork`, finds no exact match in
+`listing_paths`, and appends it. Both render.
+
+Nothing in either pass consults `ArchiveStagingSession::edits`, even though that log already
+records `ArchiveEdit::Rename { from, to }` (`src/tui/browse.rs:2987`) and is persisted for
+recovery. The information needed to suppress the superseded name is present and unused.
+
+### Scope is broader than the case-only symptom
+
+The comparison is exact, so the mechanism is not specific to case. Any staged rename should
+leave its old name visible. Case-only renames are simply the variant where the two entries
+look like duplicates of one thing rather than two unrelated names, which is why this is what
+got noticed.
+
+Renames that take the format-native path install a rewritten archive immediately and Browse
+re-lists it, so those refresh correctly; the stale view is a property of the staged/deferred
+path. Which path a given rename takes depends on format, tool availability, and whether the
+directory is explicit or synthesized, so the user-visible behaviour is inconsistent between
+otherwise identical-looking operations.
+
+### Cautionary history
+
+An earlier round attempted ASCII-case-insensitive path reconciliation across Browse, probes,
+tag extraction, and rename/delete validation. It was cut back before landing because review
+found it could suppress a genuinely distinct user-created `artwork` sitting beside `Artwork`,
+or resolve a case-only staged rename back to the old spelling even though the staged bytes
+carried the user's spelling. Case-insensitive matching is therefore known not to be the
+answer here; the edit log is authoritative about what superseded what, and case-folding
+discards exactly the distinction that matters.
+
+### Outcomes wanted
+
+- What Browse shows while edits are staged should match what saving would produce.
+- A user should not have to know whether their rename took the native or the staged path to
+  predict what the view will show.
+
+Mechanism and scope are the implementer's call.
+
+## 25. Long archive transfers should use the existing progress surface, not just the status bar
+
+**Status:** open work item. Raised 2026-09-01 after `653cb1e`.
+
+The locality work landed in `653cb1e` reports archive copy and extraction progress through
+the status bar. That is an improvement on silence, but it is a single line of text for an
+operation that can move several gigabytes and run for tens of seconds or longer.
+
+The project already owns a surface built for exactly this: a long file transfer the user
+should be able to ignore while continuing to work.
+
+- `AppState::minimized_file_task_progress` (`src/tui/app.rs:12702`) holds a
+  `FileTaskProgressSession` (`app.rs:6658`) parked outside the modal overlay and rendered in
+  the shared footer rather than as a pop-up box.
+- Its doc comment records the property that matters: the session retains its
+  `controls: mpsc::Sender<FileTaskControl>`, so "cancellation/conflict guarantees are
+  identical whether the surface is visible or in the shared footer."
+- `FileTransferQueueState::keep_minimized_across_jobs` (`app.rs:6780`) already expresses
+  "keep this minimized", and `blocked_for_attention` already expresses "this needs the user
+  now".
+- Coverage exists, for example `minimized_footer_state_tracks_live_progress_and_fifo_depth`
+  and `visible_archive_install_preserves_scheduler_owned_minimized_transfer` in
+  `event_loop.rs`.
+
+The user's position is that not using this for archive localization and extraction is a
+mistake, and that such an operation could reasonably start **minimized by default** — footer
+progress bar rather than a modal box — so the user keeps working, still sees progress, and
+retains cancellation.
+
+### Open questions
+
+- Whether minimized-by-default applies to every archive transfer, only above a size
+  threshold, or is a user preference.
+- Whether the archive copy should become a first-class job in the existing transfer queue or
+  merely borrow its progress surface. The queue carries FIFO ordering, preemption, and
+  journal-based crash recovery, which may or may not be wanted for an edit-session transfer
+  that is already inside its own transaction.
+- How this interacts with the copy-back leg, which currently runs inside the
+  backup/install/restore transaction and is deliberately non-cancellable past the final
+  conflict check.
+
+## 26. Reverting an archive edit still leaves the session marked as needing a repackage
+
+**Status:** open. Reported from field use 2026-09-01, after `653cb1e`.
+
+Extract an archive, change something, then change it back. Tonepoet still wants to repackage
+the archive, even though the staged tree once again matches what the archive already
+contains.
+
+This is not cosmetic. Repackaging a multi-gigabyte archive is the expensive operation this
+whole line of work exists to avoid, and the user is prompted to pay it for a net change of
+nothing — on remote storage, including a full sequential copy back.
+
+### Mechanism
+
+`ArchiveStagingSession` (`src/tui/browse.rs:3009`) carries `dirty: bool` alongside its
+`edits` log. It has three mutation methods — `append_edit`, `append_metadata_write`, and
+`append_content_modified` — and all five of their write paths latch the flag:
+
+```rust
+pub fn append_edit(&mut self, edit: ArchiveEdit) {
+    self.edits.push(edit);
+    self.dirty = true;
+}
+```
+
+`self.dirty = true` appears at `src/tui/browse.rs:3063`, `:3081`, `:3090`, `:3103` and
+`:3108`. The string `dirty = false` does not appear anywhere in `src/tui/browse.rs`. The flag
+is monotonic for the lifetime of the session.
+
+Renaming `Artwork` to `artwork` and back therefore appends two `ArchiveEdit::Rename` records
+and leaves `dirty` latched over a staging tree identical to the archive.
+`append_metadata_write` does coalesce repeated writes to the same field, but it still latches
+on the coalesced result, so writing a tag back to its original value dirties the session too.
+
+### Related to #24
+
+#24 (a staged rename leaving the pre-rename name visible) and this entry share an observable
+property: in neither case does anything establish the current relationship between the staged
+tree and the archive's original contents. #24's view reads the staging tree only to add
+entries and refine kind/size/mtime, never to retire a listing entry staging no longer backs;
+this entry's flag records that a mutation occurred and cannot be cleared by any later state,
+including a state identical to the original.
+
+Whether that shared property means they share a solution, and what any such approach would
+cost on a large archive, is open.
+
+Note also that `edits` doubles as the crash-recovery log, so it has a second consumer whose
+needs may differ from the view's and the dirty flag's.
+
+### Outcomes wanted
+
+- A user who reverts their changes should not be asked to repackage.
+- Whatever answers "does this need saving" should agree with what a save would actually
+  produce.
+
+Mechanism and scope are the implementer's call. Described in full as section B of
+`BRIEF_archive_staged_view_and_progress_2026-09-01.md`.

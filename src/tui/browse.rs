@@ -2991,8 +2991,26 @@ pub enum ArchiveEdit {
     /// `field=metadata,value=updated`; new inline writes store the actual
     /// edited metadata field and final value. Repackage still treats the
     /// staged tree as the source of truth, but the log is now meaningful for
-    /// audit, recovery review, and future replay.
-    MetadataWrite { inner_path: String, field: String, value: String },
+    /// audit, recovery review, and future replay. `original_value` is the
+    /// archive-member baseline when it was known before the first staged
+    /// write; `None` is intentionally sticky and means equivalence cannot be
+    /// proven from the recovery log alone.
+    MetadataWrite {
+        inner_path: String,
+        field: String,
+        value: String,
+        #[serde(default)]
+        original_value: Option<String>,
+        /// Lossless ordered members for set-valued metadata fields. `None`
+        /// means the exact stored-value representation was not known at the
+        /// time this recovery row was recorded; that uncertainty is sticky.
+        #[serde(default)]
+        ordered_values: Option<Vec<String>>,
+        /// Exact archive baseline corresponding to `ordered_values`. Older
+        /// recovery rows deserialize as `None` and must remain conservative.
+        #[serde(default)]
+        original_ordered_values: Option<Vec<String>>,
+    },
     /// Non-field-specific file content change.
     ///
     /// The metadata editor, artwork writer, and ReplayGain writer can update
@@ -3063,21 +3081,65 @@ impl ArchiveStagingSession {
         self.dirty = true;
     }
 
-    pub fn append_metadata_write(&mut self, inner_path: String, field: String, value: String) {
-        if let Some(ArchiveEdit::MetadataWrite {
-            value: existing_value,
-            ..
-        }) = self.edits.iter_mut().rev().find(|edit| {
-            matches!(
+    pub fn append_metadata_write(
+        &mut self,
+        inner_path: String,
+        field: String,
+        value: String,
+        original_value: Option<String>,
+    ) {
+        self.append_metadata_write_with_ordered_values(
+            inner_path,
+            field,
+            value,
+            original_value,
+            None,
+            None,
+        );
+    }
+
+    pub fn append_metadata_write_with_ordered_values(
+        &mut self,
+        inner_path: String,
+        field: String,
+        value: String,
+        original_value: Option<String>,
+        ordered_values: Option<Vec<String>>,
+        original_ordered_values: Option<Vec<String>>,
+    ) {
+        let field = crate::tui::probe::canonical_metadata_display_key(&field);
+        let mut matching_index = None;
+        for (index, edit) in self.edits.iter().enumerate().rev() {
+            if archive_edit_may_change_path_origin(edit, &inner_path) {
+                break;
+            }
+            if matches!(
                 edit,
                 ArchiveEdit::MetadataWrite {
                     inner_path: existing_inner,
                     field: existing_field,
                     ..
-                } if existing_inner == &inner_path && existing_field == &field
-            )
-        }) {
+                } if existing_inner == &inner_path
+                    && crate::tui::probe::canonical_metadata_display_key(existing_field) == field
+            ) {
+                matching_index = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = matching_index {
+            let ArchiveEdit::MetadataWrite {
+                value: existing_value,
+                ordered_values: existing_ordered_values,
+                ..
+            } = &mut self.edits[index]
+            else {
+                unreachable!("metadata index was selected only from MetadataWrite edits");
+            };
             *existing_value = value;
+            // Replace only the final exact representation. The first exact
+            // archive baseline is retained, and an unknown baseline from an
+            // older recovery row is never backfilled from later staged state.
+            *existing_ordered_values = ordered_values;
             self.dirty = true;
             return;
         }
@@ -3086,6 +3148,9 @@ impl ArchiveStagingSession {
             inner_path,
             field,
             value,
+            original_value,
+            ordered_values,
+            original_ordered_values,
         });
         self.dirty = true;
     }
@@ -3107,6 +3172,152 @@ impl ArchiveStagingSession {
         self.edits.push(ArchiveEdit::ContentModified { inner_path, kind });
         self.dirty = true;
     }
+}
+
+
+fn archive_path_is_at_or_below(path: &str, root: &str) -> bool {
+    path == root || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn archive_edit_may_change_path_origin(edit: &ArchiveEdit, path: &str) -> bool {
+    match edit {
+        ArchiveEdit::Rename { from, to } => {
+            archive_path_is_at_or_below(path, from) || archive_path_is_at_or_below(path, to)
+        }
+        ArchiveEdit::Delete { inner_path } | ArchiveEdit::Create { inner_path, .. } => {
+            archive_path_is_at_or_below(path, inner_path)
+        }
+        ArchiveEdit::MetadataWrite { .. } | ArchiveEdit::ContentModified { .. } => false,
+    }
+}
+
+fn archive_path_after_structural_edits(path: &str, edits: &[ArchiveEdit]) -> Option<String> {
+    let mut current = path.to_string();
+    for edit in edits {
+        match edit {
+            ArchiveEdit::Rename { from, to } if archive_path_is_at_or_below(&current, from) => {
+                let suffix = &current[from.len()..];
+                current = format!("{to}{suffix}");
+            }
+            ArchiveEdit::Delete { inner_path } if archive_path_is_at_or_below(&current, inner_path) => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(current)
+}
+
+fn archive_staging_has_net_changes(
+    listing: &crate::tui::archive_listing::ArchiveListing,
+    staging: &ArchiveStagingSession,
+) -> bool {
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum PathOrigin {
+        Original(String),
+        Created,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MetadataState {
+        original_value: Option<String>,
+        value: String,
+        ordered_values: Option<Vec<String>>,
+        original_ordered_values: Option<Vec<String>>,
+    }
+
+    let original: BTreeMap<String, PathOrigin> = listing
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                PathOrigin::Original(entry.path.clone()),
+            )
+        })
+        .collect();
+    let mut current = original.clone();
+    let mut metadata: BTreeMap<(String, String), MetadataState> = BTreeMap::new();
+
+    for edit in &staging.edits {
+        match edit {
+            ArchiveEdit::Rename { from, to } => {
+                let affected: Vec<(String, PathOrigin)> = current
+                    .iter()
+                    .filter(|(path, _)| archive_path_is_at_or_below(path, from))
+                    .map(|(path, origin)| (path.clone(), origin.clone()))
+                    .collect();
+                for (path, origin) in affected {
+                    current.remove(&path);
+                    let suffix = &path[from.len()..];
+                    current.insert(format!("{to}{suffix}"), origin);
+                }
+            }
+            ArchiveEdit::Delete { inner_path } => {
+                current.retain(|path, _| !archive_path_is_at_or_below(path, inner_path));
+            }
+            ArchiveEdit::Create { inner_path, .. } => {
+                current.insert(inner_path.clone(), PathOrigin::Created);
+            }
+            ArchiveEdit::MetadataWrite {
+                inner_path,
+                field,
+                value,
+                original_value,
+                ordered_values,
+                original_ordered_values,
+            } => {
+                let Some(origin) = current.get(inner_path) else {
+                    // The log no longer maps this metadata write to a live
+                    // namespace object. Do not guess at equivalence.
+                    return true;
+                };
+                let PathOrigin::Original(original_inner_path) = origin else {
+                    // Metadata on a newly-created member has no independent
+                    // effect on net-dirty state: the structural create/delete
+                    // transform already decides whether that member survives.
+                    continue;
+                };
+                let field = crate::tui::probe::canonical_metadata_display_key(field);
+                let state = metadata
+                    .entry((original_inner_path.clone(), field))
+                    .or_insert_with(|| MetadataState {
+                        original_value: original_value.clone(),
+                        value: value.clone(),
+                        ordered_values: ordered_values.clone(),
+                        original_ordered_values: original_ordered_values.clone(),
+                    });
+                if state.value != *value {
+                    state.value = value.clone();
+                }
+                state.ordered_values = ordered_values.clone();
+            }
+            ArchiveEdit::ContentModified { .. } => return true,
+        }
+    }
+
+    if current != original {
+        return true;
+    }
+
+    metadata.iter().any(|((_, field), state)| {
+        if crate::tui::probe::metadata_field_is_set_valued(field) {
+            match (
+                state.original_ordered_values.as_deref(),
+                state.ordered_values.as_deref(),
+            ) {
+                (Some(original), Some(current)) => original != current,
+                // Set-valued display strings are not an equality identity:
+                // one literal "Alice; Bob" member and two ordered members
+                // ["Alice", "Bob"] intentionally render the same.
+                _ => true,
+            }
+        } else {
+            state.original_value.as_deref() != Some(state.value.as_str())
+        }
+    })
 }
 
 /// Panic-safe owner for archive staging sessions created by tests.
@@ -5141,6 +5352,21 @@ impl BrowseState {
     /// columns, and the active-search ownership invariant. The archive path now
     /// mirrors filesystem scans: `parent_entry` + `all_dirs` + `all_files` are
     /// the raw model, and `apply_view()` / search produce the visible list.
+    pub(crate) fn reconcile_active_archive_staging_dirty(&mut self) -> bool {
+        let dirty = self.archive.as_ref().and_then(|arc| {
+            arc.staging
+                .as_ref()
+                .map(|staging| archive_staging_has_net_changes(&arc.listing, staging))
+        });
+        if let (Some(dirty), Some(staging)) = (
+            dirty,
+            self.archive.as_mut().and_then(|arc| arc.staging.as_mut()),
+        ) {
+            staging.dirty = dirty;
+        }
+        dirty.unwrap_or(false)
+    }
+
     pub(crate) fn refresh_archive_view(&mut self) {
         self.refresh_archive_view_with_search(None);
     }
@@ -5154,6 +5380,7 @@ impl BrowseState {
             .get(self.selected_index)
             .map(|entry| entry.path.clone());
 
+        self.reconcile_active_archive_staging_dirty();
         self.rebuild_archive_raw_entries();
         self.reapply_after_directory_scan_complete(tx);
         self.restore_cursor_on_path(prev_path);
@@ -5202,6 +5429,13 @@ impl BrowseState {
         let items = arc.listing.entries_at(&arc.inner_path);
         let mut listing_paths = HashSet::new();
         for item in &items {
+            let projected = arc
+                .staging
+                .as_ref()
+                .and_then(|staging| archive_path_after_structural_edits(&item.full_path, &staging.edits));
+            if arc.staging.is_some() && projected.as_deref() != Some(item.full_path.as_str()) {
+                continue;
+            }
             listing_paths.insert(item.full_path.clone());
             let staged_metadata = arc
                 .staging
@@ -7614,6 +7848,13 @@ impl BrowseState {
             if display_name.is_empty() {
                 continue;
             }
+            let projected = arc
+                .staging
+                .as_ref()
+                .and_then(|staging| archive_path_after_structural_edits(&item.path, &staging.edits));
+            if arc.staging.is_some() && projected.as_deref() != Some(item.path.as_str()) {
+                continue;
+            }
             listing_paths.insert(item.path.clone());
             let staged_metadata = arc
                 .staging
@@ -8148,25 +8389,35 @@ impl BrowseState {
     /// expose a temporary filesystem copy whose size/mtime differs from the
     /// logical archive member; tag search must keep using the synthetic archive
     /// path and archive-member identity rather than the staging-file identity.
-    fn valid_archive_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
+    pub(super) fn valid_archive_probe_for_entry(&self, entry: &BrowseEntry) -> Option<&CachedInfo> {
         let Some(archive) = self.archive.as_ref() else {
             return self.valid_probe_for_entry(entry);
         };
 
         let inner = self.archive_inner_path_for_entry(entry)?;
-        let archive_entry = archive
+        if let Some(archive_entry) = archive
             .listing
             .entries
             .iter()
-            .find(|candidate| candidate.path == inner)?;
-        let archive_identity = ProbeCacheIdentity {
-            modified: None,
-            size: archive_entry.size,
-        };
+            .find(|candidate| candidate.path == inner)
+        {
+            let archive_identity = ProbeCacheIdentity {
+                modified: None,
+                size: archive_entry.size,
+            };
 
-        self.valid_probe_arc_for_identity(&entry.path, archive_identity)
-            .or_else(|| self.valid_probe_arc_for_entry(entry))
-            .map(|info| info.as_ref())
+            return self
+                .valid_probe_arc_for_identity(&entry.path, archive_identity)
+                .or_else(|| self.valid_probe_arc_for_entry(entry))
+                .map(|info| info.as_ref());
+        }
+
+        // A staged rename has no exact pathname in the immutable archive
+        // listing, but the visible staged Browse entry can already have an
+        // identity-checked generic probe. That is the same cache whose
+        // presence enables inline editing, so allow it to anchor the baseline
+        // instead of turning a known original value into sticky `None`.
+        self.valid_probe_for_entry(entry)
     }
 
     /// Identity-checked probe info as an `Arc`, for callers that must keep the
@@ -17186,18 +17437,26 @@ mod tests {
             .listing
             .archive_path
             .clone();
-        let staging_guard = ArchiveStagingSession::new_test_owned(
+        let mut staging_guard = ArchiveStagingSession::new_test_owned(
             staging_dir,
             archive_path.clone(),
             0,
             0,
             0,
         );
+        staging_guard.append_edit(ArchiveEdit::Rename {
+            from: "Artwork".to_string(),
+            to: "artwork".to_string(),
+        });
         staging_guard
             .install_clone_into_browse_state(&mut state)
             .expect("archive entered");
 
         state.refresh_archive_view();
+        assert!(
+            !state.entries.iter().any(|entry| entry.name == "Artwork"),
+            "the pre-rename listing name must be retired while staging owns the renamed path",
+        );
         let renamed_index = state
             .entries
             .iter()
@@ -17210,6 +17469,460 @@ mod tests {
             .expect("selected rename")
             .path
             .ends_with("artwork"));
+    }
+
+
+    #[test]
+    fn reverted_archive_rename_clears_net_dirty_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(staging_dir.join("Artwork")).expect("staging tree");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("Artwork", true)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "Artwork".to_string(),
+            to: "artwork".to_string(),
+        });
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "artwork".to_string(),
+            to: "Artwork".to_string(),
+        });
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(!state.reconcile_active_archive_staging_dirty());
+        assert!(state.active_archive_staging().is_some_and(|session| !session.dirty));
+    }
+
+    #[test]
+    fn delete_then_recreate_same_archive_path_remains_dirty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"replacement").expect("replacement");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_edit(ArchiveEdit::Delete {
+            inner_path: "track.flac".to_string(),
+        });
+        staging.append_edit(ArchiveEdit::Create {
+            inner_path: "track.flac".to_string(),
+            is_dir: false,
+        });
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(state.reconcile_active_archive_staging_dirty());
+    }
+
+    #[test]
+    fn metadata_field_reverted_to_first_original_value_clears_net_dirty_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Changed".to_string(),
+            Some("Original".to_string()),
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Original".to_string(),
+            Some("Changed".to_string()),
+        );
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(!state.reconcile_active_archive_staging_dirty());
+    }
+
+    #[test]
+    fn metadata_field_identity_is_canonical_across_editor_surfaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Changed".to_string(),
+            Some("Original".to_string()),
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "title".to_string(),
+            "Original".to_string(),
+            Some("Changed".to_string()),
+        );
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(!state.reconcile_active_archive_staging_dirty());
+        let edits = &state.active_archive_staging().expect("staging").edits;
+        assert_eq!(edits.len(), 1, "canonical field identity should coalesce same-path writes");
+        assert!(matches!(
+            &edits[0],
+            ArchiveEdit::MetadataWrite { field, .. } if field == "TITLE"
+        ));
+    }
+
+    #[test]
+    fn metadata_year_alias_reverts_against_canonical_date_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "DATE".to_string(),
+            "2025".to_string(),
+            Some("2024".to_string()),
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "year".to_string(),
+            "2024".to_string(),
+            Some("2025".to_string()),
+        );
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(!state.reconcile_active_archive_staging_dirty());
+    }
+
+    #[test]
+    fn metadata_revert_tracks_original_member_identity_across_rename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Changed".to_string(),
+            Some("Original".to_string()),
+        );
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "track.flac".to_string(),
+            to: "renamed.flac".to_string(),
+        });
+        staging.append_metadata_write(
+            "renamed.flac".to_string(),
+            "title".to_string(),
+            "Original".to_string(),
+            Some("Changed".to_string()),
+        );
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "renamed.flac".to_string(),
+            to: "track.flac".to_string(),
+        });
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(!state.reconcile_active_archive_staging_dirty());
+    }
+
+    #[test]
+    fn recovered_metadata_unknown_baseline_never_backfills_from_staged_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        let recovered: ArchiveEdit = serde_json::from_str(
+            r#"{"MetadataWrite":{"inner_path":"track.flac","field":"title","value":"Recovered"}}"#,
+        )
+        .expect("old metadata edit without original_value");
+        staging.append_edit(recovered);
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Later".to_string(),
+            Some("Recovered".to_string()),
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "title".to_string(),
+            "Recovered".to_string(),
+            Some("Later".to_string()),
+        );
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(state.reconcile_active_archive_staging_dirty());
+        assert!(matches!(
+            &state.active_archive_staging().expect("staging").edits[0],
+            ArchiveEdit::MetadataWrite {
+                original_value: None,
+                value,
+                ..
+            } if value == "Recovered"
+        ));
+    }
+
+    #[test]
+    fn ordered_metadata_display_collision_stays_dirty_until_exact_representation_reverts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+
+        staging.append_metadata_write_with_ordered_values(
+            "track.flac".to_string(),
+            "ARTIST".to_string(),
+            "Alice; Bob".to_string(),
+            Some("Alice; Bob".to_string()),
+            Some(vec!["Alice".to_string(), "Bob".to_string()]),
+            Some(vec!["Alice; Bob".to_string()]),
+        );
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+        assert!(
+            state.reconcile_active_archive_staging_dirty(),
+            "equal display strings must not hide an ordered-value change",
+        );
+
+        state
+            .active_archive_staging_mut()
+            .expect("staging")
+            .append_metadata_write_with_ordered_values(
+                "track.flac".to_string(),
+                "artist".to_string(),
+                "Alice; Bob".to_string(),
+                Some("Alice; Bob".to_string()),
+                Some(vec!["Alice; Bob".to_string()]),
+                Some(vec!["Alice".to_string(), "Bob".to_string()]),
+            );
+        assert!(
+            !state.reconcile_active_archive_staging_dirty(),
+            "restoring the exact original ordered members must become clean",
+        );
+    }
+
+    #[test]
+    fn recovered_ordered_metadata_without_exact_values_remains_conservatively_dirty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let recovered: ArchiveEdit = serde_json::from_str(
+            r#"{"MetadataWrite":{"inner_path":"track.flac","field":"ARTIST","value":"Alice; Bob","original_value":"Alice; Bob"}}"#,
+        )
+        .expect("old recovery row");
+        assert!(matches!(
+            &recovered,
+            ArchiveEdit::MetadataWrite {
+                ordered_values: None,
+                original_ordered_values: None,
+                ..
+            }
+        ));
+
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_edit(recovered);
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(
+            state.reconcile_active_archive_staging_dirty(),
+            "an old set-valued row cannot prove equality from its joined display string",
+        );
+
+        let staging = state.active_archive_staging_mut().expect("staging");
+        staging.append_metadata_write_with_ordered_values(
+            "track.flac".to_string(),
+            "ARTIST".to_string(),
+            "Alice; Bob".to_string(),
+            Some("Alice; Bob".to_string()),
+            Some(vec!["Alice".to_string(), "Bob".to_string()]),
+            Some(vec!["Alice; Bob".to_string()]),
+        );
+        staging.append_metadata_write_with_ordered_values(
+            "track.flac".to_string(),
+            "artist".to_string(),
+            "Alice; Bob".to_string(),
+            Some("Alice; Bob".to_string()),
+            Some(vec!["Alice; Bob".to_string()]),
+            Some(vec!["Alice".to_string(), "Bob".to_string()]),
+        );
+        assert!(
+            state.reconcile_active_archive_staging_dirty(),
+            "later staged edits must not backfill an exact archive baseline that recovery never knew",
+        );
+        assert!(matches!(
+            &state.active_archive_staging().expect("staging").edits[0],
+            ArchiveEdit::MetadataWrite {
+                original_ordered_values: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metadata_coalescing_does_not_cross_archive_path_identity_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging tree");
+        std::fs::write(staging_dir.join("track.flac"), b"fixture").expect("staged track");
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("track.flac", false)]),
+            None,
+        );
+        let archive_path = state.archive.as_ref().expect("archive").listing.archive_path.clone();
+        let mut staging = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path,
+            0,
+            0,
+            0,
+        );
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "TITLE".to_string(),
+            "Changed".to_string(),
+            Some("Original".to_string()),
+        );
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "track.flac".to_string(),
+            to: "original.flac".to_string(),
+        });
+        staging.append_edit(ArchiveEdit::Create {
+            inner_path: "track.flac".to_string(),
+            is_dir: false,
+        });
+        staging.append_metadata_write(
+            "track.flac".to_string(),
+            "title".to_string(),
+            "Original".to_string(),
+            Some(String::new()),
+        );
+        staging.append_edit(ArchiveEdit::Delete {
+            inner_path: "track.flac".to_string(),
+        });
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "original.flac".to_string(),
+            to: "track.flac".to_string(),
+        });
+        staging.install_clone_into_browse_state(&mut state).expect("install staging");
+
+        assert!(state.reconcile_active_archive_staging_dirty());
+        assert_eq!(
+            state
+                .active_archive_staging()
+                .expect("staging")
+                .edits
+                .iter()
+                .filter(|edit| matches!(edit, ArchiveEdit::MetadataWrite { .. }))
+                .count(),
+            2,
+            "path reuse by another namespace object must form a coalescing barrier",
+        );
     }
 
     #[test]
@@ -17991,11 +18704,13 @@ mod archive_edit_log_semantics_tests {
             "Disc 1/01.flac".to_string(),
             "Title".to_string(),
             "Old title".to_string(),
+            Some("Original title".to_string()),
         );
         staging.append_metadata_write(
             "Disc 1/01.flac".to_string(),
             "Title".to_string(),
             "Final title".to_string(),
+            Some("Old title".to_string()),
         );
 
         assert!(staging.dirty);
@@ -18004,8 +18719,11 @@ mod archive_edit_log_semantics_tests {
             staging.edits[0],
             ArchiveEdit::MetadataWrite {
                 inner_path: "Disc 1/01.flac".to_string(),
-                field: "Title".to_string(),
+                field: "TITLE".to_string(),
                 value: "Final title".to_string(),
+                original_value: Some("Original title".to_string()),
+                ordered_values: None,
+                original_ordered_values: None,
             }
         );
     }

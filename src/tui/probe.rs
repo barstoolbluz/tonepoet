@@ -9064,6 +9064,35 @@ pub fn read_all_tags(path: &std::path::Path) -> Result<Vec<TagEntry>, String> {
     Ok(tag_entries_from_canonical_fields(fields))
 }
 
+/// Read the lossless ordered representation for one inline-edit metadata
+/// field. This deliberately goes through the same editor/tag reader that owns
+/// repeated-value semantics instead of `SourceMetadata`, whose scalar fields
+/// are only a display/preview projection.
+pub(crate) fn read_inline_metadata_ordered_values(
+    path: &std::path::Path,
+    field: MetadataField,
+) -> Result<Vec<String>, String> {
+    let canonical = canonical_metadata_display_key(field.label());
+    Ok(read_all_tags(path)?
+        .into_iter()
+        .find(|entry| canonical_metadata_display_key(&entry.display_key) == canonical)
+        .and_then(|entry| entry.per_file_values.into_iter().next())
+        .map(|values| values.to_texts())
+        .unwrap_or_default())
+}
+
+/// Exact ordered value produced by the scalar inline writer. The inline
+/// surface never parses delimiters into repeated values: a non-empty edit is
+/// one stored member, while clearing the scalar deletes the field.
+pub(crate) fn inline_metadata_scalar_ordered_values(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        vec![value.to_string()]
+    }
+}
+
 /// Tags plus compact source metadata read from the same Lofty pass.
 ///
 /// `metadata[i]` is aligned with the input `paths[i]` until the caller
