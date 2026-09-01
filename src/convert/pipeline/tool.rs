@@ -1318,8 +1318,9 @@ impl RealToolRunner {
             };
 
             let started = Instant::now();
-            let launch_path = binary_path;
             let spawn_record = || Self::build_record(&cmd, None, "", "", started.elapsed());
+            let launch_path = resolve_command_launch_path(binary_path, cmd.environment_policy)
+                .map_err(|_| ToolRunnerError::Spawn { command: spawn_record() })?;
             let reviewed_path = std::fs::canonicalize(&launch_path)
                 .map_err(|_| ToolRunnerError::Spawn { command: spawn_record() })?;
             let binary_file = std::fs::OpenOptions::new()
@@ -2784,6 +2785,32 @@ mod real_tool_runner_tests {
         let error = std::fs::canonicalize(&resolved)
             .expect_err("unique explicit relative fixture should be absent from the filesystem");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_with_binary_path_resolves_bare_program_before_cwd_lookup() {
+        let runner = RealToolRunner::new(HashMap::new());
+        let cwd = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !cwd.path().join("sh").exists(),
+            "test precondition: cwd must not contain the PATH-resolved executable"
+        );
+        let cmd = ToolCommand {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            binary: ToolBinary::Ffmpeg,
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            secret_args: vec![],
+            cwd: Some(cwd.path().to_path_buf()),
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        };
+
+        let output = runner
+            .run_with_binary_path(cmd, PathBuf::from("sh"), &CancellationToken::new())
+            .await
+            .expect("bare executable should resolve through PATH before supervised cwd use");
+        assert_eq!(output.exit, ProcessExit::Code(0));
     }
 
     #[tokio::test]

@@ -1933,6 +1933,7 @@ pub async fn rename_archive_entry_native_transactional<F>(
     rename_pairs: &[ArchiveNativeRenamePair],
     archive_members: &[ArchiveNativeMember],
     expected_fingerprint: (i64, u32, u64),
+    localize_transaction: bool,
     archive_password: Option<&str>,
     tool_paths: &HashMap<String, PathBuf>,
     cancel: &CancellationToken,
@@ -1976,43 +1977,68 @@ where
     let install_metadata = capture_archive_install_metadata(original_archive)?;
     let archive_size = expected_fingerprint.2;
     let nonce = uuid::Uuid::new_v4();
-    let temp_archive = parent.join(format!(
+    let work_parent = if localize_transaction {
+        std::env::temp_dir()
+    } else {
+        parent.to_path_buf()
+    };
+    let temp_archive = work_parent.join(format!(
         ".{file_name}.tonepoet-native-rename-{nonce}{}",
         repackage_format_suffix(format)
     ));
+    let install_archive = if localize_transaction {
+        parent.join(format!(
+            ".{file_name}.tonepoet-install-{nonce}{}",
+            repackage_format_suffix(format)
+        ))
+    } else {
+        temp_archive.clone()
+    };
     let backup_archive = parent.join(format!(".{file_name}.tonepoet-backup-{nonce}"));
 
-    let source = original_archive.to_path_buf();
-    let temp_for_copy = temp_archive.clone();
-    let copy_cancel = cancel.clone();
     emit_progress(ArchiveNativeRenameProgressSnapshot::new(
         "Preparing transactional archive copy...",
         0,
         archive_size,
     ));
     let copy_progress = std::sync::Arc::clone(&progress);
-    let copy_result = tokio::task::spawn_blocking(move || {
-        copy_archive_for_native_edit(
-            &source,
-            &temp_for_copy,
-            archive_size,
-            &copy_cancel,
-            |bytes_done| {
-                if let Ok(mut callback) = copy_progress.lock() {
-                    (*callback)(ArchiveNativeRenameProgressSnapshot::new(
-                        "Copying archive transactionally...",
-                        bytes_done,
-                        archive_size,
-                    ));
-                }
-            },
-        )
-    })
+    let copy_elapsed = match copy_archive_file_with_polled_progress(
+        original_archive,
+        &temp_archive,
+        archive_size,
+        cancel,
+        move |bytes_done, _elapsed| {
+            if let Ok(mut callback) = copy_progress.lock() {
+                (*callback)(ArchiveNativeRenameProgressSnapshot::new(
+                    "Copying archive transactionally...",
+                    bytes_done,
+                    archive_size,
+                ));
+            }
+        },
+    )
     .await
-    .map_err(|err| format!("archive rename copy worker failed: {err}"))?;
-    if let Err(err) = copy_result {
-        let _ = fs::remove_file(&temp_archive);
-        return Err(err);
+    {
+        Ok(elapsed) => elapsed,
+        Err(err) => {
+            let _ = fs::remove_file(&temp_archive);
+            return Err(err);
+        }
+    };
+    if localize_transaction {
+        let rate = if copy_elapsed.as_secs_f64() > 0.0 {
+            archive_size as f64 / copy_elapsed.as_secs_f64()
+        } else {
+            archive_size as f64
+        };
+        log::info!(
+            "localized native archive rename source: {} -> {} ({} bytes in {:.3}s, {:.1} MiB/s)",
+            original_archive.display(),
+            temp_archive.display(),
+            archive_size,
+            copy_elapsed.as_secs_f64(),
+            rate / (1024.0 * 1024.0),
+        );
     }
     emit_progress(ArchiveNativeRenameProgressSnapshot::new(
         "Transactional archive copy ready",
@@ -2197,21 +2223,98 @@ where
     check_repackage_cancelled(cancel).inspect_err(|_| {
         let _ = fs::remove_file(&temp_archive);
     })?;
-    if archive_fingerprint_for_native_edit(original_archive)? != expected_fingerprint {
+    let current_fingerprint = match archive_fingerprint_for_native_edit(original_archive) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) => {
+            let _ = fs::remove_file(&temp_archive);
+            return Err(err);
+        }
+    };
+    if current_fingerprint != expected_fingerprint {
         let _ = fs::remove_file(&temp_archive);
         return Err("archive changed externally while rename was being prepared; original was left untouched".to_string());
     }
-    if fs::metadata(&temp_archive)
-        .map_err(|err| format!("inspect native-rename archive failed: {err}"))?
-        .len()
-        == 0
-    {
+    let prepared_size = match fs::metadata(&temp_archive) {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            let _ = fs::remove_file(&temp_archive);
+            return Err(format!("inspect native-rename archive failed: {err}"));
+        }
+    };
+    if prepared_size == 0 {
         let _ = fs::remove_file(&temp_archive);
         return Err("native archive rename produced an empty archive".to_string());
     }
 
-    let install_metadata_warning = apply_archive_install_metadata(&temp_archive, &install_metadata);
-    if let Ok(file) = fs::OpenOptions::new().read(true).open(&temp_archive) {
+    if install_archive != temp_archive {
+        emit_progress(ArchiveNativeRenameProgressSnapshot::new(
+            "Copying renamed archive to source storage...",
+            0,
+            prepared_size,
+        ));
+        let copy_progress = std::sync::Arc::clone(&progress);
+        let transfer = copy_archive_file_with_polled_progress(
+            &temp_archive,
+            &install_archive,
+            prepared_size,
+            cancel,
+            move |bytes_done, _elapsed| {
+                if let Ok(mut callback) = copy_progress.lock() {
+                    (*callback)(ArchiveNativeRenameProgressSnapshot::new(
+                        "Copying renamed archive to source storage...",
+                        bytes_done,
+                        prepared_size,
+                    ));
+                }
+            },
+        )
+        .await;
+        let transfer_elapsed = match transfer {
+            Ok(elapsed) => elapsed,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_archive);
+                let _ = fs::remove_file(&install_archive);
+                return Err(err);
+            }
+        };
+        let rate = if transfer_elapsed.as_secs_f64() > 0.0 {
+            prepared_size as f64 / transfer_elapsed.as_secs_f64()
+        } else {
+            prepared_size as f64
+        };
+        log::info!(
+            "copied native-renamed archive back to source storage: {} -> {} ({} bytes in {:.3}s, {:.1} MiB/s)",
+            temp_archive.display(),
+            install_archive.display(),
+            prepared_size,
+            transfer_elapsed.as_secs_f64(),
+            rate / (1024.0 * 1024.0),
+        );
+        let current_fingerprint = match archive_fingerprint_for_native_edit(original_archive) {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_archive);
+                let _ = fs::remove_file(&install_archive);
+                return Err(err);
+            }
+        };
+        if current_fingerprint != expected_fingerprint {
+            let _ = fs::remove_file(&temp_archive);
+            let _ = fs::remove_file(&install_archive);
+            return Err("archive changed externally while renamed archive was being copied back; original was left untouched".to_string());
+        }
+    }
+
+    check_repackage_cancelled(cancel).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_archive);
+        if install_archive != temp_archive {
+            let _ = fs::remove_file(&install_archive);
+        }
+    })?;
+
+    let install_metadata_warning =
+        apply_archive_install_metadata(&install_archive, &install_metadata);
+    if let Ok(file) = fs::OpenOptions::new().read(true).open(&install_archive) {
         let _ = file.sync_all();
     }
 
@@ -2224,6 +2327,9 @@ where
             Ok(rewrite) => rewrite,
             Err(err) => {
                 let _ = fs::remove_file(&temp_archive);
+                if install_archive != temp_archive {
+                    let _ = fs::remove_file(&install_archive);
+                }
                 log::debug!(
                     "native ISO-WV rename could not safely synchronize metadata snapshot; using extraction fallback: {err}"
                 );
@@ -2240,12 +2346,15 @@ where
     ));
     let report = replace_archive_atomically(
         original_archive,
-        &temp_archive,
+        &install_archive,
         &backup_archive,
         install_metadata_warning,
     );
     if report.is_err() {
         let _ = fs::remove_file(&temp_archive);
+        if install_archive != temp_archive {
+            let _ = fs::remove_file(&install_archive);
+        }
         if backup_archive.exists() && !original_archive.exists() {
             let _ = fs::rename(&backup_archive, original_archive);
         }
@@ -2261,6 +2370,8 @@ where
                 ));
             }
         }
+    } else if install_archive != temp_archive {
+        let _ = fs::remove_file(&temp_archive);
     }
     report.map(Some)
 }
@@ -2358,8 +2469,8 @@ fn archive_fingerprint_for_native_edit(path: &Path) -> Result<(i64, u32, u64), S
     Ok((duration.as_secs() as i64, duration.subsec_nanos(), metadata.len()))
 }
 
-#[allow(unsafe_code)] // Linux FICLONE/copy_file_range for transactional archive preparation
-fn copy_archive_for_native_edit<F>(
+#[allow(unsafe_code)] // Linux FICLONE/copy_file_range for large sequential archive transfers
+fn copy_archive_file_with_progress<F>(
     source: &Path,
     destination: &Path,
     total: u64,
@@ -2373,13 +2484,13 @@ where
         return Err(ARCHIVE_REPACKAGE_CANCELLED.to_string());
     }
     let mut source_file = fs::File::open(source)
-        .map_err(|err| format!("open archive for transactional copy failed: {err}"))?;
+        .map_err(|err| format!("open archive source for copy failed: {err}"))?;
     let mut destination_file = fs::OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
         .open(destination)
-        .map_err(|err| format!("create transactional archive copy failed: {err}"))?;
+        .map_err(|err| format!("create archive copy destination failed: {err}"))?;
 
     #[cfg(target_os = "linux")]
     {
@@ -2402,7 +2513,7 @@ where
 
     destination_file
         .set_len(0)
-        .map_err(|err| format!("reset transactional archive copy failed: {err}"))?;
+        .map_err(|err| format!("reset archive copy destination failed: {err}"))?;
 
     let mut copied = 0u64;
     #[cfg(target_os = "linux")]
@@ -2449,7 +2560,7 @@ where
                 | Some(libc::EOPNOTSUPP) => break,
                 _ => {
                     return Err(format!(
-                        "kernel-assisted transactional archive copy failed: {error}"
+                        "kernel-assisted archive copy failed: {error}"
                     ))
                 }
             }
@@ -2457,7 +2568,7 @@ where
         if copied == total {
             destination_file
                 .sync_all()
-                .map_err(|err| format!("sync transactional archive copy failed: {err}"))?;
+                .map_err(|err| format!("sync archive copy failed: {err}"))?;
             return Ok(());
         }
     }
@@ -2469,25 +2580,71 @@ where
         }
         let count = source_file
             .read(&mut buffer)
-            .map_err(|err| format!("read archive during transactional copy failed: {err}"))?;
+            .map_err(|err| format!("read archive during copy failed: {err}"))?;
         if count == 0 {
             break;
         }
         destination_file
             .write_all(&buffer[..count])
-            .map_err(|err| format!("write transactional archive copy failed: {err}"))?;
+            .map_err(|err| format!("write archive copy failed: {err}"))?;
         copied = copied.saturating_add(count as u64);
         progress(copied.min(total));
     }
     destination_file
         .sync_all()
-        .map_err(|err| format!("sync transactional archive copy failed: {err}"))?;
+        .map_err(|err| format!("sync archive copy failed: {err}"))?;
     if copied != total {
         return Err(format!(
-            "transactional archive copy size mismatch: expected {total} bytes, copied {copied}"
+            "archive copy size mismatch: expected {total} bytes, copied {copied}"
         ));
     }
     Ok(())
+}
+
+
+async fn copy_archive_file_with_polled_progress<F>(
+    source: &Path,
+    destination: &Path,
+    total: u64,
+    cancel: &CancellationToken,
+    mut progress: F,
+) -> Result<Duration, String>
+where
+    F: FnMut(u64, Duration),
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let observed = std::sync::Arc::new(AtomicU64::new(0));
+    let worker_observed = std::sync::Arc::clone(&observed);
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    let worker_cancel = cancel.clone();
+    let started = Instant::now();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        copy_archive_file_with_progress(
+            &source,
+            &destination,
+            total,
+            &worker_cancel,
+            |bytes_done| worker_observed.store(bytes_done, Ordering::Relaxed),
+        )
+    });
+
+    loop {
+        tokio::select! {
+            result = &mut worker => {
+                let result = result
+                    .map_err(|err| format!("archive copy worker failed: {err}"))?;
+                result?;
+                let elapsed = started.elapsed();
+                progress(total, elapsed);
+                return Ok(elapsed);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                progress(observed.load(Ordering::Relaxed).min(total), started.elapsed());
+            }
+        }
+    }
 }
 
 /// Re-create an archive from an extracted staging tree and atomically replace
@@ -2591,15 +2748,26 @@ where
     ));
     check_repackage_cancelled(cancel)?;
 
+    // Capture the source after the UI's overwrite/conflict decision. A later
+    // re-check prevents a long local repackage/copy-back from overwriting a
+    // second external change that occurred while Tonepoet was working.
+    let source_fingerprint = archive_fingerprint_for_native_edit(original_archive)?;
+
     // Fail before staging traversal or any child-process work when the target
     // format cannot be created. This keeps the direct save path aligned with
     // the UI preflight and preserves actionable tool-resolution errors even
     // when ToolRunner intentionally redacts spawn details.
     let format = repackage_archive_format(original_archive)?;
     require_repackage_format_tool_available(format, tool_paths)?;
+
+    // Remote edit sessions keep a sequential source copy beside (not inside)
+    // the extracted staging tree. Reuse it for encryption-policy inspection so
+    // save never reintroduces a seek-heavy read pattern against sshfs/FUSE.
+    let local_source = existing_archive_local_source_for_staging(staging_dir, original_archive);
+    let policy_source = local_source.as_deref().unwrap_or(original_archive);
     let encryption_policy = detect_repackage_encryption_policy(
         format,
-        original_archive,
+        policy_source,
         archive_password,
         tool_paths,
         cancel,
@@ -2638,10 +2806,31 @@ where
         .ok_or_else(|| format!("archive name is not valid Unicode: {}", original_archive.display()))?;
     let install_metadata = capture_archive_install_metadata(original_archive)?;
     let nonce = uuid::Uuid::new_v4();
-    let temp_archive = parent.join(format!(
+    let work_parent = local_source
+        .as_ref()
+        .and_then(|path| path.parent())
+        .unwrap_or(parent);
+    if !work_parent.is_dir() {
+        return Err(format!(
+            "archive repackage work directory is not a directory: {}",
+            work_parent.display()
+        ));
+    }
+    let temp_archive = work_parent.join(format!(
         ".{file_name}.tonepoet-repack-{nonce}{}",
         repackage_format_suffix(format)
     ));
+    // The final rename must stay on the source filesystem. When work is local,
+    // stream the verified result back to this same-parent install temporary;
+    // local archives keep the existing one-temp-file path with no extra copy.
+    let install_archive = if local_source.is_some() {
+        parent.join(format!(
+            ".{file_name}.tonepoet-install-{nonce}{}",
+            repackage_format_suffix(format)
+        ))
+    } else {
+        temp_archive.clone()
+    };
     let backup_archive = parent.join(format!(".{file_name}.tonepoet-backup-{nonce}"));
 
     let result = async {
@@ -2703,6 +2892,67 @@ where
         }
 
         check_repackage_cancelled(cancel)?;
+        if archive_fingerprint_for_native_edit(original_archive)? != source_fingerprint {
+            return Err(
+                "archive changed externally while the replacement was being prepared; original was left untouched"
+                    .to_string(),
+            );
+        }
+
+        if install_archive != temp_archive {
+            progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                ArchiveRepackageStage::Installing,
+                "Copying repackaged archive to source storage...",
+                &archive_label,
+                0,
+                Some(created_size.max(1)),
+                None,
+            ));
+            let transfer_elapsed = copy_archive_file_with_polled_progress(
+                &temp_archive,
+                &install_archive,
+                created_size,
+                cancel,
+                |bytes_done, elapsed| {
+                    let rate = (elapsed.as_secs_f64() > 0.0).then(|| {
+                        (bytes_done as f64 / elapsed.as_secs_f64()) as u64
+                    });
+                    progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
+                        ArchiveRepackageStage::Installing,
+                        "Copying repackaged archive to source storage...",
+                        &archive_label,
+                        bytes_done,
+                        Some(created_size.max(1)),
+                        rate,
+                    ));
+                },
+            )
+            .await?;
+            let rate = if transfer_elapsed.as_secs_f64() > 0.0 {
+                created_size as f64 / transfer_elapsed.as_secs_f64()
+            } else {
+                created_size as f64
+            };
+            log::info!(
+                "copied repackaged archive back to source storage: {} -> {} ({} bytes in {:.3}s, {:.1} MiB/s)",
+                temp_archive.display(),
+                install_archive.display(),
+                created_size,
+                transfer_elapsed.as_secs_f64(),
+                rate / (1024.0 * 1024.0),
+            );
+
+            // The copy-back itself can be long. Re-check after it as well so
+            // external writers never lose a change that landed during transfer.
+            if archive_fingerprint_for_native_edit(original_archive)? != source_fingerprint {
+                return Err(
+                    "archive changed externally while the replacement was being copied back; original was left untouched"
+                        .to_string(),
+                );
+            }
+        }
+
+        check_repackage_cancelled(cancel)?;
         progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
             ArchiveRepackageStage::PreservingMetadata,
             ArchiveRepackageStage::PreservingMetadata.status_label(),
@@ -2712,11 +2962,12 @@ where
             None,
         ));
         let install_metadata_warning =
-            apply_archive_install_metadata(&temp_archive, &install_metadata);
+            apply_archive_install_metadata(&install_archive, &install_metadata);
 
         // Installation is deliberately not cancelled once entered: the new
-        // archive has already been created and verified, and completing the
-        // atomic replacement is safer than interrupting the handoff.
+        // archive has already been created, verified, copied to the source
+        // filesystem (when needed), and conflict-checked. Completing the
+        // same-filesystem atomic replacement is safer than interrupting it.
         progress(ArchiveRepackageProgressSnapshot::with_archive_bytes(
             ArchiveRepackageStage::Installing,
             ArchiveRepackageStage::Installing.status_label(),
@@ -2727,7 +2978,7 @@ where
         ));
         let report = replace_archive_atomically(
             original_archive,
-            &temp_archive,
+            &install_archive,
             &backup_archive,
             install_metadata_warning,
         )?;
@@ -2751,9 +3002,16 @@ where
 
     if result.is_err() {
         let _ = fs::remove_file(&temp_archive);
+        if install_archive != temp_archive {
+            let _ = fs::remove_file(&install_archive);
+        }
         if backup_archive.exists() && !original_archive.exists() {
             let _ = fs::rename(&backup_archive, original_archive);
         }
+    } else if install_archive != temp_archive {
+        // replace_archive_atomically consumed the source-filesystem install
+        // temporary; only the verified local build remains to be discarded.
+        let _ = fs::remove_file(&temp_archive);
     }
 
     result
@@ -3393,6 +3651,10 @@ fn command_path_available(command: &Path) -> bool {
 }
 
 fn repackage_tool_path(tool_paths: &HashMap<String, PathBuf>, names: &[&str]) -> PathBuf {
+    // Explicit configuration retains precedence exactly as before, including
+    // candidate order. Production normally supplies an empty map, though, so
+    // the bare-name fallback must honor the full advertised candidate list
+    // rather than assuming the first spelling exists on PATH.
     for name in names {
         if let Some(path) = tool_paths.get(*name) {
             return path.clone();
@@ -3402,6 +3664,12 @@ fn repackage_tool_path(tool_paths: &HashMap<String, PathBuf>, names: &[&str]) ->
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
         {
             return path.clone();
+        }
+    }
+    for name in names {
+        let candidate = PathBuf::from(name);
+        if command_path_available(&candidate) {
+            return candidate;
         }
     }
     PathBuf::from(names.first().copied().unwrap_or_default())
@@ -3760,10 +4028,181 @@ pub struct ArchiveExtractionProgressSnapshot {
     pub elapsed: Duration,
 }
 
+/// Stable sibling directory used to keep a remote archive's sequential local
+/// copy outside the extracted tree. Keeping it outside `staging_root` prevents
+/// the cache from appearing in Browse or being accidentally repackaged.
+pub(crate) fn archive_local_source_dir_for_staging(staging_root: &Path) -> Option<PathBuf> {
+    let parent = staging_root.parent()?;
+    let name = staging_root.file_name()?;
+    let mut companion = std::ffi::OsString::from(".");
+    companion.push(name);
+    companion.push(".tonepoet-local-source");
+    Some(parent.join(companion))
+}
+
+fn archive_local_source_path_for_staging(
+    staging_root: &Path,
+    archive_path: &Path,
+) -> Result<PathBuf, String> {
+    let dir = archive_local_source_dir_for_staging(staging_root).ok_or_else(|| {
+        format!(
+            "archive staging path has no usable parent/name for local source cache: {}",
+            staging_root.display()
+        )
+    })?;
+    let file_name = archive_path.file_name().ok_or_else(|| {
+        format!(
+            "archive path has no file name for local source cache: {}",
+            archive_path.display()
+        )
+    })?;
+    Ok(dir.join(file_name))
+}
+
+/// Remove the companion local archive source, if this staging session created
+/// one. This is intentionally idempotent so normal cleanup, cancellation, and
+/// recovery-discard paths can all call it unconditionally.
+pub(crate) fn cleanup_archive_local_source_for_staging(
+    staging_root: &Path,
+) -> Result<(), String> {
+    let Some(dir) = archive_local_source_dir_for_staging(staging_root) else {
+        return Ok(());
+    };
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to remove local archive source cache {}: {err}",
+            dir.display()
+        )),
+    }
+}
+
+fn existing_archive_local_source_for_staging(
+    staging_root: &Path,
+    archive_path: &Path,
+) -> Option<PathBuf> {
+    let path = archive_local_source_path_for_staging(staging_root, archive_path).ok()?;
+    path.is_file().then_some(path)
+}
+
+fn emit_archive_extraction_progress<F>(
+    progress: &std::sync::Arc<std::sync::Mutex<F>>,
+    snapshot: ArchiveExtractionProgressSnapshot,
+) where
+    F: FnMut(ArchiveExtractionProgressSnapshot),
+{
+    if let Ok(mut callback) = progress.lock() {
+        (*callback)(snapshot);
+    }
+}
+
+async fn localize_archive_edit_source<F>(
+    archive_path: &Path,
+    staging_root: &Path,
+    cancel: &CancellationToken,
+    progress: &std::sync::Arc<std::sync::Mutex<F>>,
+) -> Result<PathBuf, MaterializeError>
+where
+    F: FnMut(ArchiveExtractionProgressSnapshot) + Send + 'static,
+{
+    if cancel.is_cancelled() {
+        return Err(MaterializeError::Cancelled);
+    }
+    let source_size = fs::metadata(archive_path).map_err(MaterializeError::Io)?.len();
+    let local_source = archive_local_source_path_for_staging(staging_root, archive_path)
+        .map_err(MaterializeError::Extraction)?;
+    let local_dir = local_source
+        .parent()
+        .ok_or_else(|| MaterializeError::Extraction("local archive source has no parent".to_string()))?
+        .to_path_buf();
+    fs::create_dir_all(&local_dir).map_err(MaterializeError::Io)?;
+    if local_source.exists() {
+        return Err(MaterializeError::Extraction(format!(
+            "local archive source cache already exists unexpectedly: {}",
+            local_source.display()
+        )));
+    }
+
+    let started = Instant::now();
+    emit_archive_extraction_progress(
+        progress,
+        ArchiveExtractionProgressSnapshot {
+            status: "Copying archive to local staging...".to_string(),
+            bytes_done: 0,
+            bytes_total: Some(source_size.max(1)),
+            elapsed: Duration::ZERO,
+        },
+    );
+
+    let partial_path = local_dir.join(format!(
+        ".tonepoet-local-archive-copy-{}.partial",
+        uuid::Uuid::new_v4()
+    ));
+    let copy_result = copy_archive_file_with_polled_progress(
+        archive_path,
+        &partial_path,
+        source_size,
+        cancel,
+        |bytes_done, elapsed| {
+            emit_archive_extraction_progress(
+                progress,
+                ArchiveExtractionProgressSnapshot {
+                    status: "Copying archive to local staging...".to_string(),
+                    bytes_done,
+                    bytes_total: Some(source_size.max(1)),
+                    elapsed,
+                },
+            );
+        },
+    )
+    .await;
+    if let Err(err) = copy_result {
+        let _ = fs::remove_file(&partial_path);
+        let _ = cleanup_archive_local_source_for_staging(staging_root);
+        if cancel.is_cancelled() || err == ARCHIVE_REPACKAGE_CANCELLED {
+            return Err(MaterializeError::Cancelled);
+        }
+        return Err(MaterializeError::Extraction(err));
+    }
+    if let Err(err) = fs::rename(&partial_path, &local_source) {
+        let _ = fs::remove_file(&partial_path);
+        let _ = cleanup_archive_local_source_for_staging(staging_root);
+        return Err(MaterializeError::Extraction(format!(
+            "install local archive source cache failed: {err}"
+        )));
+    }
+
+    let elapsed = started.elapsed();
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        source_size as f64 / elapsed.as_secs_f64()
+    } else {
+        source_size as f64
+    };
+    log::info!(
+        "localized archive edit source: {} -> {} ({} bytes in {:.3}s, {:.1} MiB/s)",
+        archive_path.display(),
+        local_source.display(),
+        source_size,
+        elapsed.as_secs_f64(),
+        rate / (1024.0 * 1024.0),
+    );
+    emit_archive_extraction_progress(
+        progress,
+        ArchiveExtractionProgressSnapshot {
+            status: "Archive copied to local staging".to_string(),
+            bytes_done: source_size,
+            bytes_total: Some(source_size.max(1)),
+            elapsed,
+        },
+    );
+    Ok(local_source)
+}
+
 /// Browse-facing extraction wrapper that preserves the established extraction
 /// implementation while adding coarse, low-overhead progress from the staged
-/// byte count. This is intentionally used only on edit slow paths; conversion
-/// keeps its existing PipelineReporter contract.
+/// byte count. Remote edit sources can be localized first so 7z performs its
+/// seek-heavy work against local storage rather than a network/FUSE mount.
 pub(crate) async fn extract_archive_to_staging_with_progress<F>(
     archive_path: &Path,
     staging_root: &Path,
@@ -3772,20 +4211,31 @@ pub(crate) async fn extract_archive_to_staging_with_progress<F>(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     expected_bytes: Option<u64>,
-    mut progress: F,
+    localize_source: bool,
+    progress: F,
 ) -> Result<(), MaterializeError>
 where
-    F: FnMut(ArchiveExtractionProgressSnapshot) + Send,
+    F: FnMut(ArchiveExtractionProgressSnapshot) + Send + 'static,
 {
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
+    let extraction_archive = if localize_source {
+        localize_archive_edit_source(archive_path, staging_root, cancel, &progress).await?
+    } else {
+        archive_path.to_path_buf()
+    };
+
     let started = Instant::now();
-    progress(ArchiveExtractionProgressSnapshot {
-        status: "Extracting archive...".to_string(),
-        bytes_done: 0,
-        bytes_total: expected_bytes,
-        elapsed: Duration::ZERO,
-    });
+    emit_archive_extraction_progress(
+        &progress,
+        ArchiveExtractionProgressSnapshot {
+            status: "Extracting archive...".to_string(),
+            bytes_done: 0,
+            bytes_total: expected_bytes,
+            elapsed: Duration::ZERO,
+        },
+    );
     let future = extract_archive_to_staging(
-        archive_path,
+        &extraction_archive,
         staging_root,
         item_id,
         archive_password,
@@ -3799,24 +4249,37 @@ where
             result = &mut future => {
                 if result.is_ok() {
                     let done = expected_bytes.unwrap_or_else(|| staged_regular_file_bytes(staging_root));
-                    progress(ArchiveExtractionProgressSnapshot {
-                        status: "Archive extraction complete".to_string(),
-                        bytes_done: done,
-                        bytes_total: expected_bytes.or(Some(done.max(1))),
-                        elapsed: started.elapsed(),
-                    });
+                    emit_archive_extraction_progress(
+                        &progress,
+                        ArchiveExtractionProgressSnapshot {
+                            status: "Archive extraction complete".to_string(),
+                            bytes_done: done,
+                            bytes_total: expected_bytes.or(Some(done.max(1))),
+                            elapsed: started.elapsed(),
+                        },
+                    );
+                    log::info!(
+                        "archive edit extraction complete: source={} extraction_source={} staging={} elapsed={:.3}s",
+                        archive_path.display(),
+                        extraction_archive.display(),
+                        staging_root.display(),
+                        started.elapsed().as_secs_f64(),
+                    );
                 }
                 return result;
             }
             _ = tokio::time::sleep(Duration::from_millis(750)) => {
                 let observed = staged_regular_file_bytes(staging_root);
                 let done = expected_bytes.map(|total| observed.min(total)).unwrap_or(observed);
-                progress(ArchiveExtractionProgressSnapshot {
-                    status: "Extracting archive...".to_string(),
-                    bytes_done: done,
-                    bytes_total: expected_bytes,
-                    elapsed: started.elapsed(),
-                });
+                emit_archive_extraction_progress(
+                    &progress,
+                    ArchiveExtractionProgressSnapshot {
+                        status: "Extracting archive...".to_string(),
+                        bytes_done: done,
+                        bytes_total: expected_bytes,
+                        elapsed: started.elapsed(),
+                    },
+                );
             }
         }
     }
@@ -6379,6 +6842,7 @@ mod tests {
                 },
             ],
             fingerprint,
+            false,
             None,
             &tool_paths,
             &cancel,
@@ -6499,6 +6963,7 @@ mod tests {
                 },
             ],
             fingerprint,
+            false,
             None,
             &tool_paths,
             &cancel,
@@ -6591,6 +7056,7 @@ mod tests {
             &pairs,
             &members,
             fingerprint,
+            false,
             None,
             &tool_paths,
             &cancel,
@@ -6625,6 +7091,77 @@ mod tests {
         assert_eq!(
             fs::read(extracted.join("CD 1/Live/02.flac")).unwrap(),
             b"track-two-payload"
+        );
+    }
+
+    #[test]
+    fn production_style_seven_zip_selector_honors_all_path_candidates() {
+        const CHILD_MODE: &str = "TONEPOET_TEST_7Z_SELECTOR_MODE";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            let tool_paths = HashMap::new();
+            let selected = repackage_tool_path(&tool_paths, &["7zz", "7z"]);
+            match mode.as_str() {
+                "7z-only" => assert_eq!(selected, PathBuf::from("7z")),
+                "both" => assert_eq!(selected, PathBuf::from("7zz")),
+                other => panic!("unexpected child selector mode: {other}"),
+            }
+
+            preflight_archive_repackage_capability(Path::new("Album.zip"), &tool_paths)
+                .expect("production-style ZIP preflight");
+            preflight_archive_repackage_capability(Path::new("Album.7z"), &tool_paths)
+                .expect("production-style 7z preflight");
+            assert!(archive_native_rename_available(Path::new("Album.zip"), &tool_paths)
+                .expect("production-style ZIP native rename admission"));
+            assert!(archive_native_rename_available(Path::new("Album.7z"), &tool_paths)
+                .expect("production-style 7z native rename admission"));
+            return;
+        }
+
+        fn write_path_candidate(dir: &Path, name: &str) {
+            let suffix = std::env::consts::EXE_SUFFIX;
+            let path = if suffix.is_empty() {
+                dir.join(name)
+            } else {
+                dir.join(format!("{name}{suffix}"))
+            };
+            fs::write(path, b"test executable placeholder").expect("fake PATH candidate");
+        }
+
+        fn run_child(path_dir: &Path, mode: &str) {
+            let output = Command::new(std::env::current_exe().expect("current test binary"))
+                .arg("production_style_seven_zip_selector_honors_all_path_candidates")
+                .arg("--nocapture")
+                .env("PATH", path_dir)
+                .env(CHILD_MODE, mode)
+                .output()
+                .expect("spawn selector child test");
+            assert!(
+                output.status.success(),
+                "selector child failed ({mode}): stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        let fallback = tempfile::tempdir().expect("7z-only PATH");
+        write_path_candidate(fallback.path(), "7z");
+        run_child(fallback.path(), "7z-only");
+
+        let preferred = tempfile::tempdir().expect("7zz+7z PATH");
+        write_path_candidate(preferred.path(), "7zz");
+        write_path_candidate(preferred.path(), "7z");
+        run_child(preferred.path(), "both");
+
+        let configured_7zz = PathBuf::from("/configured/seven-zip-modern");
+        let configured_7z = PathBuf::from("/configured/seven-zip-legacy");
+        let configured = HashMap::from([
+            ("7z".to_string(), configured_7z),
+            ("7zz".to_string(), configured_7zz.clone()),
+        ]);
+        assert_eq!(
+            repackage_tool_path(&configured, &["7zz", "7z"]),
+            configured_7zz,
+            "explicit configured candidate order must retain precedence",
         );
     }
 
@@ -6664,7 +7201,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut observed = Vec::new();
 
-        copy_archive_for_native_edit(
+        copy_archive_file_with_progress(
             &source,
             &destination,
             payload.len() as u64,
@@ -6679,7 +7216,7 @@ mod tests {
         let cancelled_destination = temp.path().join("cancelled.7z");
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        let err = copy_archive_for_native_edit(
+        let err = copy_archive_file_with_progress(
             &source,
             &cancelled_destination,
             payload.len() as u64,
@@ -6689,6 +7226,91 @@ mod tests {
         .expect_err("pre-cancelled copy must stop before creating a destination");
         assert_eq!(err, ARCHIVE_REPACKAGE_CANCELLED);
         assert!(!cancelled_destination.exists());
+    }
+
+    #[tokio::test]
+    async fn edit_extraction_uses_localized_archive_source_when_requested() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive = temp.path().join("Album.zip");
+        let archive_bytes: Vec<u8> = (0..(1024 * 1024 + 31))
+            .map(|index| (index % 239) as u8)
+            .collect();
+        fs::write(&archive, &archive_bytes).expect("archive fixture");
+        let staging = temp.path().join("tonepoet-archive-edit-locality");
+        fs::create_dir_all(&staging).expect("staging");
+        let runner = SimulatedArchiveRunner::new(staging.clone());
+        let cancel = CancellationToken::new();
+        let snapshots = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_progress = std::sync::Arc::clone(&snapshots);
+
+        extract_archive_to_staging_with_progress(
+            &archive,
+            &staging,
+            "browse-archive-locality-test",
+            None,
+            &runner,
+            &cancel,
+            None,
+            true,
+            move |snapshot| {
+                snapshots_for_progress
+                    .lock()
+                    .expect("progress snapshots")
+                    .push(snapshot);
+            },
+        )
+        .await
+        .expect("localized extraction");
+
+        let local_source = archive_local_source_path_for_staging(&staging, &archive)
+            .expect("local source path");
+        assert_eq!(
+            fs::read(&local_source).expect("localized archive bytes"),
+            archive_bytes,
+            "localization must preserve archive bytes exactly"
+        );
+        let extract_commands = runner.command_args_for(ToolBinary::SevenZip);
+        assert_eq!(extract_commands.len(), 1);
+        let local_source_arg = local_source.to_string_lossy().into_owned();
+        assert_eq!(
+            extract_commands[0].get(1).map(String::as_str),
+            Some(local_source_arg.as_str()),
+            "the seek-heavy extractor must read the localized source rather than the original archive"
+        );
+        let snapshots = snapshots.lock().expect("progress snapshots");
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.status.starts_with("Copying archive to local staging")),
+            "localization should be visible in progress"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.status == "Archive extraction complete"),
+            "extraction completion should still be reported"
+        );
+
+        cleanup_archive_local_source_for_staging(&staging).expect("cleanup local source");
+    }
+
+    #[test]
+    fn local_archive_source_cache_is_outside_staging_and_cleanup_is_idempotent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("tonepoet-archive-edit-test");
+        fs::create_dir_all(&staging).expect("staging");
+        let companion = archive_local_source_dir_for_staging(&staging)
+            .expect("staging path should have a companion");
+        assert!(
+            !companion.starts_with(&staging),
+            "local source cache must never become part of the repackaged staging tree"
+        );
+        fs::create_dir_all(&companion).expect("companion");
+        fs::write(companion.join("Album.iso.wv"), b"archive cache").expect("cache file");
+
+        cleanup_archive_local_source_for_staging(&staging).expect("first cleanup");
+        assert!(!companion.exists());
+        cleanup_archive_local_source_for_staging(&staging).expect("idempotent cleanup");
     }
 
     #[test]

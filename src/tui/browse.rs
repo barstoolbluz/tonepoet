@@ -17113,6 +17113,121 @@ mod tests {
     }
 
     #[test]
+    fn staged_archive_view_preserves_explicit_case_distinct_create() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(staging_dir.join("Artwork")).expect("Artwork");
+        if std::fs::create_dir(staging_dir.join("artwork")).is_err() {
+            // A case-insensitive test filesystem cannot represent the operation
+            // that this regression protects.
+            return;
+        }
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("Artwork", true)]),
+            None,
+        );
+        let archive_path = state
+            .archive
+            .as_ref()
+            .expect("archive")
+            .listing
+            .archive_path
+            .clone();
+        let staging_guard = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path.clone(),
+            0,
+            0,
+            0,
+        );
+        staging_guard
+            .install_clone_into_browse_state(&mut state)
+            .expect("archive entered");
+
+        state.refresh_archive_view();
+        let artwork_index = state
+            .entries
+            .iter()
+            .position(|entry| entry.name == "artwork")
+            .expect("explicit case-distinct staged directory remains visible");
+        assert!(state.entries.iter().any(|entry| entry.name == "Artwork"));
+        state.selected_index = artwork_index;
+        assert_eq!(state.selected_entry().expect("selected artwork").name, "artwork");
+        assert!(
+            state
+                .selected_entry()
+                .expect("selected artwork")
+                .path
+                .ends_with("artwork"),
+            "selection must retain the explicitly authored spelling",
+        );
+    }
+
+    #[test]
+    fn staged_archive_view_keeps_case_only_rename_spelling_selectable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).expect("staging");
+        std::fs::create_dir(staging_dir.join("Artwork")).expect("original Artwork");
+        std::fs::rename(staging_dir.join("Artwork"), staging_dir.join("artwork"))
+            .expect("case-only staged rename");
+
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![archive_entry_for_tests("Artwork", true)]),
+            None,
+        );
+        let archive_path = state
+            .archive
+            .as_ref()
+            .expect("archive")
+            .listing
+            .archive_path
+            .clone();
+        let staging_guard = ArchiveStagingSession::new_test_owned(
+            staging_dir,
+            archive_path.clone(),
+            0,
+            0,
+            0,
+        );
+        staging_guard
+            .install_clone_into_browse_state(&mut state)
+            .expect("archive entered");
+
+        state.refresh_archive_view();
+        let renamed_index = state
+            .entries
+            .iter()
+            .position(|entry| entry.name == "artwork")
+            .expect("case-only renamed staged directory remains visible");
+        state.selected_index = renamed_index;
+        assert_eq!(state.selected_entry().expect("selected rename").name, "artwork");
+        assert!(state
+            .selected_entry()
+            .expect("selected rename")
+            .path
+            .ends_with("artwork"));
+    }
+
+    #[test]
+    fn archive_listing_preserves_genuine_case_distinct_names() {
+        let mut state = BrowseState::new();
+        state.enter_archive(
+            archive_listing_for_tests(vec![
+                archive_entry_for_tests("Artwork", true),
+                archive_entry_for_tests("artwork", true),
+            ]),
+            None,
+        );
+        state.refresh_archive_view();
+        assert!(state.entries.iter().any(|entry| entry.name == "Artwork"));
+        assert!(state.entries.iter().any(|entry| entry.name == "artwork"));
+    }
+
+    #[test]
     fn archive_view_audio_filter_hides_non_audio_entries() {
         let mut state = BrowseState::new();
         state.enter_archive(

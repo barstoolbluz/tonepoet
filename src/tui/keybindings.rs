@@ -33870,13 +33870,24 @@ fn archive_extract_progress_message(
     snapshot: &crate::convert::pipeline::materializer_archive::ArchiveExtractionProgressSnapshot,
 ) -> String {
     let elapsed = snapshot.elapsed.as_secs();
+    let action = if snapshot.status.starts_with("Copying archive")
+        || snapshot.status == "Archive copied to local staging"
+    {
+        snapshot.status.trim_end_matches('.').to_string()
+    } else {
+        label.to_string()
+    };
     match snapshot.bytes_total.filter(|total| *total > 0) {
         Some(total) => {
-            let percent = snapshot.bytes_done.saturating_mul(100).min(total.saturating_mul(100)) / total;
-            format!("{label}: ~{percent}% ({elapsed}s)")
+            let percent = snapshot
+                .bytes_done
+                .saturating_mul(100)
+                .min(total.saturating_mul(100))
+                / total;
+            format!("{action}: ~{percent}% ({elapsed}s)")
         }
         None => format!(
-            "{label}: {:.1} MiB extracted ({elapsed}s)",
+            "{action}: {:.1} MiB ({elapsed}s)",
             snapshot.bytes_done as f64 / (1024.0 * 1024.0)
         ),
     }
@@ -34192,6 +34203,7 @@ fn open_browse_archive_metadata_editor_for_entries(
                 &runner,
                 &cancel,
                 expected_extract_bytes,
+                super::archive_listing::is_remote_filesystem(&archive_path),
                 {
                     let progress_tx = tx.clone();
                     let progress_archive = archive_path.clone();
@@ -34954,6 +34966,7 @@ pub(super) fn start_browse_archive_entry_delete(
                 &runner,
                 &cancel,
                 expected_extract_bytes,
+                super::archive_listing::is_remote_filesystem(&archive_path),
                 {
                     let progress_tx = tx.clone();
                     let progress_archive = archive_path.clone();
@@ -59172,6 +59185,7 @@ fn start_browse_archive_entry_rename(
                         .expect("native rename plan must accompany native admission"),
                     &archive_members,
                     (archive_mtime_secs, archive_mtime_nanos, archive_size),
+                    super::archive_listing::is_remote_filesystem(&admitted_archive_path),
                     password.as_deref(),
                     &tool_paths,
                     &cancel,
@@ -59216,6 +59230,7 @@ fn start_browse_archive_entry_rename(
                 &runner,
                 &cancel,
                 expected_extract_bytes,
+                super::archive_listing::is_remote_filesystem(&archive_path),
                 {
                     let progress_tx = tx.clone();
                     let progress_archive = archive_path.clone();
@@ -59543,6 +59558,7 @@ fn start_browse_iso_wv_archive_create(
                 &runner,
                 &cancel,
                 expected_extract_bytes,
+                super::archive_listing::is_remote_filesystem(&archive_path),
                 {
                     let progress_tx = tx_for_task.clone();
                     let progress_archive = archive_path.clone();

@@ -2285,13 +2285,24 @@ pub struct ArchiveMetadataEditorPayload {
 }
 
 pub fn try_cleanup_archive_metadata_staging_dir(staging_dir: &Path) -> Result<(), String> {
-    match std::fs::remove_dir_all(staging_dir) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!(
+    let staging_error = match std::fs::remove_dir_all(staging_dir) {
+        Ok(()) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!(
             "failed to remove archive staging directory {}: {err}",
             staging_dir.display()
         )),
+    };
+    let local_source_error =
+        crate::convert::pipeline::materializer_archive::cleanup_archive_local_source_for_staging(
+            staging_dir,
+        )
+        .err();
+
+    match (staging_error, local_source_error) {
+        (None, None) => Ok(()),
+        (Some(err), None) | (None, Some(err)) => Err(err),
+        (Some(staging_err), Some(local_err)) => Err(format!("{staging_err}; {local_err}")),
     }
 }
 
