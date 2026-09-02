@@ -374,6 +374,9 @@ pub enum AppMessage {
     ArchivePreviewResult {
         generation: u64,
         archive_path: std::path::PathBuf,
+        /// Password proven by the preview's bounded archive listing, if any.
+        /// This is process-local only and must never be rendered or logged.
+        resolved_password: Option<crate::convert::pipeline::SecretString>,
         result: Result<crate::tui::app::ArchivePreview, String>,
         baseline: crate::tui::app::ConvertProbeBaseline,
     },
@@ -773,7 +776,7 @@ pub enum AppMessage {
         archive_path: std::path::PathBuf,
         cache_key: Option<crate::tui::archive_listing::ArchiveListingCacheKey>,
         result: Box<Result<crate::tui::archive_listing::ArchiveListing, String>>,
-        password: Option<String>,
+        password: Option<crate::convert::pipeline::SecretString>,
     },
     /// Result of the blocking optical-disc classifier/TOC read used to seed
     /// a GNUDB lookup. The operation ID makes late completions total no-ops.

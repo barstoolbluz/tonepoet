@@ -93,6 +93,14 @@
           xorriso
           atomicparsley
           bat
+        ]
+        # RARLAB's proprietary writer is required for RAR creation. The flake
+        # already permits unfree packages. nixpkgs distributes `rar` only on a
+        # subset of our default systems, so add it exactly where its package
+        # metadata says it is available; other hosts can still provide `rar`
+        # on PATH without making flake evaluation fail.
+        ++ lib.optionals (lib.meta.availableOn stdenv.hostPlatform rar) [
+          rar
         ] ++ lib.optionals stdenv.isLinux [
           fuse-archive
           fuseiso

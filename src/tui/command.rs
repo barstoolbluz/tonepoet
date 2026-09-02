@@ -463,6 +463,12 @@ pub struct BrowseConvertExpansionRequest {
 #[derive(Debug, Clone)]
 pub struct BrowseConvertExpansion {
     pub queue: QueueExpansionResult,
+    /// Passwords resolved by the background expansion worker for encrypted
+    /// archive paths that bypass the single-archive preview flow. When more
+    /// than one candidate exists the selected value is authenticated; a lone
+    /// session candidate preserves the previous zero-probe behavior. Values
+    /// use SecretString so debug output from AppMessage remains redacted.
+    pub resolved_archive_passwords: BTreeMap<PathBuf, crate::convert::pipeline::SecretString>,
     /// Explicit top-level selection paths that the blocking worker classified
     /// as unsupported. Recursive files discovered inside selected directories
     /// are intentionally excluded so folder-expansion diagnostics do not grow
@@ -486,6 +492,7 @@ impl BrowseConvertExpansion {
     fn cancelled(visited: usize) -> Self {
         Self {
             queue: QueueExpansionResult::default(),
+            resolved_archive_passwords: BTreeMap::new(),
             refused_explicit_paths: Vec::new(),
             expanded_folder_count: 0,
             empty_audio_folders: Vec::new(),
@@ -498,6 +505,7 @@ impl BrowseConvertExpansion {
     fn failed(message: String) -> Self {
         Self {
             queue: QueueExpansionResult::default(),
+            resolved_archive_passwords: BTreeMap::new(),
             refused_explicit_paths: Vec::new(),
             expanded_folder_count: 0,
             empty_audio_folders: Vec::new(),
@@ -835,6 +843,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
 
             BrowseConvertExpansion {
                 queue,
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths,
                 expanded_folder_count,
                 empty_audio_folders,
@@ -848,6 +857,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
         }
         Err(err) => BrowseConvertExpansion {
             queue: QueueExpansionResult::default(),
+            resolved_archive_passwords: BTreeMap::new(),
             refused_explicit_paths,
             expanded_folder_count: 0,
             empty_audio_folders: Vec::new(),
@@ -949,6 +959,20 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
         app,
         &request.queue_input_paths,
     );
+    // Password material stays out of BrowseConvertExpansionRequest because that
+    // request participates in debug output and freshness equality. Capture the
+    // minimum secret state in the worker closure instead. A loaded keychain can
+    // be reused without I/O; otherwise the worker loads it only if expansion
+    // actually discovers an archive path that needs authentication.
+    let configured_archive_password = app.config.conversion.archive_password.clone();
+    let configured_archive_password_ref = app.config.conversion.archive_password_ref.clone();
+    let loaded_archive_passwords = app.keychain.loaded.then(|| app.keychain.passwords.clone());
+    let session_archive_passwords = app.archive_passwords.clone();
+    let archive_listing_timeout = match app.config.performance.browsing.archive_listing_timeout {
+        0 => None,
+        seconds => Some(std::time::Duration::from_secs(seconds)),
+    };
+
     let tx_for_worker = tx.clone();
     let request_for_worker = request.clone();
     tokio::spawn(async move {
@@ -956,7 +980,7 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
         let browse_in_archive = request_for_worker.browse_in_archive;
         let cue_selection_overrides = request_for_worker.cue_selection_overrides.clone();
         let cancel_for_worker = cancel.clone();
-        let worker_result = task::spawn_blocking(move || {
+        let mut worker_result = task::spawn_blocking(move || {
             expand_regular_filesystem_audio_folders_for_convert_blocking_with_grouping_decisions_and_cue_selections(
                 browse_in_archive,
                 paths_for_worker,
@@ -968,6 +992,17 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
         .await
         .unwrap_or_else(|err| BrowseConvertExpansion::failed(format!("folder expansion worker failed: {err}")));
 
+        authenticate_expanded_archive_paths(
+            &mut worker_result,
+            configured_archive_password,
+            configured_archive_password_ref,
+            loaded_archive_passwords,
+            session_archive_passwords,
+            archive_listing_timeout,
+            cancel.clone(),
+        )
+        .await;
+
         let _ = tx_for_worker
             .send(AppMessage::BrowseConvertExpansionComplete {
                 generation,
@@ -977,6 +1012,351 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
             .await;
     });
 }
+
+
+async fn authenticate_expanded_archive_paths(
+    expansion: &mut BrowseConvertExpansion,
+    configured_password: Option<String>,
+    configured_password_ref: Option<String>,
+    loaded_passwords: Option<Vec<String>>,
+    session_passwords: std::collections::HashMap<PathBuf, String>,
+    timeout: Option<std::time::Duration>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    if expansion.cancelled || cancel.is_cancelled() {
+        return;
+    }
+
+    let mut archive_paths = expansion
+        .queue
+        .paths
+        .iter()
+        .filter(|path| crate::is_encrypted_archive_ext(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    archive_paths.sort();
+    archive_paths.dedup();
+    if archive_paths.is_empty() {
+        return;
+    }
+
+    // Resolve the ordinary configured/keychain candidate source once. A
+    // per-path session password is an ordering hint, not proof that no newer
+    // cached password can work for an archive that changed in-place.
+    let fallback_passwords = if let Some(password) = configured_password {
+        Ok(vec![password])
+    } else if let Some(reference) = configured_password_ref {
+        task::spawn_blocking(move || {
+            crate::secret_store::get(&reference)
+                .map(|password| vec![password])
+                .map_err(|error| format!("cannot resolve configured archive password: {error}"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("archive password worker failed: {error}")))
+    } else if let Some(passwords) = loaded_passwords {
+        Ok(passwords)
+    } else {
+        task::spawn_blocking(|| {
+            crate::tui::keychain::load_keychain_with_warnings()
+                .map(|result| result.passwords)
+                .map_err(|error| format!("cannot resolve stored archive passwords: {error}"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("archive password worker failed: {error}")))
+    };
+
+    authenticate_expanded_archive_paths_with_candidates(
+        expansion,
+        archive_paths,
+        fallback_passwords,
+        session_passwords,
+        timeout,
+        cancel,
+        None,
+    )
+    .await;
+}
+
+async fn authenticate_expanded_archive_paths_with_candidates(
+    expansion: &mut BrowseConvertExpansion,
+    archive_paths: Vec<PathBuf>,
+    fallback_passwords: Result<Vec<String>, String>,
+    session_passwords: std::collections::HashMap<PathBuf, String>,
+    timeout: Option<std::time::Duration>,
+    cancel: tokio_util::sync::CancellationToken,
+    archive_binary: Option<&Path>,
+) {
+    let fallback_passwords = match fallback_passwords {
+        Ok(passwords) => passwords,
+        Err(error) => {
+            let mut dropped_unresolved = false;
+            for archive_path in archive_paths {
+                if let Some(password) = session_passwords.get(&archive_path) {
+                    // Preserve the old session-only resilience when the secret
+                    // backend cannot supply any additional candidates.
+                    expansion.resolved_archive_passwords.insert(
+                        archive_path,
+                        crate::convert::pipeline::SecretString::new(password.clone()),
+                    );
+                } else {
+                    expansion.queue.paths.retain(|path| path != &archive_path);
+                    dropped_unresolved = true;
+                }
+            }
+            if dropped_unresolved {
+                expansion.expansion_errors.push(format!(
+                    "archive password resolution failed before queue admission: {error}"
+                ));
+            }
+            return;
+        }
+    };
+
+    let options = super::archive_listing::ArchiveListingOptions { timeout };
+    for archive_path in archive_paths {
+        if cancel.is_cancelled() {
+            expansion.cancelled = true;
+            return;
+        }
+
+        let session_password = session_passwords.get(&archive_path).cloned();
+        if let Some(session_password) = session_password.as_ref() {
+            let has_alternate = fallback_passwords
+                .iter()
+                .any(|password| password != session_password);
+            if !has_alternate {
+                // With literally no alternate candidate there is no useful
+                // probe to perform. Preserve the previous cheap session-only
+                // behavior and avoid cloning the fallback list.
+                expansion.resolved_archive_passwords.insert(
+                    archive_path,
+                    crate::convert::pipeline::SecretString::new(session_password.clone()),
+                );
+                continue;
+            }
+        } else if fallback_passwords.is_empty() {
+            // No cached password means there is nothing to cycle. Preserve the
+            // legacy no-password queue behavior; extraction will surface the
+            // ordinary password requirement if the archive is encrypted.
+            continue;
+        }
+
+        let merged_candidates;
+        let candidates = if session_password.is_some() {
+            merged_candidates = super::app::archive_password_candidates_with_session(
+                session_password,
+                fallback_passwords.clone(),
+            );
+            merged_candidates.as_slice()
+        } else {
+            fallback_passwords.as_slice()
+        };
+
+        let result = match archive_binary {
+            Some(binary) => {
+                super::archive_listing::list_archive_with_password_candidates_using_binary(
+                    &archive_path,
+                    candidates,
+                    options,
+                    cancel.clone(),
+                    binary,
+                )
+                .await
+            }
+            None => {
+                super::archive_listing::list_archive_with_password_candidates(
+                    &archive_path,
+                    candidates,
+                    options,
+                    cancel.clone(),
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok((_listing, Some(password))) => {
+                expansion.resolved_archive_passwords.insert(
+                    archive_path,
+                    crate::convert::pipeline::SecretString::new(password),
+                );
+            }
+            Ok((_listing, None)) => {
+                // Plaintext ZIP/7z/RAR accepts a supplied -p argument. Do not
+                // create a false per-archive secret association for it.
+            }
+            Err(error) => {
+                expansion.queue.paths.retain(|path| path != &archive_path);
+                expansion.expansion_errors.push(format!(
+                    "archive '{}' was not queued: {error}",
+                    archive_path.display()
+                ));
+            }
+        }
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod archive_password_bulk_auth_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn expansion_for_archive(path: &Path) -> BrowseConvertExpansion {
+        let mut queue = QueueExpansionResult::default();
+        queue.paths.push(path.to_path_buf());
+        BrowseConvertExpansion {
+            queue,
+            resolved_archive_passwords: BTreeMap::new(),
+            refused_explicit_paths: Vec::new(),
+            expanded_folder_count: 0,
+            empty_audio_folders: Vec::new(),
+            expansion_errors: Vec::new(),
+            visited: 1,
+            cancelled: false,
+        }
+    }
+
+    fn fake_password_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let tool = temp.path().join("fake-7z");
+        let log = temp.path().join("attempts.log");
+        let script = format!(
+            r#"#!/bin/sh
+action="$1"
+password=""
+for arg in "$@"; do
+  case "$arg" in
+    -p*) password="${{arg#-p}}" ;;
+  esac
+done
+printf '%s:%s\n' "$action" "$password" >> '{}'
+
+if [ "$action" = "l" ]; then
+  cat <<'EOF'
+Type = zip
+Physical Size = 123
+
+----------
+Path = track.flac
+Size = 1
+Packed Size = 1
+Encrypted = +
+EOF
+  exit 0
+fi
+
+case "$password" in
+  good) exit 0 ;;
+  *)
+    echo 'ERROR: Wrong password' >&2
+    exit 2
+    ;;
+esac
+"#,
+            log.display()
+        );
+        std::fs::write(&tool, script).expect("fake 7z script");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("fake 7z metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("make fake 7z executable");
+        (tool, log)
+    }
+
+    #[tokio::test]
+    async fn bulk_stale_session_password_cycles_to_cached_password() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let archive = temp.path().join("album.rar");
+        let mut expansion = expansion_for_archive(&archive);
+        let session_passwords = HashMap::from([(archive.clone(), "wrong".to_string())]);
+
+        authenticate_expanded_archive_paths_with_candidates(
+            &mut expansion,
+            vec![archive.clone()],
+            Ok(vec!["good".to_string(), "older".to_string()]),
+            session_passwords,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            Some(&tool),
+        )
+        .await;
+
+        assert_eq!(expansion.queue.paths, vec![archive.clone()]);
+        assert!(expansion.expansion_errors.is_empty());
+        assert_eq!(
+            expansion
+                .resolved_archive_passwords
+                .get(&archive)
+                .map(|password| password.expose()),
+            Some("good")
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:wrong\nt:wrong\nt:good\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_backend_failure_preserves_session_only_password() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.7z");
+        let mut expansion = expansion_for_archive(&archive);
+        let session_passwords = HashMap::from([(archive.clone(), "session-only".to_string())]);
+
+        authenticate_expanded_archive_paths_with_candidates(
+            &mut expansion,
+            vec![archive.clone()],
+            Err("secret backend unavailable".to_string()),
+            session_passwords,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            Some(Path::new("/definitely/not/invoked")),
+        )
+        .await;
+
+        assert_eq!(expansion.queue.paths, vec![archive.clone()]);
+        assert!(expansion.expansion_errors.is_empty());
+        assert_eq!(
+            expansion
+                .resolved_archive_passwords
+                .get(&archive)
+                .map(|password| password.expose()),
+            Some("session-only")
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_session_only_candidate_keeps_the_zero_probe_fast_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive = temp.path().join("album.rar");
+        let mut expansion = expansion_for_archive(&archive);
+        let session_passwords = HashMap::from([(archive.clone(), "session-only".to_string())]);
+
+        authenticate_expanded_archive_paths_with_candidates(
+            &mut expansion,
+            vec![archive.clone()],
+            Ok(vec!["session-only".to_string()]),
+            session_passwords,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            Some(Path::new("/definitely/not/invoked")),
+        )
+        .await;
+
+        assert_eq!(
+            expansion
+                .resolved_archive_passwords
+                .get(&archive)
+                .map(|password| password.expose()),
+            Some("session-only")
+        );
+        assert!(expansion.expansion_errors.is_empty());
+    }
+}
+
 
 pub(crate) fn browse_convert_expansion_selection_still_current(
     app: &AppState,
@@ -1078,6 +1458,10 @@ pub(crate) fn handle_browse_convert_expansion_complete(
     }
 
     if expansion.cancelled {
+        // Authentication runs after filesystem expansion and can therefore be
+        // cancelled after synthetic CUE artifacts already exist. Retire those
+        // caller-owned temporaries before dropping the cancelled result.
+        cleanup_discarded_browse_convert_expansion(&expansion);
         app.set_status(status_with_stale_selection_notice(
             request.dropped_stale_selection_count,
             "folder expansion cancelled",
@@ -1092,9 +1476,9 @@ pub(crate) fn handle_browse_convert_expansion_complete(
             ));
             return;
         }
-        // Currently unreachable (constructors only populate this field with
-        // empty queue paths), but if it ever fires the status below is
-        // overwritten in the same reducer pass — keep a durable record.
+        // Archive authentication can reject one encrypted input while leaving
+        // other queueable sources intact. Keep the warning durable because the
+        // final queue/review status in this reducer pass may replace it.
         log::warn!("browse expansion warning: {}", err);
         app.set_status(status_with_stale_selection_notice(
             request.dropped_stale_selection_count,
@@ -1120,6 +1504,11 @@ pub(crate) fn handle_browse_convert_expansion_complete(
             status,
         ));
         return;
+    }
+
+    for (path, password) in &expansion.resolved_archive_passwords {
+        app.archive_passwords
+            .insert(path.clone(), password.expose().to_string());
     }
 
     match request.target {
@@ -19435,6 +19824,7 @@ mod execute_queue_state_consistency_tests {
                     expansion_errors: vec![diagnostic.clone()],
                     ..QueueExpansionResult::default()
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 0,
                 empty_audio_folders: Vec::new(),
@@ -20014,6 +20404,7 @@ FILE "{stem}.flac" WAVE
                     expansion_errors: Vec::new(),
                     cue_selection_prompt: None,
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20099,6 +20490,7 @@ FILE "{stem}.flac" WAVE
                     expansion_errors: vec![ordinary_warning.clone(), warning],
                     cue_selection_prompt: None,
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20186,6 +20578,7 @@ FILE "{stem}.flac" WAVE
                     expansion_errors: vec![warning],
                     cue_selection_prompt: None,
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20337,6 +20730,7 @@ FILE "{stem}.flac" WAVE
                     ),
                     ..QueueExpansionResult::default()
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20475,6 +20869,7 @@ FILE "side_b.flac" WAVE
             request,
             BrowseConvertExpansion {
                 queue: expansion,
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20573,6 +20968,7 @@ FILE "side_b.flac" WAVE
                     paths: vec![track.clone()],
                     ..QueueExpansionResult::default()
                 },
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20667,6 +21063,7 @@ FILE "side_b.flac" WAVE
             request,
             BrowseConvertExpansion {
                 queue: expansion,
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20772,6 +21169,7 @@ FILE "side_b.flac" WAVE
             request,
             BrowseConvertExpansion {
                 queue: expansion,
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -20896,6 +21294,7 @@ FILE "side_b.flac" WAVE
             request,
             BrowseConvertExpansion {
                 queue: stale_expansion,
+                resolved_archive_passwords: BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),

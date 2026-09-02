@@ -7414,11 +7414,19 @@ pub(super) fn browse_tab_action_ready(app: &mut AppState, tx: &mpsc::Sender<AppM
         app.set_status("tab action deferred: finish saving archive changes first");
         return false;
     }
+    if browse_archive_inline_metadata_operation_pending(app) {
+        app.set_status("tab action deferred: finish the archive metadata write first");
+        return false;
+    }
     let mut cancelled_archive_preparation =
         cancel_and_detach_pending_browse_archive_edit_staging(app);
     if app.browse_inline_edit.is_some() {
         finish_active_inline_edit(app, InlineEditResolution::Commit, tx);
         if app.browse_inline_edit.is_some() {
+            return false;
+        }
+        if browse_archive_inline_metadata_operation_pending(app) {
+            app.set_status("tab action deferred: finish the archive metadata write first");
             return false;
         }
         // Committing an archive inline rename can itself start asynchronous
@@ -8494,6 +8502,13 @@ pub fn load_browse_selection_pub(
 }
 
 
+fn archive_listing_passwords_for_path(
+    app: &mut AppState,
+    path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    super::app::archive_password_candidates_for_path(app, path)
+}
+
 fn archive_listing_password_for_path(
     app: &mut AppState,
     path: &std::path::Path,
@@ -8589,27 +8604,40 @@ fn start_browse_archive_listing_inner(
     if !bypass_cache {
         if let Some(listing) = app.cached_archive_listing(&cache_key) {
             let count = listing.entries.len();
-            let password = match password_override.clone() {
-                Some(password) => Some(password),
-                None => match archive_listing_password_for_path(app, &path) {
-                    Ok(password) => password,
+            let passwords = match password_override.clone() {
+                Some(password) => vec![password],
+                None => match archive_listing_passwords_for_path(app, &path) {
+                    Ok(passwords) => passwords,
                     Err(error) => {
                         app.set_status(error);
                         return;
                     }
                 },
             };
-            app.browse.enter_archive(listing, password);
-            app.force_redraw = true;
-            app.set_status(format!("Opened from cache ({} entries)", count));
-            return;
+            let has_encrypted_payload = listing
+                .entries
+                .iter()
+                .any(|entry| entry.encrypted && !entry.is_dir);
+            if !(has_encrypted_payload && passwords.len() > 1) {
+                // Do not associate an arbitrary cached secret with plaintext
+                // archives. For an encrypted cache entry, a multi-candidate
+                // MRU still needs authentication; fall through to the bounded
+                // worker rather than silently picking position zero.
+                let password = has_encrypted_payload
+                    .then(|| passwords.into_iter().next())
+                    .flatten();
+                app.browse.enter_archive(listing, password);
+                app.force_redraw = true;
+                app.set_status(format!("Opened from cache ({} entries)", count));
+                return;
+            }
         }
     }
 
-    let password = match password_override {
-        Some(password) => Some(password),
-        None => match archive_listing_password_for_path(app, &path) {
-            Ok(password) => password,
+    let passwords = match password_override {
+        Some(password) => vec![password],
+        None => match archive_listing_passwords_for_path(app, &path) {
+            Ok(passwords) => passwords,
             Err(error) => {
                 app.set_status(error);
                 return;
@@ -8641,13 +8669,17 @@ fn start_browse_archive_listing_inner(
             })
             .await;
 
-        let result = super::archive_listing::list_archive_with_options(
+        let result = super::archive_listing::list_archive_with_password_candidates(
             &path_for_worker,
-            password.as_deref(),
+            &passwords,
             super::archive_listing::ArchiveListingOptions { timeout },
             cancel,
         )
         .await;
+        let (result, password) = match result {
+            Ok((listing, matched_password)) => (Ok(listing), matched_password),
+            Err(error) => (Err(error), None),
+        };
 
         let _ = tx
             .send(AppMessage::ArchiveListingComplete {
@@ -8656,7 +8688,7 @@ fn start_browse_archive_listing_inner(
                 archive_path: path_for_worker,
                 cache_key: cache_key_for_result,
                 result: Box::new(result),
-                password,
+                password: password.map(crate::convert::pipeline::SecretString::new),
             })
             .await;
     });
@@ -9190,6 +9222,7 @@ mod browse_convert_queue_return_worker_tests {
                     paths: vec![iso.clone()],
                     ..Default::default()
                 },
+                resolved_archive_passwords: std::collections::BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 0,
                 empty_audio_folders: Vec::new(),
@@ -9247,6 +9280,7 @@ mod browse_convert_queue_return_worker_tests {
                     paths: vec![audio.clone()],
                     ..Default::default()
                 },
+                resolved_archive_passwords: std::collections::BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 1,
                 empty_audio_folders: Vec::new(),
@@ -9305,6 +9339,7 @@ mod browse_convert_queue_return_worker_tests {
                     paths: vec![iso],
                     ..Default::default()
                 },
+                resolved_archive_passwords: std::collections::BTreeMap::new(),
                 refused_explicit_paths: Vec::new(),
                 expanded_folder_count: 0,
                 empty_audio_folders: Vec::new(),
@@ -9532,6 +9567,7 @@ fn handle_queue_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMess
                         app.active_overlay = ActiveOverlay::ErrorDetail {
                             item_id: item.id.clone(),
                             error: error.clone(),
+                            scroll: 0,
                         };
                     }
                     _ => {
@@ -9702,6 +9738,36 @@ fn commit_gnudb_review_edit_to_row(state: &mut super::app::GnudbReviewState, row
         }
         _ => {}
     }
+}
+
+fn bounded_scroll_offset(scroll: usize, key: KeyCode, max_scroll: usize) -> usize {
+    let current = scroll.min(max_scroll);
+    match key {
+        KeyCode::Up => current.saturating_sub(1),
+        KeyCode::Down => current.saturating_add(1).min(max_scroll),
+        KeyCode::PageUp => current.saturating_sub(5),
+        KeyCode::PageDown => current.saturating_add(5).min(max_scroll),
+        KeyCode::Home => 0,
+        KeyCode::End => max_scroll,
+        _ => current,
+    }
+}
+
+fn update_scrollable_message_offset(
+    scroll: usize,
+    key: KeyCode,
+    message: &str,
+    preferred_width: u16,
+    min_height: u16,
+) -> usize {
+    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    let max_scroll = super::draw_overlays::scrollable_message_max_scroll(
+        Rect::new(0, 0, width, height),
+        preferred_width,
+        min_height,
+        message,
+    );
+    bounded_scroll_offset(scroll, key, max_scroll)
 }
 
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
@@ -9888,7 +9954,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             | ConfirmAction::ArchiveRepackageFailure { .. }
                     ) =>
                 {
-                    execute_archive_staging_discard_action(app, &action);
+                    execute_archive_staging_discard_action(app, &action, tx);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     cancel_confirm_action(app, Some(&action));
@@ -9896,7 +9962,37 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 _ => {}
             }
         }
-        ActiveOverlay::ErrorDetail { .. } | ActiveOverlay::ItemInfo { .. } => {
+        ActiveOverlay::ErrorDetail {
+            item_id,
+            error,
+            scroll,
+        } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                _ => {}
+            }
+            let scroll = update_scrollable_message_offset(scroll, key.code, &error, 72, 10);
+            app.active_overlay = ActiveOverlay::ErrorDetail { item_id, error, scroll };
+        }
+        ActiveOverlay::Notice {
+            title,
+            message,
+            scroll,
+        } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    app.active_overlay = ActiveOverlay::None;
+                    return;
+                }
+                _ => {}
+            }
+            let scroll = update_scrollable_message_offset(scroll, key.code, &message, 66, 9);
+            app.active_overlay = ActiveOverlay::Notice { title, message, scroll };
+        }
+        ActiveOverlay::ItemInfo { .. } => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 app.active_overlay = ActiveOverlay::None;
             }
@@ -33552,6 +33648,25 @@ pub(super) fn persist_active_archive_staging_session(app: &mut AppState) -> Resu
     )
 }
 
+fn reject_competing_archive_staging_owner(
+    app: &mut AppState,
+    archive_path: &std::path::Path,
+    operation: &str,
+) -> Result<(), String> {
+    if app
+        .browse
+        .archive_staging_owner_tab_id(archive_path)
+        .is_some_and(|owner| owner != app.browse.active_tab_id())
+    {
+        let message = format!(
+            "{operation}: this archive already has pending changes in another Browse tab; finish or save them there before editing here"
+        );
+        app.set_status(message.clone());
+        return Err(message);
+    }
+    Ok(())
+}
+
 fn persist_empty_archive_staging_registration(
     app: &mut AppState,
     archive_path: &std::path::Path,
@@ -33953,12 +34068,19 @@ fn rollback_iso_wv_cue_rename(
     std::fs::rename(new_staged, old_staged)
         .map_err(|err| format!("staged filesystem rename rollback failed: {err}"))
 }
-pub(super) fn rename_staged_archive_entry_transactional(
-    app: &mut AppState,
+struct AppliedStagedArchiveRename {
+    old_staged: std::path::PathBuf,
+    new_staged: std::path::PathBuf,
+    cue_rename_plan: Option<IsoWvCueRenamePlan>,
+    rewritten_cue_bytes: Option<Vec<u8>>,
+}
+
+fn apply_staged_archive_entry_rename(
     staging_dir: &std::path::Path,
     old_inner_path: &str,
     new_inner_path: &str,
-) -> Result<(), String> {
+    is_iso_wv: bool,
+) -> Result<AppliedStagedArchiveRename, String> {
     let old_staged = staging_path_for_archive_inner(staging_dir, old_inner_path)?;
     let new_staged = staging_path_for_archive_inner(staging_dir, new_inner_path)?;
     if !old_staged.exists() {
@@ -33968,19 +34090,6 @@ pub(super) fn rename_staged_archive_entry_transactional(
         return Err(format!("rename target already exists in staging: {new_inner_path}"));
     }
 
-    let is_iso_wv = app
-        .browse
-        .archive
-        .as_ref()
-        .filter(|archive| {
-            archive
-                .staging
-                .as_ref()
-                .is_some_and(|staging| staging.staging_dir == staging_dir)
-        })
-        .is_some_and(|archive| {
-            crate::convert::classify::is_iso_wv_container(&archive.listing.archive_path)
-        });
     let cue_rename_plan = if is_iso_wv {
         prepare_iso_wv_cue_rename_plan(staging_dir, &old_staged, &new_staged)?
     } else {
@@ -34063,13 +34172,75 @@ pub(super) fn rename_staged_archive_entry_transactional(
         rewritten_cue_bytes = Some(current);
     }
 
+    Ok(AppliedStagedArchiveRename {
+        old_staged,
+        new_staged,
+        cue_rename_plan,
+        rewritten_cue_bytes,
+    })
+}
+
+fn rollback_applied_staged_archive_entry_rename(
+    applied: &AppliedStagedArchiveRename,
+) -> Result<(), String> {
+    rollback_iso_wv_cue_rename(
+        applied.cue_rename_plan.as_ref(),
+        applied.rewritten_cue_bytes.as_deref(),
+        &applied.new_staged,
+        &applied.old_staged,
+    )
+}
+
+fn replay_pending_archive_renames_into_staging(
+    staging_dir: &std::path::Path,
+    archive_path: &std::path::Path,
+    edits: &[super::browse::ArchiveEdit],
+) -> Result<(), String> {
+    let is_iso_wv = crate::convert::classify::is_iso_wv_container(archive_path);
+    for edit in edits {
+        match edit {
+            super::browse::ArchiveEdit::Rename { from, to } => {
+                apply_staged_archive_entry_rename(staging_dir, from, to, is_iso_wv)?;
+            }
+            _ => {
+                return Err(
+                    "logical archive staging contained a non-rename edit before materialization"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn rename_staged_archive_entry_transactional(
+    app: &mut AppState,
+    staging_dir: &std::path::Path,
+    old_inner_path: &str,
+    new_inner_path: &str,
+) -> Result<(), String> {
+    let is_iso_wv = app
+        .browse
+        .archive
+        .as_ref()
+        .filter(|archive| {
+            archive
+                .staging
+                .as_ref()
+                .is_some_and(|staging| staging.staging_dir == staging_dir)
+        })
+        .is_some_and(|archive| {
+            crate::convert::classify::is_iso_wv_container(&archive.listing.archive_path)
+        });
+    let applied = apply_staged_archive_entry_rename(
+        staging_dir,
+        old_inner_path,
+        new_inner_path,
+        is_iso_wv,
+    )?;
+
     if let Err(err) = append_archive_rename_edit_and_persist(app, old_inner_path, new_inner_path) {
-        match rollback_iso_wv_cue_rename(
-            cue_rename_plan.as_ref(),
-            rewritten_cue_bytes.as_deref(),
-            &new_staged,
-            &old_staged,
-        ) {
+        match rollback_applied_staged_archive_entry_rename(&applied) {
             Ok(()) => Err(format!(
                 "rename recovery tracking failed; staged filesystem/CUE rename was rolled back: {err}"
             )),
@@ -34473,6 +34644,233 @@ fn archive_extract_progress_message(
     }
 }
 
+fn clear_logical_archive_staging_contents(staging_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(staging_dir)
+        .map_err(|err| format!("create logical archive staging root failed: {err}"))?;
+    let entries = std::fs::read_dir(staging_dir)
+        .map_err(|err| format!("read logical archive staging root failed: {err}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read logical archive staging entry failed: {err}"))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("stat logical archive staging entry {} failed: {err}", path.display()))?;
+        let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(err) = result {
+            return Err(format!(
+                "clear logical archive staging entry {} failed: {err}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reset_logical_archive_staging_after_failure(
+    staging_dir: &std::path::Path,
+    primary_error: String,
+) -> String {
+    let staging_error = clear_logical_archive_staging_contents(staging_dir).err();
+    let local_source_error =
+        crate::convert::pipeline::materializer_archive::cleanup_archive_local_source_for_staging(
+            staging_dir,
+        )
+        .err();
+
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = staging_error {
+        cleanup_errors.push(error);
+    }
+    if let Some(error) = local_source_error {
+        cleanup_errors.push(error);
+    }
+    if cleanup_errors.is_empty() {
+        primary_error
+    } else {
+        format!(
+            "{primary_error}; logical staging reset also failed: {}",
+            cleanup_errors.join("; ")
+        )
+    }
+}
+
+pub(super) async fn materialize_logical_archive_staging_with_progress<F>(
+    archive_path: &std::path::Path,
+    staging_dir: &std::path::Path,
+    edits: &[super::browse::ArchiveEdit],
+    expected_fingerprint: (i64, u32, u64),
+    password: Option<&str>,
+    tool_paths: &std::collections::HashMap<String, std::path::PathBuf>,
+    cancel: &tokio_util::sync::CancellationToken,
+    expected_extract_bytes: Option<u64>,
+    progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(
+            crate::convert::pipeline::materializer_archive::ArchiveExtractionProgressSnapshot,
+        ) + Send
+        + 'static,
+{
+    if !super::browse::archive_logical_staging_marker_exists(staging_dir) {
+        return Err(
+            "logical archive staging marker is missing; refusing to overwrite an unknown staging tree"
+                .to_string(),
+        );
+    }
+    if edits
+        .iter()
+        .any(|edit| !matches!(edit, super::browse::ArchiveEdit::Rename { .. }))
+    {
+        return Err(
+            "logical archive staging contains non-rename edits and cannot be replayed safely"
+                .to_string(),
+        );
+    }
+
+    clear_logical_archive_staging_contents(staging_dir)?;
+    crate::convert::pipeline::materializer_archive::cleanup_archive_local_source_for_staging(
+        staging_dir,
+    )
+    .map_err(|err| format!("clear stale localized archive source before materialization failed: {err}"))?;
+    if cancel.is_cancelled() {
+        return Err("archive staging materialization cancelled".to_string());
+    }
+
+    let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths.clone());
+    if let Err(err) = crate::convert::pipeline::materializer_archive::extract_archive_to_staging_with_progress(
+        archive_path,
+        staging_dir,
+        "browse-archive-pending-edit-materialize",
+        password,
+        &runner,
+        cancel,
+        expected_extract_bytes,
+        super::archive_listing::is_remote_filesystem(archive_path),
+        progress,
+    )
+    .await
+    {
+        return Err(reset_logical_archive_staging_after_failure(
+            staging_dir,
+            format!("archive staging materialization extraction failed: {err}"),
+        ));
+    }
+
+    if let Err(err) = archive_fingerprint_changed(
+        archive_path,
+        expected_fingerprint.0,
+        expected_fingerprint.1,
+        expected_fingerprint.2,
+    )
+    .and_then(|changed| {
+        if changed {
+            Err(
+                "archive changed externally while pending edits were being materialized; pending edits were preserved without touching the archive"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        }
+    }) {
+        return Err(reset_logical_archive_staging_after_failure(staging_dir, err));
+    }
+
+    if cancel.is_cancelled() {
+        return Err(reset_logical_archive_staging_after_failure(
+            staging_dir,
+            "archive staging materialization cancelled".to_string(),
+        ));
+    }
+
+    if let Err(err) = replay_pending_archive_renames_into_staging(staging_dir, archive_path, edits) {
+        return Err(reset_logical_archive_staging_after_failure(
+            staging_dir,
+            format!("replay pending archive renames into staging failed: {err}"),
+        ));
+    }
+
+    if cancel.is_cancelled() {
+        return Err(reset_logical_archive_staging_after_failure(
+            staging_dir,
+            "archive staging materialization cancelled".to_string(),
+        ));
+    }
+
+    if let Err(err) = super::browse::clear_archive_logical_staging_marker(staging_dir) {
+        return Err(reset_logical_archive_staging_after_failure(staging_dir, err));
+    }
+    Ok(())
+}
+
+pub(super) fn refresh_active_archive_staging_materialization_state(
+    app: &mut AppState,
+    archive_path: &std::path::Path,
+    staging_dir: &std::path::Path,
+) {
+    if let Some(staging) = app
+        .browse
+        .archive
+        .as_mut()
+        .filter(|archive| archive.listing.archive_path == archive_path)
+        .and_then(|archive| archive.staging.as_mut())
+        .filter(|staging| staging.staging_dir == staging_dir)
+    {
+        staging.tree_materialized =
+            !super::browse::archive_logical_staging_marker_exists(staging_dir);
+    }
+}
+
+fn cancel_browse_owned_archive_preparation_for_deferred_navigation(
+    app: &mut AppState,
+) -> bool {
+    let Some(active) = app.browse.active_archive_staging() else {
+        return false;
+    };
+    let archive_path = active.archive_path.clone();
+    let staging_dir = active.staging_dir.clone();
+
+    if let Some(pending) = app
+        .pending_browse_archive_metadata
+        .as_ref()
+        .filter(|pending| {
+            !pending.owns_staging
+                && pending.archive_path == archive_path
+                && pending.staging_dir == staging_dir
+        })
+    {
+        pending.cancel.cancel();
+        return true;
+    }
+    if let Some(pending) = app
+        .pending_browse_archive_delete
+        .as_ref()
+        .filter(|pending| {
+            !pending.owns_staging
+                && pending.archive_path == archive_path
+                && pending.staging_dir == staging_dir
+        })
+    {
+        pending.cancel.cancel();
+        return true;
+    }
+    if let Some(pending) = app
+        .pending_browse_archive_create
+        .as_ref()
+        .filter(|pending| {
+            !pending.owns_staging
+                && pending.archive_path == archive_path
+                && pending.staging_dir == staging_dir
+        })
+    {
+        pending.cancel.cancel();
+        return true;
+    }
+    false
+}
+
 pub(super) fn cancel_and_detach_pending_browse_archive_edit_staging(
     app: &mut AppState,
 ) -> bool {
@@ -34487,15 +34885,21 @@ pub(super) fn cancel_and_detach_pending_browse_archive_edit_staging(
     }
     if let Some(pending) = app.pending_browse_archive_delete.take() {
         let archive_path = pending.archive_path.clone();
+        let owns_staging = pending.owns_staging;
         pending.cancel_and_cleanup();
-        delete_pending_archive_session_best_effort(app, &archive_path);
+        if owns_staging {
+            delete_pending_archive_session_best_effort(app, &archive_path);
+        }
         app.quit_after_browse_archive_delete = false;
         cancelled = true;
     }
     if let Some(pending) = app.pending_browse_archive_create.take() {
         let archive_path = pending.archive_path.clone();
+        let owns_staging = pending.owns_staging;
         pending.cancel_and_cleanup();
-        delete_pending_archive_session_best_effort(app, &archive_path);
+        if owns_staging {
+            delete_pending_archive_session_best_effort(app, &archive_path);
+        }
         app.quit_after_browse_archive_create = false;
         cancelled = true;
     }
@@ -34514,6 +34918,30 @@ pub(super) fn cancel_and_detach_pending_browse_archive_edit_staging(
 
 pub(super) fn exit_browse_archive(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     app.browse.reconcile_active_archive_staging_dirty();
+    if browse_archive_inline_metadata_operation_pending(app) {
+        // A submitted inline metadata edit is user work, not cancellable
+        // preparation. Keep the archive/staging owner stable until the write
+        // reducer has recorded the edit, then continue this exact exit/save.
+        app.deferred_browse_archive_exit = true;
+        app.set_status(
+            "archive exit deferred: waiting for archive metadata write before save".to_string(),
+        );
+        return;
+    }
+    if app.browse.active_archive_staging().is_some_and(|staging| staging.dirty)
+        && cancel_browse_owned_archive_preparation_for_deferred_navigation(app)
+    {
+        // A worker over an existing logical staging session may currently be
+        // extracting/replaying into that same directory. Do not start commit
+        // until its terminal reducer has observed cancellation and restored a
+        // stable logical/materialized state.
+        app.deferred_browse_archive_exit = true;
+        app.set_status(
+            "archive exit deferred: cancelling pending archive edit preparation before save"
+                .to_string(),
+        );
+        return;
+    }
     // Extraction/native-rename preparation has no user edit to preserve yet.
     // Request cooperative cancellation but do not trap navigation waiting for
     // the worker. Result reducers own late cleanup and never apply an edit once
@@ -34567,6 +34995,10 @@ fn open_browse_archive_metadata_editor_for_entries(
     archive_path: std::path::PathBuf,
     target_inner_paths: Option<Vec<String>>,
 ) {
+    if browse_archive_inline_metadata_operation_pending(app) {
+        app.set_status("metadata: wait for the current archive metadata write to finish");
+        return;
+    }
     if app.browse_archive_repackage.is_some() {
         app.set_status("metadata: wait for the current archive repackage to finish before editing another archive");
         return;
@@ -34587,8 +35019,14 @@ fn open_browse_archive_metadata_editor_for_entries(
             return;
         }
     }
-    if app.pending_browse_archive_rename.is_some() || app.pending_browse_archive_create.is_some() {
+    if app.pending_browse_archive_rename.is_some()
+        || app.pending_browse_archive_delete.is_some()
+        || app.pending_browse_archive_create.is_some()
+    {
         app.set_status("metadata: wait for the current archive structural edit to finish before editing metadata");
+        return;
+    }
+    if reject_competing_archive_staging_owner(app, &archive_path, "metadata").is_err() {
         return;
     }
 
@@ -34606,14 +35044,48 @@ fn open_browse_archive_metadata_editor_for_entries(
         .filter(|arc| arc.listing.archive_path == archive_path)
         .and_then(|arc| arc.staging.clone())
     {
-        let pending = PendingBrowseArchiveMetadataEdit::from_existing(
+        let mut pending = PendingBrowseArchiveMetadataEdit::from_existing(
             archive_path.clone(),
             staging.staging_dir.clone(),
             target_inner_paths_for_retry.clone(),
         );
+        pending.archive_mtime_secs = staging.archive_mtime_secs;
+        pending.archive_mtime_nanos = staging.archive_mtime_nanos;
+        pending.archive_size = staging.archive_size;
         let staging_dir = staging.staging_dir.clone();
         let cancel = pending.cancel.clone();
         let target_count = target_inner_paths.as_ref().map(|paths| paths.len());
+        let needs_materialization = !staging.tree_materialized
+            || super::browse::archive_logical_staging_marker_exists(&staging_dir);
+        let pending_edits = staging.edits.clone();
+        let expected_fingerprint = (
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+        );
+        let tool_paths = app.manager.config.tool_paths.clone();
+        let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+        let password = if needs_materialization {
+            if let Some(password) = app
+                .browse
+                .archive
+                .as_ref()
+                .filter(|archive| archive.listing.archive_path == archive_path)
+                .and_then(|archive| archive.password.clone())
+            {
+                Some(password)
+            } else {
+                match super::app::archive_password_for_path(app, &archive_path) {
+                    Ok(password) => password,
+                    Err(error) => {
+                        app.set_status(format!("metadata: {error}"));
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
         app.pending_browse_archive_metadata = Some(pending);
         app.set_status(match target_count {
             Some(1) => "Opening staged archive entry for metadata editing...".to_string(),
@@ -34626,6 +35098,32 @@ fn open_browse_archive_metadata_editor_for_entries(
             let result: Result<ArchiveMetadataEditorPayload, String> = async {
                 if cancel.is_cancelled() {
                     return Err("archive metadata edit cancelled".to_string());
+                }
+                if needs_materialization {
+                    let progress_tx = tx.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    materialize_logical_archive_staging_with_progress(
+                        &archive_path,
+                        &staging_dir,
+                        &pending_edits,
+                        expected_fingerprint,
+                        password.as_deref(),
+                        &tool_paths,
+                        &cancel,
+                        expected_extract_bytes,
+                        move |snapshot| {
+                            let _ = progress_tx.try_send(AppMessage::ArchiveMetadataEditorProgress {
+                                archive_path: progress_archive.clone(),
+                                staging_dir: progress_staging.clone(),
+                                message: archive_extract_progress_message(
+                                    "Preparing archive pending edits",
+                                    &snapshot,
+                                ),
+                            });
+                        },
+                    )
+                    .await?;
                 }
                 let paths = if let Some(inner_paths) = target_inner_paths {
                     let mut paths = Vec::with_capacity(inner_paths.len());
@@ -34675,7 +35173,7 @@ fn open_browse_archive_metadata_editor_for_entries(
         &archive_path,
         &tool_paths,
     ) {
-        app.set_status(format!("metadata: archive cannot be edited: {err}"));
+        show_archive_edit_unavailable_notice(app, "Metadata edit", &archive_path, &err);
         return;
     }
 
@@ -34719,7 +35217,7 @@ fn open_browse_archive_metadata_editor_for_entries(
     {
         Some(password)
     } else {
-        match super::app::archive_preview_password_for_path(app, &archive_path) {
+        match super::app::archive_password_for_path(app, &archive_path) {
             Ok(password) => password,
             Err(error) => {
                 let _ = app.db.delete_pending_archive_session(&archive_path);
@@ -35122,26 +35620,34 @@ fn collect_listing_archive_audio_inner_paths(app: &AppState, inner_path: &str) -
     let Some(arc) = app.browse.archive.as_ref() else {
         return Vec::new();
     };
-    let Some(entry) = arc.listing.entries.iter().find(|entry| entry.path == inner_path) else {
-        return Vec::new();
-    };
-    if !entry.is_dir {
-        return matches!(
-            crate::convert::classify::classify_file(std::path::Path::new(entry.file_name())),
-            crate::convert::classify::EntryKind::AudioFile(_)
-        )
-        .then(|| inner_path.to_string())
-        .into_iter()
-        .collect();
+    let projected_listing = arc
+        .staging
+        .as_ref()
+        .filter(|staging| !staging.tree_materialized)
+        .map(|staging| super::browse::projected_archive_listing(&arc.listing, staging));
+    let listing = projected_listing.as_ref().unwrap_or(&arc.listing);
+
+    if let Some(entry) = listing.entries.iter().find(|entry| entry.path == inner_path) {
+        if !entry.is_dir {
+            return matches!(
+                crate::convert::classify::classify_file(std::path::Path::new(entry.file_name())),
+                crate::convert::classify::EntryKind::AudioFile(_)
+            )
+            .then(|| inner_path.to_string())
+            .into_iter()
+            .collect();
+        }
     }
 
+    // Archive listings are allowed to omit explicit directory records. Treat
+    // any path with live descendants as the same synthesized directory Browse
+    // already presents to the user, including after logical pending renames.
     let prefix = if inner_path.ends_with('/') {
         inner_path.to_string()
     } else {
         format!("{inner_path}/")
     };
-    let mut out: Vec<String> = arc
-        .listing
+    let mut out: Vec<String> = listing
         .entries
         .iter()
         .filter(|candidate| !candidate.is_dir && candidate.path.starts_with(&prefix))
@@ -35414,6 +35920,75 @@ pub(super) fn append_archive_delete_edits_and_persist(
     }
 }
 
+fn show_archive_edit_unavailable_notice(
+    app: &mut AppState,
+    operation: &str,
+    archive_path: &std::path::Path,
+    error: &str,
+) -> String {
+    let status_prefix = operation
+        .split_whitespace()
+        .next()
+        .unwrap_or(operation)
+        .to_ascii_lowercase();
+    let status = format!("{status_prefix}: archive cannot be edited: {error}");
+    app.active_overlay = ActiveOverlay::Notice {
+        title: "Archive cannot be edited".to_string(),
+        message: format!(
+            "{operation} cannot start for '{}'.\n\n{error}\n\nNo archive data was extracted or changed.",
+            archive_path.display()
+        ),
+        scroll: 0,
+    };
+    app.set_status(status.clone());
+    status
+}
+
+#[cfg(test)]
+mod archive_edit_notice_tests {
+    use super::*;
+
+    #[test]
+    fn edit_capability_refusal_opens_blocking_notice_and_keeps_status_contract() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let archive = std::path::PathBuf::from("/tmp/album.rar");
+        let status = show_archive_edit_unavailable_notice(
+            &mut app,
+            "Rename",
+            &archive,
+            "RAR writer unavailable",
+        );
+
+        assert_eq!(
+            status,
+            "rename: archive cannot be edited: RAR writer unavailable"
+        );
+        let ActiveOverlay::Notice {
+            title,
+            message,
+            scroll,
+        } = &app.active_overlay
+        else {
+            panic!("archive edit preflight refusal must open a blocking notice");
+        };
+        assert_eq!(title, "Archive cannot be edited");
+        assert!(message.contains("Rename cannot start"), "{message}");
+        assert!(message.contains("RAR writer unavailable"), "{message}");
+        assert_eq!(*scroll, 0);
+    }
+
+    #[test]
+    fn scroll_offsets_clamp_at_both_ends_and_move_back_from_end() {
+        assert_eq!(bounded_scroll_offset(0, KeyCode::Up, 12), 0);
+        assert_eq!(bounded_scroll_offset(11, KeyCode::Down, 12), 12);
+        assert_eq!(bounded_scroll_offset(12, KeyCode::Down, 12), 12);
+        assert_eq!(bounded_scroll_offset(0, KeyCode::End, 12), 12);
+        assert_eq!(bounded_scroll_offset(usize::MAX, KeyCode::Up, 12), 11);
+        assert_eq!(bounded_scroll_offset(12, KeyCode::PageUp, 12), 7);
+        assert_eq!(bounded_scroll_offset(7, KeyCode::Home, 12), 0);
+    }
+}
+
 pub(super) fn start_browse_archive_entry_delete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -35433,6 +36008,11 @@ pub(super) fn start_browse_archive_entry_delete(
         return;
     }
 
+    if browse_archive_inline_metadata_operation_pending(app) {
+        app.set_status("delete: wait for the current archive metadata write to finish");
+        return;
+    }
+
     if app.pending_browse_archive_delete.is_some() {
         app.set_status("delete: wait for the current archive delete to finish");
         return;
@@ -35445,32 +36025,138 @@ pub(super) fn start_browse_archive_entry_delete(
         app.set_status("delete: wait for the current archive edit operation to finish");
         return;
     }
+    if reject_competing_archive_staging_owner(app, &archive_path, "delete").is_err() {
+        return;
+    }
 
-    if let Some(staging_dir) = app
+    if let Some(staging) = app
         .browse
         .archive
         .as_ref()
         .filter(|arc| arc.listing.archive_path == archive_path)
-        .and_then(|arc| arc.staging.as_ref().map(|staging| staging.staging_dir.clone()))
+        .and_then(|arc| arc.staging.clone())
     {
-        if let Err(err) = delete_staged_archive_entries_transactional(
-            &staging_dir,
-            &inner_paths,
-            || append_archive_delete_edits_and_persist(app, &inner_paths),
-        ) {
-            app.set_status(err);
+        if staging.tree_materialized
+            && !super::browse::archive_logical_staging_marker_exists(&staging.staging_dir)
+        {
+            if let Err(err) = delete_staged_archive_entries_transactional(
+                &staging.staging_dir,
+                &inner_paths,
+                || append_archive_delete_edits_and_persist(app, &inner_paths),
+            ) {
+                app.set_status(err);
+                return;
+            }
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            app.browse.clear_multi_selection();
+            app.browse.refresh_with_search(Some(tx));
+            app.cancel_browse_convert_expansion_for_selection_change();
+            app.force_redraw = true;
+            let count = inner_paths.len();
+            app.set_status(format!(
+                "deleted {count} staged archive entr{}; archive changes pending",
+                if count == 1 { "y" } else { "ies" }
+            ));
             return;
         }
-        app.browse.invalidate_archive_probe_cache_for(&archive_path);
-        app.browse.clear_multi_selection();
-        app.browse.refresh_with_search(Some(tx));
-        app.cancel_browse_convert_expansion_for_selection_change();
-        app.force_redraw = true;
-        let count = inner_paths.len();
-        app.set_status(format!(
-            "deleted {count} staged archive entr{}; archive changes pending",
-            if count == 1 { "y" } else { "ies" }
-        ));
+
+        let pending = PendingBrowseArchiveDelete::from_existing(
+            archive_path.clone(),
+            staging.staging_dir.clone(),
+            inner_paths.clone(),
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+            Some(inner_paths.clone()),
+        );
+        let staging_dir = staging.staging_dir.clone();
+        let cancel = pending.cancel.clone();
+        let tool_paths = app.manager.config.tool_paths.clone();
+        let password = match app
+            .browse
+            .archive
+            .as_ref()
+            .filter(|arc| arc.listing.archive_path == archive_path)
+            .and_then(|arc| arc.password.clone())
+        {
+            Some(password) => Some(password),
+            None => match archive_listing_password_for_path(app, &archive_path) {
+                Ok(password) => password,
+                Err(error) => {
+                    app.set_status(error);
+                    return;
+                }
+            },
+        };
+        let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+        let pending_edits = staging.edits.clone();
+        let expected_fingerprint = (
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+        );
+        let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+            app,
+            &archive_path,
+            &staging_dir,
+            "Preparing archive delete",
+            cancel.clone(),
+        );
+        let tx = tx.clone();
+        app.browse.bump_archive_probe_epoch_for(&archive_path);
+        app.pending_browse_archive_delete = Some(pending);
+        app.set_status("Preparing pending archive edits for delete...".to_string());
+        tokio::spawn(async move {
+            let archive_for_result = archive_path.clone();
+            let staging_for_result = staging_dir.clone();
+            let inner_for_result = inner_paths.clone();
+            let result = materialize_logical_archive_staging_with_progress(
+                &archive_path,
+                &staging_dir,
+                &pending_edits,
+                expected_fingerprint,
+                password.as_deref(),
+                &tool_paths,
+                &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryDeleteProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message(
+                                "Preparing archive pending edits for delete",
+                                &snapshot,
+                            ),
+                        });
+                    }
+                },
+            )
+            .await;
+            let cancelled = cancel.is_cancelled();
+            progress_control_done.cancel();
+            let _ = tx.send(AppMessage::FileTaskProgress {
+                session_id: progress_session_id,
+                update: archive_staging_terminal_update(result.is_ok(), cancelled),
+            }).await;
+            let _ = tx.send(AppMessage::ArchiveStagingProgressTerminal {
+                session_id: progress_session_id,
+                requires_attention: result.is_err() && !cancelled,
+            }).await;
+            let _ = tx.send(AppMessage::ArchiveEntryDeleteResult {
+                archive_path: archive_for_result,
+                staging_dir: staging_for_result,
+                inner_paths: inner_for_result,
+                result,
+            }).await;
+        });
         return;
     }
 
@@ -35479,7 +36165,7 @@ pub(super) fn start_browse_archive_entry_delete(
         &archive_path,
         &tool_paths,
     ) {
-        app.set_status(format!("delete: archive cannot be edited: {err}"));
+        show_archive_edit_unavailable_notice(app, "Delete", &archive_path, &err);
         return;
     }
 
@@ -36313,16 +36999,20 @@ fn open_metadata_editor_impl_for_selection(
 
         let candidate_paths: Vec<std::path::PathBuf> = sel.clone();
 
-        let staging = app
+        let materialized_staging = app
             .browse
             .active_archive_staging()
+            .filter(|staging| {
+                staging.tree_materialized
+                    && !super::browse::archive_logical_staging_marker_exists(&staging.staging_dir)
+            })
             .map(|staging| staging.staging_dir.clone());
         let mut inner_paths = Vec::new();
         for path in candidate_paths {
             let Some(inner) = app.browse.archive_inner_path_for_path(&path) else {
                 continue;
             };
-            let mut collected = if let Some(staging_dir) = staging.as_ref() {
+            let mut collected = if let Some(staging_dir) = materialized_staging.as_ref() {
                 match collect_staged_archive_audio_inner_paths(staging_dir, &inner) {
                     Ok(paths) => paths,
                     Err(err) => {
@@ -40319,12 +41009,41 @@ fn handle_generic_overlay_mouse_in_area(
                 let y = (area.1.saturating_sub(h)) / 2;
                 (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
             }
-            ActiveOverlay::ErrorDetail { .. } => {
-                let w: u16 = 60;
-                let h: u16 = 12;
-                let x = (area.0.saturating_sub(w)) / 2;
-                let y = (area.1.saturating_sub(h)) / 2;
-                (Rect::new(x, y, w, h), vec![("Esc close", "esc")])
+            ActiveOverlay::ErrorDetail { error, .. } => {
+                let rect = super::draw_overlays::scrollable_message_popup_rect(
+                    Rect::new(0, 0, area.0, area.1),
+                    72,
+                    10,
+                    error,
+                );
+                (
+                    rect,
+                    vec![
+                        ("Up", "up"),
+                        ("Down", "down"),
+                        ("PgUp", "pageup"),
+                        ("PgDn", "pagedown"),
+                        ("Esc close", "esc"),
+                    ],
+                )
+            }
+            ActiveOverlay::Notice { message, .. } => {
+                let rect = super::draw_overlays::scrollable_message_popup_rect(
+                    Rect::new(0, 0, area.0, area.1),
+                    66,
+                    9,
+                    message,
+                );
+                (
+                    rect,
+                    vec![
+                        ("Up", "up"),
+                        ("Down", "down"),
+                        ("PgUp", "pageup"),
+                        ("PgDn", "pagedown"),
+                        ("Esc close", "esc"),
+                    ],
+                )
             }
             ActiveOverlay::ItemInfo { .. } => {
                 let w: u16 = 70;
@@ -40343,15 +41062,17 @@ fn handle_generic_overlay_mouse_in_area(
                     vec![("Enter confirm", "enter"), ("Esc cancel", "esc")],
                 )
             }
-            ActiveOverlay::TextEdit { .. } => {
-                let w = area.0.saturating_sub(4).min(80);
-                let h: u16 = 7;
-                let x = (area.0.saturating_sub(w)) / 2;
-                let y = (area.1.saturating_sub(h)) / 2;
-                (
-                    Rect::new(x, y, w, h),
-                    vec![("Enter save", "enter"), ("Esc cancel", "esc")],
-                )
+            ActiveOverlay::TextEdit { label, .. } => {
+                let rect = super::draw_overlays::text_edit_popup_rect(
+                    Rect::new(0, 0, area.0, area.1),
+                    label,
+                );
+                let confirm = if label.eq_ignore_ascii_case("archive password") {
+                    "Enter use"
+                } else {
+                    "Enter save"
+                };
+                (rect, vec![(confirm, "enter"), ("Esc cancel", "esc")])
             }
             ActiveOverlay::FormatSettings { ref kind, .. } => {
                 let min_w = super::draw_overlays::format_settings_min_width(kind);
@@ -40583,6 +41304,10 @@ fn handle_generic_overlay_mouse_in_area(
                         "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                         "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                         "tab" => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                        "up" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                        "down" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                        "pageup" => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                        "pagedown" => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                         other => {
                             let ch = other.chars().next().unwrap_or('?');
                             if ch.is_uppercase() {
@@ -47485,6 +48210,48 @@ fn inline_archive_metadata_final_ordered_values(
     .then(|| crate::tui::probe::inline_metadata_scalar_ordered_values(value))
 }
 
+/// True while a submitted Browse inline metadata edit still owns the active
+/// archive staging session. This covers both the physical writer and the lazy
+/// materialization step that precedes it for a rename-only logical session.
+/// Navigation and structural edits must wait for the terminal reducer so the
+/// metadata change is recorded in the same pending edit set before commit.
+pub(super) fn browse_archive_inline_metadata_operation_pending(app: &AppState) -> bool {
+    let Some(staging) = app.browse.active_archive_staging() else {
+        return false;
+    };
+
+    let writer_targets_staging = app.inline_metadata_write.as_ref().is_some_and(|write| {
+        write.path.strip_prefix(&staging.staging_dir).is_ok()
+    });
+    let deferred_write_targets_staging = app
+        .pending_browse_archive_metadata
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.archive_path.as_path() == staging.archive_path.as_path()
+                && pending.staging_dir.as_path() == staging.staging_dir.as_path()
+                && pending.deferred_inline_write.is_some()
+        });
+
+    writer_targets_staging || deferred_write_targets_staging
+}
+
+pub(super) fn resume_deferred_archive_inline_metadata_write(
+    app: &mut AppState,
+    deferred: super::app::DeferredArchiveInlineMetadataWrite,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    apply_text_edit(
+        app,
+        TextEditTarget::BrowseMetadata {
+            path: deferred.path,
+            field: deferred.field,
+        },
+        &deferred.value,
+        tx,
+    );
+    app.inline_metadata_write.is_some()
+}
+
 fn apply_text_edit(
     app: &mut AppState,
     target: TextEditTarget,
@@ -47543,6 +48310,34 @@ fn apply_text_edit(
                     app.set_status("metadata: selected archive entry could not be resolved in staging");
                     return;
                 };
+                if !staging.tree_materialized
+                    || super::browse::archive_logical_staging_marker_exists(&staging.staging_dir)
+                {
+                    if app.pending_browse_archive_metadata.is_some() {
+                        app.set_status("metadata: wait for the current archive metadata operation to finish");
+                        return;
+                    }
+                    open_browse_archive_metadata_editor_for_entries(
+                        app,
+                        staging.archive_path.clone(),
+                        Some(vec![inner_path]),
+                    );
+                    if let Some(pending) = app.pending_browse_archive_metadata.as_mut() {
+                        if pending.archive_path == staging.archive_path
+                            && pending.staging_dir == staging.staging_dir
+                        {
+                            pending.deferred_inline_write = Some(
+                                super::app::DeferredArchiveInlineMetadataWrite {
+                                    path: path.clone(),
+                                    field,
+                                    value: trimmed.to_string(),
+                                },
+                            );
+                            app.set_status("Preparing archive entry for metadata write...");
+                        }
+                    }
+                    return;
+                }
                 match staged_archive_file_for_metadata(&staging.staging_dir, &inner_path) {
                     Ok(path) => path,
                     Err(err) => {
@@ -59617,6 +60412,146 @@ fn native_implicit_directory_rename_pairs(
     (!pairs.is_empty()).then_some(pairs)
 }
 
+
+fn archive_pending_rename_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Build one container-native batch for a rename-only pending set when every
+/// rename is independent in namespace terms. Cascaded/overlapping renames are
+/// deliberately declined so commit can materialize and replay them in journal
+/// order, avoiding command-order ambiguity in 7-Zip/xorriso.
+pub(super) fn pending_native_archive_rename_plan(
+    listing: &super::archive_listing::ArchiveListing,
+    edits: &[super::browse::ArchiveEdit],
+) -> Option<Vec<crate::convert::pipeline::materializer_archive::ArchiveNativeRenamePair>> {
+    if edits.is_empty() {
+        return None;
+    }
+
+    let mut endpoints: Vec<(String, String)> = Vec::with_capacity(edits.len());
+    let mut pairs = Vec::new();
+    for edit in edits {
+        let super::browse::ArchiveEdit::Rename { from, to } = edit else {
+            return None;
+        };
+        if from == to {
+            return None;
+        }
+        if endpoints.iter().any(|(prior_from, prior_to)| {
+            archive_pending_rename_paths_overlap(from, prior_from)
+                || archive_pending_rename_paths_overlap(from, prior_to)
+                || archive_pending_rename_paths_overlap(to, prior_from)
+                || archive_pending_rename_paths_overlap(to, prior_to)
+        }) {
+            return None;
+        }
+
+        if listing.entries.iter().any(|entry| entry.path == *from) {
+            pairs.push(
+                crate::convert::pipeline::materializer_archive::ArchiveNativeRenamePair::new(
+                    from.clone(),
+                    to.clone(),
+                ),
+            );
+        } else {
+            let mut implicit = native_implicit_directory_rename_pairs(listing, from, to)?;
+            pairs.append(&mut implicit);
+        }
+        endpoints.push((from.clone(), to.clone()));
+    }
+
+    if crate::convert::classify::is_iso_wv_container(&listing.archive_path) && pairs.len() != 1 {
+        return None;
+    }
+
+    let mut old_paths = std::collections::HashSet::new();
+    let mut new_paths = std::collections::HashSet::new();
+    if pairs.iter().any(|pair| {
+        !old_paths.insert(pair.old_inner_path.clone())
+            || !new_paths.insert(pair.new_inner_path.clone())
+    }) {
+        return None;
+    }
+    Some(pairs)
+}
+
+#[cfg(test)]
+mod pending_native_archive_rename_plan_tests {
+    use super::*;
+
+    fn zip_listing() -> super::super::archive_listing::ArchiveListing {
+        super::super::archive_listing::ArchiveListing {
+            archive_path: std::path::PathBuf::from("Album.zip"),
+            format: "zip".to_string(),
+            physical_size: 100,
+            entries: ["01.flac", "02.flac", "Disc 2/03.flac"]
+                .into_iter()
+                .map(|path| super::super::archive_listing::ArchiveEntry {
+                    path: path.to_string(),
+                    size: 10,
+                    packed_size: 8,
+                    is_dir: false,
+                    encrypted: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn independent_pending_renames_form_one_native_batch() {
+        let edits = vec![
+            super::super::browse::ArchiveEdit::Rename {
+                from: "01.flac".to_string(),
+                to: "01 - Intro.flac".to_string(),
+            },
+            super::super::browse::ArchiveEdit::Rename {
+                from: "02.flac".to_string(),
+                to: "02 - Song.flac".to_string(),
+            },
+        ];
+        let pairs = pending_native_archive_rename_plan(&zip_listing(), &edits)
+            .expect("independent renames should batch");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].old_inner_path, "01.flac");
+        assert_eq!(pairs[1].new_inner_path, "02 - Song.flac");
+    }
+
+    #[test]
+    fn cascaded_pending_renames_decline_native_batch() {
+        let edits = vec![
+            super::super::browse::ArchiveEdit::Rename {
+                from: "Disc 2".to_string(),
+                to: "CD 2".to_string(),
+            },
+            super::super::browse::ArchiveEdit::Rename {
+                from: "CD 2/03.flac".to_string(),
+                to: "CD 2/03 - Finale.flac".to_string(),
+            },
+        ];
+        assert!(pending_native_archive_rename_plan(&zip_listing(), &edits).is_none());
+    }
+
+    #[test]
+    fn implicit_directory_pending_rename_expands_real_members() {
+        let edits = vec![super::super::browse::ArchiveEdit::Rename {
+            from: "Disc 2".to_string(),
+            to: "CD 2".to_string(),
+        }];
+        let pairs = pending_native_archive_rename_plan(&zip_listing(), &edits)
+            .expect("implicit directory should expand for ZIP");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].old_inner_path, "Disc 2/03.flac");
+        assert_eq!(pairs[0].new_inner_path, "CD 2/03.flac");
+    }
+}
+
 fn start_browse_archive_entry_rename(
     app: &mut AppState,
     archive_path: std::path::PathBuf,
@@ -59624,7 +60559,15 @@ fn start_browse_archive_entry_rename(
     new_name: &str,
     tx: &mpsc::Sender<AppMessage>,
 ) -> Result<(), String> {
-    if app.pending_browse_archive_rename.is_some() || app.pending_browse_archive_create.is_some() {
+    if browse_archive_inline_metadata_operation_pending(app) {
+        let message = "rename: wait for the current archive metadata write to finish".to_string();
+        app.set_status(message.clone());
+        return Err(message);
+    }
+    if app.pending_browse_archive_rename.is_some()
+        || app.pending_browse_archive_delete.is_some()
+        || app.pending_browse_archive_create.is_some()
+    {
         let message = "rename: wait for the current archive structural edit to finish".to_string();
         app.set_status(message.clone());
         return Err(message);
@@ -59634,6 +60577,7 @@ fn start_browse_archive_entry_rename(
         app.set_status(message.clone());
         return Err(message);
     }
+    reject_competing_archive_staging_owner(app, &archive_path, "rename")?;
 
     let old_name = old_inner_path
         .rsplit('/')
@@ -59654,9 +60598,11 @@ fn start_browse_archive_entry_rename(
         .filter(|arc| arc.listing.archive_path == archive_path)
         .is_some_and(|arc| {
             if let Some(staging) = arc.staging.as_ref() {
-                staging_path_for_archive_inner(&staging.staging_dir, &new_inner_path)
-                    .map(|path| path.exists())
-                    .unwrap_or(true)
+                super::browse::archive_staging_current_path_exists(
+                    &arc.listing,
+                    staging,
+                    &new_inner_path,
+                )
             } else {
                 arc.listing.entries.iter().any(|entry| {
                     entry.path == new_inner_path || entry.path.starts_with(&target_prefix)
@@ -59676,21 +60622,37 @@ fn start_browse_archive_entry_rename(
         .filter(|arc| arc.listing.archive_path == archive_path)
         .and_then(|arc| arc.staging.clone())
     {
-        match rename_staged_archive_entry_transactional(
-            app,
-            &staging.staging_dir,
-            &old_inner_path,
-            &new_inner_path,
-        ) {
+        let result = if staging.tree_materialized {
+            rename_staged_archive_entry_transactional(
+                app,
+                &staging.staging_dir,
+                &old_inner_path,
+                &new_inner_path,
+            )
+        } else {
+            // A rename-only pending set remains logical until commit (or until a
+            // later edit kind requires extracted payload data). Persist only the
+            // namespace edit here; Browse projects the listing through the edit
+            // journal so no archive write or extraction occurs per rename.
+            append_archive_rename_edit_and_persist(app, &old_inner_path, &new_inner_path)
+        };
+        match result {
             Ok(()) => {
                 app.browse.invalidate_archive_probe_cache_for(&archive_path);
+                app.browse.bump_archive_probe_epoch_for(&archive_path);
                 app.browse.refresh_with_search(Some(tx));
                 let target_path = archive_path.join(&new_inner_path);
                 if let Some(idx) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
                     app.browse.selected_index = idx;
                     app.browse.ensure_visible();
                 }
-                app.set_status(format!("renamed staged archive entry: {old_name} -> {new_name}; archive changes pending"));
+                let archive_label = archive_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| archive_path.display().to_string());
+                app.set_status(format!(
+                    "renamed archive entry in {archive_label}: {old_name} -> {new_name}; archive changes pending"
+                ));
             }
             Err(err) => {
                 let message = format!("rename failed: {err}");
@@ -59706,8 +60668,7 @@ fn start_browse_archive_entry_rename(
         &archive_path,
         &tool_paths,
     ) {
-        let message = format!("rename: archive cannot be edited: {err}");
-        app.set_status(message.clone());
+        let message = show_archive_edit_unavailable_notice(app, "Rename", &archive_path, &err);
         return Err(message);
     }
 
@@ -59755,14 +60716,6 @@ fn start_browse_archive_entry_rename(
             .any(|entry| entry.path == old_inner_path && entry.is_dir);
         has_descendants && !has_explicit_directory_entry
     };
-    let archive_members = archive_listing
-        .entries
-        .iter()
-        .map(|entry| crate::convert::pipeline::materializer_archive::ArchiveNativeMember {
-            path: entry.path.clone(),
-            is_dir: entry.is_dir,
-        })
-        .collect::<Vec<_>>();
     let native_rename_available = if password.is_some() {
         // Keep encrypted/header-encrypted containers on the established
         // password-aware extract/repackage path until native header-only
@@ -59775,8 +60728,8 @@ fn start_browse_archive_entry_rename(
         ) {
             Ok(available) => available,
             Err(err) => {
-                let message = format!("rename: archive cannot be edited: {err}");
-                app.set_status(message.clone());
+                let message =
+                    show_archive_edit_unavailable_notice(app, "Rename", &archive_path, &err);
                 return Err(message);
             }
         }
@@ -59802,7 +60755,79 @@ fn start_browse_archive_entry_rename(
             ),
         ])
     };
-    let native_rename = native_rename_pairs.is_some();
+    if native_rename_pairs.is_some() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "tonepoet-archive-rename-{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(err) = std::fs::create_dir(&staging_dir) {
+            let message = format!("rename: cannot create logical archive staging owner: {err}");
+            app.set_status(message.clone());
+            return Err(message);
+        }
+        if let Err(err) = super::browse::write_archive_logical_staging_marker(&staging_dir) {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            let message = format!("rename: cannot create logical archive staging marker: {err}");
+            app.set_status(message.clone());
+            return Err(message);
+        }
+        if let Some(archive) = app
+            .browse
+            .archive
+            .as_mut()
+            .filter(|archive| archive.listing.archive_path == archive_path)
+        {
+            archive.staging = Some(super::browse::ArchiveStagingSession::new_logical(
+                staging_dir.clone(),
+                archive_path.clone(),
+                archive_mtime_secs,
+                archive_mtime_nanos,
+                archive_size,
+            ));
+        } else {
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            let message = "rename: active archive listing disappeared before staging could be attached".to_string();
+            app.set_status(message.clone());
+            return Err(message);
+        }
+        if let Err(err) = append_archive_rename_edit_and_persist(
+            app,
+            &old_inner_path,
+            &new_inner_path,
+        ) {
+            if let Some(archive) = app.browse.archive.as_mut() {
+                if archive
+                    .staging
+                    .as_ref()
+                    .is_some_and(|staging| staging.staging_dir == staging_dir)
+                {
+                    archive.staging = None;
+                }
+            }
+            super::app::cleanup_archive_metadata_staging_dir(&staging_dir);
+            delete_pending_archive_session_best_effort(app, &archive_path);
+            let message = format!("rename: cannot persist pending archive rename: {err}");
+            app.set_status(message.clone());
+            return Err(message);
+        }
+        app.browse.invalidate_archive_probe_cache_for(&archive_path);
+        app.browse.bump_archive_probe_epoch_for(&archive_path);
+        app.browse.refresh_with_search(Some(tx));
+        let target_path = archive_path.join(&new_inner_path);
+        if let Some(idx) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
+            app.browse.selected_index = idx;
+            app.browse.ensure_visible();
+        }
+        let archive_label = archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.display().to_string());
+        app.set_status(format!(
+            "renamed archive entry in {archive_label}: {old_name} -> {new_name}; archive changes pending"
+        ));
+        return Ok(());
+    }
+
     let pending = PendingBrowseArchiveRename::new(
         archive_path.clone(),
         old_inner_path.clone(),
@@ -59814,39 +60839,8 @@ fn start_browse_archive_entry_rename(
     );
     let staging_dir = pending.staging_dir.clone();
     let cancel = pending.cancel.clone();
-    let native_rename_admission = if native_rename {
-        let claim = match crate::concurrency::PathClaim::resolve_with_semantics(
-            &archive_path,
-            crate::concurrency::ClaimMode::Write,
-            crate::concurrency::ClaimScope::Exact,
-            crate::concurrency::PathResolutionSemantics::NamespaceObject,
-        ) {
-            Ok(claim) => claim,
-            Err(error) => {
-                let message = format!("rename: archive mutation admission failed: {error}");
-                app.set_status(message.clone());
-                return Err(message);
-            }
-        };
-        let admitted_archive_path = claim.identity.resolved_io_path.clone();
-        let guard = match crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim]) {
-            Ok(guard) => guard,
-            Err(error) => {
-                let message = format!("rename: archive is busy: {error}");
-                app.set_status(message.clone());
-                return Err(message);
-            }
-        };
-        Some((admitted_archive_path, guard))
-    } else {
-        None
-    };
-    // Register a lightweight recovery owner before the worker starts even for
-    // a native attempt. ISO-WV may deliberately decline the fast path after a
-    // target-read CUE safety check; the same worker can then enter the proven
-    // extract/edit/repackage fallback without a recovery-registration race.
-    // Successful native renames remove this empty staging registration in the
-    // existing result handler and never extract payload data.
+    // The native-capable path returned above without touching the archive.
+    // This recovery owner therefore belongs only to the extraction fallback.
     if let Err(err) = persist_empty_archive_staging_registration(
         app,
         &archive_path,
@@ -59882,68 +60876,6 @@ fn start_browse_archive_entry_rename(
         let old_for_result = old_inner_path.clone();
         let new_for_result = new_inner_path.clone();
         let result: Result<Option<crate::convert::pipeline::materializer_archive::ArchiveRepackageReport>, String> = async {
-            if native_rename {
-                let (admitted_archive_path, _archive_mutation_claim) = native_rename_admission
-                    .expect("native archive rename admission must accompany the native path");
-                let progress_tx = tx.clone();
-                let progress_archive = archive_path.clone();
-                let progress_staging = staging_dir.clone();
-                let native_result = crate::convert::pipeline::materializer_archive::rename_archive_entry_native_transactional(
-                    &admitted_archive_path,
-                    &archive_path,
-                    native_rename_pairs
-                        .as_deref()
-                        .expect("native rename plan must accompany native admission"),
-                    &archive_members,
-                    (archive_mtime_secs, archive_mtime_nanos, archive_size),
-                    super::archive_listing::is_remote_filesystem(&admitted_archive_path),
-                    password.as_deref(),
-                    &tool_paths,
-                    &cancel,
-                    move |snapshot| {
-                        let percent = if snapshot.bytes_total == 0 {
-                            0
-                        } else {
-                            snapshot.bytes_done.saturating_mul(100) / snapshot.bytes_total
-                        };
-                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
-                            session_id: progress_session_id,
-                            update: tui_file_picker::FileTaskProgressUpdate::Snapshot {
-                                phase: tui_file_picker::FileTaskPhase::Running,
-                                status: snapshot.status.clone(),
-                                current_item: Some(tui_file_picker::ProgressItem {
-                                    label: snapshot.status.clone(),
-                                    source: None,
-                                    destination: None,
-                                    bytes_done: snapshot.bytes_done,
-                                    bytes_total: Some(snapshot.bytes_total),
-                                }),
-                                // ArchiveNativeRenameProgressSnapshot carries only
-                                // status/bytes_done/bytes_total, so item counts and a
-                                // transfer rate are left at their defaults rather than
-                                // fabricated here.
-                                totals: tui_file_picker::ProgressTotals {
-                                    item_unit: tui_file_picker::ProgressUnit::Files,
-                                    bytes_done: snapshot.bytes_done,
-                                    bytes_total: Some(snapshot.bytes_total),
-                                    ..tui_file_picker::ProgressTotals::default()
-                                },
-                                rate_bytes_per_sec: None,
-                            },
-                        });
-                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryRenameProgress {
-                            archive_path: progress_archive.clone(),
-                            staging_dir: progress_staging.clone(),
-                            message: format!("{} {percent}%", snapshot.status),
-                        });
-                    },
-                )
-                .await?;
-                if let Some(report) = native_result {
-                    return Ok(Some(report));
-                }
-            }
-
             let _ = tx.send(AppMessage::ArchiveEntryRenameProgress {
                 archive_path: archive_path.clone(),
                 staging_dir: staging_dir.clone(),
@@ -60062,9 +60994,11 @@ fn iso_wv_archive_create_target_exists(app: &AppState, inner_path: &str) -> bool
         return true;
     };
     if let Some(staging) = archive.staging.as_ref() {
-        return staging_path_for_archive_inner(&staging.staging_dir, inner_path)
-            .map(|path| path.exists())
-            .unwrap_or(true);
+        return super::browse::archive_staging_current_path_exists(
+            &archive.listing,
+            staging,
+            inner_path,
+        );
     }
     archive
         .listing
@@ -60182,6 +61116,9 @@ fn start_browse_iso_wv_archive_create(
     name: &str,
     tx: &mpsc::Sender<AppMessage>,
 ) -> Result<(), String> {
+    if browse_archive_inline_metadata_operation_pending(app) {
+        return Err("create: wait for the current archive metadata write to finish".to_string());
+    }
     if app.pending_browse_archive_create.is_some() {
         return Err("create: wait for the current archive create to finish".to_string());
     }
@@ -60194,41 +61131,149 @@ fn start_browse_iso_wv_archive_create(
     }
 
     let (archive_path, inner_path) = archive_create_inner_path_for_name(app, name)?;
+    reject_competing_archive_staging_owner(app, &archive_path, "create")?;
     if iso_wv_archive_create_target_exists(app, &inner_path) {
         return Err(format!("create: target already exists in archive: {name}"));
     }
 
-    if let Some(staging_dir) = app
+    if let Some(staging) = app
         .browse
         .archive
         .as_ref()
         .filter(|archive| archive.listing.archive_path == archive_path)
-        .and_then(|archive| archive.staging.as_ref().map(|staging| staging.staging_dir.clone()))
+        .and_then(|archive| archive.staging.clone())
     {
-        create_staged_archive_entry_transactional(app, &staging_dir, &inner_path, kind)?;
-        app.browse.invalidate_archive_probe_cache_for(&archive_path);
-        app.browse.refresh_with_search(Some(tx));
-        let target_path = archive_path.join(&inner_path);
-        if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
-            app.browse.selected_index = index;
-            app.browse.ensure_visible();
-        }
-        app.set_status(format!(
-            "created staged archive {}: {name}; archive changes pending",
-            match kind {
-                BrowseCreateKind::File => "file",
-                BrowseCreateKind::Folder => "folder",
+        if staging.tree_materialized
+            && !super::browse::archive_logical_staging_marker_exists(&staging.staging_dir)
+        {
+            create_staged_archive_entry_transactional(
+                app,
+                &staging.staging_dir,
+                &inner_path,
+                kind,
+            )?;
+            app.browse.invalidate_archive_probe_cache_for(&archive_path);
+            app.browse.refresh_with_search(Some(tx));
+            let target_path = archive_path.join(&inner_path);
+            if let Some(index) = app.browse.entries.iter().position(|entry| entry.path == target_path) {
+                app.browse.selected_index = index;
+                app.browse.ensure_visible();
             }
-        ));
+            app.set_status(format!(
+                "created staged archive {}: {name}; archive changes pending",
+                match kind {
+                    BrowseCreateKind::File => "file",
+                    BrowseCreateKind::Folder => "folder",
+                }
+            ));
+            return Ok(());
+        }
+
+        let pending = PendingBrowseArchiveCreate::from_existing(
+            archive_path.clone(),
+            staging.staging_dir.clone(),
+            inner_path.clone(),
+            kind,
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+        );
+        let staging_dir = staging.staging_dir.clone();
+        let cancel = pending.cancel.clone();
+        let tool_paths = app.manager.config.tool_paths.clone();
+        let password = match app
+            .browse
+            .archive
+            .as_ref()
+            .filter(|archive| archive.listing.archive_path == archive_path)
+            .and_then(|archive| archive.password.clone())
+        {
+            Some(password) => Some(password),
+            None => archive_listing_password_for_path(app, &archive_path)?,
+        };
+        let expected_extract_bytes = browse_archive_expected_extract_bytes(app, &archive_path);
+        let pending_edits = staging.edits.clone();
+        let expected_fingerprint = (
+            staging.archive_mtime_secs,
+            staging.archive_mtime_nanos,
+            staging.archive_size,
+        );
+        let (progress_session_id, progress_control_done) = start_browse_archive_staging_progress(
+            app,
+            &archive_path,
+            &staging_dir,
+            "Preparing archive create",
+            cancel.clone(),
+        );
+        let tx_for_task = tx.clone();
+        app.browse.bump_archive_probe_epoch_for(&archive_path);
+        app.pending_browse_archive_create = Some(pending);
+        app.set_status(format!("Preparing pending archive edits for create: {name}"));
+        tokio::spawn(async move {
+            let archive_for_result = archive_path.clone();
+            let staging_for_result = staging_dir.clone();
+            let inner_for_result = inner_path.clone();
+            let result = materialize_logical_archive_staging_with_progress(
+                &archive_path,
+                &staging_dir,
+                &pending_edits,
+                expected_fingerprint,
+                password.as_deref(),
+                &tool_paths,
+                &cancel,
+                expected_extract_bytes,
+                {
+                    let progress_tx = tx_for_task.clone();
+                    let progress_archive = archive_path.clone();
+                    let progress_staging = staging_dir.clone();
+                    move |snapshot| {
+                        let _ = progress_tx.try_send(AppMessage::FileTaskProgress {
+                            session_id: progress_session_id,
+                            update: archive_extraction_file_task_update(&snapshot),
+                        });
+                        let _ = progress_tx.try_send(AppMessage::ArchiveEntryCreateProgress {
+                            archive_path: progress_archive.clone(),
+                            staging_dir: progress_staging.clone(),
+                            message: archive_extract_progress_message(
+                                "Preparing archive pending edits for create",
+                                &snapshot,
+                            ),
+                        });
+                    }
+                },
+            )
+            .await;
+            let cancelled = cancel.is_cancelled();
+            progress_control_done.cancel();
+            let _ = tx_for_task.send(AppMessage::FileTaskProgress {
+                session_id: progress_session_id,
+                update: archive_staging_terminal_update(result.is_ok(), cancelled),
+            }).await;
+            let _ = tx_for_task.send(AppMessage::ArchiveStagingProgressTerminal {
+                session_id: progress_session_id,
+                requires_attention: result.is_err() && !cancelled,
+            }).await;
+            let _ = tx_for_task.send(AppMessage::ArchiveEntryCreateResult {
+                archive_path: archive_for_result,
+                staging_dir: staging_for_result,
+                inner_path: inner_for_result,
+                kind,
+                result,
+            }).await;
+        });
         return Ok(());
     }
 
     let tool_paths = app.manager.config.tool_paths.clone();
-    crate::convert::pipeline::materializer_archive::preflight_archive_repackage_capability(
-        &archive_path,
-        &tool_paths,
-    )
-    .map_err(|err| format!("create: archive cannot be edited: {err}"))?;
+    if let Err(err) =
+        crate::convert::pipeline::materializer_archive::preflight_archive_repackage_capability(
+            &archive_path,
+            &tool_paths,
+        )
+    {
+        let message = show_archive_edit_unavailable_notice(app, "Create", &archive_path, &err);
+        return Err(message);
+    }
 
     let (archive_mtime_secs, archive_mtime_nanos, archive_size) =
         super::app::archive_fingerprint(&archive_path)
@@ -61357,25 +62402,89 @@ pub(super) fn switch_screen_reconciling_browse_archive(
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let leaving_browse = app.current_screen == AppScreen::Browse && target != AppScreen::Browse;
-    app.browse.reconcile_active_archive_staging_dirty();
-    let dirty_archive_staging = app
-        .browse
-        .active_archive_staging()
-        .is_some_and(|staging| staging.dirty);
-
     if leaving_browse {
-        // In-flight preparation is cancellable and must never pin the user to
-        // Browse. Late completions are rejected by archive ownership checks.
-        cancel_and_detach_pending_browse_archive_edit_staging(app);
-        app.deferred_browse_archive_exit = false;
-        app.deferred_browse_archive_screen_switch = None;
+        // A screen switch is an archive commit trigger, not merely an active-tab
+        // transition. Keep the target deferred until every Browse tab's pending
+        // archive set has either been cleaned synchronously or has completed its
+        // one save. Re-entering this helper from a save completion serializes the
+        // next archive without ever exposing a non-Browse screen in between.
+        app.deferred_browse_archive_screen_switch = Some(target);
+        loop {
+            app.browse.reconcile_active_archive_staging_dirty();
+            if browse_archive_inline_metadata_operation_pending(app) {
+                app.deferred_browse_archive_exit = false;
+                app.set_status(
+                    "screen switch deferred: waiting for archive metadata write before save"
+                        .to_string(),
+                );
+                return;
+            }
 
-        if dirty_archive_staging {
-            app.quit_after_browse_archive_repackage = false;
+            let dirty_archive_staging = app
+                .browse
+                .active_archive_staging()
+                .is_some_and(|staging| staging.dirty);
+            if dirty_archive_staging
+                && cancel_browse_owned_archive_preparation_for_deferred_navigation(app)
+            {
+                app.deferred_browse_archive_exit = false;
+                app.set_status(
+                    "screen switch deferred: cancelling pending archive edit preparation before save"
+                        .to_string(),
+                );
+                return;
+            }
+
+            // Fresh preparation owns no user edits yet. Detach it before moving
+            // focus to another tab; stale reducers are ownership-checked.
+            cancel_and_detach_pending_browse_archive_edit_staging(app);
             app.deferred_browse_archive_exit = false;
-            app.deferred_browse_archive_screen_switch = Some(target);
+
+            let Some(staging_tab_id) = app.browse.first_archive_staging_tab_id() else {
+                break;
+            };
+            if app.browse.active_tab_id() != staging_tab_id {
+                if !app.browse.switch_to_tab_id(staging_tab_id) {
+                    app.set_status(
+                        "screen switch deferred: could not activate a Browse tab with pending archive changes"
+                            .to_string(),
+                    );
+                    return;
+                }
+                continue;
+            }
+
+            app.browse.reconcile_active_archive_staging_dirty();
+            if app
+                .browse
+                .active_archive_staging()
+                .is_some_and(|staging| staging.dirty)
+            {
+                app.quit_after_browse_archive_repackage = false;
+                app.deferred_browse_archive_exit = false;
+                exit_browse_archive(app, tx);
+                return;
+            }
+
+            // Net-clean staging still owns durable/session temporary state. The
+            // normal exit path removes it synchronously, then this loop can drain
+            // another archive tab without starting a write.
             exit_browse_archive(app, tx);
-            return;
+            if app.browse.first_archive_staging_tab_id() == Some(staging_tab_id) {
+                app.set_status(
+                    "screen switch deferred: archive staging cleanup is waiting for an in-flight operation"
+                        .to_string(),
+                );
+                return;
+            }
+        }
+
+        app.deferred_browse_archive_screen_switch = None;
+    } else {
+        // No deferred screen-switch lifecycle exists when Browse itself is not
+        // being left. Do not consume a pending target owned by an async reducer.
+        if app.current_screen == AppScreen::Browse {
+            app.deferred_browse_archive_exit = false;
         }
     }
 
@@ -61415,6 +62524,7 @@ fn discard_archive_staging_context(
     app: &mut AppState,
     context: &ArchiveMetadataEditContext,
     quit_after_discard: bool,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     if let Err(err) = super::app::try_cleanup_archive_metadata_staging_dir(&context.staging_dir) {
         app.active_overlay = ActiveOverlay::None;
@@ -61473,11 +62583,13 @@ fn discard_archive_staging_context(
         }
 
         if let Some(target) = deferred_screen_switch {
-            app.current_screen = target;
-            app.set_status(format!(
-                "discarded staged archive changes; switched to {}",
-                target.tab_label()
-            ));
+            switch_screen_reconciling_browse_archive(app, target, tx);
+            if app.deferred_browse_archive_screen_switch.is_none() {
+                app.set_status(format!(
+                    "discarded staged archive changes; switched to {}",
+                    target.tab_label()
+                ));
+            }
         } else if deferred_archive_exit {
             app.set_status("discarded staged archive changes; exited archive".to_string());
         } else {
@@ -61933,13 +63045,23 @@ fn resume_startup_archive_recovery(
     defer_pending_startup_archive_recovery(app, &session);
     app.archive_recovery_prompt_active = false;
 
-    let mut staging = super::browse::ArchiveStagingSession::new(
-        session.staging_dir.clone(),
-        session.archive_path.clone(),
-        session.archive_mtime_secs,
-        session.archive_mtime_nanos,
-        session.archive_size,
-    );
+    let mut staging = if super::browse::archive_logical_staging_marker_exists(&session.staging_dir) {
+        super::browse::ArchiveStagingSession::new_logical(
+            session.staging_dir.clone(),
+            session.archive_path.clone(),
+            session.archive_mtime_secs,
+            session.archive_mtime_nanos,
+            session.archive_size,
+        )
+    } else {
+        super::browse::ArchiveStagingSession::new(
+            session.staging_dir.clone(),
+            session.archive_path.clone(),
+            session.archive_mtime_secs,
+            session.archive_mtime_nanos,
+            session.archive_size,
+        )
+    };
     staging.edits = serde_json::from_str(&session.edits_json).unwrap_or_default();
     // A durable pending-session row means the staged tree may contain edits
     // that have not reached the archive yet. Treat it as dirty even if an
@@ -61957,18 +63079,22 @@ fn resume_startup_archive_recovery(
     ));
 }
 
-fn execute_archive_staging_discard_action(app: &mut AppState, action: &ConfirmAction) {
+fn execute_archive_staging_discard_action(
+    app: &mut AppState,
+    action: &ConfirmAction,
+    tx: &mpsc::Sender<AppMessage>,
+) {
     match action {
         ConfirmAction::ArchiveExternalConflict { context }
         | ConfirmAction::ArchiveRepackageFailure { context, .. } => {
             let quit_after_discard = app.quit_after_browse_archive_repackage;
-            discard_archive_staging_context(app, context, quit_after_discard);
+            discard_archive_staging_context(app, context, quit_after_discard, tx);
         }
         ConfirmAction::ArchiveDiscardStaging {
             context,
             quit_after_discard,
         } => {
-            discard_archive_staging_context(app, context, *quit_after_discard);
+            discard_archive_staging_context(app, context, *quit_after_discard, tx);
         }
         ConfirmAction::ArchiveStartupRecovery { session }
         | ConfirmAction::ArchiveDiscardStartupRecovery { session } => {
@@ -62608,7 +63734,7 @@ fn execute_confirm_action(
             context,
             quit_after_discard,
         } => {
-            discard_archive_staging_context(app, context, *quit_after_discard);
+            discard_archive_staging_context(app, context, *quit_after_discard, tx);
         }
         ConfirmAction::ArchiveStartupRecovery { session } => {
             resume_startup_archive_recovery(app, session.clone(), tx);
@@ -62619,6 +63745,7 @@ fn execute_confirm_action(
                 &ConfirmAction::ArchiveDiscardStartupRecovery {
                     session: session.clone(),
                 },
+                tx,
             );
         }
         ConfirmAction::BulkOperation {
@@ -72348,7 +73475,8 @@ ignored".to_string()),
         };
 
         if let ActiveOverlay::Confirmation { action, .. } = app.active_overlay.clone() {
-            execute_archive_staging_discard_action(&mut app, &action);
+            let (tx, _rx) = mpsc::channel(1);
+            execute_archive_staging_discard_action(&mut app, &action, &tx);
         }
 
         assert_eq!(app.current_screen, AppScreen::Convert);
@@ -79555,6 +80683,60 @@ mod staged_archive_metadata_path_tests {
     }
 
     #[test]
+    fn logical_renamed_implicit_folder_metadata_collects_projected_audio_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("album.zip");
+        let staging_dir = temp.path().join("staging");
+        fs::write(&archive_path, b"archive").expect("archive");
+        fs::create_dir_all(&staging_dir).expect("staging");
+
+        let listing = crate::tui::archive_listing::ArchiveListing {
+            archive_path: archive_path.clone(),
+            format: "zip".to_string(),
+            physical_size: 7,
+            entries: vec![
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/01.flac".to_string(),
+                    size: 10,
+                    packed_size: 8,
+                    is_dir: false,
+                    encrypted: false,
+                },
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/notes.txt".to_string(),
+                    size: 5,
+                    packed_size: 5,
+                    is_dir: false,
+                    encrypted: false,
+                },
+            ],
+        };
+        let mut staging = crate::tui::browse::ArchiveStagingSession::new_logical(
+            staging_dir,
+            archive_path.clone(),
+            0,
+            0,
+            7,
+        );
+        staging.append_edit(crate::tui::browse::ArchiveEdit::Rename {
+            from: "Disc 1".to_string(),
+            to: "CD 1".to_string(),
+        });
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.browse.enter_archive(listing, None);
+        app.browse.archive.as_mut().expect("archive").staging = Some(staging);
+
+        let paths = collect_listing_archive_audio_inner_paths(&app, "CD 1");
+
+        assert_eq!(paths, vec!["CD 1/01.flac".to_string()]);
+        assert!(
+            collect_listing_archive_audio_inner_paths(&app, "Disc 1").is_empty(),
+            "the original implicit directory must disappear from the logical view"
+        );
+    }
+
+    #[test]
     fn staged_metadata_file_rejects_lexical_escape() {
         let temp = tempfile::tempdir().expect("tempdir");
         let err = staged_archive_file_for_metadata(temp.path(), "../outside.flac")
@@ -79778,7 +80960,8 @@ mod staged_archive_metadata_path_tests {
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.preserved_editor_archive_repackage = Some(context.clone());
 
-        discard_archive_staging_context(&mut app, &context, false);
+        let (tx, _rx) = mpsc::channel(1);
+        discard_archive_staging_context(&mut app, &context, false, &tx);
 
         assert!(
             app.preserved_editor_archive_repackage.is_none(),
@@ -101750,7 +102933,7 @@ mod browse_tab_input_tests {
                 archive_path: archive.clone(),
                 cache_key: None,
                 result: Box::new(Ok(refreshed_listing)),
-                password: Some("secret".to_string()),
+                password: Some(crate::convert::pipeline::SecretString::new("secret".to_string())),
             },
             &tx,
         );
@@ -101950,7 +103133,7 @@ mod browse_tab_input_tests {
                 archive_path: archive.clone(),
                 cache_key: None,
                 result: Box::new(Ok(post_save_listing)),
-                password: Some("secret".to_string()),
+                password: Some(crate::convert::pipeline::SecretString::new("secret".to_string())),
             },
             &tx,
         );

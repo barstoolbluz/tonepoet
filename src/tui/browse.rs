@@ -3032,6 +3032,11 @@ pub struct ArchiveStagingSession {
     pub archive_size: u64,
     pub edits: Vec<ArchiveEdit>,
     pub dirty: bool,
+    /// False while the pending set is representable as logical/native renames
+    /// only and no extracted archive tree exists yet. The durable sibling
+    /// marker is the crash-safe source of truth; this flag is the in-memory
+    /// fast path used by Browse rendering and edit admission.
+    pub tree_materialized: bool,
 }
 
 impl ArchiveStagingSession {
@@ -3050,7 +3055,26 @@ impl ArchiveStagingSession {
             archive_size,
             edits: Vec::new(),
             dirty: false,
+            tree_materialized: true,
         }
+    }
+
+    pub fn new_logical(
+        staging_dir: PathBuf,
+        archive_path: PathBuf,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        let mut session = Self::new(
+            staging_dir,
+            archive_path,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+        );
+        session.tree_materialized = false;
+        session
     }
 
     /// Construct a staging session wrapped in a panic-safe cleanup guard.
@@ -3175,6 +3199,80 @@ impl ArchiveStagingSession {
 }
 
 
+pub(crate) fn archive_logical_staging_marker_path(staging_dir: &Path) -> PathBuf {
+    let file_name = staging_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tonepoet-archive-staging");
+    staging_dir.with_file_name(format!(".{file_name}.logical-pending"))
+}
+
+pub(crate) fn archive_logical_staging_marker_exists(staging_dir: &Path) -> bool {
+    archive_logical_staging_marker_path(staging_dir).is_file()
+}
+
+pub(crate) fn write_archive_logical_staging_marker(staging_dir: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let marker = archive_logical_staging_marker_path(staging_dir);
+    if marker.is_file() {
+        return Ok(());
+    }
+    let parent = marker
+        .parent()
+        .ok_or_else(|| "archive logical staging marker has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("create archive logical staging marker parent failed: {err}"))?;
+    let temp = marker.with_extension(format!("logical-pending-{}.tmp", uuid::Uuid::new_v4()));
+    let mut marker_installed = false;
+    let publish = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|err| format!("create archive logical staging marker failed: {err}"))?;
+        file.write_all(b"tonepoet archive logical staging\n")
+            .map_err(|err| format!("write archive logical staging marker failed: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("sync archive logical staging marker failed: {err}"))?;
+        std::fs::rename(&temp, &marker)
+            .map_err(|err| format!("install archive logical staging marker failed: {err}"))?;
+        marker_installed = true;
+        crate::config::sync_parent_dir(parent)
+            .map_err(|err| format!("sync archive logical staging marker parent failed: {err}"))
+    })();
+    if publish.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        if marker_installed {
+            let _ = std::fs::remove_file(&marker);
+            let _ = crate::config::sync_parent_dir(parent);
+        }
+    }
+    publish
+}
+
+pub(crate) fn clear_archive_logical_staging_marker(staging_dir: &Path) -> Result<(), String> {
+    let marker = archive_logical_staging_marker_path(staging_dir);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            if let Some(parent) = marker.parent() {
+                if let Err(err) = crate::config::sync_parent_dir(parent) {
+                    // The marker is already absent in the live namespace, so
+                    // materialization is semantically complete. If the parent
+                    // sync cannot be guaranteed and a crash resurrects the
+                    // marker, recovery safely re-materializes from the archive
+                    // and replays the rename journal rather than trusting the
+                    // staged tree.
+                    log::warn!(
+                        "archive logical staging marker removal parent sync failed for {}: {err}",
+                        marker.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove archive logical staging marker failed: {err}")),
+    }
+}
+
 fn archive_path_is_at_or_below(path: &str, root: &str) -> bool {
     path == root || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
 }
@@ -3206,6 +3304,151 @@ fn archive_path_after_structural_edits(path: &str, edits: &[ArchiveEdit]) -> Opt
         }
     }
     Some(current)
+}
+
+fn archive_path_before_structural_edits(path: &str, edits: &[ArchiveEdit]) -> Option<String> {
+    let mut current = path.to_string();
+    for edit in edits.iter().rev() {
+        match edit {
+            ArchiveEdit::Rename { from, to } if archive_path_is_at_or_below(&current, to) => {
+                let suffix = &current[to.len()..];
+                current = format!("{from}{suffix}");
+            }
+            ArchiveEdit::Create { inner_path, .. } if archive_path_is_at_or_below(&current, inner_path) => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(current)
+}
+
+pub(crate) fn projected_archive_listing(
+    listing: &crate::tui::archive_listing::ArchiveListing,
+    staging: &ArchiveStagingSession,
+) -> crate::tui::archive_listing::ArchiveListing {
+    crate::tui::archive_listing::ArchiveListing {
+        archive_path: listing.archive_path.clone(),
+        format: listing.format.clone(),
+        physical_size: listing.physical_size,
+        entries: listing
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let path = archive_path_after_structural_edits(&entry.path, &staging.edits)?;
+                let mut entry = entry.clone();
+                entry.path = path;
+                Some(entry)
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn logical_archive_original_path(staging: &ArchiveStagingSession, path: &str) -> Option<String> {
+    if staging.tree_materialized {
+        Some(path.to_string())
+    } else {
+        archive_path_before_structural_edits(path, &staging.edits)
+    }
+}
+
+pub(crate) fn archive_staging_current_path_exists(
+    listing: &crate::tui::archive_listing::ArchiveListing,
+    staging: &ArchiveStagingSession,
+    path: &str,
+) -> bool {
+    if staging.tree_materialized {
+        return staging.staging_dir.join(path).exists();
+    }
+    let prefix = format!("{path}/");
+    projected_archive_listing(listing, staging)
+        .entries
+        .iter()
+        .any(|entry| entry.path == path || entry.path.starts_with(&prefix))
+}
+
+#[cfg(test)]
+mod logical_archive_staging_tests {
+    use super::*;
+
+    fn listing(archive_path: PathBuf) -> crate::tui::archive_listing::ArchiveListing {
+        crate::tui::archive_listing::ArchiveListing {
+            archive_path,
+            format: "zip".to_string(),
+            physical_size: 100,
+            entries: vec![
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "Disc 1/01.flac".to_string(),
+                    size: 10,
+                    packed_size: 8,
+                    is_dir: false,
+                    encrypted: false,
+                },
+                crate::tui::archive_listing::ArchiveEntry {
+                    path: "booklet.pdf".to_string(),
+                    size: 5,
+                    packed_size: 4,
+                    is_dir: false,
+                    encrypted: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn logical_staging_projects_chained_renames_without_physical_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_path = temp.path().join("Album.zip");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir(&staging_dir).expect("staging");
+        let source = listing(archive_path.clone());
+        let mut staging = ArchiveStagingSession::new_logical(
+            staging_dir,
+            archive_path,
+            1,
+            2,
+            100,
+        );
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "Disc 1".to_string(),
+            to: "CD 1".to_string(),
+        });
+        staging.append_edit(ArchiveEdit::Rename {
+            from: "CD 1/01.flac".to_string(),
+            to: "CD 1/01 - Intro.flac".to_string(),
+        });
+
+        let projected = projected_archive_listing(&source, &staging);
+        assert!(projected
+            .entries
+            .iter()
+            .any(|entry| entry.path == "CD 1/01 - Intro.flac"));
+        assert!(!projected
+            .entries
+            .iter()
+            .any(|entry| entry.path == "Disc 1/01.flac"));
+        assert_eq!(
+            logical_archive_original_path(&staging, "CD 1/01 - Intro.flac").as_deref(),
+            Some("Disc 1/01.flac")
+        );
+        assert!(archive_staging_current_path_exists(&source, &staging, "CD 1"));
+        assert!(!archive_staging_current_path_exists(&source, &staging, "Disc 1"));
+    }
+
+    #[test]
+    fn logical_staging_marker_round_trip_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging_dir = temp.path().join("staging");
+        std::fs::create_dir(&staging_dir).expect("staging");
+
+        write_archive_logical_staging_marker(&staging_dir).expect("write marker");
+        write_archive_logical_staging_marker(&staging_dir).expect("rewrite marker");
+        assert!(archive_logical_staging_marker_exists(&staging_dir));
+
+        clear_archive_logical_staging_marker(&staging_dir).expect("clear marker");
+        clear_archive_logical_staging_marker(&staging_dir).expect("clear missing marker");
+        assert!(!archive_logical_staging_marker_exists(&staging_dir));
+    }
 }
 
 fn archive_staging_has_net_changes(
@@ -3734,6 +3977,32 @@ impl BrowseState {
         tabs.slots.iter().filter_map(|slot| slot.state.as_deref()).find_map(|state| {
             state.archive.as_ref().and_then(|arc| arc.staging.as_ref()).map(|_| state.tab_id)
         })
+    }
+
+    /// Return the Browse tab that already owns pending edits for this exact
+    /// archive, if any. Archive staging is deliberately single-owner: duplicate
+    /// tabs may share an immutable listing, but they must never create a second
+    /// recovery/staging session for the same archive path.
+    pub fn archive_staging_owner_tab_id(
+        &self,
+        archive_path: &std::path::Path,
+    ) -> Option<BrowseTabId> {
+        if self.archive.as_ref().is_some_and(|archive| {
+            archive.listing.archive_path.as_path() == archive_path && archive.staging.is_some()
+        }) {
+            return Some(self.tab_id);
+        }
+        let tabs = self.tabs.as_ref()?;
+        tabs.slots
+            .iter()
+            .filter_map(|slot| slot.state.as_deref())
+            .find_map(|state| {
+                state.archive.as_ref().filter(|archive| {
+                    archive.listing.archive_path.as_path() == archive_path
+                        && archive.staging.is_some()
+                })?;
+                Some(state.tab_id)
+            })
     }
 
     pub fn first_dirty_archive_tab_id(&self) -> Option<BrowseTabId> {
@@ -5426,20 +5695,35 @@ impl BrowseState {
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
-        let items = arc.listing.entries_at(&arc.inner_path);
+        let logical_staging = arc
+            .staging
+            .as_ref()
+            .is_some_and(|staging| !staging.tree_materialized);
+        let projected_listing = arc
+            .staging
+            .as_ref()
+            .filter(|staging| !staging.tree_materialized)
+            .map(|staging| projected_archive_listing(&arc.listing, staging));
+        let items = projected_listing
+            .as_ref()
+            .unwrap_or(&arc.listing)
+            .entries_at(&arc.inner_path);
         let mut listing_paths = HashSet::new();
         for item in &items {
-            let projected = arc
-                .staging
-                .as_ref()
-                .and_then(|staging| archive_path_after_structural_edits(&item.full_path, &staging.edits));
-            if arc.staging.is_some() && projected.as_deref() != Some(item.full_path.as_str()) {
-                continue;
+            if !logical_staging {
+                let projected = arc
+                    .staging
+                    .as_ref()
+                    .and_then(|staging| archive_path_after_structural_edits(&item.full_path, &staging.edits));
+                if arc.staging.is_some() && projected.as_deref() != Some(item.full_path.as_str()) {
+                    continue;
+                }
             }
             listing_paths.insert(item.full_path.clone());
             let staged_metadata = arc
                 .staging
                 .as_ref()
+                .filter(|staging| staging.tree_materialized)
                 .and_then(|staging| {
                     staging_path_for_archive_inner(&staging.staging_dir, &item.full_path).ok()
                 })
@@ -5448,7 +5732,7 @@ impl BrowseState {
                 EntryKind::Directory
             } else if staged_metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
                 EntryKind::Directory
-            } else if let Some(staging) = arc.staging.as_ref() {
+            } else if let Some(staging) = arc.staging.as_ref().filter(|staging| staging.tree_materialized) {
                 staging_path_for_archive_inner(&staging.staging_dir, &item.full_path)
                     .ok()
                     .map(|path| classify_file(&path))
@@ -5477,7 +5761,7 @@ impl BrowseState {
             }
         }
 
-        if let Some(staging) = arc.staging.as_ref() {
+        if let Some(staging) = arc.staging.as_ref().filter(|staging| staging.tree_materialized) {
             let current_dir = staging.staging_dir.join(&arc.inner_path);
             if let Ok(read_dir) = fs::read_dir(&current_dir) {
                 for child in read_dir.flatten() {
@@ -6288,12 +6572,17 @@ impl BrowseState {
 
     pub fn archive_entry_for_path(&self, path: &Path) -> Option<&crate::tui::archive_listing::ArchiveEntry> {
         let inner = self.archive_inner_path_for_path(path)?;
-        self.archive
-            .as_ref()?
+        let archive = self.archive.as_ref()?;
+        let original_inner = archive
+            .staging
+            .as_ref()
+            .and_then(|staging| logical_archive_original_path(staging, &inner))
+            .unwrap_or(inner);
+        archive
             .listing
             .entries
             .iter()
-            .find(|entry| entry.path == inner)
+            .find(|entry| entry.path == original_inner)
     }
 
     pub fn selected_entry(&self) -> Option<&BrowseEntry> {
@@ -7559,6 +7848,9 @@ impl BrowseState {
     fn archive_staged_path_for_entry(&self, entry: &BrowseEntry) -> Option<PathBuf> {
         let inner = self.archive_inner_path_for_entry(entry)?;
         let staging = self.active_archive_staging()?;
+        if !staging.tree_materialized {
+            return None;
+        }
         let staged = staging_path_for_archive_inner(&staging.staging_dir, &inner).ok()?;
         staged.is_file().then_some(staged)
     }
@@ -7582,9 +7874,14 @@ impl BrowseState {
 
             if entry.is_audio() {
                 if let Some(inner_path) = self.archive_inner_path_for_entry(entry) {
+                    let source_inner_path = arc
+                        .staging
+                        .as_ref()
+                        .and_then(|staging| logical_archive_original_path(staging, &inner_path))
+                        .unwrap_or(inner_path);
                     return TagSearchSource::ExtractArchiveEntry {
                         archive_path: arc.listing.archive_path.clone(),
-                        inner_path,
+                        inner_path: source_inner_path,
                         password: arc.password.clone(),
                         synthetic_path: entry.path.clone(),
                     };
@@ -7832,8 +8129,18 @@ impl BrowseState {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         let mut listing_paths = HashSet::new();
+        let logical_staging = arc
+            .staging
+            .as_ref()
+            .is_some_and(|staging| !staging.tree_materialized);
+        let projected_listing = arc
+            .staging
+            .as_ref()
+            .filter(|staging| !staging.tree_materialized)
+            .map(|staging| projected_archive_listing(&arc.listing, staging));
+        let listing = projected_listing.as_ref().unwrap_or(&arc.listing);
 
-        for item in &arc.listing.entries {
+        for item in &listing.entries {
             if !prefix.is_empty() && !item.path.starts_with(&prefix) {
                 continue;
             }
@@ -7848,17 +8155,20 @@ impl BrowseState {
             if display_name.is_empty() {
                 continue;
             }
-            let projected = arc
-                .staging
-                .as_ref()
-                .and_then(|staging| archive_path_after_structural_edits(&item.path, &staging.edits));
-            if arc.staging.is_some() && projected.as_deref() != Some(item.path.as_str()) {
-                continue;
+            if !logical_staging {
+                let projected = arc
+                    .staging
+                    .as_ref()
+                    .and_then(|staging| archive_path_after_structural_edits(&item.path, &staging.edits));
+                if arc.staging.is_some() && projected.as_deref() != Some(item.path.as_str()) {
+                    continue;
+                }
             }
             listing_paths.insert(item.path.clone());
             let staged_metadata = arc
                 .staging
                 .as_ref()
+                .filter(|staging| staging.tree_materialized)
                 .and_then(|staging| {
                     staging_path_for_archive_inner(&staging.staging_dir, &item.path).ok()
                 })
@@ -7867,7 +8177,7 @@ impl BrowseState {
                 EntryKind::Directory
             } else if staged_metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
                 EntryKind::Directory
-            } else if let Some(staging) = arc.staging.as_ref() {
+            } else if let Some(staging) = arc.staging.as_ref().filter(|staging| staging.tree_materialized) {
                 staging_path_for_archive_inner(&staging.staging_dir, &item.path)
                     .ok()
                     .map(|path| classify_file(&path))
@@ -7896,7 +8206,7 @@ impl BrowseState {
             }
         }
 
-        if let Some(staging) = arc.staging.as_ref() {
+        if let Some(staging) = arc.staging.as_ref().filter(|staging| staging.tree_materialized) {
             let root = staging.staging_dir.join(&arc.inner_path);
             for entry in walkdir::WalkDir::new(&root)
                 .min_depth(1)
@@ -8395,11 +8705,16 @@ impl BrowseState {
         };
 
         let inner = self.archive_inner_path_for_entry(entry)?;
+        let source_inner = archive
+            .staging
+            .as_ref()
+            .and_then(|staging| logical_archive_original_path(staging, &inner))
+            .unwrap_or(inner);
         if let Some(archive_entry) = archive
             .listing
             .entries
             .iter()
-            .find(|candidate| candidate.path == inner)
+            .find(|candidate| candidate.path == source_inner)
         {
             let archive_identity = ProbeCacheIdentity {
                 modified: None,
@@ -8840,7 +9155,7 @@ impl BrowseState {
         };
         let archive_path = arc.listing.archive_path.clone();
         let probe_context = self.archive_entry_probe_context_for(&archive_path);
-        if let Some(staging) = arc.staging.as_ref() {
+        if let Some(staging) = arc.staging.as_ref().filter(|staging| staging.tree_materialized) {
             match staging_path_for_archive_inner(&staging.staging_dir, &inner_path) {
                 Ok(staged_path) if staged_path.is_file() => {
                     self.probe_pending.insert(path.clone());
@@ -8865,12 +9180,17 @@ impl BrowseState {
             }
             return;
         }
+        let source_inner_path = arc
+            .staging
+            .as_ref()
+            .and_then(|staging| logical_archive_original_path(staging, &inner_path))
+            .unwrap_or(inner_path);
         let password = arc.password.clone();
 
         self.probe_pending.insert(path.clone());
         spawn_archive_entry_audio_probe(
             archive_path,
-            inner_path,
+            source_inner_path,
             path,
             password,
             probe_context,
@@ -21102,6 +21422,7 @@ mod tabbed_browsing_tests {
             kind: "test-edit".to_string(),
         });
         staging.install_clone_into_browse_state(&mut browse).expect("install staging");
+        let source_tab_id = browse.active_tab_id();
         let source_staging = browse
             .active_archive_staging()
             .map(|session| session.staging_dir.clone())
@@ -21109,6 +21430,11 @@ mod tabbed_browsing_tests {
 
         assert!(browse.duplicate_tab());
         assert!(browse.active_archive_staging().is_none(), "duplicate cannot share staging ownership");
+        assert_eq!(
+            browse.archive_staging_owner_tab_id(&archive),
+            Some(source_tab_id),
+            "a duplicate archive view must discover the original tab as the sole staging owner",
+        );
         assert!(source_staging.exists(), "source staging remains owned by the original tab");
         assert!(browse.switch_to_tab(0));
         assert_eq!(

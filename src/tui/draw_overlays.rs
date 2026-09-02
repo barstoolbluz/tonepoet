@@ -592,8 +592,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             let action = action.clone();
             draw_confirmation(f, &message, &action, app, theme);
         }
-        ActiveOverlay::ErrorDetail { error, .. } => {
-            draw_error_detail(f, &error, theme);
+        ActiveOverlay::ErrorDetail { error, scroll, .. } => {
+            draw_error_detail(f, &error, scroll, theme);
+        }
+        ActiveOverlay::Notice { title, message, scroll } => {
+            draw_notice(f, &title, &message, scroll, theme);
         }
         ActiveOverlay::ItemInfo { ref item } => {
             draw_item_info(f, item, theme);
@@ -1570,6 +1573,53 @@ fn wrapped_row_count(message: &str, width: u16) -> u16 {
     rows.clamp(1, u16::MAX as usize) as u16
 }
 
+pub(super) fn scrollable_message_popup_rect(
+    area: Rect,
+    preferred_width: u16,
+    min_height: u16,
+    message: &str,
+) -> Rect {
+    let max_w = area.width.saturating_sub(2).max(1);
+    let popup_w = preferred_width.min(max_w);
+    let text_w = popup_w.saturating_sub(2).max(1);
+    // Two block borders plus one footer row. The body itself expands to the
+    // wrapped content and then scrolls once the terminal becomes the limit.
+    let desired_h = wrapped_row_count(message, text_w).saturating_add(3);
+    let max_h = area.height.saturating_sub(2).max(1);
+    let popup_h = desired_h.clamp(min_height.min(max_h), max_h);
+    centered_rect(popup_w, popup_h, area)
+}
+
+pub(super) fn scrollable_message_max_scroll(
+    area: Rect,
+    preferred_width: u16,
+    min_height: u16,
+    message: &str,
+) -> usize {
+    let popup = scrollable_message_popup_rect(area, preferred_width, min_height, message);
+    let text_width = popup.width.saturating_sub(2).max(1);
+    let body_height = popup.height.saturating_sub(3) as usize;
+    (wrapped_row_count(message, text_width) as usize).saturating_sub(body_height)
+}
+
+const ARCHIVE_PASSWORD_PROMPT_HINT: &str = "Enter a password to open this archive. Saved passwords are tried automatically first; successful passwords remain available for later archive opens.";
+
+pub(super) fn text_edit_popup_rect(area: Rect, label: &str) -> Rect {
+    if label.eq_ignore_ascii_case("archive password") {
+        let max_w = area.width.saturating_sub(2).max(1);
+        let popup_w = 66u16.min(max_w);
+        let text_w = popup_w.saturating_sub(2).max(1);
+        // Borders + input + footer are four rows beyond the wrapped hint.
+        let desired_h = wrapped_row_count(ARCHIVE_PASSWORD_PROMPT_HINT, text_w).saturating_add(4);
+        let max_h = area.height.saturating_sub(2).max(1);
+        let popup_h = desired_h.clamp(9u16.min(max_h), max_h);
+        centered_rect(popup_w, popup_h, area)
+    } else {
+        let popup_width = area.width.saturating_sub(4).min(80);
+        centered_rect(popup_width, 7, area)
+    }
+}
+
 fn draw_confirmation(
     f: &mut Frame,
     message: &str,
@@ -1599,10 +1649,15 @@ fn draw_confirmation(
     let min_h = (if cue_consent { 14u16 } else { 9u16 }).min(max_h);
     let popup_h = desired_h.clamp(min_h, max_h);
     let popup = centered_rect(popup_w, popup_h, area);
+    let content_clipped = desired_h > max_h;
 
     f.render_widget(Clear, popup);
-    let title = if cue_consent {
+    let title = if cue_consent && content_clipped {
+        " Tonepoet CUE metadata - resize to read all "
+    } else if cue_consent {
         " Tonepoet CUE metadata "
+    } else if content_clipped {
+        " Confirm - resize to read all "
     } else {
         " Confirm "
     };
@@ -1712,13 +1767,24 @@ fn draw_confirmation(
     }
 }
 
-/// Draw an error detail popup
-fn draw_error_detail(f: &mut Frame, error: &str, theme: super::theme::Theme) {
+/// Draw a scrollable message popup. Content-derived sizing keeps ordinary
+/// messages compact; long tool output remains fully reachable on small screens.
+fn draw_scrollable_message_popup(
+    f: &mut Frame,
+    title: &str,
+    message: &str,
+    scroll: usize,
+    preferred_width: u16,
+    min_height: u16,
+    accent: Color,
+    text_color: Color,
+    theme: super::theme::Theme,
+) {
     let area = f.size();
-    let popup = centered_rect(60, 12, area);
+    let popup = scrollable_message_popup_rect(area, preferred_width, min_height, message);
 
     f.render_widget(Clear, popup);
-    let block = super::draw::solid_title_block(popup, " Error Detail ", theme.destructive, theme);
+    let block = super::draw::solid_title_block(popup, format!(" {title} "), accent, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1726,15 +1792,73 @@ fn draw_error_detail(f: &mut Frame, error: &str, theme: super::theme::Theme) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
+    let body_width = chunks[0].width.max(1);
+    let body_rows = wrapped_row_count(message, body_width) as usize;
+    let visible_rows = chunks[0].height as usize;
+    let max_scroll = body_rows.saturating_sub(visible_rows);
+    let scroll = scroll.min(max_scroll);
+    let scroll_u16 = u16::try_from(scroll).unwrap_or(u16::MAX);
 
-    let error_text = Paragraph::new(error.to_string())
+    let text = Paragraph::new(message.to_string())
         .wrap(Wrap { trim: true })
-        .style(Style::default().fg(theme.destructive));
-    f.render_widget(error_text, chunks[0]);
+        .scroll((scroll_u16, 0))
+        .style(Style::default().fg(text_color));
+    f.render_widget(text, chunks[0]);
 
-    let hint = Paragraph::new(Line::from(vec![footer_pill("Esc close", theme.purple, theme)]))
-        .alignment(Alignment::Center);
+    let mut spans = Vec::new();
+    if max_scroll > 0 {
+        spans.push(footer_pill("Up", theme.blue, theme));
+        spans.push(pill_gap());
+        spans.push(footer_pill("Down", theme.blue, theme));
+        spans.push(pill_gap());
+        spans.push(footer_pill("PgUp", theme.blue, theme));
+        spans.push(pill_gap());
+        spans.push(footer_pill("PgDn", theme.blue, theme));
+        spans.push(pill_gap());
+    }
+    spans.push(footer_pill("Esc close", theme.purple, theme));
+    let hint = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
+}
+
+/// Draw an error detail popup.
+fn draw_error_detail(
+    f: &mut Frame,
+    error: &str,
+    scroll: usize,
+    theme: super::theme::Theme,
+) {
+    draw_scrollable_message_popup(
+        f,
+        "Error Detail",
+        error,
+        scroll,
+        72,
+        10,
+        theme.destructive,
+        theme.destructive,
+        theme,
+    );
+}
+
+fn draw_notice(
+    f: &mut Frame,
+    title: &str,
+    message: &str,
+    scroll: usize,
+    theme: super::theme::Theme,
+) {
+    draw_scrollable_message_popup(
+        f,
+        title,
+        message,
+        scroll,
+        66,
+        9,
+        theme.amber,
+        theme.text,
+        theme,
+    );
 }
 
 /// Draw item info popup
@@ -1968,29 +2092,46 @@ fn draw_text_edit(
     theme: super::theme::Theme,
 ) {
     let area = f.size();
-    // Dynamic popup width: 80 if terminal allows it, otherwise shrink to fit.
-    // Reserve 4 cols of margin (2 each side) when room allows.
-    let popup_width = area.width.saturating_sub(4).min(80);
-    let popup = centered_rect(popup_width, 7, area);
+    let archive_password = label.eq_ignore_ascii_case("archive password");
+    let popup = text_edit_popup_rect(area, label);
 
     f.render_widget(Clear, popup);
-    let block = super::draw::solid_title_block(popup, format!(" Edit {} ", label), theme.blue, theme);
+    let password_hint_clipped = archive_password
+        && wrapped_row_count(
+            ARCHIVE_PASSWORD_PROMPT_HINT,
+            popup.width.saturating_sub(2).max(1),
+        )
+        .saturating_add(4)
+            > popup.height;
+    let (title, accent) = if archive_password && password_hint_clipped {
+        (" Archive password - resize to read all ".to_string(), theme.amber)
+    } else if archive_password {
+        (" Archive password ".to_string(), theme.amber)
+    } else {
+        (format!(" Edit {} ", label), theme.blue)
+    };
+    let block = super::draw::solid_title_block(popup, title, accent, theme);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // hint
+            Constraint::Min(1), // hint
             Constraint::Length(1), // input
             Constraint::Length(1), // help
         ])
         .split(inner);
 
-    let hint = Paragraph::new(Line::from(vec![Span::styled(
-        format!("Enter new {}:", label),
-        Style::default().fg(theme.text_muted),
-    )]));
+    let hint_text = if archive_password {
+        ARCHIVE_PASSWORD_PROMPT_HINT.to_string()
+    } else {
+        format!("Enter new {}:", label)
+    };
+    let hint = Paragraph::new(hint_text)
+        .wrap(Wrap { trim: true })
+        .alignment(if archive_password { Alignment::Center } else { Alignment::Left })
+        .style(Style::default().fg(theme.text_muted));
     f.render_widget(hint, chunks[0]);
 
     let visible_width = chunks[1].width as usize;
@@ -2008,8 +2149,9 @@ fn draw_text_edit(
         chunks[1].y,
     );
 
+    let confirm_label = if archive_password { "Enter use" } else { "Enter save" };
     let help = Paragraph::new(Line::from(vec![
-        footer_pill("Enter save", theme.green, theme),
+        footer_pill(confirm_label, theme.green, theme),
         pill_gap(),
         footer_pill("Esc cancel", theme.purple, theme),
     ]))
@@ -10254,4 +10396,77 @@ mod multiline_display_width_tests {
         );
         assert_eq!(multiline_byte_for_display_position(text, 2, 0, 4), text.len());
     }
+    #[test]
+    fn long_error_detail_can_scroll_to_the_final_wrapped_content() {
+        let theme = super::super::theme::theme_by_slug_or_default(
+            super::super::theme::default_theme_slug(),
+        );
+        let mut message = (0..40)
+            .map(|index| format!("diagnostic line {index}: a deliberately long explanation"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        message.push_str("\nFINAL-CANARY");
+
+        let backend = ratatui::backend::TestBackend::new(80, 18);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_error_detail(frame, &message, usize::MAX, theme))
+            .expect("draw scrolled error detail");
+        let rendered = (0..18).fold(String::new(), |mut text, y| {
+            for x in 0..80 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push('\n');
+            text
+        });
+
+        assert!(rendered.contains("FINAL-CANARY"), "{rendered}");
+        assert!(rendered.contains("PgUp"), "{rendered}");
+        assert!(rendered.contains("PgDn"), "{rendered}");
+    }
+
+    #[test]
+    fn archive_password_prompt_uses_prompt_chrome_not_generic_edit_chrome() {
+        let theme = super::super::theme::theme_by_slug_or_default(
+            super::super::theme::default_theme_slug(),
+        );
+        let input = super::super::text_input::TextInputState::empty();
+        let mut buttons = super::super::button_map::ButtonRenderMap::default();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_text_edit(frame, "archive password", &input, &mut buttons, theme)
+            })
+            .expect("draw archive password prompt");
+        let rendered = (0..24).fold(String::new(), |mut text, y| {
+            for x in 0..80 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push('\n');
+            text
+        });
+
+        // The prompt body is word-wrapped inside a bordered block, so assert on
+        // text with borders removed and whitespace collapsed rather than on
+        // literal substrings that wrapping can split across rows.
+        let flattened = rendered
+            .replace('\u{2502}', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("Archive password"), "{rendered}");
+        assert!(
+            flattened.contains("Saved passwords are tried automatically first"),
+            "{rendered}"
+        );
+        assert!(
+            flattened.contains("successful passwords remain available"),
+            "{rendered}"
+        );
+        // Checked against the flattened text too: a regression to the generic
+        // edit chrome must not slip through merely by wrapping.
+        assert!(!flattened.contains("Edit archive password"), "{rendered}");
+    }
+
 }

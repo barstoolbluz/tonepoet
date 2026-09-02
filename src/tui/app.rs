@@ -1020,42 +1020,83 @@ pub(crate) fn create_pending_archive_preview(
     }
 }
 
-pub(crate) fn stored_archive_password(app: &mut AppState) -> Result<Option<String>, String> {
+pub(crate) fn stored_archive_passwords(app: &mut AppState) -> Result<Vec<String>, String> {
+    // An explicit configured password remains an override, matching the old
+    // single-password semantics. The MRU keychain is a fallback source only
+    // when no explicit configuration is present.
     if let Some(password) = app.config.conversion.archive_password.clone() {
-        return Ok(Some(password));
+        return Ok(vec![password]);
     }
     if let Some(reference) = app.config.conversion.archive_password_ref.as_deref() {
         return crate::secret_store::get(reference)
-            .map(Some)
+            .map(|password| vec![password])
             .map_err(|error| format!("cannot resolve configured archive password: {error}"));
     }
     app.keychain
         .ensure_loaded()
         .map_err(|error| format!("cannot resolve stored archive passwords: {error}"))?;
-    Ok(app.keychain.passwords.first().cloned())
+    Ok(app.keychain.passwords.clone())
+}
+
+pub(crate) fn archive_password_candidates_with_session(
+    session_password: Option<String>,
+    fallback_passwords: Vec<String>,
+) -> Vec<String> {
+    let Some(session_password) = session_password else {
+        // Preserve the existing configured/keychain ordering exactly when
+        // there is no path-local association.
+        return fallback_passwords;
+    };
+
+    let mut candidates = Vec::with_capacity(fallback_passwords.len().saturating_add(1));
+    candidates.push(session_password);
+    for password in fallback_passwords {
+        if !candidates.iter().any(|existing| existing == &password) {
+            candidates.push(password);
+        }
+    }
+    candidates
+}
+
+pub(crate) fn archive_password_candidates_for_path(
+    app: &mut AppState,
+    path: &Path,
+) -> Result<Vec<String>, String> {
+    // Passwords are meaningful only for the encrypted archive formats handled
+    // by the 7z/RAR paths. Avoid touching the secret backend for tar/ISO-WV.
+    if !crate::is_encrypted_archive_ext(path) {
+        return Ok(Vec::new());
+    }
+
+    let session_password = app.archive_passwords.get(path).cloned();
+    match stored_archive_passwords(app) {
+        Ok(fallback_passwords) => Ok(archive_password_candidates_with_session(
+            session_password,
+            fallback_passwords,
+        )),
+        Err(_) if session_password.is_some() => {
+            // Keep a working process-local association usable even when the
+            // secret backend cannot currently supply additional candidates.
+            Ok(vec![session_password.expect("checked above")])
+        }
+        Err(error) => Err(format!("{error} for '{}'", path.display())),
+    }
 }
 
 pub(crate) fn archive_password_for_path(
     app: &mut AppState,
     path: &Path,
 ) -> Result<Option<String>, String> {
-    if let Some(password) = app.archive_passwords.get(path).cloned() {
-        return Ok(Some(password));
-    }
-    stored_archive_password(app).map_err(|error| {
-        format!("{error} for '{}'; the operation was not started", path.display())
-    })
+    archive_password_candidates_for_path(app, path)
+        .map(|passwords| passwords.into_iter().next())
+        .map_err(|error| format!("{error}; the operation was not started"))
 }
 
-pub(crate) fn archive_preview_password_for_path(
+pub(crate) fn archive_preview_passwords_for_path(
     app: &mut AppState,
     path: &Path,
-) -> Result<Option<String>, String> {
-    if let Some(password) = app.archive_passwords.get(path).cloned() {
-        return Ok(Some(password));
-    }
-    stored_archive_password(app)
-        .map_err(|error| format!("{error} for '{}'", path.display()))
+) -> Result<Vec<String>, String> {
+    archive_password_candidates_for_path(app, path)
 }
 
 /// Successful archive-preview dispatch. The generation/path pair is the exact
@@ -1163,7 +1204,7 @@ pub(crate) fn install_archive_preview_convert_source(
         app,
         path,
         tx,
-        archive_preview_password_for_path,
+        archive_preview_passwords_for_path,
     )
 }
 
@@ -1174,7 +1215,7 @@ fn install_archive_preview_convert_source_with_password_resolver<F>(
     resolve_password: F,
 ) -> Result<ArchivePreviewStarted, ArchivePreviewStartError>
 where
-    F: FnOnce(&mut AppState, &Path) -> Result<Option<String>, String>,
+    F: FnOnce(&mut AppState, &Path) -> Result<Vec<String>, String>,
 {
     // Complete every fallible prerequisite before touching the currently
     // installed source. This makes activation failure-atomic even when secret
@@ -1192,7 +1233,7 @@ where
         .probe_generation
         .checked_add(1)
         .ok_or(ArchivePreviewStartError::GenerationExhausted)?;
-    let password = resolve_password(app, &path)
+    let passwords = resolve_password(app, &path)
         .map_err(ArchivePreviewStartError::PasswordResolution)?;
     let pending = create_pending_archive_preview(generation, path.clone());
     let staging_dir = pending.staging_dir.clone();
@@ -1222,7 +1263,7 @@ where
         baseline,
         staging_dir,
         cancel,
-        password,
+        passwords,
         tool_paths,
         tx,
     );
@@ -1444,7 +1485,7 @@ pub(crate) fn spawn_archive_preview(
     baseline: ConvertProbeBaseline,
     staging_dir: PathBuf,
     cancel: tokio_util::sync::CancellationToken,
-    archive_password: Option<String>,
+    archive_passwords: Vec<String>,
     tool_paths: std::collections::HashMap<String, PathBuf>,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1453,7 +1494,7 @@ pub(crate) fn spawn_archive_preview(
         let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
         let item_id = format!("archive-preview-{}", generation);
 
-        let result: Result<ArchivePreview, String> = async {
+        let result: Result<(ArchivePreview, Option<String>), String> = async {
             if cancel.is_cancelled() {
                 return Err("archive preview cancelled".to_string());
             }
@@ -1466,6 +1507,30 @@ pub(crate) fn spawn_archive_preview(
             }
 
             let is_iso_wv = crate::convert::classify::is_iso_wv_container(&archive_path);
+            let archive_password = if is_iso_wv || archive_passwords.is_empty() {
+                None
+            } else if archive_passwords.len() == 1 {
+                // Preserve the old one-password fast path: extraction itself is
+                // already the password check, so do not add a duplicate listing.
+                archive_passwords.first().cloned()
+            } else {
+                let _ = tx
+                    .send(crate::tui::message::AppMessage::ArchivePreviewProgress {
+                        generation,
+                        archive_path: archive_path.clone(),
+                        message: "Checking stored archive passwords...".to_string(),
+                    })
+                    .await;
+                let (_listing, matched_password) =
+                    crate::tui::archive_listing::list_archive_with_password_candidates(
+                        &archive_path,
+                        &archive_passwords,
+                        crate::tui::archive_listing::ArchiveListingOptions::default(),
+                        cancel.clone(),
+                    )
+                    .await?;
+                matched_password
+            };
             let mount_lease = if is_iso_wv {
                 crate::convert::pipeline::materializer_archive::try_mount_iso_wv_readonly(
                     &archive_path,
@@ -1520,13 +1585,16 @@ pub(crate) fn spawn_archive_preview(
                 .await
                 .map_err(|err| format!("ISO-WV preview task failed: {err}"))??;
                 let album_metadata = archive_preview_album_metadata(&tracks);
-                return Ok(ArchivePreview {
-                    staging_dir: staging_dir.clone(),
-                    archive_path,
-                    tracks,
-                    album_metadata,
-                    mount_lease,
-                });
+                return Ok((
+                    ArchivePreview {
+                        staging_dir: staging_dir.clone(),
+                        archive_path,
+                        tracks,
+                        album_metadata,
+                        mount_lease,
+                    },
+                    archive_password,
+                ));
             }
 
             let audio_files = crate::convert::pipeline::materializer_archive::discover_archive_audio_files(&staging_dir)
@@ -1581,16 +1649,23 @@ pub(crate) fn spawn_archive_preview(
             }
 
             let album_metadata = archive_preview_album_metadata(&tracks);
-            Ok(ArchivePreview {
-                staging_dir: staging_dir.clone(),
-                archive_path,
-                tracks,
-                album_metadata,
-                mount_lease,
-            })
+            Ok((
+                ArchivePreview {
+                    staging_dir: staging_dir.clone(),
+                    archive_path,
+                    tracks,
+                    album_metadata,
+                    mount_lease,
+                },
+                archive_password,
+            ))
         }
         .await;
 
+        let (result, resolved_password) = match result {
+            Ok((preview, password)) => (Ok(preview), password),
+            Err(error) => (Err(error), None),
+        };
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&staging_dir);
         }
@@ -1599,6 +1674,8 @@ pub(crate) fn spawn_archive_preview(
             .send(crate::tui::message::AppMessage::ArchivePreviewResult {
                 generation,
                 archive_path: result_path,
+                resolved_password: resolved_password
+                    .map(crate::convert::pipeline::SecretString::new),
                 result,
                 baseline,
             })
@@ -1828,6 +1905,13 @@ impl PendingBrowseConvertExpansion {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DeferredArchiveInlineMetadataWrite {
+    pub path: PathBuf,
+    pub field: crate::tui::probe::MetadataField,
+    pub value: String,
+}
+
 /// Lifecycle handle for Browse-screen archive metadata editing while extraction
 /// and tag reads are still running. The staging directory remains owned by this
 /// handle until the editor opens or the worker reports failure/staleness.
@@ -1841,6 +1925,7 @@ pub struct PendingBrowseArchiveMetadataEdit {
     pub target_inner_paths: Option<Vec<String>>,
     pub cancel: tokio_util::sync::CancellationToken,
     pub owns_staging: bool,
+    pub deferred_inline_write: Option<DeferredArchiveInlineMetadataWrite>,
 }
 
 impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
@@ -1853,6 +1938,7 @@ impl fmt::Debug for PendingBrowseArchiveMetadataEdit {
             .field("archive_size", &self.archive_size)
             .field("target_inner_paths", &self.target_inner_paths)
             .field("owns_staging", &self.owns_staging)
+            .field("has_deferred_inline_write", &self.deferred_inline_write.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1877,6 +1963,7 @@ impl PendingBrowseArchiveMetadataEdit {
             target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
             owns_staging: true,
+            deferred_inline_write: None,
         }
     }
 
@@ -1896,6 +1983,7 @@ impl PendingBrowseArchiveMetadataEdit {
             target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
             owns_staging: false,
+            deferred_inline_write: None,
         }
     }
 
@@ -1912,10 +2000,10 @@ impl PendingBrowseArchiveMetadataEdit {
 }
 
 
-/// Lifecycle handle for Browse-screen archive-entry rename. The operation
-/// captures the archive fingerprint and either runs a transaction-safe native
-/// container rename or prepares the established extracted staging fallback.
-/// Fallback edits join the deferred-save lifecycle for repackage/cleanup.
+/// Lifecycle handle for Browse-screen archive-entry rename while the extracted
+/// fallback is still being prepared. Native-capable rename-only sessions are
+/// represented directly by the Browse-owned logical `ArchiveStagingSession`,
+/// so no archive mutation occurs from this preparation handle.
 #[derive(Clone)]
 pub struct PendingBrowseArchiveRename {
     pub archive_path: PathBuf,
@@ -1994,6 +2082,7 @@ pub struct PendingBrowseArchiveDelete {
     pub archive_size: u64,
     pub target_inner_paths: Option<Vec<String>>,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub owns_staging: bool,
 }
 
 impl fmt::Debug for PendingBrowseArchiveDelete {
@@ -2005,6 +2094,7 @@ impl fmt::Debug for PendingBrowseArchiveDelete {
             .field("archive_mtime_secs", &self.archive_mtime_secs)
             .field("archive_mtime_nanos", &self.archive_mtime_nanos)
             .field("archive_size", &self.archive_size)
+            .field("owns_staging", &self.owns_staging)
             .finish_non_exhaustive()
     }
 }
@@ -2030,6 +2120,30 @@ impl PendingBrowseArchiveDelete {
             archive_size,
             target_inner_paths,
             cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: true,
+        }
+    }
+
+
+    pub fn from_existing(
+        archive_path: PathBuf,
+        staging_dir: PathBuf,
+        inner_paths: Vec<String>,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+        target_inner_paths: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            archive_path,
+            staging_dir,
+            inner_paths,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            target_inner_paths,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: false,
         }
     }
 
@@ -2039,7 +2153,9 @@ impl PendingBrowseArchiveDelete {
 
     pub fn cancel_and_cleanup(self) {
         self.cancel.cancel();
-        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        if self.owns_staging {
+            cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        }
     }
 }
 
@@ -2057,6 +2173,7 @@ pub struct PendingBrowseArchiveCreate {
     pub archive_mtime_nanos: u32,
     pub archive_size: u64,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub owns_staging: bool,
 }
 
 impl fmt::Debug for PendingBrowseArchiveCreate {
@@ -2069,6 +2186,7 @@ impl fmt::Debug for PendingBrowseArchiveCreate {
             .field("archive_mtime_secs", &self.archive_mtime_secs)
             .field("archive_mtime_nanos", &self.archive_mtime_nanos)
             .field("archive_size", &self.archive_size)
+            .field("owns_staging", &self.owns_staging)
             .finish_non_exhaustive()
     }
 }
@@ -2094,6 +2212,30 @@ impl PendingBrowseArchiveCreate {
             archive_mtime_nanos,
             archive_size,
             cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: true,
+        }
+    }
+
+
+    pub fn from_existing(
+        archive_path: PathBuf,
+        staging_dir: PathBuf,
+        inner_path: String,
+        kind: BrowseCreateKind,
+        archive_mtime_secs: i64,
+        archive_mtime_nanos: u32,
+        archive_size: u64,
+    ) -> Self {
+        Self {
+            archive_path,
+            staging_dir,
+            inner_path,
+            kind,
+            archive_mtime_secs,
+            archive_mtime_nanos,
+            archive_size,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            owns_staging: false,
         }
     }
 
@@ -2103,7 +2245,9 @@ impl PendingBrowseArchiveCreate {
 
     pub fn cancel_and_cleanup(self) {
         self.cancel.cancel();
-        cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        if self.owns_staging {
+            cleanup_archive_metadata_staging_dir(&self.staging_dir);
+        }
     }
 }
 
@@ -2285,6 +2429,11 @@ pub struct ArchiveMetadataEditorPayload {
 }
 
 pub fn try_cleanup_archive_metadata_staging_dir(staging_dir: &Path) -> Result<(), String> {
+    // A logical pending session's sibling marker is the durable discriminator
+    // between an intentionally empty owner and a materialized staging tree.
+    // Retire payload/localization first and remove that marker only after both
+    // have succeeded. If cleanup is partial, callers keep the recovery row and
+    // the marker keeps restart recovery fail-safe/idempotent.
     let staging_error = match std::fs::remove_dir_all(staging_dir) {
         Ok(()) => None,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -2299,12 +2448,29 @@ pub fn try_cleanup_archive_metadata_staging_dir(staging_dir: &Path) -> Result<()
         )
         .err();
 
-    match (staging_error, local_source_error) {
-        (None, None) => Ok(()),
-        (Some(err), None) | (None, Some(err)) => Err(err),
-        (Some(staging_err), Some(local_err)) => Err(format!("{staging_err}; {local_err}")),
+    let marker_error = if staging_error.is_none() && local_source_error.is_none() {
+        crate::tui::browse::clear_archive_logical_staging_marker(staging_dir).err()
+    } else {
+        None
+    };
+
+    let mut errors = Vec::new();
+    if let Some(err) = staging_error {
+        errors.push(err);
+    }
+    if let Some(err) = local_source_error {
+        errors.push(err);
+    }
+    if let Some(err) = marker_error {
+        errors.push(err);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
+
 
 pub fn cleanup_archive_metadata_staging_dir(staging_dir: &Path) {
     if let Err(err) = try_cleanup_archive_metadata_staging_dir(staging_dir) {
@@ -6109,6 +6275,14 @@ pub enum ActiveOverlay {
     ErrorDetail {
         item_id: String,
         error: String,
+        scroll: usize,
+    },
+    /// A blocking informational/warning surface that must be acknowledged.
+    /// Unlike a transient status line, arbitrary-length text remains scrollable.
+    Notice {
+        title: String,
+        message: String,
+        scroll: usize,
     },
     ItemInfo {
         item: ConversionItem,
@@ -11771,6 +11945,13 @@ pub enum TextEditTarget {
 /// conservative but broader than the listing path's old `password`-only check.
 pub(crate) fn looks_like_archive_password_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("unsupported encryption")
+        || lower.contains("unsupported encrypted")
+        || lower.contains("unsupported method")
+        || lower.contains("not implemented")
+    {
+        return false;
+    }
     [
         "password",
         "passphrase",
@@ -11778,7 +11959,6 @@ pub(crate) fn looks_like_archive_password_error(message: &str) -> bool {
         "encryption",
         "wrong password",
         "requires password",
-        "unsupported encryption",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -12053,6 +12233,103 @@ mod keychain_state_retry_tests {
         assert_eq!(state.loaded, true);
         assert_eq!(state.passwords, vec!["recovered-secret"]);
         assert_eq!(state.load_error, None);
+    }
+}
+
+#[cfg(test)]
+mod archive_password_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn archive_password_candidates_preserve_the_full_loaded_mru() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.keychain.loaded = true;
+        app.keychain.passwords = vec![
+            "newest".to_string(),
+            "older-working".to_string(),
+            "oldest".to_string(),
+        ];
+
+        let passwords = archive_password_candidates_for_path(
+            &mut app,
+            Path::new("/tmp/album.7z"),
+        )
+        .expect("loaded MRU");
+        assert_eq!(passwords, app.keychain.passwords);
+    }
+
+    #[test]
+    fn session_password_is_first_then_the_flat_mru() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let archive = PathBuf::from("/tmp/album.rar");
+        app.archive_passwords
+            .insert(archive.clone(), "wrong".to_string());
+        app.keychain.loaded = true;
+        app.keychain.passwords = vec!["good".to_string(), "older".to_string()];
+
+        assert_eq!(
+            archive_password_candidates_for_path(&mut app, &archive).expect("session plus MRU"),
+            vec![
+                "wrong".to_string(),
+                "good".to_string(),
+                "older".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_password_is_not_retried_when_it_is_also_in_the_mru() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let archive = PathBuf::from("/tmp/album.rar");
+        app.archive_passwords
+            .insert(archive.clone(), "wrong".to_string());
+        app.keychain.loaded = true;
+        app.keychain.passwords = vec!["wrong".to_string(), "good".to_string()];
+
+        assert_eq!(
+            archive_password_candidates_for_path(&mut app, &archive)
+                .expect("deduplicated candidates"),
+            vec!["wrong".to_string(), "good".to_string()]
+        );
+    }
+
+    #[test]
+    fn session_password_survives_secret_backend_failure() {
+        let _backend = crate::secret_store::enable_unavailable_test_backend();
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let archive = PathBuf::from("/tmp/album.7z");
+        app.archive_passwords
+            .insert(archive.clone(), "session-only".to_string());
+        app.config.conversion.archive_password_ref =
+            Some(crate::secret_store::allocate_reference());
+
+        let candidates = archive_password_candidates_for_path(&mut app, &archive)
+            .expect("session candidate remains usable while backend is unavailable");
+        assert_eq!(candidates, vec!["session-only".to_string()]);
+    }
+
+    #[test]
+    fn non_password_archive_formats_do_not_touch_the_keychain() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.keychain.loaded = false;
+        app.keychain.load_error = Some("backend unavailable".to_string());
+
+        assert!(
+            archive_password_candidates_for_path(&mut app, Path::new("/tmp/album.tar"))
+                .expect("tar needs no password backend")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unsupported_encryption_is_not_misclassified_as_a_password_prompt() {
+        assert!(!looks_like_archive_password_error(
+            "7z listing failed: Unsupported encryption method"
+        ));
+        assert!(!looks_like_archive_password_error(
+            "Cannot open encrypted archive: Unsupported Method"
+        ));
+        assert!(looks_like_archive_password_error("wrong password"));
     }
 }
 

@@ -279,6 +279,284 @@ pub async fn list_archive(
     .await
 }
 
+/// Return whether a normalized listing failure means another stored password
+/// can safely be tried. Keep this deliberately narrow: unsupported encryption,
+/// damaged archives, tool failures, and timeouts must stop the cycle rather than
+/// multiplying expensive or futile attempts.
+pub(crate) fn is_retryable_archive_password_error(error: &str) -> bool {
+    error == "wrong archive password"
+        || error.starts_with("archive requires a password;")
+        || error == "no stored archive password opened the archive"
+}
+
+/// Try the supplied password candidates in order and return the first one that
+/// authenticates the archive. Listing is the cheap first stage; when the
+/// listing exposes encrypted payload members, one bounded `7z t` probe prevents
+/// ZIP/RAR plaintext-directory listings from producing a false password match.
+/// A successful password is returned alongside the listing so the caller can
+/// keep a process-local per-archive association.
+///
+/// Each attempt uses the ordinary bounded/cancellable listing path. Only the
+/// two canonical wrong/missing-password errors advance the cycle; every other
+/// failure is returned immediately. This avoids treating unsupported encryption
+/// or an unusable archive as a reason to hammer every cached secret.
+pub async fn list_archive_with_password_candidates(
+    archive: &Path,
+    passwords: &[String],
+    options: ArchiveListingOptions,
+    cancel: CancellationToken,
+) -> Result<(ArchiveListing, Option<String>), String> {
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    list_archive_with_password_candidates_using_binary(
+        archive,
+        passwords,
+        options,
+        cancel,
+        Path::new(bin),
+    )
+    .await
+}
+
+pub(super) async fn list_archive_with_password_candidates_using_binary(
+    archive: &Path,
+    passwords: &[String],
+    options: ArchiveListingOptions,
+    cancel: CancellationToken,
+    bin: &Path,
+) -> Result<(ArchiveListing, Option<String>), String> {
+    if passwords.is_empty() {
+        let listing = list_archive_with_options_using_binary(
+            archive,
+            None,
+            options,
+            cancel,
+            bin,
+        )
+        .await?;
+        if listing
+            .entries
+            .iter()
+            .any(|entry| entry.encrypted && !entry.is_dir)
+        {
+            return Err(
+                "archive requires a password; set one with :password or in Config > Archive Passwords"
+                    .to_string(),
+            );
+        }
+        return Ok((listing, None));
+    }
+
+    // Start with the MRU candidate. If its listing is rejected, the headers
+    // themselves require authentication and subsequent candidates need only
+    // repeat that cheap header probe. If listing succeeds but an encrypted
+    // payload rejects the candidate (the ordinary ZIP/RAR visible-header case),
+    // reuse the already-parsed listing and test only that one payload member for
+    // the remaining candidates. This keeps attempts correct without N repeated
+    // directory reads on large or remote archives.
+    let first_password = &passwords[0];
+    match list_archive_with_options_using_binary(
+        archive,
+        Some(first_password.as_str()),
+        options,
+        cancel.clone(),
+        bin,
+    )
+    .await
+    {
+        Ok(listing) => {
+            let probe_entry = archive_password_probe_entry(&listing);
+
+            let Some(probe_entry) = probe_entry else {
+                // `-p` is harmless for an unencrypted archive. Do not bind an
+                // arbitrary cached secret merely because the tool accepted it.
+                return Ok((listing, None));
+            };
+
+            match test_archive_entry_password_using_binary(
+                archive,
+                &probe_entry,
+                first_password,
+                options,
+                cancel.clone(),
+                bin,
+            )
+            .await
+            {
+                Ok(()) => return Ok((listing, Some(first_password.clone()))),
+                Err(error) if is_retryable_archive_password_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+
+            for password in passwords.iter().skip(1) {
+                if cancel.is_cancelled() {
+                    return Err("archive listing cancelled".to_string());
+                }
+                match test_archive_entry_password_using_binary(
+                    archive,
+                    &probe_entry,
+                    password,
+                    options,
+                    cancel.clone(),
+                    bin,
+                )
+                .await
+                {
+                    Ok(()) => return Ok((listing, Some(password.clone()))),
+                    Err(error) if is_retryable_archive_password_error(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err("no stored archive password opened the archive".to_string())
+        }
+        Err(error) if is_retryable_archive_password_error(&error) => {
+            for password in passwords.iter().skip(1) {
+                if cancel.is_cancelled() {
+                    return Err("archive listing cancelled".to_string());
+                }
+                match list_archive_with_options_using_binary(
+                    archive,
+                    Some(password.as_str()),
+                    options,
+                    cancel.clone(),
+                    bin,
+                )
+                .await
+                {
+                    Ok(listing) => {
+                        let Some(probe_entry) = archive_password_probe_entry(&listing) else {
+                            // Reaching this branch means a password was required
+                            // to expose the headers, so retain the proven header
+                            // password even if the listing has no payload member
+                            // that can be tested independently.
+                            return Ok((listing, Some(password.clone())));
+                        };
+                        match test_archive_entry_password_using_binary(
+                            archive,
+                            &probe_entry,
+                            password,
+                            options,
+                            cancel.clone(),
+                            bin,
+                        )
+                        .await
+                        {
+                            Ok(()) => return Ok((listing, Some(password.clone()))),
+                            Err(error) if is_retryable_archive_password_error(&error) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) if is_retryable_archive_password_error(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err("no stored archive password opened the archive".to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn archive_password_probe_entry(listing: &ArchiveListing) -> Option<String> {
+    listing
+        .entries
+        .iter()
+        .filter(|entry| entry.encrypted && !entry.is_dir)
+        .min_by_key(|entry| {
+            if entry.packed_size > 0 {
+                entry.packed_size
+            } else {
+                entry.size
+            }
+        })
+        .map(|entry| entry.path.clone())
+}
+
+/// Validate one encrypted member with `7z t` so a listing-only success cannot
+/// falsely authenticate a password for ZIP/RAR archives with plaintext names.
+/// The command is bounded by the same timeout/cancellation policy as listing,
+/// inherits no terminal stdin, and never includes the password in returned
+/// diagnostics.
+async fn test_archive_entry_password_using_binary(
+    archive: &Path,
+    entry_path: &str,
+    password: &str,
+    options: ArchiveListingOptions,
+    cancel: CancellationToken,
+    bin: &Path,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    if cancel.is_cancelled() {
+        return Err("archive listing cancelled".to_string());
+    }
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("t")
+        .arg(format!("-p{password}"))
+        .arg("--")
+        .arg(archive)
+        .arg(entry_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let output_future = cmd.output();
+    let output = match options.timeout {
+        Some(timeout) if !timeout.is_zero() => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err("archive listing cancelled".to_string());
+                }
+                result = tokio::time::timeout(timeout, output_future) => {
+                    match result {
+                        Ok(output) => output,
+                        Err(_) => {
+                            return Err(format!(
+                                "archive authentication check timed out after {}s",
+                                timeout.as_secs()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err("archive listing cancelled".to_string());
+                }
+                output = output_future => output,
+            }
+        }
+    }
+    .map_err(|error| format!("failed to run {}: {error}", bin.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    if looks_like_missing_password(&combined) || looks_like_wrong_password(&combined) {
+        return Err("wrong archive password".to_string());
+    }
+    if combined.trim().is_empty() {
+        return Err(format!(
+            "{} archive authentication check failed with exit status {}",
+            bin.display(),
+            output.status
+        ));
+    }
+    let safe_combined = redact_archive_password_from_text(&combined, Some(password));
+    Err(format!(
+        "{} archive authentication check failed: {}",
+        bin.display(),
+        collapse_error_text(&safe_combined)
+    ))
+}
+
 /// Cancellable, timeout-bounded variant of [`list_archive`].
 ///
 /// The child process never inherits terminal stdin. This is critical while the
@@ -290,14 +568,23 @@ pub async fn list_archive_with_options(
     options: ArchiveListingOptions,
     cancel: CancellationToken,
 ) -> Result<ArchiveListing, String> {
+    let bin = crate::detect_7z_binary()
+        .ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
+    list_archive_with_options_using_binary(archive, password, options, cancel, Path::new(bin)).await
+}
+
+async fn list_archive_with_options_using_binary(
+    archive: &Path,
+    password: Option<&str>,
+    options: ArchiveListingOptions,
+    cancel: CancellationToken,
+    bin: &Path,
+) -> Result<ArchiveListing, String> {
     use tokio::process::Command;
 
     if cancel.is_cancelled() {
         return Err("archive listing cancelled".to_string());
     }
-
-    let bin =
-        crate::detect_7z_binary().ok_or_else(|| "neither 7zz nor 7z found in PATH".to_string())?;
 
     let mut cmd = Command::new(bin);
     cmd.arg("l").arg("-slt").arg(archive);
@@ -333,7 +620,7 @@ pub async fn list_archive_with_options(
             }
         }
     }
-    .map_err(|e| format!("failed to run {}: {}", bin, e))?;
+    .map_err(|e| format!("failed to run {}: {}", bin.display(), e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -347,21 +634,43 @@ pub async fn list_archive_with_options(
             return Err("wrong archive password".into());
         }
         if combined.trim().is_empty() {
-            return Err(format!("{} listing failed with exit status {}", bin, output.status));
+            return Err(format!(
+                "{} listing failed with exit status {}",
+                bin.display(),
+                output.status
+            ));
         }
-        return Err(format!("{} listing failed: {}", bin, collapse_error_text(&combined)));
+        let safe_combined = redact_archive_password_from_text(&combined, password);
+        return Err(format!(
+            "{} listing failed: {}",
+            bin.display(),
+            collapse_error_text(&safe_combined)
+        ));
     }
 
     parse_slt_output(&stdout, archive)
 }
 
+fn looks_like_unsupported_encryption(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("unsupported encryption")
+        || lower.contains("unsupported method")
+        || lower.contains("not implemented")
+}
+
 fn looks_like_missing_password(text: &str) -> bool {
+    if looks_like_unsupported_encryption(text) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
     (lower.contains("enter password") || lower.contains("password is required"))
         && !lower.contains("wrong password")
 }
 
 fn looks_like_wrong_password(text: &str) -> bool {
+    if looks_like_unsupported_encryption(text) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
     lower.contains("wrong password")
         || lower.contains("can not open encrypted archive")
@@ -384,6 +693,13 @@ fn collapse_error_text(text: &str) -> String {
         format!("{}...", &collapsed[..end])
     } else {
         collapsed
+    }
+}
+
+fn redact_archive_password_from_text(text: &str, password: Option<&str>) -> String {
+    match password.filter(|password| !password.is_empty()) {
+        Some(password) => text.replace(password, "<redacted>"),
+        None => text.to_string(),
     }
 }
 
@@ -843,10 +1159,408 @@ Encrypted = -
         assert_eq!(album[1].name, "02 - Track.flac");
     }
 
+    #[cfg(unix)]
+    fn fake_password_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tool = temp.path().join("fake-7z");
+        let log = temp.path().join("attempts.log");
+        let script = format!(
+            r#"#!/bin/sh
+action="$1"
+password=""
+for arg in "$@"; do
+  case "$arg" in
+    -p*) password="${{arg#-p}}" ;;
+  esac
+done
+printf '%s:%s\n' "$action" "$password" >> '{}'
+
+if [ "$action" = "l" ]; then
+  case "$password" in
+    unsupported)
+      echo 'ERROR: Cannot open encrypted archive: Unsupported Method' >&2
+      exit 2
+      ;;
+  esac
+  # Emulate ZIP/RAR data encryption: the directory is listable with any
+  # password, but the encrypted member still requires authentication.
+  cat <<'EOF'
+Type = zip
+Physical Size = 123
+
+----------
+Path = track.flac
+Size = 1
+Packed Size = 1
+Encrypted = +
+EOF
+  exit 0
+fi
+
+case "$password" in
+  working)
+    exit 0
+    ;;
+  unsupported)
+    echo 'ERROR: Cannot open encrypted archive: Unsupported Method' >&2
+    exit 2
+    ;;
+  *)
+    echo 'ERROR: Wrong password' >&2
+    exit 2
+    ;;
+esac
+"#,
+            log.display()
+        );
+        std::fs::write(&tool, script).expect("fake 7z script");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("fake 7z metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("make fake 7z executable");
+        (tool, log)
+    }
+
+    #[cfg(unix)]
+    fn fake_plaintext_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tool = temp.path().join("fake-plaintext-7z");
+        let log = temp.path().join("plaintext-attempts.log");
+        let script = format!(
+            r#"#!/bin/sh
+action="$1"
+password=""
+for arg in "$@"; do
+  case "$arg" in
+    -p*) password="${{arg#-p}}" ;;
+  esac
+done
+printf '%s:%s\n' "$action" "$password" >> '{}'
+
+cat <<'EOF'
+Type = zip
+Physical Size = 123
+
+----------
+Path = track.flac
+Size = 1
+Packed Size = 1
+Encrypted = -
+EOF
+exit 0
+"#,
+            log.display()
+        );
+        std::fs::write(&tool, script).expect("fake plaintext 7z script");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("fake plaintext 7z metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("make fake plaintext 7z executable");
+        (tool, log)
+    }
+
+    #[cfg(unix)]
+    fn fake_header_encrypted_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tool = temp.path().join("fake-header-encrypted-7z");
+        let log = temp.path().join("header-encrypted-attempts.log");
+        let script = format!(
+            r#"#!/bin/sh
+action="$1"
+password=""
+for arg in "$@"; do
+  case "$arg" in
+    -p*) password="${{arg#-p}}" ;;
+  esac
+done
+printf '%s:%s\n' "$action" "$password" >> '{}'
+
+if [ "$password" != "working" ]; then
+  echo 'ERROR: Wrong password' >&2
+  exit 2
+fi
+if [ "$action" = "t" ]; then
+  exit 0
+fi
+cat <<'EOF'
+Type = 7z
+Physical Size = 123
+
+----------
+Path = track.flac
+Size = 1
+Packed Size = 1
+Encrypted = +
+EOF
+exit 0
+"#,
+            log.display()
+        );
+        std::fs::write(&tool, script).expect("fake header-encrypted 7z script");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("fake header-encrypted 7z metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions)
+            .expect("make fake header-encrypted 7z executable");
+        (tool, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_session_password_does_not_block_a_working_cached_password() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let archive = temp.path().join("album.rar");
+        let mut app = crate::tui::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default(),
+        );
+        app.archive_passwords
+            .insert(archive.clone(), "first-wrong".to_string());
+        app.keychain.loaded = true;
+        app.keychain.passwords = vec!["working".to_string(), "older".to_string()];
+
+        let candidates = crate::tui::app::archive_password_candidates_for_path(
+            &mut app,
+            &archive,
+        )
+        .expect("session plus cached candidates");
+        let (_listing, matched) = list_archive_with_password_candidates_using_binary(
+            &archive,
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect("working cached password should follow the stale session value");
+
+        assert_eq!(
+            candidates,
+            vec![
+                "first-wrong".to_string(),
+                "working".to_string(),
+                "older".to_string(),
+            ]
+        );
+        assert_eq!(matched.as_deref(), Some("working"));
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:first-wrong\nt:first-wrong\nt:working\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_password_cycle_does_not_accept_a_listing_only_zip_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let candidates = vec!["first-wrong".to_string(), "working".to_string()];
+
+        let (_listing, matched) = list_archive_with_password_candidates_using_binary(
+            Path::new("album.zip"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect("payload test should advance past the listing-only false positive");
+
+        assert_eq!(matched.as_deref(), Some("working"));
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:first-wrong\nt:first-wrong\nt:working\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn header_encrypted_archive_cycles_passworded_listings_without_payload_retests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_header_encrypted_listing_tool(&temp);
+        let candidates = vec!["first-wrong".to_string(), "working".to_string()];
+
+        let (_listing, matched) = list_archive_with_password_candidates_using_binary(
+            Path::new("album.7z"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect("second cached password should decrypt the archive headers");
+
+        assert_eq!(matched.as_deref(), Some("working"));
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:first-wrong\nl:working\nt:working\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encrypted_payload_listing_without_cached_password_requests_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+
+        let error = list_archive_with_password_candidates_using_binary(
+            Path::new("album.zip"),
+            &[],
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect_err("encrypted payload must request a password even when names are listable");
+
+        assert!(error.starts_with("archive requires a password;"), "{error}");
+        assert_eq!(std::fs::read_to_string(log).expect("attempt log"), "l:\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plaintext_archive_does_not_bind_an_arbitrary_cached_password() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_plaintext_listing_tool(&temp);
+        let candidates = vec!["irrelevant".to_string(), "also-irrelevant".to_string()];
+
+        let (_listing, matched) = list_archive_with_password_candidates_using_binary(
+            Path::new("album.zip"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect("plaintext listing");
+
+        assert!(matched.is_none());
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:irrelevant\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_password_cycle_stops_at_the_first_success_without_global_path_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let candidates = vec![
+            "first-wrong".to_string(),
+            "second-wrong".to_string(),
+            "working".to_string(),
+            "must-not-run".to_string(),
+        ];
+
+        let (listing, matched) = list_archive_with_password_candidates_using_binary(
+            Path::new("album.7z"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect("third cached password should open the archive");
+
+        assert_eq!(matched.as_deref(), Some("working"));
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, "track.flac");
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:first-wrong\nt:first-wrong\nt:second-wrong\nt:working\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_password_cycle_stops_immediately_on_unsupported_encryption() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let candidates = vec!["unsupported".to_string(), "working".to_string()];
+
+        let error = list_archive_with_password_candidates_using_binary(
+            Path::new("album.7z"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect_err("unsupported encryption must not cycle through cached secrets");
+
+        assert!(error.contains("Unsupported Method"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:unsupported\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_password_cycle_exhausts_every_candidate_before_prompt_signal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tool, log) = fake_password_listing_tool(&temp);
+        let candidates = vec![
+            "first-wrong".to_string(),
+            "second-wrong".to_string(),
+            "third-wrong".to_string(),
+        ];
+
+        let error = list_archive_with_password_candidates_using_binary(
+            Path::new("album.7z"),
+            &candidates,
+            ArchiveListingOptions::default(),
+            CancellationToken::new(),
+            &tool,
+        )
+        .await
+        .expect_err("the cycle should report exhaustion only after every cached password fails");
+
+        assert_eq!(error, "no stored archive password opened the archive");
+        assert!(is_retryable_archive_password_error(&error));
+        assert_eq!(
+            std::fs::read_to_string(log).expect("attempt log"),
+            "l:first-wrong\nt:first-wrong\nt:second-wrong\nt:third-wrong\n"
+        );
+    }
+
     #[test]
     fn password_errors_are_classified() {
         assert!(looks_like_missing_password("Enter password (will not be echoed):"));
         assert!(looks_like_wrong_password("ERROR: Wrong password"));
+        assert!(!looks_like_wrong_password(
+            "ERROR: Cannot open encrypted archive: Unsupported Method"
+        ));
+        assert!(!looks_like_missing_password(
+            "Enter password: ERROR: Unsupported encryption method"
+        ));
+        assert!(is_retryable_archive_password_error("wrong archive password"));
+        assert!(is_retryable_archive_password_error(
+            "archive requires a password; set one with :password or in Config > Archive Passwords"
+        ));
+        assert!(is_retryable_archive_password_error(
+            "no stored archive password opened the archive"
+        ));
+        assert!(!is_retryable_archive_password_error(
+            "7z listing failed: Unsupported encryption method"
+        ));
+        assert!(!is_retryable_archive_password_error(
+            "archive listing timed out after 30s"
+        ));
+        assert_eq!(
+            redact_archive_password_from_text(
+                "tool failed while processing -phunter2",
+                Some("hunter2")
+            ),
+            "tool failed while processing -p<redacted>"
+        );
     }
 
     #[test]

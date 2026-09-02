@@ -1952,3 +1952,78 @@ needs may differ from the view's and the dirty flag's.
 
 Mechanism and scope are the implementer's call. Described in full as section B of
 `BRIEF_archive_staged_view_and_progress_2026-09-01.md`.
+
+## 27. The conversion manifest is written to the output root, not the album folder, and serves nobody
+
+**Status:** open. Established 2026-09-01, confirmed by the user against real DSD conversions.
+
+Tonepoet writes a hidden `.tonepoet-manifest.json` recording how a conversion was performed.
+The user does not want this behaviour, has asked for its removal in prior sessions, and has
+rejected co-located dotfile designs when they were proposed. The findings below are recorded
+because the mechanism took several passes to pin down and is not what the code comments
+suggest.
+
+### Where the file actually lands
+
+Not in the album folder. Converting into `~/temp/` writes `~/temp/.tonepoet-manifest.json`,
+*beside* the created album directory rather than inside it — confirmed by the user across
+several DSD conversions.
+
+The cause is that `AlbumPlan::album_dir` is the per-album subfolder only when
+`req.naming.per_album_subdir` is set **and** the folder template contains no disc tokens. A
+template using disc tokens cannot be resolved statically at plan time, so `album_dir` remains
+the **output root** and the real album folders are created beneath it later. The manifest is
+written at `album_dir`, so it lands in the root.
+
+Note that `write_manifest_for_publish` has two call shapes in `stages.rs`: one writes into a
+temp directory that is then atomically renamed, and one writes directly to `plan.album_dir`.
+A comment on the first ("written under the temporary album directory so it moves with the
+atomic album rename") describes behaviour that does not apply to the second, which is what
+the DSD reference path reaches. Reading that comment alone gives the wrong answer.
+
+### Consequences
+
+- The file never travels with the album, so it is absent from the user's library.
+- Every conversion into the same output root **overwrites** the previous manifest, so it
+  cannot hold a per-album record even in principle.
+- Its only reader is `rerun.rs`, whose `Skip` / `Verify` / `Proceed` decision exists to avoid
+  re-converting an album already produced. Because the file is per-root and overwritten, that
+  reader will usually find a manifest belonging to some other album.
+
+There is no correctness hazard: `rerun` compares a `settings_fingerprint` and returns `Redo`
+on mismatch, and the native-v2 path additionally requires an exact source/toolchain preflight.
+A stale manifest causes regeneration, not an incorrect skip. The cost is a hidden file in the
+user's staging root and a feature that cannot do its job.
+
+### Why it is still written despite being disabled
+
+Both production sites set `write_manifest: false` (`unified_request.rs`, `main.rs`); the only
+`true` in the tree is a test fixture. The publish site is:
+
+```rust
+let conversion_manifest = if req.publish.write_manifest || reference_manifest_required {
+```
+
+`reference_manifest_required` is true when any track carries DSD reference evidence, so the
+reference pathway forces a manifest regardless of the setting. That OR-clause is the entire
+reason the behaviour survives.
+
+### Outcomes wanted
+
+- Conversions should not leave hidden files in the user's output or staging directories.
+- Whatever record the reference pathway needs for its own auditability, if any, should live
+  somewhere belonging to the application rather than beside the user's audio.
+
+### Notes for whoever picks this up
+
+- The `DsdReferencePolicyVersion` and `MeasurementParser` enum variants should **not** be
+  deleted as part of this. They are the deserialization vocabulary for any manifest that does
+  exist, and removing them buys nothing once nothing writes new ones. There are sixteen policy
+  versions and four parser contracts; execution already rejects everything except the current
+  pair, so the historical variants cost only enum size.
+- The fate of `rerun`'s skip/verify behaviour is a product decision, not a mechanical one.
+  Avoiding re-conversion of an already-produced album is build-farm behaviour; this is a
+  desktop tool whose user converts into a staging area and moves results manually.
+- This is expected to be folded into the planned pipeline redesign rather than done as
+  isolated work, unless the hidden files become annoying enough to justify deleting the
+  OR-clause on its own, which is a small and independently safe change.

@@ -114,7 +114,7 @@ enum Commands {
         #[arg(long)]
         replaygain: Option<String>,
 
-        /// Archive password for encrypted 7z files
+        /// Archive password for encrypted 7z, ZIP, or RAR files
         #[arg(long)]
         archive_password: Option<String>,
 
@@ -1668,7 +1668,6 @@ async fn run_convert(
     // Note: expansion does not follow symlinks inside directories (matching
     // Browse); symlinked layouts need explicit file arguments.
     {
-        let mut q = queue.write().await;
         let planned = plan_cli_convert_queue_for_conversion(
             &paths,
             &config.conversion.aggregate_metadata_target_priority,
@@ -1695,7 +1694,7 @@ async fn run_convert(
             .items
             .iter()
             .any(|(path, _, _, _)| tonepoet::is_encrypted_archive_ext(path));
-        let resolved_archive_password = match resolve_cli_archive_password(
+        let archive_password_candidates = match resolve_cli_archive_passwords(
             needs_archive_password,
             &archive_password,
             config,
@@ -1711,7 +1710,7 @@ async fn run_convert(
                 })
             },
         ) {
-            Ok(password) => password,
+            Ok(passwords) => passwords,
             Err(error) => {
                 tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
                     &planned_synthetic_cue_artifacts,
@@ -1719,7 +1718,67 @@ async fn run_convert(
                 return Err(anyhow::anyhow!(error));
             }
         };
+
+        // A single explicit/configured password keeps the previous zero-probe
+        // fast path. Cycling is needed only when the flat MRU contains multiple
+        // candidates; resolve each distinct archive once and carry the proven
+        // password into that item's pipeline request.
+        let mut resolved_archive_passwords =
+            std::collections::HashMap::<PathBuf, Option<String>>::new();
+        if archive_password_candidates.len() > 1 {
+            let mut archive_paths = planned
+                .items
+                .iter()
+                .map(|(path, _, _, _)| path)
+                .filter(|path| tonepoet::is_encrypted_archive_ext(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            archive_paths.sort();
+            archive_paths.dedup();
+            for path in archive_paths {
+                let resolved = tonepoet::tui::archive_listing::list_archive_with_password_candidates(
+                    &path,
+                    &archive_password_candidates,
+                    tonepoet::tui::archive_listing::ArchiveListingOptions::default(),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .map(|(_listing, password)| password)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot resolve a stored archive password for '{}': {error}",
+                        path.display()
+                    )
+                });
+                let resolved = match resolved {
+                    Ok(password) => password,
+                    Err(error) => {
+                        tonepoet::convert::queue_expansion::cleanup_synthetic_cue_artifacts(
+                            &planned_synthetic_cue_artifacts,
+                        );
+                        return Err(error);
+                    }
+                };
+                resolved_archive_passwords.insert(path, resolved);
+            }
+        }
+        // Do not hold the queue write lock while external archive probes run.
+        // CLI queue publication starts only after every needed password has
+        // been resolved, so admission remains all-or-nothing on probe failure.
+        let mut q = queue.write().await;
         for (path, format, cue_sidecar_override, sidecar_cue_track_metadata) in planned.items {
+            let resolved_archive_password = if tonepoet::is_encrypted_archive_ext(&path) {
+                if archive_password_candidates.len() > 1 {
+                    resolved_archive_passwords
+                        .get(&path)
+                        .cloned()
+                        .flatten()
+                } else {
+                    archive_password_candidates.first().cloned()
+                }
+            } else {
+                None
+            };
             add_item_to_queue(
                 &mut q,
                 path,
@@ -2100,40 +2159,39 @@ fn plan_cli_convert_queue_with_grouping_decisions_and_metadata_priority(
     }
 }
 
-fn resolve_cli_archive_password<F>(
+fn resolve_cli_archive_passwords<F>(
     needs_archive_password: bool,
     cli_password: &Option<String>,
     config: &TonepoetConfig,
     load_mru: F,
-) -> Result<Option<String>, String>
+) -> Result<Vec<String>, String>
 where
     F: FnOnce() -> Result<Vec<String>, String>,
 {
     if !needs_archive_password {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if let Some(password) = cli_password
         .clone()
         .or_else(|| config.conversion.archive_password.clone())
     {
-        return Ok(Some(password));
+        // Explicit CLI/config values remain authoritative overrides.
+        return Ok(vec![password]);
     }
     if let Some(reference) = config.conversion.archive_password_ref.as_deref() {
         return tonepoet::secret_store::get(reference)
-            .map(Some)
+            .map(|password| vec![password])
             .map_err(|error| {
                 format!(
                     "cannot resolve configured archive password before queue admission: {error}"
                 )
             });
     }
-    load_mru()
-        .map(|passwords| passwords.into_iter().next())
-        .map_err(|error| {
-            format!(
-                "cannot resolve stored archive passwords before queue admission: {error}"
-            )
-        })
+    load_mru().map_err(|error| {
+        format!(
+            "cannot resolve stored archive passwords before queue admission: {error}"
+        )
+    })
 }
 
 fn add_item_to_queue(
@@ -4496,7 +4554,7 @@ FILE "side_b.flac" WAVE
     #[test]
     fn cli_archive_password_resolution_propagates_mru_backend_failure_before_admission() {
         let calls = std::cell::Cell::new(0usize);
-        let error = resolve_cli_archive_password(
+        let error = resolve_cli_archive_passwords(
             true,
             &None,
             &TonepoetConfig::default(),
@@ -4517,7 +4575,7 @@ FILE "side_b.flac" WAVE
     #[test]
     fn explicit_cli_archive_password_bypasses_unavailable_mru_backend() {
         let calls = std::cell::Cell::new(0usize);
-        let password = resolve_cli_archive_password(
+        let password = resolve_cli_archive_passwords(
             true,
             &Some("ephemeral-cli-secret".to_string()),
             &TonepoetConfig::default(),
@@ -4529,7 +4587,33 @@ FILE "side_b.flac" WAVE
         .expect("explicit CLI password is self-contained");
 
         assert_eq!(calls.get(), 0);
-        assert_eq!(password.as_deref(), Some("ephemeral-cli-secret"));
+        assert_eq!(password, vec!["ephemeral-cli-secret".to_string()]);
+    }
+
+    #[test]
+    fn cli_archive_password_resolution_preserves_the_full_mru_order() {
+        let passwords = resolve_cli_archive_passwords(
+            true,
+            &None,
+            &TonepoetConfig::default(),
+            || {
+                Ok(vec![
+                    "most-recent".to_string(),
+                    "older-working".to_string(),
+                    "oldest".to_string(),
+                ])
+            },
+        )
+        .expect("MRU load");
+
+        assert_eq!(
+            passwords,
+            vec![
+                "most-recent".to_string(),
+                "older-working".to_string(),
+                "oldest".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -4540,7 +4624,7 @@ FILE "side_b.flac" WAVE
         config.conversion.archive_password_ref =
             Some("archive-password:unavailable-but-unused".to_string());
 
-        let password = resolve_cli_archive_password(
+        let password = resolve_cli_archive_passwords(
             false,
             &Some("unused-cli-secret".to_string()),
             &config,
@@ -4552,7 +4636,7 @@ FILE "side_b.flac" WAVE
         .expect("non-archive queue admission must be independent of secret backends");
 
         assert_eq!(calls.get(), 0);
-        assert_eq!(password, None);
+        assert!(password.is_empty());
     }
 
     #[test]

@@ -4114,6 +4114,7 @@ pub fn execute_context_action(
                         app.active_overlay = ActiveOverlay::ErrorDetail {
                             item_id: qi.id.clone(),
                             error: error.clone(),
+                            scroll: 0,
                         };
                     }
                     _ => {

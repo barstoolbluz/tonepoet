@@ -1358,7 +1358,49 @@ pub fn preflight_archive_repackage_capability(
     tool_paths: &HashMap<String, PathBuf>,
 ) -> Result<(), String> {
     let format = repackage_archive_format(original_archive)?;
-    require_repackage_format_tool_available(format, tool_paths)
+    require_repackage_format_tool_available(format, tool_paths)?;
+    validate_repackage_container_layout(original_archive, format)
+}
+
+fn validate_repackage_container_layout(
+    original_archive: &Path,
+    format: RepackageArchiveFormat,
+) -> Result<(), String> {
+    if matches!(format, RepackageArchiveFormat::Rar)
+        && looks_like_multivolume_rar(original_archive)
+    {
+        return Err(
+            "multi-volume RAR archives are currently read-only; Tonepoet will not replace only one volume of a set"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn looks_like_multivolume_rar(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // RAR 3+/5 split sets use names such as album.part01.rar. Treat even a
+    // lone matching name as a split-set marker: missing sibling volumes are
+    // more reason to refuse writeback, not less.
+    if let Some(prefix) = file_name.strip_suffix(".rar") {
+        if let Some((_stem, part)) = prefix.rsplit_once(".part") {
+            if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    // Old-style split sets use album.rar + album.r00, album.r01, ... . The
+    // first continuation is deterministically .r00, so avoid scanning an
+    // arbitrarily large sibling directory just to establish write capability.
+    let lower_continuation = path.with_extension("r00");
+    let upper_continuation = path.with_extension("R00");
+    lower_continuation.is_file() || upper_continuation.is_file()
 }
 
 fn require_repackage_format_tool_available(
@@ -1378,18 +1420,41 @@ fn require_repackage_format_tool_available(
                 tool_paths,
                 &["tar"],
                 "tar archive creation requires the `tar` executable",
+            )?;
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "tar writeback requires `7zz` or `7z` so Tonepoet can verify the archive with its actual reader",
             )
         }
-        RepackageArchiveFormat::Rar => require_repackage_tool_available(
-            tool_paths,
-            &["rar"],
-            "RAR archive creation requires the `rar` executable; install rar or convert the archive to 7z before editing metadata",
-        ),
-        RepackageArchiveFormat::IsoWv => require_repackage_tool_available(
-            tool_paths,
-            &["xorriso"],
-            "ISO-WV repackaging requires the `xorriso` executable",
-        ),
+        RepackageArchiveFormat::Rar => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["rar"],
+                "RAR archive creation requires the `rar` executable; install rar or convert the archive to 7z before editing metadata",
+            )?;
+            // RAR writeback is only safe if the resulting archive can be
+            // verified by the same 7-Zip reader Tonepoet uses for subsequent
+            // listing/extraction. Do not allow a writer-only configuration to
+            // enter an edit session that cannot prove the readback invariant.
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "RAR writeback requires `7zz` or `7z` so Tonepoet can verify the archive with its actual reader",
+            )
+        }
+        RepackageArchiveFormat::IsoWv => {
+            require_repackage_tool_available(
+                tool_paths,
+                &["xorriso"],
+                "ISO-WV repackaging requires the `xorriso` executable",
+            )?;
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "ISO-WV writeback requires `7zz` or `7z` so Tonepoet can verify the image with its actual reader",
+            )
+        }
     }
 }
 
@@ -1433,6 +1498,11 @@ pub fn archive_native_rename_available(
                 tool_paths,
                 &["xorriso"],
                 "ISO-WV rename requires the `xorriso` executable",
+            )?;
+            require_repackage_tool_available(
+                tool_paths,
+                &["7zz", "7z"],
+                "ISO-WV rename requires `7zz` or `7z` so Tonepoet can verify the image with its actual reader",
             )?;
             Ok(true)
         }
@@ -2396,6 +2466,7 @@ async fn verify_native_archive_header(
                 secret_args.push(args.len());
                 args.push(format!("-p{password}"));
             }
+            args.push("--".to_string());
             args.push(archive.display().to_string());
             run_native_archive_edit_command(
                 ToolBinary::SevenZip,
@@ -2408,21 +2479,23 @@ async fn verify_native_archive_header(
             .await
         }
         RepackageArchiveFormat::IsoWv => {
-            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            // `xorriso` is the mutating writer for this fast path, but final
+            // admission must come from Tonepoet's actual archive reader. A
+            // structured 7-Zip listing is header-only, so it preserves the
+            // performance reason native rename exists while proving Browse can
+            // reopen the rewritten image.
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
             run_native_archive_edit_command(
-                ToolBinary::Xorriso,
-                xorriso,
+                ToolBinary::SevenZip,
+                seven_zip,
                 vec![
-                    "-indev".into(),
-                    archive.display().to_string(),
-                    "-find".into(),
-                    "/".into(),
-                    "-exec".into(),
-                    "report_lba".into(),
+                    "l".into(),
+                    "-slt".into(),
                     "--".into(),
+                    archive.display().to_string(),
                 ],
                 Vec::new(),
-                "verify native ISO-WV rename header",
+                "verify native ISO-WV rename with Tonepoet reader",
                 cancel,
             )
             .await
@@ -2759,6 +2832,7 @@ where
     // when ToolRunner intentionally redacts spawn details.
     let format = repackage_archive_format(original_archive)?;
     require_repackage_format_tool_available(format, tool_paths)?;
+    validate_repackage_container_layout(original_archive, format)?;
 
     // Remote edit sessions keep a sequential source copy beside (not inside)
     // the extracted staging tree. Reuse it for encryption-policy inspection so
@@ -3392,18 +3466,7 @@ where
         }
         RepackageArchiveFormat::Rar => {
             let rar = repackage_tool_path(tool_paths, &["rar"]);
-            let mut args = vec!["a".into(), "-r".into()];
-            let mut secret_args = Vec::new();
-            if let Some(policy) = encryption_policy {
-                secret_args.push(args.len());
-                args.push(if policy.header_encryption {
-                    format!("-hp{}", policy.password.expose())
-                } else {
-                    format!("-p{}", policy.password.expose())
-                });
-            }
-            args.push(temp_archive.display().to_string());
-            args.push(".".into());
+            let (args, secret_args) = rar_repackage_create_args(temp_archive, encryption_policy);
             run_repackage_command(
                 ToolBinary::Rar, rar,
                 args, secret_args,
@@ -3447,6 +3510,29 @@ where
     }
 }
 
+fn rar_repackage_create_args(
+    temp_archive: &Path,
+    encryption_policy: Option<&ArchiveRepackageEncryptionPolicy>,
+) -> (Vec<String>, Vec<usize>) {
+    // RAR 7.x defaults to version-6 compression methods that 7-Zip 25.x can
+    // list but cannot necessarily decode. Tonepoet's reader is 7-Zip, so RAR
+    // writeback must use the interoperable store method. Keep this explicit:
+    // changing it requires proving writer -> Tonepoet-reader round-trip again.
+    let mut args = vec!["a".into(), "-r".into(), "-m0".into()];
+    let mut secret_args = Vec::new();
+    if let Some(policy) = encryption_policy {
+        secret_args.push(args.len());
+        args.push(if policy.header_encryption {
+            format!("-hp{}", policy.password.expose())
+        } else {
+            format!("-p{}", policy.password.expose())
+        });
+    }
+    args.push(temp_archive.display().to_string());
+    args.push(".".into());
+    (args, secret_args)
+}
+
 async fn verify_repackaged_archive<F>(
     format: RepackageArchiveFormat,
     temp_archive: &Path,
@@ -3484,46 +3570,56 @@ where
             ).await
         }
         RepackageArchiveFormat::Tar | RepackageArchiveFormat::TarGz => {
-            let tar = repackage_tool_path(tool_paths, &["tar"]);
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
             run_repackage_command(
-                ToolBinary::Tar, tar, vec!["tf".into(), temp_archive.display().to_string()],
+                ToolBinary::SevenZip,
+                seven_zip,
+                vec![
+                    "l".into(),
+                    "-slt".into(),
+                    "--".into(),
+                    temp_archive.display().to_string(),
+                ],
                 Vec::new(),
-                None, "verify repackaged tar archive", cancel, monitor, progress
+                None,
+                "verify repackaged tar archive with Tonepoet reader",
+                cancel,
+                monitor,
+                progress,
             ).await
         }
         RepackageArchiveFormat::Rar => {
-            let rar = repackage_tool_path(tool_paths, &["rar"]);
+            // Verify through Tonepoet's real RAR reader rather than asking the
+            // writer to validate its own output. A successful `rar t` is not
+            // sufficient: RAR 7.x can read methods that 7-Zip cannot decode.
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
             let mut args = vec!["t".into()];
             let mut secret_args = Vec::new();
             if let Some(policy) = encryption_policy {
                 secret_args.push(args.len());
                 args.push(format!("-p{}", policy.password.expose()));
             }
+            args.push("--".into());
             args.push(temp_archive.display().to_string());
             run_repackage_command(
-                ToolBinary::Rar, rar, args, secret_args,
+                ToolBinary::SevenZip, seven_zip, args, secret_args,
                 None, "verify repackaged rar archive", cancel, monitor, progress
             ).await
         }
         RepackageArchiveFormat::IsoWv => {
-            let xorriso = repackage_tool_path(tool_paths, &["xorriso"]);
+            let seven_zip = repackage_tool_path(tool_paths, &["7zz", "7z"]);
             run_repackage_command(
-                ToolBinary::Xorriso,
-                xorriso,
+                ToolBinary::SevenZip,
+                seven_zip,
                 vec![
-                    "-indev".into(),
-                    temp_archive.display().to_string(),
-                    "-find".into(),
-                    "/".into(),
-                    "-type".into(),
-                    "f".into(),
-                    "-exec".into(),
-                    "report_lba".into(),
+                    "l".into(),
+                    "-slt".into(),
                     "--".into(),
+                    temp_archive.display().to_string(),
                 ],
                 Vec::new(),
                 None,
-                "verify repackaged ISO-WV image",
+                "verify repackaged ISO-WV image with Tonepoet reader",
                 cancel,
                 monitor,
                 progress,
@@ -5261,6 +5357,48 @@ mod tests {
     }
 
     #[test]
+    fn iso_wv_repackage_preflight_requires_tonepoet_reader_for_readback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.iso.wv");
+        fs::write(&original, b"iso placeholder").expect("archive placeholder");
+        let fake_xorriso = temp.path().join("xorriso");
+        fs::write(&fake_xorriso, b"not executed").expect("fake xorriso");
+        let tool_paths = HashMap::from([
+            ("xorriso".to_string(), fake_xorriso),
+            ("7zz".to_string(), temp.path().join("missing-7zz")),
+        ]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("ISO-WV writeback must require Tonepoet's actual reader");
+        assert!(
+            err.contains("ISO-WV writeback requires `7zz` or `7z`")
+                && err.contains("actual reader"),
+            "ISO-WV reader refusal should explain the readback invariant: {err}",
+        );
+    }
+
+    #[test]
+    fn tar_repackage_preflight_requires_tonepoet_reader_for_readback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.tar");
+        fs::write(&original, b"tar placeholder").expect("archive placeholder");
+        let fake_tar = temp.path().join("tar");
+        fs::write(&fake_tar, b"not executed").expect("fake tar");
+        let tool_paths = HashMap::from([
+            ("tar".to_string(), fake_tar),
+            ("7zz".to_string(), temp.path().join("missing-7zz")),
+        ]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("tar writeback must require Tonepoet's actual reader");
+        assert!(
+            err.contains("tar writeback requires `7zz` or `7z`")
+                && err.contains("actual reader"),
+            "tar reader refusal should explain the readback invariant: {err}",
+        );
+    }
+
+    #[test]
     fn iso_wv_sidecar_geometry_ignores_metadata_but_rejects_track_drift() {
         let base = crate::convert::cue_parser::parse_cue(
             "TITLE \"Album A\"\nFILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Two\"\n    INDEX 01 04:00:00\n",
@@ -6073,6 +6211,10 @@ mod tests {
             &[
                 OsStr::new("a"),
                 OsStr::new("-idq"),
+                // Match Tonepoet's RAR writeback compatibility contract.
+                // RAR 7.x default compression can produce methods the 7-Zip
+                // reader used by Tonepoet cannot decode.
+                OsStr::new("-m0"),
                 archive.as_os_str(),
                 OsStr::new("Disc 1/01.wav"),
             ],
@@ -6284,6 +6426,12 @@ mod tests {
             eprintln!("skipping real tar repackage integration test: tar is required");
             return;
         };
+        let Some(seven_zip) = find_executable(&["7zz", "7z"]) else {
+            eprintln!(
+                "skipping real tar repackage integration test: Tonepoet's 7z/7zz reader is required"
+            );
+            return;
+        };
 
         for (archive_name, gz) in [("Album.tar", false), ("Album.tar.gz", true)] {
             let temp = tempfile::tempdir().expect("temp dir");
@@ -6292,7 +6440,10 @@ mod tests {
             let expected = format!("edited payload for {archive_name}");
             let staging = write_repackage_staging(temp.path(), &expected)
                 .expect("write repackage staging");
-            let tool_paths = HashMap::from([("tar".to_string(), tar.clone())]);
+            let tool_paths = HashMap::from([
+                ("tar".to_string(), tar.clone()),
+                ("7zz".to_string(), seven_zip.clone()),
+            ]);
 
             let mut progress = Vec::new();
             let report = repackage_archive_with_progress(&staging, &original, &tool_paths, |snapshot| {
@@ -6375,18 +6526,19 @@ mod tests {
             .unwrap_or(false);
         let tools = (
             find_executable(&["xorriso"]),
+            find_executable(&["7zz", "7z"]),
             find_executable(&["fuseiso"]),
             find_executable(&["wavpack"]),
             find_executable(&["ffmpeg"]),
         );
-        let (Some(xorriso), Some(fuseiso), Some(wavpack), Some(ffmpeg)) = tools else {
+        let (Some(xorriso), Some(seven_zip), Some(fuseiso), Some(wavpack), Some(ffmpeg)) = tools else {
             if required {
                 panic!(
-                    "ISO-WV real acceptance requires xorriso, fuseiso, wavpack, and ffmpeg because TONEPOET_REQUIRE_TOOLS=1"
+                    "ISO-WV real acceptance requires xorriso, 7z/7zz, fuseiso, wavpack, and ffmpeg because TONEPOET_REQUIRE_TOOLS=1"
                 );
             }
             eprintln!(
-                "skipping ISO-WV real repackage acceptance; xorriso, fuseiso, wavpack, and ffmpeg are required"
+                "skipping ISO-WV real repackage acceptance; xorriso, 7z/7zz, fuseiso, wavpack, and ffmpeg are required"
             );
             return;
         };
@@ -6450,7 +6602,10 @@ mod tests {
 
         let archive = temp.path().join("Album.iso.wv");
         fs::write(&archive, b"pre-repackage placeholder").expect("original placeholder");
-        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso)]);
+        let tool_paths = HashMap::from([
+            ("xorriso".to_string(), xorriso),
+            ("7zz".to_string(), seven_zip),
+        ]);
         repackage_archive(&staging, &archive, &tool_paths)
             .await
             .expect("rebuild renamed ISO-WV fixture");
@@ -6701,11 +6856,20 @@ mod tests {
             let original = temp.path().join(archive_name);
             let staging = write_repackage_staging(temp.path(), "original encrypted RAR payload")
                 .expect("write RAR repackage staging");
+            // Keep a strongly compressible member in the fixture. Without
+            // Tonepoet's explicit -m0 policy, current RAR 7.x writers select a
+            // compression method that 7-Zip 25.x cannot decode; a tiny text-
+            // only fixture could be stored opportunistically and miss that
+            // regression.
+            let compatibility_probe = staging.join("Disc 1").join("compatibility-probe.bin");
+            fs::write(&compatibility_probe, vec![0u8; 256 * 1024])
+                .expect("write compressible RAR compatibility probe");
             let create = run_secret_fixture_output(
                 &rar,
                 &[
                     "a".to_string(),
                     "-r".to_string(),
+                    "-m0".to_string(),
                     password_switch,
                     original.display().to_string(),
                     ".".to_string(),
@@ -6736,26 +6900,28 @@ mod tests {
             .unwrap_or_else(|err| panic!("encrypted RAR repackage {archive_name}: {err}"));
 
             let correct = run_secret_fixture_output(
-                &rar,
+                &seven_zip,
                 &[
                     "t".to_string(),
                     format!("-p{password}"),
+                    "--".to_string(),
                     original.display().to_string(),
                 ],
                 None,
             )
-            .expect("test RAR with correct password");
+            .expect("test RAR with Tonepoet's reader and correct password");
             assert!(correct.status.success(), "correct password must verify {archive_name}");
             let wrong = run_secret_fixture_output(
-                &rar,
+                &seven_zip,
                 &[
                     "t".to_string(),
                     "-pdefinitely-wrong".to_string(),
+                    "--".to_string(),
                     original.display().to_string(),
                 ],
                 None,
             )
-            .expect("test RAR with wrong password");
+            .expect("test RAR with Tonepoet's reader and wrong password");
             assert!(!wrong.status.success(), "wrong password must fail for {archive_name}");
 
             let unauthenticated_listing = run_secret_fixture_output(
@@ -6773,6 +6939,36 @@ mod tests {
                 !header_encrypted,
                 "RAR header visibility must be preserved"
             );
+
+            let extract_dir = temp.path().join("readback");
+            fs::create_dir(&extract_dir).expect("RAR readback output dir");
+            let extract = run_secret_fixture_output(
+                &seven_zip,
+                &[
+                    "x".to_string(),
+                    "-y".to_string(),
+                    format!("-p{password}"),
+                    format!("-o{}", extract_dir.display()),
+                    "--".to_string(),
+                    original.display().to_string(),
+                ],
+                None,
+            )
+            .expect("extract repackaged RAR with Tonepoet's reader");
+            assert!(
+                extract.status.success(),
+                "Tonepoet's 7-Zip reader must extract repackaged {archive_name}"
+            );
+            assert_repackaged_content(&extract_dir, &expected);
+            let readback_probe = fs::read(
+                extract_dir.join("Disc 1").join("compatibility-probe.bin")
+            )
+            .expect("read RAR compatibility probe");
+            assert_eq!(readback_probe.len(), 256 * 1024);
+            assert!(
+                readback_probe.iter().all(|byte| *byte == 0),
+                "RAR readback must preserve the compressible compatibility probe"
+            );
         }
     }
 
@@ -6780,6 +6976,12 @@ mod tests {
     async fn native_iso_wv_real_rename_repairs_cue_and_snapshot_without_extracting_audio() {
         let Some(xorriso) = find_executable(&["xorriso"]) else {
             eprintln!("skipping native ISO-WV rename integration test: xorriso is required");
+            return;
+        };
+        let Some(seven_zip) = find_executable(&["7zz", "7z"]) else {
+            eprintln!(
+                "skipping native ISO-WV rename integration test: Tonepoet's 7z/7zz reader is required"
+            );
             return;
         };
         let _coordination = crate::concurrency::scoped_test_coordination_root();
@@ -6825,7 +7027,10 @@ mod tests {
         fs::write(&snapshot, snapshot_before.as_bytes()).expect("snapshot fixture");
 
         let fingerprint = archive_fingerprint_for_native_edit(&archive).expect("fingerprint");
-        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso.clone())]);
+        let tool_paths = HashMap::from([
+            ("xorriso".to_string(), xorriso.clone()),
+            ("7zz".to_string(), seven_zip),
+        ]);
         let cancel = CancellationToken::new();
         let report = rename_archive_entry_native_transactional(
             &archive,
@@ -6903,6 +7108,12 @@ mod tests {
             eprintln!("skipping native ISO-WV failure integration test: xorriso is required");
             return;
         };
+        let Some(seven_zip) = find_executable(&["7zz", "7z"]) else {
+            eprintln!(
+                "skipping native ISO-WV failure integration test: Tonepoet's 7z/7zz reader is required"
+            );
+            return;
+        };
         let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("temp dir");
         let source = temp.path().join("iso-source");
@@ -6946,7 +7157,10 @@ mod tests {
         fs::write(&snapshot, &snapshot_bytes).expect("Tonepoet metadata snapshot fixture");
         let archive_before = fs::read(&archive).expect("archive before native decline");
         let fingerprint = archive_fingerprint_for_native_edit(&archive).expect("fingerprint");
-        let tool_paths = HashMap::from([("xorriso".to_string(), xorriso)]);
+        let tool_paths = HashMap::from([
+            ("xorriso".to_string(), xorriso),
+            ("7zz".to_string(), seven_zip),
+        ]);
         let cancel = CancellationToken::new();
         let result = rename_archive_entry_native_transactional(
             &archive,
@@ -7314,6 +7528,64 @@ mod tests {
     }
 
     #[test]
+    fn rar_multivolume_detection_covers_new_and_old_naming_without_false_positive() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let ordinary = temp.path().join("Album.rar");
+        fs::write(&ordinary, b"single").expect("ordinary rar placeholder");
+        assert!(!looks_like_multivolume_rar(&ordinary));
+
+        let modern = temp.path().join("Set.part01.rar");
+        fs::write(&modern, b"part one").expect("modern split placeholder");
+        assert!(looks_like_multivolume_rar(&modern));
+
+        let old = temp.path().join("Legacy.rar");
+        let old_part = temp.path().join("Legacy.r00");
+        fs::write(&old, b"first").expect("old split first");
+        fs::write(&old_part, b"second").expect("old split continuation");
+        assert!(looks_like_multivolume_rar(&old));
+    }
+
+    #[test]
+    fn preflight_refuses_multivolume_rar_even_when_writer_is_available() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.part01.rar");
+        fs::write(&original, b"rar placeholder").expect("archive placeholder");
+        let fake_rar = temp.path().join("rar");
+        let fake_seven_zip = temp.path().join("7zz");
+        fs::write(&fake_rar, b"not executed").expect("fake writer");
+        fs::write(&fake_seven_zip, b"not executed").expect("fake reader");
+        let tool_paths = HashMap::from([
+            ("rar".to_string(), fake_rar),
+            ("7zz".to_string(), fake_seven_zip),
+        ]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("split RAR writeback must fail before extraction");
+        assert!(err.contains("multi-volume RAR archives are currently read-only"), "{err}");
+    }
+
+    #[test]
+    fn preflight_refuses_rar_writeback_without_the_actual_reader() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let original = temp.path().join("Album.rar");
+        fs::write(&original, b"rar placeholder").expect("archive placeholder");
+        let fake_rar = temp.path().join("rar");
+        fs::write(&fake_rar, b"not executed").expect("fake writer");
+        let tool_paths = HashMap::from([
+            ("rar".to_string(), fake_rar),
+            ("7zz".to_string(), temp.path().join("missing-7zz")),
+        ]);
+
+        let err = preflight_archive_repackage_capability(&original, &tool_paths)
+            .expect_err("RAR writeback must require the reader used for verification");
+        assert!(
+            err.contains("RAR writeback requires `7zz` or `7z`")
+                && err.contains("actual reader"),
+            "RAR reader refusal should explain the readback invariant: {err}",
+        );
+    }
+
+    #[test]
     fn preflight_refuses_rar_writes_without_a_configured_writer_before_extraction_work() {
         let temp = tempfile::tempdir().expect("temp dir");
         let original = temp.path().join("Album.rar");
@@ -7330,6 +7602,47 @@ mod tests {
                 && err.contains("convert the archive to 7z"),
             "RAR refusal should explain the missing writer without changing formats: {err}"
         );
+    }
+
+    #[test]
+    fn rar_repackage_creation_forces_the_seven_zip_compatible_store_method() {
+        let archive = Path::new("Tonepoet-test.rar");
+        let (plain_args, plain_secrets) = rar_repackage_create_args(archive, None);
+        assert_eq!(
+            plain_args,
+            vec![
+                "a".to_string(),
+                "-r".to_string(),
+                "-m0".to_string(),
+                archive.display().to_string(),
+                ".".to_string(),
+            ]
+        );
+        assert!(plain_secrets.is_empty());
+
+        for header_encryption in [false, true] {
+            let policy = ArchiveRepackageEncryptionPolicy {
+                password: SecretString::new("correct horse battery staple"),
+                header_encryption,
+                zip_method: None,
+            };
+            let (args, secret_args) = rar_repackage_create_args(archive, Some(&policy));
+            assert_eq!(
+                &args[0..3],
+                &["a".to_string(), "-r".to_string(), "-m0".to_string()][..]
+            );
+            assert_eq!(secret_args, vec![3]);
+            assert_eq!(
+                args[3].as_str(),
+                if header_encryption {
+                    "-hpcorrect horse battery staple"
+                } else {
+                    "-pcorrect horse battery staple"
+                }
+            );
+            assert_eq!(args[4], archive.display().to_string());
+            assert_eq!(args[5].as_str(), ".");
+        }
     }
 
     #[tokio::test]

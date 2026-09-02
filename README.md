@@ -13,7 +13,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 ### Browsing and file management
 
 - **File browser** — audio-only filtering, type-ahead and recursive search, visual/range selection, column sorting, right-click context menus, info pane with metadata and analysis
-- **Archive browsing** — browse inside 7z/zip/rar/tar/tar.gz/tar.bz2/tar.xz/tar.zst archives transparently. Rename files, edit metadata tags, and delete entries — all changes staged locally and repackaged atomically on navigate-away. Deferred save with SQLite crash recovery. Password keychain for encrypted archives. Info pane shows full metadata and format details for files inside archives. Progress overlay during repackage operations.
+- **Archive browsing** — browse inside 7z/zip/rar/tar/tar.gz/tar.bz2/tar.xz/tar.zst archives transparently. Rename files, edit metadata tags, and delete entries — all changes staged locally and repackaged atomically on navigate-away. Deferred save with SQLite crash recovery. Password keychain for encrypted archives. Info pane shows full metadata and format details for files inside archives. Progress overlay during repackage operations. RAR writeback requires RARLAB `rar`; Tonepoet writes replacement RARs in store mode so the same 7-Zip reader used by Tonepoet can always read them back.
 - **Template-based naming** — folder and filename templates with tag variables (%ARTIST%, %ALBUM%, %TITLE%, etc.), interactive template builder with saved presets
 - **Bulk rename** — tag-based batch renaming with preview
 - **Bookmarks** — saved directory shortcuts
