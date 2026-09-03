@@ -2770,6 +2770,7 @@ dependencies = [
  "tonepoet-backend",
  "tonepoet-features",
  "tonepoet-pipeline",
+ "tonepoet-true-peak",
  "tonepoet-wizard",
  "tui-file-picker",
  "uuid",
@@ -2817,6 +2818,10 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
+
+[[package]]
+name = "tonepoet-true-peak"
+version = "0.1.0"
 
 [[package]]
 name = "tonepoet-wizard"

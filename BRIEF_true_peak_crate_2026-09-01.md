@@ -1,7 +1,7 @@
 # BRIEF — A world-class, standalone, path-independent true-peak crate
 
 **Date:** 2026-09-01
-**Base:** `main` @ `3714ac1`
+**Base:** `main` @ `9254daa`
 **Related:** `OUTSTANDING_ISSUES.md` #19 (preserve-original-peaks and true-peak-informed
 headroom), #27 (the conversion manifest)
 
@@ -28,7 +28,34 @@ Concretely, it must not import `DbNano`, `MeasurementParser`, `PlannedMeasuremen
 `DsdReferencePolicyVersion`, or any other tonepoet type. Today's caller converts the result
 into whatever the current contract wants; the redesigned pipeline converts it into whatever
 it wants. That single rule is what lets both consume the same crate without modification, and
-it is the most important constraint in this brief.
+it is the architectural constraint the whole shape depends on. The standard it has to meet is
+the subject of the next section.
+
+### Reuse in the redesigned pipeline is a requirement, not a hope
+
+This work is the first of two steps the user has sequenced deliberately. The second is a
+redesign of the conversion pipeline, and **this crate must survive it unchanged**. It is being
+built first precisely so the redesign consumes a finished component rather than aiming at a
+moving target.
+
+That redesign is expected to be substantially wider than what exists today. As described by
+the user, it should support:
+
+- the existing reference/golden DSD-to-PCM path;
+- user-composed pipeline steps — arbitrary SoX or FFmpeg effects such as DC-offset removal or
+  RIAA equalisation, inserted where the user wants them;
+- PCM to DSD, which is a different problem from the reverse and not simply the pipeline run
+  backwards;
+- DSD to lossy PCM, and lossy PCM to DSD, neither of which is supported now.
+
+So this crate will be called from more places, on more material, than the single album
+auto-gain site that is its first consumer. Anything that ties it to DSD, to a particular
+sample rate or channel count, to one carrier format, or to the assumption that its result
+feeds a gain decision, is a design that will need reopening. It should be as true of a
+44.1 kHz stereo lossy decode as of a DSD256 multichannel reference conversion.
+
+The user's phrasing was that the true-peak work must be something "we can also carry over into
+the refactored pipeline". Treat carrying over as a constraint on this delivery.
 
 ### The quality bar
 
@@ -50,6 +77,17 @@ Concretely, world-class means:
 
 A meter whose correctness cannot be demonstrated is not world-class regardless of how good its
 filter is, which is why the validation requirement below is not optional.
+
+**If nothing world-class exists to borrow, build it.** Adapting a mediocre implementation
+because it is available would miss the point of this work. The candidate crates on crates.io
+in this space are young and lightly used; the implementations already in this repository are
+external-tool text parsing with the constraints documented below. None of that is a reason to
+settle. If, having looked, the best available option is not good enough, write one that is —
+that outcome is expected and wanted, not a fallback.
+
+The bar is not "better than what tonepoet does today". It is an implementation that would be
+the right answer for anyone measuring true peak, which is why it is a standalone crate rather
+than a module.
 
 ## What exists today, as best I can tell
 
@@ -76,10 +114,27 @@ sox f64 → CAF  → ffmpeg loudnorm:  input_tp 166.64   BROKEN
 sox f64 → WAV / AIFF:              correct, but 4 GiB-class ceilings
 ```
 
-I am **not certain** why the design ended at SoX 16x rather than a fixed loudnorm carrier —
-whether loudnorm's BS.1770 4x was also judged insufficient, or whether SoX simply won on
-carrier robustness. That distinction matters for the conformance question below and is worth
-establishing.
+**The 16x factor turns out to be deliberate and quantified**, which I did not appreciate on my
+first pass. `dsd_reference.rs` carries an explicit error budget in nanodecibels:
+
+| Constant | Value | Comment in the source |
+|---|---|---|
+| `REFERENCE_TRUE_PEAK_GRID_BOUND` | 0.041925957 dB | "Conservative analytic grid under-read bound for 16x sampling of a signal bandlimited to the original Nyquist frequency" |
+| `REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT` | 0.058074043 dB | "Empirically qualified residual allowance for the exact pinned SoX-ng resampler" |
+| `REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL` | 0.100000000 dB | grid + resampler, exactly |
+| `REFERENCE_TRUE_PEAK_ONE_SIDED_AUTHORITY` | 0.110000000 dB | residual plus the reporting-quantization reserve |
+
+The grid bound is the closed-form worst case. For a sinusoid at Nyquist, a sample grid at `L`
+times the original rate can miss the true peak by at most `20·log10(cos(π/2L))`. At L=16 that
+is **0.0419 dB**, matching the constant to the digit.
+
+So the existing implementation has an accuracy contract: total analyzer residual 0.1 dB,
+applied one-sided, against a `-1.0 dBTP` ceiling enforced by `validate_post_final_true_peak`.
+That is a concrete bar for any replacement — match or beat 0.1 dB total, and be able to say
+why.
+
+There is also a deadline model around it (`REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS`, a
+qualified throughput floor), so the measurement is expected to be slow and is budgeted for.
 
 **2. The PCM/ReplayGain path** shells out to `loudgain` and parses `True_Peak_dBTP` from
 tab-delimited columns by field index (`src/convert/replaygain.rs`, `src/tui/analyze.rs`).
@@ -120,8 +175,10 @@ is about, and using it there requires no change to the certified reference contr
 - The **already-built binary links `libswresample.so.5` and `libsoxr.so.0`**.
 - `software::resampling` has **zero** uses anywhere in tonepoet.
 
-So high-quality oversampling is linked into the process today and entirely unused. Whether to
-use it, or to implement the filter directly, is open — see below.
+This is recorded as an inventory of what is already present, not as a recommendation. It is
+listed because it would otherwise be invisible, and because its absence from the dependency
+diff might otherwise be mistaken for a reason it cannot be used. Whether to use it, implement
+the filter directly, or do neither is open — see "Implementation freedom" below.
 
 I noticed the built binary loads two `libavutil` versions simultaneously (`.so.59` from
 ffmpeg-full 7.1.3 and `.so.60` from ffmpeg-headless 8.0.1). I did not determine why, and it
@@ -130,14 +187,30 @@ to matter.
 
 ## The conformance question, which we have not decided
 
-ITU-R BS.1770-4 specifies a *particular* 4x oversampling filter. soxr at high precision is
-arguably a better reconstruction, but "better" and "conformant" are different properties, and
-they can disagree by a fraction of a dB.
+ITU-R BS.1770-4 specifies a *particular* 4x oversampling filter. The disagreement is larger
+than "a fraction of a dB", and it is quantifiable using the same closed form the existing code
+relies on:
+
+| Oversample factor | Worst-case grid under-read |
+|---|---|
+| 4x (BS.1770) | **0.6877 dB** |
+| 8x | 0.1685 dB |
+| 16x (current) | **0.0419 dB** |
+| 32x | 0.0105 dB |
+
+These are bounds on the grid component alone, not measured error for any implementation.
+BS.1770 specifies a designed interpolating filter rather than naive grid sampling, so a
+conformant meter's real error is not its grid bound, and comparing the two properly requires
+measurement rather than arithmetic. They are included because the existing code derives its
+own budget this way, so the same reasoning is available to you.
+
+What the standard optimises for, what the current implementation optimises for, and which of
+those this crate should target are yours to determine.
 
 Which matters depends on the use:
 
-- For **headroom decisions** — should this album be attenuated — a superior estimate is
-  straightforwardly better.
+- For **headroom decisions** — should this album be attenuated — what matters is how closely
+  the estimate tracks the real inter-sample peak.
 - For **reported dBTP** — anything shown to a user or written into a tag — a number that
   cannot be reproduced by other meters reads as a defect, however good the filter.
 
@@ -151,13 +224,30 @@ including large DSD sources.
 
 ## Implementation freedom, and the one thing that is not optional
 
-**How the measurement is produced is entirely your choice.** Write the oversampling filter
-from scratch; drive libsoxr in-process through `ffmpeg-next`, which is already linked and
-unused; adapt a published implementation with a compatible licence; or something else. There
-is no preferred answer here and no obligation to reuse anything that currently exists in this
-repository. The existing paths are described above so you know what is there, not because the
-new crate should imitate them — they are external-tool text parsing, which is precisely what
-this work is meant to stop doing.
+**How the measurement is produced is entirely your choice**, and that includes deciding to
+depend on none of the tools described above.
+
+Three shapes, listed without preference:
+
+- **Fully self-contained.** Implement the oversampling and peak detection in the crate itself,
+  depending on no external audio library. This is the only option that owes nothing to
+  `ffmpeg`'s build flags, to a pinned SoX-ng version, or to any tool's sample-format
+  behaviour — including the clamp documented below. It is also the option under which the
+  crate could stand alone as a published artefact.
+- **Link an existing resampler in-process.** `ffmpeg-next` is already a dependency with
+  `software-resampling` on by default, and `libswresample` and `libsoxr` are already linked
+  into the binary, so this route adds nothing new to build.
+- **Adapt a published implementation** with a compatible licence, or take a hybrid of the
+  above.
+
+There is no preferred answer here and no obligation to reuse anything that currently exists in
+this repository. The existing paths are described above so you know what is there, not because
+the new crate should imitate them — they are external-tool text parsing, which is precisely
+what this work is meant to stop doing.
+
+If a self-contained implementation is the right answer, say so and build it. The inventory of
+what happens to be linked already is context, not a constraint, and it should not be read as
+narrowing the field.
 
 **What is not optional is demonstrating correctness.** A true-peak meter that has not been
 checked against independent references is a guess with a confident interface. The delivery
@@ -172,6 +262,31 @@ automatically your error, and finding that one of them is wrong would be a genui
 result. Published conformance vectors, other standards-compliant meters, and synthesised
 signals with analytically known inter-sample peaks are all stronger references than anything
 currently in this repository.
+
+## A measured constraint on the current toolchain
+
+SoX cannot represent samples above full scale. Given a raw `f64le` file whose peak sample is
+`1.5`, the two tools disagree:
+
+| Tool | Reported |
+|---|---|
+| `sox -t f64 … -n stats` | `Max level 1.000000`, `Pk lev dB -0.00` |
+| `ffmpeg -f f64le … astats` | `Max level: 1.500000`, `Peak level dB: 3.521825` |
+
+The same clamp occurs at `1.001`. So any measurement routed through SoX cannot report a peak
+above 0 dBFS, which is the region true-peak measurement exists to detect.
+
+Whether this currently matters in the reference path is not established here. That path
+applies headroom before reconstruction, and `validate_post_final_true_peak` enforces a
+`-1.0 dBTP` ceiling, so an over may never reach the measurement in practice — but if one did,
+the reported value would be `-0.00` rather than its true magnitude.
+
+For the album auto-gain path, which is this brief's intended first consumer, the exposure is
+more direct: that path measures a peak in order to decide attenuation, and a source peaking
+above full scale would be measured as `-0.00`.
+
+This is offered as a property of the current toolchain that a decoded-frames-in implementation
+would not inherit, not as an argument for any particular design.
 
 ## Things the crate has to get right
 

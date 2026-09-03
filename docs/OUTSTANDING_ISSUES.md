@@ -2027,3 +2027,57 @@ reason the behaviour survives.
 - This is expected to be folded into the planned pipeline redesign rather than done as
   isolated work, unless the hidden files become annoying enough to justify deleting the
   OR-clause on its own, which is a small and independently safe change.
+
+## 28. Displayed true peak should come from `tonepoet-true-peak`, in its reporting mode
+
+The `tonepoet-true-peak` crate now measures true peak in-process, with no dependencies and no
+subprocess. Its first consumer is album DSD auto-gain. The `:analyze` display still gets its
+true-peak figure by shelling out to `loudgain` and parsing tab-separated text
+(`src/tui/analyze.rs`, `measure_loudness`), which predates the crate. We plan to move that
+display onto the crate.
+
+### The mode selection this settles
+
+The crate has two modes, and they are not fast/slow tiers of one measurement -- they answer
+different questions:
+
+- `Headroom64x` answers "how much gain is safe?" It carries a declared, qualified accuracy
+  bound of 0.030 dB, of which the interpolation grid contributes 0.0026 dB.
+- `Reporting4x` reproduces libebur128's *reporting* profile, which is what loudgain, foobar,
+  and EBU R128 compliance readouts show. That fidelity deliberately includes behaviours no
+  gain decision should use: oversampling drops to 2x at 96-192 kHz and to plain sample peak
+  at 192 kHz and above (`crates/tonepoet-true-peak/src/lib.rs`,
+  `oversample_factor_for_sample_rate`), and it follows libebur128's zero-initialized
+  finite-stream contract, which rings on an abrupt onset -- a hard-onset constant block
+  measures +1.03 dB above its own value, correctly, in that mode.
+
+The grid under-read bound is `20*log10(cos(pi/2L))`: 0.6877 dB at 4x against 0.0026 dB at 64x.
+So the modes are not interchangeable, and a 4x measurement driving album gain could under-read
+true peak by nearly 0.7 dB and clip.
+
+**The right mode is a static property of each call site, not of the material and not a user
+setting.** The gain decision asks how much headroom exists, so it uses `Headroom64x`. A
+displayed compliance figure should match what other tools report, so it would use
+`Reporting4x`. Neither should be surfaced as a "fast/ultra" switch in the Convert UI: that
+would let a user silently make auto-gain unsafe in exchange for a speed win on a measurement
+that rides along with a far more expensive decode.
+
+### Outcomes wanted
+
+- The `:analyze` true-peak figure comes from `tonepoet-true-peak` in `Reporting4x`, so the
+  displayed number stays comparable to what other R128 tools report.
+- One fewer external-tool text-parsing dependency on a display path.
+- The mode stays chosen at the call site. No config key, no pill, no `:set` option.
+
+### Notes for whoever picks this up
+
+- **This does not retire the `loudgain` shell-out.** `measure_loudness` returns LUFS *and*
+  true peak from one invocation, and the crate measures peak only -- it has no loudness
+  meter. Only the true-peak column can move. Whether that is worth a second pass over the
+  audio, or whether the display should keep taking both from loudgain until something also
+  supplies LUFS in-process, is the first thing to decide.
+- The crate takes interleaved `f64` frames, so this needs a decode path to feed it. The album
+  gain site already has one because it measures a retained PCM carrier; the `:analyze` site
+  currently hands `loudgain` a file path and lets it do its own decoding.
+- ReplayGain *writing* (`command.rs`) is a separate use of `loudgain` and is not in scope.
+- Expected to be folded into the planned pipeline redesign rather than done as isolated work.

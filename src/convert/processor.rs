@@ -3140,14 +3140,13 @@ fn resolve_completed_dsd_album_gain_submission(
         .map(|value| value.render(false))
         .unwrap_or_else(|| "-inf (verified silence)".to_string());
     log::info!(
-        "DSD album gain: submitted batch scope={} item(s), {} DSD track(s), {} excluded non-DSD track(s) in {} DSD-free item(s); participants={:?}; loudest reported peak={} dBFS; analyzer reserve={} dB; target={} dBFS; fixed gain={} dB",
+        "DSD album gain: submitted batch scope={} item(s), {} DSD track(s), {} excluded non-DSD track(s) in {} DSD-free item(s); participants={:?}; loudest true peak={} dBTP; target={} dBTP; fixed gain={} dB",
         state.expected_items,
         authority.track_count,
         scope_disclosure.excluded_non_dsd_track_count,
         scope_disclosure.excluded_non_dsd_item_count,
         scope_disclosure.dsd_participants,
         loudest,
-        tonepoet_pipeline::ALBUM_SOX_STATS_REPORTING_UNCERTAINTY.render(false),
         authority.target_dbfs.render(false),
         authority.gain_db.render(false),
     );

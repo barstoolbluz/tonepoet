@@ -5,9 +5,7 @@
 //! not create or consume Reference attestations and never modifies the frozen
 //! qualification corpus.
 
-use crate::dsd_reference::{
-    extract_single_sox_stats_peak_report, resolve_reference_profile, DbNano,
-};
+use crate::dsd_reference::{resolve_reference_profile, DbNano};
 use crate::enums::{DsdAutoGainScope, DsdLowpassMethod, RateTarget};
 use crate::error::{PlanningError, Result};
 use crate::mapping;
@@ -19,16 +17,10 @@ use crate::source::SourceInfo;
 use crate::tools::ToolIdentifier;
 use std::path::Path;
 
-/// SoX `stats` reports `Pk lev dB` to centidecibel precision. Album mode
-/// binds an explicit fixed gain from that text report, so reserve one complete
-/// reporting quantum. This is a local measurement-safety rule, not part of
-/// the qualified DSD Reference acceptance policy.
-pub const ALBUM_SOX_STATS_REPORTING_UNCERTAINTY: DbNano = DbNano(10_000_000);
-
 /// One deterministic post-reconstruction peak report for album aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlbumPeakMeasurement {
-    /// Finite sample peak in dBFS.
+    /// Finite measured true peak in dBTP.
     Finite(DbNano),
     /// The analyzer reported a completely silent signal (`-inf`).
     Silence,
@@ -39,26 +31,12 @@ pub enum AlbumPeakMeasurement {
 pub struct AlbumGainAuthority {
     /// Peak target selected by the user-facing headroom control.
     pub target_dbfs: DbNano,
-    /// Loudest finite measured track, or `None` when every track is silent.
+    /// Loudest finite measured true peak, or `None` when every track is silent.
     pub loudest_peak_dbfs: Option<DbNano>,
     /// Fixed gain to apply uniformly to every participating DSD track.
     pub gain_db: DbNano,
     /// Number of DSD tracks represented by this authority.
     pub track_count: usize,
-}
-
-/// Parse the strict `Pk lev dB` token from one SoX `stats` run.
-pub fn parse_album_peak_measurement(
-    stderr: &str,
-    channels: u16,
-) -> std::result::Result<AlbumPeakMeasurement, String> {
-    let raw = extract_single_sox_stats_peak_report(stderr, channels)?;
-    if raw == "-inf" {
-        return Ok(AlbumPeakMeasurement::Silence);
-    }
-    raw.parse::<DbNano>()
-        .map(AlbumPeakMeasurement::Finite)
-        .map_err(|error| format!("album DSD peak report is invalid: {error}"))
 }
 
 /// Derive one fixed album gain from a complete measurement set.
@@ -81,19 +59,9 @@ pub fn resolve_album_gain(
     }).max();
 
     let gain_db = match loudest_peak_dbfs {
-        Some(reported_peak) => {
-            // The real peak may lie anywhere inside the analyzer's 0.01 dB
-            // reporting bin. Treat the printed value as a lower bound and
-            // raise it by one complete quantum before binding gain. That makes
-            // the resulting explicit fixed gain conservative even when SoX
-            // rounded the peak downward.
-            let conservative_peak = reported_peak
-                .checked_add(ALBUM_SOX_STATS_REPORTING_UNCERTAINTY)
-                .ok_or_else(|| "album DSD peak safety reserve overflowed".to_string())?;
-            target_dbfs
-                .checked_sub(conservative_peak)
-                .ok_or_else(|| "album DSD gain arithmetic overflowed".to_string())?
-        }
+        Some(true_peak) => target_dbfs
+            .checked_sub(true_peak)
+            .ok_or_else(|| "album DSD gain arithmetic overflowed".to_string())?,
         None => DbNano::ZERO,
     };
 
@@ -140,8 +108,10 @@ pub fn album_gain_target_rate_hz(
 
 /// Build the single expensive decode used by album-scoped DSD normalization.
 ///
-/// The command writes a headerless little-endian Float64 carrier while the
-/// final `stats` effect measures the exact same post-reconstruction samples.
+/// The command writes a headerless little-endian Float64 carrier. The root
+/// crate streams that retained carrier through the standalone true-peak meter
+/// after validating frame alignment; SoX text output is not measurement
+/// authority for album gain.
 /// Headerless PCM deliberately avoids both container-size ceilings and the
 /// cross-tool Float64 container interpretation differences exercised by this
 /// pipeline. The orchestrator retains the authoritative sample rate and
@@ -215,15 +185,13 @@ pub fn build_album_gain_analysis_command(
     } else {
         add_legacy_reconstruction_effects(settings, source, &mut args, target_rate_hz);
     }
-    args.push("stats".to_string());
-
     let mut command = PlannedCommand::new(
         ToolIdentifier::Sox,
         args,
         InputSource::Path(input.to_path_buf()),
         OutputSink::Path(output.to_path_buf()),
         duration,
-        "Decode DSD once and measure submitted-batch album peak",
+        "Decode DSD once for submitted-batch album true-peak analysis",
     );
     command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
     command.environment.insert("LC_ALL".to_string(), "C".to_string());
@@ -362,7 +330,11 @@ mod tests {
             "album carrier must not depend on a Float64 container contract: {:?}",
             command.args,
         );
-        assert_eq!(command.args.last().map(String::as_str), Some("stats"));
+        assert!(
+            !command.args.iter().any(|arg| arg == "stats"),
+            "production album analysis must not depend on SoX stats: {:?}",
+            command.args,
+        );
     }
 
     #[test]
@@ -377,7 +349,7 @@ mod tests {
         )
         .expect("album authority");
         assert_eq!(authority.loudest_peak_dbfs, Some(db("-3.250000000")));
-        assert_eq!(authority.gain_db, db("3.090000000"));
+        assert_eq!(authority.gain_db, db("3.100000000"));
         assert_eq!(authority.track_count, 3);
     }
 
@@ -395,32 +367,24 @@ mod tests {
         .expect("album authority");
         let quiet_after = quiet.checked_add(authority.gain_db).unwrap();
         let loud_after = loud.checked_add(authority.gain_db).unwrap();
-        assert_eq!(loud_after, db("-0.160000000"));
+        assert_eq!(loud_after, db("-0.150000000"));
         assert_eq!(loud.checked_sub(quiet), loud_after.checked_sub(quiet_after));
     }
 
     #[test]
-    fn analyzer_reporting_reserve_prevents_headroom_overshoot() {
-        let reported_peak = db("-0.154000000");
+    fn in_process_true_peak_is_used_without_sox_text_quantization_reserve() {
+        let true_peak = db("-0.154000000");
         let target = db("-0.150000000");
         let authority = resolve_album_gain(
             target,
-            &[AlbumPeakMeasurement::Finite(reported_peak)],
+            &[AlbumPeakMeasurement::Finite(true_peak)],
         )
         .expect("album authority");
 
-        // If SoX rounded a true -0.149 dBFS peak down into this printed bin,
-        // using the report verbatim would apply +0.004 dB and exceed target.
-        // The one-quantum reserve instead attenuates by 0.006 dB.
-        assert_eq!(authority.gain_db, db("-0.006000000"));
-        let conservative_peak = reported_peak
-            .checked_add(ALBUM_SOX_STATS_REPORTING_UNCERTAINTY)
-            .unwrap();
-        assert!(
-            conservative_peak
-                .checked_add(authority.gain_db)
-                .unwrap()
-                <= target
+        assert_eq!(authority.gain_db, db("0.004000000"));
+        assert_eq!(
+            true_peak.checked_add(authority.gain_db).unwrap(),
+            target,
         );
     }
 
@@ -431,7 +395,7 @@ mod tests {
             &[AlbumPeakMeasurement::Finite(db("-0.100000000"))],
         )
         .expect("album authority");
-        assert_eq!(authority.gain_db, db("-0.910000000"));
+        assert_eq!(authority.gain_db, db("-0.900000000"));
     }
 
     #[test]
@@ -444,7 +408,7 @@ mod tests {
             ],
         )
         .expect("mixed authority");
-        assert_eq!(mixed.gain_db, db("4.840000000"));
+        assert_eq!(mixed.gain_db, db("4.850000000"));
 
         let silent = resolve_album_gain(
             db("-0.150000000"),
@@ -460,15 +424,4 @@ mod tests {
         assert!(resolve_album_gain(db("-0.150000000"), &[]).is_err());
     }
 
-    #[test]
-    fn parses_multichannel_sox_stats_overall_peak_and_silence() {
-        assert_eq!(
-            parse_album_peak_measurement("Pk lev dB     -2.000000 -3.0 -2.0\n", 2).unwrap(),
-            AlbumPeakMeasurement::Finite(db("-2.000000")),
-        );
-        assert_eq!(
-            parse_album_peak_measurement("Pk lev dB      -inf -inf -inf\n", 2).unwrap(),
-            AlbumPeakMeasurement::Silence,
-        );
-    }
 }

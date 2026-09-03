@@ -12,9 +12,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonepoet_pipeline::{
-    build_album_gain_analysis_command, parse_album_peak_measurement, plan_conversion,
-    AlbumPeakMeasurement, AudioCodec, AudioFormat, BitDepthTarget, DbNano, DsdAutoGainScope,
-    DsdRate, DsdToPcmGainMode, InputSource, OutputSink, PcmBitDepth, PipelineSettings,
+    build_album_gain_analysis_command, extract_single_sox_stats_peak_report, plan_conversion,
+    AudioCodec, AudioFormat, BitDepthTarget, DbNano, DsdAutoGainScope, DsdRate,
+    DsdToPcmGainMode, InputSource, OutputSink, PcmBitDepth, PipelineSettings,
     PlanAction, PlanRequest, PreferredTool, RateTarget, SampleKind, SourceInfo,
     SourceRepresentationKind, ToolIdentifier,
 };
@@ -263,12 +263,10 @@ fn sox_written_album_carrier_survives_production_ffmpeg_consumer_at_known_level(
         "post-consumer known-level measurement",
     );
     let stderr = String::from_utf8_lossy(&measurement.stderr);
-    let peak = match parse_album_peak_measurement(&stderr, 2)
+    let peak: DbNano = extract_single_sox_stats_peak_report(&stderr, 2)
         .unwrap_or_else(|error| panic!("could not parse post-consumer peak: {error}\n{stderr}"))
-    {
-        AlbumPeakMeasurement::Finite(peak) => peak,
-        AlbumPeakMeasurement::Silence => panic!("known-level carrier became silence"),
-    };
+        .parse()
+        .expect("finite known-level SoX peak");
     let lower: DbNano = "-6.100000000".parse().expect("lower bound");
     let upper: DbNano = "-5.900000000".parse().expect("upper bound");
     assert!(

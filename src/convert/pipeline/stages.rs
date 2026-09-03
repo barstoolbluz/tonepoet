@@ -23104,7 +23104,7 @@ fn conversion_summary(
                 req.settings.dsd.runtime_album_loudest_peak_dbfs(),
             ) {
                 (Some(track_count), Some(loudest)) => format!(
-                    "{track_count} measured DSD track(s), loudest reported peak {} dBFS",
+                    "{track_count} measured DSD track(s), loudest true peak {} dBTP",
                     loudest.render(false),
                 ),
                 (Some(track_count), None) => {
@@ -23113,10 +23113,9 @@ fn conversion_summary(
                 _ => "submitted DSD batch".to_string(),
             };
             transforms.push(format!(
-                "submitted-batch DSD album gain {} dB ({scope}; target {} dBFS; {} dB analyzer reserve)",
+                "submitted-batch DSD album gain {} dB ({scope}; true-peak target {} dBTP)",
                 gain_db.render(true),
                 target,
-                tonepoet_pipeline::ALBUM_SOX_STATS_REPORTING_UNCERTAINTY.render(false),
             ));
         }
     }
@@ -30054,34 +30053,299 @@ fn admit_planned_output_claim(
     )
 }
 
-fn verify_album_gain_silence_carrier(
+fn album_peak_measurement_from_true_peak(
+    point: tonepoet_true_peak::PeakLevel,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
+    match point {
+        tonepoet_true_peak::PeakLevel::Silence => {
+            Ok(tonepoet_pipeline::AlbumPeakMeasurement::Silence)
+        }
+        tonepoet_true_peak::PeakLevel::Finite { dbtp, .. } => {
+            let rendered = format!("{dbtp:.9}");
+            rendered
+                .parse::<tonepoet_pipeline::DbNano>()
+                .map(tonepoet_pipeline::AlbumPeakMeasurement::Finite)
+                .map_err(|error| {
+                    format!(
+                        "album DSD true-peak result is outside the gain measurement range: {error}"
+                    )
+                })
+        }
+    }
+}
+
+fn scan_album_gain_true_peak_carrier_with_cancel<F>(
     carrier: &Path,
-    cancel: &CancellationToken,
-) -> Result<(), String> {
+    sample_rate_hz: u32,
+    channels: u16,
+    mut is_cancelled: F,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
+where
+    F: FnMut() -> bool,
+{
+    if is_cancelled() {
+        return Err("album DSD true-peak scan cancelled".to_string());
+    }
+    let frame_bytes = usize::from(channels)
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| "album DSD true-peak frame size overflowed".to_string())?;
+    if frame_bytes == 0 {
+        return Err("album DSD true-peak scan requires at least one channel".to_string());
+    }
     let mut file = fs::File::open(carrier)
-        .map_err(|error| format!("could not open album DSD silence proof: {error}"))?;
+        .map_err(|error| format!("could not open album DSD true-peak carrier: {error}"))?;
     let len = file
         .metadata()
-        .map_err(|error| format!("could not stat album DSD silence proof: {error}"))?
+        .map_err(|error| format!("could not stat album DSD true-peak carrier: {error}"))?
         .len();
-    if len == 0 || len % 8 != 0 {
-        return Err("album DSD silence proof found an empty or truncated f64 stream".to_string());
+    if len == 0 || len % frame_bytes as u64 != 0 {
+        return Err(format!(
+            "album DSD true-peak carrier is empty or truncated ({len} bytes is not aligned to {frame_bytes}-byte frames)",
+        ));
     }
-    let mut buffer = [0_u8; 8 * 4096];
+
+    let config = tonepoet_true_peak::TruePeakConfig::new(sample_rate_hz, usize::from(channels))
+        .with_mode(tonepoet_true_peak::TruePeakMode::Headroom64x)
+        .with_edge_policy(tonepoet_true_peak::EdgePolicy::RepeatEndpoints);
+    let mut meter = tonepoet_true_peak::TruePeakMeter::new(config)
+        .map_err(|error| format!("could not initialize album DSD true-peak meter: {error}"))?;
+
+    const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
+    let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes).max(1) * frame_bytes;
+    let mut bytes = vec![0_u8; buffer_len];
+    let mut samples = Vec::<f64>::with_capacity(buffer_len / 8);
     let mut remaining = len;
     while remaining > 0 {
-        if cancel.is_cancelled() {
-            return Err("album DSD silence proof cancelled".to_string());
+        if is_cancelled() {
+            return Err("album DSD true-peak scan cancelled".to_string());
         }
-        let count = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| "album DSD silence proof length does not fit this platform".to_string())?;
-        std::io::Read::read_exact(&mut file, &mut buffer[..count])
-            .map_err(|error| format!("could not read album DSD silence proof: {error}"))?;
-        tonepoet_pipeline::validate_signed_zero_f64le(&buffer[..count])
-            .map_err(|error| format!("album DSD silence proof failed: {error}"))?;
+        let count = usize::try_from(remaining.min(buffer_len as u64)).map_err(|_| {
+            "album DSD true-peak carrier length does not fit this platform".to_string()
+        })?;
+        std::io::Read::read_exact(&mut file, &mut bytes[..count])
+            .map_err(|error| format!("could not read album DSD true-peak carrier: {error}"))?;
+        samples.clear();
+        for raw in bytes[..count].chunks_exact(8) {
+            samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
+        }
+        meter
+            .push_interleaved(&samples)
+            .map_err(|error| format!("album DSD true-peak carrier is invalid: {error}"))?;
         remaining -= count as u64;
     }
-    Ok(())
+    if is_cancelled() {
+        return Err("album DSD true-peak scan cancelled".to_string());
+    }
+
+    let result = meter
+        .finalize()
+        .map_err(|error| format!("could not finalize album DSD true-peak measurement: {error}"))?;
+    album_peak_measurement_from_true_peak(result.overall)
+}
+
+fn scan_album_gain_true_peak_carrier(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    cancel: &CancellationToken,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
+    scan_album_gain_true_peak_carrier_with_cancel(carrier, sample_rate_hz, channels, || {
+        cancel.is_cancelled()
+    })
+}
+
+#[cfg(test)]
+mod album_true_peak_carrier_tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn write_f64le(path: &Path, samples: &[f64]) {
+        let mut bytes = Vec::with_capacity(samples.len() * 8);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        fs::write(path, bytes).expect("write f64le carrier");
+    }
+
+    fn finite(measurement: tonepoet_pipeline::AlbumPeakMeasurement) -> tonepoet_pipeline::DbNano {
+        match measurement {
+            tonepoet_pipeline::AlbumPeakMeasurement::Finite(value) => value,
+            tonepoet_pipeline::AlbumPeakMeasurement::Silence => panic!("expected finite peak"),
+        }
+    }
+
+    #[test]
+    fn true_peak_mapping_preserves_the_measured_point_without_runtime_reserve() {
+        let point = tonepoet_true_peak::PeakLevel::Finite {
+            linear: 0.1,
+            dbtp: -20.0,
+        };
+        let measured = finite(album_peak_measurement_from_true_peak(point).unwrap());
+        let expected: tonepoet_pipeline::DbNano = "-20.000000000".parse().unwrap();
+        assert_eq!(measured, expected);
+    }
+
+    #[test]
+    fn carrier_scanner_preserves_above_unity_and_nonfirst_channel_peak() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("above-unity.f64le");
+        let mut samples = Vec::new();
+        for _ in 0..64 {
+            samples.extend_from_slice(&[0.1, 1.25]);
+        }
+        write_f64le(&carrier, &samples);
+        let measured = finite(
+            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 2, || false)
+                .unwrap(),
+        );
+        assert!(measured > tonepoet_pipeline::DbNano::ZERO, "measured={measured}");
+    }
+
+    #[test]
+    fn carrier_scanner_preserves_very_low_finite_measurement() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("very-low.f64le");
+        write_f64le(&carrier, &[0.0001; 256]);
+        let measured = finite(
+            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 1, || false)
+                .unwrap(),
+        );
+        let floor: tonepoet_pipeline::DbNano = "-30.000000000".parse().unwrap();
+        assert!(measured < floor, "very-low point was unexpectedly gated: {measured}");
+    }
+
+    #[test]
+    fn carrier_scanner_maps_true_silence() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("silence.f64le");
+        write_f64le(&carrier, &[0.0; 128]);
+        assert_eq!(
+            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 2, || false)
+                .unwrap(),
+            tonepoet_pipeline::AlbumPeakMeasurement::Silence,
+        );
+    }
+
+    #[test]
+    fn carrier_scanner_rejects_truncated_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("truncated.f64le");
+        fs::write(&carrier, 0.25_f64.to_le_bytes()).unwrap();
+        let error = scan_album_gain_true_peak_carrier_with_cancel(
+            &carrier,
+            48_000,
+            2,
+            || false,
+        )
+        .unwrap_err();
+        assert!(error.contains("not aligned"), "{error}");
+    }
+
+    #[test]
+    fn carrier_true_peak_changes_gain_when_sample_peak_would_choose_positive_gain() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("intersample.f64le");
+        let frames = 4096usize;
+        let ramp = 256usize;
+        let omega = PI / 2.0;
+        let phase = PI / 2.0 - omega * 0.125;
+        let samples = (0..frames)
+            .map(|frame| {
+                let edge = frame.min(frames - 1 - frame);
+                let envelope = if edge < ramp {
+                    0.5 - 0.5 * (PI * edge as f64 / ramp as f64).cos()
+                } else {
+                    1.0
+                };
+                envelope * (omega * frame as f64 + phase).sin()
+            })
+            .collect::<Vec<_>>();
+        write_f64le(&carrier, &samples);
+
+        let true_peak = finite(
+            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 1, || false)
+                .unwrap(),
+        );
+        let sample_linear = samples.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let sample_db: tonepoet_pipeline::DbNano = format!("{:.9}", 20.0 * sample_linear.log10())
+            .parse()
+            .unwrap();
+        let target: tonepoet_pipeline::DbNano = "-0.100000000".parse().unwrap();
+        let true_peak_gain = tonepoet_pipeline::resolve_album_gain(
+            target,
+            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(true_peak)],
+        )
+        .unwrap();
+        let sample_peak_gain = tonepoet_pipeline::resolve_album_gain(
+            target,
+            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(sample_db)],
+        )
+        .unwrap();
+
+        assert!(sample_peak_gain.gain_db > tonepoet_pipeline::DbNano::ZERO);
+        assert!(true_peak_gain.gain_db < tonepoet_pipeline::DbNano::ZERO);
+        assert!(true_peak > sample_db, "sample={sample_db}, true={true_peak}");
+    }
+
+    #[test]
+    fn reviewer_three_tone_measurement_keeps_post_gain_peak_below_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("reviewer-three-tone.f64le");
+        let samples = (0..4096)
+            .map(|frame| {
+                let t = frame as f64 - 2000.5;
+                ((2.0 * PI * 0.30 * t).cos()
+                    + (2.0 * PI * 0.35 * t).cos()
+                    + (2.0 * PI * 0.40 * t).cos())
+                    / 6.0
+            })
+            .collect::<Vec<_>>();
+        write_f64le(&carrier, &samples);
+
+        let measured_peak = finite(
+            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 44_100, 1, || false)
+                .unwrap(),
+        );
+        let analytical_true_peak: tonepoet_pipeline::DbNano =
+            "-6.020599913".parse().unwrap();
+        assert!(
+            measured_peak >= analytical_true_peak,
+            "measured point {measured_peak} under-read analytical true peak {analytical_true_peak}"
+        );
+
+        let target: tonepoet_pipeline::DbNano = "-0.150000000".parse().unwrap();
+        let resolved = tonepoet_pipeline::resolve_album_gain(
+            target,
+            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(measured_peak)],
+        )
+        .unwrap();
+        let actual_post_gain = analytical_true_peak.checked_add(resolved.gain_db).unwrap();
+        assert!(
+            actual_post_gain <= target,
+            "post-gain analytical true peak {actual_post_gain} exceeded target {target}"
+        );
+    }
+
+    #[test]
+    fn carrier_scanner_honors_cancellation_between_large_sequential_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("large.f64le");
+        let samples = vec![0.25_f64; (1024 * 1024 / 8) * 3];
+        write_f64le(&carrier, &samples);
+        let mut checks = 0usize;
+        let error = scan_album_gain_true_peak_carrier_with_cancel(
+            &carrier,
+            48_000,
+            1,
+            || {
+                checks += 1;
+                checks >= 3
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(checks >= 3);
+    }
 }
 
 struct PreparedAlbumGainCarrier {
@@ -30161,7 +30425,7 @@ async fn prepare_album_gain_carrier_for_track(
     .map_err(|error| error.to_string())?;
     let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
         .map_err(|error| error.to_string())?;
-    let output = run_tool_command_with_concurrency(
+    run_tool_command_with_concurrency(
         command,
         runner,
         cancel,
@@ -30171,7 +30435,7 @@ async fn prepare_album_gain_carrier_for_track(
     .map_err(|error| {
         let _ = fs::remove_file(&carrier_path);
         format!(
-            "DSD track {} could not be measured for submitted-batch album gain: {error}",
+            "DSD track {} could not be reconstructed for submitted-batch album true-peak analysis: {error}",
             track.id.source_ordinal,
         )
     })?;
@@ -30188,22 +30452,33 @@ async fn prepare_album_gain_carrier_for_track(
             frame_bytes,
         ));
     }
-    let measurement = tonepoet_pipeline::parse_album_peak_measurement(
-        &output.stderr_tail,
-        channels,
-    )
+    let scan_path = carrier_path.clone();
+    let scan_cancel = cancel.clone();
+    let measurement = tokio::task::spawn_blocking(move || {
+        scan_album_gain_true_peak_carrier(
+            &scan_path,
+            target_rate_hz,
+            channels,
+            &scan_cancel,
+        )
+    })
+    .await
     .map_err(|error| {
         let _ = fs::remove_file(&carrier_path);
         format!(
-            "DSD track {} produced an invalid album peak report: {error}",
+            "DSD track {} true-peak worker failed: {error}",
+            track.id.source_ordinal,
+        )
+    })?
+    .map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!(
+            "DSD track {} produced an invalid album true-peak measurement: {error}",
             track.id.source_ordinal,
         )
     })?;
-    if measurement == tonepoet_pipeline::AlbumPeakMeasurement::Silence {
-        verify_album_gain_silence_carrier(&carrier_path, cancel)?;
-    }
     log::info!(
-        "album-scoped DSD analysis measured item={} track={} peak={:?} carrier={} rate={} channels={}",
+        "album-scoped DSD analysis measured item={} track={} true_peak={:?} carrier={} rate={} channels={}",
         req.item_id,
         track.id.source_ordinal,
         measurement,

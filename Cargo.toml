@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-demuxer", "crates/dvdvideo", "crates/tui-file-picker", "tonepoet-pipeline"]
+members = ["crates/tonepoet-backend", "crates/tonepoet-features", "crates/tonepoet-wizard", "crates/sacd-rs", "crates/dvda-demuxer", "crates/dvdvideo", "crates/tui-file-picker", "crates/tonepoet-true-peak", "tonepoet-pipeline"]
 resolver = "2"
 
 [package]
@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 tonepoet-pipeline = { path = "tonepoet-pipeline", features = ["serde"] }
+tonepoet-true-peak = { path = "crates/tonepoet-true-peak" }
 fs2 = "0.4"
 same-file = "1"
 tonepoet-backend = { path = "crates/tonepoet-backend" }
