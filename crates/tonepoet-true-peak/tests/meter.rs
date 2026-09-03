@@ -1,8 +1,8 @@
 use std::f64::consts::PI;
 
 use tonepoet_true_peak::{
-    headroom64x_authority, EdgePolicy, HeadroomAuthorityError, PeakLevel, TruePeakConfig,
-    TruePeakMeter, TruePeakMode, HEADROOM64X_GRID_MAX_UNDERREAD_DB,
+    headroom64x_authority, EdgePolicy, HeadroomAuthorityError, HeadroomCeilingMeter, PeakLevel,
+    TruePeakConfig, TruePeakMeter, TruePeakMode, HEADROOM64X_GRID_MAX_UNDERREAD_DB,
     HEADROOM64X_MAX_UNDERREAD_DB, HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
 };
 
@@ -373,6 +373,115 @@ fn real_program_material_matches_frozen_independent_references() {
         (headroom_dbtp - SOXR_256X_DBTP).abs() <= SOXR_OBSERVATION_TOLERANCE_DB,
         "real material Headroom64x: measured {headroom_dbtp:.12}, 256x libsoxr {SOXR_256X_DBTP:.12}"
     );
+}
+
+#[test]
+fn ceiling_reconstruction_contains_independent_analytical_and_edge_references() {
+    // These raw reconstruction values are frozen from the independent
+    // qualification/verify_ceiling_contract.py convolution, which rebuilds the
+    // six-stage cascade from the checked-in coefficient values rather than
+    // calling this Rust implementation. The hard-ceiling result adds only its
+    // explicit binary64 enclosure on top.
+    let three = aligned_multitone(
+        4096,
+        0,
+        2000.5,
+        &[(0.30, 1.0 / 6.0), (0.35, 1.0 / 6.0), (0.40, 1.0 / 6.0)],
+    );
+    let five = aligned_multitone(
+        1024,
+        0,
+        511.5,
+        &[
+            (0.4850, 0.2),
+            (0.4875, 0.2),
+            (0.4900, 0.2),
+            (0.4925, 0.2),
+            (0.4950, 0.2),
+        ],
+    );
+    let short = vec![0.25, -0.4, 0.1];
+    let cases = [
+        ("three-repeat", &three, EdgePolicy::RepeatEndpoints, 0.501_639_316_802_993_0, Some(0.5)),
+        ("three-zero", &three, EdgePolicy::ZeroExtend, 0.502_743_126_691_215_5, Some(0.5)),
+        ("five-repeat", &five, EdgePolicy::RepeatEndpoints, 1.005_323_886_713_449_0, Some(1.0)),
+        ("five-zero", &five, EdgePolicy::ZeroExtend, 1.005_294_532_852_855_5, Some(1.0)),
+        ("short-repeat", &short, EdgePolicy::RepeatEndpoints, 0.402_593_472_683_757_06, None),
+        ("short-zero", &short, EdgePolicy::ZeroExtend, 0.405_208_842_634_359_25, None),
+    ];
+
+    for (name, signal, edge, independent_raw, ideal_truth) in cases {
+        let mut meter = HeadroomCeilingMeter::new(44_100, 1, edge).unwrap();
+        meter.push_interleaved(signal).unwrap();
+        let result = meter.finalize().unwrap();
+        let upper = result.reconstruction_upper.linear();
+        assert!(upper >= independent_raw, "{name}: {upper:.17e} < {independent_raw:.17e}");
+        assert!(
+            upper - independent_raw < 2.0e-11,
+            "{name}: numerical enclosure is unexpectedly loose: {:.17e}",
+            upper - independent_raw,
+        );
+        if let Some(truth) = ideal_truth {
+            assert!(upper >= truth, "{name}: failed to contain analytical truth");
+            let model_delta_db = 20.0 * (upper / truth).log10();
+            assert!(
+                model_delta_db < 0.05,
+                "{name}: finite reconstruction differs from analytical truth by {model_delta_db:.9} dB",
+            );
+        }
+    }
+}
+
+#[test]
+fn ceiling_meter_preserves_headroom64_point_bits() {
+    let signal = aligned_multitone(
+        4096,
+        0,
+        2000.5,
+        &[(0.30, 1.0 / 6.0), (0.35, 1.0 / 6.0), (0.40, 1.0 / 6.0)],
+    );
+    let mut ordinary = meter_at_rate(TruePeakMode::Headroom64x, 1, 44_100);
+    ordinary.push_interleaved(&signal).unwrap();
+    let ordinary = ordinary.finalize().unwrap();
+
+    let mut ceiling = HeadroomCeilingMeter::new(44_100, 1, EdgePolicy::RepeatEndpoints).unwrap();
+    ceiling.push_interleaved(&signal).unwrap();
+    let ceiling = ceiling.finalize().unwrap();
+
+    assert_eq!(ordinary.frames, ceiling.point_estimate.frames);
+    assert_eq!(ordinary.overall, ceiling.point_estimate.overall);
+    assert_eq!(
+        ordinary
+            .channel_linear_peaks
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        ceiling
+            .point_estimate
+            .channel_linear_peaks
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn real_program_material_ceiling_reconstruction_matches_independent_convolution() {
+    const BYTES: &[u8] = include_bytes!("fixtures/real_reference_48k_stereo.f64le");
+    const INDEPENDENT_RAW: f64 = 0.987_957_420_634_978_8;
+    let samples = BYTES
+        .chunks_exact(8)
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+
+    let mut meter = HeadroomCeilingMeter::new(48_000, 2, EdgePolicy::RepeatEndpoints).unwrap();
+    for chunk in samples.chunks(997 * 2) {
+        meter.push_interleaved(chunk).unwrap();
+    }
+    let result = meter.finalize().unwrap();
+    let upper = result.reconstruction_upper.linear();
+    assert!(upper >= INDEPENDENT_RAW);
+    assert!(upper - INDEPENDENT_RAW < 2.0e-11, "upper={upper:.17e}");
 }
 
 #[test]

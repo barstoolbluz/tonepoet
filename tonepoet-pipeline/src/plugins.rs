@@ -74,6 +74,26 @@ impl ToolPlugin for FfmpegPlugin {
                     return ToolSupport::UNSUPPORTED;
                 }
                 let dither = context.request.settings.dither_type;
+                // A bound album NormalizePeak gain is a hard-ceiling path. For
+                // integer dithered lossless output, route the terminal stage to
+                // SoX so the deterministic dither/noise-shaping support bound
+                // used by the resolver matches the implementation that writes
+                // the samples. This is ordinary planner selection, not runtime
+                // commissioning or executable fingerprinting.
+                let hard_ceiling_requires_sox_terminal = context
+                    .request
+                    .settings
+                    .dsd
+                    .runtime_album_gain_db()
+                    .is_some()
+                    && *apply_processing
+                    && target_format.is_pcm_lossless()
+                    && target_format.sox_encodable()
+                    && target_depth_needs_dither(*target_bit_depth)
+                    && dither != DitherType::None;
+                if hard_ceiling_requires_sox_terminal {
+                    return ToolSupport::UNSUPPORTED;
+                }
                 let dither_supported = !*apply_processing || !mapping::requires_sox_dither(dither);
                 if target_format.ffmpeg_encodable() && dither_supported {
                     if *apply_processing {
@@ -723,6 +743,32 @@ fn build_ffmpeg_encode_lossy(
     apply_processing: bool,
 ) -> Result<PlannedCommand> {
     validate_aac_family_container(context, target_format)?;
+    if context.request.settings.dsd.runtime_album_gain_db().is_some() {
+        let carrier_rate_hz = context.request.source.sample_rate_hz.ok_or_else(|| {
+            PlanningError::invalid_source(
+                "sample_rate_hz",
+                "runtime DSD album gain lossy encode requires an authoritative carrier sample rate",
+            )
+        })?;
+        if target_rate_hz != Some(carrier_rate_hz) {
+            return Err(PlanningError::invalid_source(
+                "sample_rate_hz",
+                "runtime DSD album gain lossy encode must pin the encoder-input rate to the measured carrier rate",
+            ));
+        }
+        if mapping::ffmpeg_lossy_encoder_accepts_rate_directly(target_format, carrier_rate_hz)
+            != Some(true)
+        {
+            return Err(PlanningError::invalid_settings(
+                "target_sample_rate",
+                format!(
+                    "runtime DSD album gain requires {} to accept {} Hz directly; refusing FFmpeg rate conversion after the proved gain",
+                    target_format,
+                    carrier_rate_hz,
+                ),
+            ));
+        }
+    }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let mut args = ffmpeg_base_input_args(context, step, &input)?;
@@ -730,12 +776,12 @@ fn build_ffmpeg_encode_lossy(
     if apply_processing {
         if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
             args.push("-af".into());
-            args.push(format!("volume={}dB", gain.render(false)));
+            args.push(format!("volume={}dB:precision=double", gain.render(false)));
         }
-        if let Some(rate) = target_rate_hz {
-            args.push("-ar".into());
-            args.push(rate.to_string());
-        }
+    }
+    if let Some(rate) = target_rate_hz {
+        args.push("-ar".into());
+        args.push(rate.to_string());
     }
     match target_format {
         AudioFormat::Mp3 => {
@@ -1464,7 +1510,7 @@ fn ffmpeg_audio_filter(
     let settings = &context.request.settings;
     let mut filters = Vec::new();
     if let Some(gain) = settings.dsd.runtime_album_gain_db() {
-        filters.push(format!("volume={}dB", gain.render(false)));
+        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
 
     let ffmpeg_needs_dither = match target_depth {
@@ -2222,7 +2268,147 @@ mod tests {
                 .filter(|arg| arg.contains("volume=2.125000000dB"))
                 .count();
             assert_eq!(count, expected_count, "{:?}", command.args);
+            if apply_processing {
+                // The -af value is a filter chain: terminal bit-depth/dither
+                // realization is appended after the gain, at the same sample
+                // rate, and is budgeted by the terminal bound. The invariant
+                // that matters is that the gain is the FIRST link and runs in
+                // double precision, so assert on the head of the chain rather
+                // than on the whole argument.
+                assert!(
+                    command.args.iter().any(|arg| arg
+                        .split(',')
+                        .next()
+                        .is_some_and(|head| head == "volume=2.125000000dB:precision=double")),
+                    "album gain must execute in FFmpeg double precision: {:?}",
+                    command.args,
+                );
+            }
         }
+    }
+
+    #[test]
+    fn ffmpeg_lossy_album_gain_pins_measured_encoder_input_rate() {
+        let mut request = album_gain_pcm_request(AudioFormat::Aac);
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("output.m4a");
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(96_000),
+                apply_processing: true,
+            },
+            InputSource::Path(PathBuf::from("album-carrier.f64le")),
+            OutputSink::Path(PathBuf::from("output.m4a")),
+            "AAC album gain application test",
+        );
+
+        let command = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Aac,
+            Some(96_000),
+            true,
+        )
+        .expect("supported AAC hard-ceiling encode command");
+        assert_arg(&command.args, "-ar", "96000");
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "volume=2.125000000dB:precision=double"),
+            "album gain must precede a rate-pinned encoder input: {:?}",
+            command.args,
+        );
+
+        // The gain may already have been realized by a preceding SoX PCM
+        // processing step. The final FFmpeg encode still has to pin the same
+        // measured rate even though it must not apply `volume` a second time.
+        let post_gain_step = PlanStep::new(
+            1,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(96_000),
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("post-gain.wav")),
+            OutputSink::Path(PathBuf::from("output.m4a")),
+            "AAC post-gain encode rate pin test",
+        );
+        let post_gain_command = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &post_gain_step,
+            &AudioFormat::Aac,
+            Some(96_000),
+            false,
+        )
+        .expect("post-gain AAC encode must keep the measured rate pinned");
+        assert_arg(&post_gain_command.args, "-ar", "96000");
+        assert!(
+            !post_gain_command
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("volume=")),
+            "already-realized gain must not be applied twice: {:?}",
+            post_gain_command.args,
+        );
+
+        let error = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Aac,
+            None,
+            true,
+        )
+        .expect_err("hard-ceiling lossy encode must fail closed without a pinned rate");
+        assert!(error.to_string().contains("pin the encoder-input rate"), "{error}");
+    }
+
+    #[test]
+    fn ffmpeg_lossy_album_gain_rejects_unsupported_measured_rate() {
+        let mut request = album_gain_pcm_request(AudioFormat::Aac);
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("output.m4a");
+        request.source.sample_rate_hz = Some(192_000);
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(192_000),
+                apply_processing: true,
+            },
+            InputSource::Path(PathBuf::from("album-carrier.f64le")),
+            OutputSink::Path(PathBuf::from("output.m4a")),
+            "AAC unsupported-rate album gain test",
+        );
+
+        let error = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Aac,
+            Some(192_000),
+            true,
+        )
+        .expect_err("AAC 192 kHz must not fall through to FFmpeg auto-resampling");
+        assert!(error.to_string().contains("refusing FFmpeg rate conversion"), "{error}");
+    }
+
+    #[test]
+    fn hard_ceiling_lossless_dither_routes_processing_encode_to_sox() {
+        let mut request = album_gain_pcm_request(AudioFormat::Flac);
+        request.settings.dither_type = DitherType::Shibata;
+        request.settings.dither_explicit = true;
+        let step = album_gain_encode_step(AudioFormat::Flac, true);
+
+        assert!(
+            !FfmpegPlugin.supports(&request.context(), &step).is_supported(),
+            "FFmpeg must not own a dithered hard-ceiling terminal stage",
+        );
+        assert!(
+            SoxPlugin.supports(&request.context(), &step).is_supported(),
+            "SoX must own the dithered hard-ceiling terminal stage",
+        );
     }
 
     #[test]

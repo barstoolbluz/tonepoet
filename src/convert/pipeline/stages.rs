@@ -30055,22 +30055,36 @@ fn admit_planned_output_claim(
 
 fn album_peak_measurement_from_true_peak(
     point: tonepoet_true_peak::PeakLevel,
+    reconstruction_upper: tonepoet_true_peak::PeakLevel,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
-    match point {
-        tonepoet_true_peak::PeakLevel::Silence => {
+    match (point, reconstruction_upper) {
+        (tonepoet_true_peak::PeakLevel::Silence, tonepoet_true_peak::PeakLevel::Silence) => {
             Ok(tonepoet_pipeline::AlbumPeakMeasurement::Silence)
         }
-        tonepoet_true_peak::PeakLevel::Finite { dbtp, .. } => {
+        (
+            tonepoet_true_peak::PeakLevel::Finite { dbtp, .. },
+            tonepoet_true_peak::PeakLevel::Finite {
+                linear: signal_upper_linear,
+                ..
+            },
+        ) => {
             let rendered = format!("{dbtp:.9}");
-            rendered
+            let point_db = rendered
                 .parse::<tonepoet_pipeline::DbNano>()
-                .map(tonepoet_pipeline::AlbumPeakMeasurement::Finite)
                 .map_err(|error| {
                     format!(
                         "album DSD true-peak result is outside the gain measurement range: {error}"
                     )
-                })
+                })?;
+            Ok(tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+                point_db,
+                signal_upper_linear,
+            })
         }
+        _ => Err(
+            "album DSD point estimate and ceiling reconstruction disagree about silence"
+                .to_string(),
+        ),
     }
 }
 
@@ -30104,11 +30118,12 @@ where
         ));
     }
 
-    let config = tonepoet_true_peak::TruePeakConfig::new(sample_rate_hz, usize::from(channels))
-        .with_mode(tonepoet_true_peak::TruePeakMode::Headroom64x)
-        .with_edge_policy(tonepoet_true_peak::EdgePolicy::RepeatEndpoints);
-    let mut meter = tonepoet_true_peak::TruePeakMeter::new(config)
-        .map_err(|error| format!("could not initialize album DSD true-peak meter: {error}"))?;
+    let mut meter = tonepoet_true_peak::HeadroomCeilingMeter::new(
+        sample_rate_hz,
+        usize::from(channels),
+        tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+    )
+    .map_err(|error| format!("could not initialize album DSD ceiling meter: {error}"))?;
 
     const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
     let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes).max(1) * frame_bytes;
@@ -30139,8 +30154,11 @@ where
 
     let result = meter
         .finalize()
-        .map_err(|error| format!("could not finalize album DSD true-peak measurement: {error}"))?;
-    album_peak_measurement_from_true_peak(result.overall)
+        .map_err(|error| format!("could not finalize album DSD ceiling measurement: {error}"))?;
+    album_peak_measurement_from_true_peak(
+        result.point_estimate.overall,
+        result.reconstruction_upper,
+    )
 }
 
 fn scan_album_gain_true_peak_carrier(
@@ -30152,6 +30170,278 @@ fn scan_album_gain_true_peak_carrier(
     scan_album_gain_true_peak_carrier_with_cancel(carrier, sample_rate_hz, channels, || {
         cancel.is_cancelled()
     })
+}
+
+/// Derive the deterministic terminal realization bound used by album-scoped
+/// NormalizePeak. The signal-domain reconstruction is already bounded by the
+/// retained-carrier ceiling scan; this function accounts only for what happens
+/// after the fixed gain is applied.
+///
+/// For integer lossless output the stored-sample error is expressed in LSBs.
+/// No-dither paths use the actual nearest-rounding half-LSB stages. SoX TPDF
+/// reserves 1.5 target LSBs; the FIR noise-shaping factors are conservative
+/// integer ceilings derived from the shipping SoX-ng dither recurrence and
+/// the absolute coefficient sums of the named filters. Gesemann uses a
+/// separately derived finite bound from its stable four-state IIR recurrence
+/// rather than being treated as an FIR.
+pub(crate) fn album_gain_terminal_bound(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    sample_rate_hz: u32,
+) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
+    use tonepoet_pipeline::{
+        AlbumCeilingDomain, AlbumTerminalBound, AudioFormat, BitDepthTarget, DitherType,
+        PcmBitDepth,
+    };
+
+    let depth = match settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) => depth,
+        // Album auto-gain participation is DSD-only, so Source has no PCM word
+        // length to preserve and resolves to the documented target default.
+        BitDepthTarget::Source => tonepoet_pipeline::default_pcm_depth_for_format(
+            &settings.target_format,
+        ),
+    };
+
+    if settings.target_format.is_lossy() {
+        // The lossy contract ends at PCM presented to the encoder, not decoded
+        // codec output. Carrier construction has already admitted only a rate
+        // accepted directly by the configured FFmpeg encoder; planning then
+        // pins that exact measured rate on the final lossy command and the
+        // command builder independently fails closed if the pin is lost. Thus
+        // the only post-gain terminal transformation covered here is
+        // sample-format realization at the same rate. Current encoder
+        // negotiation never goes below signed 16-bit PCM; half a 16-bit LSB
+        // plus a binary64 arithmetic allowance therefore covers the worst
+        // supported conversion/gain route without making any decoded-codec
+        // peak promise.
+        let encoder_input_error = next_up_nonnegative(2.0_f64.powi(-16) + 2.0_f64.powi(-52));
+        return Ok(AlbumTerminalBound {
+            pre_gain_reconstructed_error_linear: 0.0,
+            stored_sample_error_linear: None,
+            post_gain_reconstructed_error_linear: next_up_nonnegative(
+                encoder_input_error
+                    * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
+            ),
+            domain: AlbumCeilingDomain::LossyEncoderInputPcm,
+        });
+    }
+
+    if !settings.target_format.is_pcm_lossless() {
+        return Err(format!(
+            "album-scoped DSD NormalizePeak hard ceiling is not defined for {} output",
+            settings.target_format,
+        ));
+    }
+
+    // These cells are intentionally rejected by the SoX plugin because it
+    // silently substitutes another stored representation. Every other
+    // SoX-encodable lossless cell may be selected by Auto or an explicit SoX
+    // preference, so the terminal bound must cover that route even when
+    // FFmpeg would be slightly tighter.
+    let sox_silently_substitutes =
+        (settings.target_format == AudioFormat::Flac && depth == PcmBitDepth::Int32)
+            || (settings.target_format == AudioFormat::Aiff
+                && matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64))
+            || (settings.target_format == AudioFormat::WavPack
+                && matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64));
+    let sox_may_be_terminal = settings.target_format.sox_encodable() && !sox_silently_substitutes;
+    // When the lossless target itself is not SoX-encodable (currently ALAC is
+    // the important case), the bound album-gain planner inserts the existing
+    // SoX-to-WAV preprocessing leg before the lossless final encode whenever
+    // integer dither applies. That first leg owns gain + quantization/dither;
+    // the final lossless encoder preserves those PCM samples. Treat that as a
+    // proved SoX terminal realization rather than either rejecting a formerly
+    // valid output or attempting to qualify FFmpeg's distinct dither engine in
+    // this work order.
+    let sox_preprocess_available = !settings.target_format.sox_encodable()
+        && settings.target_format.ffmpeg_encodable();
+
+    // The retained Float64 carrier is emitted from SoX's signed Q1.31
+    // internal sample domain. The pinned SoX-ng conversion to Float64 is exact
+    // power-of-two scaling, and reading that carrier back into the same Q1.31
+    // effects domain recovers the integer sample exactly. Consequently there
+    // is no pre-gain carrier-conversion term to charge here. This is the same
+    // source fact proved independently for the existing Reference terminal
+    // contract; NormalizePeak does not inherit that contract, only this
+    // matching arithmetic fact.
+    let pre_gain_reconstructed_error_linear = 0.0;
+
+    // Pinned SoX-ng non-limiter gain realizes the binary64 multiplier and then
+    // performs exactly one Q1.31 nearest rounding. The Q1.31 contribution is
+    // 2^-32 FS. Retain the independently frozen 2^-51 binary64
+    // coefficient/arithmetic allowance used by the existing source proof.
+    let sox_gain_realization_error =
+        next_up_nonnegative(2.0_f64.powi(-32) + 2.0_f64.powi(-51));
+
+    let ffmpeg_output_error = match depth {
+        // Conservative absolute binary floating-point rounding bounds near
+        // full scale. The actual half-ULP bounds are tighter below 1.0.
+        PcmBitDepth::Float32 => 2.0_f64.powi(-24),
+        PcmBitDepth::Float64 => 2.0_f64.powi(-52),
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24 | PcmBitDepth::Int32 => {
+            0.5 * 2.0_f64.powi(-((depth.bits() - 1) as i32))
+        }
+    };
+
+    let integer_dither_applies = matches!(
+        depth,
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
+    ) && settings.dither_type != DitherType::None;
+
+    let sox_output_error = match depth {
+        PcmBitDepth::Float32 => {
+            // Gain is first rounded to SoX's 32-bit internal sample, then the
+            // writer converts that sample to float32.
+            next_up_nonnegative(sox_gain_realization_error + 2.0_f64.powi(-24))
+        }
+        PcmBitDepth::Float64 => {
+            // SoX sample -> float64 is an exact power-of-two scaling; only the
+            // gain effect's nearest-integer realization remains.
+            sox_gain_realization_error
+        }
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24 | PcmBitDepth::Int32 => {
+            let lsb = 2.0_f64.powi(-((depth.bits() - 1) as i32));
+            if integer_dither_applies {
+                if !sox_may_be_terminal && !sox_preprocess_available {
+                    return Err(format!(
+                        "album-scoped DSD NormalizePeak with {:?} dither requires a proved SoX terminal or preprocess path; {} cannot provide one",
+                        settings.dither_type,
+                        settings.target_format,
+                    ));
+                }
+                let multiplier = sox_dither_error_lsb_upper(settings.dither_type, sample_rate_hz);
+                next_up_nonnegative(sox_gain_realization_error + multiplier * lsb)
+            } else if depth == PcmBitDepth::Int32 {
+                // The gain effect already outputs an Int32 `sox_sample_t`;
+                // writing Int32 introduces no second quantizer.
+                sox_gain_realization_error
+            } else {
+                // Nearest gain realization plus nearest target-depth write.
+                next_up_nonnegative(sox_gain_realization_error + 0.5 * lsb)
+            }
+        }
+    };
+
+    let stored_sample_error_linear = next_up_nonnegative(if sox_may_be_terminal {
+        // Auto or an explicit preference may select either direct writer in
+        // non-dither cells, so cover both. Dithered hard-ceiling cells are
+        // routed to SoX, for which this max remains conservative.
+        ffmpeg_output_error.max(sox_output_error)
+    } else if sox_preprocess_available && integer_dither_applies {
+        // The planner's SoX-to-WAV preprocessing leg owns the only lossy
+        // sample realization; the following lossless encode preserves it.
+        sox_output_error
+    } else {
+        ffmpeg_output_error
+    });
+
+    // RepeatEndpoints applies to the entire final finite stream, including the
+    // terminal-error sequence. A direct infinite/LTI shaper+reconstruction
+    // convolution is therefore not, by itself, an edge proof: endpoint
+    // extension can repeat the worst stored error outside the nominal stream.
+    // Multiplying the deterministic stored-sample support by the complete
+    // reconstruction L-inf norm is valid for both the interior and either
+    // finite edge. This is intentionally kept separate from a possible future
+    // tighter edge-aware shaping proof.
+    let post_gain_reconstructed_error_linear = next_up_nonnegative(
+        stored_sample_error_linear
+            * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
+    );
+
+    Ok(AlbumTerminalBound {
+        pre_gain_reconstructed_error_linear,
+        stored_sample_error_linear: Some(stored_sample_error_linear),
+        post_gain_reconstructed_error_linear,
+        domain: AlbumCeilingDomain::LosslessStoredPcm,
+    })
+}
+
+// SoX-ng selects the first named filter whose design rate is within 5% of the
+// stream rate. If none matches it falls back to (sloped, where applicable)
+// TPDF. Both plain and sloped TPDF have deterministic 1.5-LSB support: the
+// random term is bounded by one target LSB and nearest rounding adds at most
+// another half LSB. Mirroring selection is important for tightness at
+// 88.2/96/176.4/192 kHz, where the classic shaping tables do not apply.
+fn sox_dither_within_five_percent(actual: u32, design: u32) -> bool {
+    u64::from(actual.abs_diff(design)) * 20 <= u64::from(design)
+}
+
+fn sox_dither_first_matching_bound(actual: u32, table: &[(u32, f64)], fallback: f64) -> f64 {
+    table
+        .iter()
+        .find_map(|&(design, bound)| {
+            sox_dither_within_five_percent(actual, design).then_some(bound)
+        })
+        .unwrap_or(fallback)
+}
+
+/// Deterministic target-LSB support bound on each *stored sample* selected by
+/// the pinned SoX-ng 14.8.0.1 dither implementation.
+///
+/// For an FIR shaper, the SoX recurrence gives a fresh error sample with
+/// `|e_n| < 1.5 LSB`. The output perturbation relative to undithered input is
+/// `e_n - sum(c_j * e_{n-j})`, so its support is bounded by
+/// `1.5 * (1 + sum(|c_j|))`. The table contains upward integer ceilings of
+/// that expression. Gesemann is the only IIR entry; qualification proves both
+/// stable recurrences below 22 LSB.
+fn sox_dither_error_lsb_upper(dither: tonepoet_pipeline::DitherType, sample_rate_hz: u32) -> f64 {
+    use tonepoet_pipeline::DitherType;
+
+    match dither {
+        DitherType::None => 0.5,
+        DitherType::Tpdf | DitherType::SlopedTpdf => 1.5,
+        DitherType::Lipshitz => {
+            sox_dither_first_matching_bound(sample_rate_hz, &[(44_100, 15.0)], 1.5)
+        }
+        DitherType::FWeighted => {
+            sox_dither_first_matching_bound(sample_rate_hz, &[(46_000, 34.0)], 1.5)
+        }
+        DitherType::ModifiedEWeighted => {
+            sox_dither_first_matching_bound(sample_rate_hz, &[(46_000, 8.0)], 1.5)
+        }
+        DitherType::ImprovedEWeighted => {
+            sox_dither_first_matching_bound(sample_rate_hz, &[(46_000, 59.0)], 1.5)
+        }
+        DitherType::Gesemann => sox_dither_first_matching_bound(
+            sample_rate_hz,
+            &[(48_000, 22.0), (44_100, 22.0)],
+            1.5,
+        ),
+        DitherType::Shibata => sox_dither_first_matching_bound(
+            sample_rate_hz,
+            &[
+                (48_000, 50.0),
+                (44_100, 84.0),
+                (37_800, 26.0),
+                (32_000, 16.0),
+                (22_050, 6.0),
+                (16_000, 9.0),
+                (11_025, 10.0),
+                (8_000, 12.0),
+            ],
+            1.5,
+        ),
+        DitherType::LowShibata => sox_dither_first_matching_bound(
+            sample_rate_hz,
+            &[(48_000, 28.0), (44_100, 27.0)],
+            1.5,
+        ),
+        DitherType::HighShibata => {
+            sox_dither_first_matching_bound(sample_rate_hz, &[(44_100, 155.0)], 1.5)
+        }
+    }
+}
+
+
+fn next_up_nonnegative(value: f64) -> f64 {
+    debug_assert!(value >= 0.0 && !value.is_nan());
+    if value == f64::INFINITY {
+        value
+    } else if value == 0.0 {
+        f64::from_bits(1)
+    } else {
+        f64::from_bits(value.to_bits() + 1)
+    }
 }
 
 #[cfg(test)]
@@ -30167,10 +30457,24 @@ mod album_true_peak_carrier_tests {
         fs::write(path, bytes).expect("write f64le carrier");
     }
 
-    fn finite(measurement: tonepoet_pipeline::AlbumPeakMeasurement) -> tonepoet_pipeline::DbNano {
+    fn finite(
+        measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    ) -> (tonepoet_pipeline::DbNano, f64) {
         match measurement {
-            tonepoet_pipeline::AlbumPeakMeasurement::Finite(value) => value,
+            tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+                point_db,
+                signal_upper_linear,
+            } => (point_db, signal_upper_linear),
             tonepoet_pipeline::AlbumPeakMeasurement::Silence => panic!("expected finite peak"),
+        }
+    }
+
+    fn zero_terminal() -> tonepoet_pipeline::AlbumTerminalBound {
+        tonepoet_pipeline::AlbumTerminalBound {
+            pre_gain_reconstructed_error_linear: 0.0,
+            stored_sample_error_linear: Some(0.0),
+            post_gain_reconstructed_error_linear: 0.0,
+            domain: tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
         }
     }
 
@@ -30180,9 +30484,15 @@ mod album_true_peak_carrier_tests {
             linear: 0.1,
             dbtp: -20.0,
         };
-        let measured = finite(album_peak_measurement_from_true_peak(point).unwrap());
+        let reconstruction = tonepoet_true_peak::PeakLevel::Finite {
+            linear: 0.100_1,
+            dbtp: 20.0 * 0.100_1_f64.log10(),
+        };
+        let (measured, signal_upper) =
+            finite(album_peak_measurement_from_true_peak(point, reconstruction).unwrap());
         let expected: tonepoet_pipeline::DbNano = "-20.000000000".parse().unwrap();
         assert_eq!(measured, expected);
+        assert_eq!(signal_upper, 0.100_1);
     }
 
     #[test]
@@ -30194,11 +30504,12 @@ mod album_true_peak_carrier_tests {
             samples.extend_from_slice(&[0.1, 1.25]);
         }
         write_f64le(&carrier, &samples);
-        let measured = finite(
+        let (measured, signal_upper) = finite(
             scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 2, || false)
                 .unwrap(),
         );
         assert!(measured > tonepoet_pipeline::DbNano::ZERO, "measured={measured}");
+        assert!(signal_upper >= 1.25);
     }
 
     #[test]
@@ -30206,7 +30517,7 @@ mod album_true_peak_carrier_tests {
         let temp = tempfile::tempdir().unwrap();
         let carrier = temp.path().join("very-low.f64le");
         write_f64le(&carrier, &[0.0001; 256]);
-        let measured = finite(
+        let (measured, _) = finite(
             scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 1, || false)
                 .unwrap(),
         );
@@ -30262,28 +30573,30 @@ mod album_true_peak_carrier_tests {
             .collect::<Vec<_>>();
         write_f64le(&carrier, &samples);
 
-        let true_peak = finite(
-            scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 1, || false)
-                .unwrap(),
-        );
+        let measured = scan_album_gain_true_peak_carrier_with_cancel(
+            &carrier, 48_000, 1, || false,
+        )
+        .unwrap();
+        let (true_peak, _) = finite(measured);
         let sample_linear = samples.iter().copied().map(f64::abs).fold(0.0, f64::max);
         let sample_db: tonepoet_pipeline::DbNano = format!("{:.9}", 20.0 * sample_linear.log10())
             .parse()
             .unwrap();
         let target: tonepoet_pipeline::DbNano = "-0.100000000".parse().unwrap();
-        let true_peak_gain = tonepoet_pipeline::resolve_album_gain(
-            target,
-            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(true_peak)],
-        )
-        .unwrap();
+        let true_peak_gain =
+            tonepoet_pipeline::resolve_album_gain(target, &[measured], zero_terminal()).unwrap();
         let sample_peak_gain = tonepoet_pipeline::resolve_album_gain(
             target,
-            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(sample_db)],
+            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+                point_db: sample_db,
+                signal_upper_linear: sample_linear,
+            }],
+            zero_terminal(),
         )
         .unwrap();
 
         assert!(sample_peak_gain.gain_db > tonepoet_pipeline::DbNano::ZERO);
-        assert!(true_peak_gain.gain_db < tonepoet_pipeline::DbNano::ZERO);
+        assert!(true_peak_gain.gain_db < sample_peak_gain.gain_db);
         assert!(true_peak > sample_db, "sample={sample_db}, true={true_peak}");
     }
 
@@ -30302,10 +30615,10 @@ mod album_true_peak_carrier_tests {
             .collect::<Vec<_>>();
         write_f64le(&carrier, &samples);
 
-        let measured_peak = finite(
+        let measurement =
             scan_album_gain_true_peak_carrier_with_cancel(&carrier, 44_100, 1, || false)
-                .unwrap(),
-        );
+                .unwrap();
+        let (measured_peak, _) = finite(measurement);
         let analytical_true_peak: tonepoet_pipeline::DbNano =
             "-6.020599913".parse().unwrap();
         assert!(
@@ -30314,11 +30627,8 @@ mod album_true_peak_carrier_tests {
         );
 
         let target: tonepoet_pipeline::DbNano = "-0.150000000".parse().unwrap();
-        let resolved = tonepoet_pipeline::resolve_album_gain(
-            target,
-            &[tonepoet_pipeline::AlbumPeakMeasurement::Finite(measured_peak)],
-        )
-        .unwrap();
+        let resolved =
+            tonepoet_pipeline::resolve_album_gain(target, &[measurement], zero_terminal()).unwrap();
         let actual_post_gain = analytical_true_peak.checked_add(resolved.gain_db).unwrap();
         assert!(
             actual_post_gain <= target,
@@ -30346,6 +30656,177 @@ mod album_true_peak_carrier_tests {
         assert!(error.contains("cancelled"), "{error}");
         assert!(checks >= 3);
     }
+
+    fn terminal_settings(
+        format: tonepoet_pipeline::AudioFormat,
+        depth: tonepoet_pipeline::PcmBitDepth,
+        dither: tonepoet_pipeline::DitherType,
+    ) -> tonepoet_pipeline::PipelineSettings {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = format;
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(depth);
+        settings.dither_type = dither;
+        settings
+    }
+
+    #[test]
+    fn terminal_bound_separates_stored_sample_and_reconstructed_error() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let bound = album_gain_terminal_bound(&settings, 44_100).unwrap();
+        let stored = bound.stored_sample_error_linear.unwrap();
+        let lsb = 2.0_f64.powi(-23);
+
+        assert_eq!(bound.pre_gain_reconstructed_error_linear, 0.0);
+        assert!(stored > 0.5 * lsb);
+        assert!(stored < 0.51 * lsb);
+        assert!(bound.post_gain_reconstructed_error_linear > stored);
+        assert_eq!(
+            bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+    }
+
+    #[test]
+    fn terminal_bound_preserves_shaped_dither_support_and_gesemann_iir_bound() {
+        let lsb = 2.0_f64.powi(-23);
+        for (dither, expected_lsb_ceiling) in [
+            (tonepoet_pipeline::DitherType::Shibata, 84.0),
+            (tonepoet_pipeline::DitherType::HighShibata, 155.0),
+            (tonepoet_pipeline::DitherType::Gesemann, 22.0),
+        ] {
+            let settings = terminal_settings(
+                tonepoet_pipeline::AudioFormat::Flac,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+                dither,
+            );
+            let bound = album_gain_terminal_bound(&settings, 44_100).unwrap();
+            let stored = bound.stored_sample_error_linear.unwrap();
+            assert!(stored > expected_lsb_ceiling * lsb);
+            assert!(stored < (expected_lsb_ceiling + 0.01) * lsb);
+            let repeat_edge_safe = stored
+                * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER;
+            assert!(bound.post_gain_reconstructed_error_linear >= repeat_edge_safe);
+            assert!(
+                bound.post_gain_reconstructed_error_linear
+                    < repeat_edge_safe * (1.0 + 1.0e-12),
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_bound_mirrors_sox_filter_rate_selection_and_tpdf_fallback() {
+        use tonepoet_pipeline::DitherType;
+
+        assert_eq!(sox_dither_error_lsb_upper(DitherType::Shibata, 48_000), 50.0);
+        assert_eq!(sox_dither_error_lsb_upper(DitherType::Shibata, 44_100), 84.0);
+        // 45.6 kHz lies in both 48 kHz and 44.1 kHz five-percent windows.
+        // SoX's table lists 48 kHz first, so that entry must win.
+        assert_eq!(sox_dither_error_lsb_upper(DitherType::Shibata, 45_600), 50.0);
+        for rate in [88_200, 96_000, 176_400, 192_000, 352_800, 384_000] {
+            assert_eq!(
+                sox_dither_error_lsb_upper(DitherType::Shibata, rate),
+                1.5,
+                "rate={rate}",
+            );
+            assert_eq!(
+                sox_dither_error_lsb_upper(DitherType::HighShibata, rate),
+                1.5,
+                "rate={rate}",
+            );
+        }
+    }
+
+    #[test]
+    fn high_rate_shaped_dither_bound_does_not_charge_an_inapplicable_44k_filter() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::HighShibata,
+        );
+        let at_44k = album_gain_terminal_bound(&settings, 44_100).unwrap();
+        let at_192k = album_gain_terminal_bound(&settings, 192_000).unwrap();
+        assert!(
+            at_192k.post_gain_reconstructed_error_linear
+                < at_44k.post_gain_reconstructed_error_linear / 50.0
+        );
+    }
+
+    #[test]
+    fn terminal_bound_handles_float_outputs_without_integer_target_reserve() {
+        let wav = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Wav,
+            tonepoet_pipeline::PcmBitDepth::Float64,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let wav_bound = album_gain_terminal_bound(&wav, 48_000).unwrap();
+        let wav_stored = wav_bound.stored_sample_error_linear.unwrap();
+        assert!(wav_stored >= 2.0_f64.powi(-32));
+        assert!(wav_stored < 2.0_f64.powi(-31));
+
+        let aiff = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Aiff,
+            tonepoet_pipeline::PcmBitDepth::Float64,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let aiff_bound = album_gain_terminal_bound(&aiff, 48_000).unwrap();
+        let aiff_stored = aiff_bound.stored_sample_error_linear.unwrap();
+        assert_eq!(aiff_bound.pre_gain_reconstructed_error_linear, 0.0);
+        assert!(aiff_stored < 1.0e-14);
+    }
+
+    #[test]
+    fn terminal_bound_rejects_custom_output_instead_of_inventing_a_ceiling_domain() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Custom {
+                extension: "proofless".to_string(),
+                display_name: "Proofless".to_string(),
+            },
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        let error = album_gain_terminal_bound(&settings, 48_000).unwrap_err();
+        assert!(error.contains("hard ceiling is not defined"), "{error}");
+    }
+
+    #[test]
+    fn terminal_bound_accepts_alac_dither_via_proved_sox_preprocess() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Alac,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        let bound = album_gain_terminal_bound(&settings, 96_000).unwrap();
+        let lsb = 2.0_f64.powi(-23);
+        let stored = bound.stored_sample_error_linear.unwrap();
+        assert!(stored > 1.5 * lsb);
+        assert!(stored < 1.51 * lsb);
+        assert_eq!(
+            bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+    }
+
+    #[test]
+    fn lossy_terminal_contract_stops_at_encoder_input_pcm() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Mp3,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let bound = album_gain_terminal_bound(&settings, 44_100).unwrap();
+        assert_eq!(bound.stored_sample_error_linear, None);
+        assert_eq!(bound.pre_gain_reconstructed_error_linear, 0.0);
+        assert!(bound.post_gain_reconstructed_error_linear > 0.0);
+        assert_eq!(
+            bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm,
+        );
+    }
+
 }
 
 struct PreparedAlbumGainCarrier {

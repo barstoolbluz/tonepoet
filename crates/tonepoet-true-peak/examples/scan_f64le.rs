@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{Read, Result as IoResult};
+use std::time::Instant;
 
 use tonepoet_true_peak::{PeakLevel, TruePeakConfig, TruePeakMeter, TruePeakMode};
 
@@ -16,17 +17,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "headroom64x" => TruePeakMode::Headroom64x,
         other => return Err(format!("unknown mode: {other}").into()),
     };
-    let mut meter = TruePeakMeter::new(TruePeakConfig::new(sample_rate_hz, channels).with_mode(mode))?;
+    let mut meter =
+        TruePeakMeter::new(TruePeakConfig::new(sample_rate_hz, channels).with_mode(mode))?;
+
+    // Time only the production-style streaming scan/finalize. Opening the file
+    // and parsing command-line arguments stay outside the interval; file reads
+    // themselves remain inside because retained-carrier I/O is part of the
+    // production cost this example is intended to reproduce.
+    let started = Instant::now();
     scan_file(&args[1], channels, &mut meter)?;
     let result = meter.finalize()?;
+    let elapsed = started.elapsed();
+    let wall_seconds = elapsed.as_secs_f64();
+    let programme_seconds = result.frames as f64 / f64::from(sample_rate_hz);
+    let realtime = programme_seconds / wall_seconds;
+    let ns_per_original_frame_channel = elapsed.as_nanos() as f64
+        / (result.frames as f64 * channels as f64);
+
     match result.overall {
         PeakLevel::Silence => println!(
-            "{{\"frames\":{},\"linear\":0.0,\"dbtp\":\"-inf\"}}",
-            result.frames
+            "{{\"frames\":{},\"sample_rate_hz\":{},\"channels\":{},\"wall_seconds\":{:.9},\"realtime\":{:.6},\"ns_per_original_frame_channel\":{:.6},\"linear\":0.0,\"dbtp\":\"-inf\"}}",
+            result.frames,
+            sample_rate_hz,
+            channels,
+            wall_seconds,
+            realtime,
+            ns_per_original_frame_channel,
         ),
         PeakLevel::Finite { linear, dbtp } => println!(
-            "{{\"frames\":{},\"linear\":{linear:.17},\"dbtp\":{dbtp:.12}}}",
-            result.frames
+            "{{\"frames\":{},\"sample_rate_hz\":{},\"channels\":{},\"wall_seconds\":{:.9},\"realtime\":{:.6},\"ns_per_original_frame_channel\":{:.6},\"linear\":{linear:.17},\"dbtp\":{dbtp:.12}}}",
+            result.frames,
+            sample_rate_hz,
+            channels,
+            wall_seconds,
+            realtime,
+            ns_per_original_frame_channel,
         ),
     }
     Ok(())

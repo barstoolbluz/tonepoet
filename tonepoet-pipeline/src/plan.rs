@@ -1421,6 +1421,28 @@ fn plan_from_pcm(
                 "runtime DSD album gain carrier rate must already equal the requested final PCM rate",
             ));
         }
+        if request.settings.target_format.is_lossy() {
+            let carrier_rate_hz = request.source.sample_rate_hz.ok_or_else(|| {
+                PlanningError::invalid_source(
+                    "sample_rate_hz",
+                    "runtime DSD album gain lossy carrier requires an authoritative PCM sample rate",
+                )
+            })?;
+            if mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+                &request.settings.target_format,
+                carrier_rate_hz,
+            ) != Some(true)
+            {
+                return Err(PlanningError::invalid_settings(
+                    "target_sample_rate",
+                    format!(
+                        "runtime DSD album gain requires {} to accept {} Hz directly; FFmpeg rate conversion after the proved gain is forbidden",
+                        request.settings.target_format,
+                        carrier_rate_hz,
+                    ),
+                ));
+            }
+        }
     }
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
@@ -1482,8 +1504,20 @@ fn plan_from_pcm(
         return Ok(());
     }
 
+    let hard_ceiling_needs_proved_dither_terminal = request
+        .settings
+        .dsd
+        .runtime_album_gain_db()
+        .is_some()
+        && request.settings.target_format.is_pcm_lossless()
+        && request.settings.dither_type != DitherType::None
+        && matches!(
+            target_depth,
+            PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
+        );
     let needs_sox_preprocess = request.settings.dither_type != DitherType::None
-        && mapping::requires_sox_dither(request.settings.dither_type)
+        && (mapping::requires_sox_dither(request.settings.dither_type)
+            || hard_ceiling_needs_proved_dither_terminal)
         && !request.settings.target_format.sox_encodable()
         && request.settings.target_format.ffmpeg_encodable();
 
@@ -1535,6 +1569,39 @@ fn push_encode_final(
     apply_processing: bool,
 ) -> Result<()> {
     if request.settings.target_format.is_lossy() {
+        let target_rate_hz = if request.settings.dsd.runtime_album_gain_db().is_some() {
+            let carrier_rate_hz = request.source.sample_rate_hz.ok_or_else(|| {
+                PlanningError::invalid_source(
+                    "sample_rate_hz",
+                    "runtime DSD album gain lossy encode requires an authoritative carrier sample rate",
+                )
+            })?;
+            if mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+                &request.settings.target_format,
+                carrier_rate_hz,
+            ) != Some(true)
+            {
+                return Err(PlanningError::invalid_settings(
+                    "target_sample_rate",
+                    format!(
+                        "runtime DSD album gain requires {} to accept {} Hz directly; FFmpeg rate conversion after the proved gain is forbidden",
+                        request.settings.target_format,
+                        carrier_rate_hz,
+                    ),
+                ));
+            }
+            if let Some(planned_rate_hz) = target_rate_hz {
+                if planned_rate_hz != carrier_rate_hz {
+                    return Err(PlanningError::invalid_source(
+                        "sample_rate_hz",
+                        "runtime DSD album gain lossy encode rate must equal the measured carrier rate",
+                    ));
+                }
+            }
+            Some(carrier_rate_hz)
+        } else {
+            target_rate_hz
+        };
         push_step(
             steps,
             PlanOperation::EncodeLossy {
@@ -1933,6 +2000,88 @@ mod dsd_album_gain_carrier_planning_tests {
             !steps.iter().any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
             "post-measurement resampling would invalidate the measured peak: {steps:#?}"
         );
+    }
+
+    #[test]
+    fn runtime_album_gain_rejects_aac_rate_that_would_be_resampled_after_gain() {
+        let mut request = carrier_request(192_000);
+        request.settings.target_format = AudioFormat::Aac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(192_000);
+        request.output_path = PathBuf::from("output.m4a");
+
+        let error = plan_topology(&request)
+            .expect_err("AAC 192 kHz must not negotiate a post-gain encoder rate");
+        assert!(error.to_string().contains("accept 192000 Hz directly"), "{error}");
+    }
+
+    #[test]
+    fn runtime_album_gain_pins_supported_aac_encoder_input_rate() {
+        let mut request = carrier_request(96_000);
+        request.settings.target_format = AudioFormat::Aac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("AAC 96 kHz hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force executable AAC encode");
+        };
+        // A trailing MetadataTransfer step carries no audio and cannot move the
+        // measured peak, so the ceiling invariant is about the audio-affecting
+        // steps. Assert on those, and that metadata transfer is the only extra.
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(96_000),
+                apply_processing: true,
+            }
+        ));
+        assert!(
+            !steps.iter().any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "supported encoder-input rate must not add a post-measurement resample: {steps:#?}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
+        let mut request = carrier_request(96_000);
+        request.settings.target_format = AudioFormat::Alac;
+        request.settings.dither_type = crate::enums::DitherType::Tpdf;
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("ALAC hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force executable ALAC encode");
+        };
+        // See the AAC pin test: a trailing MetadataTransfer step is audio-inert.
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Alac,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+                ..
+            }
+        ));
     }
 }
 

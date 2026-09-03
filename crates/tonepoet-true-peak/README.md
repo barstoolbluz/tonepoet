@@ -2,7 +2,7 @@
 
 A small, application-independent streaming true-peak meter for decoded PCM.
 
-The library owns only audio-domain concepts: sample rate, channel count, interleaved decoded `f64` frames, interpolation mode, finite-stream edge policy, level, and a band-qualified headroom authority. It does not open files, discover tools, know Tonepoet pipeline types, or decide gain policy.
+The library owns only audio-domain concepts: sample rate, channel count, interleaved decoded `f64` frames, interpolation mode, finite-stream edge policy, level, a band-qualified point-estimate authority, and a separately defined finite Headroom64 ceiling reconstruction. It does not open files, discover tools, know Tonepoet pipeline types, or decide gain policy.
 
 ## API shape
 
@@ -68,14 +68,37 @@ HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE = 0.495
 
 Neither mode clamps input samples to full scale; decoded values above `1.0` can produce positive dBTP.
 
+### Finite ceiling reconstruction
+
+Album-scoped `NormalizePeak` does **not** promote the Headroom64x point estimate with the `0.030 dB` reserve. The production DSD carrier has no fabricated `<= 0.495 * Fs` spectral-support declaration. Instead, `HeadroomCeilingMeter` evaluates a separately named finite waveform contract:
+
+- the signal is each channel of the retained final-rate Float64 PCM carrier;
+- production uses `RepeatEndpoints` outside the finite stream (the meter also retains `ZeroExtend` for regression coverage);
+- the samples pass through the same six-stage Headroom64 interpolation cascade, but without the point-estimator's `-0.004 dB` calibration;
+- over the nominal interval from the first input frame through the last, the continuous reconstruction is straight-line interpolation between adjacent 64x knots;
+- channels are independent and the ceiling peak is the maximum absolute reconstructed value over all channels;
+- because absolute value on an affine segment is maximized at an endpoint, the continuous peak is bounded by the 64x knot maximum plus the explicit binary64 evaluation enclosure.
+
+This is a mathematical contract for Tonepoet's finite reconstruction model. It is deliberately **not** a claim about arbitrary ideal-sinc/DAC reconstruction or decoded output from a lossy codec. `HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER` separately bounds how a deterministic stored-sample error sequence can amplify in this reconstruction; it is not the published Headroom64x point-estimation reserve.
+
 ## Performance
 
-The R3 Headroom16x first stage evaluated a 2001-tap windowed-sinc on every original input frame. Headroom64x instead computes only the missing half-sample phase and exploits coefficient symmetry. A simple coefficient-product count gives approximately:
+The R3 Headroom16x first stage evaluated a 2001-tap windowed-sinc on every original input frame. Headroom64x instead computes only the missing half-sample phase and exploits coefficient symmetry. The exact coefficient-product count for the R10 generic six-stage implementation is **638 products per original input frame/channel**, not `192 * 64` and not 1022. It is:
 
-- R3 Headroom16x cascade: 2335 products per original input frame/channel;
-- Headroom64x cascade: 1022 products per original input frame/channel.
+```text
+stage 1:                    192
+stage 2:  2 * (1 + 24)  =    50
+stage 3:  4 * (1 + 12)  =    52
+stage 4:  8 * (1 +  8)  =    72
+stage 5: 16 * (1 +  6)  =   112
+stage 6: 32 * (1 +  4)  =   160
+                                ---
+                                638
+```
 
-That is about a 56% reduction in FIR coefficient products despite increasing the final grid from 16x to 64x. The count excludes ring/index/add overhead; qualification includes the reproducer that derives it. Reporting4x pays none of this cost.
+The optimized exhaustive implementation preserves that mathematical cascade and accumulation order but specializes the exact identity phases, eliminating their coefficient-1 multiplies, and uses doubled circular buffers so every nontrivial FIR history window is contiguous. The resulting count is **576 coefficient products per original input frame/channel** (192 + 48 + 48 + 64 + 96 + 128), while also removing modulo/index adjustment from the FIR inner loops. The latter is expected to matter more than the ~9.7% multiply-count reduction. No adaptive pruning is part of this implementation.
+
+`examples/scan_f64le.rs` reports wall time, realtime factor, and `ns / original frame / channel` for a retained-carrier style scan. Production acceptance numbers must be collected with the shipping Nix/Rust codegen and a clean machine; they are not asserted by unit tests. Reporting4x pays none of the Headroom cascade cost.
 
 ## Finite-stream edges
 

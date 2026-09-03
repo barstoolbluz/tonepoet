@@ -430,6 +430,34 @@ mod tests {
         assert!(ssrc_dither_selection_for_rate(DitherType::Shibata, 176_400).is_err());
         assert!(ssrc_dither_selection_for_rate(DitherType::Tpdf, 176_400).is_ok());
     }
+
+    #[test]
+    fn configured_lossy_encoder_rate_tables_reject_implicit_resample_rates() {
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Aac, 96_000),
+            Some(true)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Aac, 192_000),
+            Some(false)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Mp3, 96_000),
+            Some(false)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Opus, 96_000),
+            Some(false)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Ac3, 48_000),
+            Some(true)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Flac, 48_000),
+            None
+        );
+    }
 }
 
 /// Resolve SSRC profile from explicit profile, insane mode, and quality.
@@ -502,6 +530,60 @@ pub const fn ffmpeg_aac_profile(profile: AacProfile) -> &'static str {
         AacProfile::HeAac => "aac_he",
         AacProfile::HeAacV2 => "aac_he_v2",
     }
+}
+
+/// Whether Tonepoet's configured FFmpeg lossy encoder accepts
+/// `sample_rate_hz` directly, without FFmpeg inserting a rate conversion
+/// before the encoder.
+///
+/// This is intentionally an encoder-capability table, not a general codec
+/// sample-rate claim. The encoder names are fixed by `plugins.rs`:
+/// `libmp3lame`, `libfdk_aac`, `libopus`, `dca`, and `ac3`. FFmpeg may accept
+/// other input rates by automatically resampling them, but that is not a
+/// direct-rate path and therefore cannot be used after a proved album
+/// NormalizePeak gain.
+#[must_use]
+pub(crate) fn ffmpeg_lossy_encoder_accepts_rate_directly(
+    format: &AudioFormat,
+    sample_rate_hz: u32,
+) -> Option<bool> {
+    let accepted = match format {
+        AudioFormat::Mp3 => matches!(
+            sample_rate_hz,
+            8_000
+                | 11_025
+                | 12_000
+                | 16_000
+                | 22_050
+                | 24_000
+                | 32_000
+                | 44_100
+                | 48_000
+        ),
+        AudioFormat::Aac => matches!(
+            sample_rate_hz,
+            8_000
+                | 11_025
+                | 12_000
+                | 16_000
+                | 22_050
+                | 24_000
+                | 32_000
+                | 44_100
+                | 48_000
+                | 64_000
+                | 88_200
+                | 96_000
+        ),
+        AudioFormat::Opus => matches!(sample_rate_hz, 8_000 | 12_000 | 16_000 | 24_000 | 48_000),
+        AudioFormat::Dts => matches!(
+            sample_rate_hz,
+            8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
+        ),
+        AudioFormat::Ac3 => matches!(sample_rate_hz, 32_000 | 44_100 | 48_000),
+        _ => return None,
+    };
+    Some(accepted)
 }
 
 /// FFmpeg/libopus application string.

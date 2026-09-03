@@ -2081,3 +2081,191 @@ that rides along with a far more expensive decode.
   currently hands `loudgain` a file path and lets it do its own decoding.
 - ReplayGain *writing* (`command.rs`) is a separate use of `loudgain` and is not in scope.
 - Expected to be folded into the planned pipeline redesign rather than done as isolated work.
+
+## 29. Hard-ceiling headroom reserve for 16-bit aggressive noise shaping
+
+**Status:** accepted as-is for now. Deferred deliberately, not overlooked.
+
+Album auto-gain with a hard ceiling holds back headroom to guarantee the ceiling is never
+exceeded. For most configurations the reserve is negligible. For 16-bit output with aggressive
+noise shaping it is not:
+
+| terminal case | reserve |
+|---|---:|
+| Int16, no dither | 0.000542 dB |
+| Int24, no dither | 0.000002 dB |
+| Int16, TPDF | 0.001626 dB |
+| Int16, Gesemann @ 44.1 kHz | 0.023884 dB |
+| Int16, Shibata @ 44.1 kHz | 0.091549 dB |
+| Int16, High-Shibata @ 44.1 kHz | 0.169689 dB |
+| Int24, High-Shibata @ 44.1 kHz | 0.000656 dB |
+
+So a 0.0 dB ceiling on a CD-format file with High-Shibata lands near -0.17 dB. That is about
+2% in amplitude -- not audible, and the default no-dither and all 24-bit cases stay under
+0.001 dB. It is recorded because it is a real shortfall from what the user literally asked for
+in a configuration people actually use.
+
+### Why the reserve is that large
+
+Noise shaping injects a deliberate shaped error sequence, so the terminal signal can peak above
+the audio alone. Proving a hard ceiling requires budgeting that sequence's worst case.
+
+Production uses the edge-safe proof `E_post = E_stored * 4.09`, where `4.09` is the widened
+complete Headroom reconstruction induced L-infinity norm (independently derived as
+`4.089899431660599`). Shaper support is derived from the pinned SoX-ng recurrence as
+`1.5 * (1 + sum(abs(c_j)))` target LSB -- for example High-Shibata at 44.1 kHz gives
+`154.9964651791 -> 155 LSB`.
+
+The delivery notes that an interior LTI convolution of the shaper with the reconstruction is
+substantially tighter, but does not by itself prove finite-stream endpoint behaviour, because
+`RepeatEndpoints` extends the error sequence as well as the signal. The tighter interior
+figures are therefore kept as diagnostics only. **That gap is the lever** for any future
+tightening: prove the endpoint case, and the reserve shrinks toward the interior bound.
+
+### This is not a `tonepoet-true-peak` item
+
+Worth stating plainly, because it is easy to assume otherwise. The crate measures peaks and
+knows nothing about dither, shapers, or LSBs -- its only mention of dither is a doc comment,
+and it carries zero Tonepoet references and no dependencies. The reserve lives in
+`tonepoet-pipeline` (`AlbumTerminalBound` in `dsd_album_gain.rs`, shaper data in `mapping.rs`)
+because it describes what SoX does to the audio *after* the meter is finished.
+
+Consequences for scheduling:
+
+- The **crate** can be refactored independently of the pipeline redesign, and that independence
+  is a property worth preserving deliberately (see #28).
+- **This item cannot.** Tightening the terminal reserve is pipeline-side work about how terminal
+  stages are modelled, so it belongs with the pipeline redesign rather than beside it.
+
+### Outcomes wanted, if picked up
+
+- A proved finite-stream endpoint bound for shaped dither, so the 16-bit reserve approaches the
+  interior figure instead of the conservative `stored support * reconstruction norm` product.
+- No loosening of the guarantee to buy headroom. The ceiling either holds or it is not a ceiling;
+  a smaller reserve has to come from a better proof, not a weaker promise.
+
+## 30. Format sample-rate ceilings are silently exceeded, and AAC's TUI cap is wrong
+
+**Status:** open. Contains one live defect that can be fixed now, and one behaviour question for
+the planner/pipeline redesign.
+
+### The live defect
+
+`FormatState::apply_format_constraints` (`src/tui/app.rs`) caps AAC's selectable sample rate at
+`192_000`:
+
+```rust
+AudioFormat::Aac => {
+    ...
+    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 192_000 { opt.enabled = false; }
+}
+```
+
+AAC's real maximum is **96 kHz**. This is a property of the format, not of one encoder: the
+MPEG-4 sampling-frequency index stops at 96 kHz. Both encoders in tonepoet's own flake agree --
+
+- native `aac`: 96000 88200 64000 48000 44100 32000 24000 22050 16000 12000 11025 8000 7350
+- `libfdk_aac`: 96000 88200 64000 48000 44100 32000 24000 22050 16000 12000 11025 8000
+
+and `ffmpeg ... -c:a aac -ar 192000` fails with `Specified sample rate 192000 is not supported
+by the aac encoder`.
+
+The neighbouring branches are correct -- Opus is pinned to 48 kHz, MP3/Ogg capped at 48 kHz --
+so this is an isolated wrong constant, and `96_000` is the fix.
+
+### The silent downsample
+
+Two ways a user reaches an unsupported rate today:
+
+1. Selecting 176.4 or 192 kHz for AAC, which the cap above wrongly permits.
+2. Selecting "same as source" with a >96 kHz source. `SOURCE_SAMPLE_RATE_SENTINEL` is exempted
+   from every per-format cap, so no cap applies at all.
+
+Neither is refused. The only path that pins an explicit `-ar` is runtime DSD album gain
+(`tonepoet-pipeline/src/plan.rs`); otherwise no rate is pinned, FFmpeg picks a supported rate on
+its own, and the output is quietly downsampled. The user asked for 192 kHz AAC and received
+96 kHz with nothing said.
+
+This is also why the album-gain path refuses instead: an unannounced resample **after** the
+proved gain would void the ceiling guarantee silently. That refusal is correct and should stay.
+
+### What the redesign should do instead
+
+Refusing is right when a ceiling has been promised, but it is a poor general answer. The wanted
+behaviour, per the user: when a requested rate exceeds what the target format can encode --
+including via "same as source" -- **tell the user and offer the choice** rather than silently
+downsampling or dead-ending. Either offer the highest supported rate (96 kHz for AAC, 48 kHz for
+MP3/Opus) as a one-keypress default, or let them pick from the supported set.
+
+### Which layer owns what
+
+- **The planner owns the constraint.** `mapping::ffmpeg_lossy_encoder_accepts_rate_directly`
+  already encodes the per-encoder rate tables in `tonepoet-pipeline`. It should also be able to
+  answer "what is the highest rate this format accepts at or below the requested one", so the
+  answer has a single source of truth.
+- **The UI owns the prompt.** `tonepoet-pipeline` is a pure planner with no I/O and must not
+  grow interactive behaviour. It reports the constraint and the candidate rates; Convert/Browse
+  surface the choice.
+- **The TUI cascade should stop hardcoding caps.** The `192_000` error exists because the cap is
+  duplicated in the UI instead of derived from the planner's tables. Fixing the constant without
+  removing the duplication invites the next drift.
+
+### Notes
+
+- Applies to every lossy target, not just AAC: MP3/Ogg at 48 kHz and Opus at 48 kHz have the same
+  silent-downsample exposure via "same as source".
+- The `SOURCE_SAMPLE_RATE_SENTINEL` exemption is the more likely path in practice, since "same as
+  source" is a natural choice for a high-rate source.
+- Fixing the AAC constant to `96_000` is small and independently safe; the prompt behaviour is
+  redesign work.
+
+## 31. Low-rate gate flake: `empty_dead_queue_scope_is_reclaimed_but_live_empty_scope_is_preserved`
+
+**Status:** open. Observed 2026-09-03 during the true-peak zero-ceiling gate. Sibling of #20.
+
+Not a regression from that delivery -- see below -- but like #20 it fails a full-workspace gate
+often enough to cost a re-run, so it should be settled.
+
+### The failure
+
+```
+---- db::tests::empty_dead_queue_scope_is_reclaimed_but_live_empty_scope_is_preserved stdout ----
+thread '...' panicked at src/db.rs:7457:
+assertion `left == right` failed: abandoned empty scope row must be retired
+  left: 1
+ right: 0
+```
+
+The test drops the owning `db_owner` handle and then asserts, from a separate observer
+connection, that the abandoned empty scope row has been reclaimed. On the failing run the row
+was still present. The immediately following assertion -- that the on-disk descriptor is also
+retired -- was not reached.
+
+### Why this is not the true-peak delivery's regression
+
+- That change set touches `crates/tonepoet-true-peak/`, `src/convert/pipeline/stages.rs`,
+  `src/convert/processor.rs`, and three `tonepoet-pipeline` files. It does not touch `src/db.rs`
+  or any queue/coordination code.
+- Four consecutive workspace gates produced: one failure of #20, one failure of this test, then
+  two fully clean runs (6681 passed, 0 failed). A different single test failing per run, with
+  identical pass counts, is the contamination signature rather than a regression.
+- Isolated reruns pass 8/8.
+
+One honest caveat: both this and #20 are timing-sensitive tests inside the single-process lib
+target, and the delivery did make the true-peak meter about 1.9x faster. A timing change
+anywhere in that binary can shift interleavings and make a latent race easier to hit. So the
+claim is that the delivery did not *introduce* this -- the code paths are untouched and it
+belongs to the coordination-descriptor reclamation work in `983fa0c` / `57d1e0c` -- not that it
+cannot have influenced how often it appears.
+
+### Notes for whoever picks this up
+
+- Reclamation of an ownerless scope depends on observing that the owner is gone. The assertion
+  runs immediately after `drop(db_owner)`, so the likely shape is a reclamation that is not yet
+  guaranteed complete at the moment the observer queries, rather than a scope that never gets
+  reclaimed.
+- Worth settling together with #20: both are "a supervisor/reclaimer has not finished by the
+  time the assertion reads" and may share a fix in how the tests await completion, or in how
+  reclamation publishes its result.
+- Related history is recorded in the coordination-descriptor reclamation work; that fix's own
+  race was real, so treat a genuine ordering defect as plausible rather than assuming a test bug.

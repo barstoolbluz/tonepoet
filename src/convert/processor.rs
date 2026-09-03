@@ -58,7 +58,7 @@ use crate::convert::pipeline::stages::{
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
     prepare_verified_single_file_album_batch_completion_order_fallback,
-    resolve_dsd_album_gain_post_barrier_rerun,
+    resolve_dsd_album_gain_post_barrier_rerun, album_gain_terminal_bound,
     finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
@@ -3024,6 +3024,41 @@ fn build_dsd_album_gain_scope_disclosure<'a>(
     }
 }
 
+fn scheduled_album_gain_carrier_rate_hz(album: &ScheduledAlbum) -> Result<u32, String> {
+    let mut rate_hz = None;
+    let mut carrier_count = 0usize;
+    for track in &album.source.tracks {
+        let TrackSourceRef::DsdAlbumGainCarrier { sample_rate_hz, .. } = &track.source_ref else {
+            continue;
+        };
+        if *sample_rate_hz == 0 {
+            return Err("submitted-batch DSD album-gain carrier has zero sample rate".to_string());
+        }
+        carrier_count = carrier_count.saturating_add(1);
+        match rate_hz {
+            None => rate_hz = Some(*sample_rate_hz),
+            Some(expected) if expected == *sample_rate_hz => {}
+            Some(expected) => {
+                return Err(format!(
+                    "submitted-batch DSD album-gain item has inconsistent retained-carrier rates ({expected} Hz and {sample_rate_hz} Hz)",
+                ));
+            }
+        }
+    }
+
+    if carrier_count != album.album_gain_measurements.len() {
+        return Err(format!(
+            "submitted-batch DSD album-gain item has {} measurement(s) for {} retained carrier(s)",
+            album.album_gain_measurements.len(),
+            carrier_count,
+        ));
+    }
+    rate_hz.ok_or_else(|| {
+        "submitted-batch DSD album-gain item has measurements but no retained carrier rate"
+            .to_string()
+    })
+}
+
 fn resolve_completed_dsd_album_gain_submission(
     submission_id: &str,
     pending: &mut BTreeMap<String, PendingDsdAlbumGainSubmission>,
@@ -3087,7 +3122,7 @@ fn resolve_completed_dsd_album_gain_submission(
     }
 
     let mut target = None;
-    let mut measurements = Vec::new();
+    let mut participants = Vec::new();
     let mut validation_error = None;
     for album in &state.ready_albums {
         let Some(album_target) = album.req.settings.dsd.album_auto_gain_target_dbfs() else {
@@ -3108,13 +3143,35 @@ fn resolve_completed_dsd_album_gain_submission(
         } else {
             target = Some(album_target);
         }
-        measurements.extend(album.album_gain_measurements.iter().copied());
+        if !album.album_gain_measurements.is_empty() {
+            let rate_hz = match scheduled_album_gain_carrier_rate_hz(album) {
+                Ok(rate_hz) => rate_hz,
+                Err(error) => {
+                    validation_error = Some(error);
+                    break;
+                }
+            };
+            let terminal_bound = match album_gain_terminal_bound(&album.req.settings, rate_hz) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    validation_error = Some(error);
+                    break;
+                }
+            };
+            participants.extend(
+                album
+                    .album_gain_measurements
+                    .iter()
+                    .copied()
+                    .map(|measurement| (measurement, terminal_bound)),
+            );
+        }
     }
     if let Some(error) = validation_error {
         return Some(Err((error, state.ready_albums)));
     }
 
-    if measurements.is_empty() {
+    if participants.is_empty() {
         log::info!(
             "submitted-batch DSD album gain scope contained no DSD tracks: items={}, excluded_non_dsd_tracks={}, excluded_non_dsd_items={}",
             scope_disclosure.submitted_item_count,
@@ -3131,7 +3188,10 @@ fn resolve_completed_dsd_album_gain_submission(
             state.ready_albums,
         )));
     };
-    let authority = match tonepoet_pipeline::resolve_album_gain(target, &measurements) {
+    let authority = match tonepoet_pipeline::resolve_album_gain_constraints(
+        target,
+        &participants,
+    ) {
         Ok(authority) => authority,
         Err(error) => return Some(Err((error, state.ready_albums))),
     };
@@ -3140,13 +3200,17 @@ fn resolve_completed_dsd_album_gain_submission(
         .map(|value| value.render(false))
         .unwrap_or_else(|| "-inf (verified silence)".to_string());
     log::info!(
-        "DSD album gain: submitted batch scope={} item(s), {} DSD track(s), {} excluded non-DSD track(s) in {} DSD-free item(s); participants={:?}; loudest true peak={} dBTP; target={} dBTP; fixed gain={} dB",
+        "DSD album gain: submitted batch scope={} item(s), {} DSD track(s), {} excluded non-DSD track(s) in {} DSD-free item(s); participants={:?}; loudest Headroom64 point={} dBTP; signal ceiling upper={:.12e} FS; terminal pre-gain reconstruction error={:.12e} FS; terminal post-gain reconstruction error={:.12e} FS ({:?}); target={} dBTP; fixed gain={} dB",
         state.expected_items,
         authority.track_count,
         scope_disclosure.excluded_non_dsd_track_count,
         scope_disclosure.excluded_non_dsd_item_count,
         scope_disclosure.dsd_participants,
         loudest,
+        authority.loudest_signal_upper_linear,
+        authority.terminal_bound.pre_gain_reconstructed_error_linear,
+        authority.terminal_bound.post_gain_reconstructed_error_linear,
+        authority.terminal_bound.domain,
         authority.target_dbfs.render(false),
         authority.gain_db.render(false),
     );
