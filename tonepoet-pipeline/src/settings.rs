@@ -1558,8 +1558,41 @@ fn validate_ssrc_dither_settings(settings: &PipelineSettings) -> Result<()> {
         return Ok(());
     }
 
-    let RateTarget::PcmHz(target_rate_hz) = settings.target_sample_rate else {
+    let RateTarget::PcmHz(requested_rate_hz) = settings.target_sample_rate else {
         return Ok(());
+    };
+
+    // Rate-dependent processing must be validated against the rate the
+    // ordinary lossy planner will actually deliver, not an impossible
+    // requested rate that will be adapted before encoding. Conversely, a
+    // hard-ceiling album-gain request must remain a rate refusal; defer its
+    // unsupported-rate diagnostic to request planning instead of obscuring it
+    // with an SSRC dither error for a conversion that cannot be admitted.
+    let target_rate_hz = if settings.target_format.is_lossy() {
+        match mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+            &settings.target_format,
+            requested_rate_hz,
+        ) {
+            Some(true) => requested_rate_hz,
+            Some(false)
+                if settings.dsd.album_auto_gain_selected()
+                    || settings.dsd.runtime_album_gain_db().is_some() =>
+            {
+                return Ok(());
+            }
+            Some(false) => {
+                let Some(rate_hz) = mapping::ffmpeg_lossy_encoder_rate_for_request(
+                    &settings.target_format,
+                    requested_rate_hz,
+                ) else {
+                    return Ok(());
+                };
+                rate_hz
+            }
+            None => return Ok(()),
+        }
+    } else {
+        requested_rate_hz
     };
 
     if let Some(dither_id) = settings.ssrc.dither_id {
@@ -1741,6 +1774,41 @@ mod ssrc_rate_dependent_dither_validation_tests {
 
         settings.dither_type = DitherType::Tpdf;
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn lossy_fallback_validates_ssrc_dither_against_effective_encoder_rate() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.nyquist_transition = NyquistTransition::BrickWall;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::HighShibata;
+
+        settings
+            .validate()
+            .expect("AAC 176.4 kHz resolves to 96 kHz, where the derived SSRC mapping is valid");
+    }
+
+    #[test]
+    fn hard_ceiling_invalid_lossy_rate_defers_to_the_rate_admission_error() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        settings.preferred_tool = PreferredTool::Ssrc;
+        settings.nyquist_transition = NyquistTransition::BrickWall;
+        settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.dither_type = DitherType::HighShibata;
+        settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy album hard-ceiling settings");
+        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+
+        settings
+            .validate()
+            .expect("unsupported hard-ceiling lossy rate belongs to request planning, not SSRC dither validation");
     }
 
     #[test]

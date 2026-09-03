@@ -23117,7 +23117,26 @@ fn conversion_summary(
                 gain_db.render(true),
                 target,
             ));
+            if let Some(target_rate_hz) = target_rate {
+                if let Ok(Some(reserve_db)) =
+                    album_gain_terminal_headroom_reserve_db(&req.settings, target_rate_hz)
+                {
+                    transforms.push(format!(
+                        "hard-ceiling terminal reserve {reserve_db:.6} dB below requested {target} dBTP (dither/quantization safety bound)",
+                    ));
+                }
+            }
         }
+    }
+    if let Some((requested_hz, effective_hz)) =
+        ordinary_lossy_rate_divergence(track, &req.settings)
+    {
+        transforms.push(format!(
+            "sample-rate request {} adjusted to {} because {} cannot encode the requested rate directly",
+            format_sample_rate(requested_hz),
+            format_sample_rate(effective_hz),
+            req.settings.target_format.display_name(),
+        ));
     }
     if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {
         if source_rate != target_rate {
@@ -23343,7 +23362,7 @@ fn source_default_pcm_depth_for_track(
     }
 }
 
-fn resolved_target_rate_hz(
+fn requested_target_rate_hz(
     track: &PreparedTrack,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> Option<u32> {
@@ -23354,6 +23373,176 @@ fn resolved_target_rate_hz(
         RateTarget::Source => track.scalar_sample_rate(),
         RateTarget::PcmHz(hz) => Some(hz),
         RateTarget::Dsd(rate) => Some(rate.hz()),
+    }
+}
+
+fn track_requires_dsd_hard_ceiling_rate_exactness(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    let dsd_gain_participant = source_track_dsd_rate(track).is_some()
+        || matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. });
+    dsd_gain_participant
+        && (settings.dsd.album_auto_gain_selected()
+            || settings.dsd.runtime_album_gain_db().is_some())
+}
+
+fn resolved_target_rate_hz(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<u32> {
+    let requested_hz = requested_target_rate_hz(track, settings)?;
+    if settings.target_format.is_lossy()
+        && !track_requires_dsd_hard_ceiling_rate_exactness(track, settings)
+    {
+        return tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
+            &settings.target_format,
+            requested_hz,
+        )
+        .or(Some(requested_hz));
+    }
+    Some(requested_hz)
+}
+
+fn ordinary_lossy_rate_divergence(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<(u32, u32)> {
+    if !settings.target_format.is_lossy()
+        || track_requires_dsd_hard_ceiling_rate_exactness(track, settings)
+    {
+        return None;
+    }
+    let requested_hz = requested_target_rate_hz(track, settings)?;
+    let effective_hz = tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
+        &settings.target_format,
+        requested_hz,
+    )?;
+    (effective_hz != requested_hz).then_some((requested_hz, effective_hz))
+}
+
+fn hard_ceiling_lossy_rate_rejection(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<u32> {
+    if !settings.target_format.is_lossy()
+        || !track_requires_dsd_hard_ceiling_rate_exactness(track, settings)
+    {
+        return None;
+    }
+    let requested_hz = requested_target_rate_hz(track, settings)?;
+    (tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+        &settings.target_format,
+        requested_hz,
+    ) == Some(false))
+    .then_some(requested_hz)
+}
+
+const HARD_CEILING_HEADROOM_DISCLOSURE_THRESHOLD_DB: f64 = 0.001;
+
+fn album_gain_terminal_headroom_reserve_db(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    sample_rate_hz: u32,
+) -> Result<Option<f64>, String> {
+    let Some(target) = settings.dsd.album_auto_gain_target_dbfs() else {
+        return Ok(None);
+    };
+    let terminal = album_gain_terminal_bound(settings, sample_rate_hz)?;
+    let target_db = target.0 as f64 / 1_000_000_000.0;
+    let ceiling_linear = 10.0_f64.powf(target_db / 20.0);
+    if terminal.post_gain_reconstructed_error_linear >= ceiling_linear {
+        return Err(format!(
+            "terminal realization bound ({:.12e} FS) leaves no signal headroom below requested ceiling {} dBTP",
+            terminal.post_gain_reconstructed_error_linear,
+            target.render(false),
+        ));
+    }
+    let signal_ceiling_linear = ceiling_linear - terminal.post_gain_reconstructed_error_linear;
+    let signal_ceiling_db = 20.0 * signal_ceiling_linear.log10();
+    let reserve_db = target_db - signal_ceiling_db;
+    if !reserve_db.is_finite() || reserve_db < 0.0 {
+        return Err("hard-ceiling terminal headroom reserve is not finite and non-negative".to_string());
+    }
+    Ok(Some(reserve_db))
+}
+
+fn preconversion_disclosure_messages(
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> Vec<String> {
+    let settings = &req.settings;
+    let mut messages = BTreeSet::new();
+    for track in &source.tracks {
+        if let Some((requested_hz, effective_hz)) = ordinary_lossy_rate_divergence(track, settings) {
+            messages.insert(format!(
+                "{} cannot encode {} directly with Tonepoet's configured encoder; this conversion will use {} instead.",
+                settings.target_format.display_name(),
+                format_sample_rate(requested_hz),
+                format_sample_rate(effective_hz),
+            ));
+        }
+        if let Some(requested_hz) = hard_ceiling_lossy_rate_rejection(track, settings) {
+            messages.insert(format!(
+                "{} cannot encode {} directly; album-scoped hard-ceiling gain forbids rate adaptation after measurement, so this conversion will be refused. Choose a supported output rate.",
+                settings.target_format.display_name(),
+                format_sample_rate(requested_hz),
+            ));
+            // There will be no delivered stream, so do not follow the refusal
+            // with a headroom number for an output that cannot exist.
+            continue;
+        }
+        if !track_requires_dsd_hard_ceiling_rate_exactness(track, settings) {
+            continue;
+        }
+        let Some(sample_rate_hz) = requested_target_rate_hz(track, settings) else {
+            continue;
+        };
+        let Ok(Some(reserve_db)) = album_gain_terminal_headroom_reserve_db(settings, sample_rate_hz)
+        else {
+            continue;
+        };
+        if reserve_db < HARD_CEILING_HEADROOM_DISCLOSURE_THRESHOLD_DB {
+            continue;
+        }
+        let depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
+        let depth = depth
+            .map(pcm_bit_depth_label)
+            .map(|label| format!("{label}/{}", format_sample_rate(sample_rate_hz)))
+            .unwrap_or_else(|| format_sample_rate(sample_rate_hz));
+        let terminal_reason = if settings.dither_type == DitherType::None {
+            "terminal quantization"
+        } else {
+            "terminal dither/quantization"
+        };
+        let target = settings
+            .dsd
+            .album_auto_gain_target_dbfs()
+            .expect("reserve exists only while album auto gain is selected");
+        messages.insert(format!(
+            "Hard-ceiling headroom: {depth} output reserves {reserve_db:.6} dB below the requested {} dBTP ceiling for {terminal_reason} error.",
+            target.render(false),
+        ));
+    }
+    messages.into_iter().collect()
+}
+
+async fn emit_preconversion_disclosures(
+    reporter: &dyn PipelineReporter,
+    item_id: &str,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) {
+    for message in preconversion_disclosure_messages(source, req) {
+        log::warn!("{message}");
+        reporter
+            .emit(PipelineEvent::Progress {
+                item_id: item_id.to_string(),
+                stage: PipelineStage::PlanOutputs,
+                phase_progress: 1.0,
+                message: Some(message),
+            })
+            .await;
     }
 }
 
@@ -23591,7 +23780,24 @@ fn target_sample_rate_setting_label(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> String {
     match settings.target_sample_rate {
-        RateTarget::PcmHz(hz) => format_sample_rate(hz),
+        RateTarget::PcmHz(hz) => {
+            let hard_ceiling_rate_is_exact = source
+                .tracks
+                .iter()
+                .any(|track| track_requires_dsd_hard_ceiling_rate_exactness(track, settings));
+            let effective_hz = if settings.target_format.is_lossy()
+                && !hard_ceiling_rate_is_exact
+            {
+                tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
+                    &settings.target_format,
+                    hz,
+                )
+                .unwrap_or(hz)
+            } else {
+                hz
+            };
+            format_sample_rate(effective_hz)
+        }
         RateTarget::Dsd(rate) => dsd_rate_label(rate).to_string(),
         RateTarget::Source => {
             let labels = source
@@ -30778,6 +30984,69 @@ mod album_true_peak_carrier_tests {
         assert!(aiff_stored < 1.0e-14);
     }
 
+    fn hard_ceiling_settings(
+        depth: tonepoet_pipeline::PcmBitDepth,
+        dither: tonepoet_pipeline::DitherType,
+    ) -> tonepoet_pipeline::PipelineSettings {
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            depth,
+            dither,
+        );
+        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+        settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
+        settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        settings
+    }
+
+    #[test]
+    fn disclosed_terminal_headroom_matches_the_proved_reserve_without_tightening_it() {
+        for (depth, dither, expected_db) in [
+            (
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::None,
+                0.000_542_098_f64,
+            ),
+            (
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::Tpdf,
+                0.001_626_379_f64,
+            ),
+            (
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::Gesemann,
+                0.023_884_023_f64,
+            ),
+            (
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::Shibata,
+                0.091_549_024_f64,
+            ),
+            (
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::HighShibata,
+                0.169_689_406_f64,
+            ),
+            (
+                tonepoet_pipeline::PcmBitDepth::Int24,
+                tonepoet_pipeline::DitherType::HighShibata,
+                0.000_656_449_f64,
+            ),
+        ] {
+            let settings = hard_ceiling_settings(depth, dither);
+            let reserve = album_gain_terminal_headroom_reserve_db(&settings, 44_100)
+                .expect("headroom reserve")
+                .expect("album NormalizePeak reserve");
+            assert!(
+                (reserve - expected_db).abs() < 0.000_000_5,
+                "depth={depth:?} dither={dither:?}: reserve={reserve:.9}, expected={expected_db:.9}",
+            );
+        }
+    }
+
     #[test]
     fn terminal_bound_rejects_custom_output_instead_of_inventing_a_ceiling_domain() {
         let settings = terminal_settings(
@@ -31405,6 +31674,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
     let album_plan = match plan_outputs(&prepared, &req) {
         Ok(album_plan) => {
+            emit_preconversion_disclosures(reporter, &item_id, &prepared, &req).await;
             let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
@@ -34385,6 +34655,13 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     emit_stage_started(reporter, &item_id, PipelineStage::PlanOutputs).await;
     match plan_outputs(source.as_ref().expect("materialized source present"), &req) {
         Ok(album_plan) => {
+            emit_preconversion_disclosures(
+                reporter,
+                &item_id,
+                source.as_ref().expect("materialized source present"),
+                &req,
+            )
+            .await;
             let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Ok);
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
@@ -48533,6 +48810,275 @@ mod pipeline_test_helpers {
         }
     }
 
+    fn configure_native_album_hard_ceiling(
+        req: &mut PipelineRequest,
+        target_rate_hz: u32,
+        depth: tonepoet_pipeline::PcmBitDepth,
+        dither: tonepoet_pipeline::DitherType,
+    ) {
+        req.settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+        req.settings.dither_type = dither;
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd.from_dsd.gain_mode =
+            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+        req.settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
+        req.settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+    }
+
+    #[test]
+    fn ordinary_lossy_rate_divergence_is_predeclared_and_durable_in_the_summary() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(192_000);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(192_000),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        track.bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth =
+            BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
+
+        let messages = preconversion_disclosure_messages(&source, &req);
+        assert!(messages.iter().any(|message| {
+            message.contains("AAC")
+                && message.contains(&format_sample_rate(192_000))
+                && message.contains(&format_sample_rate(96_000))
+                && message.contains("will use")
+        }), "{messages:#?}");
+
+        let summary = conversion_summary(&source.tracks[0], &req, None, None);
+        assert!(summary.contains("24-bit/96kHz AAC"), "{summary}");
+        assert!(summary.contains("sample-rate request 192kHz adjusted to 96kHz"), "{summary}");
+
+        // An explicit request can need no physical resample when the source is
+        // already at the fallback rate. The settings summary must still name
+        // the effective 96 kHz delivery rather than contradicting the plan with
+        // the impossible requested 192 kHz.
+        source.tracks[0].sample_rate = Some(96_000);
+        source.tracks[0].source_audio = SourceAudioDescriptor::from_scalar(
+            Some(96_000),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        req.settings.target_sample_rate = RateTarget::PcmHz(192_000);
+        assert_eq!(
+            target_sample_rate_setting_label(&source, &req.settings),
+            "96kHz"
+        );
+        assert_eq!(
+            sample_rate_transition_log_label(&source, &req.settings),
+            "96kHz"
+        );
+    }
+
+    #[test]
+    fn ordinary_lossy_rate_disclosure_uses_the_bandwidth_preserving_resolution() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let mut req = log_test_request();
+        req.settings.target_sample_rate = RateTarget::Source;
+
+        for (format, requested_hz, effective_hz) in [
+            (tonepoet_pipeline::AudioFormat::Opus, 44_100, 48_000),
+            (tonepoet_pipeline::AudioFormat::Ac3, 22_050, 32_000),
+            (tonepoet_pipeline::AudioFormat::Aac, 192_000, 96_000),
+        ] {
+            let track = &mut source.tracks[0];
+            track.sample_rate = Some(requested_hz);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(requested_hz),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            );
+            track.bit_depth = Some(24);
+            req.settings.target_format = format.clone();
+
+            assert_eq!(
+                ordinary_lossy_rate_divergence(track, &req.settings),
+                Some((requested_hz, effective_hz)),
+                "{format:?}"
+            );
+            let messages = preconversion_disclosure_messages(&source, &req);
+            assert!(
+                messages.iter().any(|message| {
+                    message.contains(format.display_name())
+                        && message.contains(&format_sample_rate(requested_hz))
+                        && message.contains(&format_sample_rate(effective_hz))
+                        && message.contains("will use")
+                }),
+                "{format:?}: {messages:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_track_with_album_gain_settings_is_disclosed_as_ordinary_fallback_not_hard_ceiling() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(192_000);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(192_000),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        track.bit_depth = Some(24);
+
+        let mut req = log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
+        configure_native_album_hard_ceiling(
+            &mut req,
+            192_000,
+            tonepoet_pipeline::PcmBitDepth::Int16,
+            tonepoet_pipeline::DitherType::HighShibata,
+        );
+
+        let messages = preconversion_disclosure_messages(&source, &req);
+        assert!(messages.iter().any(|message| {
+            message.contains("AAC")
+                && message.contains(&format_sample_rate(192_000))
+                && message.contains(&format_sample_rate(96_000))
+                && message.contains("will use")
+        }), "{messages:#?}");
+        assert!(
+            messages.iter().all(|message| !message.contains("will be refused")),
+            "non-DSD tracks are excluded from the album hard-ceiling authority: {messages:#?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("Hard-ceiling headroom")),
+            "non-DSD tracks must not receive DSD hard-ceiling headroom disclosure: {messages:#?}",
+        );
+        assert_eq!(
+            target_sample_rate_setting_label(&source, &req.settings),
+            "96kHz"
+        );
+    }
+
+    #[test]
+    fn hard_ceiling_impossible_lossy_rate_is_predeclared_as_refusal_not_fallback() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(tonepoet_pipeline::DsdRate::Dsd128.hz());
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(tonepoet_pipeline::DsdRate::Dsd128.hz()),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        );
+        track.bit_depth = None;
+
+        let mut req = log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
+        configure_native_album_hard_ceiling(
+            &mut req,
+            192_000,
+            tonepoet_pipeline::PcmBitDepth::Int16,
+            tonepoet_pipeline::DitherType::None,
+        );
+
+        let messages = preconversion_disclosure_messages(&source, &req);
+        let rate_message = messages
+            .iter()
+            .find(|message| message.contains("AAC") && message.contains("192kHz"))
+            .expect("hard-ceiling rate refusal disclosure");
+        assert!(rate_message.contains("will be refused"), "{rate_message}");
+        assert!(!rate_message.contains("will use 96kHz"), "{rate_message}");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("Hard-ceiling headroom")),
+            "a refused rate has no delivered stream whose headroom should be reported: {messages:#?}",
+        );
+    }
+
+    #[test]
+    fn measurable_hard_ceiling_headroom_is_predeclared_but_sub_millidb_reserve_is_not_noisy() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(tonepoet_pipeline::DsdRate::Dsd64.hz());
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(tonepoet_pipeline::DsdRate::Dsd64.hz()),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        );
+        track.bit_depth = None;
+
+        let mut req = log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        configure_native_album_hard_ceiling(
+            &mut req,
+            44_100,
+            tonepoet_pipeline::PcmBitDepth::Int16,
+            tonepoet_pipeline::DitherType::HighShibata,
+        );
+        let messages = preconversion_disclosure_messages(&source, &req);
+        assert!(messages.iter().any(|message| {
+            message.contains("Hard-ceiling headroom")
+                && message.contains("16-bit/44.1kHz")
+                && message.contains("0.169689 dB")
+        }), "{messages:#?}");
+
+        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+        let quiet = preconversion_disclosure_messages(&source, &req);
+        assert!(
+            quiet.iter().all(|message| !message.contains("Hard-ceiling headroom")),
+            "sub-millidB no-dither reserve should remain in the durable log without creating a noisy preflight warning: {quiet:#?}",
+        );
+    }
+
+    #[test]
+    fn conversion_summary_records_hard_ceiling_terminal_reserve() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(44_100);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100),
+            Some(64),
+            Some(SourceAudioCoding::Dsd),
+        );
+        track.bit_depth = Some(64);
+        track.source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+            path: PathBuf::from("/stage/album-gain.f64le"),
+            source_path: PathBuf::from("/music/source.dsf"),
+            sample_rate_hz: 44_100,
+            channels: 2,
+            duration: None,
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        configure_native_album_hard_ceiling(
+            &mut req,
+            44_100,
+            tonepoet_pipeline::PcmBitDepth::Int16,
+            tonepoet_pipeline::DitherType::HighShibata,
+        );
+        req.settings.dsd.bind_runtime_album_gain(
+            tonepoet_pipeline::DbNano::ZERO,
+            Some("-1.000000000".parse().unwrap()),
+            1,
+        );
+
+        let summary = conversion_summary(track, &req, None, None);
+        assert!(
+            summary.contains("hard-ceiling terminal reserve 0.169689 dB below requested 0.000000000 dBTP"),
+            "{summary}",
+        );
+    }
+
     pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
             actions: crate::convert::pipeline::ActionPipeline::default(),
@@ -53985,6 +54531,79 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             );
             cleanup_cue_stream_direct_track_plan(&plan);
         }
+    }
+
+    #[test]
+    fn cue_stream_auto_opus_44k1_uses_explicit_soxr_48k_without_losing_the_direct_route() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Opus;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+        let (track, fallback) = cue_stream_source_depth_track(temp.path(), 24, "album.flac");
+        let staged = temp.path().join("convert-auto-opus/track-00.opus");
+        let plan = prepare_cue_stream_direct_track_plan(
+            &req,
+            &track,
+            &fallback,
+            &staged,
+            &temp.path().join("work-auto-opus"),
+        )
+        .expect("Auto Opus plan")
+        .expect("44.1 kHz Opus must remain directly streamable");
+
+        assert_eq!(
+            plan.planned_command.tool,
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg
+        );
+        assert!(
+            plan.planned_command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-ar" && pair[1] == "48000"),
+            "Opus encoder boundary must be pinned to 48 kHz: {:?}",
+            plan.planned_command.args
+        );
+        let filter = plan
+            .planned_command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-af")
+            .map(|pair| pair[1].as_str())
+            .expect("44.1 -> 48 kHz Opus must use an explicit SoXR filter");
+        assert!(filter.starts_with("aresample=resampler=soxr:"), "{filter}");
+        assert!(filter.contains("out_sample_rate=48000"), "{filter}");
+        assert!(!filter.contains("dither_method="), "{filter}");
+        assert!(!filter.contains("out_sample_fmt="), "{filter}");
+
+        let consumer = cue_stream_consumer_command(
+            &plan,
+            44_100,
+            2,
+            CueSegmentCarrier::PcmS32LeWav,
+        )
+        .expect("Opus direct stream consumer");
+        assert!(
+            consumer
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-ar" && pair[1] == "44100"),
+            "raw CUE input rate must remain 44.1 kHz: {:?}",
+            consumer.args
+        );
+        assert!(
+            consumer
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-ar" && pair[1] == "48000"),
+            "output encoder rate must remain pinned to 48 kHz: {:?}",
+            consumer.args
+        );
+        cleanup_cue_stream_direct_track_plan(&plan);
     }
 
     #[test]

@@ -830,6 +830,110 @@ fn cue_stream_ffmpeg_filter_is_only_carrier_depth_normalization(
     filter == &format!("aresample={}", expected_options.join(":"))
 }
 
+fn cue_stream_ffmpeg_filter_is_only_lossy_rate_conversion(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+    target_rate_hz: u32,
+) -> bool {
+    use tonepoet_pipeline::DitherType;
+
+    if plan_request.settings.dither_type != DitherType::None
+        || plan_request.source.sample_rate_hz == Some(target_rate_hz)
+    {
+        return false;
+    }
+    let af_positions = command
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (arg == "-af").then_some(index))
+        .collect::<Vec<_>>();
+    if af_positions.len() != 1 {
+        return false;
+    }
+    let Some(filter) = command.args.get(af_positions[0] + 1) else {
+        return false;
+    };
+
+    let settings = &plan_request.settings;
+    let mut expected_options = vec![
+        "resampler=soxr".to_string(),
+        format!("out_sample_rate={target_rate_hz}"),
+        format!(
+            "precision={}",
+            tonepoet_pipeline::soxr_precision(settings.resample_quality)
+        ),
+    ];
+    let cutoff = settings
+        .soxr_resampler
+        .cutoff
+        .unwrap_or_else(|| tonepoet_pipeline::ffmpeg_cutoff(settings.nyquist_transition));
+    expected_options.push(format!("cutoff={cutoff:.3}"));
+    if settings.soxr_resampler.chebyshev {
+        expected_options.push("cheby=1".to_string());
+    }
+    if let Some(phase) = settings.soxr_resampler.phase {
+        expected_options.push(format!("phase_shift={phase}"));
+    }
+    filter == &format!("aresample={}", expected_options.join(":"))
+}
+
+fn cue_stream_ffmpeg_lossy_plan_is_phase1_direct(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+) -> bool {
+    use tonepoet_pipeline::{DitherType, RateTarget};
+
+    if !plan_request.settings.target_format.is_lossy()
+        || plan_request.settings.dither_type != DitherType::None
+    {
+        return false;
+    }
+    let requested_rate_hz = match plan_request.settings.target_sample_rate {
+        RateTarget::Source => plan_request.source.sample_rate_hz,
+        RateTarget::PcmHz(rate_hz) => Some(rate_hz),
+        RateTarget::Dsd(_) => None,
+    };
+    let Some(requested_rate_hz) = requested_rate_hz else {
+        return false;
+    };
+    let Some(target_rate_hz) =
+        tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
+            &plan_request.settings.target_format,
+            requested_rate_hz,
+        )
+    else {
+        return false;
+    };
+
+    let ar_positions = command
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (arg == "-ar").then_some(index))
+        .collect::<Vec<_>>();
+    if ar_positions.len() != 1
+        || command
+            .args
+            .get(ar_positions[0] + 1)
+            .and_then(|value| value.parse::<u32>().ok())
+            != Some(target_rate_hz)
+    {
+        return false;
+    }
+
+    let af_count = command.args.iter().filter(|arg| arg.as_str() == "-af").count();
+    if plan_request.source.sample_rate_hz == Some(target_rate_hz) {
+        af_count == 0
+    } else {
+        cue_stream_ffmpeg_filter_is_only_lossy_rate_conversion(
+            plan_request,
+            command,
+            target_rate_hz,
+        )
+    }
+}
+
 fn cue_stream_ffmpeg_plan_is_phase1_direct(
     plan_request: &PlanRequest,
     command: &PlannedCommand,
@@ -858,11 +962,17 @@ fn cue_stream_ffmpeg_plan_is_phase1_direct(
         || command
             .args
             .iter()
-            .any(|arg| matches!(arg.as_str(), "-filter_complex" | "-ar"))
+            .any(|arg| arg == "-filter_complex")
     {
         return false;
     }
 
+    if plan_request.settings.target_format.is_lossy() {
+        return cue_stream_ffmpeg_lossy_plan_is_phase1_direct(plan_request, command);
+    }
+    if command.args.iter().any(|arg| arg == "-ar") {
+        return false;
+    }
     let af_count = command.args.iter().filter(|arg| arg.as_str() == "-af").count();
     af_count == 0
         || (af_count == 1
@@ -991,9 +1101,10 @@ fn cue_stream_phase1_direct_plan_for_paths(
     // Phase 1 stays intentionally narrow. A 16/24-bit source carried as raw
     // s32 may legitimately look like a depth conversion to the ordinary
     // planner even when the requested output preserves the authoritative source
-    // width. FFmpeg is admitted only with its exact carrier-normalization
-    // aresample filter; SoX is admitted only when the complete canonical command
-    // is a single no-effect Int16/Int24 lossless encode. Real DSP remains
+    // width. FFmpeg is admitted only for the exact carrier-normalization filter
+    // or the exact ordinary lossy SoXR rate-conversion filter emitted by the
+    // planner; SoX is admitted only when the complete canonical command is a
+    // single no-effect Int16/Int24 lossless encode. Every other DSP shape stays
     // file-backed, and the existing WavPack-hybrid/FFmpeg-Int24 fidelity guards
     // remain planner authority rather than being bypassed here.
     let direct = match &command.tool {

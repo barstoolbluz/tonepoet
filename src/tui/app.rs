@@ -3478,6 +3478,74 @@ mod clamp_pill_tests {
             "MP3 cap should land on 48 kHz, not wrap to 44.1"
         );
     }
+
+    #[test]
+    fn lossy_picker_concrete_rates_match_the_pipeline_encoder_authority() {
+        use super::SOURCE_SAMPLE_RATE_SENTINEL;
+
+        for fmt in [
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Opus,
+            AudioFormat::Dts,
+            AudioFormat::Ac3,
+        ] {
+            let mut state = FormatState::new();
+            state.format.select_value(&fmt);
+            state.apply_format_constraints();
+            let pipeline_format = crate::tui::convert_actions::map_audio_format(fmt, None);
+            for option in &state.sample_rate.options {
+                if option.value == SOURCE_SAMPLE_RATE_SENTINEL {
+                    assert_eq!(
+                        option.enabled,
+                        matches!(fmt, AudioFormat::Mp3 | AudioFormat::Aac),
+                        "unexpected Source availability for {fmt:?}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    option.enabled,
+                    tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+                        &pipeline_format,
+                        option.value,
+                    ) == Some(true),
+                    "picker/planner rate drift for {fmt:?} at {} Hz",
+                    option.value,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aac_192k_clamps_to_96k_and_dts_ac3_expose_their_valid_44k1_cell() {
+        use super::SOURCE_SAMPLE_RATE_SENTINEL;
+
+        let mut aac = FormatState::new();
+        aac.sample_rate.select_value(&192_000);
+        aac.format.select_value(&AudioFormat::Aac);
+        aac.apply_format_constraints();
+        assert_eq!(*aac.sample_rate.selected_value(), 96_000);
+        assert!(aac.sample_rate.options.iter().any(|option| {
+            option.value == 96_000 && option.enabled
+        }));
+        assert!(aac.sample_rate.options.iter().any(|option| {
+            option.value == 192_000 && !option.enabled
+        }));
+
+        for fmt in [AudioFormat::Dts, AudioFormat::Ac3] {
+            let mut state = FormatState::new();
+            state.sample_rate.select_value(&44_100);
+            state.format.select_value(&fmt);
+            state.apply_format_constraints();
+            assert_eq!(*state.sample_rate.selected_value(), 44_100, "{fmt:?}");
+        }
+
+        let mut opus = FormatState::new();
+        opus.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        opus.format.select_value(&AudioFormat::Opus);
+        opus.apply_format_constraints();
+        assert_eq!(*opus.sample_rate.selected_value(), 48_000);
+    }
 }
 
 #[cfg(test)]
@@ -5156,13 +5224,6 @@ impl FormatState {
             &DsdReconstructionSelection::Reference,
             self.dsd_reference_controls_available(),
         );
-        let target_rate_hz = *self.sample_rate.selected_value();
-        let wideband_available = self.dsd_reference_controls_available()
-            && self.source_dsd_rate_hz == Some(5_644_800)
-            && target_rate_hz >= 176_400
-            && target_rate_hz != SOURCE_SAMPLE_RATE_SENTINEL;
-        self.dsd_profile
-            .set_enabled(&DsdReconstructionSelection::Wideband, wideband_available);
         // Pre-promotion exposes the exact legacy Disabled/Auto/Manual family.
         // Promotion switches this same row to the native Reference family; the
         // two settings origins are never mixed.
@@ -5236,24 +5297,44 @@ impl FormatState {
 
         match fmt {
             AudioFormat::Dsf | AudioFormat::Dff => {}
-            AudioFormat::Opus => {
-                self.sample_rate.select_value(&48_000);
-                for opt in &mut self.sample_rate.options {
-                    opt.enabled = opt.value == 48_000;
+            AudioFormat::Mp3
+            | AudioFormat::Aac
+            | AudioFormat::Opus
+            | AudioFormat::Dts
+            | AudioFormat::Ac3 => {
+                self.bit_depth.set_all_enabled(false);
+                self.dither.set_all_enabled(false);
+                let pipeline_format =
+                    crate::tui::convert_actions::map_audio_format(fmt, None);
+                // Concrete choices use the planner's encoder table. Source is
+                // kept only for the cap-style formats that historically
+                // expose it; its concrete value is validated after source
+                // resolution in the pure planner.
+                let source_rate_allowed = matches!(fmt, AudioFormat::Mp3 | AudioFormat::Aac);
+                if !source_rate_allowed
+                    && *self.sample_rate.selected_value() == SOURCE_SAMPLE_RATE_SENTINEL
+                {
+                    // Preserve the established pin-style behavior for Opus,
+                    // DTS and AC3 even while source facts are unstaged. Unlike
+                    // ordinary clamping, an intentionally disabled Source
+                    // sentinel must not be retained for these formats.
+                    self.sample_rate.select_value(&48_000);
                 }
-                self.bit_depth.set_all_enabled(false);
-                self.dither.set_all_enabled(false);
-            }
-            AudioFormat::Aac => {
-                self.bit_depth.set_all_enabled(false);
-                self.dither.set_all_enabled(false);
                 for opt in &mut self.sample_rate.options {
-                    if opt.value != SOURCE_SAMPLE_RATE_SENTINEL && opt.value > 192_000 {
-                        opt.enabled = false;
+                    if opt.value == SOURCE_SAMPLE_RATE_SENTINEL {
+                        opt.enabled &= source_rate_allowed;
+                    } else {
+                        opt.enabled &= tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+                            &pipeline_format,
+                            opt.value,
+                        ) == Some(true);
                     }
                 }
             }
-            AudioFormat::Mp3 | AudioFormat::Ogg => {
+            AudioFormat::Ogg => {
+                // Decode-only: retained solely for the legacy state model.
+                // Ogg is never an output target and therefore has no pipeline
+                // encoder capability table to derive from.
                 self.bit_depth.set_all_enabled(false);
                 self.dither.set_all_enabled(false);
                 for opt in &mut self.sample_rate.options {
@@ -5283,17 +5364,6 @@ impl FormatState {
             AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::Lpcm => {
                 // Full range including float32 and float64.
             }
-            // Dts/Ac3 are lossy, 48kHz only
-            AudioFormat::Dts | AudioFormat::Ac3 => {
-                self.bit_depth.set_all_enabled(false);
-                self.dither.set_all_enabled(false);
-                self.sample_rate.select_value(&48_000);
-                for opt in &mut self.sample_rate.options {
-                    if opt.value != 48_000 {
-                        opt.enabled = false;
-                    }
-                }
-            }
             // Ape/Shorten/TTA are lossless but not encodable; same constraints as FLAC.
             AudioFormat::Ape | AudioFormat::Musepack | AudioFormat::Shorten | AudioFormat::Tta => {
                 self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
@@ -5305,6 +5375,22 @@ impl FormatState {
                 }
             }
         }
+
+        // Rate-dependent DSD profile admission must see the constrained sample
+        // rate, not the value that happened to be selected before a format
+        // switch. In particular, AAC 176.4/192 kHz now clamps to 96 kHz;
+        // leaving Wideband enabled from the pre-clamp value would create an
+        // internally inconsistent Reference request.
+        let retain_disabled_sentinel =
+            self.source_rate_identity != SourceRateIdentity::Known;
+        clamp_sample_rate_pill(&mut self.sample_rate, retain_disabled_sentinel);
+        let target_rate_hz = *self.sample_rate.selected_value();
+        let wideband_available = self.dsd_reference_controls_available()
+            && self.source_dsd_rate_hz == Some(5_644_800)
+            && target_rate_hz >= 176_400
+            && target_rate_hz != SOURCE_SAMPLE_RATE_SENTINEL;
+        self.dsd_profile
+            .set_enabled(&DsdReconstructionSelection::Wideband, wideband_available);
 
         // Native-v2 Reference owns resampling and dither, but the pre-promotion
         // legacy DSD-to-PCM route still exposes the generic controls.  Do not

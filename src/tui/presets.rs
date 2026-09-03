@@ -1838,6 +1838,30 @@ merge = "multi-file"
     }
 
     #[test]
+    fn aac_preset_with_now_impossible_concrete_rate_is_refused_explicitly() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("aac-legacy-rate", &format, &output, &metadata);
+        preset.format = "aac".to_string();
+        preset.sample_rate = 192_000;
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert!(report.refused_fields.iter().any(|field| field == "sample_rate"));
+        assert!(report.status_suffix().contains("sample_rate"));
+        assert_eq!(*restored_format.format.selected_value(), AudioFormat::Aac);
+        assert_ne!(*restored_format.sample_rate.selected_value(), 192_000);
+    }
+
+    #[test]
     fn dsd_preset_refusal_is_independent_of_disabled_pcm_prestate() {
         let format = FormatState::new();
         let output = OutputOptionsState::new();

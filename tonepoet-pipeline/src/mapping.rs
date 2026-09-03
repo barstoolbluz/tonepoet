@@ -450,6 +450,14 @@ mod tests {
             Some(false)
         );
         assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Opus, 24_000),
+            Some(false)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Opus, 48_000),
+            Some(true)
+        );
+        assert_eq!(
             ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Ac3, 48_000),
             Some(true)
         );
@@ -457,6 +465,69 @@ mod tests {
             ffmpeg_lossy_encoder_accepts_rate_directly(&AudioFormat::Flac, 48_000),
             None
         );
+    }
+
+    #[test]
+    fn lossy_encoder_rate_resolution_preserves_bandwidth_when_a_higher_cell_exists() {
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Aac, 192_000),
+            Some(96_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Aac, 176_400),
+            Some(96_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Aac, 50_000),
+            Some(64_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Mp3, 96_000),
+            Some(48_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Mp3, 45_000),
+            Some(48_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Dts, 44_100),
+            Some(44_100)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Ac3, 44_100),
+            Some(44_100)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Ac3, 22_050),
+            Some(32_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Opus, 8_000),
+            Some(48_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Opus, 44_100),
+            Some(48_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Opus, 192_000),
+            Some(48_000)
+        );
+        assert_eq!(
+            ffmpeg_lossy_encoder_rate_for_request(&AudioFormat::Flac, 192_000),
+            None
+        );
+
+        for format in [
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Opus,
+            AudioFormat::Dts,
+            AudioFormat::Ac3,
+        ] {
+            let rates = ffmpeg_lossy_encoder_direct_rates(&format).unwrap();
+            assert!(rates.windows(2).all(|pair| pair[0] < pair[1]), "{format:?}: {rates:?}");
+        }
     }
 }
 
@@ -532,58 +603,79 @@ pub const fn ffmpeg_aac_profile(profile: AacProfile) -> &'static str {
     }
 }
 
-/// Whether Tonepoet's configured FFmpeg lossy encoder accepts
-/// `sample_rate_hz` directly, without FFmpeg inserting a rate conversion
-/// before the encoder.
+const MP3_DIRECT_SAMPLE_RATES_HZ: &[u32] = &[
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
+const AAC_DIRECT_SAMPLE_RATES_HZ: &[u32] = &[
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200,
+    96_000,
+];
+const OPUS_DIRECT_SAMPLE_RATES_HZ: &[u32] = &[48_000];
+const DTS_DIRECT_SAMPLE_RATES_HZ: &[u32] = &[
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
+const AC3_DIRECT_SAMPLE_RATES_HZ: &[u32] = &[32_000, 44_100, 48_000];
+
+/// PCM rates Tonepoet may present directly to its configured FFmpeg encoder
+/// without a rate conversion remaining inside the encoder boundary.
 ///
-/// This is intentionally an encoder-capability table, not a general codec
-/// sample-rate claim. The encoder names are fixed by `plugins.rs`:
-/// `libmp3lame`, `libfdk_aac`, `libopus`, `dca`, and `ac3`. FFmpeg may accept
-/// other input rates by automatically resampling them, but that is not a
-/// direct-rate path and therefore cannot be used after a proved album
-/// NormalizePeak gain.
+/// This is the single authority for both admission and ordinary-path rate
+/// resolution. For MP3, AAC, DTS and AC-3 these are output sample rates. Opus
+/// is different: its coded stream runs at 48 kHz, so lower libopus input-rate
+/// modes are bandwidth limits rather than alternate output rates. Tonepoet
+/// therefore exposes only 48 kHz as a direct Opus encoder-boundary rate and
+/// performs any required conversion before encoding.
+///
+/// The encoder names are fixed by `plugins.rs`: `libmp3lame`, `libfdk_aac`,
+/// `libopus`, `dca`, and `ac3`. The slices are strictly ascending.
 #[must_use]
-pub(crate) fn ffmpeg_lossy_encoder_accepts_rate_directly(
+pub fn ffmpeg_lossy_encoder_direct_rates(format: &AudioFormat) -> Option<&'static [u32]> {
+    match format {
+        AudioFormat::Mp3 => Some(MP3_DIRECT_SAMPLE_RATES_HZ),
+        AudioFormat::Aac => Some(AAC_DIRECT_SAMPLE_RATES_HZ),
+        AudioFormat::Opus => Some(OPUS_DIRECT_SAMPLE_RATES_HZ),
+        AudioFormat::Dts => Some(DTS_DIRECT_SAMPLE_RATES_HZ),
+        AudioFormat::Ac3 => Some(AC3_DIRECT_SAMPLE_RATES_HZ),
+        _ => None,
+    }
+}
+
+/// Whether `sample_rate_hz` is a rate-stable direct boundary rate for
+/// Tonepoet's configured FFmpeg lossy encoder.
+///
+/// This is intentionally an encoder-boundary authority, not a general codec
+/// input-rate claim. FFmpeg/libopus may accept other input rates by resampling
+/// before or inside the encoder, but those are not direct rate-stable paths and
+/// therefore cannot be used after a proved album NormalizePeak gain.
+#[must_use]
+pub fn ffmpeg_lossy_encoder_accepts_rate_directly(
     format: &AudioFormat,
     sample_rate_hz: u32,
 ) -> Option<bool> {
-    let accepted = match format {
-        AudioFormat::Mp3 => matches!(
-            sample_rate_hz,
-            8_000
-                | 11_025
-                | 12_000
-                | 16_000
-                | 22_050
-                | 24_000
-                | 32_000
-                | 44_100
-                | 48_000
-        ),
-        AudioFormat::Aac => matches!(
-            sample_rate_hz,
-            8_000
-                | 11_025
-                | 12_000
-                | 16_000
-                | 22_050
-                | 24_000
-                | 32_000
-                | 44_100
-                | 48_000
-                | 64_000
-                | 88_200
-                | 96_000
-        ),
-        AudioFormat::Opus => matches!(sample_rate_hz, 8_000 | 12_000 | 16_000 | 24_000 | 48_000),
-        AudioFormat::Dts => matches!(
-            sample_rate_hz,
-            8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
-        ),
-        AudioFormat::Ac3 => matches!(sample_rate_hz, 32_000 | 44_100 | 48_000),
-        _ => return None,
-    };
-    Some(accepted)
+    ffmpeg_lossy_encoder_direct_rates(format)
+        .map(|rates| rates.binary_search(&sample_rate_hz).is_ok())
+}
+
+/// Resolve the ordinary lossy encoder-boundary rate for `requested_hz`.
+///
+/// Exact supported requests remain exact. Requests below or between supported
+/// rates resolve upward to the smallest rate that can preserve their requested
+/// bandwidth. Requests above the format maximum resolve downward to that
+/// maximum. Since Opus exposes only 48 kHz in the authority table, every Opus
+/// request resolves to 48 kHz.
+///
+/// Returns `None` only for targets without a built-in lossy rate authority.
+#[must_use]
+pub fn ffmpeg_lossy_encoder_rate_for_request(
+    format: &AudioFormat,
+    requested_hz: u32,
+) -> Option<u32> {
+    let rates = ffmpeg_lossy_encoder_direct_rates(format)?;
+    match rates.binary_search(&requested_hz) {
+        Ok(index) => Some(rates[index]),
+        Err(index) if index < rates.len() => Some(rates[index]),
+        Err(_) => rates.last().copied(),
+    }
 }
 
 /// FFmpeg/libopus application string.

@@ -1153,7 +1153,7 @@ fn validate_request_semantics(request: &PlanRequest) -> Result<()> {
     if request.settings.ssrc.force
         && (request.source.is_dsd()
             || request.settings.target_format.is_dsd()
-            || rate_change_for_pcm(request).is_none())
+            || rate_change_for_pcm(request)?.is_none())
     {
         return Err(PlanningError::invalid_settings(
             "ssrc.force",
@@ -1322,7 +1322,7 @@ fn plan_from_dsd(
     current_input: &mut InputSource,
     final_work: PathBuf,
 ) -> Result<()> {
-    let target_rate_hz = match request.settings.target_sample_rate {
+    let requested_target_rate_hz = match request.settings.target_sample_rate {
         RateTarget::PcmHz(hz) => hz,
         RateTarget::Source => request
             .source
@@ -1340,6 +1340,11 @@ fn plan_from_dsd(
                 "PCM targets cannot use RateTarget::Dsd",
             ));
         }
+    };
+    let target_rate_hz = if request.settings.target_format.is_lossy() {
+        resolve_lossy_encoder_target_rate(request, requested_target_rate_hz)?
+    } else {
+        requested_target_rate_hz
     };
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
@@ -1393,7 +1398,11 @@ fn plan_from_dsd(
         steps,
         current_input,
         final_work,
-        None,
+        request
+            .settings
+            .target_format
+            .is_lossy()
+            .then_some(target_rate_hz),
         target_depth,
         false,
     )?;
@@ -1407,7 +1416,8 @@ fn plan_from_pcm(
     current_input: &mut InputSource,
     final_work: PathBuf,
 ) -> Result<()> {
-    let processing_rate = rate_change_for_pcm(request);
+    let lossy_encoder_rate = resolved_lossy_encoder_target_rate(request)?;
+    let processing_rate = rate_change_for_pcm(request)?;
     if request.settings.dsd.runtime_album_gain_db().is_some() {
         if request.source.representation_kind() != SourceRepresentationKind::Dsd {
             return Err(PlanningError::invalid_source(
@@ -1497,7 +1507,7 @@ fn plan_from_pcm(
             steps,
             current_input,
             final_work,
-            None,
+            lossy_encoder_rate,
             target_depth,
             false,
         )?;
@@ -1541,7 +1551,7 @@ fn plan_from_pcm(
             steps,
             current_input,
             final_work,
-            None,
+            lossy_encoder_rate,
             target_depth,
             false,
         )?;
@@ -1553,7 +1563,7 @@ fn plan_from_pcm(
         steps,
         current_input,
         final_work,
-        processing_rate,
+        lossy_encoder_rate.or(processing_rate),
         target_depth,
         needs_processing,
     )
@@ -1825,12 +1835,83 @@ fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
     }
 }
 
-fn rate_change_for_pcm(request: &PlanRequest) -> Option<u32> {
-    match request.settings.target_sample_rate {
+fn dsd_hard_ceiling_requires_exact_encoder_rate(request: &PlanRequest) -> bool {
+    request.source.representation_kind() == SourceRepresentationKind::Dsd
+        && (request.settings.dsd.album_auto_gain_selected()
+            || request.settings.dsd.runtime_album_gain_db().is_some())
+}
+
+fn resolve_lossy_encoder_target_rate(request: &PlanRequest, requested_hz: u32) -> Result<u32> {
+    match mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
+        &request.settings.target_format,
+        requested_hz,
+    ) {
+        Some(true) => Ok(requested_hz),
+        Some(false) if dsd_hard_ceiling_requires_exact_encoder_rate(request) => {
+            Err(PlanningError::invalid_settings(
+                "target_sample_rate",
+                format!(
+                    "album-scoped DSD hard-ceiling gain requires {} to accept {} Hz directly; rate adaptation after a hard-ceiling measurement is forbidden",
+                    request.settings.target_format,
+                    requested_hz,
+                ),
+            ))
+        }
+        Some(false) => mapping::ffmpeg_lossy_encoder_rate_for_request(
+            &request.settings.target_format,
+            requested_hz,
+        )
+        .ok_or_else(|| {
+            PlanningError::invalid_settings(
+                "target_format",
+                format!(
+                    "{} is marked as lossy but has no configured ordinary FFmpeg rate resolution for {} Hz",
+                    request.settings.target_format,
+                    requested_hz,
+                ),
+            )
+        }),
+        None => Err(PlanningError::invalid_settings(
+            "target_format",
+            format!(
+                "{} is marked as lossy but has no configured FFmpeg direct-rate capability table",
+                request.settings.target_format,
+            ),
+        )),
+    }
+}
+
+fn resolved_lossy_encoder_target_rate(request: &PlanRequest) -> Result<Option<u32>> {
+    if !request.settings.target_format.is_lossy() {
+        return Ok(None);
+    }
+    let requested_hz = match request.settings.target_sample_rate {
+        RateTarget::Source => request.source.sample_rate_hz.ok_or_else(|| {
+            PlanningError::invalid_source(
+                "sample_rate_hz",
+                "a lossy same-as-source target requires an authoritative source PCM sample rate before encoder planning",
+            )
+        })?,
+        RateTarget::PcmHz(hz) => hz,
+        RateTarget::Dsd(_) => {
+            return Err(PlanningError::invalid_settings(
+                "target_sample_rate",
+                "lossy PCM targets cannot use RateTarget::Dsd",
+            ));
+        }
+    };
+    resolve_lossy_encoder_target_rate(request, requested_hz).map(Some)
+}
+
+fn rate_change_for_pcm(request: &PlanRequest) -> Result<Option<u32>> {
+    if let Some(effective_hz) = resolved_lossy_encoder_target_rate(request)? {
+        return Ok((request.source.sample_rate_hz != Some(effective_hz)).then_some(effective_hz));
+    }
+    Ok(match request.settings.target_sample_rate {
         RateTarget::Source | RateTarget::Dsd(_) => None,
         RateTarget::PcmHz(hz) if request.source.sample_rate_hz == Some(hz) => None,
         RateTarget::PcmHz(hz) => Some(hz),
-    }
+    })
 }
 
 fn resolve_target_dsd_rate(request: &PlanRequest) -> Result<DsdRate> {
@@ -2082,6 +2163,236 @@ mod dsd_album_gain_carrier_planning_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod ordinary_lossy_rate_resolution_tests {
+    use super::*;
+    use crate::enums::{AudioCodec, AudioFormat, BitDepthTarget, PcmBitDepth, RateTarget, SampleKind};
+    use crate::settings::PipelineSettings;
+    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use std::path::PathBuf;
+
+    fn pcm_request(source_rate_hz: u32, target: RateTarget) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        settings.target_sample_rate = target;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("input.wav"),
+            output_path: PathBuf::from("output.m4a"),
+            source: SourceInfo {
+                dsd_source_kind: None,
+                format: AudioFormat::Wav,
+                codec: AudioCodec::PcmSigned,
+                sample_rate_hz: Some(source_rate_hz),
+                bit_depth: Some(PcmBitDepth::Int24),
+                true_source_depth: Some(PcmBitDepth::Int24),
+                source_representation: SourceRepresentationKind::Pcm,
+                sample_kind: Some(SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn dsd_request() -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        settings.target_sample_rate = RateTarget::Source;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("input.dsf"),
+            output_path: PathBuf::from("output.m4a"),
+            source: SourceInfo {
+                dsd_source_kind: None,
+                format: AudioFormat::Dsf,
+                codec: AudioCodec::Dsd,
+                sample_rate_hz: Some(DsdRate::Dsd128.hz()),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: SourceRepresentationKind::Dsd,
+                sample_kind: Some(SampleKind::Dsd),
+                channels: Some(2),
+                duration: None,
+                audio_md5: None,
+            },
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    fn lossy_step_rate(steps: &[PlanStep]) -> Option<u32> {
+        steps.iter().find_map(|step| match &step.operation {
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz,
+                ..
+            } => *target_rate_hz,
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn pcm_same_as_source_aac_192k_resolves_to_96k_and_pins_the_encoder() {
+        let request = pcm_request(192_000, RateTarget::Source);
+        let topology = plan_topology(&request).expect("ordinary AAC Source rate should adapt before encode");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert_eq!(lossy_step_rate(&steps), Some(96_000), "{steps:#?}");
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            PlanOperation::EncodeLossy {
+                target_rate_hz: Some(96_000),
+                apply_processing: true,
+                ..
+            }
+        )), "192 -> 96 must be explicit processing, not FFmpeg negotiation: {steps:#?}");
+    }
+
+    #[test]
+    fn pcm_explicit_aac_176k4_resolves_to_96k_while_supported_rate_stays_exact() {
+        let request = pcm_request(176_400, RateTarget::PcmHz(176_400));
+        let topology = plan_topology(&request).expect("ordinary AAC 176.4 kHz should adapt");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert_eq!(lossy_step_rate(&steps), Some(96_000), "{steps:#?}");
+
+        let supported = pcm_request(96_000, RateTarget::Source);
+        let topology = plan_topology(&supported).expect("AAC 96 kHz Source rate should stay exact");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert_eq!(lossy_step_rate(&steps), Some(96_000), "{steps:#?}");
+    }
+
+    #[test]
+    fn pcm_same_as_source_mp3_high_rate_resolves_to_48k() {
+        let mut request = pcm_request(192_000, RateTarget::Source);
+        request.settings.target_format = AudioFormat::Mp3;
+        request.output_path = PathBuf::from("output.mp3");
+        let topology = plan_topology(&request).expect("ordinary MP3 Source rate should adapt before encode");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Mp3,
+                target_rate_hz: Some(48_000),
+                ..
+            }
+        )), "192 -> 48 must be a planner-owned MP3 rate choice: {steps:#?}");
+    }
+
+    #[test]
+    fn pcm_same_as_source_opus_44k1_resolves_to_48k() {
+        let mut request = pcm_request(44_100, RateTarget::Source);
+        request.settings.target_format = AudioFormat::Opus;
+        request.output_path = PathBuf::from("output.opus");
+        let topology = plan_topology(&request)
+            .expect("ordinary Opus Source rate should resolve to the fixed 48 kHz encoder boundary");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Opus,
+                target_rate_hz: Some(48_000),
+                apply_processing: true,
+            }
+        )), "44.1 -> 48 must be explicit Tonepoet processing before Opus encode: {steps:#?}");
+    }
+
+    #[test]
+    fn pcm_track_carrying_album_auto_gain_settings_still_uses_ordinary_lossy_fallback() {
+        let mut request = pcm_request(192_000, RateTarget::Source);
+        request
+            .settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(crate::enums::DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy album hard-ceiling settings");
+        request
+            .settings
+            .dsd
+            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
+
+        let topology = plan_topology(&request)
+            .expect("non-DSD tracks are excluded from album gain and retain ordinary fallback");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert_eq!(lossy_step_rate(&steps), Some(96_000), "{steps:#?}");
+    }
+
+    #[test]
+    fn dsd_same_as_source_aac_resolves_before_carrier_creation_and_pins_final_encode() {
+        let request = dsd_request();
+        let topology = plan_topology(&request).expect("ordinary DSD to AAC should resolve a supported PCM rate");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            PlanOperation::DsdToPcm { target_rate_hz: 96_000, .. }
+        )), "DSD carrier itself should be built at the resolved rate: {steps:#?}");
+        assert_eq!(lossy_step_rate(&steps), Some(96_000), "{steps:#?}");
+    }
+
+    #[test]
+    fn album_hard_ceiling_rejects_unsupported_rate_before_runtime_gain_is_bound() {
+        let mut request = dsd_request();
+        request
+            .settings
+            .dsd
+            .set_legacy_dsd_to_pcm_gain(crate::enums::DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy album hard-ceiling settings");
+        request
+            .settings
+            .dsd
+            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
+
+        let error = plan_conversion(&request)
+            .expect_err("hard-ceiling DSD128 Source -> AAC must not adapt 176.4 kHz to 96 kHz");
+        let message = error.to_string();
+        assert!(message.contains("album-scoped DSD hard-ceiling gain"), "{message}");
+        assert!(message.contains("accept 176400 Hz directly"), "{message}");
+        assert!(message.contains("rate adaptation"), "{message}");
+    }
+
+    #[test]
+    fn below_minimum_ac3_source_rate_resolves_upward_to_32k() {
+        let mut request = pcm_request(22_050, RateTarget::Source);
+        request.settings.target_format = AudioFormat::Ac3;
+        request.output_path = PathBuf::from("output.ac3");
+        let topology = plan_topology(&request)
+            .expect("22.05 kHz AC-3 source should resolve upward instead of being refused");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("lossy target must execute");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Ac3,
+                target_rate_hz: Some(32_000),
+                apply_processing: true,
+            }
+        )), "22.05 -> 32 must preserve available source bandwidth: {steps:#?}");
     }
 }
 

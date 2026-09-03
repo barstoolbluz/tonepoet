@@ -559,7 +559,10 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     Ok(settings)
 }
 
-fn map_audio_format(format: AudioFormat, container_ext: Option<&str>) -> pipeline_enums::AudioFormat {
+pub(crate) fn map_audio_format(
+    format: AudioFormat,
+    container_ext: Option<&str>,
+) -> pipeline_enums::AudioFormat {
     match (format, container_ext) {
         // Backward-compatible DSD container routing: a DSF target with the
         // DFF container override should still route to the pipeline's Dff

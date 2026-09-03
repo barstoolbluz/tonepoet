@@ -769,20 +769,40 @@ fn build_ffmpeg_encode_lossy(
             ));
         }
     }
+    let encoder_rate_hz = target_rate_hz.ok_or_else(|| {
+        PlanningError::invalid_settings(
+            "target_sample_rate",
+            format!(
+                "{} encode requires an explicit resolved encoder-input sample rate; refusing to let FFmpeg choose or resample one implicitly",
+                target_format,
+            ),
+        )
+    })?;
+    if mapping::ffmpeg_lossy_encoder_accepts_rate_directly(target_format, encoder_rate_hz)
+        != Some(true)
+    {
+        return Err(PlanningError::invalid_settings(
+            "target_sample_rate",
+            format!(
+                "{} does not accept {} Hz directly with Tonepoet's configured FFmpeg encoder; planner must resolve a supported rate before encoding",
+                target_format,
+                encoder_rate_hz,
+            ),
+        ));
+    }
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let mut args = ffmpeg_base_input_args(context, step, &input)?;
     add_ffmpeg_metadata_args(context, &mut args, target_format);
     if apply_processing {
-        if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+        let filter = ffmpeg_lossy_processing_filter(context, encoder_rate_hz);
+        if !filter.is_empty() {
             args.push("-af".into());
-            args.push(format!("volume={}dB:precision=double", gain.render(false)));
+            args.push(filter);
         }
     }
-    if let Some(rate) = target_rate_hz {
-        args.push("-ar".into());
-        args.push(rate.to_string());
-    }
+    args.push("-ar".into());
+    args.push(encoder_rate_hz.to_string());
     match target_format {
         AudioFormat::Mp3 => {
             args.push("-c:a".into());
@@ -1502,6 +1522,47 @@ fn add_ffmpeg_audio_filter_args(
     Ok(())
 }
 
+fn ffmpeg_soxr_resample_options(
+    context: &PlanContext<'_>,
+    target_rate_hz: Option<u32>,
+) -> Vec<String> {
+    let settings = &context.request.settings;
+    let mut opts = vec!["resampler=soxr".to_string()];
+    if let Some(rate) = target_rate_hz {
+        opts.push(format!("out_sample_rate={rate}"));
+    }
+    opts.push(format!(
+        "precision={}",
+        mapping::soxr_precision(settings.resample_quality)
+    ));
+    let cutoff = settings
+        .soxr_resampler
+        .cutoff
+        .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
+    opts.push(format!("cutoff={cutoff:.3}"));
+    if settings.soxr_resampler.chebyshev {
+        opts.push("cheby=1".to_string());
+    }
+    if let Some(phase) = settings.soxr_resampler.phase {
+        opts.push(format!("phase_shift={phase}"));
+    }
+    opts
+}
+
+fn ffmpeg_lossy_processing_filter(context: &PlanContext<'_>, encoder_rate_hz: u32) -> String {
+    let mut filters = Vec::new();
+    if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+    }
+    if context.request.source.sample_rate_hz != Some(encoder_rate_hz) {
+        filters.push(format!(
+            "aresample={}",
+            ffmpeg_soxr_resample_options(context, Some(encoder_rate_hz)).join(":")
+        ));
+    }
+    filters.join(",")
+}
+
 fn ffmpeg_audio_filter(
     context: &PlanContext<'_>,
     target_rate_hz: Option<u32>,
@@ -1525,23 +1586,7 @@ fn ffmpeg_audio_filter(
         || target_depth.is_some()
         || settings.dither_type != DitherType::None;
     if aresample_needed {
-        let mut opts = vec!["resampler=soxr".to_string()];
-        if let Some(rate) = target_rate_hz {
-            opts.push(format!("out_sample_rate={rate}"));
-        }
-        opts.push(format!(
-            "precision={}",
-            mapping::soxr_precision(settings.resample_quality)
-        ));
-        let cutoff = settings.soxr_resampler.cutoff
-            .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
-        opts.push(format!("cutoff={:.3}", cutoff));
-        if settings.soxr_resampler.chebyshev {
-            opts.push("cheby=1".to_string());
-        }
-        if let Some(phase) = settings.soxr_resampler.phase {
-            opts.push(format!("phase_shift={}", phase));
-        }
+        let mut opts = ffmpeg_soxr_resample_options(context, target_rate_hz);
         if settings.dither_type != DitherType::None {
             let explicit_int32 = explicit_int32_dither_requested(
                 settings,
@@ -2288,6 +2333,77 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_ordinary_lossy_encode_refuses_missing_or_unsupported_rate_pins() {
+        let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int24);
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("output.m4a");
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: None,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("input.wav")),
+            OutputSink::Path(PathBuf::from("output.m4a")),
+            "ordinary AAC rate-pin defense",
+        );
+
+        let missing = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Aac,
+            None,
+            false,
+        )
+        .expect_err("ordinary lossy encode must not delegate rate choice to FFmpeg");
+        assert!(missing.to_string().contains("explicit resolved encoder-input sample rate"), "{missing}");
+
+        let unsupported = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Aac,
+            Some(192_000),
+            false,
+        )
+        .expect_err("ordinary lossy encode must not pass an unsupported rate to FFmpeg");
+        assert!(unsupported.to_string().contains("does not accept 192000 Hz directly"), "{unsupported}");
+    }
+
+    #[test]
+    fn ffmpeg_ordinary_lossy_rate_change_uses_explicit_soxr_before_the_rate_pin() {
+        let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int24);
+        request.settings.target_format = AudioFormat::Opus;
+        request.output_path = PathBuf::from("output.opus");
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Opus,
+                target_rate_hz: Some(48_000),
+                apply_processing: true,
+            },
+            InputSource::Path(PathBuf::from("input.wav")),
+            OutputSink::Path(PathBuf::from("output.opus")),
+            "ordinary Opus explicit resample",
+        );
+
+        let command = build_ffmpeg_encode_lossy(
+            &request.context(),
+            &step,
+            &AudioFormat::Opus,
+            Some(48_000),
+            true,
+        )
+        .expect("96 -> 48 kHz Opus must use Tonepoet's configured SoXR path");
+        assert_arg(&command.args, "-ar", "48000");
+        let filter = arg_value(&command.args, "-af").expect("explicit SoXR filter");
+        assert!(filter.starts_with("aresample=resampler=soxr:"), "{filter}");
+        assert!(filter.contains("out_sample_rate=48000"), "{filter}");
+        assert!(!filter.contains("dither_method="), "{filter}");
+        assert!(!filter.contains("out_sample_fmt="), "{filter}");
+    }
+
+    #[test]
     fn ffmpeg_lossy_album_gain_pins_measured_encoder_input_rate() {
         let mut request = album_gain_pcm_request(AudioFormat::Aac);
         request.settings.target_format = AudioFormat::Aac;
@@ -2319,6 +2435,11 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "volume=2.125000000dB:precision=double"),
             "album gain must precede a rate-pinned encoder input: {:?}",
+            command.args,
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg.contains("aresample=")),
+            "hard-ceiling carrier must not be resampled after the proved gain: {:?}",
             command.args,
         );
 
@@ -3033,7 +3154,7 @@ mod tests {
             0,
             PlanOperation::EncodeLossy {
                 target_format: AudioFormat::Aac,
-                target_rate_hz: None,
+                target_rate_hz: Some(44_100),
                 apply_processing: false,
             },
             InputSource::Path(PathBuf::from("realized.flac")),
