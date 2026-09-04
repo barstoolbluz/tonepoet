@@ -11,7 +11,7 @@ use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
 use tonepoet_pipeline::enums::{
-    DsdAutoGainScope, DsdFilterPreset, DsdNoiseShaper, ModulatorOrder,
+    DsdAutoGainScope, DsdFilterPreset, DsdNoiseShaper, DsdTruePeakScanMode, ModulatorOrder,
 };
 use tonepoet_pipeline::{DbNano, DsdReconstructionSelection, DsdSourcePathway};
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
@@ -3752,6 +3752,8 @@ pub enum FormatField {
     DsdGain,
     /// Track or submitted-batch scope for automatic DSD peak normalization.
     DsdGainScope,
+    /// Accuracy/speed rung for submitted-batch DSD true-peak analysis.
+    DsdTruePeakScan,
     /// Fixed DSD-to-PCM gain value, edited with left/right controls.
     DsdGainDb,
     /// Native NormalizePeak target or exact legacy Auto safety margin.
@@ -3971,6 +3973,8 @@ pub struct FormatState {
     pub dsd_gain_mode: PillState<DsdGainMode>,
     /// Scope for legacy Auto / native NormalizePeak. Track is compatibility default.
     pub dsd_auto_gain_scope: PillState<DsdAutoGainScope>,
+    /// Opt-in true-peak scan rung for album scope. Reference is the default.
+    pub dsd_true_peak_scan_mode: PillState<DsdTruePeakScanMode>,
     /// Fixed DSD-to-PCM gain in dB used when `dsd_gain_mode` is Manual.
     pub dsd_gain_db: DbNano,
     /// NormalizePeak target in dBFS. Stored as fixed-point text authority.
@@ -4235,6 +4239,11 @@ impl FormatState {
             (DsdAutoGainScope::Track, "track"),
             (DsdAutoGainScope::Album, "album"),
         ]);
+        let dsd_true_peak_scan_mode = PillState::new(vec![
+            (DsdTruePeakScanMode::Reference, "0.030 dB / accurate"),
+            (DsdTruePeakScanMode::Fast, "0.044 dB / fast"),
+            (DsdTruePeakScanMode::Fastest, "0.084 dB / fastest"),
+        ]);
         let mut dsd_pathway = PillState::new(vec![
             (DsdSourcePathway::Reference, "reference"),
             (DsdSourcePathway::Manual, "manual (not yet available)"),
@@ -4260,6 +4269,7 @@ impl FormatState {
             dsd_profile,
             dsd_gain_mode,
             dsd_auto_gain_scope,
+            dsd_true_peak_scan_mode,
             dsd_gain_db: DbNano(0),
             dsd_normalize_target_dbfs: DbNano::DEFAULT_NORMALIZE_TARGET,
             dsd_auto_gain_margin_db: DbNano(150_000_000),
@@ -4550,10 +4560,13 @@ impl FormatState {
                 }
                 rows.push(FormatPaneRow::Field(FormatField::DsdGain));
                 match *self.dsd_gain_mode.selected_value() {
-                    DsdGainMode::Auto | DsdGainMode::NormalizePeak => rows.extend([
-                        FormatPaneRow::Field(FormatField::DsdGainScope),
-                        FormatPaneRow::Field(FormatField::DsdNormalizeTarget),
-                    ]),
+                    DsdGainMode::Auto | DsdGainMode::NormalizePeak => {
+                        rows.push(FormatPaneRow::Field(FormatField::DsdGainScope));
+                        if *self.dsd_auto_gain_scope.selected_value() == DsdAutoGainScope::Album {
+                            rows.push(FormatPaneRow::Field(FormatField::DsdTruePeakScan));
+                        }
+                        rows.push(FormatPaneRow::Field(FormatField::DsdNormalizeTarget));
+                    }
                     DsdGainMode::Fixed => {
                         rows.push(FormatPaneRow::Field(FormatField::DsdGainDb));
                     }
@@ -4860,6 +4873,9 @@ impl FormatState {
             FormatField::DsdGain => select_enabled_index(&mut self.dsd_gain_mode, index),
             FormatField::DsdGainScope => {
                 select_enabled_index(&mut self.dsd_auto_gain_scope, index)
+            }
+            FormatField::DsdTruePeakScan => {
+                select_enabled_index(&mut self.dsd_true_peak_scan_mode, index)
             }
             FormatField::DsdGainDb => {
                 // Clicking/focusing the value row makes Fixed explicit;
@@ -5439,6 +5455,7 @@ impl FormatState {
         clamp_pill(&mut self.dsd_pathway);
         clamp_pill(&mut self.dsd_profile);
         clamp_pill(&mut self.dsd_auto_gain_scope);
+        clamp_pill(&mut self.dsd_true_peak_scan_mode);
         // Manual gain is an explicit output-policy override. Keep it selected
         // while source identity is temporarily unavailable; the disabled option
         // communicates that it cannot currently be applied without erasing it.
@@ -5469,6 +5486,9 @@ impl FormatState {
             FormatField::DsdGain => FocusedPill::DsdGain(&mut self.dsd_gain_mode),
             FormatField::DsdGainScope => {
                 FocusedPill::DsdGainScope(&mut self.dsd_auto_gain_scope)
+            }
+            FormatField::DsdTruePeakScan => {
+                FocusedPill::DsdTruePeakScan(&mut self.dsd_true_peak_scan_mode)
             }
             FormatField::DsdGainDb => FocusedPill::DsdGainDb {
                 gain_db: &mut self.dsd_gain_db,
@@ -5642,6 +5662,7 @@ pub enum FocusedPill<'a> {
     DsdProfile(&'a mut PillState<DsdReconstructionSelection>),
     DsdGain(&'a mut PillState<DsdGainMode>),
     DsdGainScope(&'a mut PillState<DsdAutoGainScope>),
+    DsdTruePeakScan(&'a mut PillState<DsdTruePeakScanMode>),
     DsdGainDb {
         gain_db: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
@@ -5672,6 +5693,7 @@ impl FocusedPill<'_> {
             Self::DsdProfile(p) => p.select_next(),
             Self::DsdGain(p) => p.select_next(),
             Self::DsdGainScope(p) => p.select_next(),
+            Self::DsdTruePeakScan(p) => p.select_next(),
             Self::DsdGainDb { gain_db, gain_mode } => {
                 (*gain_mode).select_value(&DsdGainMode::Fixed);
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
@@ -5702,6 +5724,7 @@ impl FocusedPill<'_> {
             Self::DsdProfile(p) => p.select_prev(),
             Self::DsdGain(p) => p.select_prev(),
             Self::DsdGainScope(p) => p.select_prev(),
+            Self::DsdTruePeakScan(p) => p.select_prev(),
             Self::DsdGainDb { gain_db, gain_mode } => {
                 (*gain_mode).select_value(&DsdGainMode::Fixed);
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
@@ -17345,13 +17368,28 @@ mod dsd_gain_format_state_tests {
         assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Auto));
         let rows = state.visible_fields(false);
         assert!(rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScan));
         assert!(rows.contains(&FormatField::DsdNormalizeTarget));
         assert!(!rows.contains(&FormatField::DsdGainDb));
+
+        assert!(state
+            .dsd_auto_gain_scope
+            .select_value(&DsdAutoGainScope::Album));
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdTruePeakScan));
+        assert!(state
+            .dsd_true_peak_scan_mode
+            .select_value(&DsdTruePeakScanMode::Fastest));
+        assert_eq!(
+            state.dsd_true_peak_scan_mode.selected_label(),
+            "0.084 dB / fastest"
+        );
 
         assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
         let rows = state.visible_fields(false);
         assert!(rows.contains(&FormatField::DsdGainDb));
         assert!(!rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScan));
         assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
 
         state.format.select_value(&AudioFormat::Dsf);

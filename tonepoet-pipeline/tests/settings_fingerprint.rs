@@ -230,6 +230,7 @@ fn album_gain_fingerprint_extension_is_separate_and_byte_affecting() {
         DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS,
         &[
             "dsd.auto_gain_scope",
+            "dsd.true_peak_scan_mode",
             "dsd.album_native_from_dsd_profile",
             "dsd.album_gain_db",
         ]
@@ -245,6 +246,15 @@ fn album_gain_fingerprint_extension_is_separate_and_byte_affecting() {
     settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
     let album_unbound = settings_fingerprint(&settings);
     assert_ne!(track, album_unbound, "album scope changes output authority");
+
+    let mut fast = settings.clone();
+    fast.dsd
+        .set_true_peak_scan_mode(tonepoet_pipeline::DsdTruePeakScanMode::Fast);
+    assert_ne!(
+        album_unbound,
+        settings_fingerprint(&fast),
+        "album true-peak scan authority must be fingerprinted",
+    );
 
     settings
         .dsd

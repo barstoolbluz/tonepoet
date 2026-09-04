@@ -1,0 +1,174 @@
+{
+  "frozen_first_stage_coefficient_count": 192,
+  "hard_ceiling_bridge": {
+    "fast16": {
+      "declared_linf_error_upper": 0.003,
+      "interpolator": "four-point cubic; runtime envelope via two interior Bernstein controls",
+      "margin": 0.00014990448918183585,
+      "measured_phase_l1_max": 0.002850095510818164,
+      "worst_phase": 31
+    },
+    "fastest8": {
+      "declared_linf_error_upper": 0.003,
+      "interpolator": "four-point cubic; runtime envelope via two interior Bernstein controls",
+      "margin": 6.73993157495824e-05,
+      "measured_phase_l1_max": 0.0029326006842504177,
+      "worst_phase": 27
+    },
+    "governed_reference": "uncalibrated finite Headroom64x reconstruction",
+    "proof_note": "For any bounded input sequence, each phase error is bounded by the absolute coefficient-sum norm times input sample peak. RepeatEndpoints and ZeroExtend remain bounded by that same sample peak, so finite-stream edges do not invalidate it."
+  },
+  "numpy_version": "2.3.5",
+  "operation_model": {
+    "designed_cpu_minutes_from_12_7_reference": {
+      "fast": 6.7027777777777775,
+      "fastest": 5.644444444444444
+    },
+    "fast_ceiling_bridge_multiplies_per_input_channel": 32,
+    "fast_fir_products_per_input_channel": 272,
+    "fast_fraction_of_reference": 0.5277777777777778,
+    "fast_modeled_multiplies_per_input_channel": 304,
+    "fastest_ceiling_bridge_multiplies_per_input_channel": 16,
+    "fastest_fir_products_per_input_channel": 240,
+    "fastest_fraction_of_fast": 0.8421052631578947,
+    "fastest_fraction_of_reference": 0.4444444444444444,
+    "fastest_modeled_multiplies_per_input_channel": 256,
+    "note": "static floating-multiply model for the production ceiling path; designed-for only, not measured throughput; additions, abs/max, memory, and I/O remain unmodeled",
+    "reference_fir_products_per_input_channel": 576
+  },
+  "point_authority": {
+    "fast": {
+      "calibration_db": 0.007,
+      "component_margin_db": 0.0027536932963169933,
+      "declared_one_sided_underread_db": 0.044,
+      "derived_component_budget_db": 0.041246306703683004,
+      "deterministic_analytic_search": {
+        "case_count": 1000,
+        "seed": "0x46535454504b3236",
+        "worst_case": {
+          "aligned_time": 255.15659603260718,
+          "case": 383,
+          "frames": 512,
+          "frequencies_fraction_fs": [
+            0.44322659508336676,
+            0.4621088792802895,
+            0.4818479339336653
+          ],
+          "measured_dbtp": -0.031650445887747666,
+          "support_fraction_fs": 0.48380225439784946
+        },
+        "worst_one_sided_underread_db": 0.031650445887747666,
+        "worst_overread_case": {
+          "aligned_time": 1023.499473662976,
+          "case": 591,
+          "frames": 2048,
+          "frequencies_fraction_fs": [
+            0.42983608920928507,
+            0.4310143040575409,
+            0.44122064675806655,
+            0.45155450677724146,
+            0.47680791535824457
+          ],
+          "measured_dbtp": 0.018721984848261285,
+          "support_fraction_fs": 0.4772964348920737
+        },
+        "worst_overread_db": 0.018721984848261285
+      },
+      "factor": 16,
+      "numerical_allowance_db": 1e-05,
+      "qualified_grid_max_underread_db": 0.041090311680097205,
+      "required_regressions": {
+        "five_tone_upper_band": {
+          "measured_dbtp": 0.053120032170956295,
+          "one_sided_underread_db": 0.0
+        },
+        "three_tone": {
+          "measured_dbtp": 0.03543126723781458,
+          "one_sided_underread_db": 0.0
+        }
+      },
+      "response": {
+        "maximum_location": {
+          "frequency_fraction_fs": 0.494505,
+          "phase": 8
+        },
+        "maximum_magnitude_db": 0.020042687392721522,
+        "minimum_location": {
+          "frequency_fraction_fs": 0.4227795,
+          "phase": 13
+        },
+        "minimum_magnitude_db": -0.0001459950235857994
+      }
+    },
+    "fastest": {
+      "calibration_db": 0.088,
+      "component_margin_db": 0.001798401296020935,
+      "declared_one_sided_underread_db": 0.084,
+      "derived_component_budget_db": 0.08220159870397907,
+      "deterministic_analytic_search": {
+        "case_count": 1000,
+        "seed": "0x46535454504b3236",
+        "worst_case": {
+          "aligned_time": 319.8128892658896,
+          "case": 401,
+          "frames": 640,
+          "frequencies_fraction_fs": [
+            0.41806255464539077,
+            0.43719138087483966,
+            0.4388293322219471,
+            0.45751919517892553,
+            0.4615984373197156,
+            0.4657628110068635,
+            0.48387100753480317
+          ],
+          "measured_dbtp": -0.04926380716120213,
+          "support_fraction_fs": 0.48543442169596385
+        },
+        "worst_one_sided_underread_db": 0.04926380716120213,
+        "worst_overread_case": {
+          "aligned_time": 1023.499473662976,
+          "case": 591,
+          "frames": 2048,
+          "frequencies_fraction_fs": [
+            0.42983608920928507,
+            0.4310143040575409,
+            0.44122064675806655,
+            0.45155450677724146,
+            0.47680791535824457
+          ],
+          "measured_dbtp": 0.09972198484826211,
+          "support_fraction_fs": 0.4772964348920737
+        },
+        "worst_overread_db": 0.09972198484826211
+      },
+      "factor": 8,
+      "numerical_allowance_db": 1e-05,
+      "qualified_grid_max_underread_db": 0.16514622285017821,
+      "required_regressions": {
+        "five_tone_upper_band": {
+          "measured_dbtp": 0.13412003217095853,
+          "one_sided_underread_db": 0.0
+        },
+        "three_tone": {
+          "measured_dbtp": 0.11643126723781572,
+          "one_sided_underread_db": 0.0
+        }
+      },
+      "response": {
+        "maximum_location": {
+          "frequency_fraction_fs": 0.494505,
+          "phase": 0
+        },
+        "maximum_magnitude_db": 0.10104268739272343,
+        "minimum_location": {
+          "frequency_fraction_fs": 0.386298,
+          "phase": 3
+        },
+        "minimum_magnitude_db": 0.08295462414619914
+      }
+    }
+  },
+  "qualified_max_frequency_fraction_fs": 0.495,
+  "schema": "tonepoet-fast-headroom-qualification-v1",
+  "scipy_version": "1.17.0"
+}

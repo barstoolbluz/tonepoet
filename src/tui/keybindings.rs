@@ -3632,6 +3632,7 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
         FormatField::DsdNormalizeTarget => format.dsd_normalize_target_dbfs.render(false),
         FormatField::DsdGainScope => format.dsd_auto_gain_scope.selected_label().to_string(),
+        FormatField::DsdTruePeakScan => format.dsd_true_peak_scan_mode.selected_label().to_string(),
         FormatField::Container => format.selected_container().display_name.to_string(),
         FormatField::ResampleQuality => format
             .resample_quality_choices()
@@ -65954,6 +65955,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DsdProfilePill(_)
             | TuiButton::DsdGainPill(_)
             | TuiButton::DsdGainScopePill(_)
+            | TuiButton::DsdTruePeakScanPill(_)
             | TuiButton::DsdGainDbField
             | TuiButton::DsdNormalizeTargetField
             | TuiButton::ContainerPill(_)

@@ -446,6 +446,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                 .map_err(|error| error.to_string())?;
         }
         dsd.set_auto_gain_scope(*format.dsd_auto_gain_scope.selected_value());
+        dsd.set_true_peak_scan_mode(*format.dsd_true_peak_scan_mode.selected_value());
     }
     if is_dsd {
         dsd.pcm_to_dsd.noise_shaper = *format.noise_shaper.selected_value();

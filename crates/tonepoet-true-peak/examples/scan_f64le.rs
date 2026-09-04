@@ -8,13 +8,15 @@ use tonepoet_true_peak::{PeakLevel, TruePeakConfig, TruePeakMeter, TruePeakMode}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args.len() != 5 {
-        return Err("usage: scan_f64le <path> <sample-rate-hz> <channels> <reporting4x|headroom64x>".into());
+        return Err("usage: scan_f64le <path> <sample-rate-hz> <channels> <reporting4x|headroom64x|headroom16x|headroom8x>".into());
     }
     let sample_rate_hz: u32 = args[2].parse()?;
     let channels: usize = args[3].parse()?;
     let mode = match args[4].as_str() {
         "reporting4x" => TruePeakMode::Reporting4x,
         "headroom64x" => TruePeakMode::Headroom64x,
+        "headroom16x" => TruePeakMode::Headroom16x,
+        "headroom8x" => TruePeakMode::Headroom8x,
         other => return Err(format!("unknown mode: {other}").into()),
     };
     let mut meter =

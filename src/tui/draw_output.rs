@@ -206,6 +206,15 @@ pub fn draw_format_pane(
                         row_focused,
                         theme,
                     )),
+                    FormatField::DsdTruePeakScan => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "TP underread",
+                        "",
+                        &render_pill_spans(&format_state.dsd_true_peak_scan_mode, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
                     FormatField::DsdGainDb => lines.push(dsd_db_value_row(
                         border_color,
                         w,

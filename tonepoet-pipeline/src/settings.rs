@@ -6,7 +6,8 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, GainCompensation, ModulatorOrder, Mp3Mode,
+    DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, DsdTruePeakScanMode, GainCompensation,
+    ModulatorOrder, Mp3Mode,
     NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
@@ -816,6 +817,9 @@ pub struct DsdSettings {
     pub from_dsd: DsdSourceSettings,
     /// Automatic DSD peak-normalization scope. Track is the compatibility default.
     auto_gain_scope: DsdAutoGainScope,
+    /// Accuracy/speed rung for the in-process album true-peak scan. Reference
+    /// is the compatibility default and remains the point-scan gold standard.
+    true_peak_scan_mode: DsdTruePeakScanMode,
     /// Runtime-only fixed album gain bound after submitted-batch analysis.
     /// Never serialized. Once bound, it is included in the execution
     /// fingerprint because it changes output bytes.
@@ -968,6 +972,7 @@ impl DsdSettings {
             pcm_to_dsd: PcmToDsdSettings::default(),
             from_dsd: DsdSourceSettings::default(),
             auto_gain_scope: DsdAutoGainScope::Track,
+            true_peak_scan_mode: DsdTruePeakScanMode::Reference,
             runtime_album_gain_db: None,
             runtime_album_loudest_peak_dbfs: None,
             runtime_album_track_count: None,
@@ -982,6 +987,7 @@ impl DsdSettings {
             pcm_to_dsd: legacy_pcm_to_dsd(wire),
             from_dsd: legacy_from_dsd_mirror(wire),
             auto_gain_scope: DsdAutoGainScope::Track,
+            true_peak_scan_mode: DsdTruePeakScanMode::Reference,
             runtime_album_gain_db: None,
             runtime_album_loudest_peak_dbfs: None,
             runtime_album_track_count: None,
@@ -1014,6 +1020,7 @@ impl DsdSettings {
                 pcm_to_dsd: self.pcm_to_dsd,
                 from_dsd: DsdSourceSettings::default(),
                 auto_gain_scope: self.auto_gain_scope,
+                true_peak_scan_mode: self.true_peak_scan_mode,
                 runtime_album_gain_db: None,
                 runtime_album_loudest_peak_dbfs: None,
                 runtime_album_track_count: None,
@@ -1031,6 +1038,28 @@ impl DsdSettings {
     /// Set the automatic DSD peak-normalization scope.
     pub fn set_auto_gain_scope(&mut self, scope: DsdAutoGainScope) {
         self.auto_gain_scope = scope;
+        if scope != DsdAutoGainScope::Album {
+            self.true_peak_scan_mode = DsdTruePeakScanMode::Reference;
+        }
+        self.clear_runtime_album_gain();
+    }
+
+    /// Return the selected submitted-batch true-peak scan rung.
+    #[must_use]
+    pub const fn true_peak_scan_mode(&self) -> DsdTruePeakScanMode {
+        self.true_peak_scan_mode
+    }
+
+    /// Select the submitted-batch true-peak scan rung.
+    ///
+    /// Any already-bound runtime album authority is invalidated because its
+    /// point provenance and signal ceiling were measured under the old rung.
+    pub fn set_true_peak_scan_mode(&mut self, mode: DsdTruePeakScanMode) {
+        self.true_peak_scan_mode = if self.auto_gain_scope == DsdAutoGainScope::Album {
+            mode
+        } else {
+            DsdTruePeakScanMode::Reference
+        };
         self.clear_runtime_album_gain();
     }
 
@@ -1198,6 +1227,7 @@ impl DsdSettings {
         }
 
         let scope = self.auto_gain_scope;
+        let true_peak_scan_mode = self.true_peak_scan_mode;
         let mut wire = self.legacy_compat_wire();
         wire.dsd_to_pcm_gain_mode = mode;
         wire.dsd_to_pcm_auto_gain_margin_db = if mode == DsdToPcmGainMode::Auto {
@@ -1212,6 +1242,7 @@ impl DsdSettings {
         };
         *self = Self::from_legacy_wire(wire);
         self.auto_gain_scope = scope;
+        self.true_peak_scan_mode = true_peak_scan_mode;
         Ok(())
     }
 
@@ -1299,7 +1330,10 @@ impl serde::Serialize for DsdSettings {
         use serde::ser::SerializeMap;
 
         match self.origin {
-            DsdSettingsOrigin::NativeV2 if self.auto_gain_scope == DsdAutoGainScope::Track => {
+            DsdSettingsOrigin::NativeV2
+                if self.auto_gain_scope == DsdAutoGainScope::Track
+                    && self.true_peak_scan_mode == DsdTruePeakScanMode::Reference =>
+            {
                 DsdSettingsWireV2 {
                     schema_version: 2,
                     pcm_to_dsd: self.pcm_to_dsd,
@@ -1308,11 +1342,17 @@ impl serde::Serialize for DsdSettings {
                 .serialize(serializer)
             }
             DsdSettingsOrigin::NativeV2 => {
-                let mut map = serializer.serialize_map(Some(4))?;
+                let include_scan_mode =
+                    self.true_peak_scan_mode != DsdTruePeakScanMode::Reference;
+                let mut map =
+                    serializer.serialize_map(Some(if include_scan_mode { 5 } else { 4 }))?;
                 map.serialize_entry("schema_version", &2_u32)?;
                 map.serialize_entry("pcm_to_dsd", &self.pcm_to_dsd)?;
                 map.serialize_entry("from_dsd", &self.from_dsd)?;
                 map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
+                if include_scan_mode {
+                    map.serialize_entry("true_peak_scan_mode", &self.true_peak_scan_mode)?;
+                }
                 map.end()
             }
             DsdSettingsOrigin::LegacyFlatV1(wire) => {
@@ -1321,11 +1361,16 @@ impl serde::Serialize for DsdSettings {
                         "native DSD-source settings were edited on a legacy value; explicitly migrate it to native v2 before serialization",
                     ));
                 }
-                if self.auto_gain_scope == DsdAutoGainScope::Track {
+                if self.auto_gain_scope == DsdAutoGainScope::Track
+                    && self.true_peak_scan_mode == DsdTruePeakScanMode::Reference
+                {
                     return self.legacy_compat_wire().serialize(serializer);
                 }
                 let wire = self.legacy_compat_wire();
-                let mut map = serializer.serialize_map(Some(11))?;
+                let include_scan_mode =
+                    self.true_peak_scan_mode != DsdTruePeakScanMode::Reference;
+                let mut map =
+                    serializer.serialize_map(Some(if include_scan_mode { 12 } else { 11 }))?;
                 map.serialize_entry("noise_shaper", &wire.noise_shaper)?;
                 map.serialize_entry("modulator_order", &wire.modulator_order)?;
                 map.serialize_entry("trellis", &wire.trellis)?;
@@ -1340,6 +1385,9 @@ impl serde::Serialize for DsdSettings {
                 map.serialize_entry("sinc", &wire.sinc)?;
                 map.serialize_entry("gain_compensation", &wire.gain_compensation)?;
                 map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
+                if include_scan_mode {
+                    map.serialize_entry("true_peak_scan_mode", &self.true_peak_scan_mode)?;
+                }
                 map.end()
             }
         }
@@ -1383,6 +1431,7 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                 let mut sinc = None;
                 let mut gain_compensation = None;
                 let mut auto_gain_scope = None;
+                let mut true_peak_scan_mode = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     macro_rules! unique {
@@ -1416,12 +1465,13 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                         "sinc" => unique!(sinc, map.next_value::<PcmToDsdSincSettings>()?),
                         "gain_compensation" => unique!(gain_compensation, map.next_value::<GainCompensation>()?),
                         "auto_gain_scope" => unique!(auto_gain_scope, map.next_value::<DsdAutoGainScope>()?),
+                        "true_peak_scan_mode" => unique!(true_peak_scan_mode, map.next_value::<DsdTruePeakScanMode>()?),
                         _ => return Err(A::Error::unknown_field(&key, &[
                             "schema_version", "pcm_to_dsd", "from_dsd", "noise_shaper",
                             "modulator_order", "trellis", "pcm_to_dsd_filter",
                             "dsd_to_pcm_lowpass", "dsd_to_pcm_gain_mode",
                             "dsd_to_pcm_auto_gain_margin_db", "dsd_to_pcm_gain_db", "sinc",
-                            "gain_compensation", "auto_gain_scope",
+                            "gain_compensation", "auto_gain_scope", "true_peak_scan_mode",
                         ])),
                     }
                 }
@@ -1438,10 +1488,17 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                     if version != 2 {
                         return Err(A::Error::custom("DSD settings schema_version must be exactly 2"));
                     }
+                    let auto_gain_scope = auto_gain_scope.unwrap_or_default();
+                    let true_peak_scan_mode = if auto_gain_scope == DsdAutoGainScope::Album {
+                        true_peak_scan_mode.unwrap_or_default()
+                    } else {
+                        DsdTruePeakScanMode::Reference
+                    };
                     return Ok(DsdSettings {
                         pcm_to_dsd: pcm_to_dsd.ok_or_else(|| A::Error::missing_field("pcm_to_dsd"))?,
                         from_dsd: from_dsd.ok_or_else(|| A::Error::missing_field("from_dsd"))?,
-                        auto_gain_scope: auto_gain_scope.unwrap_or_default(),
+                        auto_gain_scope,
+                        true_peak_scan_mode,
                         runtime_album_gain_db: None,
                         runtime_album_loudest_peak_dbfs: None,
                         runtime_album_track_count: None,
@@ -1463,6 +1520,11 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                 };
                 let mut settings = DsdSettings::from_legacy_wire(wire);
                 settings.auto_gain_scope = auto_gain_scope.unwrap_or_default();
+                settings.true_peak_scan_mode = if settings.auto_gain_scope == DsdAutoGainScope::Album {
+                    true_peak_scan_mode.unwrap_or_default()
+                } else {
+                    DsdTruePeakScanMode::Reference
+                };
                 Ok(settings)
             }
         }
@@ -2018,12 +2080,14 @@ mod pipeline_settings_serde_compatibility_tests {
         let track = DsdSettings::native_v2();
         let track_value = serde_json::to_value(track).expect("serialize native track settings");
         assert!(track_value.get("auto_gain_scope").is_none());
+        assert!(track_value.get("true_peak_scan_mode").is_none());
 
         let mut album = DsdSettings::native_v2();
         album.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
         album.set_auto_gain_scope(DsdAutoGainScope::Album);
         let value = serde_json::to_value(album).expect("serialize native album settings");
         assert_eq!(value["auto_gain_scope"], "album");
+        assert!(value.get("true_peak_scan_mode").is_none());
 
         let decoded: DsdSettings =
             serde_json::from_value(value).expect("deserialize native album settings");
@@ -2032,4 +2096,84 @@ mod pipeline_settings_serde_compatibility_tests {
         assert!(decoded.album_auto_gain_selected());
         assert_eq!(decoded.runtime_album_gain_db(), None);
     }
+
+    #[test]
+    fn true_peak_scan_mode_round_trips_additively_for_native_and_legacy_album_gain() {
+        for mut settings in [DsdSettings::native_v2(), DsdSettings::default()] {
+            if settings.is_native_v2() {
+                settings.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+            } else {
+                settings
+                    .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+                    .expect("legacy auto gain");
+            }
+            settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+            settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fastest);
+
+            let value = serde_json::to_value(settings).expect("serialize scan mode");
+            assert_eq!(value["true_peak_scan_mode"], "fastest");
+            let decoded: DsdSettings =
+                serde_json::from_value(value).expect("deserialize scan mode");
+            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Fastest);
+            assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Album);
+        }
+    }
+
+    #[test]
+    fn track_scope_canonicalizes_true_peak_scan_mode_to_reference() {
+        let mut settings = DsdSettings::native_v2();
+        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fastest);
+        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
+
+        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
+        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Fast);
+
+        settings.set_auto_gain_scope(DsdAutoGainScope::Track);
+        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
+        let value = serde_json::to_value(settings).expect("serialize canonical track settings");
+        assert!(value.get("auto_gain_scope").is_none());
+        assert!(value.get("true_peak_scan_mode").is_none());
+    }
+
+    #[test]
+    fn deserialization_canonicalizes_non_album_true_peak_scan_mode_to_reference() {
+        for mut value in [
+            serde_json::to_value(DsdSettings::native_v2()).expect("serialize native settings"),
+            serde_json::to_value(DsdSettings::default()).expect("serialize legacy settings"),
+        ] {
+            value
+                .as_object_mut()
+                .expect("DSD settings object")
+                .insert(
+                    "true_peak_scan_mode".to_owned(),
+                    serde_json::Value::String("fastest".to_owned()),
+                );
+            let decoded: DsdSettings =
+                serde_json::from_value(value).expect("deserialize canonicalized settings");
+            assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Track);
+            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
+        }
+    }
+
+    #[test]
+    fn changing_true_peak_scan_mode_invalidates_bound_runtime_album_gain() {
+        let mut settings = DsdSettings::default();
+        settings
+            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
+            .expect("legacy auto gain");
+        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings.bind_runtime_album_gain(
+            "1.250000000".parse().unwrap(),
+            Some("-1.400000000".parse().unwrap()),
+            9,
+        );
+        assert!(settings.runtime_album_gain_db().is_some());
+
+        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
+        assert_eq!(settings.runtime_album_gain_db(), None);
+        assert_eq!(settings.runtime_album_loudest_peak_dbfs(), None);
+        assert_eq!(settings.runtime_album_track_count(), None);
+    }
+
 }

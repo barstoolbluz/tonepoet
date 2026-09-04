@@ -734,3 +734,21 @@ pub enum DsdAutoGainScope {
     /// Normalize all DSD tracks in one submitted conversion batch with one gain.
     Album,
 }
+
+/// Accuracy/speed rung for submitted-batch DSD true-peak analysis.
+///
+/// This remains an application-independent policy token: the pipeline crate
+/// does not import the true-peak crate or encode interpolation details. Track
+/// normalization does not use this setting; it is effective only for album
+/// scope, where Tonepoet performs an in-process retained-carrier scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum DsdTruePeakScanMode {
+    /// Gold-standard scan; compatibility and user-facing default.
+    #[default]
+    Reference,
+    /// Opt-in middle rung with a smaller accuracy-for-speed trade.
+    Fast,
+    /// Opt-in fastest rung with the largest declared one-sided error budget.
+    Fastest,
+}

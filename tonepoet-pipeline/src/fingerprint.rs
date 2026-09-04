@@ -147,6 +147,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_COUNT: usize = SETTINGS_FINGERPRINT_FIELD_P
 /// they can change output bytes.
 pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.auto_gain_scope",
+    "dsd.true_peak_scan_mode",
     "dsd.album_native_from_dsd_profile",
     "dsd.album_gain_db",
 ];
@@ -566,6 +567,15 @@ fn push_native_dsd_v2(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         && settings.auto_gain_scope() == DsdAutoGainScope::Album
     {
         writer.field_static("dsd.auto_gain_scope", "album");
+        match settings.true_peak_scan_mode() {
+            crate::DsdTruePeakScanMode::Reference => {}
+            crate::DsdTruePeakScanMode::Fast => {
+                writer.field_static("dsd.true_peak_scan_mode", "fast");
+            }
+            crate::DsdTruePeakScanMode::Fastest => {
+                writer.field_static("dsd.true_peak_scan_mode", "fastest");
+            }
+        }
         if let Some(gain) = settings.runtime_album_gain_db() {
             writer.field_string("dsd.album_gain_db", gain.render(false));
         }
@@ -778,6 +788,15 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
     // without perturbing any historical track-scoped fingerprint.
     if settings.album_auto_gain_selected() {
         writer.field_static("dsd.auto_gain_scope", "album");
+        match settings.true_peak_scan_mode() {
+            crate::DsdTruePeakScanMode::Reference => {}
+            crate::DsdTruePeakScanMode::Fast => {
+                writer.field_static("dsd.true_peak_scan_mode", "fast");
+            }
+            crate::DsdTruePeakScanMode::Fastest => {
+                writer.field_static("dsd.true_peak_scan_mode", "fastest");
+            }
+        }
         // Native album-mode reconstruction is deliberately unqualified and
         // therefore still uses the legacy manifest-v1 settings fingerprint.
         // Bind only the native reconstruction selector consumed by the album

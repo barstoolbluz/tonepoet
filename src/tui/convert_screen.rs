@@ -310,6 +310,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::DsdProfile => register_pill_row(buttons, &state.dsd_profile, y, label_col, TuiButton::DsdProfilePill),
             FormatField::DsdGain => register_enabled_pill_row(buttons, &state.dsd_gain_mode, y, label_col, TuiButton::DsdGainPill),
             FormatField::DsdGainScope => register_pill_row(buttons, &state.dsd_auto_gain_scope, y, label_col, TuiButton::DsdGainScopePill),
+            FormatField::DsdTruePeakScan => register_pill_row(buttons, &state.dsd_true_peak_scan_mode, y, label_col, TuiButton::DsdTruePeakScanPill),
             FormatField::DsdGainDb => buttons.record_button(
                 TuiButton::DsdGainDbField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),

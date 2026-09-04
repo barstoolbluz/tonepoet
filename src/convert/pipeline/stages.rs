@@ -22657,6 +22657,21 @@ fn append_dsd_settings(
                 tonepoet_pipeline::DSD_REFERENCE_POLICY_V1_KEY,
             );
         }
+
+        if settings.dsd.album_auto_gain_selected() {
+            let scan_mode = settings.dsd.true_peak_scan_mode();
+            let bound_db = true_peak_headroom_scan_mode(scan_mode).max_underread_db();
+            let speed_label = match scan_mode {
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference => "accurate",
+                tonepoet_pipeline::DsdTruePeakScanMode::Fast => "fast",
+                tonepoet_pipeline::DsdTruePeakScanMode::Fastest => "fastest",
+            };
+            push_kv_line(
+                log,
+                "DSD true-peak scan",
+                format!("{bound_db:.3} dB one-sided bound ({speed_label})"),
+            );
+        }
     }
 
     if settings.target_format.is_dsd() {
@@ -30303,6 +30318,41 @@ fn scan_album_gain_true_peak_carrier_with_cancel<F>(
 where
     F: FnMut() -> bool,
 {
+    scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+        carrier,
+        sample_rate_hz,
+        channels,
+        tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+        is_cancelled,
+    )
+}
+
+fn true_peak_headroom_scan_mode(
+    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+) -> tonepoet_true_peak::HeadroomScanMode {
+    match scan_mode {
+        tonepoet_pipeline::DsdTruePeakScanMode::Reference => {
+            tonepoet_true_peak::HeadroomScanMode::Reference
+        }
+        tonepoet_pipeline::DsdTruePeakScanMode::Fast => {
+            tonepoet_true_peak::HeadroomScanMode::Fast
+        }
+        tonepoet_pipeline::DsdTruePeakScanMode::Fastest => {
+            tonepoet_true_peak::HeadroomScanMode::Fastest
+        }
+    }
+}
+
+fn scan_album_gain_true_peak_carrier_with_cancel_and_mode<F>(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    mut is_cancelled: F,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
+where
+    F: FnMut() -> bool,
+{
     if is_cancelled() {
         return Err("album DSD true-peak scan cancelled".to_string());
     }
@@ -30324,10 +30374,12 @@ where
         ));
     }
 
-    let mut meter = tonepoet_true_peak::HeadroomCeilingMeter::new(
+    let headroom_scan_mode = true_peak_headroom_scan_mode(scan_mode);
+    let mut meter = tonepoet_true_peak::HeadroomCeilingMeter::new_with_scan_mode(
         sample_rate_hz,
         usize::from(channels),
         tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+        headroom_scan_mode,
     )
     .map_err(|error| format!("could not initialize album DSD ceiling meter: {error}"))?;
 
@@ -30371,11 +30423,16 @@ fn scan_album_gain_true_peak_carrier(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
+    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
     cancel: &CancellationToken,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
-    scan_album_gain_true_peak_carrier_with_cancel(carrier, sample_rate_hz, channels, || {
-        cancel.is_cancelled()
-    })
+    scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+        carrier,
+        sample_rate_hz,
+        channels,
+        scan_mode,
+        || cancel.is_cancelled(),
+    )
 }
 
 /// Derive the deterministic terminal realization bound used by album-scoped
@@ -30729,6 +30786,51 @@ mod album_true_peak_carrier_tests {
         );
         let floor: tonepoet_pipeline::DbNano = "-30.000000000".parse().unwrap();
         assert!(measured < floor, "very-low point was unexpectedly gated: {measured}");
+    }
+
+    #[test]
+    fn carrier_fast_scan_modes_keep_the_full64_ceiling_conservative() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("fast-modes.f64le");
+        let samples = (0..8192)
+            .flat_map(|frame| {
+                let t = frame as f64 + 0.37;
+                [
+                    0.61 * (2.0 * PI * 0.173 * t).sin()
+                        + 0.19 * (2.0 * PI * 0.491 * t).cos(),
+                    0.47 * (2.0 * PI * 0.311 * t).cos()
+                        - 0.23 * (2.0 * PI * 0.487 * t).sin(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        write_f64le(&carrier, &samples);
+
+        let (_, reference_upper) = finite(
+            scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+                &carrier,
+                176_400,
+                2,
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                || false,
+            )
+            .unwrap(),
+        );
+
+        for mode in [
+            tonepoet_pipeline::DsdTruePeakScanMode::Fast,
+            tonepoet_pipeline::DsdTruePeakScanMode::Fastest,
+        ] {
+            let (_, fast_upper) = finite(
+                scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+                    &carrier, 176_400, 2, mode, || false,
+                )
+                .unwrap(),
+            );
+            assert!(
+                fast_upper >= reference_upper,
+                "{mode:?} ceiling {fast_upper:.17} fell below full-64x reference {reference_upper:.17}"
+            );
+        }
     }
 
     #[test]
@@ -31204,11 +31306,13 @@ async fn prepare_album_gain_carrier_for_track(
     }
     let scan_path = carrier_path.clone();
     let scan_cancel = cancel.clone();
+    let scan_mode = req.settings.dsd.true_peak_scan_mode();
     let measurement = tokio::task::spawn_blocking(move || {
         scan_album_gain_true_peak_carrier(
             &scan_path,
             target_rate_hz,
             channels,
+            scan_mode,
             &scan_cancel,
         )
     })
@@ -31228,13 +31332,14 @@ async fn prepare_album_gain_carrier_for_track(
         )
     })?;
     log::info!(
-        "album-scoped DSD analysis measured item={} track={} true_peak={:?} carrier={} rate={} channels={}",
+        "album-scoped DSD analysis measured item={} track={} true_peak={:?} carrier={} rate={} channels={} scan_mode={:?}",
         req.item_id,
         track.id.source_ordinal,
         measurement,
         carrier_path.display(),
         target_rate_hz,
         channels,
+        scan_mode,
     );
     Ok(PreparedAlbumGainCarrier {
         source_ref: TrackSourceRef::DsdAlbumGainCarrier {
@@ -50242,6 +50347,21 @@ mod conversion_log_tests {
         let dsd_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(dsd_log.contains("DSD gain mode: auto"));
         assert!(dsd_log.contains("DSD auto gain margin"));
+        assert!(!dsd_log.contains("DSD true-peak scan"));
+
+        dsd_req
+            .settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        dsd_req
+            .settings
+            .dsd
+            .set_true_peak_scan_mode(tonepoet_pipeline::DsdTruePeakScanMode::Fast);
+        let album_fast_log =
+            build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(album_fast_log.contains(
+            "DSD true-peak scan: 0.044 dB one-sided bound (fast)"
+        ));
         assert!(dsd_log.contains("DSD→PCM lowpass method"));
         assert!(!dsd_log.contains("DSD manual gain"));
         assert!(!dsd_log.contains("DSD filter preset"));

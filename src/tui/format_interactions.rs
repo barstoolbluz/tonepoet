@@ -117,6 +117,12 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::DsdTruePeakScanPill(index) => format.select_row_index(
+            FormatField::DsdTruePeakScan,
+            index,
+            source_bits,
+            source_rate,
+        ),
         TuiButton::DsdGainDbField => format.select_row_index(
             FormatField::DsdGainDb,
             0,

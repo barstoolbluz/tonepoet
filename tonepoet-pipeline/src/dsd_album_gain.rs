@@ -20,10 +20,11 @@ use std::path::Path;
 /// One deterministic post-reconstruction peak report for album aggregation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlbumPeakMeasurement {
-    /// Finite calibrated Headroom64x point plus the independently named upper
-    /// value for Tonepoet's declared finite reconstruction waveform.
+    /// Finite calibrated point from the selected headroom scan rung plus the
+    /// independently named upper value for Tonepoet's declared finite
+    /// reconstruction waveform.
     Finite {
-        /// Existing Headroom64x point estimate, retained for reporting only.
+        /// Selected-rung point estimate, retained for reporting only.
         point_db: DbNano,
         /// Conservative linear peak upper bound of the declared signal-domain
         /// reconstruction. This value, not `point_db`, drives hard-ceiling gain.
@@ -72,7 +73,7 @@ pub struct AlbumGainAuthority {
     /// Peak target selected by the user-facing NormalizePeak control. This is
     /// preserved exactly; it is never overwritten with an internal reserve.
     pub target_dbfs: DbNano,
-    /// Loudest calibrated Headroom64x point, for reporting only.
+    /// Loudest calibrated selected-rung point, for reporting only.
     pub loudest_peak_dbfs: Option<DbNano>,
     /// Loudest proved signal-domain upper bound in linear full-scale amplitude.
     pub loudest_signal_upper_linear: f64,
@@ -96,9 +97,10 @@ pub struct AlbumGainAuthority {
 ///
 /// where `C` is the requested ceiling, `P_signal` is the loudest conservative
 /// reconstruction bound, `E_pre` is any terminal realization error introduced
-/// before gain, and `E_post` is the reconstructed error introduced after gain. The resulting `G` is converted to `DbNano` only in the conservative
-/// direction. The calibrated Headroom64 point remains available for reporting
-/// but has no hard-upper-bound semantics here.
+/// before gain, and `E_post` is the reconstructed error introduced after gain.
+/// The resulting `G` is converted to `DbNano` only in the conservative
+/// direction. The calibrated selected-rung point remains available for
+/// reporting but has no hard-upper-bound semantics here.
 ///
 /// An all-silent set receives exactly 0 dB, provided the terminal realization
 /// bound itself fits beneath the requested ceiling.

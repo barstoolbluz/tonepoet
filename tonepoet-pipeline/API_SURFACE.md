@@ -70,7 +70,8 @@ The crate root re-exports the public items from these modules.
 - `SsrcSettings`: `force`, `insane_mode`, `profile`
 - `SoxResamplerSettings`: `chebyshev`, `bandwidth_pct`, `phase`, `allow_aliasing`, `sinc_taps`, `sinc_attenuation_db`, `sinc_passband_hz`, `sinc_transition_hz`, `sinc_kaiser_beta`, `sinc_phase`
 - `SoxrResamplerSettings`: `chebyshev`, `cutoff`, `phase`
-- `DsdSettings`: `pcm_to_dsd`, `from_dsd`; legacy-v1 origin and wire are private compatibility state
+- `DsdSettings`: `pcm_to_dsd`, `from_dsd`; album-gain control via `auto_gain_scope`, `set_auto_gain_scope`, `true_peak_scan_mode`, `set_true_peak_scan_mode`; legacy-v1 origin and wire are private compatibility state
+- `DsdTruePeakScanMode`: `Reference`, `Fast`, `Fastest` (only effective for album-scoped automatic DSD gain)
 - `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
 - `DsdSourceSettings`: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`

@@ -46,6 +46,7 @@ pub enum TuiButton {
     DsdProfilePill(usize),
     DsdGainPill(usize),
     DsdGainScopePill(usize),
+    DsdTruePeakScanPill(usize),
     DsdGainDbField,
     DsdNormalizeTargetField,
     MergePill(usize),
@@ -564,6 +565,7 @@ impl TuiButton {
             | Self::DsdProfilePill(_)
             | Self::DsdGainPill(_)
             | Self::DsdGainScopePill(_)
+            | Self::DsdTruePeakScanPill(_)
             | Self::DsdGainDbField
             | Self::DsdNormalizeTargetField
             | Self::MergePill(_)

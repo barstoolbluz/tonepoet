@@ -1,18 +1,29 @@
 use std::f64::consts::PI;
 
 use tonepoet_true_peak::{
-    headroom64x_authority, EdgePolicy, HeadroomAuthorityError, HeadroomCeilingMeter, PeakLevel,
-    TruePeakConfig, TruePeakMeter, TruePeakMode, HEADROOM64X_GRID_MAX_UNDERREAD_DB,
+    headroom16x_authority, headroom64x_authority, headroom8x_authority, EdgePolicy,
+    HeadroomAuthorityError, HeadroomCeilingMeter, HeadroomScanMode, PeakLevel, TruePeakConfig,
+    TruePeakMeter, TruePeakMode, HEADROOM16X_MAX_UNDERREAD_DB, HEADROOM64X_GRID_MAX_UNDERREAD_DB,
     HEADROOM64X_MAX_UNDERREAD_DB, HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
+    HEADROOM8X_MAX_UNDERREAD_DB,
 };
 
-fn meter_at_rate(mode: TruePeakMode, channels: usize, sample_rate_hz: u32) -> TruePeakMeter {
+fn meter_at_rate_with_edge(
+    mode: TruePeakMode,
+    channels: usize,
+    sample_rate_hz: u32,
+    edge_policy: EdgePolicy,
+) -> TruePeakMeter {
     TruePeakMeter::new(
         TruePeakConfig::new(sample_rate_hz, channels)
             .with_mode(mode)
-            .with_edge_policy(EdgePolicy::RepeatEndpoints),
+            .with_edge_policy(edge_policy),
     )
     .expect("valid meter")
+}
+
+fn meter_at_rate(mode: TruePeakMode, channels: usize, sample_rate_hz: u32) -> TruePeakMeter {
+    meter_at_rate_with_edge(mode, channels, sample_rate_hz, EdgePolicy::RepeatEndpoints)
 }
 
 fn meter(mode: TruePeakMode, channels: usize) -> TruePeakMeter {
@@ -144,7 +155,12 @@ fn identical_frames_one_block_or_irregular_blocks_are_bit_identical() {
         samples.push((frame as f64 * 0.031).cos() * 0.63);
     }
 
-    for mode in [TruePeakMode::Reporting4x, TruePeakMode::Headroom64x] {
+    for mode in [
+        TruePeakMode::Reporting4x,
+        TruePeakMode::Headroom64x,
+        TruePeakMode::Headroom16x,
+        TruePeakMode::Headroom8x,
+    ] {
         let mut one = meter(mode, 2);
         one.push_interleaved(&samples).unwrap();
         let one = one.finalize().unwrap();
@@ -186,7 +202,12 @@ fn identical_frames_one_block_or_irregular_blocks_are_bit_identical() {
 
 #[test]
 fn silence_is_negative_infinity_and_near_silence_is_finite() {
-    for mode in [TruePeakMode::Reporting4x, TruePeakMode::Headroom64x] {
+    for mode in [
+        TruePeakMode::Reporting4x,
+        TruePeakMode::Headroom64x,
+        TruePeakMode::Headroom16x,
+        TruePeakMode::Headroom8x,
+    ] {
         let silence = measure_mono(&[0.0; 64], mode);
         assert_eq!(silence, PeakLevel::Silence, "mode={mode:?}");
         assert!(
@@ -602,6 +623,14 @@ fn reporting_profile_exposes_its_rate_dependent_factor() {
         TruePeakMode::Headroom64x.oversample_factor_for_sample_rate(384_000),
         64
     );
+    assert_eq!(
+        TruePeakMode::Headroom16x.oversample_factor_for_sample_rate(384_000),
+        16
+    );
+    assert_eq!(
+        TruePeakMode::Headroom8x.oversample_factor_for_sample_rate(384_000),
+        8
+    );
 }
 
 #[test]
@@ -615,7 +644,213 @@ fn headroom_declared_one_sided_bound_meets_hard_authority_contract() {
     );
     assert!(HEADROOM64X_MAX_UNDERREAD_DB > HEADROOM64X_GRID_MAX_UNDERREAD_DB);
     assert!(HEADROOM64X_MAX_UNDERREAD_DB <= 0.05);
+    assert_eq!(HEADROOM16X_MAX_UNDERREAD_DB, 0.044);
+    assert_eq!(HEADROOM8X_MAX_UNDERREAD_DB, 0.084);
+    assert!(HEADROOM64X_MAX_UNDERREAD_DB < HEADROOM16X_MAX_UNDERREAD_DB);
+    assert!(HEADROOM16X_MAX_UNDERREAD_DB < HEADROOM8X_MAX_UNDERREAD_DB);
     assert_eq!(HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE, 0.495);
+    assert_eq!(HeadroomScanMode::default(), HeadroomScanMode::Reference);
+    assert_eq!(HeadroomScanMode::Reference.max_underread_db(), 0.030);
+    assert_eq!(HeadroomScanMode::Fast.max_underread_db(), 0.044);
+    assert_eq!(HeadroomScanMode::Fastest.max_underread_db(), 0.084);
+}
+
+#[test]
+fn fast_headroom_required_upper_band_regression_meets_declared_bounds() {
+    let frequencies = [0.4850, 0.4875, 0.4900, 0.4925, 0.4950];
+    let signal = (0..1024)
+        .map(|frame| {
+            frequencies
+                .iter()
+                .map(|frequency| {
+                    (2.0 * PI * frequency * (frame as f64 - 511.5)).cos()
+                })
+                .sum::<f64>()
+                / frequencies.len() as f64
+        })
+        .collect::<Vec<_>>();
+
+    for (mode, reserve) in [
+        (TruePeakMode::Headroom16x, HEADROOM16X_MAX_UNDERREAD_DB),
+        (TruePeakMode::Headroom8x, HEADROOM8X_MAX_UNDERREAD_DB),
+    ] {
+        let measured = finite_dbtp(measure_mono_at_rate(&signal, mode, 44_100));
+        assert!(
+            -measured <= reserve,
+            "mode={mode:?}: {measured:.9} dBTP exceeds {reserve:.9} dB under-read reserve"
+        );
+    }
+}
+
+#[test]
+fn fast_headroom_qualification_worst_observed_cases_are_frozen() {
+    let cases: &[(TruePeakMode, f64, usize, f64, &[f64], f64)] = &[
+        (
+            TruePeakMode::Headroom16x,
+            HEADROOM16X_MAX_UNDERREAD_DB,
+            512,
+            255.156_596_032_607_18,
+            &[
+                0.443_226_595_083_366_76,
+                0.462_108_879_280_289_5,
+                0.481_847_933_933_665_3,
+            ],
+            -0.031_650_445_887_747_666,
+        ),
+        (
+            TruePeakMode::Headroom8x,
+            HEADROOM8X_MAX_UNDERREAD_DB,
+            640,
+            319.812_889_265_889_6,
+            &[
+                0.418_062_554_645_390_77,
+                0.437_191_380_874_839_66,
+                0.438_829_332_221_947_1,
+                0.457_519_195_178_925_53,
+                0.461_598_437_319_715_6,
+                0.465_762_811_006_863_5,
+                0.483_871_007_534_803_17,
+            ],
+            -0.049_263_807_161_202_13,
+        ),
+    ];
+
+    for &(mode, reserve, frames, aligned_time, frequencies, qualified_dbtp) in cases {
+        let signal = bandlimited_enveloped_aligned_multitone(frames, aligned_time, frequencies);
+        let half_period = aligned_time.max((frames - 1) as f64 - aligned_time);
+        let support = frequencies.iter().copied().fold(0.0, f64::max)
+            + 1.0 / (2.0 * half_period);
+        assert!(support <= HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE);
+
+        for edge_policy in [EdgePolicy::RepeatEndpoints, EdgePolicy::ZeroExtend] {
+            let mut meter = meter_at_rate_with_edge(mode, 1, 44_100, edge_policy);
+            meter.push_interleaved(&signal).unwrap();
+            let measured = finite_dbtp(meter.finalize().unwrap().overall);
+            if edge_policy == EdgePolicy::RepeatEndpoints {
+                assert!(
+                    (measured - qualified_dbtp).abs() <= 1.0e-6,
+                    "mode={mode:?}: frozen qualification case drifted: measured={measured:.9} dBTP, expected={qualified_dbtp:.9} dBTP",
+                );
+            }
+            assert!(
+                -measured <= reserve,
+                "mode={mode:?}, edge={edge_policy:?}: frozen qualification case under-read {:.9} dB exceeds {reserve:.9} dB",
+                -measured,
+            );
+        }
+    }
+}
+
+#[test]
+fn fast_headroom_authorities_apply_their_own_reserves_and_band_gate() {
+    let point = PeakLevel::Finite {
+        linear: 0.5,
+        dbtp: 20.0 * 0.5_f64.log10(),
+    };
+    let fast = headroom16x_authority(point, 0.495).unwrap();
+    let fastest = headroom8x_authority(point, 0.495).unwrap();
+    assert!((fast.dbtp() - (point.dbtp() + HEADROOM16X_MAX_UNDERREAD_DB)).abs() < 1.0e-15);
+    assert!((fastest.dbtp() - (point.dbtp() + HEADROOM8X_MAX_UNDERREAD_DB)).abs() < 1.0e-15);
+    assert_eq!(
+        headroom16x_authority(point, 0.495_000_1),
+        Err(HeadroomAuthorityError::OutsideQualifiedBand)
+    );
+    assert_eq!(
+        headroom8x_authority(point, 0.5),
+        Err(HeadroomAuthorityError::OutsideQualifiedBand)
+    );
+}
+
+#[test]
+fn fast_ceiling_modes_bound_the_reference_finite_reconstruction_at_edges_and_interior() {
+    let mut carriers = vec![
+        vec![0.5],
+        vec![1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, 0.0, 0.0, 0.0, 1.0],
+        aligned_multitone(
+            1024,
+            0,
+            511.5,
+            &[(0.30, 1.0 / 3.0), (0.40, 1.0 / 3.0), (0.495, 1.0 / 3.0)],
+        ),
+    ];
+    // A deterministic nonperiodic carrier catches state/flush mistakes that
+    // purely analytical tones can miss.
+    carriers.push(
+        (0..777)
+            .map(|frame| {
+                (frame as f64 * 0.173).sin() * 0.57
+                    + (frame as f64 * 0.031 + 0.7).cos() * 0.29
+            })
+            .collect(),
+    );
+
+    for edge in [EdgePolicy::RepeatEndpoints, EdgePolicy::ZeroExtend] {
+        for signal in &carriers {
+            let mut reference = HeadroomCeilingMeter::new(176_400, 1, edge).unwrap();
+            reference.push_interleaved(signal).unwrap();
+            let reference = reference.finalize().unwrap();
+
+            for scan_mode in [HeadroomScanMode::Fast, HeadroomScanMode::Fastest] {
+                let mut fast =
+                    HeadroomCeilingMeter::new_with_scan_mode(176_400, 1, edge, scan_mode).unwrap();
+                for chunk in signal.chunks(37) {
+                    fast.push_interleaved(chunk).unwrap();
+                }
+                let fast = fast.finalize().unwrap();
+                assert_eq!(fast.point_estimate.frames, signal.len() as u64);
+                assert!(
+                    fast.reconstruction_upper.linear() >= reference.reconstruction_upper.linear(),
+                    "edge={edge:?}, mode={scan_mode:?}, fast={}, reference={}",
+                    fast.reconstruction_upper.linear(),
+                    reference.reconstruction_upper.linear(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_ceiling_point_estimates_match_ordinary_fast_meters_bit_for_bit() {
+    let signal = aligned_multitone(
+        2048,
+        0,
+        1000.375,
+        &[(0.31, 0.25), (0.41, 0.25), (0.49, 0.25)],
+    );
+    for (scan_mode, point_mode) in [
+        (HeadroomScanMode::Fast, TruePeakMode::Headroom16x),
+        (HeadroomScanMode::Fastest, TruePeakMode::Headroom8x),
+    ] {
+        let mut ordinary = meter_at_rate(point_mode, 1, 176_400);
+        ordinary.push_interleaved(&signal).unwrap();
+        let ordinary = ordinary.finalize().unwrap();
+
+        let mut ceiling = HeadroomCeilingMeter::new_with_scan_mode(
+            176_400,
+            1,
+            EdgePolicy::RepeatEndpoints,
+            scan_mode,
+        )
+        .unwrap();
+        ceiling.push_interleaved(&signal).unwrap();
+        let ceiling = ceiling.finalize().unwrap();
+
+        assert_eq!(ordinary.overall, ceiling.point_estimate.overall);
+        assert_eq!(
+            ordinary
+                .channel_linear_peaks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            ceiling
+                .point_estimate
+                .channel_linear_peaks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+    }
 }
 
 #[test]
