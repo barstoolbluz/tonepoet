@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 
 pub mod classify;
 pub mod cap_fs;
+pub mod chapter_structure;
 pub mod cue_parser;
 pub mod formats;
 pub mod queue_expansion;

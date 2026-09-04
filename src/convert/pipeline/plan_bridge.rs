@@ -1138,7 +1138,7 @@ pub fn planner_format_from_path(path: &Path) -> Option<PlannerFormat> {
         "aiff" | "aif" | "aifc" => Some(PlannerFormat::Aiff),
         "wv" => Some(PlannerFormat::WavPack),
         "mp3" => Some(PlannerFormat::Mp3),
-        "aac" | "m4a" | "mp4" => Some(PlannerFormat::Aac),
+        "aac" | "m4a" | "m4b" | "mp4" => Some(PlannerFormat::Aac),
         "opus" => Some(PlannerFormat::Opus),
         "alac" => Some(PlannerFormat::Alac),
         "dsf" => Some(PlannerFormat::Dsf),
@@ -1273,7 +1273,8 @@ mod tests {
         authoritative_dsd_sample_timing_from_path, dsd_source_metadata_from_path,
         flac_streaminfo_audio_md5, metadata_obligations_for_request,
         orchestrator_metadata_stage_required, plan_request_for_track,
-        planner_metadata_obligations_for_track, source_audio_md5_policy_downgrade_message,
+        planner_format_from_path, planner_metadata_obligations_for_track,
+        source_audio_md5_policy_downgrade_message,
         source_info_for_realized_track, source_needs_authoritative_metadata,
         source_supports_source_tag_transfer, DsdPlannerSourceKind,
         DsdPlannerValidationStatus,
@@ -1356,6 +1357,26 @@ mod tests {
             batch_resolved_identity: None,
             metadata_overrides: Default::default(),
         }
+    }
+
+    #[test]
+    fn planner_bridge_classifies_m4b_as_aac_without_changing_raw_aac_policy() {
+        assert_eq!(
+            planner_format_from_path(Path::new("book.m4b")),
+            Some(PlannerFormat::Aac)
+        );
+        assert_eq!(
+            planner_format_from_path(Path::new("track.m4a")),
+            Some(PlannerFormat::Aac)
+        );
+        assert_eq!(
+            planner_format_from_path(Path::new("track.mp4")),
+            Some(PlannerFormat::Aac)
+        );
+        assert_eq!(
+            planner_format_from_path(Path::new("track.aac")),
+            Some(PlannerFormat::Aac)
+        );
     }
 
     fn track(source_ref: TrackSourceRef) -> PreparedTrack {

@@ -616,7 +616,7 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
 fn is_single_audio_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "flac" | "wav" | "wave" | "aiff" | "aif" | "aifc" | "wv" | "mp3" | "m4a" | "mp4"
+        "flac" | "wav" | "wave" | "aiff" | "aif" | "aifc" | "wv" | "mp3" | "m4a" | "m4b" | "mp4"
             | "aac" | "opus" | "ogg" | "ape" | "w64" | "rf64" | "dsf" | "dff"
     )
 }
@@ -4263,6 +4263,13 @@ pub async fn merge_tracks_with_tool_limits(
             final_path: t.final_path.clone(),
             total_samples: t.samples.unwrap_or(0),
             source_tracks: vec![t.track_id.clone()],
+            source_track_staged_paths: vec![t.staged_path.clone()],
+            source_track_exact_samples: if req.settings.target_format.is_pcm_lossless() {
+                t.samples.map(|samples| vec![samples]).unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            timeline_sample_rate: None,
             planned_command_hash: t.planned_command_hash.clone(),
         };
         return Ok((
@@ -4365,11 +4372,19 @@ pub async fn merge_tracks_with_tool_limits(
     let (actual_sample_rate, actual_duration) = parse_merge_probe(&probe_output.stdout_tail)?;
     let actual_samples = (actual_duration * actual_sample_rate as f64).round() as u64;
 
-    let expected_sum: Option<u64> = track_artifacts
-        .iter()
-        .map(|t| t.samples)
-        .collect::<Option<Vec<u64>>>()
-        .map(|v| v.iter().sum());
+    // `TrackArtifact.samples` is an exact target-domain measurement for PCM
+    // lossless outputs, but lossy outputs intentionally retain an estimate
+    // because codec delay/padding makes strict post-encode sample validation
+    // invalid. Never compare that estimate to the merged output clock.
+    let expected_sum: Option<u64> = if req.settings.target_format.is_pcm_lossless() {
+        track_artifacts
+            .iter()
+            .map(|track| track.samples)
+            .collect::<Option<Vec<u64>>>()
+            .map(|values| values.iter().sum())
+    } else {
+        None
+    };
 
     if let Some(expected) = expected_sum {
         let tolerance = actual_sample_rate as u64;
@@ -4394,6 +4409,17 @@ pub async fn merge_tracks_with_tool_limits(
     let merged_final = final_dir.join(format!("merged.{}", ext));
 
     let source_tracks: Vec<TrackId> = track_artifacts.iter().map(|t| t.track_id.clone()).collect();
+    let source_track_staged_paths: Vec<PathBuf> =
+        track_artifacts.iter().map(|track| track.staged_path.clone()).collect();
+    let source_track_exact_samples = if req.settings.target_format.is_pcm_lossless() {
+        track_artifacts
+            .iter()
+            .map(|track| track.samples)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // Compute a stable hash of the merge command plan for manifest rerun identity.
     // Source track identities, per-track planned hashes, and target format capture
@@ -4429,6 +4455,9 @@ pub async fn merge_tracks_with_tool_limits(
         final_path: merged_final,
         total_samples: actual_samples,
         source_tracks,
+        source_track_staged_paths,
+        source_track_exact_samples,
+        timeline_sample_rate: Some(actual_sample_rate),
         planned_command_hash: merge_command_hash,
     };
 
@@ -4633,7 +4662,7 @@ fn prepared_artifact_requires_post_encode_metadata(
                     &tags,
                 )
         }
-        "m4a" | "mp4" => {
+        "m4a" | "m4b" | "mp4" => {
             !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
         }
         // W64 metadata mutation is intentionally fail-closed. Never let a
@@ -5071,14 +5100,7 @@ pub async fn apply_metadata_with_tool_limits(
             }
         }
         AudioArtifacts::Merged(merged) => {
-            let album_as_track = TrackMetadata {
-                title: source.album_metadata.album.clone(),
-                artist: source.album_metadata.album_artist.clone(),
-                album_artist: source.album_metadata.album_artist.clone(),
-                genre: source.album_metadata.genre.clone(),
-                date: source.album_metadata.date.clone(),
-                ..TrackMetadata::default()
-            };
+            let album_as_track = merged_album_metadata_as_track(source);
             apply_production_metadata_to_file(
                 &merged.staged_path,
                 &album_as_track,
@@ -5097,6 +5119,50 @@ pub async fn apply_metadata_with_tool_limits(
         outcome: StageOutcome::Ok,
         dsd_dst_stats: None,
     })
+}
+
+fn merged_album_metadata_as_track(source: &PreparedSource) -> TrackMetadata {
+    TrackMetadata {
+        title: source.album_metadata.album.clone(),
+        artist: source.album_metadata.album_artist.clone(),
+        album_artist: source.album_metadata.album_artist.clone(),
+        genre: source.album_metadata.genre.clone(),
+        date: source.album_metadata.date.clone(),
+        ..TrackMetadata::default()
+    }
+}
+
+/// Reassert the terminal MP4-family metadata layers after a structural chapter
+/// remux. The primary FFmpeg metadata rewrite and artwork embed deliberately do
+/// not run again here: they are remux-style operations themselves. AtomicParsley
+/// freeform atoms are known to be stripped by a later MOV remux, while the
+/// in-process ordered-list writer is the audited preservation-aware terminal
+/// layer. Reusing the same prepared metadata projection keeps authority identical
+/// to the ordinary merged metadata stage.
+pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
+    path: &Path,
+    source: &PreparedSource,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), MetadataError> {
+    let album_as_track = merged_album_metadata_as_track(source);
+    apply_m4a_freeform_tags(
+        path,
+        &album_as_track,
+        &source.album_metadata,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
+    apply_pipeline_multivalue_overlay(
+        path,
+        &album_as_track,
+        &source.album_metadata,
+        cancel,
+    )
+    .await
 }
 
 fn pipeline_set_valued_tag_key(key: &str) -> bool {
@@ -5207,6 +5273,7 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
         || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        || key == EMBEDDED_CHAPTER_STRUCTURE_EXTRA_KEY
         || key.starts_with(CUE_USER_METADATA_EXTRA_PREFIX)
         || key.starts_with(SOURCE_TEXT_TAG_EXTRA_PREFIX)
         || key == "image_metadata_source"
@@ -6121,7 +6188,7 @@ fn ffmpeg_metadata_rewrite_args(
     // (verified empirically: the flag stores arbitrary keys but silently
     // DROPS the attached_pic stream; without it the picture survives and
     // the muxer's atom allowlist drops the custom keys instead). Custom
-    // keys for m4a/mp4 therefore ride a follow-up AtomicParsley freeform
+    // keys for m4a/m4b/mp4 therefore ride a follow-up AtomicParsley freeform
     // pass (`apply_m4a_freeform_tags`) that runs AFTER artwork embedding.
     args.push(tmp.display().to_string());
     args
@@ -6163,7 +6230,7 @@ fn m4a_freeform_tag_pairs_for_file(
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "m4a" | "mp4") {
+    if !matches!(ext.as_str(), "m4a" | "m4b" | "mp4") {
         return Vec::new();
     }
     m4a_freeform_tag_pairs(&authoritative_metadata_tags(meta, album))
@@ -6172,7 +6239,9 @@ fn m4a_freeform_tag_pairs_for_file(
 /// Write the non-native authoritative keys as iTunes freeform atoms
 /// (`----:com.apple.iTunes:<KEY>`). Runs AFTER the ffmpeg rewrite AND after
 /// any artwork embed: every mov re-mux strips freeform atoms (allowlist), so
-/// this must be the final *remux-style* container rewrite. The Phase-4 shared
+/// this must be the final *remux-style* rewrite within the metadata stage. The
+/// structured-merge chapter finalizer is the one later remux exception and
+/// explicitly re-applies this freeform layer afterward. The Phase-4 shared
 /// in-process metadata writer may follow it; that path uses the editor's
 /// format-aware preservation logic. Later unrelated tag editors are permitted
 /// only when their preservation behavior is pinned (the real-tools
@@ -6324,7 +6393,7 @@ fn metadata_tag_command(
                 ),
             ));
         }
-        "mp3" | "m4a" | "mp4" | "wav" | "rf64" | "aiff" | "aif" => {
+        "mp3" | "m4a" | "m4b" | "mp4" | "wav" | "rf64" | "aiff" | "aif" => {
             let tmp = metadata_rewrite_temp_path(path)?;
             let carrier = if metadata_uses_rf64_carrier(path, ext)? {
                 FfmpegMetadataCarrier::Rf64
@@ -6400,7 +6469,7 @@ fn ffmpeg_artwork_rewrite_args(
             args.push("-id3v2_version".into());
             args.push("3".into());
         }
-        "m4a" | "mp4" => {
+        "m4a" | "m4b" | "mp4" => {
             args.push("-f".into());
             args.push("ipod".into());
         }
@@ -6485,7 +6554,7 @@ fn cue_artwork_embed_plan(
                 seed_from_source: true,
             }
         }
-        "mp3" | "m4a" | "mp4" => {
+        "mp3" | "m4a" | "m4b" | "mp4" => {
             let temp = metadata_rewrite_temp_path(path)?;
             let command = ToolCommand {
                 environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
@@ -6736,7 +6805,7 @@ fn fixed_vocab_scalar_collapse_warnings(
 ) -> Vec<String> {
     use lofty::tag::ItemKey;
 
-    if !matches!(ext, "mp3" | "m4a" | "mp4") {
+    if !matches!(ext, "mp3" | "m4a" | "m4b" | "mp4") {
         return Vec::new();
     }
     pipeline_multivalue_write_changes(tags)
@@ -6765,7 +6834,7 @@ fn pipeline_multivalue_overlay_changes_for_extension(
         .into_iter()
         .filter(|(item_key, _)| match ext {
             "wv" => true,
-            "mp3" | "wav" | "aiff" | "aif" | "m4a" | "mp4" => matches!(
+            "mp3" | "wav" | "aiff" | "aif" | "m4a" | "m4b" | "mp4" => matches!(
                 item_key,
                 ItemKey::TrackArtist | ItemKey::Composer | ItemKey::Performer | ItemKey::Arranger
             ),
@@ -6932,7 +7001,7 @@ async fn apply_pipeline_multivalue_overlay(
         .to_ascii_lowercase();
     if !matches!(
         ext.as_str(),
-        "wv" | "mp3" | "wav" | "aiff" | "aif" | "m4a" | "mp4"
+        "wv" | "mp3" | "wav" | "aiff" | "aif" | "m4a" | "m4b" | "mp4"
     ) {
         return Ok(());
     }
@@ -7151,9 +7220,10 @@ async fn apply_production_metadata_to_file(
     .await?;
 
     // Artwork remuxes and the M4A freeform pass run first. The audited editor
-    // writer is the final metadata mutation for formats whose command-line
-    // writer cannot represent repeated values (WavPack/ID3v2.4/MP4). For RIFF
-    // WAV, the same pass establishes a complete authoritative ID3v2 view
+    // writer is the final metadata-stage mutation for formats whose command-line
+    // writer cannot represent repeated values (WavPack/ID3v2.4/MP4). A later
+    // structured-merge chapter remux must reassert these terminal MP4 layers.
+    // For RIFF WAV, the same pass establishes a complete authoritative ID3v2 view
     // whenever repeated fields require that primary carrier. RF64 remains on
     // its validated FFmpeg INFO carrier; unsupported RF64 fields are rejected
     // before the primary rewrite because Lofty 0.21.1 cannot parse RF64.
@@ -7617,9 +7687,9 @@ mod metadata_writer_command_tests {
         ]);
         let temp = tempfile::tempdir().expect("tempdir");
         for (scope, tags) in [("single", &single_file_tags), ("album", &album_tags)] {
-            for ext in ["flac", "opus", "wv", "mp3", "m4a"] {
+            for ext in ["flac", "opus", "wv", "mp3", "m4a", "m4b", "mp4"] {
                 let path = temp.path().join(format!("{scope}-output.{ext}"));
-                if matches!(ext, "mp3" | "m4a") {
+                if matches!(ext, "mp3" | "m4a" | "m4b" | "mp4") {
                     fs::write(&path, b"source audio").expect("write metadata rewrite source");
                 }
                 let (command, temporary) =
@@ -7643,16 +7713,16 @@ mod metadata_writer_command_tests {
                         assert_pair(&command.args, "-w", "PRE_EMPHASIS=1");
                         assert!(temporary.is_none());
                     }
-                    "mp3" | "m4a" => {
+                    "mp3" | "m4a" | "m4b" | "mp4" => {
                         assert_pair(&command.args, "-map_metadata", "-1");
                         assert_pair(&command.args, "-metadata", "my_note=keep me");
                         assert_pair(&command.args, "-metadata", "pre_emphasis=1");
                         // No use_metadata_tags anywhere: on ffmpeg 7.1 the
                         // flag and an attached picture are mutually exclusive
-                        // in one mov mux, so m4a custom keys ride the
+                        // in one mov mux, so MP4-family custom keys ride the
                         // AtomicParsley freeform pass instead.
                         assert!(!command.args.iter().any(|arg| arg == "-movflags"));
-                        if ext == "m4a" {
+                        if matches!(ext, "m4a" | "m4b" | "mp4") {
                             let freeform = m4a_freeform_tag_pairs(tags);
                             assert!(freeform
                                 .iter()
@@ -8003,7 +8073,7 @@ mod metadata_writer_command_tests {
             ("GENRE".to_string(), "G1".to_string()),
             ("GENRE".to_string(), "G2".to_string()),
         ];
-        for ext in ["mp3", "m4a", "mp4"] {
+        for ext in ["mp3", "m4a", "m4b", "mp4"] {
             let warnings = fixed_vocab_scalar_collapse_warnings(
                 Path::new(&format!("track.{ext}")),
                 ext,
@@ -8088,7 +8158,7 @@ mod metadata_writer_command_tests {
             ("GENRE".to_string(), "G1".to_string()),
             ("GENRE".to_string(), "G2".to_string()),
         ];
-        for ext in ["mp3", "wav", "aiff", "aif", "m4a", "mp4"] {
+        for ext in ["mp3", "wav", "aiff", "aif", "m4a", "m4b", "mp4"] {
             let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, ext);
             assert_eq!(changes.len(), 4, "{ext}");
             for repeatable in [
@@ -8673,6 +8743,27 @@ mod metadata_writer_command_tests {
             &[("MY_NOTE".to_string(), "Reference".to_string())],
         );
         assert_closed_metadata_environment(&atomic_parsley, "C.UTF-8");
+    }
+
+    #[test]
+    fn m4b_uses_the_same_freeform_itunes_atom_projection_as_m4a() {
+        let mut track = TrackMetadata::default();
+        insert_source_text_tag(&mut track.extra, "MY_NOTE", "keep me");
+        let album = AlbumMetadata::default();
+
+        let m4a = m4a_freeform_tag_pairs_for_file(Path::new("track.m4a"), &track, &album);
+        let m4b = m4a_freeform_tag_pairs_for_file(Path::new("book.m4b"), &track, &album);
+        let mp4 = m4a_freeform_tag_pairs_for_file(Path::new("track.mp4"), &track, &album);
+        assert_eq!(m4b, m4a);
+        assert_eq!(mp4, m4a);
+        assert!(m4b.iter().any(|(key, value)| key == "MY_NOTE" && value == "keep me"));
+        assert!(m4a_freeform_tag_pairs_for_file(Path::new("track.aac"), &track, &album).is_empty());
+
+        let command = m4a_freeform_tag_command(Path::new("book.m4b"), &m4b);
+        assert_eq!(command.binary, ToolBinary::AtomicParsley);
+        assert_eq!(command.args.first().map(String::as_str), Some("book.m4b"));
+        assert!(command.args.iter().any(|arg| arg == "--rDNSatom"));
+        assert!(command.args.iter().any(|arg| arg == "name=MY_NOTE"));
     }
 
     #[test]
@@ -10469,7 +10560,7 @@ mod metadata_writer_command_tests {
             CueArtworkEmbedPlan::InPlace { .. } => panic!("FLAC artwork mutation must be fail-closed through a temp copy"),
         }
 
-        for (target, ext) in [("track.mp3", "mp3"), ("track.m4a", "m4a")] {
+        for (target, ext) in [("track.mp3", "mp3"), ("track.m4a", "m4a"), ("track.m4b", "m4b")] {
             let path = dir.join(target);
             fs::write(&path, b"source audio").expect("write artwork source");
             match cue_artwork_embed_plan(&path, ext, &artwork)
@@ -10500,7 +10591,7 @@ mod metadata_writer_command_tests {
                     assert_pair(&cmd.args, "-disposition:v:0", "attached_pic");
                     assert_pair(&cmd.args, "-c:a", "copy");
                     assert_pair(&cmd.args, "-c:v", "copy");
-                    if ext == "m4a" {
+                    if matches!(ext, "m4a" | "m4b") {
                         assert_pair(&cmd.args, "-f", "ipod");
                     } else {
                         assert_pair(&cmd.args, "-id3v2_version", "3");
@@ -10635,6 +10726,17 @@ mod cue_real_output_matrix_tests {
                 required_encoder: Some("libfdk_aac"),
                 // These custom-tag m4a cases require the metadata stage and its
                 // AtomicParsley freeform pass.
+                required_taggers: &["AtomicParsley"],
+                artwork_supported: ArtworkExpectation::EmbeddedPicture,
+                supports_album_artist: true,
+            },
+            MatrixCase {
+                name: "cue_to_aac_m4b",
+                format: tonepoet_pipeline::AudioFormat::Aac,
+                extension: "m4b",
+                container_contains: &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+                codec: "aac",
+                required_encoder: Some("libfdk_aac"),
                 required_taggers: &["AtomicParsley"],
                 artwork_supported: ArtworkExpectation::EmbeddedPicture,
                 supports_album_artist: true,
@@ -10882,7 +10984,11 @@ FILE "album.flac" WAVE
             album_batch_track: None,
             suppress_incremental_conversion_log_append: false,
             expected_album_track_count: None,
-            container_extension: None,
+            // The matrix case *is* the container selection, so the request has
+            // to carry it. Leaving this None made every MP4-family case fall
+            // back to the format default, which is why an m4b case could only
+            // ever produce m4a.
+            container_extension: Some(case.extension.to_string()),
             container_ffmpeg_flags: Vec::new(),
             companion: CompanionCopyPolicy::default(),
         }
@@ -14680,7 +14786,10 @@ fn stage_conversion_log_sidecars(
         });
     }
 
-    if req.stages.generate_cue && source.tracks.len() > 1 {
+    // The legacy generate_cue option continues to govern ordinary non-merged exports.
+    // Structured merge sidecars are finalized later from the published-output timeline and
+    // intentionally do not treat the current default `false` as an explicit merge opt-out.
+    if req.stages.generate_cue && !req.merge && source.tracks.len() > 1 {
         let cue_staged = staging.root.join("album.cue");
         let cue_content = build_cue_sheet(source, &artifacts);
         fs::write(&cue_staged, &cue_content)?;
@@ -23693,7 +23802,7 @@ fn audio_extension_label(extension: &str) -> &'static str {
         "aiff" | "aif" => "AIFF",
         "wv" => "WavPack",
         "mp3" => "MP3",
-        "m4a" | "mp4" | "aac" => "AAC/ALAC",
+        "m4a" | "m4b" | "mp4" | "aac" => "AAC/ALAC",
         "opus" | "ogg" => "Opus",
         "dsf" | "dff" | "dsd" | "iso" => "DSD",
         _ => "source",
@@ -24763,6 +24872,18 @@ fn push_cue_file_line(cue: &mut String, filename: &str) {
 }
 
 fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
+    build_cue_sheet_with_merged_timeline(source, artifacts, None)
+}
+
+/// Render the existing CUE view, optionally using authoritative target-domain
+/// start samples for a merged program. The prepared source remains the sole
+/// metadata authority; the timing override changes only INDEX 01 geometry and
+/// never re-reads or re-resolves source metadata.
+pub(crate) fn build_cue_sheet_with_merged_timeline(
+    source: &PreparedSource,
+    artifacts: &ArtifactSet,
+    merged_timeline: Option<(&[u64], u32)>,
+) -> String {
     let mut cue = String::new();
     if let Some(catalog) = source.album_metadata.extra.get("catalog") {
         if let Some(catalog) = sanitize_cue_catalog(catalog) {
@@ -24822,30 +24943,55 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
         }
         AudioArtifacts::Merged(merged) => {
             let filename = merged
-                .staged_path
+                .final_path
                 .file_name()
                 .and_then(|filename| filename.to_str())
                 .unwrap_or("merged");
             push_cue_file_line(&mut cue, filename);
-            let boundary_tracks = &source.tracks[..source.tracks.len().saturating_sub(1)];
-            let shared_rate = boundary_tracks
-                .first()
-                .and_then(|track| track.sample_rate)
-                .filter(|rate| boundary_tracks.iter().all(|track| track.sample_rate == Some(*rate)));
-            let exact_boundaries = boundary_tracks.is_empty()
-                || (shared_rate.is_some()
-                    && boundary_tracks.iter().all(|track| track.expected_samples.is_some()));
-            let mut offset_samples = 0_u64;
-            for (i, source_track) in source.tracks.iter().enumerate() {
-                cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-                push_track_body(&mut cue, source_track);
-                let index_time = if exact_boundaries {
-                    cue_index_time(offset_samples, shared_rate.unwrap_or(1))
-                } else {
-                    "00:00:00".to_string()
-                };
-                cue.push_str(&format!("    INDEX 01 {index_time}\n"));
-                offset_samples = offset_samples.saturating_add(source_track.expected_samples.unwrap_or(0));
+
+            if let Some((start_samples, sample_rate)) = merged_timeline
+                .filter(|(starts, rate)| *rate != 0 && starts.len() == merged.source_tracks.len())
+            {
+                for (i, (track_id, start_sample)) in merged
+                    .source_tracks
+                    .iter()
+                    .zip(start_samples.iter())
+                    .enumerate()
+                {
+                    cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
+                    if let Some(source_track) = source.tracks.iter().find(|track| track.id == *track_id) {
+                        push_track_body(&mut cue, source_track);
+                    }
+                    cue.push_str(&format!(
+                        "    INDEX 01 {}\n",
+                        cue_index_time(*start_sample, sample_rate)
+                    ));
+                }
+            } else {
+                // Legacy/user-requested merged CUE fallback. Pre-publish
+                // structured-merge finalization supplies target-domain starts;
+                // this branch preserves the old synchronous renderer for other
+                // callers without adding probes to ordinary conversions.
+                let boundary_tracks = &source.tracks[..source.tracks.len().saturating_sub(1)];
+                let shared_rate = boundary_tracks
+                    .first()
+                    .and_then(|track| track.sample_rate)
+                    .filter(|rate| boundary_tracks.iter().all(|track| track.sample_rate == Some(*rate)));
+                let exact_boundaries = boundary_tracks.is_empty()
+                    || (shared_rate.is_some()
+                        && boundary_tracks.iter().all(|track| track.expected_samples.is_some()));
+                let mut offset_samples = 0_u64;
+                for (i, source_track) in source.tracks.iter().enumerate() {
+                    cue.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
+                    push_track_body(&mut cue, source_track);
+                    let index_time = if exact_boundaries {
+                        cue_index_time(offset_samples, shared_rate.unwrap_or(1))
+                    } else {
+                        "00:00:00".to_string()
+                    };
+                    cue.push_str(&format!("    INDEX 01 {index_time}\n"));
+                    offset_samples = offset_samples.saturating_add(source_track.expected_samples.unwrap_or(0));
+                }
             }
         }
     }
@@ -24854,8 +25000,11 @@ fn build_cue_sheet(source: &PreparedSource, artifacts: &ArtifactSet) -> String {
 
 /// Format a sample offset as a CUE MM:SS:FF timestamp (75 frames/second).
 fn cue_index_time(offset_samples: u64, sample_rate: u32) -> String {
-    let rate = u64::from(sample_rate.max(1));
-    let frames_total = offset_samples * 75 / rate;
+    let rate = u128::from(sample_rate.max(1));
+    // CUE indexes have only 1/75-second resolution. Truncate to the preceding
+    // representable frame so a quantized sidecar boundary never starts after
+    // the measured merged-audio seam and drops presentation samples.
+    let frames_total = u128::from(offset_samples) * 75 / rate;
     let minutes = frames_total / (75 * 60);
     let seconds = (frames_total / 75) % 60;
     let frames = frames_total % 75;
@@ -34231,6 +34380,39 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
     }
 
+    emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
+    if let Some(artifact_set) = artifacts.as_mut() {
+        if let Err(err) = super::chapter_write::finalize_structured_chapters_before_publish(
+            artifact_set,
+            &source_value,
+            runner,
+            cancel,
+            req.stages.metadata != StageRequirement::Disabled,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(err.to_string()),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            current_outcome =
+                push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages: stages_from(&current_outcome),
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return Box::pin(finalize_report(
+                &req, reporter, source, plan, artifacts, published, current_outcome,
+            ))
+            .await;
+        }
+    }
+
     // Native Reference publication always carries manifest-v2 authority.
     // Existing routes retain the opt-in legacy manifest policy.
     let reference_manifest_required = artifacts.as_ref().is_some_and(|artifact_set| match &artifact_set.audio {
@@ -34245,7 +34427,6 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         Ok(None)
     };
 
-    emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
     let container_companion_snapshot =
         container_companion_snapshot_before_publish_best_effort(&req, &source_value);
     match conversion_manifest.and_then(|conversion_manifest| {
@@ -35263,6 +35444,36 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     }
 
     emit_stage_started(reporter, &item_id, PipelineStage::Publish).await;
+    if let (Some(artifact_set), Some(source_ref)) = (artifacts.as_mut(), source.as_ref()) {
+        if let Err(err) = super::chapter_write::finalize_structured_chapters_before_publish(
+            artifact_set,
+            source_ref,
+            runner,
+            cancel,
+            req.stages.metadata != StageRequirement::Disabled,
+            None,
+        )
+        .await
+        {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(err.to_string()),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages,
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return finalize_report(
+                &req, reporter, source, plan, artifacts, published, current_outcome,
+            )
+            .await;
+        }
+    }
     let container_companion_snapshot = source
         .as_ref()
         .and_then(|source_ref| container_companion_snapshot_before_publish_best_effort(&req, source_ref));
@@ -45714,7 +45925,13 @@ fn default_audio_container_extension<'a>(
     container_extension: Option<&'a str>,
 ) -> &'a str {
     match format {
-        PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => match container_extension {
+        PlannerAudioFormat::Aac => match container_extension {
+            Some(extension) if matches!(extension.trim().to_ascii_lowercase().as_str(), "m4a" | "m4b" | "mp4") => {
+                extension
+            }
+            _ => "m4a",
+        },
+        PlannerAudioFormat::Alac => match container_extension {
             Some(extension) if matches!(extension.trim().to_ascii_lowercase().as_str(), "m4a" | "mp4") => {
                 extension
             }
@@ -45741,12 +45958,12 @@ fn validate_final_container_extension(
 
     match format {
         PlannerAudioFormat::Aac => match extension.as_str() {
-            "m4a" | "mp4" => Ok(()),
+            "m4a" | "m4b" | "mp4" => Ok(()),
             "aac" => Err(
-                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode".to_string(),
+                "AAC output is muxed as MP4-family M4A/M4B/MP4 by this pipeline; raw .aac output is not implemented, so use .m4a/.m4b/.mp4 or add an explicit raw-AAC mode".to_string(),
             ),
             _ => Err(
-                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented".to_string(),
+                "AAC output must use an .m4a, .m4b, or .mp4 container extension unless an explicit raw-AAC mode is implemented".to_string(),
             ),
         },
         PlannerAudioFormat::Alac => match extension.as_str() {
@@ -45847,9 +46064,10 @@ fn staged_audio_path(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.to_ascii_lowercase())
         .filter(|extension| match format {
-            PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => {
-                matches!(extension.as_str(), "m4a" | "mp4")
+            PlannerAudioFormat::Aac => {
+                matches!(extension.as_str(), "m4a" | "m4b" | "mp4")
             }
+            PlannerAudioFormat::Alac => matches!(extension.as_str(), "m4a" | "mp4"),
             _ => true,
         })
         .unwrap_or_else(|| default_audio_container_extension(format, None).to_string());
@@ -45919,11 +46137,37 @@ mod cue_container_extension_tests {
     }
 
     #[test]
-    fn explicit_aac_mp4_containers_are_accepted() {
+    fn explicit_aac_mp4_family_containers_are_accepted_without_broadening_alac() {
         validate_final_container_extension(&PlannerAudioFormat::Aac, Some("m4a")).unwrap();
+        validate_final_container_extension(&PlannerAudioFormat::Aac, Some("m4b")).unwrap();
         validate_final_container_extension(&PlannerAudioFormat::Aac, Some("mp4")).unwrap();
         validate_final_container_extension(&PlannerAudioFormat::Alac, Some("m4a")).unwrap();
         validate_final_container_extension(&PlannerAudioFormat::Alac, Some("mp4")).unwrap();
+        assert!(validate_final_container_extension(&PlannerAudioFormat::Alac, Some("m4b")).is_err());
+    }
+
+    #[test]
+    fn explicit_aac_m4b_extension_survives_defaulting_and_staging() {
+        assert_eq!(
+            default_audio_container_extension(&PlannerAudioFormat::Aac, Some("m4b")),
+            "m4b"
+        );
+        let mut output = PathBuf::from("03 - Chapter");
+        append_default_extension(&mut output, &PlannerAudioFormat::Aac, Some("m4b"));
+        assert_eq!(output.extension().and_then(|value| value.to_str()), Some("m4b"));
+
+        let id = TrackId {
+            source_ordinal: 3,
+            disc_number: None,
+            track_number: 3,
+        };
+        let staged = staged_audio_path(
+            Path::new("convert"),
+            Path::new("03 - Chapter.m4b"),
+            &id,
+            &PlannerAudioFormat::Aac,
+        );
+        assert_eq!(staged.extension().and_then(|value| value.to_str()), Some("m4b"));
     }
 
     #[test]
@@ -48024,6 +48268,28 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
         return StagingParentSelection::disk(disk_parent);
     };
 
+    // Embedded chapters turn one compressed SingleFile into a retained set of
+    // decoded PCM carriers during materialization. The legacy SingleFile
+    // scratch estimate is deliberately based on compressed source bytes and
+    // therefore cannot safely bound this new expansion (a low-bitrate,
+    // long-form AAC book can expand by an order of magnitude). Keep the
+    // optional tmpfs/scratch budget honest by using ordinary disk staging for
+    // this structural path. CUE's proven direct-stream scratch estimator and
+    // ordinary one-track SingleFile scratch behavior remain unchanged.
+    if matches!(detect_source_kind(req), Ok(SourceKind::SingleFile))
+        && crate::convert::chapter_structure::chapter_capable_source_extension(&req.container)
+        && crate::convert::chapter_structure::read_embedded_chapters(&req.container)
+            .is_ok_and(|chapters| !chapters.is_empty())
+    {
+        log::info!(
+            "scratch bypassed for embedded-chapter single-file item: job_id={}, item_id={}, disk_staging_path={}",
+            req.job_id,
+            req.item_id,
+            disk_parent.display(),
+        );
+        return StagingParentSelection::disk(disk_parent);
+    }
+
     let scratch_parent = scratch.root().join(STAGING_PARENT_NAME);
     if let Err(err) = scratch.ensure_usable(&scratch_parent) {
         log::warn!(
@@ -49730,6 +49996,9 @@ mod build_cue_sheet_tests {
                 final_path: PathBuf::from("/out/album.flac"),
                 total_samples: 44_100 * 90,
                 source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                source_track_staged_paths: vec![],
+                source_track_exact_samples: vec![],
+                timeline_sample_rate: None,
                 planned_command_hash: None,
             }),
             sidecars: Vec::new(),
@@ -49746,6 +50015,46 @@ mod build_cue_sheet_tests {
     }
 
     #[test]
+    fn merged_cue_target_timeline_override_uses_published_filename_and_measured_seams() {
+        let mut source = cue_source();
+        // Deliberately make source-domain expectations disagree with the
+        // supplied target-domain seam. The merged structural finalizer must
+        // not leak these source facts into the published sidecar.
+        source.tracks[0].expected_samples = Some(44_100 * 60);
+        source.tracks[0].sample_rate = Some(44_100);
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Merged(MergedArtifact {
+                staged_path: PathBuf::from("/staging/internal-merged.m4b"),
+                final_path: PathBuf::from("/out/Published Book.m4b"),
+                total_samples: 144_000,
+                source_tracks: source.tracks.iter().map(|track| track.id.clone()).collect(),
+                source_track_staged_paths: vec![],
+                source_track_exact_samples: vec![],
+                timeline_sample_rate: None,
+                planned_command_hash: None,
+            }),
+            sidecars: Vec::new(),
+        };
+
+        let cue = build_cue_sheet_with_merged_timeline(
+            &source,
+            &artifacts,
+            Some((&[0, 48_000], 48_000)),
+        );
+        assert!(cue.contains("FILE \"Published Book.m4b\" WAVE"), "{cue}");
+        assert!(cue.contains("    INDEX 01 00:01:00"), "{cue}");
+        assert!(!cue.contains("    INDEX 01 01:00:00"), "{cue}");
+    }
+
+    #[test]
+    fn cue_index_quantization_never_advances_past_the_measured_sample_seam() {
+        // 32_319 samples at 48 kHz is 50.498... CUE frames. Truncation emits
+        // frame 50 rather than frame 51, so the sidecar cannot skip samples at
+        // the true target-domain boundary.
+        assert_eq!(cue_index_time(32_319, 48_000), "00:00:50");
+    }
+
+    #[test]
     fn merged_cue_degrades_to_zero_indexes_when_boundary_facts_are_incomplete() {
         // A boundary-contributing track with unknown length (or an unknown/
         // mixed rate) makes cumulative offsets unknowable: emit placeholder
@@ -49759,6 +50068,9 @@ mod build_cue_sheet_tests {
                 final_path: PathBuf::from("/out/album.flac"),
                 total_samples: 44_100 * 90,
                 source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                source_track_staged_paths: vec![],
+                source_track_exact_samples: vec![],
+                timeline_sample_rate: None,
                 planned_command_hash: None,
             }),
             sidecars: Vec::new(),
@@ -49778,6 +50090,9 @@ mod build_cue_sheet_tests {
                 final_path: PathBuf::from("/out/album.flac"),
                 total_samples: 44_100 * 120,
                 source_tracks: source.tracks.iter().map(|t| t.id.clone()).collect(),
+                source_track_staged_paths: vec![],
+                source_track_exact_samples: vec![],
+                timeline_sample_rate: None,
                 planned_command_hash: None,
             }),
             sidecars: Vec::new(),
@@ -49861,6 +50176,13 @@ mod bluray_routing_tests {
                 "{name} should route as a generic archive"
             );
         }
+    }
+
+    #[test]
+    fn pipeline_m4b_routes_as_single_file_source() {
+        let mut req = log_test_request();
+        req.container = PathBuf::from("/tmp/book.M4B");
+        assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::SingleFile);
     }
 
     #[test]
@@ -57177,7 +57499,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         fixture.album.source.tracks[0].metadata.arranger =
             vec!["R1".to_string(), "R2".to_string()].into();
-        for extension in ["mp3", "wav", "aiff", "aif", "m4a"] {
+        for extension in ["mp3", "wav", "aiff", "aif", "m4a", "m4b", "mp4"] {
             let mut repeated_artifact = artifact.clone();
             repeated_artifact.staged_path.set_extension(extension);
             let repeated_artifacts = ArtifactSet {
@@ -57458,7 +57780,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         artifact.metadata_required = planner_source_tag_satisfaction();
         artifact.metadata_satisfaction = planner_source_tag_satisfaction();
 
-        for ext in ["mp3", "m4a", "mp4"] {
+        for ext in ["mp3", "m4a", "m4b", "mp4"] {
             artifact.staged_path.set_extension(ext);
             fixture.album.source.tracks[0].metadata = TrackMetadata {
                 artist: vec!["A1".to_string(), "A2".to_string()].into(),

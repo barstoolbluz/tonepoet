@@ -1904,6 +1904,14 @@ pub const CUE_ARTWORK_MIME_EXTRA_KEY: &str = "tonepoet_cue_artwork_mime";
 pub const CUE_ARTWORK_SOURCE_EXTRA_KEY: &str = "tonepoet_cue_artwork_source";
 pub const CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY: &str = "tonepoet_cue_artwork_unsupported";
 
+/// Reserved AlbumMetadata.extra marker proving that a SingleFile source was
+/// expanded from embedded container chapters. This is pipeline provenance,
+/// never user metadata, and lets pre-publish structural finalization distinguish
+/// an ordinary multi-track batch from one ordered program.
+pub const EMBEDDED_CHAPTER_STRUCTURE_EXTRA_KEY: &str =
+    "tonepoet_embedded_chapter_structure";
+pub const EMBEDDED_CHAPTER_STRUCTURE_VERSION: &str = "v1";
+
 /// Reserved AlbumMetadata.extra marker proving that the bounded native APEv2
 /// fallback supplied the authoritative source tag set. This key is internal
 /// pipeline state and must never be emitted as user metadata.
@@ -2577,6 +2585,25 @@ pub struct MergedArtifact {
     pub final_path: PathBuf,
     pub total_samples: u64,
     pub source_tracks: Vec<TrackId>,
+    /// Per-track encoded carrier paths in `source_tracks` order. Structural
+    /// finalization probes these only when a merged lossy program needs
+    /// target-domain boundaries for chapter/CUE serialization, so codec delay
+    /// never leaks into sidecar geometry without adding probe overhead to
+    /// ordinary non-merged conversions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_track_staged_paths: Vec<PathBuf>,
+    /// Exact per-track target-domain sample counts when conversion already
+    /// established them without an extra probe (currently PCM/lossless
+    /// carriers). Empty for lossy carriers, whose presentation timeline must
+    /// be measured after encode because codec priming/padding can diverge from
+    /// source-domain expectations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_track_exact_samples: Vec<u64>,
+    /// Measured merged-output sample rate when merge validation already had to
+    /// probe it. Structural sidecar/chapter finalization reuses this fact on
+    /// the lossless fast path instead of probing unchanged PCM carriers again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_sample_rate: Option<u32>,
     /// SHA-256 of the planned merge command sequence. Single-track merge
     /// shortcuts reuse the wrapped track artifact hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]

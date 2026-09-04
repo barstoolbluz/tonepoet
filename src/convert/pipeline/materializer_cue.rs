@@ -2434,6 +2434,170 @@ fn staged_cue_segment_path(
     ))
 }
 
+/// Shared sample-bounded staging request for non-CUE structure (currently
+/// embedded container chapters). This is transport geometry only, not a second
+/// source model: chapter parsing/normalization is owned by `chapter_structure`,
+/// while decode/validation/publish semantics remain owned here beside CUE.
+#[derive(Debug, Clone)]
+pub(super) struct StructuredSegmentRequest {
+    pub start_sample: u64,
+    pub samples: u64,
+    pub destination: PathBuf,
+    pub lossy_tail: bool,
+}
+
+/// Stage a set of structural segments through the CUE cutter authority.
+///
+/// More than one segment is decoded in one FFmpeg process with an `asplit`
+/// filter graph. That matters for long lossy chaptered programs: invoking the
+/// ordinary `atrim=start_sample=...` cutter once per chapter would repeatedly
+/// decode the program prefix and turn a 45-chapter audiobook into O(N^2)
+/// source decoding. The batched transport is still bounded-memory and uses the
+/// exact same sample-domain `atrim` geometry, carrier type, length policy, and
+/// atomic validated publication as the established CUE fallback.
+pub(super) async fn stage_structured_segments_as_wav(
+    image: &Path,
+    sample_rate: u32,
+    carrier: CueSegmentCarrier,
+    segments: &[StructuredSegmentRequest],
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Vec<(PathBuf, u64)>, MaterializeError> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    if segments.len() == 1 {
+        let segment = &segments[0];
+        let policy = if segment.lossy_tail {
+            SegmentLengthPolicy::LossyTail
+        } else {
+            SegmentLengthPolicy::Exact
+        };
+        return stage_cue_segment_as_wav(
+            image,
+            segment.start_sample,
+            segment.samples,
+            sample_rate,
+            carrier,
+            &segment.destination,
+            policy,
+            runner,
+            cancel,
+        )
+        .await
+        .map(|staged| vec![(staged.path, staged.samples)]);
+    }
+
+    // A completed all-exact batch is fully reusable without another decode.
+    // LossyTail uses a measured-name destination, so it intentionally falls
+    // through to the single-decode rebuild just like the existing CUE path.
+    let mut reusable = Vec::with_capacity(segments.len());
+    let mut all_reusable = true;
+    for segment in segments {
+        if segment.samples == 0 {
+            return Err(MaterializeError::Parse(
+                "structured segment has zero audio samples".to_string(),
+            ));
+        }
+        if segment.lossy_tail || !segment.destination.exists() {
+            all_reusable = false;
+            break;
+        }
+        match validate_staged_cue_segment_as(
+            &segment.destination,
+            sample_rate,
+            segment.samples,
+            carrier,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok(()) => reusable.push((segment.destination.clone(), segment.samples)),
+            Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+            Err(_) => {
+                all_reusable = false;
+                break;
+            }
+        }
+    }
+    if all_reusable && reusable.len() == segments.len() {
+        return Ok(reusable);
+    }
+
+    let mut temporary_paths = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if segment.samples == 0 {
+            return Err(MaterializeError::Parse(
+                "structured segment has zero audio samples".to_string(),
+            ));
+        }
+        if let Some(parent) = segment.destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = temporary_segment_path(&segment.destination)?;
+        if let Some(parent) = temporary.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        cleanup_old_temporary_segments(&segment.destination);
+        remove_path_if_exists(&temporary)?;
+        temporary_paths.push(temporary);
+    }
+
+    let command = structured_segments_ffmpeg_command_for_carrier(
+        image,
+        segments,
+        carrier,
+        &temporary_paths,
+    )?;
+    match runner.run(command, cancel).await {
+        Ok(_) => {}
+        Err(ToolRunnerError::Cancelled { .. }) => {
+            for path in &temporary_paths {
+                let _ = remove_path_if_exists(path);
+            }
+            return Err(MaterializeError::Cancelled);
+        }
+        Err(error) => {
+            for path in &temporary_paths {
+                let _ = remove_path_if_exists(path);
+            }
+            return Err(error.into());
+        }
+    }
+
+    let mut staged = Vec::with_capacity(segments.len());
+    for (segment, temporary) in segments.iter().zip(temporary_paths.iter()) {
+        let policy = if segment.lossy_tail {
+            SegmentLengthPolicy::LossyTail
+        } else {
+            SegmentLengthPolicy::Exact
+        };
+        match finalize_staged_cue_segment(
+            image,
+            temporary,
+            &segment.destination,
+            segment.samples,
+            sample_rate,
+            carrier,
+            policy,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok(segment) => staged.push((segment.path, segment.samples)),
+            Err(error) => {
+                for path in &temporary_paths {
+                    let _ = remove_path_if_exists(path);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(staged)
+}
+
 #[cfg(test)] // test-only shim over the typed-carrier path
 async fn stage_cue_segment_as_s32_wav(
     image: &Path,
@@ -2553,7 +2717,7 @@ async fn stage_cue_segment_as_wav(
 ) -> Result<StagedCueSegment, MaterializeError> {
     // Pre-ffmpeg reuse short-circuit. For LossyTail the published file lives
     // under the MEASURED name, which is unknowable before decoding, so an
-    // interrupted-run retry pays one extra decode (correctness unaffected —
+    // interrupted-run retry pays one extra decode (correctness unaffected --
     // the publish path still reuses a valid measured-name file).
     if policy == SegmentLengthPolicy::Exact && destination.exists() {
         match validate_staged_cue_segment_as(
@@ -2574,10 +2738,8 @@ async fn stage_cue_segment_as_wav(
             }
             Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
             Err(_) => {
-                // Do not remove the published path yet. A stale or partial file from a
-                // previous interrupted run is not trusted, but keeping it in place until a
-                // fully validated replacement is ready avoids a publish gap for any
-                // accidental concurrent observer of the private staging directory.
+                // Keep an invalid prior path in place until a fully validated
+                // replacement is ready; private staging never needs a publish gap.
             }
         }
     }
@@ -2585,7 +2747,6 @@ async fn stage_cue_segment_as_wav(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-
     let tmp_destination = temporary_segment_path(destination)?;
     if let Some(parent) = tmp_destination.parent() {
         fs::create_dir_all(parent)?;
@@ -2594,14 +2755,14 @@ async fn stage_cue_segment_as_wav(
     remove_path_if_exists(&tmp_destination)?;
 
     // LossyTail stages OPEN-ENDED: the header-derived end is an estimate in
-    // both directions (delay/padding overstates; Xing-less VBR understates —
+    // both directions (delay/padding overstates; Xing-less VBR understates --
     // a capped extraction would silently truncate real audio AND validate
     // clean). CUE tail semantics are "play to end of audio".
     let capped_samples = match policy {
         SegmentLengthPolicy::Exact => Some(samples),
         SegmentLengthPolicy::LossyTail => None,
     };
-    let cmd = cue_segment_ffmpeg_command_for_carrier(
+    let command = cue_segment_ffmpeg_command_for_carrier(
         image,
         start_sample,
         capped_samples,
@@ -2609,129 +2770,206 @@ async fn stage_cue_segment_as_wav(
         &tmp_destination,
     )?;
 
-    let run_result = runner.run(cmd, cancel).await;
-    match run_result {
+    match runner.run(command, cancel).await {
         Ok(_) => {
-            // Measure once on the tmp file; every later validation is Exact
-            // against the measured count.
-            let measured = match measure_staged_cue_segment_as(
+            let result = finalize_staged_cue_segment(
+                image,
                 &tmp_destination,
+                destination,
+                samples,
                 sample_rate,
                 carrier,
+                policy,
                 runner,
                 cancel,
             )
-            .await
-            {
-                Ok(measured) => measured,
-                Err(err) => {
-                    let _ = remove_path_if_exists(&tmp_destination);
-                    return Err(err);
-                }
-            };
-            match policy {
-                SegmentLengthPolicy::Exact => {
-                    if measured != samples {
-                        let _ = remove_path_if_exists(&tmp_destination);
-                        return Err(MaterializeError::Parse(format!(
-                            "CUE image {} decoded {} samples for the requested segment, expected {}; temporary staging file was {}",
-                            image.display(),
-                            measured,
-                            samples,
-                            tmp_destination.display()
-                        )));
-                    }
-                }
-                SegmentLengthPolicy::LossyTail => {
-                    let limit = lossy_tail_shortfall_limit(sample_rate, samples);
-                    if measured == 0 {
-                        let _ = remove_path_if_exists(&tmp_destination);
-                        return Err(MaterializeError::Parse(format!(
-                            "lossy CUE image {} decoded no samples for its tail segment",
-                            image.display()
-                        )));
-                    }
-                    if measured.saturating_add(limit) < samples {
-                        let _ = remove_path_if_exists(&tmp_destination);
-                        return Err(MaterializeError::Parse(format!(
-                            "lossy CUE image {} decoded {} samples short of its header length for the tail segment (measured {}, expected {}, limit {}); the source appears truncated",
-                            image.display(),
-                            samples - measured,
-                            measured,
-                            samples,
-                            limit
-                        )));
-                    }
-                    if measured > samples.saturating_add(u64::from(sample_rate)) {
-                        log::warn!(
-                            "lossy CUE image {} decoded {} samples beyond its header length for the tail segment (measured {}, header {}); keeping the full decode",
-                            image.display(),
-                            measured - samples,
-                            measured,
-                            samples
-                        );
-                    }
-                }
-            }
-            let final_destination =
-                segment_destination_with_samples(destination, samples, measured);
-
-            sync_file_to_storage(&tmp_destination)?;
-
-            if final_destination.exists() {
-                match validate_staged_cue_segment_as(
-                    &final_destination,
-                    sample_rate,
-                    measured,
-                    carrier,
-                    runner,
-                    cancel,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let _ = remove_path_if_exists(&tmp_destination);
-                        return Ok(StagedCueSegment {
-                            path: final_destination,
-                            samples: measured,
-                        });
-                    }
-                    Err(MaterializeError::Cancelled) => {
-                        let _ = remove_path_if_exists(&tmp_destination);
-                        return Err(MaterializeError::Cancelled);
-                    }
-                    Err(_) => {}
-                }
-            }
-
-            if let Err(err) = publish_validated_staged_segment(
-                &tmp_destination,
-                &final_destination,
-                sample_rate,
-                measured,
-                carrier,
-                runner,
-                cancel,
-            )
-            .await
-            {
+            .await;
+            if result.is_err() {
                 let _ = remove_path_if_exists(&tmp_destination);
-                return Err(err);
             }
-            Ok(StagedCueSegment {
-                path: final_destination,
-                samples: measured,
-            })
+            result
         }
         Err(ToolRunnerError::Cancelled { .. }) => {
             let _ = remove_path_if_exists(&tmp_destination);
             Err(MaterializeError::Cancelled)
         }
-        Err(err) => {
+        Err(error) => {
             let _ = remove_path_if_exists(&tmp_destination);
-            Err(err.into())
+            Err(error.into())
         }
     }
+}
+
+async fn finalize_staged_cue_segment(
+    image: &Path,
+    tmp_destination: &Path,
+    destination: &Path,
+    requested_samples: u64,
+    sample_rate: u32,
+    carrier: CueSegmentCarrier,
+    policy: SegmentLengthPolicy,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<StagedCueSegment, MaterializeError> {
+    // Measure once on the tmp file; every later validation is Exact against
+    // the measured count.
+    let measured = measure_staged_cue_segment_as(
+        tmp_destination,
+        sample_rate,
+        carrier,
+        runner,
+        cancel,
+    )
+    .await?;
+    match policy {
+        SegmentLengthPolicy::Exact => {
+            if measured != requested_samples {
+                return Err(MaterializeError::Parse(format!(
+                    "CUE image {} decoded {} samples for the requested segment, expected {}; temporary staging file was {}",
+                    image.display(),
+                    measured,
+                    requested_samples,
+                    tmp_destination.display()
+                )));
+            }
+        }
+        SegmentLengthPolicy::LossyTail => {
+            let limit = lossy_tail_shortfall_limit(sample_rate, requested_samples);
+            if measured == 0 {
+                return Err(MaterializeError::Parse(format!(
+                    "lossy CUE image {} decoded no samples for its tail segment",
+                    image.display()
+                )));
+            }
+            if measured.saturating_add(limit) < requested_samples {
+                return Err(MaterializeError::Parse(format!(
+                    "lossy CUE image {} decoded {} samples short of its header length for the tail segment (measured {}, expected {}, limit {}); the source appears truncated",
+                    image.display(),
+                    requested_samples - measured,
+                    measured,
+                    requested_samples,
+                    limit
+                )));
+            }
+            if measured > requested_samples.saturating_add(u64::from(sample_rate)) {
+                log::warn!(
+                    "lossy CUE image {} decoded {} samples beyond its header length for the tail segment (measured {}, header {}); keeping the full decode",
+                    image.display(),
+                    measured - requested_samples,
+                    measured,
+                    requested_samples
+                );
+            }
+        }
+    }
+
+    let final_destination =
+        segment_destination_with_samples(destination, requested_samples, measured);
+    sync_file_to_storage(tmp_destination)?;
+
+    if final_destination.exists() {
+        match validate_staged_cue_segment_as(
+            &final_destination,
+            sample_rate,
+            measured,
+            carrier,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = remove_path_if_exists(tmp_destination);
+                return Ok(StagedCueSegment {
+                    path: final_destination,
+                    samples: measured,
+                });
+            }
+            Err(MaterializeError::Cancelled) => return Err(MaterializeError::Cancelled),
+            Err(_) => {}
+        }
+    }
+
+    publish_validated_staged_segment(
+        tmp_destination,
+        &final_destination,
+        sample_rate,
+        measured,
+        carrier,
+        runner,
+        cancel,
+    )
+    .await?;
+    Ok(StagedCueSegment {
+        path: final_destination,
+        samples: measured,
+    })
+}
+
+fn structured_segments_ffmpeg_command_for_carrier(
+    image: &Path,
+    segments: &[StructuredSegmentRequest],
+    carrier: CueSegmentCarrier,
+    destinations: &[PathBuf],
+) -> Result<ToolCommand, MaterializeError> {
+    if segments.is_empty() || segments.len() != destinations.len() {
+        return Err(MaterializeError::Parse(
+            "structured segment batch has inconsistent geometry/output cardinality".to_string(),
+        ));
+    }
+
+    let mut graph = format!("[0:a:0]asplit={}", segments.len());
+    for index in 0..segments.len() {
+        graph.push_str(&format!("[segment{index}]"));
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        let capped_samples = if segment.lossy_tail {
+            None
+        } else {
+            Some(segment.samples)
+        };
+        let filter = cue_segment_atrim_filter(segment.start_sample, capped_samples)?;
+        graph.push(';');
+        graph.push_str(&format!(
+            "[segment{index}]{filter}[output{index}]"
+        ));
+    }
+
+    let mut args = vec![
+        "-v".into(),
+        "error".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-i".into(),
+        image.display().to_string(),
+        "-filter_complex".into(),
+        graph,
+    ];
+    for (index, destination) in destinations.iter().enumerate() {
+        args.extend([
+            "-map".to_string(),
+            format!("[output{index}]"),
+            "-c:a".to_string(),
+            carrier.codec_name().to_string(),
+            "-f".to_string(),
+            "wav".to_string(),
+            destination.display().to_string(),
+        ]);
+    }
+
+    Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        binary: ToolBinary::Ffmpeg,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        // This command intentionally decodes an entire long-form program once.
+        // A 15-minute per-segment timeout would be inappropriate for a 20-hour
+        // audiobook even though one-pass decoding is fast in ordinary use.
+        timeout: Duration::from_secs(6 * 60 * 60),
+    })
 }
 
 #[cfg(test)] // test-only shim over the typed-carrier path
@@ -5342,6 +5580,75 @@ TRACK XX AUDIO
         assert!(cmd.args.windows(2).any(|pair| pair[0] == "-c:a" && pair[1] == "pcm_s32le"));
         assert!(cmd.args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "wav"));
         assert!(!cmd.args.iter().any(|arg| arg == "-ss" || arg == "-t"));
+    }
+
+    #[test]
+    fn structured_segment_batch_decodes_once_and_preserves_open_lossy_tail() {
+        let segments = vec![
+            StructuredSegmentRequest {
+                start_sample: 0,
+                samples: 44_101,
+                destination: PathBuf::from("chapter-1.wav"),
+                lossy_tail: false,
+            },
+            StructuredSegmentRequest {
+                start_sample: 44_101,
+                samples: 44_099,
+                destination: PathBuf::from("chapter-2.wav"),
+                lossy_tail: false,
+            },
+            StructuredSegmentRequest {
+                start_sample: 88_200,
+                samples: 44_100,
+                destination: PathBuf::from("chapter-3.wav"),
+                lossy_tail: true,
+            },
+        ];
+        let destinations = vec![
+            PathBuf::from("tmp-1.wav"),
+            PathBuf::from("tmp-2.wav"),
+            PathBuf::from("tmp-3.wav"),
+        ];
+        let command = structured_segments_ffmpeg_command_for_carrier(
+            Path::new("book.m4b"),
+            &segments,
+            CueSegmentCarrier::PcmS32LeWav,
+            &destinations,
+        )
+        .expect("build batched structural cutter");
+
+        assert_eq!(command.args.iter().filter(|arg| arg.as_str() == "-i").count(), 1);
+        let graph = command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].as_str())
+            .expect("filter graph");
+        assert!(graph.contains("[0:a:0]asplit=3"));
+        assert!(graph.contains(
+            "atrim=start_sample=0:end_sample=44101,asetpts=N/SR/TB"
+        ));
+        assert!(graph.contains(
+            "atrim=start_sample=44101:end_sample=88200,asetpts=N/SR/TB"
+        ));
+        assert!(graph.contains("atrim=start_sample=88200,asetpts=N/SR/TB"));
+        assert!(!graph.contains("start_sample=88200:end_sample="));
+        assert_eq!(
+            command
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "-map" && pair[1].starts_with("[output"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            command
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "-c:a" && pair[1] == "pcm_s32le")
+                .count(),
+            3
+        );
     }
 
     #[test]

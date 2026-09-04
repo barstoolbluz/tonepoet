@@ -4,7 +4,7 @@
 //! executor, metadata, ReplayGain, publish, and logging stages then handle it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ impl super::stages::Materializer for SingleFileMaterializer {
     async fn materialize(
         &self,
         req: &PipelineRequest,
-        _staging: &StagingDir,
+        staging: &StagingDir,
         runner: &dyn ToolRunner,
         reporter: Option<&dyn PipelineReporter>,
         _tool_paths: &HashMap<String, std::path::PathBuf>,
@@ -60,6 +60,40 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 }
             }
         }
+        let embedded_chapters = if crate::convert::chapter_structure::chapter_capable_source_extension(
+            &req.container,
+        ) {
+            match crate::convert::chapter_structure::read_embedded_chapters(&req.container) {
+                Ok(raw) if raw.is_empty() => {
+                    if crate::convert::chapter_structure::is_m4b_path(&req.container) {
+                        return Err(MaterializeError::Parse(format!(
+                            "M4B source {} contains no embedded chapters; Tonepoet will not convert it as one undifferentiated track",
+                            req.container.display()
+                        )));
+                    }
+                    Vec::new()
+                }
+                Ok(raw) => crate::convert::chapter_structure::normalize_embedded_chapters(
+                    &raw,
+                    probe.sample_rate,
+                )
+                .map_err(|error| {
+                    MaterializeError::Parse(format!(
+                        "embedded chapter structure in {} is not usable: {error}",
+                        req.container.display()
+                    ))
+                })?,
+                Err(error) => {
+                    return Err(MaterializeError::Parse(format!(
+                        "cannot inspect embedded chapter structure in {}: {error}; refusing to fall back to one undifferentiated track because that could silently discard chapters",
+                        req.container.display()
+                    )));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         let transferred_cue_metadata = req
             .source
             .sidecar_cue_track_metadata
@@ -142,6 +176,121 @@ impl super::stages::Materializer for SingleFileMaterializer {
             0.5,
         )
         .await;
+        if !embedded_chapters.is_empty() {
+            let carrier = CueSegmentCarrier::for_source_depth_descriptor(probe.bit_depth);
+            let selected_chapters = embedded_chapters
+                .iter()
+                .filter(|chapter| {
+                    track_ordinal_selected(chapter.ordinal, &req.source.track_selection)
+                })
+                .collect::<Vec<_>>();
+            if cancel.is_cancelled() {
+                return Err(MaterializeError::Cancelled);
+            }
+
+            // One source decode fans out all selected chapter carriers. The
+            // shared CUE materializer owns the `atrim` geometry, LossyTail
+            // contract, validation, and atomic staging; this layer contributes
+            // only container-derived boundaries and titles.
+            let segment_requests = selected_chapters
+                .iter()
+                .map(|chapter| {
+                    let boundary = chapter.boundary;
+                    super::materializer_cue::StructuredSegmentRequest {
+                        start_sample: boundary.start_sample,
+                        samples: boundary.samples,
+                        destination: staged_embedded_chapter_path(
+                            staging,
+                            chapter.ordinal,
+                            boundary.start_sample,
+                            boundary.samples,
+                        ),
+                        lossy_tail: probe.coding == SourceAudioCoding::Lossy
+                            && boundary.is_program_tail,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let staged_segments = super::materializer_cue::stage_structured_segments_as_wav(
+                &req.container,
+                probe.sample_rate,
+                carrier,
+                &segment_requests,
+                runner,
+                cancel,
+            )
+            .await?;
+            if staged_segments.len() != selected_chapters.len() {
+                return Err(MaterializeError::Parse(format!(
+                    "embedded chapter staging for {} returned {} carriers for {} selected chapters",
+                    req.container.display(),
+                    staged_segments.len(),
+                    selected_chapters.len()
+                )));
+            }
+
+            let mut tracks = Vec::with_capacity(selected_chapters.len());
+            for (chapter, (staged_path, measured_samples)) in
+                selected_chapters.into_iter().zip(staged_segments.into_iter())
+            {
+                let boundary = chapter.boundary;
+                let mut chapter_metadata = metadata.clone();
+                chapter_metadata.title = chapter.title.clone();
+                chapter_metadata.track_number = Some(chapter.ordinal);
+                let id = TrackId {
+                    source_ordinal: chapter.ordinal,
+                    disc_number: chapter_metadata.disc_number,
+                    track_number: chapter.ordinal,
+                };
+                tracks.push(PreparedTrack {
+                    id,
+                    source_ref: TrackSourceRef::CueSegmentCarrier {
+                        path: staged_path,
+                        source_image: req.container.clone(),
+                        start_sample: boundary.start_sample,
+                        samples: measured_samples,
+                        carrier,
+                    },
+                    metadata: chapter_metadata,
+                    expected_samples: Some(measured_samples),
+                    sample_rate: Some(probe.sample_rate),
+                    bit_depth: probe.bit_depth,
+                    source_audio: SourceAudioDescriptor::from_scalar(
+                        Some(probe.sample_rate),
+                        probe.bit_depth,
+                        Some(probe.coding),
+                    ),
+                    warnings: metadata_warnings.clone(),
+                });
+            }
+
+            let mut album_metadata = sidecar_album_fallback.unwrap_or_else(|| {
+                derive_single_file_album_metadata(&tracks, metadata_recovered_by_fallback)
+            });
+            album_metadata.total_tracks = embedded_chapters.len() as u32;
+            album_metadata.extra.insert(
+                EMBEDDED_CHAPTER_STRUCTURE_EXTRA_KEY.to_string(),
+                EMBEDDED_CHAPTER_STRUCTURE_VERSION.to_string(),
+            );
+            if let Some(cue_album_metadata) = cue_album_metadata {
+                merge_sidecar_cue_album_metadata(&mut album_metadata, cue_album_metadata);
+                // Embedded chapter cardinality is structural source authority;
+                // a sidecar metadata total must not collapse it back to one.
+                album_metadata.total_tracks = embedded_chapters.len() as u32;
+            }
+            return Ok(PreparedSource {
+                container: req.container.clone(),
+                kind: SourceKind::SingleFile,
+                tracks,
+                album_metadata,
+                provenance: ExtractionProvenance {
+                    source_kind: SourceKind::SingleFile,
+                    source_sha256: None,
+                    tool_versions: BTreeMap::new(),
+                    extracted_at: chrono::Utc::now(),
+                },
+            });
+        }
+
         let track_number = single_file_filename_track_number(
             metadata.track_number,
             req.album_batch_track.as_ref(),
@@ -778,16 +927,33 @@ pub(super) fn item_key_to_extra_key(
     }
 }
 
+fn staged_embedded_chapter_path(
+    staging: &StagingDir,
+    ordinal: u32,
+    start_sample: u64,
+    samples: u64,
+) -> PathBuf {
+    staging.root.join("chapter-segments").join(format!(
+        "{ordinal:03}-s{start_sample}-n{samples}.wav"
+    ))
+}
+
+fn track_ordinal_selected(ordinal: u32, selection: &TrackSelection) -> bool {
+    match selection {
+        TrackSelection::All => true,
+        TrackSelection::Range { start, end } => ordinal >= *start && ordinal <= *end,
+        TrackSelection::Set(set) => set.contains(&ordinal),
+    }
+}
+
 fn apply_track_selection(
     tracks: Vec<PreparedTrack>,
     selection: &TrackSelection,
 ) -> Result<Vec<PreparedTrack>, MaterializeError> {
-    match selection {
-        TrackSelection::All => Ok(tracks),
-        TrackSelection::Range { start, end } if *start <= 1 && *end >= 1 => Ok(tracks),
-        TrackSelection::Set(set) if set.contains(&1) => Ok(tracks),
-        TrackSelection::Range { .. } | TrackSelection::Set(_) => Ok(Vec::new()),
-    }
+    Ok(tracks
+        .into_iter()
+        .filter(|track| track_ordinal_selected(track.id.source_ordinal, selection))
+        .collect())
 }
 
 fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {

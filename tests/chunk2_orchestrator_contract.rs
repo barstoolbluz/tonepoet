@@ -62,12 +62,24 @@ fn single_files_enter_the_shared_pool_as_immediate_work_units() {
     assert!(processor.contains("run_single_item_with_shared_scheduler"));
     assert!(processor.contains("run_queue_with_shared_orchestrator("));
 
+    // The contract is an ordering one: after branching on SingleFile the
+    // dispatcher must reach build_single_file_work, and must not route through
+    // prepare_pipeline_item_for_scheduler on the way. It is deliberately not a
+    // proximity check -- an earlier fixed 500-character window broke the moment
+    // legitimate code (embedded-chapter detection) was added inside the branch,
+    // even though the ordering it exists to protect was untouched.
     let single_branch = processor
         .find("Some(SourceKind::SingleFile)")
         .expect("processor must branch on SourceKind::SingleFile");
-    let branch_tail = &processor[single_branch..processor.len().min(single_branch + 500)];
-    assert!(branch_tail.contains("build_single_file_work"));
-    assert!(!branch_tail.contains("prepare_pipeline_item_for_scheduler"));
+    let branch_tail = &processor[single_branch..];
+    let reaches_builder = branch_tail
+        .find("build_single_file_work")
+        .expect("SingleFile branch must reach build_single_file_work");
+    let reaches_scheduler_prep = branch_tail.find("prepare_pipeline_item_for_scheduler");
+    assert!(
+        reaches_scheduler_prep.is_none_or(|prep| prep > reaches_builder),
+        "SingleFile must build its work unit directly, not via prepare_pipeline_item_for_scheduler"
+    );
 }
 
 #[test]

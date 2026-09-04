@@ -25,6 +25,7 @@ pub(crate) mod bluray_lpcm;
 pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
 pub mod actions;
+pub(crate) mod chapter_write;
 pub mod errors;
 pub mod label_resolver;
 pub mod manifest;

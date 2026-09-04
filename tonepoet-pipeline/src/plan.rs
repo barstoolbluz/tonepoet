@@ -1049,14 +1049,14 @@ fn validate_requested_container_extension(request: &PlanRequest) -> Result<()> {
 
     match &request.settings.target_format {
         AudioFormat::Aac => match extension.as_deref() {
-            None | Some("m4a" | "mp4") => Ok(()),
+            None | Some("m4a" | "m4b" | "mp4") => Ok(()),
             Some("aac") => Err(PlanningError::invalid_settings(
                 "output_path",
-                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode",
+                "AAC output is muxed as MP4-family M4A/M4B/MP4 by this pipeline; raw .aac output is not implemented, so use .m4a/.m4b/.mp4 or add an explicit raw-AAC mode",
             )),
             Some(_) => Err(PlanningError::invalid_settings(
                 "output_path",
-                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented",
+                "AAC output must use an .m4a, .m4b, or .mp4 container extension unless an explicit raw-AAC mode is implemented",
             )),
         },
         AudioFormat::Alac => match extension.as_deref() {
@@ -2564,6 +2564,22 @@ mod metadata_pruning_tests {
     }
 
     #[test]
+    fn plan_accepts_explicit_aac_m4b_and_preserves_work_extension() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("track.m4b");
+        request.intermediate_dir = Some(PathBuf::from("work"));
+
+        let context = request.context();
+        assert_eq!(context.target_container_extension(), "m4b");
+        assert_eq!(
+            context.final_work_path(),
+            PathBuf::from("work/.track.tonepoet-final.m4b")
+        );
+        plan_conversion(&request).expect("explicit AAC M4B must pass pure planning");
+    }
+
+    #[test]
     fn plan_context_defaults_aac_to_m4a_when_no_extension_is_requested() {
         let mut request = metadata_pruning_request();
         request.settings.target_format = AudioFormat::Aac;
@@ -2585,6 +2601,16 @@ mod metadata_pruning_tests {
             err.to_string().contains("raw .aac output is not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn plan_rejects_alac_m4b_because_catalog_support_is_aac_only() {
+        let mut request = metadata_pruning_request();
+        request.settings.target_format = AudioFormat::Alac;
+        request.output_path = PathBuf::from("track.m4b");
+
+        let err = plan_conversion(&request).expect_err("ALAC M4B is not an enabled output product");
+        assert!(err.to_string().contains("ALAC output must use"), "unexpected error: {err}");
     }
 
     #[test]

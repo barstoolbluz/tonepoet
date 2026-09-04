@@ -1452,14 +1452,14 @@ fn validate_aac_family_container_extension(
 ) -> Result<()> {
     match target_format {
         AudioFormat::Aac => match extension {
-            "m4a" | "mp4" => Ok(()),
+            "m4a" | "m4b" | "mp4" => Ok(()),
             "aac" => Err(PlanningError::invalid_settings(
                 "output_path",
-                "AAC output is muxed as MP4/M4A by this pipeline; raw .aac output is not implemented, so use .m4a/.mp4 or add an explicit raw-AAC mode",
+                "AAC output is muxed as MP4-family M4A/M4B/MP4 by this pipeline; raw .aac output is not implemented, so use .m4a/.m4b/.mp4 or add an explicit raw-AAC mode",
             )),
             _ => Err(PlanningError::invalid_settings(
                 "output_path",
-                "AAC output must use an .m4a or .mp4 container extension unless an explicit raw-AAC mode is implemented",
+                "AAC output must use an .m4a, .m4b, or .mp4 container extension unless an explicit raw-AAC mode is implemented",
             )),
         },
         AudioFormat::Alac => match extension {
@@ -1475,7 +1475,7 @@ fn validate_aac_family_container_extension(
 
 fn add_ffmpeg_container_format_args(args: &mut Vec<String>, target_format: &AudioFormat) {
     match target_format {
-        // Use the MP4/iPod muxer for AAC-family .m4a outputs. A raw ADTS .aac
+        // Use the MP4/iPod muxer for AAC-family M4A/M4B/MP4 outputs. A raw ADTS .aac
         // stream cannot carry the metadata and artwork contract required here.
         AudioFormat::Aac | AudioFormat::Alac => {
             args.push("-f".into());
@@ -3117,6 +3117,56 @@ mod tests {
             err.to_string().contains("raw .aac output is not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn ffmpeg_aac_m4b_command_uses_ipod_muxer() {
+        let source = SourceInfo {
+            dsd_source_kind: None,
+            format: AudioFormat::Wav,
+            codec: crate::enums::AudioCodec::PcmSigned,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(PcmBitDepth::Int16),
+            true_source_depth: Some(PcmBitDepth::Int16),
+            source_representation: Default::default(),
+            sample_kind: Some(crate::enums::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            audio_md5: None,
+        };
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        let request = PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("realized.wav"),
+            output_path: PathBuf::from("track.m4b"),
+            source,
+            settings,
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        };
+        let step = PlanStep::new(
+            0,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(44_100),
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("realized.wav")),
+            OutputSink::Path(PathBuf::from("track.m4b")),
+            "Encode AAC M4B output",
+        );
+
+        let command = FfmpegPlugin
+            .build_command(&request.context(), &step)
+            .expect("AAC M4B command");
+        assert!(command.args.windows(2).any(|window| window[0] == "-f" && window[1] == "ipod"));
+        assert!(command
+            .output
+            .as_path()
+            .is_some_and(|path| path.extension().and_then(|ext| ext.to_str()) == Some("m4b")));
     }
 
     #[test]

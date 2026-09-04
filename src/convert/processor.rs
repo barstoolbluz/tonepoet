@@ -3768,11 +3768,55 @@ fn build_initial_work(
         }
     };
 
+    let source_kind = detect_source_kind(&request).ok();
+    let mut has_embedded_chapters = false;
+    if matches!(source_kind, Some(SourceKind::SingleFile))
+        && crate::convert::chapter_structure::chapter_capable_source_extension(&request.container)
+    {
+        match crate::convert::chapter_structure::read_embedded_chapters(&request.container) {
+            Ok(chapters) if !chapters.is_empty() => {
+                has_embedded_chapters = true;
+            }
+            Ok(_) if crate::convert::chapter_structure::is_m4b_path(&request.container) => {
+                pool.metrics().record_job_failed();
+                terminal.insert(
+                    item_id.clone(),
+                    ConversionStatus::Failed {
+                        error: format!(
+                            "M4B source '{}' contains no embedded chapters. Tonepoet admits .m4b as a structured audiobook source and will not silently convert it as one undifferentiated track.",
+                            request.container.display()
+                        ),
+                        log_path: None,
+                    },
+                );
+                return None;
+            }
+            Err(error) => {
+                pool.metrics().record_job_failed();
+                terminal.insert(
+                    item_id.clone(),
+                    ConversionStatus::Failed {
+                        error: format!(
+                            "Cannot inspect embedded chapter structure in '{}': {error}. Tonepoet will not fall back to one undifferentiated track because that could silently discard chapters.",
+                            request.container.display()
+                        ),
+                        log_path: None,
+                    },
+                );
+                return None;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // Do not register scheduler correlation for an item rejected by the early
+    // structure gate above. Every returned work unit, including the single-file
+    // fast path, is registered before it can be submitted.
     job_to_item.insert(request.job_id.clone(), item_id.clone());
 
-    let source_kind = detect_source_kind(&request).ok();
     if matches!(source_kind, Some(SourceKind::SingleFile))
         && !request.settings.dsd.album_auto_gain_selected()
+        && !has_embedded_chapters
     {
         return Some(build_single_file_work(
             request,
