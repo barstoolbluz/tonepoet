@@ -186,27 +186,34 @@ pub fn plan_request_for_track(
         settings.preferred_tool = PreferredTool::Ffmpeg;
     }
 
-    // CUE planning uses an audio-only PCM carrier model. Stream segments keep the
-    // same carrier semantics without eagerly writing the hypothetical WAV:
-    // S32 for integer sources and class-preserving F32/F64 for float sources.
-    // It is a sample-bounded decoded segment, not the original image
-    // container, so the planner must not claim source tag/artwork transfer or
-    // source-audio MD5 from this carrier. Authoritative CUE tags remain owned by
-    // the post-encode metadata stage. Force an encode step so a target WAV does
-    // not passthrough-copy the staging carrier when the requested target depth is
-    // `Source` and the original image depth happened to match the carrier.
-    if cue_pcm_segment_carrier_depth_descriptor(track).is_some() {
+    // Structured-track planning uses an audio-only PCM carrier model. CUE stream
+    // segments keep the same carrier semantics without eagerly writing the
+    // hypothetical WAV; embedded chapters and file-backed CUE segments already
+    // have a validated carrier. In every case the carrier is a sample-bounded
+    // decode, not the original tagged container, so the planner must not claim
+    // source tag/artwork transfer or source-audio MD5 from it. Prepared
+    // authoritative metadata remains owned by the post-encode metadata stage.
+    // Force an encode step so a target WAV does not passthrough-copy the staging
+    // carrier when the requested target depth is `Source` and the original image
+    // depth happened to match the carrier.
+    if pcm_segment_carrier_depth_descriptor(track).is_some() {
         settings.force_encode = true;
         if settings.metadata.transfer_tags {
             log::warn!(
-                "metadata.transfer_tags requested for a CUE PCM segment carrier; source-container tag transfer from the original image is unsupported on this path and will be skipped"
+                "metadata.transfer_tags requested for an audio-only PCM segment carrier; planner source-container tag transfer is disabled on this path and prepared authoritative metadata is handled by the post-encode metadata stage"
             );
             disable_planner_source_tag_transfer(&mut settings);
         }
         if settings.metadata.preserve_artwork {
-            log::warn!(
-                "metadata.preserve_artwork requested for a CUE PCM segment carrier; planner artwork transfer from the audio-only carrier is disabled; original image artwork, when extracted by the CUE materializer, is handled by the post-encode metadata/artwork stage"
-            );
+            if matches!(&track.source_ref, TrackSourceRef::EmbeddedChapterCarrier { .. }) {
+                log::warn!(
+                    "metadata.preserve_artwork requested for an embedded-chapter PCM carrier; planner artwork transfer from the audio-only carrier is disabled because the original source container is not the realized audio input"
+                );
+            } else {
+                log::warn!(
+                    "metadata.preserve_artwork requested for a CUE PCM segment carrier; planner artwork transfer from the audio-only carrier is disabled; original image artwork, when extracted by the CUE materializer, is handled by the post-encode metadata/artwork stage"
+                );
+            }
             disable_planner_artwork_transfer(&mut settings);
         }
         disable_planner_source_audio_md5(&mut settings);
@@ -381,7 +388,10 @@ fn reference_programme_scope(
     if request.merge
         || matches!(
             &track.source_ref,
-            TrackSourceRef::CueStreamSegment { .. } | TrackSourceRef::CueSegmentCarrier { .. } | TrackSourceRef::ImageSegment { .. }
+            TrackSourceRef::CueStreamSegment { .. }
+                | TrackSourceRef::CueSegmentCarrier { .. }
+                | TrackSourceRef::EmbeddedChapterCarrier { .. }
+                | TrackSourceRef::ImageSegment { .. }
         )
     {
         return ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing;
@@ -586,10 +596,17 @@ pub fn apply_unsupported_target_metadata_policy_downgrades(
     if settings.metadata.transfer_tags
         && !settings.target_format.supports_planner_source_tag_transfer()
     {
-        messages.push(format!(
-            "metadata.transfer_tags requested for target format {:?}, but the planner/plugin metadata path cannot represent source tags for that target; source tag transfer is unsupported for this track and will be skipped",
-            settings.target_format
-        ));
+        if matches!(settings.target_format, PlannerFormat::Opus) {
+            messages.push(
+                "metadata.transfer_tags requested for Opus; planner source-tag transfer is disabled because the post-encode opustags metadata stage owns authoritative source-tag application"
+                    .to_string(),
+            );
+        } else {
+            messages.push(format!(
+                "metadata.transfer_tags requested for target format {:?}, but the planner/plugin metadata path cannot represent source tags for that target; source tag transfer is unsupported for this track and will be skipped",
+                settings.target_format
+            ));
+        }
         disable_planner_source_tag_transfer(settings);
     }
 
@@ -758,10 +775,20 @@ pub fn source_needs_authoritative_metadata(source: &PreparedSource) -> bool {
             )
         });
 
+    // Embedded chapters are cut from an audio-only PCM carrier, but unlike CUE
+    // albums their metadata authority is the prepared chapter model derived
+    // from the original single-file container. Encode that distinction in the
+    // source-reference type itself rather than inferring it from an extension
+    // or an album-level marker.
+    let embedded_chapter_carrier = source.tracks.iter().any(|track| {
+        matches!(&track.source_ref, TrackSourceRef::EmbeddedChapterCarrier { .. })
+    });
+
     (matches!(
         source.kind,
         SourceKind::CueImage | SourceKind::SacdIso | SourceKind::DvdVideo | SourceKind::BluRay
     ) || archive_wrapped_cue
+        || embedded_chapter_carrier
         || (matches!(source.kind, SourceKind::SingleFile)
             && source
                 .album_metadata
@@ -1029,6 +1056,10 @@ pub fn source_info_for_realized_track(
         | TrackSourceRef::CueSegmentCarrier {
             carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
             ..
+        }
+        | TrackSourceRef::EmbeddedChapterCarrier {
+            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+            ..
         } => PlannerCodec::PcmFloat,
         _ => codec_for_format(&format),
     };
@@ -1049,7 +1080,7 @@ pub fn source_info_for_realized_track(
         // it (a 16-bit target from an s32 carrier still needs explicit depth
         // args). BitDepthTarget::Source resolution must NOT read this value —
         // it resolves from the true probed track depth below.
-        cue_pcm_segment_carrier_depth_descriptor(track)
+        pcm_segment_carrier_depth_descriptor(track)
             .or(track.bit_depth)
             .and_then(pcm_bit_depth_from_source_bits)
     };
@@ -1207,10 +1238,11 @@ pub(super) fn resolve_dither_source_pcm_depth(track: &PreparedTrack) -> Option<P
     resolve_source_pcm_depth(track)
 }
 
-fn cue_pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
+fn pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
     match &track.source_ref {
         TrackSourceRef::CueStreamSegment { carrier, .. }
-        | TrackSourceRef::CueSegmentCarrier { carrier, .. } => {
+        | TrackSourceRef::CueSegmentCarrier { carrier, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { carrier, .. } => {
             Some(carrier.source_depth_descriptor())
         }
         // Legacy callers that still use ImageSegment are realized by stages.rs as
@@ -1402,6 +1434,21 @@ mod tests {
 
     fn cue_carrier(path: PathBuf, source_image: PathBuf, start_sample: u64, samples: u64) -> TrackSourceRef {
         TrackSourceRef::CueSegmentCarrier {
+            path,
+            source_image,
+            start_sample,
+            samples,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+        }
+    }
+
+    fn embedded_chapter_carrier(
+        path: PathBuf,
+        source_image: PathBuf,
+        start_sample: u64,
+        samples: u64,
+    ) -> TrackSourceRef {
+        TrackSourceRef::EmbeddedChapterCarrier {
             path,
             source_image,
             start_sample,
@@ -2292,7 +2339,12 @@ mod tests {
             "Opus/Ogg artwork remains unsupported until a METADATA_BLOCK_PICTURE writer exists"
         );
         assert_eq!(messages.len(), 2);
-        assert!(messages.iter().any(|message| message.contains("metadata.transfer_tags requested")));
+        let tag_message = messages
+            .iter()
+            .find(|message| message.contains("metadata.transfer_tags requested"))
+            .expect("Opus source-tag downgrade message");
+        assert!(tag_message.contains("post-encode opustags metadata stage"));
+        assert!(!tag_message.contains("will be skipped"));
         assert!(messages.iter().any(|message| message.contains("metadata.preserve_artwork requested")));
     }
 
@@ -2784,6 +2836,28 @@ mod tests {
         assert!(
             metadata_obligations_for_request(&req, &src).authoritative_tags_applied,
             "an Archive wrapper around a streaming CUE carrier retains CUE metadata authority"
+        );
+    }
+
+    #[test]
+    fn embedded_chapter_carrier_is_authoritative_without_album_marker() {
+        let temp = TempDir::new().expect("temp dir");
+        let req = request(temp.path());
+        let src = source(
+            SourceKind::SingleFile,
+            track(embedded_chapter_carrier(
+                temp.path().join("chapter-01.wav"),
+                temp.path().join("book.m4b"),
+                0,
+                44_100,
+            )),
+            temp.path(),
+        );
+
+        assert!(source_needs_authoritative_metadata(&src));
+        assert!(
+            metadata_obligations_for_request(&req, &src).authoritative_tags_applied,
+            "embedded chapter metadata authority must come from its typed source reference, not an album marker",
         );
     }
 

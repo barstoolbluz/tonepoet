@@ -4027,6 +4027,7 @@ fn next_album_source_work(
             }
             TrackSourceRef::CueStreamSegment { .. } => unreachable!("handled above"),
             TrackSourceRef::CueSegmentCarrier { .. }
+            | TrackSourceRef::EmbeddedChapterCarrier { .. }
             | TrackSourceRef::ImageSegment { .. }
             | TrackSourceRef::SacdTrack { .. }
             | TrackSourceRef::DvdaTrack { .. }
@@ -4138,6 +4139,7 @@ fn build_realize_work(
     let kind = match &track.source_ref {
         TrackSourceRef::CueStreamSegment { .. }
         | TrackSourceRef::CueSegmentCarrier { .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { .. }
         | TrackSourceRef::ImageSegment { .. } => WorkKind::CueSplitTrack { track_id: track_id.clone() },
         TrackSourceRef::SacdTrack { .. } => WorkKind::SacdExtractTrack { track_id: track_id.clone() },
         TrackSourceRef::DvdaTrack { .. } => WorkKind::MaterializeItem, // Phase 3: DvdaExtractTrack

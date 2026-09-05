@@ -1205,6 +1205,21 @@ async fn realize_track_with_tool_limits_and_stats(
             }
             Ok(RealizedTrackInfo::without_stats(path.clone()))
         }
+        TrackSourceRef::EmbeddedChapterCarrier { path, .. } => {
+            if !path.exists() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "staged embedded-chapter PCM carrier does not exist: {}",
+                    path.display()
+                )));
+            }
+            if !path.is_file() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "staged embedded-chapter PCM carrier is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Ok(RealizedTrackInfo::without_stats(path.clone()))
+        }
         TrackSourceRef::ImageSegment {
             image,
             start_sample,
@@ -4642,8 +4657,35 @@ fn prepared_artifact_requires_post_encode_metadata(
         // source provenance with embedded NUL separators likewise needs the
         // authoritative boundary to project every logical value into one
         // legal scalar carrier instead of trusting FFmpeg's first-value view.
-        "flac" | "opus" | "ogg" | "wv" => {
+        "flac" | "wv" => {
             !pipeline_multivalue_write_changes(&tags).is_empty()
+                || source_provenance_requires_scalar_projection(
+                    &track.metadata,
+                    &source.album_metadata,
+                    &tags,
+                )
+        }
+        // FFmpeg/libopus is an audio encoder here, not Tonepoet's metadata
+        // writer. The planner intentionally disables Opus source-tag transfer,
+        // so any requested source tags in the prepared model must keep the
+        // native opustags stage alive even when every value is an ordinary
+        // scalar. Repeated/custom values retain the same unconditional
+        // prepared-model repair behavior as the other native taggers.
+        "opus" | "ogg" => {
+            // `AlbumMetadata::total_tracks` is populated structurally even for
+            // an otherwise untagged ordinary SingleFile. Do not turn that
+            // bookkeeping fact into the sole reason to create new Opus tags.
+            // Real source text is provenance-marked by the metadata readers;
+            // every other emitted key here is substantive prepared metadata.
+            let source_text_tags_present = track.metadata.extra.iter().any(|(key, value)| {
+                source_text_tag_key_from_extra(&track.metadata.extra, key, value).is_some()
+            });
+            let requested_source_tags_present = source_text_tags_present
+                || tags.iter().any(|(key, _)| {
+                    !matches!(key.as_str(), "TRACKTOTAL" | "DISCTOTAL")
+                });
+            (req.settings.metadata.transfer_tags && requested_source_tags_present)
+                || !pipeline_multivalue_write_changes(&tags).is_empty()
                 || source_provenance_requires_scalar_projection(
                     &track.metadata,
                     &source.album_metadata,
@@ -23783,7 +23825,8 @@ fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
         TrackSourceRef::StagedFile(path) => path,
         TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => source_path,
         TrackSourceRef::CueStreamSegment { source_image, .. }
-        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image,
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image,
         TrackSourceRef::ImageSegment { image, .. } => image,
         TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
         TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
@@ -24502,6 +24545,18 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             carrier,
         } => format!(
             "typed CUE segment carrier {} ({:?}, source {}, start sample {start_sample}, {samples} samples)",
+            path_log_value(path),
+            carrier,
+            path_log_value(source_image)
+        ),
+        TrackSourceRef::EmbeddedChapterCarrier {
+            path,
+            source_image,
+            start_sample,
+            samples,
+            carrier,
+        } => format!(
+            "embedded-chapter PCM carrier {} ({:?}, source {}, start sample {start_sample}, {samples} samples)",
             path_log_value(path),
             carrier,
             path_log_value(source_image)
@@ -29010,7 +29065,8 @@ fn track_source_identity_path(track: &PreparedTrack) -> &Path {
         TrackSourceRef::StagedFile(path) => path.as_path(),
         TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => source_path.as_path(),
         TrackSourceRef::CueStreamSegment { source_image, .. }
-        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.as_path(),
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image.as_path(),
         TrackSourceRef::ImageSegment { image, .. } => image.as_path(),
         TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
         TrackSourceRef::DvdaTrack { volume_source, .. } => volume_source.root_or_image().as_path(),
@@ -37746,7 +37802,8 @@ fn companion_track_source_path_and_role(
             Some((source_path.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::CueStreamSegment { source_image, .. }
-        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => {
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => {
             Some((source_image.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::ImageSegment { image, .. } => {
@@ -45285,6 +45342,7 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
         TrackSourceRef::DsdAlbumGainCarrier { .. }
         | TrackSourceRef::CueStreamSegment { .. }
         | TrackSourceRef::CueSegmentCarrier { .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { .. }
         | TrackSourceRef::ImageSegment { .. }
         | TrackSourceRef::SacdTrack { .. }
         | TrackSourceRef::DvdaTrack { .. }
@@ -45298,7 +45356,8 @@ fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
         TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => Some(source_path.as_path()),
         TrackSourceRef::CueStreamSegment { source_image, .. }
-        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => Some(source_image.as_path()),
+        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => Some(source_image.as_path()),
         TrackSourceRef::ImageSegment { image, .. } => Some(image.as_path()),
         TrackSourceRef::SacdTrack { iso, .. } => Some(iso.as_path()),
         TrackSourceRef::DvdaTrack { volume_source, .. } => match volume_source {
@@ -48951,7 +49010,8 @@ fn build_manifest_for_album(
                             source_path.clone()
                         }
                         TrackSourceRef::CueStreamSegment { source_image, .. }
-                        | TrackSourceRef::CueSegmentCarrier { source_image, .. } => source_image.clone(),
+                        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
+                        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image.clone(),
                         TrackSourceRef::ImageSegment { image, .. } => image.clone(),
                         TrackSourceRef::SacdTrack { iso, .. } => iso.clone(),
                         TrackSourceRef::DvdaTrack { volume_source, .. } => {
@@ -57559,7 +57619,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             "MY_NOTE",
             "one",
         );
-        for ext in ["flac", "opus", "ogg", "wv", "mp3"] {
+        // FLAC/WavPack/MP3 keep a native post stage only to repair repeated or
+        // NUL-separated values that FFmpeg would scalarize. An ordinary scalar
+        // leaves it nothing to repair, so the planner fast path stands.
+        for ext in ["flac", "wv", "mp3"] {
             artifact.staged_path.set_extension(ext);
             let artifacts = ArtifactSet {
                 audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
@@ -57572,6 +57635,28 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                     &fixture.album.req,
                 ),
                 "ordinary scalar custom provenance must keep the {ext} planner fast path",
+            );
+        }
+
+        // Opus/Ogg differ in kind rather than degree: the planner cannot write
+        // their tags at all and disables source-tag transfer for them, so the
+        // native opustags stage is the only writer. Any requested source tag
+        // must keep that stage alive even when every value is an ordinary
+        // scalar; treating a scalar as "already satisfied" here is what drops
+        // source tags from Opus output entirely.
+        for ext in ["opus", "ogg"] {
+            artifact.staged_path.set_extension(ext);
+            let artifacts = ArtifactSet {
+                audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                sidecars: Vec::new(),
+            };
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &artifacts,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "requested source tags must keep the {ext} native post stage alive for an ordinary scalar",
             );
         }
 
@@ -57993,6 +58078,151 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(
             !planner_metadata_already_satisfied(&artifacts, &fixture.album.source, &fixture.album.req),
             "generated WAV source-tag transfer cannot satisfy Blu-ray materializer metadata",
+        );
+    }
+
+    #[test]
+    fn ordinary_scalar_opus_source_tags_force_post_encode_metadata() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.target_format = tonepoet_pipeline::AudioFormat::Opus;
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.req.settings.metadata.preserve_artwork = false;
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Ordinary Chapter".to_string()),
+            artist: Some("Reader".to_string()).into(),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        insert_source_text_tag(
+            &mut fixture.album.source.tracks[0].metadata.extra,
+            "TITLE",
+            "Ordinary Chapter",
+        );
+        fixture.album.source.album_metadata = AlbumMetadata {
+            album: Some("Ordinary Album".to_string()),
+            album_artist: Some("Author".to_string()).into(),
+            genre: Some("Audiobook".to_string()).into(),
+            total_tracks: 1,
+            ..AlbumMetadata::default()
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.staged_path.set_extension("opus");
+        artifact.final_path.set_extension("opus");
+        artifact.metadata_required = PlannedMetadataSatisfaction::none();
+        artifact.metadata_satisfaction = PlannedMetadataSatisfaction::none();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(prepared_artifact_requires_post_encode_metadata(
+            &artifact,
+            &fixture.album.source,
+            &fixture.album.req,
+        ));
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "plain scalar Opus source tags must reach the native opustags stage",
+        );
+
+        fixture.album.req.settings.metadata.transfer_tags = false;
+        assert!(
+            !prepared_artifact_requires_post_encode_metadata(
+                &artifact,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "ordinary scalar source tags must continue to honor a transfer-tags opt-out",
+        );
+
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata = TrackMetadata::default();
+        fixture.album.source.album_metadata = AlbumMetadata {
+            total_tracks: 1,
+            ..AlbumMetadata::default()
+        };
+        assert!(
+            !prepared_artifact_requires_post_encode_metadata(
+                &artifact,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "a structural total alone must not invent metadata on an otherwise untagged Opus source",
+        );
+    }
+
+    #[test]
+    fn embedded_chapter_single_file_metadata_is_authoritative() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = false;
+        fixture.album.req.settings.metadata.preserve_artwork = false;
+        fixture.album.source.album_metadata.album = Some("The Book".to_string());
+        fixture.album.source.album_metadata.album_artist = Some("The Author".to_string()).into();
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            title: Some("Chapter One".to_string()),
+            artist: Some("Narrator".to_string()).into(),
+            track_number: Some(1),
+            ..TrackMetadata::default()
+        };
+        let source_image = fixture._temp.path().join("book.m4b");
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::EmbeddedChapterCarrier {
+            path: fixture._temp.path().join("chapter-01.wav"),
+            source_image,
+            start_sample: 0,
+            samples: 44_100,
+            carrier: CueSegmentCarrier::PcmS32LeWav,
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = PlannedMetadataSatisfaction::none();
+        artifact.metadata_satisfaction = PlannedMetadataSatisfaction::none();
+        let artifacts = ArtifactSet {
+            audio: AudioArtifacts::Tracks(vec![artifact]),
+            sidecars: Vec::new(),
+        };
+
+        assert!(
+            super::super::plan_bridge::source_needs_authoritative_metadata(&fixture.album.source),
+            "embedded chapter expansion must make the prepared SingleFile metadata authoritative",
+        );
+        let tags = authoritative_metadata_tags(
+            &fixture.album.source.tracks[0].metadata,
+            &fixture.album.source.album_metadata,
+        );
+        for expected in [
+            ("TITLE", "Chapter One"),
+            ("ARTIST", "Narrator"),
+            ("ALBUM", "The Book"),
+            ("ALBUMARTIST", "The Author"),
+            ("TRACKNUMBER", "1"),
+        ] {
+            assert!(
+                tags.iter().any(|tag| tag.0 == expected.0 && tag.1 == expected.1),
+                "chapter authoritative tags are missing {expected:?}: {tags:?}",
+            );
+        }
+        assert!(
+            !planner_metadata_already_satisfied(
+                &artifacts,
+                &fixture.album.source,
+                &fixture.album.req,
+            ),
+            "chapter-derived metadata must survive the audio-only carrier boundary",
         );
     }
 

@@ -1138,6 +1138,21 @@ pub enum TrackSourceRef {
         samples: u64,
         carrier: CueSegmentCarrier,
     },
+    /// Validated, sample-bounded PCM WAV carrier produced from an embedded
+    /// chapter in an ordinary single-file source (for example M4B/M4A).
+    ///
+    /// The carrier is audio-only. `source_image` remains the original tagged
+    /// container for provenance, while the chapter-specific `PreparedTrack`
+    /// metadata is authoritative for post-encode tag application. Keeping this
+    /// distinct from `CueSegmentCarrier` prevents CUE metadata-authority rules
+    /// from leaking into embedded-chapter sources (and vice versa).
+    EmbeddedChapterCarrier {
+        path: PathBuf,
+        source_image: PathBuf,
+        start_sample: u64,
+        samples: u64,
+        carrier: CueSegmentCarrier,
+    },
     ImageSegment {
         image: PathBuf,
         start_sample: u64,

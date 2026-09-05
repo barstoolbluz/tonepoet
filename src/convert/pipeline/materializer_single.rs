@@ -242,7 +242,7 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 };
                 tracks.push(PreparedTrack {
                     id,
-                    source_ref: TrackSourceRef::CueSegmentCarrier {
+                    source_ref: TrackSourceRef::EmbeddedChapterCarrier {
                         path: staged_path,
                         source_image: req.container.clone(),
                         start_sample: boundary.start_sample,
