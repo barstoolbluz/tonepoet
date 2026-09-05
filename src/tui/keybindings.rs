@@ -13843,6 +13843,61 @@ fn metadata_editor_forced_delete_items(
 }
 
 
+fn metadata_editor_chapter_projection_owned_rows_dirty(
+    surface: &super::app::PresentationTab,
+) -> bool {
+    if !surface.chapter_authoring.projection_only
+        || !matches!(
+            surface.chapter_authoring.load_state,
+            crate::tui::chapter_authoring::ChapterAuthoringLoadState::Ready { .. }
+        )
+    {
+        return false;
+    }
+    surface.entries.iter().enumerate().any(|(index, entry)| {
+        let owned = entry.row_scope == crate::tui::probe::RowScope::Track
+            && (entry.display_key.eq_ignore_ascii_case("TITLE")
+                || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER"));
+        owned
+            && (surface.deleted.contains(&index)
+                || entry.per_file_values != entry.per_file_originals
+                || entry.value != entry.original)
+    })
+}
+
+fn metadata_editor_chapter_seed_row_conflict(
+    surface: &super::app::PresentationTab,
+) -> Option<String> {
+    if surface.cue_album_synthetic_sheet.is_some() {
+        return None;
+    }
+    let dirty = surface.entries.iter().enumerate().any(|(index, entry)| {
+        let seed_owned = entry.display_key.eq_ignore_ascii_case("TITLE")
+            || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER");
+        seed_owned
+            && (surface.deleted.contains(&index)
+                || entry.per_file_values != entry.per_file_originals
+                || entry.value != entry.original)
+    });
+    dirty.then(|| {
+        "save or revert unsaved TITLE/TRACKNUMBER edits before opening Chapters; chapter row projection must not overwrite pending metadata edits".to_string()
+    })
+}
+
+fn metadata_editor_has_unsaved_chapter_structure(
+    state: &super::app::MetadataEditorState,
+) -> bool {
+    if state.presentation_tabs.is_empty() {
+        state.file_surface.chapter_authoring.dirty
+            || metadata_editor_chapter_projection_owned_rows_dirty(&state.file_surface)
+    } else {
+        state.presentation_tabs.iter().any(|tab| {
+            tab.chapter_authoring.dirty
+                || metadata_editor_chapter_projection_owned_rows_dirty(tab)
+        })
+    }
+}
+
 fn metadata_editor_has_save_work(
     state: &super::app::MetadataEditorState,
     forced_deletes: &[(usize, lofty::tag::ItemKey)],
@@ -14324,6 +14379,12 @@ fn metadata_editor_tonepoet_metadata_consent_gate(
 struct MetadataAlbumSidecarWrite {
     cue_path: std::path::PathBuf,
     create: bool,
+    /// Chapter authoring replaces CUE geometry deliberately; ordinary Album
+    /// metadata writes preserve it.
+    replace_structure: bool,
+    /// Exact editor-open bytes required before a structural replacement of an
+    /// existing sidecar. Ordinary metadata plans leave this unset.
+    expected_raw_snapshot: Option<Vec<u8>>,
     replacement_cuesheet: String,
     fidelity_warnings: Vec<String>,
     deletion_intent: super::cue_parser::CueAlbumMetadataDeletionIntent,
@@ -14697,7 +14758,7 @@ fn metadata_album_view_audio_snapshots(
             .map(|index| index + 1)
     };
 
-    surface
+    let mut snapshots = surface
         .entries
         .iter()
         .map(|entry| {
@@ -14806,7 +14867,34 @@ fn metadata_album_view_audio_snapshots(
                 originals,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // A chapterless image legitimately has no CUESHEET row in the editor.
+    // An explicit embedded-CUE save must still be able to create the carrier;
+    // synthesize only that tag snapshot from the exact editor-open payload.
+    if let Some(cuesheet) = embedded_cuesheet {
+        if !snapshots
+            .iter()
+            .any(|snapshot| snapshot.display_key.eq_ignore_ascii_case("CUESHEET"))
+        {
+        let original = match embedded_original {
+            Some(Some(value)) => crate::tui::probe::MetadataFieldValues::from(value),
+            Some(None) => crate::tui::probe::MetadataFieldValues::default(),
+            None => metadata_album_view_expected_cuesheet_value(surface, path),
+        };
+        snapshots.push(crate::tui::probe::MetadataEditorTagSnapshot {
+            display_key: "CUESHEET".to_string(),
+            item_key: lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+            row_scope: crate::tui::probe::RowScope::File,
+            tag_type: crate::tui::probe::editor_tag_origin("CUESHEET"),
+            existed: vec![!original.as_str().is_empty()],
+            values: vec![crate::tui::probe::MetadataFieldValues::from(cuesheet)],
+            originals: vec![original],
+        });
+        }
+    }
+
+    Ok(snapshots)
 }
 
 fn metadata_album_view_sidecar_discnumber_audio_snapshot(
@@ -14957,6 +15045,14 @@ fn metadata_album_view_plan(
     state: &super::app::MetadataEditorState,
     mode: MetadataAlbumCarrierWriteMode,
 ) -> Result<(MetadataAlbumWritePlan, Vec<crate::config::AggregateMetadataTarget>), String> {
+    metadata_album_view_plan_with_structure_policy(state, mode, false)
+}
+
+fn metadata_album_view_plan_with_structure_policy(
+    state: &super::app::MetadataEditorState,
+    mode: MetadataAlbumCarrierWriteMode,
+    replace_cue_structure: bool,
+) -> Result<(MetadataAlbumWritePlan, Vec<crate::config::AggregateMetadataTarget>), String> {
     let surface = state.active_surface();
     let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| {
         "save aborted: Album view lost its unified CUE model; no carrier was changed".to_string()
@@ -15039,6 +15135,8 @@ fn metadata_album_view_plan(
                 sidecars.push(MetadataAlbumSidecarWrite {
                     cue_path,
                     create: !side.sidecar_present,
+                    replace_structure: replace_cue_structure,
+                    expected_raw_snapshot: None,
                     replacement_cuesheet,
                     fidelity_warnings,
                     deletion_intent: metadata_album_view_sidecar_deletion_intent(
@@ -15248,6 +15346,7 @@ fn metadata_album_view_plan(
                         == crate::config::AggregateMetadataTarget::EmbeddedCue)
                         .then(|| metadata_album_view_expected_embedded_cuesheet(side, path));
                     let embedded_cuesheet = match generated_embedded_cuesheet {
+                        Some(generated) if replace_cue_structure => Some(generated),
                         Some(generated) => {
                             if let Some(template) = expected_embedded
                                 .as_ref()
@@ -15365,6 +15464,27 @@ fn metadata_album_view_revalidate_sidecar(plan: &MetadataAlbumSidecarWrite) -> R
                 plan.cue_path.display()
             )),
         };
+    }
+    if plan.replace_structure {
+        let expected = plan.expected_raw_snapshot.as_deref().ok_or_else(|| {
+            format!(
+                "sidecar CUE '{}' has no editor-open byte snapshot for structural replacement",
+                plan.cue_path.display()
+            )
+        })?;
+        let current = std::fs::read(&plan.cue_path).map_err(|error| {
+            format!(
+                "sidecar CUE '{}' could not be re-read before structural replacement: {error}",
+                plan.cue_path.display()
+            )
+        })?;
+        if current != expected {
+            return Err(format!(
+                "sidecar CUE '{}' changed after the Chapters surface opened",
+                plan.cue_path.display()
+            ));
+        }
+        return Ok(());
     }
     let member = crate::convert::split_cue_album::admit_split_cue_member(&plan.cue_path)
         .map_err(|error| {
@@ -15488,6 +15608,11 @@ fn metadata_album_view_execute_plan(
             };
             let write = if sidecar.create {
                 super::cue_parser::create_cue_sidecar_from_cuesheet(
+                    stage.staged_path(),
+                    &sidecar.replacement_cuesheet,
+                )
+            } else if sidecar.replace_structure {
+                super::cue_parser::replace_cue_sidecar_structure_from_cuesheet(
                     stage.staged_path(),
                     &sidecar.replacement_cuesheet,
                 )
@@ -16101,6 +16226,12 @@ fn metadata_editor_save_with_cue_consent(
         }
         return;
     }
+    if metadata_editor_has_unsaved_chapter_structure(state) {
+        app.set_status(
+            "metadata editor: chapter structure has unsaved changes; open Chapters and use Save to choose its destinations",
+        );
+        return;
+    }
     let forced_deletes_for_save = metadata_editor_forced_delete_items(state);
     if !metadata_editor_has_save_work(state, &forced_deletes_for_save) {
         app.set_status("No changes to save");
@@ -16248,7 +16379,9 @@ fn metadata_editor_save_with_cue_consent(
         }
         return;
     }
-    if !state.active_surface().cue_album_view_sides.is_empty() {
+    if !state.active_surface().cue_album_view_sides.is_empty()
+        && !state.active_surface().chapter_authoring.projection_only
+    {
         metadata_editor_save_album_view(
             app,
             state,
@@ -17015,8 +17148,9 @@ fn metadata_editor_switch_content_tab(
         state.previous_content_tab()
     };
     if changed {
-        if state.content_tab == crate::tui::app::ContentTab::Details {
-            ensure_metadata_content_tab_loaded(state, crate::tui::app::ContentTab::Details, tx);
+        if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+            let tab = state.content_tab;
+            ensure_metadata_content_tab_loaded(state, tab, tx);
         } else if was_details {
             metadata_editor_cancel_details_probe(state);
         }
@@ -17042,6 +17176,10 @@ fn metadata_editor_cycle_field_in_current_tab(
         crate::tui::app::ContentTab::Metadata => {
             metadata_editor_move_visible_cursor(state, 1, true);
             ensure_cursor_visible(state);
+        }
+        crate::tui::app::ContentTab::Chapters => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.column = surface.chapter_authoring.column.next();
         }
         crate::tui::app::ContentTab::ReplayGain => {
             handle_metadata_replaygain_key(
@@ -21462,6 +21600,13 @@ fn handle_metadata_editor_key(
 
     let total_rows = state.visible_metadata_rows().len(); // includes the "Add field" row
 
+    if state.content_tab == crate::tui::app::ContentTab::Chapters
+        && state.active_surface().chapter_authoring.saving
+    {
+        let _ = metadata_editor_handle_chapter_key(app, key, state, tx);
+        return;
+    }
+
     if metadata_editor_handle_alt_commit_action(app, state, &key, tx) {
         return;
     }
@@ -21510,12 +21655,9 @@ fn handle_metadata_editor_key(
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let changed = state.select_presentation_selector_cursor();
                         if changed {
-                            if state.content_tab == crate::tui::app::ContentTab::Details {
-                                ensure_metadata_content_tab_loaded(
-                                    state,
-                                    crate::tui::app::ContentTab::Details,
-                                    tx,
-                                );
+                            if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                                let tab = state.content_tab;
+                                ensure_metadata_content_tab_loaded(state, tab, tx);
                             }
                             if let Some(label) = state.active_presentation_label() {
                                 app.set_status(format!("metadata editor: {}", label));
@@ -21528,12 +21670,9 @@ fn handle_metadata_editor_key(
                             state.set_presentation_selector_cursor(idx);
                             let changed = state.select_presentation_selector_cursor();
                             if changed {
-                                if state.content_tab == crate::tui::app::ContentTab::Details {
-                                    ensure_metadata_content_tab_loaded(
-                                        state,
-                                        crate::tui::app::ContentTab::Details,
-                                        tx,
-                                    );
+                                if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                                    let tab = state.content_tab;
+                                    ensure_metadata_content_tab_loaded(state, tab, tx);
                                 }
                                 if let Some(label) = state.active_presentation_label() {
                                     app.set_status(format!("metadata editor: {}", label));
@@ -21543,6 +21682,12 @@ fn handle_metadata_editor_key(
                     }
                     _ => {}
                 }
+                return;
+            }
+
+            if state.content_tab == crate::tui::app::ContentTab::Chapters
+                && metadata_editor_handle_chapter_key(app, key, state, tx)
+            {
                 return;
             }
 
@@ -21583,12 +21728,9 @@ fn handle_metadata_editor_key(
                 KeyCode::Char(c) if key.modifiers.is_empty() && ('1'..='9').contains(&c) => {
                     let idx = (c as u8 - b'1') as usize;
                     if state.switch_presentation_tab(idx) {
-                        if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(
-                                state,
-                                crate::tui::app::ContentTab::Details,
-                                tx,
-                            );
+                        if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                            let tab = state.content_tab;
+                            ensure_metadata_content_tab_loaded(state, tab, tx);
                         }
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
@@ -21597,6 +21739,7 @@ fn handle_metadata_editor_key(
                 }
                 _ if state.content_tab != crate::tui::app::ContentTab::Metadata => {
                     match state.content_tab {
+                        crate::tui::app::ContentTab::Chapters => {}
                         crate::tui::app::ContentTab::ReplayGain => {
                             handle_metadata_replaygain_key(app, key, state, tx);
                         }
@@ -22547,6 +22690,13 @@ pub fn regenerate_cuesheet_for_save(
         }
     }
     if state.active_surface().cue_album_synthetic_sheet.is_some() {
+        if state.active_surface().chapter_authoring.projection_only {
+            // The Chapters tab may temporarily project embedded MP4 chapters
+            // (or a chapterless single file) into unified-CUE-shaped rows for
+            // editing. Until a CUE carrier is actually saved, ordinary
+            // Metadata-tab writes must remain native file-tag writes.
+            return Ok(false);
+        }
         return regenerate_unified_cue_album_cuesheet_for_save(state);
     }
     let n_paths = state.active_surface().paths.len();
@@ -27583,6 +27733,8 @@ fn cue_album_project_authoritative_parsed_sheet(
         source.file_ref = track.file.clone().unwrap_or_else(|| source.file_ref.clone());
         source.index00_frames = track.index00_frames;
         source.index01_frames = track.index01_frames;
+        source.index00_sample = None;
+        source.index01_sample = None;
         source.isrc = track.isrc.clone();
         source.directives = track.directives.clone();
         track_numbers.push(format!("{:02}", idx + 1));
@@ -28061,10 +28213,17 @@ fn cue_album_generate_cuesheet_for_track_indices_with_numbers(
                 out.push_str(&format!("    {directive}\n"));
             }
         }
-        if let Some(frames) = source.index00_frames {
+        if let Some(frames) = crate::tui::chapter_authoring::cue_index00_frames(
+            source,
+            sheet.program_sample_rate,
+        )? {
             out.push_str(&format!("    INDEX 00 {}\n", cue_album_timestamp(frames)));
         }
-        let frames = source.index01_frames.ok_or_else(|| {
+        let frames = crate::tui::chapter_authoring::cue_index01_frames(
+            source,
+            sheet.program_sample_rate,
+        )?
+        .ok_or_else(|| {
             format!(
                 "save aborted: track {} from {} has no INDEX 01",
                 track_number,
@@ -28644,6 +28803,8 @@ fn build_unified_cue_album_sheet_with_combined_limit(
                 file_ref,
                 index00_frames: track.index00_frames,
                 index01_frames: track.index01_frames,
+                index00_sample: None,
+                index01_sample: None,
                 isrc: track.isrc.clone(),
                 album_user_metadata: surface.sheet.user_metadata.clone(),
                 user_metadata: track.user_metadata.clone(),
@@ -28690,6 +28851,8 @@ fn build_unified_cue_album_sheet_with_combined_limit(
             .first()
             .map(|surface| surface.sheet.user_metadata.clone())
             .unwrap_or_default(),
+        program_sample_rate: None,
+        program_total_samples: None,
     };
     Ok((sheet, track_numbers, track_titles, track_artists, isrcs, warnings))
 }
@@ -29441,6 +29604,8 @@ fn cue_less_untaggable_sidecar_seed(
                 .unwrap_or_else(|| path.display().to_string()),
             index00_frames: None,
             index01_frames: Some(0),
+            index00_sample: None,
+            index01_sample: None,
             isrc: None,
             album_user_metadata: Default::default(),
             user_metadata: Default::default(),
@@ -29458,6 +29623,8 @@ fn cue_less_untaggable_sidecar_seed(
         album_genre: None,
         album_catalog: None,
         user_metadata: Default::default(),
+        program_sample_rate: None,
+        program_total_samples: None,
     };
     Ok(Some(CuelessUntaggableSidecarSeed {
         cue_path,
@@ -33000,6 +33167,2209 @@ fn metadata_technical_details_for_paths_with_analysis(
     crate::tui::app::MetadataTechnicalDetails::from_files(files)
 }
 
+
+fn metadata_editor_chapter_program_path(
+    surface: &crate::tui::app::PresentationTab,
+) -> Result<std::path::PathBuf, String> {
+    let mut paths = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.audio_paths.clone())
+        .unwrap_or_else(|| surface.paths.clone());
+    paths.sort_by(|left, right| metadata_cue_surface_key(left).cmp(&metadata_cue_surface_key(right)));
+    paths.dedup_by(|left, right| metadata_cue_surface_key(left) == metadata_cue_surface_key(right));
+    match paths.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err("chapter authoring requires one continuous audio file; this presentation has no audio carrier".to_string()),
+        _ => Err("chapter authoring requires one continuous audio file; select a single-image presentation".to_string()),
+    }
+}
+
+fn metadata_editor_chapter_sidecar_path(
+    surface: &crate::tui::app::PresentationTab,
+    program_path: &std::path::Path,
+) -> std::path::PathBuf {
+    match surface.cue_source.as_ref() {
+        Some(crate::tui::app::MetadataCueSource::Sidecar(path)) => path.clone(),
+        _ => program_path.with_extension("cue"),
+    }
+}
+
+fn metadata_editor_request_chapter_probe(
+    state: &mut crate::tui::app::MetadataEditorState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    if let Some(reason) = metadata_editor_chapter_seed_row_conflict(state.active_surface()) {
+        let path = state.active_surface().paths.first().cloned().unwrap_or_default();
+        state.active_surface_mut().chapter_authoring.load_state =
+            crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason };
+        return false;
+    }
+    let path = match metadata_editor_chapter_program_path(state.active_surface()) {
+        Ok(path) => path,
+        Err(reason) => {
+            let path = state.active_surface().paths.first().cloned().unwrap_or_default();
+            state.active_surface_mut().chapter_authoring.load_state =
+                crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason };
+            return false;
+        }
+    };
+    if state.active_surface().chapter_authoring.ready_for(&path)
+        || state.active_surface().chapter_authoring.is_loading()
+    {
+        return false;
+    }
+
+    let session_id = state.active_surface().technical_details.session_id;
+    let generation = state.active_surface_mut().chapter_authoring.begin_load(path.clone());
+    let sidecar_path = metadata_editor_chapter_sidecar_path(state.active_surface(), &path);
+    let inspect_embedded = crate::convert::chapter_structure::chapter_capable_source_extension(&path);
+    let snapshot_embedded_cuesheet = state.active_surface().embedded_cuesheet_present;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let worker_path = path.clone();
+        let worker_sidecar = sidecar_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // Chapter endpoints are structural data, so do not derive EOF
+            // from the presentation probe's floating-point seconds. Reuse
+            // Tonepoet's sample-count probe, which reads stream duration in
+            // the carrier time base and yields the integer sample timeline
+            // used by the rest of the TUI's disc/album tooling.
+            let timeline = super::accuraterip::probe_sample_count(&worker_path)
+                .map_err(|error| format!("sample-count probe '{}': {error}", worker_path.display()));
+            let sample_rate = timeline
+                .as_ref()
+                .map(|(_, sample_rate)| *sample_rate)
+                .map_err(Clone::clone);
+            let total_samples = timeline
+                .as_ref()
+                .map(|(samples, _)| *samples)
+                .map_err(Clone::clone)
+                .and_then(|samples| {
+                    if samples == 0 {
+                        Err(format!("'{}' has no usable positive audio duration", worker_path.display()))
+                    } else {
+                        Ok(samples)
+                    }
+                });
+            let embedded_chapters = if inspect_embedded {
+                crate::convert::chapter_structure::read_embedded_chapters(&worker_path)
+            } else {
+                Ok(Vec::new())
+            };
+            let embedded_cuesheet_snapshot = if snapshot_embedded_cuesheet {
+                metadata_album_view_embedded_cuesheet_at(&worker_path)
+            } else {
+                Ok(None)
+            };
+            let (sidecar_exists, sidecar_snapshot) = match std::fs::symlink_metadata(&worker_sidecar) {
+                Ok(metadata) if metadata.file_type().is_symlink() => (
+                    true,
+                    Err(format!(
+                        "sidecar CUE '{}' is a symlink; structural authoring refuses to replace symlink metadata targets",
+                        worker_sidecar.display()
+                    )),
+                ),
+                Ok(metadata) if !metadata.is_file() => (
+                    true,
+                    Err(format!(
+                        "sidecar CUE destination '{}' exists but is not a regular file",
+                        worker_sidecar.display()
+                    )),
+                ),
+                Ok(_) => (
+                    true,
+                    std::fs::read(&worker_sidecar)
+                        .map(Some)
+                        .map_err(|error| format!(
+                            "cannot snapshot sidecar CUE '{}': {error}",
+                            worker_sidecar.display()
+                        )),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, Ok(None)),
+                Err(error) => (
+                    false,
+                    Err(format!(
+                        "cannot inspect sidecar CUE destination '{}': {error}",
+                        worker_sidecar.display()
+                    )),
+                ),
+            };
+            (
+                sample_rate,
+                total_samples,
+                embedded_chapters,
+                sidecar_exists,
+                sidecar_snapshot,
+                embedded_cuesheet_snapshot,
+            )
+        })
+        .await;
+        let (
+            sample_rate,
+            total_samples,
+            embedded_chapters,
+            sidecar_exists,
+            sidecar_snapshot,
+            embedded_cuesheet_snapshot,
+        ) = match result {
+            Ok(values) => values,
+            Err(error) => (
+                Err(format!("chapter probe task failed: {error}")),
+                Err(format!("chapter probe task failed: {error}")),
+                Err(format!("chapter probe task failed: {error}")),
+                false,
+                Err(format!("chapter probe task failed: {error}")),
+                Err(format!("chapter probe task failed: {error}")),
+            ),
+        };
+        let _ = tx
+            .send(AppMessage::MetadataEditorChapterProbeComplete {
+                session_id,
+                generation,
+                path,
+                sample_rate,
+                total_samples,
+                embedded_chapters,
+                sidecar_path,
+                sidecar_exists,
+                sidecar_snapshot,
+                embedded_cuesheet_snapshot,
+            })
+            .await;
+    });
+    true
+}
+
+fn metadata_editor_chapter_existing_scalar(
+    entries: &[crate::tui::probe::TagEntry],
+    key: &str,
+) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case(key))
+        .map(|entry| entry.value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "<multiple values>")
+}
+
+fn metadata_editor_chapter_new_track_source(
+    program_path: &std::path::Path,
+    cue_path: &std::path::Path,
+    row: usize,
+    start_sample: u64,
+) -> crate::tui::app::CueAlbumTrackSource {
+    crate::tui::app::CueAlbumTrackSource {
+        cue_path: cue_path.to_path_buf(),
+        audio_path: program_path.to_path_buf(),
+        local_track_index: row,
+        original_track_number: u32::try_from(row + 1).unwrap_or(u32::MAX),
+        file_ref: program_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio")
+            .to_string(),
+        index00_frames: None,
+        index01_frames: None,
+        index00_sample: None,
+        index01_sample: Some(start_sample),
+        isrc: None,
+        album_user_metadata: crate::convert::cue_parser::CueUserMetadata::default(),
+        user_metadata: crate::convert::cue_parser::CueUserMetadata::default(),
+        tonepoet_metadata_present: false,
+        directives: Vec::new(),
+    }
+}
+
+fn metadata_editor_chapter_import_embedded_starts(
+    raw: &[crate::convert::chapter_structure::RawEmbeddedChapter],
+    sample_rate: u32,
+    total_samples: u64,
+) -> (Vec<u64>, Vec<String>, Vec<String>) {
+    if raw.is_empty() {
+        return (vec![0], vec!["Chapter 01".to_string()], Vec::new());
+    }
+    let mut starts = Vec::with_capacity(raw.len());
+    let mut titles = Vec::with_capacity(raw.len());
+    let mut notes = Vec::new();
+    for (index, chapter) in raw.iter().enumerate() {
+        match crate::convert::chapter_structure::timestamp_to_sample(
+            chapter.start,
+            chapter.time_base_num,
+            chapter.time_base_den,
+            sample_rate,
+        ) {
+            Ok(start) => starts.push(start),
+            Err(reason) => {
+                notes.push(format!(
+                    "existing chapter {} start could not be imported ({reason}); opened a blank repair map",
+                    index + 1
+                ));
+                return (vec![0], vec!["Chapter 01".to_string()], notes);
+            }
+        }
+        titles.push(
+            chapter
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Chapter {:02}", index + 1)),
+        );
+    }
+
+    for index in 0..raw.len() {
+        let expected_end = starts.get(index + 1).copied().unwrap_or(total_samples);
+        match crate::convert::chapter_structure::timestamp_to_sample(
+            raw[index].end,
+            raw[index].time_base_num,
+            raw[index].time_base_den,
+            sample_rate,
+        ) {
+            Ok(observed_end) if observed_end.abs_diff(expected_end) > 1 => notes.push(format!(
+                "existing chapter {} end differs from the next division point by {} samples; starts were imported and durations will be rebuilt continuously",
+                index + 1,
+                observed_end.abs_diff(expected_end)
+            )),
+            Err(reason) => notes.push(format!(
+                "existing chapter {} end is invalid ({reason}); starts were imported and durations will be rebuilt continuously",
+                index + 1
+            )),
+            _ => {}
+        }
+    }
+    (starts, titles, notes)
+}
+
+fn metadata_editor_chapter_track_titles_from_surface(
+    surface: &crate::tui::app::PresentationTab,
+    count: usize,
+) -> Vec<String> {
+    surface
+        .entries
+        .iter()
+        .find(|entry| entry.display_key.eq_ignore_ascii_case("TITLE")
+            && entry.row_scope == crate::tui::probe::RowScope::Track)
+        .map(|entry| {
+            (0..count)
+                .map(|index| {
+                    entry.per_file_values
+                        .get(index)
+                        .map(|value| value.as_str().trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| format!("Chapter {:02}", index + 1))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| (0..count).map(|index| format!("Chapter {:02}", index + 1)).collect())
+}
+
+fn metadata_editor_stage_chapter_rows(
+    surface: &mut crate::tui::app::PresentationTab,
+    titles: Vec<String>,
+) {
+    let count = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+    let mut titles = titles;
+    titles.resize_with(count, || "Chapter".to_string());
+    titles.truncate(count);
+    let numbers = (0..count).map(|index| format!("{:02}", index + 1)).collect::<Vec<_>>();
+    cue_album_upsert_per_track_entry(
+        &mut surface.entries,
+        "TRACKNUMBER",
+        lofty::tag::ItemKey::TrackNumber,
+        numbers,
+    );
+    cue_album_upsert_per_track_entry(
+        &mut surface.entries,
+        "TITLE",
+        lofty::tag::ItemKey::TrackTitle,
+        titles,
+    );
+    surface.file_labels = (0..count).map(|index| format!("{:02}", index + 1)).collect();
+    cue_album_sort_entries(&mut surface.entries);
+}
+
+pub(super) fn complete_metadata_editor_chapter_probe(
+    state: &mut crate::tui::app::MetadataEditorState,
+    session_id: u64,
+    generation: u64,
+    path: std::path::PathBuf,
+    sample_rate: Result<u32, String>,
+    total_samples: Result<u64, String>,
+    embedded_chapters: Result<Vec<crate::convert::chapter_structure::RawEmbeddedChapter>, String>,
+    sidecar_path: std::path::PathBuf,
+    sidecar_exists: bool,
+    sidecar_snapshot: Result<Option<Vec<u8>>, String>,
+    embedded_cuesheet_snapshot: Result<Option<String>, String>,
+) -> String {
+    let Some(surface) = state.surface_mut_for_session(session_id) else {
+        return format!("metadata editor: ignored stale chapter probe for session {session_id}");
+    };
+    let expected = matches!(
+        &surface.chapter_authoring.load_state,
+        crate::tui::chapter_authoring::ChapterAuthoringLoadState::Loading { path: loading }
+            if metadata_cue_surface_key(loading) == metadata_cue_surface_key(&path)
+    );
+    if !expected || surface.chapter_authoring.load_generation != generation {
+        return format!("metadata editor: ignored stale chapter probe generation {generation}");
+    }
+    let sample_rate = match sample_rate {
+        Ok(rate) if rate != 0 => rate,
+        Ok(_) => {
+            let reason = "source reports a zero sample rate".to_string();
+            surface.chapter_authoring.load_state = crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason: reason.clone() };
+            return format!("chapter authoring: {reason}");
+        }
+        Err(reason) => {
+            surface.chapter_authoring.load_state = crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason: reason.clone() };
+            return format!("chapter authoring: {reason}");
+        }
+    };
+    let total_samples = match total_samples {
+        Ok(samples) if samples != 0 => samples,
+        Ok(_) => {
+            let reason = "source reports a zero-length program".to_string();
+            surface.chapter_authoring.load_state = crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason: reason.clone() };
+            return format!("chapter authoring: {reason}");
+        }
+        Err(reason) => {
+            surface.chapter_authoring.load_state = crate::tui::chapter_authoring::ChapterAuthoringLoadState::Failed { path, reason: reason.clone() };
+            return format!("chapter authoring: {reason}");
+        }
+    };
+
+    let old_file_title = metadata_editor_chapter_existing_scalar(&surface.entries, "TITLE");
+    let mut imported_notes = Vec::new();
+    surface.chapter_authoring.sidecar_snapshot = None;
+    surface.chapter_authoring.sidecar_snapshot_error = None;
+    match sidecar_snapshot {
+        Ok(Some(bytes)) => {
+            surface.chapter_authoring.sidecar_snapshot = Some(
+                crate::tui::chapter_authoring::ChapterSidecarSnapshot {
+                    path: sidecar_path.clone(),
+                    bytes,
+                },
+            );
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            surface.chapter_authoring.sidecar_snapshot_error = Some(reason.clone());
+            imported_notes.push(reason);
+        }
+    }
+    let existing_structure = surface.cue_album_synthetic_sheet.is_some();
+    surface.chapter_authoring.projection_only = !existing_structure;
+    let origin = if existing_structure {
+        match surface.cue_source.as_ref() {
+            Some(crate::tui::app::MetadataCueSource::Sidecar(_)) => crate::tui::chapter_authoring::ChapterStructureOrigin::SidecarCue,
+            Some(crate::tui::app::MetadataCueSource::Embedded(_)) => crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedCue,
+            None => crate::tui::chapter_authoring::ChapterStructureOrigin::Authored,
+        }
+    } else {
+        crate::tui::chapter_authoring::ChapterStructureOrigin::None
+    };
+
+    let mut imported_titles = None;
+    if let Some(sheet) = surface.cue_album_synthetic_sheet.as_mut() {
+        sheet.program_sample_rate = Some(sample_rate);
+        sheet.program_total_samples = Some(total_samples);
+    } else {
+        let (starts, titles, notes, imported_origin) = match embedded_chapters {
+            Ok(raw) if !raw.is_empty() => {
+                let (starts, titles, notes) = metadata_editor_chapter_import_embedded_starts(&raw, sample_rate, total_samples);
+                (starts, titles, notes, crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedChapters)
+            }
+            Ok(_) => (
+                vec![0],
+                vec![old_file_title.clone().unwrap_or_else(|| "Chapter 01".to_string())],
+                Vec::new(),
+                if surface.embedded_cuesheet_present
+                    || matches!(surface.cue_source, Some(crate::tui::app::MetadataCueSource::Embedded(_)))
+                {
+                    crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedCue
+                } else {
+                    crate::tui::chapter_authoring::ChapterStructureOrigin::None
+                },
+            ),
+            Err(reason) => (
+                vec![0],
+                vec![old_file_title.clone().unwrap_or_else(|| "Chapter 01".to_string())],
+                vec![format!("embedded chapter inspection failed ({reason}); opened a blank repair map that must replace the in-file chapter table before it can become authoritative")],
+                if crate::convert::chapter_structure::chapter_capable_source_extension(&path) {
+                    crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedChapters
+                } else {
+                    crate::tui::chapter_authoring::ChapterStructureOrigin::None
+                },
+            ),
+        };
+        imported_notes.extend(notes);
+        imported_titles = Some(titles);
+        let track_sources = starts
+            .into_iter()
+            .enumerate()
+            .map(|(row, start)| metadata_editor_chapter_new_track_source(&path, &sidecar_path, row, start))
+            .collect::<Vec<_>>();
+        let album_title = metadata_editor_chapter_existing_scalar(&surface.entries, "ALBUM")
+            .or_else(|| old_file_title.clone());
+        surface.cue_album_synthetic_sheet = Some(crate::tui::app::CueAlbumSyntheticSheet {
+            cue_paths: vec![sidecar_path.clone()],
+            audio_paths: vec![path.clone()],
+            track_sources,
+            album_title,
+            album_performer: metadata_editor_chapter_existing_scalar(&surface.entries, "ALBUMARTIST"),
+            album_date: metadata_editor_chapter_existing_scalar(&surface.entries, "DATE"),
+            album_genre: metadata_editor_chapter_existing_scalar(&surface.entries, "GENRE"),
+            album_catalog: metadata_editor_chapter_existing_scalar(&surface.entries, "CATALOGNUMBER"),
+            user_metadata: crate::convert::cue_parser::CueUserMetadata::default(),
+            program_sample_rate: Some(sample_rate),
+            program_total_samples: Some(total_samples),
+        });
+        surface.chapter_authoring.origin = imported_origin;
+    }
+
+    if existing_structure {
+        surface.chapter_authoring.origin = origin;
+    }
+    let count = surface.cue_album_synthetic_sheet.as_ref().map(|sheet| sheet.track_sources.len()).unwrap_or(0);
+    if !existing_structure {
+        let titles = imported_titles
+            .unwrap_or_else(|| metadata_editor_chapter_track_titles_from_surface(surface, count));
+        metadata_editor_stage_chapter_rows(surface, titles);
+    }
+
+    let embedded_cuesheet_snapshots = if surface.embedded_cuesheet_present {
+        match embedded_cuesheet_snapshot {
+            Ok(Some(cuesheet)) => vec![(path.clone(), cuesheet)],
+            Ok(None) => {
+                imported_notes.push(format!(
+                    "embedded CUESHEET was reported present in '{}' but its exact editor-open payload could not be read; structural replacement is blocked until the editor is reopened",
+                    path.display()
+                ));
+                Vec::new()
+            }
+            Err(reason) => {
+                imported_notes.push(format!(
+                    "cannot snapshot embedded CUESHEET in '{}': {reason}; structural replacement is blocked until the editor is reopened",
+                    path.display()
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let authoritative_target = match surface.cue_source.as_ref() {
+        Some(crate::tui::app::MetadataCueSource::Embedded(_)) => crate::config::AggregateMetadataTarget::EmbeddedCue,
+        _ => crate::config::AggregateMetadataTarget::SidecarCue,
+    };
+    surface.cue_album_view_sides = vec![crate::tui::app::CueAlbumViewSide {
+        sidecar_path: Some(sidecar_path.clone()),
+        sidecar_present: sidecar_exists,
+        audio_paths: vec![path.clone()],
+        embedded_cuesheet_snapshots,
+        authoritative_target,
+    }];
+    surface.chapter_authoring.import_notes = imported_notes;
+    surface.chapter_authoring.load_state = crate::tui::chapter_authoring::ChapterAuthoringLoadState::Ready { path };
+    surface.chapter_authoring.clamp_cursor(count);
+    let problems = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(crate::tui::chapter_authoring::validate)
+        .unwrap_or_default();
+    if problems.is_empty() {
+        format!("chapter authoring: loaded {count} chapter{} from {}", if count == 1 { "" } else { "s" }, surface.chapter_authoring.origin.label())
+    } else {
+        format!("chapter authoring: loaded {count} row{} with {} problem{} to repair", if count == 1 { "" } else { "s" }, problems.len(), if problems.len() == 1 { "" } else { "s" })
+    }
+}
+
+
+fn metadata_editor_chapter_mark_dirty(surface: &mut crate::tui::app::PresentationTab) {
+    surface.chapter_authoring.dirty = true;
+    // `origin` is provenance, not edit state. Preserve it until a successful
+    // structural save so the save dialog can require updating whichever
+    // carrier was authoritative when the Chapters surface opened.
+    surface.dirty = true;
+}
+
+fn metadata_editor_chapter_title_entry_index(
+    surface: &crate::tui::app::PresentationTab,
+) -> Option<usize> {
+    surface.entries.iter().position(|entry| {
+        entry.display_key.eq_ignore_ascii_case("TITLE")
+            && entry.row_scope == crate::tui::probe::RowScope::Track
+    })
+}
+
+fn metadata_editor_chapter_title(
+    surface: &crate::tui::app::PresentationTab,
+    row: usize,
+) -> String {
+    metadata_editor_chapter_title_entry_index(surface)
+        .and_then(|index| surface.entries.get(index))
+        .and_then(|entry| entry.per_file_values.get(row))
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_default()
+}
+
+pub(super) fn metadata_editor_chapter_title_for_render(
+    surface: &crate::tui::app::PresentationTab,
+    row: usize,
+) -> String {
+    metadata_editor_chapter_title(surface, row)
+}
+
+
+fn metadata_editor_chapter_set_title(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+    title: String,
+) -> Result<(), String> {
+    let index = metadata_editor_chapter_title_entry_index(surface)
+        .ok_or_else(|| "chapter title row is unavailable".to_string())?;
+    let entry = surface
+        .entries
+        .get_mut(index)
+        .ok_or_else(|| "chapter title row disappeared".to_string())?;
+    let value = entry
+        .per_file_values
+        .get_mut(row)
+        .ok_or_else(|| format!("chapter {} title slot is unavailable", row + 1))?;
+    value.replace_scalar(title);
+    cue_album_recompute_entry_display(entry);
+    metadata_editor_chapter_mark_dirty(surface);
+    Ok(())
+}
+
+fn metadata_editor_chapter_resize_track_entries(
+    surface: &mut crate::tui::app::PresentationTab,
+    count: usize,
+) {
+    for entry in &mut surface.entries {
+        if entry.row_scope != crate::tui::probe::RowScope::Track {
+            continue;
+        }
+        entry.clear_stored_value_provenance();
+        entry.per_file_values
+            .resize(count, crate::tui::probe::MetadataFieldValues::default());
+        entry.per_file_originals
+            .resize(count, crate::tui::probe::MetadataFieldValues::default());
+        entry.per_file_values.truncate(count);
+        entry.per_file_originals.truncate(count);
+        entry.mb_proposed_per_file = None;
+        entry.mb_proposed_value = None;
+        cue_album_recompute_entry_display(entry);
+    }
+    surface.file_labels = (0..count).map(|index| format!("{:02}", index + 1)).collect();
+}
+
+fn metadata_editor_chapter_insert_track_entry_slots(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+) {
+    for entry in &mut surface.entries {
+        if entry.row_scope != crate::tui::probe::RowScope::Track {
+            continue;
+        }
+        let row = row.min(entry.per_file_values.len());
+        entry.clear_stored_value_provenance();
+        entry
+            .per_file_values
+            .insert(row, crate::tui::probe::MetadataFieldValues::default());
+        entry
+            .per_file_originals
+            .insert(row, crate::tui::probe::MetadataFieldValues::default());
+        entry.mb_proposed_per_file = None;
+        entry.mb_proposed_value = None;
+        cue_album_recompute_entry_display(entry);
+    }
+}
+
+fn metadata_editor_chapter_remove_track_entry_slots(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+) {
+    for entry in &mut surface.entries {
+        if entry.row_scope != crate::tui::probe::RowScope::Track {
+            continue;
+        }
+        entry.clear_stored_value_provenance();
+        if row < entry.per_file_values.len() {
+            entry.per_file_values.remove(row);
+        }
+        if row < entry.per_file_originals.len() {
+            entry.per_file_originals.remove(row);
+        }
+        entry.mb_proposed_per_file = None;
+        entry.mb_proposed_value = None;
+        cue_album_recompute_entry_display(entry);
+    }
+}
+
+fn metadata_editor_chapter_renumber(surface: &mut crate::tui::app::PresentationTab) {
+    let Some(sheet) = surface.cue_album_synthetic_sheet.as_mut() else {
+        return;
+    };
+    for (index, source) in sheet.track_sources.iter_mut().enumerate() {
+        source.local_track_index = index;
+        source.original_track_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+    }
+    let numbers = (0..sheet.track_sources.len())
+        .map(|index| format!("{:02}", index + 1))
+        .collect::<Vec<_>>();
+    if let Some(entry) = surface.entries.iter_mut().find(|entry| {
+        entry.display_key.eq_ignore_ascii_case("TRACKNUMBER")
+            && entry.row_scope == crate::tui::probe::RowScope::Track
+    }) {
+        entry.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(numbers);
+        cue_album_recompute_entry_display(entry);
+    }
+    surface.file_labels = (0..sheet.track_sources.len())
+        .map(|index| format!("{:02}", index + 1))
+        .collect();
+}
+
+fn metadata_editor_chapter_refresh_cuesheet_preview(surface: &mut crate::tui::app::PresentationTab) {
+    // Only maintain an already-present CUESHEET preview. Embedded MP4 chapter
+    // sources do not gain a synthetic CUE carrier merely because the user
+    // edits their chapter map; the save dialog is the sole place that chooses
+    // whether to create one.
+    if !surface.entries.iter().any(|entry| entry.display_key.eq_ignore_ascii_case("CUESHEET")) {
+        return;
+    }
+    let count = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    if count == 0 || count > 99 {
+        return;
+    }
+    let generated = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .and_then(|sheet| {
+            cue_album_generate_cuesheet_for_track_indices(
+                sheet,
+                &surface.entries,
+                &surface.deleted,
+                &(0..sheet.track_sources.len()).collect::<Vec<_>>(),
+                false,
+                true,
+                cue_album_resolved_file_ref_for_new_sidecar,
+                cue_album_sidecar_format_tag_for_audio,
+            )
+            .ok()
+        });
+    if let Some(cuesheet) = generated {
+        cue_album_update_cuesheet_entry(surface, cuesheet, None);
+        cue_album_sort_entries(&mut surface.entries);
+    }
+}
+
+fn metadata_editor_chapter_insert_division(
+    surface: &mut crate::tui::app::PresentationTab,
+    start_sample: u64,
+) -> Result<usize, String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let sample_rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let total_samples = sheet.program_total_samples.ok_or_else(|| "chapter duration is unavailable".to_string())?;
+    if start_sample == 0 || start_sample >= total_samples {
+        return Err(format!("new division point must be after sample 0 and before sample {total_samples}"));
+    }
+    let mut position = sheet.track_sources.len();
+    for (index, source) in sheet.track_sources.iter().enumerate() {
+        let existing = crate::tui::chapter_authoring::authoritative_start_sample(source, sample_rate)?;
+        if existing == start_sample {
+            return Err(format!("a division point already exists at sample {start_sample}"));
+        }
+        if existing > start_sample {
+            position = index;
+            break;
+        }
+    }
+    if sheet.track_sources.len() >= 100_000 {
+        return Err("chapter authoring is limited to 100000 rows".to_string());
+    }
+    let program_path = sheet
+        .audio_paths
+        .first()
+        .cloned()
+        .ok_or_else(|| "chapter program path is unavailable".to_string())?;
+    let cue_path = sheet
+        .cue_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| program_path.with_extension("cue"));
+    let source = metadata_editor_chapter_new_track_source(&program_path, &cue_path, position, start_sample);
+    surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .expect("sheet validated above")
+        .track_sources
+        .insert(position, source);
+    metadata_editor_chapter_insert_track_entry_slots(surface, position);
+    metadata_editor_chapter_renumber(surface);
+    metadata_editor_chapter_set_title(surface, position, format!("Chapter {:02}", position + 1))?;
+    metadata_editor_chapter_mark_dirty(surface);
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(position)
+}
+
+fn metadata_editor_chapter_remove_division(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+) -> Result<(), String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    if row == 0 {
+        return Err("chapter 1 begins the program; remove a later division point instead".to_string());
+    }
+    if row >= sheet.track_sources.len() {
+        return Err("selected chapter row no longer exists".to_string());
+    }
+    surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .expect("sheet validated above")
+        .track_sources
+        .remove(row);
+    metadata_editor_chapter_remove_track_entry_slots(surface, row);
+    metadata_editor_chapter_renumber(surface);
+    metadata_editor_chapter_mark_dirty(surface);
+    surface.chapter_authoring.clamp_cursor(
+        surface
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .map(|sheet| sheet.track_sources.len())
+            .unwrap_or(0),
+    );
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(())
+}
+
+fn metadata_editor_chapter_apply_start(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+    start_sample: u64,
+) -> Result<(), String> {
+    let source = surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .and_then(|sheet| sheet.track_sources.get_mut(row))
+        .ok_or_else(|| "selected chapter row no longer exists".to_string())?;
+    source.index01_sample = Some(start_sample);
+    source.index01_frames = None;
+    if source.index00_sample.is_some_and(|pregap| pregap > start_sample) {
+        source.index00_sample = Some(start_sample);
+        source.index00_frames = None;
+    }
+    metadata_editor_chapter_mark_dirty(surface);
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(())
+}
+
+fn metadata_editor_chapter_apply_pregap_duration(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+    duration_samples: u64,
+) -> Result<(), String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let sample_rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let source = sheet
+        .track_sources
+        .get_mut(row)
+        .ok_or_else(|| "selected chapter row no longer exists".to_string())?;
+    let start = crate::tui::chapter_authoring::authoritative_start_sample(source, sample_rate)?;
+    if duration_samples == 0 {
+        source.index00_sample = None;
+        source.index00_frames = None;
+    } else {
+        let pregap = start
+            .checked_sub(duration_samples)
+            .ok_or_else(|| "pregap duration reaches before the start of the program".to_string())?;
+        source.index00_sample = Some(pregap);
+        source.index00_frames = None;
+    }
+    metadata_editor_chapter_mark_dirty(surface);
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(())
+}
+
+fn metadata_editor_chapter_nudge(
+    surface: &mut crate::tui::app::PresentationTab,
+    row: usize,
+    column: crate::tui::chapter_authoring::ChapterColumn,
+    forward: bool,
+) -> Result<(), String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let total = sheet.program_total_samples.ok_or_else(|| "chapter duration is unavailable".to_string())?;
+    let view = crate::tui::chapter_authoring::boundary_views(sheet)?
+        .get(row)
+        .cloned()
+        .ok_or_else(|| "selected chapter row no longer exists".to_string())?;
+    match column {
+        crate::tui::chapter_authoring::ChapterColumn::Start => {
+            let next = crate::tui::chapter_authoring::nudge_samples_one_cue_frame(view.start_sample, rate, forward)?;
+            if next >= total {
+                return Err("chapter start cannot be nudged beyond program end".to_string());
+            }
+            metadata_editor_chapter_apply_start(surface, row, next)
+        }
+        crate::tui::chapter_authoring::ChapterColumn::Pregap => {
+            let pregap_start = view.pregap_start_sample.unwrap_or(view.start_sample);
+            let next = crate::tui::chapter_authoring::nudge_samples_one_cue_frame(pregap_start, rate, forward)?;
+            if next > view.start_sample {
+                return Err("pregap start cannot move after the chapter start".to_string());
+            }
+            let duration = view.start_sample.saturating_sub(next);
+            metadata_editor_chapter_apply_pregap_duration(surface, row, duration)
+        }
+        crate::tui::chapter_authoring::ChapterColumn::Title => Err("select Start or Pre to nudge a division point".to_string()),
+    }
+}
+
+fn metadata_editor_chapter_replace_structure(
+    surface: &mut crate::tui::app::PresentationTab,
+    starts: Vec<u64>,
+    titles: Vec<String>,
+) -> Result<(), String> {
+    if starts.is_empty() || starts.len() != titles.len() {
+        return Err("generated chapter rows are internally inconsistent".to_string());
+    }
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let program_path = sheet.audio_paths.first().cloned().ok_or_else(|| "chapter program path is unavailable".to_string())?;
+    let cue_path = sheet.cue_paths.first().cloned().unwrap_or_else(|| program_path.with_extension("cue"));
+    let sources = starts
+        .into_iter()
+        .enumerate()
+        .map(|(row, start)| metadata_editor_chapter_new_track_source(&program_path, &cue_path, row, start))
+        .collect::<Vec<_>>();
+    surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .expect("sheet validated above")
+        .track_sources = sources;
+    let count = titles.len();
+    metadata_editor_chapter_resize_track_entries(surface, count);
+    metadata_editor_stage_chapter_rows(surface, titles);
+    metadata_editor_chapter_renumber(surface);
+    surface.chapter_authoring.cursor = 0;
+    surface.chapter_authoring.scroll = 0;
+    metadata_editor_chapter_mark_dirty(surface);
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(())
+}
+
+fn metadata_editor_chapter_apply_generation(
+    surface: &mut crate::tui::app::PresentationTab,
+) -> Result<(), String> {
+    let generation = surface
+        .chapter_authoring
+        .generation
+        .as_ref()
+        .ok_or_else(|| "chapter generation dialog is not open".to_string())?
+        .clone();
+    if generation.titles_only {
+        let count = surface
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .map(|sheet| sheet.track_sources.len())
+            .unwrap_or(0);
+        if count == 0 {
+            return Err("chapter structure has no rows to title".to_string());
+        }
+        let titles = crate::tui::chapter_authoring::generated_titles(
+            &generation.base_title.text,
+            generation.numbering,
+            count,
+        )?;
+        metadata_editor_stage_chapter_rows(surface, titles);
+        metadata_editor_chapter_renumber(surface);
+        metadata_editor_chapter_mark_dirty(surface);
+        metadata_editor_chapter_refresh_cuesheet_preview(surface);
+        surface.chapter_authoring.generation = None;
+        return Ok(());
+    }
+    let total = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .and_then(|sheet| sheet.program_total_samples)
+        .ok_or_else(|| "chapter duration is unavailable".to_string())?;
+    let rate = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .and_then(|sheet| sheet.program_sample_rate)
+        .ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let starts = match generation.mode {
+        crate::tui::chapter_authoring::ChapterGenerationMode::FixedDuration => {
+            let duration = crate::tui::chapter_authoring::parse_position_samples(&generation.value.text, rate, None)?;
+            crate::tui::chapter_authoring::fixed_duration_starts(total, duration)?
+        }
+        crate::tui::chapter_authoring::ChapterGenerationMode::UniformCount => {
+            let count = generation
+                .value
+                .text
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "uniform generation requires a positive integer chapter count".to_string())?;
+            crate::tui::chapter_authoring::uniform_count_starts(total, count)?
+        }
+    };
+    if starts.len() > 100_000 {
+        return Err(format!("generation would create {} chapters; the editor limit is 100000", starts.len()));
+    }
+    let titles = crate::tui::chapter_authoring::generated_titles(
+        &generation.base_title.text,
+        generation.numbering,
+        starts.len(),
+    )?;
+    metadata_editor_chapter_replace_structure(surface, starts, titles)?;
+    surface.chapter_authoring.generation = None;
+    Ok(())
+}
+
+fn metadata_editor_chapter_paste_titles(
+    surface: &mut crate::tui::app::PresentationTab,
+) -> Result<usize, String> {
+    let text = tui_file_picker::read_shared_text_clipboard();
+    if text.is_empty() {
+        return Err("shared clipboard is empty".to_string());
+    }
+    let lines = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    let count = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    if lines.len() != count {
+        return Err(format!("paste list has {} line{} but this map has {count} chapter{}", lines.len(), if lines.len() == 1 { "" } else { "s" }, if count == 1 { "" } else { "s" }));
+    }
+    for (row, title) in lines.into_iter().enumerate() {
+        metadata_editor_chapter_set_title(surface, row, title)?;
+    }
+    metadata_editor_chapter_refresh_cuesheet_preview(surface);
+    Ok(count)
+}
+
+fn metadata_editor_chapter_next_numbering(
+    current: crate::tui::metadata_autonumber::NumberingScheme,
+    forward: bool,
+) -> crate::tui::metadata_autonumber::NumberingScheme {
+    use crate::tui::metadata_autonumber::NumberingScheme;
+    let all = [NumberingScheme::N, NumberingScheme::NN, NumberingScheme::NOverNN, NumberingScheme::NNOverNN];
+    let index = all.iter().position(|candidate| *candidate == current).unwrap_or(0);
+    if forward {
+        all[(index + 1) % all.len()]
+    } else {
+        all[(index + all.len() - 1) % all.len()]
+    }
+}
+
+fn metadata_editor_chapter_begin_edit(surface: &mut crate::tui::app::PresentationTab) -> Result<(), String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let views = crate::tui::chapter_authoring::boundary_views(sheet)?;
+    let row = surface.chapter_authoring.cursor;
+    let view = views.get(row).ok_or_else(|| "selected chapter row no longer exists".to_string())?;
+    let (kind, text) = match surface.chapter_authoring.column {
+        crate::tui::chapter_authoring::ChapterColumn::Start => (
+            crate::tui::chapter_authoring::ChapterEditKind::Start,
+            crate::tui::chapter_authoring::format_position(view.start_sample, rate),
+        ),
+        crate::tui::chapter_authoring::ChapterColumn::Pregap => (
+            crate::tui::chapter_authoring::ChapterEditKind::Pregap,
+            view.pregap_samples()
+                .map(|samples| crate::tui::chapter_authoring::format_position(samples, rate))
+                .unwrap_or_else(|| "0".to_string()),
+        ),
+        crate::tui::chapter_authoring::ChapterColumn::Title => (
+            crate::tui::chapter_authoring::ChapterEditKind::Title,
+            metadata_editor_chapter_title(surface, row),
+        ),
+    };
+    surface.chapter_authoring.edit_kind = Some(kind);
+    surface.chapter_authoring.edit_input = Some(super::text_input::TextInputState::new_selected(text));
+    Ok(())
+}
+
+fn metadata_editor_chapter_commit_edit(surface: &mut crate::tui::app::PresentationTab) -> Result<(), String> {
+    let kind = surface
+        .chapter_authoring
+        .edit_kind
+        .ok_or_else(|| "chapter edit kind is unavailable".to_string())?;
+    let input = surface
+        .chapter_authoring
+        .edit_input
+        .as_ref()
+        .map(|input| input.text.clone())
+        .ok_or_else(|| "chapter edit input is unavailable".to_string())?;
+    let row = surface.chapter_authoring.cursor;
+    match kind {
+        crate::tui::chapter_authoring::ChapterEditKind::Start => {
+            let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| "chapter structure is unavailable".to_string())?;
+            let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+            let current = crate::tui::chapter_authoring::boundary_views(sheet)?.get(row).map(|view| view.start_sample);
+            let sample = crate::tui::chapter_authoring::parse_position_samples(&input, rate, current)?;
+            metadata_editor_chapter_apply_start(surface, row, sample)?;
+        }
+        crate::tui::chapter_authoring::ChapterEditKind::Pregap => {
+            let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| "chapter structure is unavailable".to_string())?;
+            let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+            let current = crate::tui::chapter_authoring::boundary_views(sheet)?.get(row).and_then(|view| view.pregap_samples());
+            let samples = crate::tui::chapter_authoring::parse_position_samples(&input, rate, current)?;
+            metadata_editor_chapter_apply_pregap_duration(surface, row, samples)?;
+        }
+        crate::tui::chapter_authoring::ChapterEditKind::Title => {
+            metadata_editor_chapter_set_title(surface, row, input)?;
+            metadata_editor_chapter_refresh_cuesheet_preview(surface);
+        }
+        crate::tui::chapter_authoring::ChapterEditKind::InsertStart => {
+            let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| "chapter structure is unavailable".to_string())?;
+            let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+            let current = crate::tui::chapter_authoring::boundary_views(sheet)?.get(row).map(|view| view.start_sample);
+            let sample = crate::tui::chapter_authoring::parse_position_samples(&input, rate, current)?;
+            let inserted = metadata_editor_chapter_insert_division(surface, sample)?;
+            surface.chapter_authoring.cursor = inserted;
+        }
+    }
+    surface.chapter_authoring.edit_kind = None;
+    surface.chapter_authoring.edit_input = None;
+    Ok(())
+}
+
+fn metadata_editor_chapter_has_pregaps(surface: &crate::tui::app::PresentationTab) -> bool {
+    surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .and_then(|sheet| crate::tui::chapter_authoring::boundary_views(sheet).ok())
+        .is_some_and(|views| views.iter().any(|view| view.pregap_samples().is_some()))
+}
+
+fn metadata_editor_chapter_in_file_destination(
+    path: &std::path::Path,
+) -> Option<crate::tui::chapter_authoring::ChapterInFileDestination> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "m4a" | "m4b" | "mp4" => Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters),
+        "flac" => Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue),
+        _ => None,
+    }
+}
+
+fn metadata_editor_chapter_open_save_dialog(
+    surface: &mut crate::tui::app::PresentationTab,
+    split_on_conversion: bool,
+) -> Result<(), String> {
+    if surface.chapter_authoring.saving {
+        return Err("chapter save is already running".to_string());
+    }
+    let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let problems = crate::tui::chapter_authoring::validate(sheet);
+    if let Some(problem) = problems.first() {
+        if let Some(row) = problem.row {
+            surface.chapter_authoring.cursor = row;
+        }
+        return Err(format!("cannot save: {}", problem.message));
+    }
+    let path = sheet.audio_paths.first().ok_or_else(|| "chapter program path is unavailable".to_string())?;
+    let cue_capable = sheet.track_sources.len() <= 99;
+    let in_file = metadata_editor_chapter_in_file_destination(path);
+    surface.chapter_authoring.save_dialog = Some(crate::tui::chapter_authoring::ChapterSaveDialog {
+        cursor: 0,
+        sidecar_selected: cue_capable,
+        in_file,
+        in_file_selected: in_file.is_some(),
+        split_on_conversion,
+        snap_to_cue_grid: false,
+    });
+    Ok(())
+}
+
+
+
+fn metadata_editor_chapter_records(
+    surface: &crate::tui::app::PresentationTab,
+    snap_to_cue_grid: bool,
+) -> Result<Vec<(String, u64, u64)>, String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let total = sheet.program_total_samples.ok_or_else(|| "chapter duration is unavailable".to_string())?;
+    let views = crate::tui::chapter_authoring::boundary_views(sheet)?;
+    if views.is_empty() {
+        return Err("chapter structure has no rows".to_string());
+    }
+    let mut starts = Vec::with_capacity(views.len());
+    for view in &views {
+        let source = &sheet.track_sources[view.row];
+        let start = if snap_to_cue_grid {
+            // Project from the source's authoritative coordinate. A frame-native
+            // CUE row is already exact and must not first pass through the
+            // floored sample display coordinate, which could move it one frame
+            // early at rates not divisible by 75.
+            let frame = crate::tui::chapter_authoring::cue_index01_frames(source, Some(rate))?
+                .ok_or_else(|| format!("chapter {} has no CUE INDEX 01", view.row + 1))?;
+            crate::tui::chapter_authoring::cue_frames_to_samples(frame, rate)?
+        } else {
+            view.start_sample
+        };
+        if starts.last().is_some_and(|previous| *previous >= start) {
+            return Err(format!(
+                "CUE-grid snapping would collapse or reorder chapter {} at sample {start}; move the division points farther apart or save without snapping",
+                starts.len() + 1
+            ));
+        }
+        starts.push(start);
+    }
+    if starts.first().copied() != Some(0) {
+        return Err("chapter 1 must begin at sample 0 before saving".to_string());
+    }
+    let mut records = Vec::with_capacity(starts.len());
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(total);
+        if end <= start {
+            return Err(format!("chapter {} has no positive duration after save projection", index + 1));
+        }
+        records.push((metadata_editor_chapter_title(surface, index), start, end));
+    }
+    Ok(records)
+}
+
+fn metadata_editor_chapter_merge_album_plans(
+    mut left: MetadataAlbumWritePlan,
+    right: MetadataAlbumWritePlan,
+) -> Result<MetadataAlbumWritePlan, String> {
+    let mut targets = left
+        .sidecars
+        .iter()
+        .map(|sidecar| metadata_cue_surface_key(&sidecar.cue_path))
+        .chain(left.audio.iter().map(|audio| metadata_cue_surface_key(&audio.path)))
+        .collect::<std::collections::BTreeSet<_>>();
+    for sidecar in &right.sidecars {
+        if !targets.insert(metadata_cue_surface_key(&sidecar.cue_path)) {
+            return Err(format!("chapter save selected duplicate carrier '{}'", sidecar.cue_path.display()));
+        }
+    }
+    for audio in &right.audio {
+        if !targets.insert(metadata_cue_surface_key(&audio.path)) {
+            return Err(format!("chapter save selected duplicate carrier '{}'", audio.path.display()));
+        }
+    }
+    left.sidecars.extend(right.sidecars);
+    left.audio.extend(right.audio);
+    for path in right.logical_paths {
+        if !left.logical_paths.iter().any(|existing| metadata_cue_surface_key(existing) == metadata_cue_surface_key(&path)) {
+            left.logical_paths.push(path);
+        }
+    }
+    Ok(left)
+}
+
+fn metadata_editor_chapter_results_to_warnings(
+    results: Vec<crate::tui::app::MetadataEditorWriteResult>,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for result in results {
+        warnings.extend(result.fidelity_warnings);
+        match result.outcome {
+            crate::tui::app::MetadataEditorWriteOutcome::Saved => {}
+            crate::tui::app::MetadataEditorWriteOutcome::SavedWithWarnings { warnings: values } => warnings.extend(values),
+            crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
+                cue_path,
+                rewritten_as_utf8,
+                fidelity_warnings,
+                ..
+            } => {
+                warnings.extend(fidelity_warnings);
+                if rewritten_as_utf8 {
+                    warnings.push(format!("{} was rewritten as UTF-8 because its original text encoding could not represent the authored structure", cue_path.display()));
+                }
+            }
+            crate::tui::app::MetadataEditorWriteOutcome::Failed { reason }
+            | crate::tui::app::MetadataEditorWriteOutcome::Skipped { reason }
+            | crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { reason, .. } => return Err(reason),
+            crate::tui::app::MetadataEditorWriteOutcome::InvalidApeRepair(other) => {
+                return Err(format!("unexpected invalid-APEv2 outcome during chapter save: {other:?}"));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+
+fn metadata_editor_chapter_refresh_committed_snapshots(
+    outcome: &mut crate::tui::chapter_authoring::ChapterSaveOutcome,
+) {
+    if let Some(path) = outcome.sidecar_path.as_ref() {
+        match std::fs::read(path) {
+            Ok(bytes) => outcome.sidecar_snapshot = Some(bytes),
+            Err(error) => {
+                outcome.sidecar_snapshot = None;
+                outcome.warnings.push(format!(
+                    "{} was saved, but its post-commit concurrency snapshot could not be read: {error}; reopen the editor before saving that sidecar again",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if outcome.in_file_destination
+        == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)
+    {
+        if let Some(path) = outcome.in_file_path.as_ref() {
+            match metadata_album_view_embedded_cuesheet_at(path) {
+                Ok(Some(cuesheet)) => outcome.embedded_cuesheet_snapshot = Some(cuesheet),
+                Ok(None) => {
+                    outcome.embedded_cuesheet_snapshot = None;
+                    outcome.warnings.push(format!(
+                        "{} was saved, but the embedded CUESHEET could not be read back into the editor concurrency snapshot; reopen before saving it again",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    outcome.embedded_cuesheet_snapshot = None;
+                    outcome.warnings.push(format!(
+                        "{} was saved, but the embedded CUESHEET post-commit snapshot could not be read: {error}; reopen before saving it again",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn metadata_editor_chapter_execute_mp4_transaction(
+    mut sidecar_plan: Option<MetadataAlbumWritePlan>,
+    program_path: std::path::PathBuf,
+    chapters: Vec<(String, u64, u64)>,
+    sample_rate: u32,
+    tool_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    mut outcome: crate::tui::chapter_authoring::ChapterSaveOutcome,
+) -> Result<crate::tui::chapter_authoring::ChapterSaveOutcome, String> {
+    if sidecar_plan.as_ref().is_some_and(|plan| !plan.audio.is_empty()) {
+        return Err("internal chapter save error: sidecar plan unexpectedly contains audio-tag mutations".to_string());
+    }
+    let mut mutation_paths = vec![program_path.clone()];
+    if let Some(plan) = sidecar_plan.as_ref() {
+        mutation_paths.extend(plan.sidecars.iter().map(|sidecar| sidecar.cue_path.clone()));
+    }
+    let admission = crate::tui::probe::admit_metadata_mutation_paths(
+        &mutation_paths,
+        "metadata-editor chapter save",
+    )?;
+    let admitted_program = admission.admitted_path(&program_path)?.to_path_buf();
+    if let Some(plan) = sidecar_plan.as_mut() {
+        for sidecar in &mut plan.sidecars {
+            sidecar.cue_path = admission.admitted_path(&sidecar.cue_path)?.to_path_buf();
+        }
+    }
+    if let Some(plan) = sidecar_plan.as_ref() {
+        metadata_album_view_revalidate_plan(plan)
+            .map_err(|error| format!("chapter save revalidation failed: {error}; no carrier was changed"))?;
+    }
+
+    let mut stages = Vec::new();
+    if let Some(plan) = sidecar_plan.as_ref() {
+        for sidecar in &plan.sidecars {
+            let stage = if sidecar.create {
+                crate::convert::pipeline::metadata_rewrite::stage_new_metadata_batch_file(&sidecar.cue_path)
+            } else {
+                crate::convert::pipeline::metadata_rewrite::stage_existing_metadata_batch_file(&sidecar.cue_path)
+            }
+            .map_err(|error| format!("cannot stage chapter sidecar '{}': {error}", sidecar.cue_path.display()))?;
+            let write = if sidecar.create {
+                super::cue_parser::create_cue_sidecar_from_cuesheet(stage.staged_path(), &sidecar.replacement_cuesheet)
+            } else if sidecar.replace_structure {
+                super::cue_parser::replace_cue_sidecar_structure_from_cuesheet(
+                    stage.staged_path(),
+                    &sidecar.replacement_cuesheet,
+                )
+            } else {
+                super::cue_parser::rewrite_cue_sidecar_metadata_album_merge_from_cuesheet(
+                    stage.staged_path(),
+                    &sidecar.replacement_cuesheet,
+                    &sidecar.deletion_intent,
+                )
+            }
+            .map_err(|error| format!("cannot stage chapter sidecar '{}': {error}", sidecar.cue_path.display()))?;
+            outcome.warnings.extend(sidecar.fidelity_warnings.iter().cloned());
+            if matches!(write, super::cue_parser::CueSidecarWritebackOutcome::RewrittenUtf8Fallback { .. }) {
+                outcome.warnings.push(format!("{} was rewritten as UTF-8 because its original text encoding could not represent the authored structure", sidecar.cue_path.display()));
+            }
+            if !matches!(write, super::cue_parser::CueSidecarWritebackOutcome::Unchanged) {
+                stages.push(stage);
+            }
+        }
+    }
+
+    let mp4_stage = crate::convert::pipeline::metadata_rewrite::stage_existing_metadata_batch_file(&admitted_program)
+        .map_err(|error| format!("cannot stage '{}': {error}", program_path.display()))?;
+    let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    crate::convert::pipeline::chapter_write::rewrite_embedded_chapters_for_authoring(
+        mp4_stage.staged_path(),
+        &chapters,
+        sample_rate,
+        &runner,
+        &cancel,
+    )
+    .await?;
+    stages.push(mp4_stage);
+
+    if let Some(plan) = sidecar_plan.as_ref() {
+        metadata_album_view_revalidate_plan(plan)
+            .map_err(|error| format!("chapter save final revalidation failed: {error}; no carrier was changed"))?;
+    }
+    crate::convert::pipeline::metadata_rewrite::commit_metadata_rewrite_batch(stages)
+        .map_err(|error| format!("chapter carrier transaction failed: {error}"))?;
+    metadata_editor_chapter_refresh_committed_snapshots(&mut outcome);
+    drop(admission);
+    Ok(outcome)
+}
+
+fn metadata_editor_chapter_entry_is_owned(
+    entry: &super::probe::TagEntry,
+    file_count: usize,
+) -> bool {
+    entry.effective_row_scope(file_count) == crate::tui::probe::RowScope::Track
+        && (entry.display_key.eq_ignore_ascii_case("TITLE")
+            || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER"))
+}
+
+/// Freeze a save-only view of the editor that contains chapter-authoring
+/// mutations and editor-open metadata, but no unrelated unsaved metadata.
+///
+/// Chapters deliberately shares the Album-view rows so titles/numbering and
+/// CUE generation cannot drift into a second model. That also means the live
+/// surface may contain ordinary Metadata-tab edits while a chapter map is
+/// dirty. A structural save must not smuggle those independent edits into a
+/// sidecar or embedded CUE. Keep chapter-owned per-track TITLE/TRACKNUMBER
+/// values, restore every other row to its editor-open value, and suppress
+/// unrelated cleanup/delete intents. The returned clone is planning-only;
+/// the live editor retains all unrelated dirty state for an explicit metadata
+/// save later.
+fn metadata_editor_chapter_plan_projection(
+    state: &crate::tui::app::MetadataEditorState,
+) -> crate::tui::app::MetadataEditorState {
+    let mut projection = state.clone();
+    let surface = projection.active_surface_mut();
+    let file_count = surface.paths.len();
+
+    for entry in &mut surface.entries {
+        if metadata_editor_chapter_entry_is_owned(entry, file_count) {
+            continue;
+        }
+        entry.per_file_values = entry.per_file_originals.clone();
+        cue_album_recompute_entry_display(entry);
+    }
+
+    let chapter_owned_indices = surface
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            metadata_editor_chapter_entry_is_owned(entry, file_count).then_some(index)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    surface
+        .deleted
+        .retain(|index| chapter_owned_indices.contains(index));
+    surface.pending_embedded_cuesheet_delete = false;
+    surface.cue_album_forced_cleanup.clear();
+    projection
+}
+
+fn metadata_editor_chapter_structural_cue_plan(
+    state: &crate::tui::app::MetadataEditorState,
+    mode: MetadataAlbumCarrierWriteMode,
+) -> Result<MetadataAlbumWritePlan, String> {
+    if mode == MetadataAlbumCarrierWriteMode::EmbeddedCue
+        && state.active_surface().embedded_cuesheet_present
+    {
+        for side in &state.active_surface().cue_album_view_sides {
+            for path in &side.audio_paths {
+                let key = metadata_cue_surface_key(path);
+                let has_snapshot = side.embedded_cuesheet_snapshots.iter().any(
+                    |(snapshot_path, _)| metadata_cue_surface_key(snapshot_path) == key,
+                );
+                if !has_snapshot {
+                    return Err(format!(
+                        "cannot replace the existing embedded CUESHEET in '{}' because its exact editor-open payload is unavailable; reopen the editor before saving it",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    let projection = metadata_editor_chapter_plan_projection(state);
+    let (mut plan, _) =
+        metadata_album_view_plan_with_structure_policy(&projection, mode, true)?;
+    if mode != MetadataAlbumCarrierWriteMode::SidecarCue {
+        return Ok(plan);
+    }
+
+    let snapshot_error = state
+        .active_surface()
+        .chapter_authoring
+        .sidecar_snapshot_error
+        .as_deref();
+    for sidecar in &mut plan.sidecars {
+        if sidecar.create {
+            continue;
+        }
+        let snapshot = state
+            .active_surface()
+            .chapter_authoring
+            .sidecar_snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                metadata_cue_surface_key(&snapshot.path)
+                    == metadata_cue_surface_key(&sidecar.cue_path)
+            })
+            .ok_or_else(|| {
+                snapshot_error
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "cannot replace existing sidecar CUE '{}' because the Chapters surface has no exact editor-open snapshot",
+                            sidecar.cue_path.display()
+                        )
+                    })
+            })?;
+        sidecar.expected_raw_snapshot = Some(snapshot.bytes.clone());
+    }
+    Ok(plan)
+}
+
+fn metadata_editor_chapter_current_authority_requires_selection(
+    surface: &crate::tui::app::PresentationTab,
+    dialog: &crate::tui::chapter_authoring::ChapterSaveDialog,
+) -> Result<(), String> {
+    match surface.chapter_authoring.origin {
+        crate::tui::chapter_authoring::ChapterStructureOrigin::SidecarCue if !dialog.sidecar_selected => {
+            Err("the current sidecar CUE is authoritative; update it or it would continue to shadow the authored map".to_string())
+        }
+        crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedCue
+            if !dialog.sidecar_selected
+                && !(dialog.in_file_selected
+                    && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)) =>
+        {
+            Err("the current embedded CUESHEET must be updated or superseded by a sidecar CUE".to_string())
+        }
+        crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedChapters
+            if !dialog.sidecar_selected
+                && !(dialog.in_file_selected
+                    && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters)) =>
+        {
+            Err("the current embedded chapter map must be updated or superseded by a sidecar CUE".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn metadata_editor_start_chapter_save(
+    app: &mut AppState,
+    state: &mut Box<crate::tui::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) -> Result<String, String> {
+    let dialog = state
+        .active_surface()
+        .chapter_authoring
+        .save_dialog
+        .clone()
+        .ok_or_else(|| "chapter save dialog is not open".to_string())?;
+    if !dialog.sidecar_selected && !dialog.in_file_selected {
+        return Err("select at least one durable structure destination; Split on conversion is derived from saved structure, not a storage location".to_string());
+    }
+    metadata_editor_chapter_current_authority_requires_selection(state.active_surface(), &dialog)?;
+    let sheet = state
+        .active_surface()
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    let problems = crate::tui::chapter_authoring::validate(sheet);
+    if let Some(problem) = problems.first() {
+        return Err(format!("cannot save: {}", problem.message));
+    }
+    if sheet.track_sources.len() > 99
+        && (dialog.sidecar_selected
+            || (dialog.in_file_selected
+                && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)))
+    {
+        return Err("CUE destinations support at most 99 tracks; use embedded MP4 chapters or reduce the chapter count".to_string());
+    }
+    if metadata_editor_chapter_has_pregaps(state.active_surface())
+        && dialog.in_file_selected
+        && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters)
+        && !dialog.sidecar_selected
+    {
+        return Err("MP4 chapter entries do not carry CUE pregaps; keep Sidecar CUE selected so authored pregaps have a durable representation".to_string());
+    }
+    let writes_cue = dialog.sidecar_selected
+        || (dialog.in_file_selected
+            && dialog.in_file
+                == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue));
+    if writes_cue {
+        crate::tui::chapter_authoring::validate_cue_projection(
+            state
+                .active_surface()
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .ok_or_else(|| "chapter structure is unavailable".to_string())?,
+        )?;
+    }
+
+    let program_path = sheet.audio_paths.first().cloned().ok_or_else(|| "chapter program path is unavailable".to_string())?;
+    let sample_rate = sheet.program_sample_rate.ok_or_else(|| "chapter sample rate is unavailable".to_string())?;
+    let chapters = metadata_editor_chapter_records(state.active_surface(), dialog.snap_to_cue_grid)?;
+
+    let mut cue_plan: Option<MetadataAlbumWritePlan> = None;
+    let mut sidecar_plan_for_mp4: Option<MetadataAlbumWritePlan> = None;
+    if dialog.sidecar_selected {
+        let plan = metadata_editor_chapter_structural_cue_plan(
+            state,
+            MetadataAlbumCarrierWriteMode::SidecarCue,
+        )?;
+        if plan.sidecars.is_empty() {
+            return Err("selected Sidecar CUE destination produced no writable sidecar plan".to_string());
+        }
+        sidecar_plan_for_mp4 = Some(plan.clone());
+        cue_plan = Some(plan);
+    }
+    if dialog.in_file_selected
+        && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)
+    {
+        let plan = metadata_editor_chapter_structural_cue_plan(
+            state,
+            MetadataAlbumCarrierWriteMode::EmbeddedCue,
+        )?;
+        cue_plan = Some(match cue_plan.take() {
+            Some(existing) => metadata_editor_chapter_merge_album_plans(existing, plan)?,
+            None => plan,
+        });
+    }
+
+    let sidecar_path = if dialog.sidecar_selected {
+        state
+            .active_surface()
+            .cue_album_view_sides
+            .first()
+            .and_then(|side| side.sidecar_path.clone())
+    } else {
+        None
+    };
+    let in_file_destination = dialog.in_file.filter(|_| dialog.in_file_selected);
+    let outcome = crate::tui::chapter_authoring::ChapterSaveOutcome {
+        sidecar_path,
+        sidecar_snapshot: None,
+        in_file_path: in_file_destination.map(|_| program_path.clone()),
+        in_file_destination,
+        embedded_cuesheet_snapshot: None,
+        split_on_conversion: dialog.split_on_conversion,
+        snapped_to_cue_grid: dialog.snap_to_cue_grid,
+        warnings: Vec::new(),
+    };
+    let session_id = state.active_surface().technical_details.session_id;
+    let save_generation = state.active_surface_mut().chapter_authoring.begin_save();
+    let verification = app.config.file_operations.verification;
+    let tool_paths = app.manager.config.tool_paths.clone();
+    let tx = tx.clone();
+
+    if in_file_destination == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters) {
+        tokio::spawn(async move {
+            let result = metadata_editor_chapter_execute_mp4_transaction(
+                sidecar_plan_for_mp4,
+                program_path,
+                chapters,
+                sample_rate,
+                tool_paths,
+                outcome,
+            )
+            .await;
+            let _ = tx
+                .send(AppMessage::MetadataEditorChapterSaveComplete {
+                    session_id,
+                    save_generation,
+                    result,
+                })
+                .await;
+        });
+    } else {
+        let plan = cue_plan.ok_or_else(|| "chapter save has no durable carrier plan".to_string())?;
+        tokio::spawn(async move {
+            let base_outcome = outcome;
+            let result = tokio::task::spawn_blocking(move || {
+                let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+                let results = metadata_album_view_execute_plan(plan, cancel, verification);
+                metadata_editor_chapter_results_to_warnings(results).map(|warnings| {
+                    let mut outcome = base_outcome;
+                    outcome.warnings = warnings;
+                    metadata_editor_chapter_refresh_committed_snapshots(&mut outcome);
+                    outcome
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("chapter save worker failed: {error}")));
+            let _ = tx
+                .send(AppMessage::MetadataEditorChapterSaveComplete {
+                    session_id,
+                    save_generation,
+                    result,
+                })
+                .await;
+        });
+    }
+    Ok("chapter authoring: saving selected structure destinations".to_string())
+}
+
+fn metadata_editor_chapter_canonicalize_surface_to_cue_frames(
+    surface: &mut crate::tui::app::PresentationTab,
+) -> Result<(), String> {
+    let sheet = surface
+        .cue_album_synthetic_sheet
+        .as_mut()
+        .ok_or_else(|| "chapter structure is unavailable".to_string())?;
+    crate::tui::chapter_authoring::canonicalize_cue_projection_to_frames(sheet)
+}
+
+fn metadata_editor_chapter_save_requires_cue_canonicalization(
+    outcome: &crate::tui::chapter_authoring::ChapterSaveOutcome,
+) -> bool {
+    let has_cue_carrier = outcome.sidecar_path.is_some()
+        || outcome.in_file_destination
+            == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue);
+    let has_exact_mp4_carrier = outcome.in_file_destination
+        == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters);
+
+    // Explicit global Snap intentionally makes every selected destination use
+    // CUE-grid coordinates. Without Snap, a CUE-only save must reconcile to
+    // the frames it actually serialized, but a dual CUE+MP4 save must keep the
+    // sample-native geometry that the MP4 carrier preserved exactly.
+    outcome.snapped_to_cue_grid || (has_cue_carrier && !has_exact_mp4_carrier)
+}
+
+fn metadata_editor_chapter_reconcile_saved_geometry(
+    surface: &mut crate::tui::app::PresentationTab,
+    outcome: &crate::tui::chapter_authoring::ChapterSaveOutcome,
+) -> Result<(), String> {
+    if metadata_editor_chapter_save_requires_cue_canonicalization(outcome) {
+        metadata_editor_chapter_canonicalize_surface_to_cue_frames(surface)?;
+    }
+    Ok(())
+}
+
+fn metadata_editor_chapter_mark_owned_rows_saved(surface: &mut crate::tui::app::PresentationTab) {
+    for entry in &mut surface.entries {
+        if entry.row_scope == crate::tui::probe::RowScope::Track
+            && (entry.display_key.eq_ignore_ascii_case("TITLE")
+                || entry.display_key.eq_ignore_ascii_case("TRACKNUMBER"))
+        {
+            entry.per_file_originals = entry.per_file_values.clone();
+            entry.original = entry.value.clone();
+        }
+        if entry.display_key.eq_ignore_ascii_case("CUESHEET") {
+            entry.per_file_originals = entry.per_file_values.clone();
+            entry.original = entry.value.clone();
+        }
+    }
+}
+
+pub(super) fn complete_metadata_editor_chapter_save(
+    state: &mut crate::tui::app::MetadataEditorState,
+    session_id: u64,
+    save_generation: u64,
+    result: Result<crate::tui::chapter_authoring::ChapterSaveOutcome, String>,
+) -> String {
+    let Some(surface) = state.surface_mut_for_session(session_id) else {
+        return format!("metadata editor: ignored stale chapter save for session {session_id}");
+    };
+    if !surface.chapter_authoring.complete_save(save_generation) {
+        return format!("metadata editor: ignored stale chapter save generation {save_generation}");
+    }
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(reason) => return format!("chapter authoring: save failed: {reason}"),
+    };
+    // Reconcile only when CUE is the sole durable geometry or the user
+    // explicitly selected global Snap. In a dual CUE+MP4 save with Snap off,
+    // MP4 contains the exact sample positions just written; rewriting the live
+    // model to the sidecar's quantized coordinates would make a title-only
+    // second save silently move those embedded chapters.
+    if let Err(reason) = metadata_editor_chapter_reconcile_saved_geometry(surface, &outcome) {
+        surface.refresh_failed = true;
+        return format!("chapter authoring: carriers saved, but editor reconciliation failed: {reason}");
+    }
+    if let Some(sidecar_path) = outcome.sidecar_path.as_ref() {
+        if let Some(side) = surface.cue_album_view_sides.first_mut() {
+            side.sidecar_present = true;
+            side.sidecar_path = Some(sidecar_path.clone());
+        }
+        surface.chapter_authoring.sidecar_snapshot = outcome.sidecar_snapshot.clone().map(|bytes| {
+            crate::tui::chapter_authoring::ChapterSidecarSnapshot {
+                path: sidecar_path.clone(),
+                bytes,
+            }
+        });
+        surface.chapter_authoring.sidecar_snapshot_error = if outcome.sidecar_snapshot.is_some() {
+            None
+        } else {
+            Some(format!(
+                "post-save snapshot for '{}' is unavailable; reopen before replacing it again",
+                sidecar_path.display()
+            ))
+        };
+        // The front-end's default resolution policy is PreferSidecar. Once a
+        // sidecar exists, keep the editor's authority model aligned with what
+        // reopening the same program will select; otherwise a later
+        // embedded-only chapter save could leave a newly created sidecar stale
+        // and silently shadow the authored structure.
+        surface.cue_source = Some(crate::tui::app::MetadataCueSource::Sidecar(sidecar_path.clone()));
+        surface.pending_sidecar_cue_creation = false;
+    }
+    match outcome.in_file_destination {
+        Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue) => {
+            surface.embedded_cuesheet_present = true;
+            if let Some(path) = outcome.in_file_path.as_ref() {
+                let path_key = metadata_cue_surface_key(path);
+                for side in &mut surface.cue_album_view_sides {
+                    if !side
+                        .audio_paths
+                        .iter()
+                        .any(|audio_path| metadata_cue_surface_key(audio_path) == path_key)
+                    {
+                        continue;
+                    }
+                    side.embedded_cuesheet_snapshots.retain(|(snapshot_path, _)| {
+                        metadata_cue_surface_key(snapshot_path) != path_key
+                    });
+                    if let Some(cuesheet) = outcome.embedded_cuesheet_snapshot.as_ref() {
+                        side.embedded_cuesheet_snapshots
+                            .push((path.clone(), cuesheet.clone()));
+                    }
+                }
+                if let Some(cuesheet) = outcome.embedded_cuesheet_snapshot.as_ref() {
+                    cue_album_update_cuesheet_entry(
+                        surface,
+                        cuesheet.clone(),
+                        Some(vec![cuesheet.clone()]),
+                    );
+                    cue_album_sort_entries(&mut surface.entries);
+                }
+                if outcome.sidecar_path.is_none() {
+                    surface.cue_source = Some(crate::tui::app::MetadataCueSource::Embedded(path.clone()));
+                }
+            }
+        }
+        Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters) => {}
+        None => {}
+    }
+    metadata_editor_chapter_mark_owned_rows_saved(surface);
+    if outcome.sidecar_path.is_some()
+        || outcome.in_file_destination
+            == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)
+    {
+        surface.chapter_authoring.projection_only = false;
+    }
+    surface.chapter_authoring.dirty = false;
+    surface.chapter_authoring.save_dialog = None;
+    surface.chapter_authoring.origin = match outcome.in_file_destination {
+        _ if outcome.sidecar_path.is_some() => crate::tui::chapter_authoring::ChapterStructureOrigin::SidecarCue,
+        Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters) => crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedChapters,
+        Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue) => crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedCue,
+        _ => crate::tui::chapter_authoring::ChapterStructureOrigin::Authored,
+    };
+    surface.dirty = crate::tui::app::presentation_tab_has_changes(surface);
+    if outcome.warnings.is_empty() {
+        "chapter authoring: structure saved and verified".to_string()
+    } else {
+        format!("chapter authoring: structure saved with {} warning{}: {}", outcome.warnings.len(), if outcome.warnings.len() == 1 { "" } else { "s" }, outcome.warnings.join("; "))
+    }
+}
+
+fn metadata_editor_handle_chapter_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    state: &mut Box<crate::tui::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    use crate::tui::chapter_authoring::{
+        ChapterAuthoringLoadState, ChapterColumn, ChapterEditKind, ChapterGenerationField,
+    };
+
+    if state.content_tab != crate::tui::app::ContentTab::Chapters {
+        return false;
+    }
+
+    if state.active_surface().chapter_authoring.saving {
+        match key.code {
+            KeyCode::Esc => app.set_status("chapter authoring: save is already committing; editor remains open until it finishes"),
+            _ => app.set_status("chapter authoring: save in progress"),
+        }
+        return true;
+    }
+
+    if state.active_surface().chapter_authoring.edit_input.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                let surface = state.active_surface_mut();
+                surface.chapter_authoring.edit_input = None;
+                surface.chapter_authoring.edit_kind = None;
+                app.set_status("chapter authoring: edit reverted");
+            }
+            KeyCode::Enter => {
+                let result = metadata_editor_chapter_commit_edit(state.active_surface_mut());
+                match result {
+                    Ok(()) => {
+                        state.recompute_active_dirty();
+                        app.set_status("chapter authoring: value updated");
+                    }
+                    Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+                }
+            }
+            _ => {
+                if let Some(input) = state.active_surface_mut().chapter_authoring.edit_input.as_mut() {
+                    let _ = super::text_input::handle_text_input_key(input, &key);
+                }
+            }
+        }
+        return true;
+    }
+
+    if state.active_surface().chapter_authoring.generation.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                state.active_surface_mut().chapter_authoring.generation = None;
+                app.set_status("chapter authoring: generation cancelled");
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let reverse = matches!(key.code, KeyCode::BackTab)
+                    || key.modifiers.contains(KeyModifiers::SHIFT);
+                let generation = state.active_surface_mut().chapter_authoring.generation.as_mut().expect("checked above");
+                generation.field = if generation.titles_only {
+                    match generation.field {
+                        ChapterGenerationField::BaseTitle => ChapterGenerationField::Numbering,
+                        ChapterGenerationField::Numbering => ChapterGenerationField::BaseTitle,
+                        ChapterGenerationField::Mode | ChapterGenerationField::Value => {
+                            ChapterGenerationField::BaseTitle
+                        }
+                    }
+                } else if reverse {
+                    generation.field.previous()
+                } else {
+                    generation.field.next()
+                };
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                let forward = !matches!(key.code, KeyCode::Left);
+                let generation = state.active_surface_mut().chapter_authoring.generation.as_mut().expect("checked above");
+                match generation.field {
+                    ChapterGenerationField::Mode => generation.mode = generation.mode.next(),
+                    ChapterGenerationField::Numbering => {
+                        generation.numbering = metadata_editor_chapter_next_numbering(generation.numbering, forward)
+                    }
+                    ChapterGenerationField::Value | ChapterGenerationField::BaseTitle => {
+                        let input = if generation.field == ChapterGenerationField::Value {
+                            &mut generation.value
+                        } else {
+                            &mut generation.base_title
+                        };
+                        let _ = super::text_input::handle_text_input_key(input, &key);
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let titles_only = state
+                    .active_surface()
+                    .chapter_authoring
+                    .generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.titles_only);
+                match metadata_editor_chapter_apply_generation(state.active_surface_mut()) {
+                    Ok(()) => {
+                        state.recompute_active_dirty();
+                        app.set_status(if titles_only {
+                            "chapter authoring: generated titles; review them before saving"
+                        } else {
+                            "chapter authoring: generated chapter map; review it before saving"
+                        });
+                    }
+                    Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+                }
+            }
+            _ => {
+                let generation = state.active_surface_mut().chapter_authoring.generation.as_mut().expect("checked above");
+                match generation.field {
+                    ChapterGenerationField::Value => {
+                        let _ = super::text_input::handle_text_input_key(&mut generation.value, &key);
+                    }
+                    ChapterGenerationField::BaseTitle => {
+                        let _ = super::text_input::handle_text_input_key(&mut generation.base_title, &key);
+                    }
+                    ChapterGenerationField::Mode | ChapterGenerationField::Numbering => {}
+                }
+            }
+        }
+        return true;
+    }
+
+    if state.active_surface().chapter_authoring.save_dialog.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                state.active_surface_mut().chapter_authoring.save_dialog = None;
+                app.set_status("chapter authoring: save cancelled");
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let dialog = state.active_surface_mut().chapter_authoring.save_dialog.as_mut().expect("checked above");
+                dialog.cursor = dialog.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                let dialog = state.active_surface_mut().chapter_authoring.save_dialog.as_mut().expect("checked above");
+                dialog.cursor = (dialog.cursor + 1).min(dialog.row_count().saturating_sub(1));
+            }
+            KeyCode::BackTab => {
+                let dialog = state.active_surface_mut().chapter_authoring.save_dialog.as_mut().expect("checked above");
+                dialog.cursor = dialog.cursor.saturating_sub(1);
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let track_count = state.active_surface().cue_album_synthetic_sheet.as_ref().map(|sheet| sheet.track_sources.len()).unwrap_or(0);
+                let dialog = state.active_surface_mut().chapter_authoring.save_dialog.as_mut().expect("checked above");
+                let mut row = 0usize;
+                if dialog.cursor == row {
+                    if track_count > 99 {
+                        app.set_status("chapter authoring: CUE destinations support at most 99 tracks");
+                    } else {
+                        dialog.sidecar_selected = !dialog.sidecar_selected;
+                    }
+                } else {
+                    row += 1;
+                    if dialog.in_file.is_some() {
+                        if dialog.cursor == row {
+                            dialog.in_file_selected = !dialog.in_file_selected;
+                        }
+                        row += 1;
+                    }
+                    if dialog.cursor == row {
+                        dialog.split_on_conversion = !dialog.split_on_conversion;
+                    }
+                    row += 1;
+                    if dialog.cursor == row {
+                        dialog.snap_to_cue_grid = !dialog.snap_to_cue_grid;
+                    }
+                }
+            }
+            KeyCode::Char('s') if key.modifiers.is_empty() => {
+                match metadata_editor_start_chapter_save(app, state, tx) {
+                    Ok(status) => app.set_status(status),
+                    Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+                }
+            }
+            _ => {}
+        }
+        return true;
+    }
+
+    let chapter_load_state = state.active_surface().chapter_authoring.load_state.clone();
+    match chapter_load_state {
+        ChapterAuthoringLoadState::NotLoaded => {
+            if metadata_editor_request_chapter_probe(state, tx) {
+                app.set_status("chapter authoring: loading source structure");
+            }
+            return true;
+        }
+        ChapterAuthoringLoadState::Loading { .. } => {
+            app.set_status("chapter authoring: loading source structure");
+            return true;
+        }
+        ChapterAuthoringLoadState::Failed { .. } => {
+            if matches!(key.code, KeyCode::Char('r')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+                state.active_surface_mut().chapter_authoring.load_state = ChapterAuthoringLoadState::NotLoaded;
+                if metadata_editor_request_chapter_probe(state, tx) {
+                    app.set_status("chapter authoring: retrying source probe");
+                }
+            } else if key.code == KeyCode::Esc {
+                return false;
+            }
+            return true;
+        }
+        ChapterAuthoringLoadState::Ready { .. } => {}
+    }
+
+    let row_count = state
+        .active_surface()
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    match key.code {
+        KeyCode::Esc => return false,
+        KeyCode::Up | KeyCode::Char('k') => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.cursor = surface.chapter_authoring.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let surface = state.active_surface_mut();
+            if surface.chapter_authoring.cursor + 1 < row_count {
+                surface.chapter_authoring.cursor += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.cursor = surface.chapter_authoring.cursor.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.cursor = (surface.chapter_authoring.cursor + 10).min(row_count.saturating_sub(1));
+        }
+        KeyCode::Home => state.active_surface_mut().chapter_authoring.cursor = 0,
+        KeyCode::End => state.active_surface_mut().chapter_authoring.cursor = row_count.saturating_sub(1),
+        KeyCode::Left => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.column = surface.chapter_authoring.column.previous();
+        }
+        KeyCode::Right => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.column = surface.chapter_authoring.column.next();
+        }
+        KeyCode::Enter => {
+            match metadata_editor_chapter_begin_edit(state.active_surface_mut()) {
+                Ok(()) => app.set_status("chapter authoring: edit; Enter commits, Esc reverts"),
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Char('i') if key.modifiers == KeyModifiers::ALT => {
+            let initial = state
+                .active_surface()
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .and_then(|sheet| crate::tui::chapter_authoring::boundary_views(sheet).ok())
+                .and_then(|views| views.get(state.active_surface().chapter_authoring.cursor).cloned())
+                .and_then(|view| {
+                    state.active_surface().cue_album_synthetic_sheet.as_ref().and_then(|sheet| sheet.program_sample_rate).map(|rate| {
+                        let midpoint = view.start_sample.saturating_add(view.samples() / 2);
+                        crate::tui::chapter_authoring::format_position(midpoint, rate)
+                    })
+                })
+                .unwrap_or_default();
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.edit_kind = Some(ChapterEditKind::InsertStart);
+            surface.chapter_authoring.edit_input = Some(super::text_input::TextInputState::new_selected(initial));
+            app.set_status("chapter authoring: enter new division point; samples, time, relative time, and MM:SS:FF cue are accepted");
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::ALT => {
+            let row = state.active_surface().chapter_authoring.cursor;
+            match metadata_editor_chapter_remove_division(state.active_surface_mut(), row) {
+                Ok(()) => {
+                    state.recompute_active_dirty();
+                    app.set_status("chapter authoring: division point removed");
+                }
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Char('[') | KeyCode::Char(']') if key.modifiers.is_empty() => {
+            let forward = key.code == KeyCode::Char(']');
+            let (row, column) = {
+                let surface = state.active_surface();
+                (surface.chapter_authoring.cursor, surface.chapter_authoring.column)
+            };
+            match metadata_editor_chapter_nudge(state.active_surface_mut(), row, column, forward) {
+                Ok(()) => {
+                    state.recompute_active_dirty();
+                    app.set_status("chapter authoring: boundary nudged by one CUE frame");
+                }
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Char('g') if key.modifiers.is_empty() => {
+            state.active_surface_mut().chapter_authoring.generation = Some(crate::tui::chapter_authoring::ChapterGenerationState::default());
+            app.set_status("chapter authoring: generation dialog; Tab moves fields, Enter generates");
+        }
+        KeyCode::Char('t') if key.modifiers.is_empty() => {
+            state.active_surface_mut().chapter_authoring.generation =
+                Some(crate::tui::chapter_authoring::ChapterGenerationState::titles_only());
+            app.set_status("chapter authoring: title pattern; Tab moves fields, Enter applies");
+        }
+        KeyCode::Char('p') if key.modifiers.is_empty() => {
+            match metadata_editor_chapter_paste_titles(state.active_surface_mut()) {
+                Ok(count) => {
+                    state.recompute_active_dirty();
+                    app.set_status(format!("chapter authoring: pasted {count} chapter title{}", if count == 1 { "" } else { "s" }));
+                }
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Char('s') if key.modifiers.is_empty() => {
+            let split_on_conversion = matches!(
+                *app.convert.output_options.merge.selected_value(),
+                crate::tui::app::MergeMode::MultiFile
+            );
+            match metadata_editor_chapter_open_save_dialog(
+                state.active_surface_mut(),
+                split_on_conversion,
+            ) {
+                Ok(()) => app.set_status("chapter authoring: choose durable structure destinations; s saves"),
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::ALT => {
+            let title = metadata_editor_chapter_title(state.active_surface(), 0);
+            match metadata_editor_chapter_replace_structure(
+                state.active_surface_mut(),
+                vec![0],
+                vec![if title.trim().is_empty() { "Chapter 01".to_string() } else { title }],
+            ) {
+                Ok(()) => {
+                    state.recompute_active_dirty();
+                    app.set_status("chapter authoring: structure cleared to one chapter");
+                }
+                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+            }
+        }
+        KeyCode::Tab if key.modifiers.is_empty() => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.column = surface.chapter_authoring.column.next();
+        }
+        KeyCode::BackTab => {
+            let surface = state.active_surface_mut();
+            surface.chapter_authoring.column = surface.chapter_authoring.column.previous();
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn metadata_editor_request_details_probe(
     state: &mut crate::tui::app::MetadataEditorState,
     tx: &mpsc::Sender<AppMessage>,
@@ -33110,6 +35480,7 @@ fn ensure_metadata_content_tab_loaded(
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     match tab {
+        crate::tui::app::ContentTab::Chapters => metadata_editor_request_chapter_probe(state, tx),
         crate::tui::app::ContentTab::Details => metadata_editor_request_details_probe(state, tx),
         crate::tui::app::ContentTab::Metadata
         | crate::tui::app::ContentTab::ReplayGain
@@ -44985,8 +47356,9 @@ fn handle_metadata_editor_mouse_in_area(
                         state.set_presentation_selector_cursor(idx);
                         let changed = state.select_presentation_selector_cursor();
                         if changed {
-                            if state.content_tab == crate::tui::app::ContentTab::Details {
-                                ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                            if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                                let tab = state.content_tab;
+                                ensure_metadata_content_tab_loaded(&mut state, tab, tx);
                             }
                             if let Some(label) = state.active_presentation_label() {
                                 app.set_status(format!("metadata editor: {}", label));
@@ -44999,8 +47371,9 @@ fn handle_metadata_editor_mouse_in_area(
                 Some(super::button_map::TuiButton::MetadataEditorContentTab(idx)) => {
                     let was_details = state.content_tab == crate::tui::app::ContentTab::Details;
                     if state.set_content_tab_by_index(idx) {
-                        if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                        if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                            let tab = state.content_tab;
+                            ensure_metadata_content_tab_loaded(&mut state, tab, tx);
                         } else if was_details {
                             metadata_editor_cancel_details_probe(&mut state);
                         }
@@ -45019,11 +47392,90 @@ fn handle_metadata_editor_mouse_in_area(
                 }
                 Some(super::button_map::TuiButton::MetadataEditorTab(idx)) => {
                     if state.switch_presentation_tab(idx) {
-                        if state.content_tab == crate::tui::app::ContentTab::Details {
-                            ensure_metadata_content_tab_loaded(&mut state, crate::tui::app::ContentTab::Details, tx);
+                        if matches!(state.content_tab, crate::tui::app::ContentTab::Chapters | crate::tui::app::ContentTab::Details) {
+                            let tab = state.content_tab;
+                            ensure_metadata_content_tab_loaded(&mut state, tab, tx);
                         }
                         if let Some(label) = state.active_presentation_label() {
                             app.set_status(format!("metadata editor: {}", label));
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataChapterRow(idx)) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Chapters {
+                        let row_count = state
+                            .active_surface()
+                            .cue_album_synthetic_sheet
+                            .as_ref()
+                            .map(|sheet| sheet.track_sources.len())
+                            .unwrap_or(0);
+                        if idx < row_count {
+                            state.active_surface_mut().chapter_authoring.cursor = idx;
+                            state.active_surface_mut().chapter_authoring.clamp_cursor(row_count);
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataChapterGenerate) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving
+                    {
+                        state.active_surface_mut().chapter_authoring.generation =
+                            Some(crate::tui::chapter_authoring::ChapterGenerationState::default());
+                        app.set_status("chapter authoring: generation dialog; Tab moves fields, Enter generates");
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataChapterGenerateTitles) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving
+                    {
+                        state.active_surface_mut().chapter_authoring.generation = Some(
+                            crate::tui::chapter_authoring::ChapterGenerationState::titles_only(),
+                        );
+                        app.set_status(
+                            "chapter authoring: title pattern; Tab moves fields, Enter applies",
+                        );
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataChapterPasteTitles) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving
+                    {
+                        match metadata_editor_chapter_paste_titles(state.active_surface_mut()) {
+                            Ok(count) => {
+                                state.recompute_active_dirty();
+                                app.set_status(format!(
+                                    "chapter authoring: pasted {count} chapter title{}",
+                                    if count == 1 { "" } else { "s" }
+                                ));
+                            }
+                            Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
+                        }
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
+                Some(super::button_map::TuiButton::MetadataChapterSave) => {
+                    if state.content_tab == crate::tui::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving
+                    {
+                        let split_on_conversion = matches!(
+                            *app.convert.output_options.merge.selected_value(),
+                            crate::tui::app::MergeMode::MultiFile
+                        );
+                        match metadata_editor_chapter_open_save_dialog(
+                            state.active_surface_mut(),
+                            split_on_conversion,
+                        ) {
+                            Ok(()) => app.set_status("chapter authoring: choose durable structure destinations; s saves"),
+                            Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
                         }
                     }
                     app.active_overlay = ActiveOverlay::MetadataEditor(state);
@@ -45124,6 +47576,38 @@ fn handle_metadata_editor_mouse_in_area(
         }
 
         match mouse.kind {
+            // The Chapters tab owns its own cursor/scroll state. Keep wheel
+            // navigation on that model instead of the generic read-only-tab
+            // scroll offset, and never retarget an in-progress inline edit.
+            MouseEventKind::ScrollUp
+                if state.phase == MetadataEditorPhase::Editing
+                    && state.content_tab == crate::tui::app::ContentTab::Chapters =>
+            {
+                if state.active_surface().chapter_authoring.edit_input.is_none() {
+                    let surface = state.active_surface_mut();
+                    surface.chapter_authoring.cursor = surface.chapter_authoring.cursor.saturating_sub(1);
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+            MouseEventKind::ScrollDown
+                if state.phase == MetadataEditorPhase::Editing
+                    && state.content_tab == crate::tui::app::ContentTab::Chapters =>
+            {
+                if state.active_surface().chapter_authoring.edit_input.is_none() {
+                    let row_count = state
+                        .active_surface()
+                        .cue_album_synthetic_sheet
+                        .as_ref()
+                        .map(|sheet| sheet.track_sources.len())
+                        .unwrap_or(0);
+                    let surface = state.active_surface_mut();
+                    if surface.chapter_authoring.cursor + 1 < row_count {
+                        surface.chapter_authoring.cursor += 1;
+                    }
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+
             // Scroll wheel: read-only tabs scroll their text surface; Metadata scrolls entries.
             MouseEventKind::ScrollUp
                 if state.phase == MetadataEditorPhase::Editing
@@ -45583,6 +48067,7 @@ fn handle_metadata_editor_mouse_in_area(
                                     ("Del remove", "art-remove"),
                                 ]);
                             }
+                            crate::tui::app::ContentTab::Chapters => {}
                             crate::tui::app::ContentTab::Details => {
                                 if state.details_analysis.is_some() {
                                     pills.push(("Analyzing...", "details-running"));
@@ -66644,6 +69129,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataDetailPasteWholeField
             | TuiButton::MetadataDetailRevertPaste
             | TuiButton::MetadataDetailsAnalyze
+            | TuiButton::MetadataChapterRow(_)
+            | TuiButton::MetadataChapterGenerate
+            | TuiButton::MetadataChapterGenerateTitles
+            | TuiButton::MetadataChapterPasteTitles
+            | TuiButton::MetadataChapterSave
             | TuiButton::MetadataReplayGainScanTrack
             | TuiButton::MetadataReplayGainScanAlbum
             | TuiButton::MetadataEntryView(_) => {}
@@ -71273,6 +73763,8 @@ ignored".to_string()),
                         file_ref: "one.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(0),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -71287,6 +73779,8 @@ ignored".to_string()),
                         file_ref: "one.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -71301,6 +73795,8 @@ ignored".to_string()),
                         file_ref: "two.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(0),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -71315,6 +73811,8 @@ ignored".to_string()),
                         file_ref: "two.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -71328,6 +73826,8 @@ ignored".to_string()),
                 album_genre: None,
                 album_catalog: None,
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             },
         );
         state.active_surface_mut().dirty = true;
@@ -71363,6 +73863,8 @@ ignored".to_string()),
                         file_ref: "album.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some((index as u32) * 75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -71376,6 +73878,8 @@ ignored".to_string()),
                 album_genre: Some("Pop".to_string()),
                 album_catalog: Some("CAT-1".to_string()),
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             },
         );
         state.active_surface_mut().dirty = true;
@@ -72910,6 +75414,8 @@ ignored".to_string()),
                         file_ref: "equal-two.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(0),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -72924,6 +75430,8 @@ ignored".to_string()),
                         file_ref: "equal-one.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -72937,6 +75445,8 @@ ignored".to_string()),
                 album_genre: None,
                 album_catalog: None,
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             },
         );
 
@@ -76157,6 +78667,8 @@ ignored".to_string()),
                         file_ref: "side-a.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(0),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -76171,6 +78683,8 @@ ignored".to_string()),
                         file_ref: "side-a.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -76185,6 +78699,8 @@ ignored".to_string()),
                         file_ref: "side-b.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(0),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -76199,6 +78715,8 @@ ignored".to_string()),
                         file_ref: "side-b.flac".to_string(),
                         index00_frames: None,
                         index01_frames: Some(75),
+                        index00_sample: None,
+                        index01_sample: None,
                         isrc: None,
                         album_user_metadata: Default::default(),
                         user_metadata: Default::default(),
@@ -76212,6 +78730,8 @@ ignored".to_string()),
                 album_genre: None,
                 album_catalog: Some("NEW-CAT".to_string()),
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             },
         );
         select_sidecar_source(&mut state, &cue_path);
@@ -76288,6 +78808,8 @@ ignored".to_string()),
                 album_genre: None,
                 album_catalog: None,
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             },
         );
         select_sidecar_source(&mut state, &cue_path);
@@ -81148,6 +83670,8 @@ mod single_image_metadata_editor_regression_tests {
             album_genre: Some("Rock".to_string()),
             album_catalog: Some("0000000000001".to_string()),
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         };
         for (cue_path, audio_path, file_ref, local_tracks) in [
             (&cue_a, &audio_a, "side_a.flac", 2usize),
@@ -81162,6 +83686,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: file_ref.to_string(),
                     index00_frames: None,
                     index01_frames: Some((local_idx as u32) * 75 * 30),
+                    index00_sample: None,
+                    index01_sample: None,
                     // The deletion-respecting regeneration test deletes the
                     // ISRC row, so the model must HAVE one.
                     isrc: Some(format!("USRC176{:04}", local_idx + 1)),
@@ -81276,6 +83802,405 @@ mod single_image_metadata_editor_regression_tests {
             .iter()
             .map(crate::tui::probe::MetadataFieldValues::as_str)
             .collect()
+    }
+
+    #[test]
+    fn chapter_save_projection_excludes_unrelated_unsaved_metadata() {
+        let mut state = unified_cue_album_edit_state();
+        let album_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("ALBUM"))
+            .expect("ALBUM row");
+        let title_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("TITLE"))
+            .expect("TITLE row");
+        let genre_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("GENRE"))
+            .expect("GENRE row");
+
+        {
+            let surface = state.active_surface_mut();
+            let album_slots = surface.entries[album_index].per_file_values.len();
+            surface.entries[album_index].per_file_values =
+                crate::tui::probe::metadata_field_values_from_scalars(vec![
+                    "Unrelated Unsaved Album".to_string();
+                    album_slots
+                ]);
+            cue_album_recompute_entry_display(&mut surface.entries[album_index]);
+            surface.entries[title_index].per_file_values[0] =
+                crate::tui::probe::MetadataFieldValues::from("Authored Chapter Title");
+            cue_album_recompute_entry_display(&mut surface.entries[title_index]);
+            surface.deleted.push(genre_index);
+            surface.pending_embedded_cuesheet_delete = true;
+            surface.cue_album_forced_cleanup =
+                vec![(0, lofty::tag::ItemKey::TrackArtist)];
+        }
+
+        let projection = metadata_editor_chapter_plan_projection(&state);
+        let projected = projection.active_surface();
+        assert_eq!(
+            projected.entries[album_index].per_file_values,
+            projected.entries[album_index].per_file_originals,
+            "chapter save must not persist an unrelated ALBUM edit"
+        );
+        assert_eq!(
+            projected.entries[title_index].per_file_values[0].as_str(),
+            "Authored Chapter Title",
+            "chapter-owned title edits must survive the save projection"
+        );
+        assert!(
+            !projected.deleted.contains(&genre_index),
+            "unrelated metadata deletion intent must not join a chapter save"
+        );
+        assert!(!projected.pending_embedded_cuesheet_delete);
+        assert!(projected.cue_album_forced_cleanup.is_empty());
+
+        assert_eq!(
+            state.active_surface().entries[album_index].per_file_values[0].as_str(),
+            "Unrelated Unsaved Album",
+            "planning must not mutate or clean the live unrelated edit"
+        );
+        assert!(state.active_surface().deleted.contains(&genre_index));
+    }
+
+    fn chapter_two_row_sample_geometry(
+        sample_rate: u32,
+        second_start: u64,
+        total_samples: u64,
+    ) -> crate::tui::app::MetadataEditorState {
+        let mut state = unified_cue_album_edit_state();
+        let sheet = state
+            .active_surface_mut()
+            .cue_album_synthetic_sheet
+            .as_mut()
+            .expect("chapter sheet");
+        sheet.track_sources.truncate(2);
+        sheet.program_sample_rate = Some(sample_rate);
+        sheet.program_total_samples = Some(total_samples);
+        sheet.track_sources[0].index00_frames = None;
+        sheet.track_sources[0].index00_sample = None;
+        sheet.track_sources[0].index01_frames = Some(0);
+        sheet.track_sources[0].index01_sample = None;
+        sheet.track_sources[1].index00_frames = None;
+        sheet.track_sources[1].index00_sample = None;
+        sheet.track_sources[1].index01_frames = None;
+        sheet.track_sources[1].index01_sample = Some(second_start);
+        state
+    }
+
+    fn dual_cue_mp4_outcome(snapped_to_cue_grid: bool) -> crate::tui::chapter_authoring::ChapterSaveOutcome {
+        crate::tui::chapter_authoring::ChapterSaveOutcome {
+            sidecar_path: Some(std::path::PathBuf::from("book.cue")),
+            in_file_path: Some(std::path::PathBuf::from("book.m4b")),
+            in_file_destination: Some(
+                crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters,
+            ),
+            snapped_to_cue_grid,
+            ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
+        }
+    }
+
+    fn chapter_transaction_test_ilst(path: &std::path::Path) -> lofty::mp4::Ilst {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile as _;
+
+        let title = lofty::mp4::AtomIdent::Fourcc(*b"\xa9nam");
+        let artist = lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART");
+        let note = lofty::mp4::AtomIdent::Freeform {
+            mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+            name: std::borrow::Cow::Borrowed("MY_NOTE"),
+        };
+        let mut ilst = lofty::mp4::Ilst::new();
+        ilst.insert(lofty::mp4::Atom::new(
+            title,
+            lofty::mp4::AtomData::UTF8("Transaction Test".to_string()),
+        ));
+        ilst.insert(
+            lofty::mp4::Atom::from_collection(
+                artist,
+                vec![
+                    lofty::mp4::AtomData::UTF8("Artist One".to_string()),
+                    lofty::mp4::AtomData::UTF8("Artist Two".to_string()),
+                ],
+            )
+            .expect("transaction artist atom"),
+        );
+        ilst.insert(lofty::mp4::Atom::new(
+            note,
+            lofty::mp4::AtomData::UTF8("keep-me".to_string()),
+        ));
+
+        let mut file = std::fs::File::open(path).expect("open transaction MP4 fixture");
+        let mut mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse transaction MP4 fixture");
+        drop(file);
+        mp4.set_ilst(ilst);
+        mp4.save_to_path(path, WriteOptions::default())
+            .expect("seed transaction MP4 ilst");
+        chapter_transaction_read_ilst(path)
+    }
+
+    fn chapter_transaction_read_ilst(path: &std::path::Path) -> lofty::mp4::Ilst {
+        use lofty::file::AudioFile as _;
+
+        let mut file = std::fs::File::open(path).expect("open transaction MP4 fixture");
+        let mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse transaction MP4 fixture");
+        mp4.ilst().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn combined_sidecar_and_mp4_transaction_preserves_existing_ilst_when_ffmpeg_available() {
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping combined chapter carrier transaction: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let program_path = temp.path().join("book.m4a");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/metadata_persistence/mp4.m4a"),
+            &program_path,
+        )
+        .expect("copy transaction MP4 fixture");
+        let expected_ilst = chapter_transaction_test_ilst(&program_path);
+        let sidecar_path = temp.path().join("book.cue");
+        let replacement_cuesheet = concat!(
+            "FILE \"book.m4a\" WAVE\n",
+            "  TRACK 01 AUDIO\n",
+            "    TITLE \"One\"\n",
+            "    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n",
+            "    TITLE \"Two\"\n",
+            "    INDEX 01 00:00:01\n",
+        )
+        .to_string();
+        let plan = MetadataAlbumWritePlan {
+            sidecars: vec![MetadataAlbumSidecarWrite {
+                cue_path: sidecar_path.clone(),
+                create: true,
+                replace_structure: true,
+                expected_raw_snapshot: None,
+                replacement_cuesheet: replacement_cuesheet.clone(),
+                fidelity_warnings: Vec::new(),
+                deletion_intent: crate::tui::cue_parser::CueAlbumMetadataDeletionIntent::default(),
+                expected_audio_paths: vec![program_path.clone()],
+                expected_track_count: 2,
+                logical_audio_path: program_path.clone(),
+            }],
+            audio: Vec::new(),
+            logical_paths: vec![program_path.clone()],
+        };
+        let outcome = crate::tui::chapter_authoring::ChapterSaveOutcome {
+            sidecar_path: Some(sidecar_path.clone()),
+            in_file_path: Some(program_path.clone()),
+            in_file_destination: Some(
+                crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters,
+            ),
+            ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
+        };
+
+        let outcome = metadata_editor_chapter_execute_mp4_transaction(
+            Some(plan),
+            program_path.clone(),
+            vec![
+                ("One".to_string(), 0, 200),
+                ("Two".to_string(), 200, 400),
+            ],
+            8_000,
+            std::collections::HashMap::new(),
+            outcome,
+        )
+        .await
+        .expect("combined sidecar + MP4 chapter transaction");
+
+        assert_eq!(std::fs::read_to_string(&sidecar_path).unwrap(), replacement_cuesheet);
+        assert_eq!(outcome.sidecar_snapshot, Some(std::fs::read(&sidecar_path).unwrap()));
+        assert_eq!(chapter_transaction_read_ilst(&program_path), expected_ilst);
+        let raw = crate::convert::chapter_structure::read_embedded_chapters(&program_path)
+            .expect("read combined-transaction chapters");
+        let normalized = crate::convert::chapter_structure::normalize_embedded_chapters(&raw, 8_000)
+            .expect("normalize combined-transaction chapters");
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].boundary.start_sample, 0);
+        assert_eq!(normalized[1].boundary.start_sample, 200);
+    }
+
+    #[test]
+    fn dual_cue_mp4_save_without_snap_keeps_exact_sample_for_title_only_resave() {
+        let mut state = chapter_two_row_sample_geometry(48_000, 1_000, 2_000);
+        let outcome = dual_cue_mp4_outcome(false);
+
+        let first = metadata_editor_chapter_records(state.active_surface(), false)
+            .expect("first exact MP4 projection");
+        assert_eq!(first[1].1, 1_000);
+        assert_eq!(
+            crate::tui::chapter_authoring::cue_index01_frames(
+                &state
+                    .active_surface()
+                    .cue_album_synthetic_sheet
+                    .as_ref()
+                    .unwrap()
+                    .track_sources[1],
+                Some(48_000),
+            )
+            .unwrap(),
+            Some(1),
+            "the sidecar projection is independently frame 1"
+        );
+
+        metadata_editor_chapter_reconcile_saved_geometry(state.active_surface_mut(), &outcome)
+            .expect("dual save reconciliation");
+        let source = &state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .unwrap()
+            .track_sources[1];
+        assert_eq!(source.index01_sample, Some(1_000));
+        assert_eq!(source.index01_frames, None);
+
+        // A title-only follow-up uses the unchanged exact geometry.
+        let second = metadata_editor_chapter_records(state.active_surface(), false)
+            .expect("title-only follow-up MP4 projection");
+        assert_eq!(second[1].1, 1_000);
+    }
+
+    #[test]
+    fn cue_only_save_reconciles_sample_native_start_and_pregap_to_frames_at_32k() {
+        let mut state = chapter_two_row_sample_geometry(32_000, 1_000, 2_000);
+        {
+            let source = &mut state
+                .active_surface_mut()
+                .cue_album_synthetic_sheet
+                .as_mut()
+                .expect("chapter sheet")
+                .track_sources[1];
+            source.index00_frames = None;
+            source.index00_sample = Some(400);
+        }
+        let outcome = crate::tui::chapter_authoring::ChapterSaveOutcome {
+            sidecar_path: Some(std::path::PathBuf::from("book.cue")),
+            ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
+        };
+
+        metadata_editor_chapter_reconcile_saved_geometry(state.active_surface_mut(), &outcome)
+            .expect("CUE-only save reconciliation");
+        let source = &state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .unwrap()
+            .track_sources[1];
+        assert_eq!(source.index01_frames, Some(2));
+        assert_eq!(source.index01_sample, None);
+        assert_eq!(source.index00_frames, Some(0));
+        assert_eq!(source.index00_sample, None);
+
+        metadata_editor_chapter_reconcile_saved_geometry(state.active_surface_mut(), &outcome)
+            .expect("repeated CUE-only save reconciliation");
+        let source = &state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .unwrap()
+            .track_sources[1];
+        assert_eq!(source.index01_frames, Some(2));
+        assert_eq!(source.index00_frames, Some(0));
+    }
+
+    #[test]
+    fn explicit_snap_canonicalizes_to_frames_and_stays_stable_on_repeat_save() {
+        let mut state = chapter_two_row_sample_geometry(48_000, 1_000, 2_000);
+        let outcome = dual_cue_mp4_outcome(true);
+
+        let first = metadata_editor_chapter_records(state.active_surface(), true)
+            .expect("first snapped MP4 projection");
+        assert_eq!(first[1].1, 640);
+
+        metadata_editor_chapter_reconcile_saved_geometry(state.active_surface_mut(), &outcome)
+            .expect("snapped save reconciliation");
+        let source = &state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .unwrap()
+            .track_sources[1];
+        assert_eq!(source.index01_frames, Some(1));
+        assert_eq!(source.index01_sample, None);
+
+        let repeated_exact_view = metadata_editor_chapter_records(state.active_surface(), false)
+            .expect("canonical frame-native view");
+        let repeated_snap = metadata_editor_chapter_records(state.active_surface(), true)
+            .expect("repeat snapped MP4 projection");
+        assert_eq!(repeated_exact_view[1].1, 640);
+        assert_eq!(repeated_snap[1].1, 640);
+    }
+
+    #[test]
+    fn chapter_title_pattern_changes_titles_without_moving_divisions() {
+        let mut state = unified_cue_album_edit_state();
+        let before = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("chapter sheet")
+            .track_sources
+            .iter()
+            .map(|source| {
+                (
+                    source.index00_frames,
+                    source.index01_frames,
+                    source.index00_sample,
+                    source.index01_sample,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut generation = crate::tui::chapter_authoring::ChapterGenerationState::titles_only();
+        generation.base_title.text = "Part".to_string();
+        generation.numbering = crate::tui::metadata_autonumber::NumberingScheme::NN;
+        state.active_surface_mut().chapter_authoring.generation = Some(generation);
+
+        metadata_editor_chapter_apply_generation(state.active_surface_mut())
+            .expect("title-only pattern should apply");
+
+        let after = state
+            .active_surface()
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .expect("chapter sheet")
+            .track_sources
+            .iter()
+            .map(|source| {
+                (
+                    source.index00_frames,
+                    source.index01_frames,
+                    source.index00_sample,
+                    source.index01_sample,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(after, before, "title generation must not move chapter geometry");
+        assert_eq!(
+            entry_values(&state, "TITLE"),
+            vec!["Part 01", "Part 02", "Part 03", "Part 04"]
+        );
     }
 
     #[test]
@@ -81405,6 +84330,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side_a.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: Some("GBAYE0300334".to_string()),
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -81419,6 +84346,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side_b.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: Some("GBAYE0300335".to_string()),
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -81432,6 +84361,8 @@ mod single_image_metadata_editor_regression_tests {
             album_genre: Some("Rock".to_string()),
             album_catalog: Some("0000000000001".to_string()),
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         };
         let n_paths = sheet.audio_paths.len();
         let (_cuesheet_originals, forced) = cue_album_remove_replaced_keys(&mut entries, &sheet, n_paths);
@@ -81499,6 +84430,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side_a.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: Some("MATCH000001".to_string()),
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -81513,6 +84446,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side_b.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: Some("MATCH000002".to_string()),
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -81526,6 +84461,8 @@ mod single_image_metadata_editor_regression_tests {
             album_genre: Some("Rock".to_string()),
             album_catalog: Some("0000000000001".to_string()),
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         };
 
         let (_cuesheet_originals, forced) =
@@ -84184,6 +87121,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side-a.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: None,
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -84198,6 +87137,8 @@ mod single_image_metadata_editor_regression_tests {
                     file_ref: "side-b.flac".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: None,
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -84211,6 +87152,8 @@ mod single_image_metadata_editor_regression_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         };
         let mut state = crate::tui::app::MetadataEditorState::for_files(
             vec![audio_a.clone(), audio_b.clone()],

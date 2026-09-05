@@ -1,0 +1,123 @@
+<style>
+  .tuiwrap6{background:#0d8a8a;padding:20px;border-radius:14px;overflow-x:auto;text-align:center}
+  .tui6{display:inline-block;text-align:left;margin:0;
+       font-family:ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+       font-size:12px;line-height:1.2;white-space:pre}
+  .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+</style>
+<h2 class="sr-only">A terminal mockup of the tonepoet chapter editor with directly editable cells: fifteen visible entries, a text cursor in the title cell of entry fourteen, a status line tracking the focused row in samples and CUE frames, a red flag on a zero-length entry, and a footer of plain buttons.</h2>
+<div class="tuiwrap6"><pre class="tui6" id="tui6" role="img" aria-label="tonepoet chapter editor"></pre></div>
+<script>
+(function(){
+  var W=88,H=27;
+  var P={bg:'#1a1b26',bd:'#3b4261',ttl:'#7aa2f7',lbl:'#7f88b3',
+         val:'#c0caf5',dim:'#565f89',acc:'#7dcfff',amb:'#e0af68',red:'#f7768e'};
+  var C='color:',bd=C+P.bd,ttl=C+P.ttl,lbl=C+P.lbl,val=C+P.val,
+      dim=C+P.dim,acc=C+P.acc,amb=C+P.amb,red=C+P.red;
+  var sel='background:#283457;color:#c0caf5',selD='background:#283457;color:#8b95c9';
+  var fbg='background:#3a4877;color:#e8eefc';
+  var chip='background:#2e3450;color:#a9b1d6';
+  // Canonical pane title bar: solid bar of the border colour with
+  // background-coloured text, matching draw_metadata_title_bar et al.
+  //
+  // MOCKUP ONLY -- these are literals so the static page renders in the
+  // default Tokyo Night palette. The real widget must take its colour from
+  // the theme and dim when unfocused, as every other surface does:
+  //   focused   -> a semantic theme colour (theme.blue / amber / purple /
+  //                green / cyan -- source uses amber, metadata purple,
+  //                format green, output-options cyan)
+  //   unfocused -> theme.text_dim (panes) or theme.border_dim (overlays)
+  // and the bar itself is fg: theme.bg on bg: <that colour>, so it follows
+  // whatever theme is active. Never hardcode.
+  var tbar='background:#7aa2f7;color:#1a1b26';
+  var tbarDim='background:#7aa2f7;color:#3b4261';
+
+  function rep(c,n){return n>0?new Array(n+1).join(c):'';}
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function pad(s,n){s=String(s);return rep(' ',n-s.length)+s;}
+  var g=[];for(var r=0;r<H;r++){var row=[];for(var c=0;c<W;c++)row.push({c:' ',s:val});g.push(row);}
+  function put(r,c,t,s){for(var i=0;i<t.length;i++){var cc=c+i;if(cc>=0&&cc<W)g[r][cc]={c:t.charAt(i),s:s};}}
+  function fill(r,a,b,s){for(var c=a;c<=b;c++)g[r][c]={c:' ',s:s};}
+
+  // Title bar: corners in border colour, everything between them inverted.
+  // The disclosure marker is the maximize state -- \u25b8 restored, \u25be maximized.
+  var titleText=' \u25b8 chapters \u00b7 sunlit-man.m4b ';
+  var rightText='ma';var rightRest='ximize ';
+  put(0,0,'\u250c',bd);
+  fill(0,1,W-2,tbar);
+  put(0,1,titleText,tbar);
+  put(0,W-2-rightText.length-rightRest.length,rightText,tbarDim);
+  put(0,W-2-rightRest.length,rightRest,tbar);
+  put(0,W-1,'\u2510',bd);
+  for(var r=1;r<H-1;r++){g[r][0]={c:'\u2502',s:bd};g[r][W-1]={c:'\u2502',s:bd};}
+  put(H-1,0,'\u2514'+rep('\u2500',W-2)+'\u2518',bd);
+
+  put(2,3,'19:43:07.120',val);put(2,16,'\u00b7',dim);put(2,18,'44100 Hz',val);
+  put(2,27,'\u00b7',dim);put(2,29,'45 entries',val);
+  put(2,54,'Source',lbl);put(2,62,'embedded MP4 chapters',val);
+
+  put(4,7,'#',dim);put(4,9,'Start',lbl);put(4,28,'Length',lbl);put(4,38,'Pre',lbl);put(4,43,'Title',lbl);
+  put(5,0,'\u251c'+rep('\u2500',W-2)+'\u2524',bd);
+
+  var D=[
+   [11,'01:08:10.226','06:12.106','\u00b7','Eleven',0],
+   [12,'01:14:22.332','06:03.775','1.500','Twelve',0],
+   [13,'01:20:26.107','06:14.386','\u00b7','Thirteen \u00b7 In Which t\u2026ioned Twice at Length',0],
+   [14,'01:26:40.493','04:31.226','\u00b7','Fourteen',0],
+   [15,'01:31:11.719','03:58.004','\u00b7','Fifteen',0],
+   [16,'01:35:09.723','00:00.000','\u00b7','Sixteen',1],
+   [17,'01:35:09.723','05:42.118','\u00b7','Seventeen',0],
+   [18,'01:40:51.841','06:20.552','2.000','Eighteen',0],
+   [19,'01:47:12.393','05:55.107','\u00b7','Nineteen',0],
+   [20,'01:53:07.500','06:02.318','\u00b7','Twenty',0],
+   [21,'01:59:09.818','05:47.912','\u00b7','Twenty-One',0],
+   [22,'02:04:57.730','06:11.480','\u00b7','Twenty-Two',0],
+   [23,'02:11:09.210','05:33.006','\u00b7','Twenty-Three',0],
+   [24,'02:16:42.216','06:26.774','\u00b7','Twenty-Four',0],
+   [25,'02:23:08.990','05:59.120','\u00b7','Twenty-Five',0]];
+
+  for(var i=0;i<D.length;i++){
+    var d=D[i],r=6+i,S=(d[0]===14);
+    if(S)fill(r,1,85,sel);
+    put(r,2,S?'\u25b8':' ',S?sel:val);
+    if(d[5])put(r,4,'\u25b2',red);
+    put(r,6,pad(d[0],2),S?selD:dim);
+    put(r,9,pad(d[1],12),S?sel:val);
+    put(r,23,pad(d[2],11),S?selD:lbl);
+    put(r,36,pad(d[3],5),S?selD:dim);
+    if(S){fill(r,43,85,fbg);put(r,43,d[4],fbg);put(r,51,'\u2588',fbg);}
+    else put(r,43,d[4],val);
+  }
+
+  for(var r=6;r<=20;r++){g[r][86]={c:(r>=9&&r<=13)?'\u2588':'\u2591',s:(r>=9&&r<=13)?bd:C+'#262a3f'};}
+
+  put(21,0,'\u251c'+rep('\u2500',W-2)+'\u2524',bd);
+  put(22,3,'entry 14',lbl);put(22,12,'\u00b7',dim);put(22,14,'229,341,741 smp',val);
+  put(22,30,'\u00b7',dim);put(22,32,'CUE frame 390,036',val);
+  put(22,50,'\u25b2',amb);put(22,52,'floors 13 ms',amb);
+  put(22,68,'title \u00b7 8 chars',dim);
+
+  put(23,3,'\u25b2',red);put(23,5,'1 problem',red);put(23,15,'\u00b7',dim);
+  put(23,17,'entry 16 has zero length',val);put(23,43,'\u00b7',dim);
+  put(23,45,'^n',acc);put(23,48,'jump to it',dim);put(23,71,'save blocked',red);
+
+  put(24,3,' Generate ',chip);
+  put(24,15,' Titles ',chip);
+  put(24,25,' Paste list ',chip);
+  put(24,39,' \u2026 more ',chip);
+  put(24,73,'11-25 of 45',dim);
+
+  var L=[['tab',acc],[' field \u00b7 ',dim],['\u21b5',acc],[' next entry \u00b7 ',dim],
+         ['alt+i',acc],[' insert \u00b7 ',dim],['alt+d',acc],[' delete \u00b7 ',dim],
+         ['[ ]',acc],[' nudge \u00b7 ',dim],['esc',acc],[' revert',dim]];
+  var lc=3;for(var i=0;i<L.length;i++){put(25,lc,L[i][0],L[i][1]);lc+=L[i][0].length;}
+
+  var out=[];
+  for(var ri=0;ri<H;ri++){var row=g[ri],html='',i=0;
+    while(i<W){var st=row[i].s,s='';while(i<W&&row[i].s===st){s+=row[i].c;i++;}
+      html+='<span style="'+st+'">'+esc(s)+'</span>';}
+    out.push(html);}
+  var el=document.getElementById('tui6');
+  el.innerHTML=out.join('\n');el.style.background=P.bg;
+})();
+</script>

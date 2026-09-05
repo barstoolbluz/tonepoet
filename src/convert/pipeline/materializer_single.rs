@@ -17,6 +17,19 @@ use super::types::*;
 
 pub struct SingleFileMaterializer;
 
+fn normalize_single_file_embedded_chapters(
+    path: &Path,
+    raw: Vec<crate::convert::chapter_structure::RawEmbeddedChapter>,
+    sample_rate: u32,
+) -> Result<Vec<crate::convert::chapter_structure::EmbeddedChapterTrack>, MaterializeError> {
+    crate::convert::chapter_structure::normalize_embedded_chapters(&raw, sample_rate).map_err(|error| {
+        MaterializeError::Parse(format!(
+            "embedded chapter structure in {} is not usable: {error}",
+            path.display()
+        ))
+    })
+}
+
 #[async_trait]
 impl super::stages::Materializer for SingleFileMaterializer {
     async fn materialize(
@@ -64,25 +77,11 @@ impl super::stages::Materializer for SingleFileMaterializer {
             &req.container,
         ) {
             match crate::convert::chapter_structure::read_embedded_chapters(&req.container) {
-                Ok(raw) if raw.is_empty() => {
-                    if crate::convert::chapter_structure::is_m4b_path(&req.container) {
-                        return Err(MaterializeError::Parse(format!(
-                            "M4B source {} contains no embedded chapters; Tonepoet will not convert it as one undifferentiated track",
-                            req.container.display()
-                        )));
-                    }
-                    Vec::new()
-                }
-                Ok(raw) => crate::convert::chapter_structure::normalize_embedded_chapters(
-                    &raw,
+                Ok(raw) => normalize_single_file_embedded_chapters(
+                    &req.container,
+                    raw,
                     probe.sample_rate,
-                )
-                .map_err(|error| {
-                    MaterializeError::Parse(format!(
-                        "embedded chapter structure in {} is not usable: {error}",
-                        req.container.display()
-                    ))
-                })?,
+                )?,
                 Err(error) => {
                     return Err(MaterializeError::Parse(format!(
                         "cannot inspect embedded chapter structure in {}: {error}; refusing to fall back to one undifferentiated track because that could silently discard chapters",
@@ -985,6 +984,17 @@ mod tests {
 
     fn list_values(values: &MetadataValueList) -> Vec<&str> {
         values.values().iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn chapterless_m4b_is_an_ordinary_empty_embedded_structure() {
+        let chapters = normalize_single_file_embedded_chapters(
+            Path::new("book.m4b"),
+            Vec::new(),
+            48_000,
+        )
+        .expect("chapterless M4B must remain a valid one-track source");
+        assert!(chapters.is_empty());
     }
 
     #[test]

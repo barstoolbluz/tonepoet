@@ -676,6 +676,30 @@ pub enum AppMessage {
         save_generation: u64,
         detail: String,
     },
+    /// Result of the Metadata Editor chapter-authoring source probe.
+    /// The worker performs media/container I/O; the reducer only applies the
+    /// immutable facts to the session/generation that launched the request.
+    MetadataEditorChapterProbeComplete {
+        session_id: u64,
+        generation: u64,
+        path: std::path::PathBuf,
+        sample_rate: Result<u32, String>,
+        total_samples: Result<u64, String>,
+        embedded_chapters: Result<Vec<crate::convert::chapter_structure::RawEmbeddedChapter>, String>,
+        sidecar_path: std::path::PathBuf,
+        sidecar_exists: bool,
+        sidecar_snapshot: Result<Option<Vec<u8>>, String>,
+        embedded_cuesheet_snapshot: Result<Option<String>, String>,
+    },
+    /// Result of a durable chapter-authoring save.  This is separate from the
+    /// ordinary metadata-write completion so a structural save cannot
+    /// accidentally mark unrelated tag edits clean.
+    MetadataEditorChapterSaveComplete {
+        session_id: u64,
+        save_generation: u64,
+        result: Result<crate::tui::chapter_authoring::ChapterSaveOutcome, String>,
+    },
+
     /// Result of a background Details-tab media probe from the metadata editor.
     /// Reduced into the active editor model by the event loop; rendering never
     /// polls worker-owned state. Stale generations are ignored by the reducer.

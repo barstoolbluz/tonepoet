@@ -23,6 +23,7 @@ pub mod convert_screen;
 pub mod format_interactions;
 pub mod ctdb;
 pub mod cue_generate;
+pub mod chapter_authoring;
 pub mod cue_parser;
 pub mod dr_report;
 pub mod draw;

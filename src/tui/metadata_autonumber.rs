@@ -2386,6 +2386,8 @@ mod tests {
                     file_ref: (*path).to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: None,
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -2399,6 +2401,8 @@ mod tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().cue_source = Some(MetadataCueSource::Sidecar(cue1));
 

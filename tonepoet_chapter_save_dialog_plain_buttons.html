@@ -1,0 +1,86 @@
+<style>
+  .tuiwrap5{background:#0d8a8a;padding:20px;border-radius:14px;overflow-x:auto;text-align:center}
+  .tui5{display:inline-block;text-align:left;margin:0;
+       font-family:ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+       font-size:12px;line-height:1.2;white-space:pre}
+  .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+</style>
+<h2 class="sr-only">A terminal mockup of the save dialog: three destinations, a note that CUE sheets store times in seventy-fifths of a second, a Snap to frame grid button with a preview of what would move, and a caption showing how the in-file destination changes for MP4, FLAC and WAV.</h2>
+<div class="tuiwrap5"><pre class="tui5" id="tui5" role="img" aria-label="tonepoet save chapters dialog"></pre></div>
+<script>
+(function(){
+  var W=88,H=21;
+  var P={bg:'#1a1b26',mbg:'#20222f',bd:'#3b4261',ttl:'#7aa2f7',hdr:'#bb9af7',lbl:'#7f88b3',
+         val:'#c0caf5',dim:'#565f89',acc:'#7dcfff',amb:'#e0af68',grn:'#9ece6a'};
+  var C='color:',lbl=C+P.lbl,val=C+P.val,dim=C+P.dim,acc=C+P.acc,grn=C+P.grn;
+  var mb='background:'+P.mbg+';color:',mbd=mb+P.ttl;
+  var go='background:#9ece6a;color:#16200a',dm='background:#bb9af7;color:#1a1b26';
+  var warn='background:#e0af68;color:#2f2103';
+  // Canonical pane title bar: solid bar of the border colour with
+  // background-coloured text, matching draw_metadata_title_bar et al.
+  //
+  // MOCKUP ONLY -- these are literals so the static page renders in the
+  // default Tokyo Night palette. The real widget must take its colour from
+  // the theme and dim when unfocused, as every other surface does:
+  //   focused   -> a semantic theme colour (theme.blue / amber / purple /
+  //                green / cyan -- source uses amber, metadata purple,
+  //                format green, output-options cyan)
+  //   unfocused -> theme.text_dim (panes) or theme.border_dim (overlays)
+  // and the bar itself is fg: theme.bg on bg: <that colour>, so it follows
+  // whatever theme is active. Never hardcode.
+  var tbar='background:'+P.ttl+';color:'+P.mbg;
+  var tbarDim='background:'+P.ttl+';color:#3b4261';
+
+  function rep(c,n){return n>0?new Array(n+1).join(c):'';}
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  var g=[];for(var r=0;r<H;r++){var row=[];for(var c=0;c<W;c++)row.push({c:' ',s:val});g.push(row);}
+  function put(r,c,t,s){for(var i=0;i<t.length;i++){var cc=c+i;if(cc>=0&&cc<W)g[r][cc]={c:t.charAt(i),s:s};}}
+
+  var ML=8,MW=72;
+  for(var r=1;r<=15;r++)for(var c=ML;c<ML+MW;c++)g[r][c]={c:' ',s:mb+P.val};
+  // Title bar: corners in border colour, everything between them inverted.
+  // \u25b8 restored / \u25be maximized -- the same disclosure marker the Convert panes use.
+  var svTitle=' \u25b8 save chapters ';
+  var svR='ma';var svRest='ximize ';
+  put(1,ML,'\u250c',mbd);
+  put(1,ML+1,rep(' ',MW-2),tbar);
+  put(1,ML+1,svTitle,tbar);
+  put(1,ML+MW-2-svR.length-svRest.length,svR,tbarDim);
+  put(1,ML+MW-2-svRest.length,svRest,tbar);
+  put(1,ML+MW-1,'\u2510',mbd);
+  for(var r=2;r<=14;r++){g[r][ML]={c:'\u2502',s:mbd};g[r][ML+MW-1]={c:'\u2502',s:mbd};}
+  put(15,ML,'\u2514'+rep('\u2500',MW-2)+'\u2518',mbd);
+
+  put(3,11,'Write to',mb+P.hdr);
+  function box(r,ck){put(r,12,'[',mb+P.dim);put(r,13,ck?'\u2713':' ',mb+P.grn);put(r,14,']',mb+P.dim);}
+  box(4,1);put(4,16,'Sidecar CUE sheet',mb+P.val);put(4,46,'sunlit-man.cue',mb+P.dim);
+  box(5,1);put(5,16,'Chapter entries in the file',mb+P.val);put(5,46,'45 entries, sample-exact',mb+P.dim);
+  box(6,0);put(6,16,'Split on next conversion',mb+P.lbl);put(6,46,'45 files, one per entry',mb+P.dim);
+
+  put(8,ML,'\u251c'+rep('\u2500',MW-2)+'\u2524',mb+P.bd);
+  put(9,11,'\u25b2',mb+P.amb);
+  put(9,13,'CUE sheets store 1/75 s. Boundaries land up to 13 ms early.',mb+P.amb);
+  put(10,13,'MP4 chapter entries keep the exact sample positions.',mb+P.dim);
+
+  put(12,12,' Snap to frame grid ',warn);
+  put(12,35,'44 entries move \u00b7 max 13 ms earlier',mb+P.lbl);
+
+  put(14,11,' Save ',go);put(14,19,' Cancel ',dm);put(14,60,'space toggle',mb+P.dim);
+
+  put(17,8,'The middle row changes with the container:',dim);
+  put(18,10,'.m4b .m4a .mp4',acc);put(18,26,'[',dim);put(18,27,'\u2713',grn);put(18,28,']',dim);
+  put(18,30,'Chapter entries in the file',val);put(18,60,'titles and times',dim);
+  put(19,10,'.flac',acc);put(19,26,'[',dim);put(19,27,'\u2713',grn);put(19,28,']',dim);
+  put(19,30,'CUE sheet in a FLAC tag',val);put(19,60,'same data, tag-shaped',dim);
+  put(20,10,'.wav',acc);put(20,26,'row absent',dim);
+  put(20,38,'no in-file structure \u00b7 sidecar CUE only',lbl);
+
+  var out=[];
+  for(var ri=0;ri<H;ri++){var row=g[ri],html='',i=0;
+    while(i<W){var st=row[i].s,s='';while(i<W&&row[i].s===st){s+=row[i].c;i++;}
+      html+='<span style="'+st+'">'+esc(s)+'</span>';}
+    out.push(html);}
+  var el=document.getElementById('tui5');
+  el.innerHTML=out.join('\n');el.style.background=P.bg;
+})();
+</script>

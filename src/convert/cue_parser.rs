@@ -1631,6 +1631,50 @@ fn replace_index_timestamp_preserving_line(
     Some(out)
 }
 
+/// Replace an existing sidecar CUE with an authored structural projection.
+///
+/// Ordinary metadata write-back deliberately preserves FILE/TRACK/INDEX geometry.
+/// Chapter authoring is the explicit exception: the user's new division map is
+/// itself authoritative structure, so the complete generated CUESHEET replaces
+/// the prior geometry. The existing carrier is read only after acquiring the
+/// normal CUE mutation claim and the atomic replacement still compares that
+/// exact byte snapshot immediately before publication.
+///
+/// When the existing CUE encoding can be identified, keep it if it can represent
+/// the authored text. An undecodable source is itself a repair case, so fall back
+/// to UTF-8 rather than making broken input impossible to replace.
+pub(crate) fn replace_cue_sidecar_structure_from_cuesheet(
+    cue_path: &Path,
+    replacement_cuesheet: &str,
+) -> Result<CueSidecarWritebackOutcome, String> {
+    let (_mutation_claim, admitted_cue_path) = acquire_cue_sidecar_write_claim(cue_path)?;
+    let cue_path = admitted_cue_path.as_path();
+    let raw = std::fs::read(cue_path)
+        .map_err(|error| format!("failed to read sidecar CUE '{}': {error}", cue_path.display()))?;
+
+    validate_replacement_cuesheet_quoted_metadata(replacement_cuesheet, true)?;
+    if !cue_sidecar_bytes_are_structurally_valid(replacement_cuesheet.as_bytes(), cue_path) {
+        return Err("authored replacement CUESHEET is not structurally valid".to_string());
+    }
+
+    let (bytes, outcome) = match decode_cue_bytes_with_context_for_write(&raw, cue_path.parent()) {
+        Ok(decoded) => encode_cue_text_for_write(replacement_cuesheet, decoded.encoding),
+        Err(_) => (
+            replacement_cuesheet.as_bytes().to_vec(),
+            CueSidecarWritebackOutcome::RewrittenUtf8Fallback {
+                source_encoding: "undecodable".to_string(),
+            },
+        ),
+    };
+    if bytes == raw {
+        ensure_sidecar_snapshot_unchanged(cue_path, &raw)?;
+        return Ok(CueSidecarWritebackOutcome::Unchanged);
+    }
+
+    atomic_replace_if_unchanged(cue_path, &bytes, Some(&raw))?;
+    Ok(outcome)
+}
+
 /// Materialize a new UTF-8 sidecar CUE from a generated CUESHEET.
 ///
 /// The destination-exists preflight preserves create-only behavior for the

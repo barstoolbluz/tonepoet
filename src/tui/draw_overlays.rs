@@ -4545,12 +4545,12 @@ fn draw_content_tabs(
     // Line 1: ┌─ Active ─┐   Inactive
     // Line 2: ┘           └───────────
     //
-    // Narrow terminals cannot always show all four labels. Choose a visible
+    // Narrow terminals cannot always show every label. Choose a visible
     // window from the active tab instead of always starting at Metadata, so the
     // active tab never disappears when the user cycles or clicks through the
-    // tab strip. Ties prefer the later start index: with room for two tabs,
-    // clicking Details shifts the window to Details + ReplayGain, then clicking
-    // ReplayGain shifts it to ReplayGain + Artwork.
+    // tab strip. With room for only a few tabs, the active tab becomes the
+    // left edge while later tabs exist; the final tab shifts left only enough
+    // to keep useful neighboring context visible.
     let slots = content_tab_slots_for_width(state.content_tab, area.width);
 
     let border_style = Style::default().fg(theme.cyan);
@@ -4678,8 +4678,8 @@ fn content_tab_slots_for_width(
 
     // In constrained widths, treat the active tab as the left edge while there
     // are tabs to its right. This makes tab cycling and visible-tab clicks feel
-    // like horizontal tab-strip scrolling: Metadata+Details -> Details+ReplayGain
-    // -> ReplayGain+Artwork. For the last tab, shift left only as much as helps
+    // like horizontal tab-strip scrolling: each active tab becomes the left edge
+    // while a later tab is available. For the last tab, shift left only as much as helps
     // show useful context without accepting a clipped active tab when a full one
     // is possible.
     if active_index + 1 < tab_count {
@@ -5387,6 +5387,12 @@ fn draw_metadata_editor(
         return;
     }
 
+    if state.content_tab == ContentTab::Chapters {
+        draw_metadata_chapter_tab(f, state, content_area, footer_area, button_map, theme);
+        draw_metadata_presentation_dropdown_popup(f, state, content_area, button_map, theme);
+        return;
+    }
+
     if state.content_tab != ContentTab::Metadata {
         draw_metadata_read_only_tab(
             f,
@@ -5910,6 +5916,440 @@ fn draw_file_picker_overlay(
         );
 }
 
+
+fn metadata_chapter_cursor_text(input: &super::text_input::TextInputState) -> String {
+    let mut cursor = input.cursor.min(input.text.len());
+    while cursor > 0 && !input.text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let (left, right) = input.text.split_at(cursor);
+    format!("{left}|{right}")
+}
+
+fn metadata_chapter_dialog_area(parent: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(parent.width.saturating_sub(2)).max(parent.width.min(24));
+    let height = height.min(parent.height.saturating_sub(2)).max(parent.height.min(7));
+    Rect::new(
+        parent.x.saturating_add(parent.width.saturating_sub(width) / 2),
+        parent.y.saturating_add(parent.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn draw_metadata_chapter_generation_dialog(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    parent: Rect,
+    theme: super::theme::Theme,
+) {
+    let Some(generation) = state.active_surface().chapter_authoring.generation.as_ref() else {
+        return;
+    };
+    let area = metadata_chapter_dialog_area(parent, 68, if generation.titles_only { 7 } else { 9 });
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if generation.titles_only {
+            " Generate titles "
+        } else {
+            " Generate chapters "
+        })
+        .border_style(Style::default().fg(theme.cyan))
+        .style(Style::default().bg(theme.dropdown_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut fields = Vec::new();
+    if !generation.titles_only {
+        fields.push((
+            super::chapter_authoring::ChapterGenerationField::Mode,
+            "Mode",
+            generation.mode.label().to_string(),
+        ));
+        fields.push((
+            super::chapter_authoring::ChapterGenerationField::Value,
+            if generation.mode == super::chapter_authoring::ChapterGenerationMode::FixedDuration {
+                "Duration"
+            } else {
+                "Count"
+            },
+            if generation.field == super::chapter_authoring::ChapterGenerationField::Value {
+                metadata_chapter_cursor_text(&generation.value)
+            } else {
+                generation.value.text.clone()
+            },
+        ));
+    }
+    fields.push((
+        super::chapter_authoring::ChapterGenerationField::BaseTitle,
+        "Base title",
+        if generation.field == super::chapter_authoring::ChapterGenerationField::BaseTitle {
+            metadata_chapter_cursor_text(&generation.base_title)
+        } else {
+            generation.base_title.text.clone()
+        },
+    ));
+    fields.push((
+        super::chapter_authoring::ChapterGenerationField::Numbering,
+        "Numbering",
+        generation.numbering.label().to_string(),
+    ));
+    let mut lines = Vec::new();
+    for (field, label, value) in fields {
+        let selected = generation.field == field;
+        let style = if selected {
+            Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+        } else {
+            theme.muted()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<12}"), style),
+            Span::styled(super::display_width::truncate_right(&value, inner.width.saturating_sub(13) as usize), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        if generation.titles_only {
+            "Tab field  Space/Left/Right change choice  Enter apply  Esc cancel"
+        } else {
+            "Tab field  Space/Left/Right change choices  Enter generate  Esc cancel"
+        },
+        theme.muted(),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_metadata_chapter_save_dialog(
+    f: &mut Frame,
+    state: &super::app::MetadataEditorState,
+    parent: Rect,
+    theme: super::theme::Theme,
+) {
+    let Some(dialog) = state.active_surface().chapter_authoring.save_dialog.as_ref() else {
+        return;
+    };
+    let track_count = state
+        .active_surface()
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .map(|sheet| sheet.track_sources.len())
+        .unwrap_or(0);
+    let snap_preview = state
+        .active_surface()
+        .cue_album_synthetic_sheet
+        .as_ref()
+        .and_then(|sheet| {
+            let rate = sheet.program_sample_rate?;
+            if rate == 0 {
+                return None;
+            }
+            let views = super::chapter_authoring::boundary_views(sheet).ok()?;
+            let mut moved = 0usize;
+            let mut max_delta = 0u64;
+            for view in views.iter().skip(1) {
+                let source = &sheet.track_sources[view.row];
+                let delta = super::chapter_authoring::cue_index01_projection_error_samples(
+                    source,
+                    rate,
+                )
+                .ok()?;
+                if delta > 0 {
+                    moved += 1;
+                    max_delta = max_delta.max(delta);
+                }
+            }
+            let max_ms = max_delta as f64 * 1000.0 / rate as f64;
+            Some((moved, max_ms))
+        });
+    let area = metadata_chapter_dialog_area(parent, 76, 12);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Save chapter structure ")
+        .border_style(Style::default().fg(theme.cyan))
+        .style(Style::default().bg(theme.dropdown_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = Vec::new();
+    let mut row = 0usize;
+    let sidecar_available = track_count <= 99;
+    let sidecar_style = if dialog.cursor == row {
+        Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+    } else if sidecar_available {
+        theme.muted()
+    } else {
+        Style::default().fg(theme.text_dim)
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "[{}] Sidecar CUE{}",
+            if dialog.sidecar_selected { "x" } else { " " },
+            if sidecar_available { "" } else { " (unavailable above 99 tracks)" }
+        ),
+        sidecar_style,
+    )));
+    row += 1;
+    if let Some(in_file) = dialog.in_file {
+        let style = if dialog.cursor == row {
+            Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+        } else {
+            theme.muted()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("[{}] {}", if dialog.in_file_selected { "x" } else { " " }, in_file.label()),
+            style,
+        )));
+        row += 1;
+    } else {
+        lines.push(Line::from(Span::styled(
+            "In-file chapter structure is not supported for this carrier.",
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+    let split_style = if dialog.cursor == row {
+        Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted()
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "[{}] Split on next conversion",
+            if dialog.split_on_conversion { "x" } else { " " }
+        ),
+        split_style,
+    )));
+    row += 1;
+    let snap_style = if dialog.cursor == row {
+        Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("[{}] Snap division points to the CUE 75 Hz grid", if dialog.snap_to_cue_grid { "x" } else { " " }),
+        snap_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "MP4-family chapter entries keep exact sample positions unless snapping is selected; CUE always floors.",
+        theme.muted(),
+    )));
+    if let Some((moved, max_ms)) = snap_preview {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "CUE snap preview: {moved} entr{} move; max {max_ms:.3} ms earlier.",
+                if moved == 1 { "y" } else { "ies" }
+            ),
+            theme.muted(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Up/Down select  Space toggle  s save  Esc cancel",
+        theme.muted(),
+    )));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_metadata_chapter_tab(
+    f: &mut Frame,
+    state: &mut super::app::MetadataEditorState,
+    content_area: Rect,
+    footer_area: Rect,
+    button_map: &mut super::button_map::ButtonRenderMap,
+    theme: super::theme::Theme,
+) {
+    use super::chapter_authoring::ChapterAuthoringLoadState;
+
+    let load_state = state.active_surface().chapter_authoring.load_state.clone();
+    match load_state {
+        ChapterAuthoringLoadState::NotLoaded => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled("Chapter structure has not been loaded yet.", theme.muted()))),
+                content_area,
+            );
+        }
+        ChapterAuthoringLoadState::Loading { path } => {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("Loading chapter structure...", Style::default().fg(theme.amber))),
+                    Line::from(Span::styled(path.display().to_string(), theme.muted())),
+                ]),
+                content_area,
+            );
+        }
+        ChapterAuthoringLoadState::Failed { path, reason } => {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("Chapter authoring could not load this program.", Style::default().fg(theme.destructive))),
+                    Line::from(Span::styled(path.display().to_string(), theme.muted())),
+                    Line::from(Span::styled(reason, theme.muted())),
+                    Line::from(Span::styled("Ctrl+R retry", Style::default().fg(theme.amber))),
+                ]),
+                content_area,
+            );
+        }
+        ChapterAuthoringLoadState::Ready { .. } => {
+            let surface = state.active_surface();
+            let Some(sheet) = surface.cue_album_synthetic_sheet.as_ref() else {
+                f.render_widget(Paragraph::new("Chapter structure is unavailable."), content_area);
+                return;
+            };
+            let rate = sheet.program_sample_rate.unwrap_or(0);
+            let views = super::chapter_authoring::boundary_views(sheet).unwrap_or_default();
+            let problems = super::chapter_authoring::validate(sheet);
+            let cursor = surface.chapter_authoring.cursor.min(views.len().saturating_sub(1));
+            let visible_rows = content_area.height.saturating_sub(4) as usize;
+            let mut scroll = surface.chapter_authoring.scroll.min(views.len().saturating_sub(visible_rows));
+            if cursor < scroll {
+                scroll = cursor;
+            } else if visible_rows > 0 && cursor >= scroll + visible_rows {
+                scroll = cursor + 1 - visible_rows;
+            }
+            let header_style = Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD);
+            let title_width = content_area.width.saturating_sub(49) as usize;
+            let total = sheet.program_total_samples.unwrap_or(0);
+            let total_text = if rate > 0 {
+                super::chapter_authoring::format_position(total, rate)
+            } else {
+                "unknown".to_string()
+            };
+            let origin = surface.chapter_authoring.origin.label();
+            let mut lines = vec![Line::from(Span::styled(
+                super::display_width::truncate_right(
+                    &format!(
+                        "Total {total_text}  {rate} Hz  {} entr{}  Source: {origin}",
+                        views.len(),
+                        if views.len() == 1 { "y" } else { "ies" }
+                    ),
+                    content_area.width as usize,
+                ),
+                theme.muted(),
+            )), Line::from(vec![
+                Span::styled(format!("{:<4}", "#"), header_style),
+                Span::styled(format!("{:<14}", "Start"), header_style),
+                Span::styled(format!("{:<14}", "Length"), header_style),
+                Span::styled(format!("{:<14}", "Pre"), header_style),
+                Span::styled(super::display_width::pad_or_truncate("Title", title_width.max(1), false), header_style),
+            ])];
+
+            for (visible_index, view) in views.iter().enumerate().skip(scroll).take(visible_rows) {
+                let selected = visible_index == cursor;
+                let invalid = problems.iter().any(|problem| problem.row == Some(visible_index));
+                let number = if invalid { format!("!{}", visible_index + 1) } else { format!("{}", visible_index + 1) };
+                let start = super::chapter_authoring::format_position(view.start_sample, rate);
+                let length = super::chapter_authoring::format_position(view.samples(), rate);
+                let pregap = view
+                    .pregap_samples()
+                    .map(|samples| super::chapter_authoring::format_position(samples, rate))
+                    .unwrap_or_default();
+                let mut title = super::keybindings::metadata_editor_chapter_title_for_render(state.active_surface(), visible_index);
+                let edit_kind = state.active_surface().chapter_authoring.edit_kind;
+                let editing_here = selected && state.active_surface().chapter_authoring.edit_input.is_some();
+                let input_text = state
+                    .active_surface()
+                    .chapter_authoring
+                    .edit_input
+                    .as_ref()
+                    .map(metadata_chapter_cursor_text);
+                let column = state.active_surface().chapter_authoring.column;
+                let base = if selected {
+                    Style::default().fg(theme.text_bright).add_modifier(Modifier::BOLD)
+                } else {
+                    theme.muted()
+                };
+                let selected_style = Style::default().fg(theme.text_bright).bg(theme.selection_bg).add_modifier(Modifier::BOLD);
+                let start_text = if editing_here && edit_kind == Some(super::chapter_authoring::ChapterEditKind::Start) {
+                    input_text.clone().unwrap_or(start)
+                } else {
+                    start
+                };
+                let pregap_text = if editing_here && edit_kind == Some(super::chapter_authoring::ChapterEditKind::Pregap) {
+                    input_text.clone().unwrap_or(pregap)
+                } else {
+                    pregap
+                };
+                if editing_here && edit_kind == Some(super::chapter_authoring::ChapterEditKind::Title) {
+                    title = input_text.unwrap_or(title);
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{number:<4}"), if invalid { Style::default().fg(theme.destructive) } else { base }),
+                    Span::styled(
+                        format!("{:<14}", super::display_width::truncate_right(&start_text, 13)),
+                        if selected && column == super::chapter_authoring::ChapterColumn::Start { selected_style } else { base },
+                    ),
+                    Span::styled(format!("{:<14}", super::display_width::truncate_right(&length, 13)), base),
+                    Span::styled(
+                        format!("{:<14}", super::display_width::truncate_right(&pregap_text, 13)),
+                        if selected && column == super::chapter_authoring::ChapterColumn::Pregap { selected_style } else { base },
+                    ),
+                    Span::styled(
+                        super::display_width::pad_or_truncate(&title, title_width.max(1), false),
+                        if selected && column == super::chapter_authoring::ChapterColumn::Title { selected_style } else { base },
+                    ),
+                ]));
+                let y = content_area.y.saturating_add((lines.len() - 1) as u16);
+                if y < content_area.y.saturating_add(content_area.height) {
+                    button_map.record_button(
+                        super::button_map::TuiButton::MetadataChapterRow(visible_index),
+                        Rect::new(content_area.x, y, content_area.width, 1),
+                    );
+                }
+            }
+
+            let status = if let Some(problem) = problems.first() {
+                format!("Problem: {}", problem.message)
+            } else if let Some(note) = state.active_surface().chapter_authoring.import_notes.first() {
+                format!("Import note: {note}")
+            } else {
+                let position = views.get(cursor).map(|view| view.start_sample).unwrap_or(0);
+                let cue_error = sheet
+                    .track_sources
+                    .get(cursor)
+                    .and_then(|source| {
+                        super::chapter_authoring::cue_index01_projection_error_samples(source, rate)
+                            .ok()
+                    })
+                    .unwrap_or(0);
+                format!("Selected sample {position}  CUE floor delta {cue_error} samples")
+            };
+            lines.push(Line::from(Span::styled(
+                super::display_width::truncate_right(&status, content_area.width as usize),
+                if problems.is_empty() { theme.muted() } else { Style::default().fg(theme.destructive) },
+            )));
+            f.render_widget(Paragraph::new(lines), content_area);
+            // Commit the clamped viewport only after all immutable borrows of
+            // the chapter sheet used for rendering have ended.
+            state.active_surface_mut().chapter_authoring.scroll = scroll;
+        }
+    }
+
+    let saving = state.active_surface().chapter_authoring.saving;
+    let pills: Vec<(&str, Color, Option<super::button_map::TuiButton>)> = if saving {
+        vec![("Saving...", theme.amber, None), ("Esc close", theme.purple, None)]
+    } else {
+        vec![
+            ("g Generate", theme.green, Some(super::button_map::TuiButton::MetadataChapterGenerate)),
+            ("t Titles", theme.green, Some(super::button_map::TuiButton::MetadataChapterGenerateTitles)),
+            ("p Paste list", theme.green, Some(super::button_map::TuiButton::MetadataChapterPasteTitles)),
+            ("s Save", theme.green, Some(super::button_map::TuiButton::MetadataChapterSave)),
+            ("Alt+I Insert", theme.cyan, None),
+            ("Alt+D Delete", theme.destructive, None),
+            ("Alt+C Clear", theme.destructive, None),
+            ("[ ] nudge", theme.cyan, None),
+            ("Esc close", theme.purple, None),
+        ]
+    };
+    let mut spans = Vec::new();
+    for (index, (label, bg, _)) in pills.iter().enumerate() {
+        if index > 0 {
+            spans.push(pill_gap());
+        }
+        spans.push(footer_pill(label, *bg, theme));
+    }
+    record_centered_footer_pills(&pills, footer_area, button_map);
+    f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), footer_area);
+
+    draw_metadata_chapter_generation_dialog(f, state, content_area, theme);
+    draw_metadata_chapter_save_dialog(f, state, content_area, theme);
+}
+
 fn draw_metadata_read_only_tab(
     f: &mut Frame,
     state: &mut super::app::MetadataEditorState,
@@ -5977,6 +6417,7 @@ fn draw_metadata_read_only_footer(
                 Some(super::button_map::TuiButton::MetadataArtworkRemove(state.artwork_cursor)),
             ));
         }
+        super::app::ContentTab::Chapters => {}
         super::app::ContentTab::Details => {
             if state.details_analysis.is_some() {
                 pills.push(("Analyzing...", theme.amber, None));
@@ -6048,7 +6489,7 @@ pub(crate) fn metadata_read_only_line_count(
         super::app::ContentTab::Details => metadata_details_line_count(state),
         super::app::ContentTab::ReplayGain => metadata_replaygain_line_count(state),
         super::app::ContentTab::Artwork => metadata_artwork_table_line_count(state),
-        super::app::ContentTab::Metadata => 0,
+        super::app::ContentTab::Metadata | super::app::ContentTab::Chapters => 0,
     }
 }
 
@@ -6081,7 +6522,7 @@ fn metadata_read_only_lines(state: &super::app::MetadataEditorState, theme: supe
         super::app::ContentTab::Details => metadata_details_lines(state, theme),
         super::app::ContentTab::ReplayGain => metadata_replaygain_lines(state, theme),
         super::app::ContentTab::Artwork => metadata_artwork_non_table_lines(state, theme),
-        super::app::ContentTab::Metadata => Vec::new(),
+        super::app::ContentTab::Metadata | super::app::ContentTab::Chapters => Vec::new(),
     }
 }
 
@@ -9497,6 +9938,8 @@ mod tests {
                     file_ref: "disc.dff".to_string(),
                     index00_frames: None,
                     index01_frames: Some(0),
+                    index00_sample: None,
+                    index01_sample: None,
                     isrc: None,
                     album_user_metadata: Default::default(),
                     user_metadata: Default::default(),
@@ -9509,6 +9952,8 @@ mod tests {
                 album_genre: None,
                 album_catalog: None,
                 user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
             });
         }
         state
@@ -9636,6 +10081,8 @@ mod tests {
                 file_ref: "side-a.dff".to_string(),
                 index00_frames: None,
                 index01_frames: Some(0),
+                index00_sample: None,
+                index01_sample: None,
                 isrc: None,
                 album_user_metadata: Default::default(),
                 user_metadata: Default::default(),
@@ -9648,6 +10095,8 @@ mod tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
 
         assert_eq!(metadata_editor_detail_slot_block_reason(&state, 0, 1), None);
@@ -9951,24 +10400,24 @@ mod tests {
     #[test]
     fn narrow_content_tabs_shift_forward_from_details() {
         let slots = content_tab_slots_for_width(super::super::app::ContentTab::Details, 26);
-        assert_eq!(slots.first().map(|slot| slot.index), Some(1));
-        assert!(slots.iter().any(|slot| slot.index == 2));
-        assert!(slots.iter().any(|slot| slot.active && slot.index == 1));
-    }
-
-    #[test]
-    fn narrow_content_tabs_shift_forward_from_replaygain() {
-        let slots = content_tab_slots_for_width(super::super::app::ContentTab::ReplayGain, 26);
         assert_eq!(slots.first().map(|slot| slot.index), Some(2));
         assert!(slots.iter().any(|slot| slot.index == 3));
         assert!(slots.iter().any(|slot| slot.active && slot.index == 2));
     }
 
     #[test]
+    fn narrow_content_tabs_shift_forward_from_replaygain() {
+        let slots = content_tab_slots_for_width(super::super::app::ContentTab::ReplayGain, 26);
+        assert_eq!(slots.first().map(|slot| slot.index), Some(3));
+        assert!(slots.iter().any(|slot| slot.index == 4));
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 3));
+    }
+
+    #[test]
     fn narrow_content_tabs_keep_late_active_tab_visible() {
         let slots = content_tab_slots_for_width(super::super::app::ContentTab::Artwork, 26);
-        assert!(slots.iter().any(|slot| slot.active && slot.index == 3));
-        assert_eq!(slots.last().map(|slot| slot.index), Some(3));
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 4));
+        assert_eq!(slots.last().map(|slot| slot.index), Some(4));
     }
 
     #[test]

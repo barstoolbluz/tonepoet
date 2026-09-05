@@ -66,8 +66,9 @@ pub fn is_m4b_path(path: &Path) -> bool {
 }
 
 /// Read the container-owned chapter table without mutating global FFmpeg log
-/// state. The caller decides whether an empty table is acceptable for the
-/// source type.
+/// state. An empty result is an ordinary chapterless container; inspection
+/// errors remain distinct so callers can fail closed rather than discard an
+/// unreadable chapter table.
 pub fn read_embedded_chapters(path: &Path) -> Result<Vec<RawEmbeddedChapter>, String> {
     ensure_ffmpeg_initialized()?;
     let input = ffmpeg_next::format::input(&path)
@@ -93,7 +94,7 @@ pub fn read_embedded_chapters(path: &Path) -> Result<Vec<RawEmbeddedChapter>, St
     Ok(chapters)
 }
 
-fn timestamp_to_sample(
+pub(crate) fn timestamp_to_sample(
     timestamp: i64,
     time_base_num: i32,
     time_base_den: i32,

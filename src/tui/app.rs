@@ -6769,6 +6769,7 @@ pub enum MetadataEditorPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentTab {
     Metadata,
+    Chapters,
     Details,
     ReplayGain,
     Artwork,
@@ -6792,10 +6793,11 @@ impl MetadataEditorView {
 }
 
 impl ContentTab {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     pub const ALL: [ContentTab; Self::COUNT] = [
         ContentTab::Metadata,
+        ContentTab::Chapters,
         ContentTab::Details,
         ContentTab::ReplayGain,
         ContentTab::Artwork,
@@ -6804,6 +6806,7 @@ impl ContentTab {
     pub fn label(self) -> &'static str {
         match self {
             ContentTab::Metadata => "Metadata",
+            ContentTab::Chapters => "Chapters",
             ContentTab::Details => "Details",
             ContentTab::ReplayGain => "ReplayGain",
             ContentTab::Artwork => "Artwork",
@@ -6813,9 +6816,10 @@ impl ContentTab {
     pub fn index(self) -> usize {
         match self {
             ContentTab::Metadata => 0,
-            ContentTab::Details => 1,
-            ContentTab::ReplayGain => 2,
-            ContentTab::Artwork => 3,
+            ContentTab::Chapters => 1,
+            ContentTab::Details => 2,
+            ContentTab::ReplayGain => 3,
+            ContentTab::Artwork => 4,
         }
     }
 
@@ -8497,6 +8501,14 @@ pub struct CueAlbumTrackSource {
     pub file_ref: String,
     pub index00_frames: Option<u32>,
     pub index01_frames: Option<u32>,
+    /// Exact sample-domain pregap start authored by the chapter editor. When
+    /// present this overrides `index00_frames`; CUE save projects it by
+    /// flooring to the preceding 75 Hz frame.
+    pub index00_sample: Option<u64>,
+    /// Exact sample-domain chapter start authored by the chapter editor. When
+    /// present this overrides `index01_frames`; untouched CUE material keeps
+    /// its original frame-native authority.
+    pub index01_sample: Option<u64>,
     pub isrc: Option<String>,
     /// Tonepoet-owned inert album metadata from the same physical CUE as this
     /// track. Keeping it alongside the track's source identity preserves
@@ -8534,6 +8546,11 @@ pub struct CueAlbumSyntheticSheet {
     pub album_catalog: Option<String>,
     /// Tonepoet-owned inert album metadata from the authoritative CUE input.
     pub user_metadata: crate::convert::cue_parser::CueUserMetadata,
+    /// Source-domain facts required to interpret exact authored sample
+    /// positions. These are aggregate program facts, not another boundary
+    /// representation.
+    pub program_sample_rate: Option<u32>,
+    pub program_total_samples: Option<u64>,
 }
 
 /// One independently-authored physical side/member represented by a
@@ -8662,6 +8679,9 @@ pub struct PresentationTab {
     /// migration/cleanup plan for F2-era polluted files, not an unconditional
     /// per-save tombstone list.
     pub cue_album_forced_cleanup: Vec<(usize, lofty::tag::ItemKey)>,
+    /// Chapter-authoring interaction state for this presentation. Division
+    /// points themselves remain on `cue_album_synthetic_sheet.track_sources`.
+    pub chapter_authoring: crate::tui::chapter_authoring::ChapterAuthoringState,
 }
 
 impl Default for PresentationTab {
@@ -8699,6 +8719,7 @@ impl Default for PresentationTab {
             per_carrier_embedded_cuesheets: false,
             cue_album_cuesheet_row_baseline: None,
             cue_album_forced_cleanup: Vec::new(),
+            chapter_authoring: crate::tui::chapter_authoring::ChapterAuthoringState::default(),
         }
     }
 }
@@ -8783,6 +8804,9 @@ impl PresentationTab {
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
         tab.cue_album_view_sides = active.cue_album_view_sides.clone();
         tab.per_carrier_embedded_cuesheets = active.per_carrier_embedded_cuesheets;
+        tab.cue_album_cuesheet_row_baseline = active.cue_album_cuesheet_row_baseline.clone();
+        tab.cue_album_forced_cleanup = active.cue_album_forced_cleanup.clone();
+        tab.chapter_authoring = active.chapter_authoring.clone();
         tab
     }
 }
@@ -11312,8 +11336,12 @@ fn reduce_saved_slots(
     }
 }
 
-fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
-    if tab.refresh_failed || tab.pending_embedded_cuesheet_delete || !tab.deleted.is_empty() {
+pub(crate) fn presentation_tab_has_changes(tab: &PresentationTab) -> bool {
+    if tab.chapter_authoring.dirty
+        || tab.refresh_failed
+        || tab.pending_embedded_cuesheet_delete
+        || !tab.deleted.is_empty()
+    {
         return true;
     }
 
@@ -19338,6 +19366,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().cue_album_view_sides = vec![
             CueAlbumViewSide {
@@ -19425,6 +19455,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().cue_album_view_sides = vec![
             CueAlbumViewSide {
@@ -19502,6 +19534,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state
             .active_surface_mut()
@@ -19556,6 +19590,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state
             .active_surface_mut()
@@ -19617,6 +19653,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
@@ -19712,6 +19750,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().entries = vec![
             TagEntry {
@@ -19791,6 +19831,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().entries.push(tag(
             "TRACKNUMBER",
@@ -19839,6 +19881,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().entries.push(tag(
             "COMPOSER",
@@ -19891,6 +19935,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().cue_album_forced_cleanup = vec![
             (0, lofty::tag::ItemKey::Isrc),
@@ -19934,6 +19980,8 @@ mod metadata_presentation_tab_tests {
             album_genre: None,
             album_catalog: None,
             user_metadata: Default::default(),
+            program_sample_rate: None,
+            program_total_samples: None,
         });
         state.active_surface_mut().cue_album_forced_cleanup = vec![
             (0, lofty::tag::ItemKey::Isrc),

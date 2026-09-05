@@ -3299,6 +3299,13 @@ fn record_terminal_status(
     }
 }
 
+
+fn embedded_chapter_presence(
+    inspection: Result<Vec<crate::convert::chapter_structure::RawEmbeddedChapter>, String>,
+) -> Result<bool, String> {
+    inspection.map(|chapters| !chapters.is_empty())
+}
+
 async fn run_queue_with_shared_orchestrator(
     queued_items: Vec<ConversionItem>,
     queue: std::sync::Arc<tokio::sync::RwLock<ConversionQueue>>,
@@ -3773,23 +3780,11 @@ fn build_initial_work(
     if matches!(source_kind, Some(SourceKind::SingleFile))
         && crate::convert::chapter_structure::chapter_capable_source_extension(&request.container)
     {
-        match crate::convert::chapter_structure::read_embedded_chapters(&request.container) {
-            Ok(chapters) if !chapters.is_empty() => {
+        match embedded_chapter_presence(
+            crate::convert::chapter_structure::read_embedded_chapters(&request.container),
+        ) {
+            Ok(true) => {
                 has_embedded_chapters = true;
-            }
-            Ok(_) if crate::convert::chapter_structure::is_m4b_path(&request.container) => {
-                pool.metrics().record_job_failed();
-                terminal.insert(
-                    item_id.clone(),
-                    ConversionStatus::Failed {
-                        error: format!(
-                            "M4B source '{}' contains no embedded chapters. Tonepoet admits .m4b as a structured audiobook source and will not silently convert it as one undifferentiated track.",
-                            request.container.display()
-                        ),
-                        log_path: None,
-                    },
-                );
-                return None;
             }
             Err(error) => {
                 pool.metrics().record_job_failed();
@@ -3805,7 +3800,7 @@ fn build_initial_work(
                 );
                 return None;
             }
-            Ok(_) => {}
+            Ok(false) => {}
         }
     }
 
@@ -4903,6 +4898,31 @@ pub async fn process_item_with_scratch_policy(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn chapterless_embedded_chapter_probe_is_an_ordinary_single_track_candidate() {
+        assert_eq!(embedded_chapter_presence(Ok(Vec::new())), Ok(false));
+    }
+
+    #[test]
+    fn nonempty_embedded_chapter_probe_selects_structured_materialization() {
+        let chapter = crate::convert::chapter_structure::RawEmbeddedChapter {
+            title: Some("Chapter 1".to_string()),
+            start: 0,
+            end: 1,
+            time_base_num: 1,
+            time_base_den: 1,
+        };
+        assert_eq!(embedded_chapter_presence(Ok(vec![chapter])), Ok(true));
+    }
+
+    #[test]
+    fn embedded_chapter_inspection_failure_stays_a_refusal() {
+        assert_eq!(
+            embedded_chapter_presence(Err("inspection failed".to_string())),
+            Err("inspection failed".to_string())
+        );
+    }
 
     #[test]
     fn album_batch_component_preserves_dot_runs_and_guards_only_navigation_tokens() {

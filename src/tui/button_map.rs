@@ -158,7 +158,7 @@ pub enum TuiButton {
     /// 0-based index into `MetadataEditorState.presentation_tabs`.
     MetadataEditorTab(usize),
     /// MetadataEditor content-tab selector. Argument is:
-    /// 0=Metadata, 1=Details, 2=ReplayGain, 3=Artwork.
+    /// 0=Metadata, 1=Chapters, 2=Details, 3=ReplayGain, 4=Artwork.
     MetadataEditorContentTab(usize),
     /// MetadataEditor 3+-presentation dropdown toggle row.
     MetadataPresentationSelectorToggle,
@@ -193,6 +193,13 @@ pub enum TuiButton {
     /// MetadataEditor detail-overlay field-scoped rejection of the latest
     /// whole-field paste for the current field.
     MetadataDetailRevertPaste,
+    /// MetadataEditor Chapters tab row hit target.
+    MetadataChapterRow(usize),
+    /// MetadataEditor Chapters tab footer actions.
+    MetadataChapterGenerate,
+    MetadataChapterGenerateTitles,
+    MetadataChapterPasteTitles,
+    MetadataChapterSave,
     /// MetadataEditor Details tab: analyze HDCD + non-spectral PRE facts.
     MetadataDetailsAnalyze,
     /// MetadataEditor ReplayGain tab: scan all active tracks.
@@ -455,6 +462,11 @@ impl TuiButton {
             | Self::MetadataAutoNumberRow(_)
             | Self::MetadataAutoNumberApply
             | Self::MetadataAutoNumberCancel
+            | Self::MetadataChapterRow(_)
+            | Self::MetadataChapterGenerate
+            | Self::MetadataChapterGenerateTitles
+            | Self::MetadataChapterPasteTitles
+            | Self::MetadataChapterSave
             | Self::MbSelectRow(_)
             | Self::MbSelectAccept
             | Self::MbSelectCancel

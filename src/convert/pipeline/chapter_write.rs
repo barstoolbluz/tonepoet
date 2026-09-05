@@ -34,6 +34,56 @@ struct ChapterWriteEntry {
     end_sample: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct Mp4IlstSnapshot {
+    /// The complete concrete ilst parsed before the structural FFmpeg remux.
+    /// `None` means there was no ilst to preserve. Keeping the concrete tag,
+    /// rather than a flattened generic map, retains freeform identities,
+    /// repeated values, and multi-data atom groups already supported by Lofty.
+    ilst: Option<lofty::mp4::Ilst>,
+}
+
+fn snapshot_mp4_ilst(path: &Path) -> Result<Mp4IlstSnapshot, String> {
+    use lofty::file::AudioFile as _;
+
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("cannot open MP4 metadata carrier {}: {error}", path.display()))?;
+    let mp4 = lofty::mp4::Mp4File::read_from(
+        &mut file,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| format!("cannot snapshot MP4 ilst in {}: {error}", path.display()))?;
+    Ok(Mp4IlstSnapshot {
+        ilst: mp4.ilst().cloned(),
+    })
+}
+
+fn restore_mp4_ilst(path: &Path, snapshot: &Mp4IlstSnapshot) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::AudioFile as _;
+
+    let Some(original_ilst) = snapshot.ilst.as_ref() else {
+        return Ok(());
+    };
+
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("cannot reopen MP4 chapter rewrite {}: {error}", path.display()))?;
+    let mut mp4 = lofty::mp4::Mp4File::read_from(
+        &mut file,
+        lofty::config::ParseOptions::new().read_properties(false),
+    )
+    .map_err(|error| format!("cannot parse MP4 chapter rewrite {} before ilst restoration: {error}", path.display()))?;
+    drop(file);
+
+    mp4.set_ilst(original_ilst.clone());
+    mp4.save_to_path(path, WriteOptions::default()).map_err(|error| {
+        format!(
+            "cannot restore preserved MP4 ilst after chapter rewrite in {}: {error}",
+            path.display()
+        )
+    })
+}
+
 pub(crate) async fn finalize_structured_chapters_before_publish(
     artifacts: &mut ArtifactSet,
     source: &PreparedSource,
@@ -257,6 +307,129 @@ async fn write_embedded_chapters_for_merged(
             "validated chapter rewrite could not atomically replace {}: {error}",
             merged.staged_path.display()
         ))
+    })?;
+    Ok(())
+}
+
+/// Rewrite embedded MP4-family chapters on an existing file for the metadata
+/// editor's chapter-authoring surface.
+///
+/// The caller may pass a private same-directory batch stage instead of the
+/// authoritative path. This function then performs its own guarded rewrite
+/// inside that stage, verifies the serialized chapter table by reading it back,
+/// and leaves outer publication to the caller. That layering lets chapter
+/// entries participate in the metadata editor's all-or-nothing multi-carrier
+/// transaction without duplicating the production chapter serializer.
+pub(crate) async fn rewrite_embedded_chapters_for_authoring(
+    path: &Path,
+    chapters: &[(String, u64, u64)],
+    sample_rate: u32,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    if sample_rate == 0 {
+        return Err("chapter write requires a non-zero sample rate".to_string());
+    }
+    if chapters.is_empty() {
+        return Err("chapter write requires at least one chapter".to_string());
+    }
+    let mut entries = Vec::with_capacity(chapters.len());
+    let mut previous_end = None;
+    for (index, (title, start_sample, end_sample)) in chapters.iter().enumerate() {
+        if *end_sample <= *start_sample {
+            return Err(format!(
+                "chapter {} has a non-positive sample range {}..{}",
+                index + 1,
+                start_sample,
+                end_sample
+            ));
+        }
+        if index == 0 && *start_sample != 0 {
+            return Err(format!(
+                "chapter 1 starts at sample {}; embedded chapter structure must begin at 0",
+                start_sample
+            ));
+        }
+        if previous_end.is_some_and(|end| end != *start_sample) {
+            return Err(format!(
+                "chapter {} does not begin at the previous chapter end",
+                index + 1
+            ));
+        }
+        entries.push(ChapterWriteEntry {
+            title: if title.trim().is_empty() {
+                format!("Chapter {}", index + 1)
+            } else {
+                title.clone()
+            },
+            start_sample: *start_sample,
+            end_sample: *end_sample,
+        });
+        previous_end = Some(*end_sample);
+    }
+
+    let muxer = chapter_output_muxer(path)
+        .ok_or_else(|| format!("{} is not an MP4-family chapter carrier", path.display()))?;
+    // Structural MOV remuxes do not faithfully preserve the complete iTunes
+    // ilst (notably freeform atoms and repeated values). Snapshot the concrete
+    // parsed ilst before FFmpeg and restore that exact logical atom structure
+    // onto the guarded rewrite before publication.
+    let ilst_snapshot = snapshot_mp4_ilst(path)?;
+    let ffmetadata = render_ffmetadata(&entries, sample_rate)
+        .map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut metadata_file = tempfile::Builder::new()
+        .prefix(".tonepoet-chapter-authoring.")
+        .suffix(".ffmeta")
+        .tempfile_in(parent)
+        .map_err(|error| format!(
+            "cannot create temporary chapter metadata beside {}: {error}",
+            path.display()
+        ))?;
+    metadata_file
+        .write_all(ffmetadata.as_bytes())
+        .and_then(|_| metadata_file.flush())
+        .map_err(|error| format!(
+            "cannot write temporary chapter metadata beside {}: {error}",
+            path.display()
+        ))?;
+
+    let rewrite = metadata_rewrite_temp_path(path).map_err(|error| {
+        format!(
+            "cannot reserve guarded chapter rewrite for {}: {error}",
+            path.display()
+        )
+    })?;
+    let command = chapter_remux_command(path, metadata_file.path(), rewrite.path(), muxer);
+    if let Err(error) = run_tool_command_with_concurrency(command, runner, cancel, None).await {
+        rewrite.cleanup_best_effort();
+        return Err(format!("FFmpeg could not write chapters to {}: {error}", path.display()));
+    }
+    if let Err(error) = verify_written_chapters(rewrite.path(), &entries, sample_rate) {
+        rewrite.cleanup_best_effort();
+        return Err(error.to_string());
+    }
+    if let Err(error) = restore_mp4_ilst(rewrite.path(), &ilst_snapshot) {
+        rewrite.cleanup_best_effort();
+        return Err(error);
+    }
+    // Lofty's ilst restoration is the final metadata mutation in this
+    // authoring rewrite. Verify the chapter table again afterwards so the
+    // file is published only if both structure and unrelated metadata survive.
+    if let Err(error) = verify_written_chapters(rewrite.path(), &entries, sample_rate) {
+        rewrite.cleanup_best_effort();
+        return Err(format!(
+            "chapter verification after MP4 ilst restoration failed: {error}"
+        ));
+    }
+    replace_rewritten_metadata_file(path, rewrite).map_err(|error| {
+        format!(
+            "validated chapter rewrite could not atomically replace {}: {error}",
+            path.display()
+        )
     })?;
     Ok(())
 }
@@ -1138,6 +1311,234 @@ mod tests {
         .expect("timeline probe");
         assert_eq!(probe.sample_rate, 48_000);
         assert_eq!(probe.samples, 144_001);
+    }
+
+    fn read_fixture_mp4_ilst(path: &Path) -> lofty::mp4::Ilst {
+        use lofty::file::AudioFile as _;
+
+        let mut file = fs::File::open(path).expect("open MP4 fixture");
+        let mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse MP4 fixture");
+        mp4.ilst().cloned().unwrap_or_default()
+    }
+
+    fn seed_authoring_ilst_preservation_fixture(path: &Path) -> lofty::mp4::Ilst {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile as _;
+
+        let artist = lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART");
+        let title = lofty::mp4::AtomIdent::Fourcc(*b"\xa9nam");
+        let note = lofty::mp4::AtomIdent::Freeform {
+            mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+            name: std::borrow::Cow::Borrowed("MY_NOTE"),
+        };
+        let performer = lofty::mp4::AtomIdent::Freeform {
+            mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+            name: std::borrow::Cow::Borrowed("PERFORMER"),
+        };
+        let mut ilst = lofty::mp4::Ilst::new();
+        ilst.insert(lofty::mp4::Atom::new(
+            title,
+            lofty::mp4::AtomData::UTF8("Chapter Test".to_string()),
+        ));
+        ilst.insert(
+            lofty::mp4::Atom::from_collection(
+                artist,
+                vec![
+                    lofty::mp4::AtomData::UTF8("Artist One".to_string()),
+                    lofty::mp4::AtomData::UTF8("Artist Two".to_string()),
+                ],
+            )
+            .expect("artist atom"),
+        );
+        ilst.insert(lofty::mp4::Atom::new(
+            note,
+            lofty::mp4::AtomData::UTF8("keep-me".to_string()),
+        ));
+        ilst.insert(
+            lofty::mp4::Atom::from_collection(
+                performer,
+                vec![
+                    lofty::mp4::AtomData::UTF8("Performer One".to_string()),
+                    lofty::mp4::AtomData::UTF8("Performer Two".to_string()),
+                ],
+            )
+            .expect("performer atom"),
+        );
+
+        let mut file = fs::File::open(path).expect("open MP4 fixture for ilst seed");
+        let mut mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse MP4 fixture for ilst seed");
+        drop(file);
+        mp4.set_ilst(ilst);
+        mp4.save_to_path(path, WriteOptions::default())
+            .expect("save MP4 ilst preservation fixture");
+        read_fixture_mp4_ilst(path)
+    }
+
+    fn ilst_text_values(
+        ilst: &lofty::mp4::Ilst,
+        ident: &lofty::mp4::AtomIdent<'_>,
+    ) -> Vec<String> {
+        ilst.into_iter()
+            .filter(|atom| atom.ident() == ident)
+            .flat_map(|atom| atom.data())
+            .filter_map(|data| match data {
+                lofty::mp4::AtomData::UTF8(value) | lofty::mp4::AtomData::UTF16(value) => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn authoring_ilst_snapshot_restores_freeform_and_repeated_values_idempotently() {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("authoring-ilst.m4a");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/metadata_persistence/mp4.m4a"),
+            &path,
+        )
+        .expect("copy MP4 fixture");
+        let expected = seed_authoring_ilst_preservation_fixture(&path);
+        let snapshot = snapshot_mp4_ilst(&path).expect("snapshot concrete ilst");
+        assert_eq!(snapshot.ilst.as_ref(), Some(&expected));
+
+        // Simulate exactly the class of MOV-remux damage this authoring path
+        // must repair: keep one scalar and one ARTIST value, drop freeforms and
+        // the second repeated values.
+        let mut file = fs::File::open(&path).expect("open fixture before simulated strip");
+        let mut mp4 = lofty::mp4::Mp4File::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new().read_properties(false),
+        )
+        .expect("parse fixture before simulated strip");
+        drop(file);
+        let mut stripped = lofty::mp4::Ilst::new();
+        stripped.insert(lofty::mp4::Atom::new(
+            lofty::mp4::AtomIdent::Fourcc(*b"\xa9nam"),
+            lofty::mp4::AtomData::UTF8("Chapter Test".to_string()),
+        ));
+        stripped.insert(lofty::mp4::Atom::new(
+            lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART"),
+            lofty::mp4::AtomData::UTF8("Artist One".to_string()),
+        ));
+        mp4.set_ilst(stripped);
+        mp4.save_to_path(&path, WriteOptions::default())
+            .expect("save simulated stripped ilst");
+        assert_ne!(read_fixture_mp4_ilst(&path), expected);
+
+        restore_mp4_ilst(&path, &snapshot).expect("restore complete concrete ilst");
+        let restored = read_fixture_mp4_ilst(&path);
+        assert_eq!(restored, expected);
+
+        let artist = lofty::mp4::AtomIdent::Fourcc(*b"\xa9ART");
+        let note = lofty::mp4::AtomIdent::Freeform {
+            mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+            name: std::borrow::Cow::Borrowed("MY_NOTE"),
+        };
+        let performer = lofty::mp4::AtomIdent::Freeform {
+            mean: std::borrow::Cow::Borrowed("com.apple.iTunes"),
+            name: std::borrow::Cow::Borrowed("PERFORMER"),
+        };
+        assert_eq!(
+            ilst_text_values(&restored, &artist),
+            vec!["Artist One".to_string(), "Artist Two".to_string()]
+        );
+        assert_eq!(ilst_text_values(&restored, &note), vec!["keep-me".to_string()]);
+        assert_eq!(
+            ilst_text_values(&restored, &performer),
+            vec!["Performer One".to_string(), "Performer Two".to_string()]
+        );
+
+        // Re-applying the same post-remux restoration is semantically stable.
+        restore_mp4_ilst(&path, &snapshot).expect("repeat complete ilst restoration");
+        assert_eq!(read_fixture_mp4_ilst(&path), expected);
+    }
+
+    #[tokio::test]
+    async fn authoring_real_ffmpeg_rewrite_preserves_ilst_on_repeat_save_when_available() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map_or(true, |output| !output.status.success())
+        {
+            eprintln!("skipping real chapter-authoring MP4 rewrite: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("authoring-real-remux.m4a");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/metadata_persistence/mp4.m4a"),
+            &path,
+        )
+        .expect("copy MP4 fixture");
+        let expected_ilst = seed_authoring_ilst_preservation_fixture(&path);
+        let chapters = vec![
+            ("One".to_string(), 0, 200),
+            ("Two".to_string(), 200, 400),
+        ];
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(
+            std::collections::HashMap::new(),
+        );
+        let cancel = CancellationToken::new();
+
+        rewrite_embedded_chapters_for_authoring(&path, &chapters, 8_000, &runner, &cancel)
+            .await
+            .expect("first real chapter-authoring rewrite");
+        assert_eq!(read_fixture_mp4_ilst(&path), expected_ilst);
+        verify_written_chapters(
+            &path,
+            &[
+                ChapterWriteEntry {
+                    title: "One".to_string(),
+                    start_sample: 0,
+                    end_sample: 200,
+                },
+                ChapterWriteEntry {
+                    title: "Two".to_string(),
+                    start_sample: 200,
+                    end_sample: 400,
+                },
+            ],
+            8_000,
+        )
+        .expect("chapters survive first ilst restoration");
+
+        rewrite_embedded_chapters_for_authoring(&path, &chapters, 8_000, &runner, &cancel)
+            .await
+            .expect("second real chapter-authoring rewrite");
+        assert_eq!(read_fixture_mp4_ilst(&path), expected_ilst);
+        verify_written_chapters(
+            &path,
+            &[
+                ChapterWriteEntry {
+                    title: "One".to_string(),
+                    start_sample: 0,
+                    end_sample: 200,
+                },
+                ChapterWriteEntry {
+                    title: "Two".to_string(),
+                    start_sample: 200,
+                    end_sample: 400,
+                },
+            ],
+            8_000,
+        )
+        .expect("chapters survive repeated ilst restoration");
     }
 
     #[test]

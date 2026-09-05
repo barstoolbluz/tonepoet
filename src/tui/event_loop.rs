@@ -8738,6 +8738,74 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 tx,
             );
         }
+        AppMessage::MetadataEditorChapterProbeComplete {
+            session_id,
+            generation,
+            path,
+            sample_rate,
+            total_samples,
+            embedded_chapters,
+            sidecar_path,
+            sidecar_exists,
+            sidecar_snapshot,
+            embedded_cuesheet_snapshot,
+        } => {
+            if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
+                let status = super::keybindings::complete_metadata_editor_chapter_probe(
+                    &mut taken.state,
+                    session_id,
+                    generation,
+                    path,
+                    sample_rate,
+                    total_samples,
+                    embedded_chapters,
+                    sidecar_path,
+                    sidecar_exists,
+                    sidecar_snapshot,
+                    embedded_cuesheet_snapshot,
+                );
+                app.set_status(status);
+                restore_taken_metadata_editor(app, taken);
+            } else {
+                app.set_status("metadata editor: chapter probe finished after editor closed");
+            }
+        }
+        AppMessage::MetadataEditorChapterSaveComplete {
+            session_id,
+            save_generation,
+            result,
+        } => {
+            if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
+                let split_on_conversion = result.as_ref().ok().and_then(|outcome| {
+                    taken
+                        .state
+                        .surface_for_session(session_id)
+                        .filter(|surface| {
+                            surface.chapter_authoring.saving
+                                && surface.chapter_authoring.save_generation == save_generation
+                        })
+                        .map(|_| outcome.split_on_conversion)
+                });
+                let status = super::keybindings::complete_metadata_editor_chapter_save(
+                    &mut taken.state,
+                    session_id,
+                    save_generation,
+                    result,
+                );
+                if let Some(split) = split_on_conversion {
+                    let mode = if split {
+                        crate::tui::app::MergeMode::MultiFile
+                    } else {
+                        crate::tui::app::MergeMode::SingleImage
+                    };
+                    app.convert.output_options.merge.select_value(&mode);
+                }
+                app.set_status(status);
+                restore_taken_metadata_editor(app, taken);
+            } else {
+                app.set_status("metadata editor: chapter save finished after editor closed");
+            }
+        }
         AppMessage::MetadataEditorDetailsProbeComplete { session_id, generation, total, results } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
                 if let Some(status) = taken
