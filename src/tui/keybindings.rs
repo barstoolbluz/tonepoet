@@ -57014,9 +57014,9 @@ fn supervise_file_task_process(
     let executable_result = std::env::var_os("TONEPOET_TEST_FILE_TASK_HELPER")
         .map(std::path::PathBuf::from)
         .map(Ok)
-        .unwrap_or_else(std::env::current_exe);
+        .unwrap_or_else(crate::reexec::current_executable_for_reexec);
     #[cfg(not(test))]
-    let executable_result = std::env::current_exe();
+    let executable_result = crate::reexec::current_executable_for_reexec();
     let executable = match executable_result {
         Ok(executable) => executable,
         Err(error) => {

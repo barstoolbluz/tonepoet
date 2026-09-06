@@ -6,6 +6,7 @@ pub mod db;
 pub mod disc;
 pub mod dsf_tags;
 pub mod metadata_persistence;
+pub(crate) mod reexec;
 pub mod secret_store;
 pub mod tui;
 

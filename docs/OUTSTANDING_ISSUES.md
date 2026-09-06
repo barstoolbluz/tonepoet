@@ -187,7 +187,17 @@ recovery; the second instance also had a pending archive session waiting.
 
 ## 3. `current_exe()`-deleted → cryptic ENOENT when a file op runs from a pre-rebuild TUI
 
-> ### >>> NEXT UP — scheduled to be worked immediately after the compiler-warnings round returns <<<
+> ### >>> IMPLEMENTED 2026-09-06 — operator full-workspace gate pending <<<
+>
+> The file-task worker and both production script-supervision self-spawn paths now resolve through
+> `src/reexec.rs`. On Linux, when `current_exe()` reports a path ending in `" (deleted)"`, Tonepoet
+> executes `/proc/self/exe` instead. That procfs magic link retains the exact running executable inode,
+> so a stale TUI can start its helper without silently switching to a newly installed/rebuilt binary
+> with a potentially different internal protocol. Ordinary executable paths and the existing test /
+> embedding helper overrides are unchanged. Issue #7 startup recovery behavior is deliberately not
+> changed by this fix; its former auto-replay hazard is already fixed in this bundle, while its residual
+> supersession/dedup item remains separately visible below. Successful stale-binary helper startup also
+> avoids leaving the failed-spawn journal that led into that recovery path.
 >
 > **Field-reproduced again 2026-09-06**, on a Ctrl+X from `/home/daedalus/torrents/2025 Immersed Box`
 > to `/home/daedalus/temp/other/archive/audio-isos/blu-ray`. Direct evidence this time, not inference:
@@ -197,14 +207,16 @@ recovery; the second instance also had a pending archive session waiting.
 > session stayed open. No data was at risk — the failure is at helper spawn, before any copy or
 > removal — but the user hit it during ordinary use, which is the argument for fixing it now.
 >
-> **Anchors re-verified 2026-09-06** (the file has grown since the last correction):
-> `current_exe()` is now at `src/tui/keybindings.rs:57019` (was cited `:49710`), and the handler that
-> formats `"start isolated file-task helper: {error}"` is now at **`:57062`** (was cited `:49753`).
-> Re-locate by string rather than line number; these anchors drift every round.
+> **Implementation anchors 2026-09-06:** the file-task path now calls
+> `current_executable_for_reexec()` at `src/tui/keybindings.rs:57019`; the existing spawn-error handler
+> remains nearby. Script-supervision resolution uses the same helper at
+> `src/convert/script_supervisor.rs:494` and `:2642`. Re-locate by string rather than line number;
+> these anchors drift every round.
 >
-> **Worth folding in:** issue #4 below is the same user journey. Restarting to recover from this error
-> is what triggers the un-prompted replay of every journalled failed operation. A fix for #3 that
-> leaves #4 alone still leaves the user surprised on relaunch.
+> **Related recovery state:** the brief for this issue refers to startup recovery as issue #4, but that
+> is stale in this tracker; it is issue #7 below. Its original un-prompted replay hazard is already
+> fixed here: recoveries await explicit `:recovery-resume` / `:recovery-defer` review. The remaining
+> issue #7 supersession/dedup item is intentionally outside this fix.
 
 > **Verified STILL OPEN 2026-08-25** (read, not grepped). **Anchor correction:** `current_exe()` is at `src/tui/keybindings.rs:49710`, not `:44365` — and its `Err` arm (`:49712`) is **NOT** the failing path, because `current_exe()` *succeeds* on a deleted binary and returns `"<path> (deleted)"`. The real failure is downstream at `command.spawn()`, whose handler formats the raw `"start isolated file-task helper: {error}"` at **`:49753`**. No `(deleted)` detection and no un-suffixed-path fallback exist. Both fix directions unimplemented.
 
@@ -255,13 +267,12 @@ stays intact, destination is never created. (Verified on the field case.)
 **Immediate operational workaround.** Don't run file operations from a TUI instance whose binary
 was rebuilt underneath it; relaunch tonepoet after any rebuild.
 
-**Fix direction.**
-1. **Actionable error** — detect the `(deleted)` suffix (or ENOENT on this specific spawn) and
-   surface *"the running tonepoet binary was replaced on disk (rebuild while running) — restart
-   tonepoet to resume file operations,"* instead of the raw `os error 2`.
-2. **Optional fallback** — if `current_exe()` resolves to a `(deleted)` path but a real file now
-   exists at the un-suffixed path, spawn that (a rebuild leaves a valid new binary there). Has a
-   mild worker-protocol version-skew nuance — let the reasoning model weigh whether it's worth it.
+**Implemented resolution (2026-09-06).** On Linux, a `current_exe()` result ending in
+`" (deleted)"` is mapped to `/proc/self/exe` before any internal Tonepoet helper is spawned. The
+procfs magic link executes the exact still-running inode even after its original directory entry has
+been replaced, so the operation continues transparently and the helper cannot drift onto a newer
+internal protocol. The previously suggested un-suffixed-path fallback was deliberately not used for
+that reason. Non-deleted paths and non-Linux behavior remain unchanged.
 
 ---
 
@@ -387,6 +398,48 @@ migrating process polls, never finds a gap, and times out at 30 s.
 ---
 
 ## 7. File-task startup recovery auto-replays every pending operation with no prompt and no supersession
+
+> ### >>> NEXT UP — the operator has scheduled this as the next piece of work (2026-09-06) <<<
+>
+> **The operator's design stake, recorded as a requirement, not a suggestion.** On a restart with
+> pending recoveries, tonepoet should *prompt*, offering three choices:
+>
+> - **run** the pending operation(s),
+> - **save for later**, and
+> - **discard**.
+>
+> "Save for later" must be durable: the prompt is surfaced again on the **next** run of tonepoet,
+> rather than the entries silently persisting unmentioned.
+>
+> **There is a working precedent in this codebase for exactly those semantics.** The *archive*
+> startup recovery already prompts with `Y resume` / `D discard...` / `Esc later`
+> (`ConfirmAction::ArchiveStartupRecovery`, footer hints at `src/tui/app.rs:12779`-`12784`, with a
+> second-stage `ArchiveDiscardStartupRecovery` confirm at `:12785`). The file-task side has no
+> equivalent. Whether the right move is to reuse that machinery or mirror it is a design question,
+> but the three-option shape the operator asked for is not novel here.
+>
+> Issue #2 (fixed-height confirmation dialog clipping long recovery prompts) is **RESOLVED**, so the
+> dialog now sizes to its wrapped content — a longer recovery prompt is viable where it once clipped.
+>
+> **Presentation gaps found 2026-09-06 while answering "do we surface any warning about this?"**
+> These are observations from reading the code, not filed defects, and they are why the operator
+> asked for a prompt:
+>
+> - The only proactive notice is a **single startup status line** appended to the theme startup
+>   status (`src/tui/app.rs:14272`). It does name the commands — *"use :recovery-resume [id] or
+>   :recovery-defer [id]"* — but it is one line among others and is easy to miss.
+> - Parked entries **do** appear in the transfer queue surface, labelled `"recovered · "`
+>   (`crates/tui-file-picker/src/progress.rs:1302`-`1305`). The label does not say the entry is
+>   waiting for the user, that it will never start on its own, or how to act on it. A queued-looking
+>   transfer that never moves is the natural misreading.
+> - **`is_busy()` counts them** (`src/tui/app.rs:7089`-`7093`), and that gates real actions: undo and
+>   redo both refuse with *"Undo/Redo is unavailable while file transfers are running or queued"*
+>   (`src/tui/keybindings.rs:2580` and `:2603`). So a parked review item that cannot advance without a
+>   command blocks undo/redo indefinitely, behind a message implying the block is transient. This
+>   looks like the sharpest edge of the three.
+>
+> The supersession/dedup residual described below is still open and is a separate matter from the
+> prompt work above.
 
 > **MOSTLY RESOLVED — re-verified 2026-08-25 by reading the path (an earlier grep-based pass wrongly
 > called this fully open).**

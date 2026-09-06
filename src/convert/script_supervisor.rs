@@ -256,7 +256,7 @@ pub struct SupervisedCommand {
     pub runtime_identity: RuntimeDirectoryIdentity,
     pub containment_preference: ContainmentPreference,
     /// Test/embedding override for the trusted Tonepoet helper binary.
-    /// Production callers leave this as `None`, which resolves to `current_exe()`.
+    /// Production callers leave this as `None`, which resolves to the running Tonepoet image.
     pub helper_executable: Option<PathBuf>,
     /// Tonepoet-owned lifetime descriptors retained only by the trusted supervisor.
     /// They are made inheritable for the supervisor handoff and immediately
@@ -491,13 +491,13 @@ fn resolve_supervisor_helper_executable(
         return Ok(PathBuf::from(path));
     }
 
-    let current = std::env::current_exe().map_err(|error| {
+    let current = crate::reexec::current_executable_for_reexec().map_err(|error| {
         ScriptSupervisorError::Internal(format!(
             "cannot locate the current executable for script supervision: {error}"
         ))
     })?;
     let Some(default_test_helper) = cargo_test_helper_candidate(&current) else {
-        // Production behavior remains re-exec of the running tonepoet binary.
+        // Production behavior remains re-exec of the running Tonepoet image.
         return Ok(current);
     };
 
@@ -2639,7 +2639,7 @@ fn spawn_launcher(
 ) -> Result<(Child, UnixStream), ScriptSupervisorError> {
     let (release, launch_child) = UnixStream::pair()?;
     let launch_fd = launch_child.as_raw_fd();
-    let current_executable = std::env::current_exe().map_err(|error| {
+    let current_executable = crate::reexec::current_executable_for_reexec().map_err(|error| {
         ScriptSupervisorError::Internal(format!(
             "cannot locate the current executable for the script launcher: {error}"
         ))
