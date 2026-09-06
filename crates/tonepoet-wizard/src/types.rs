@@ -191,9 +191,6 @@ pub enum PopupType {
     TextInput {
         field: EditingField,
     },
-    OverwriteConfirm {
-        preset_name: String,
-    },
     PresetList {
         presets: Vec<String>,
         selected_index: usize,

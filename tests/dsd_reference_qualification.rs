@@ -4317,7 +4317,6 @@ fn execute_measurement(
 struct PlannedChainResult {
     measurements: BTreeMap<MeasurementId, TruePeakMeasurement>,
     terminal_args: Vec<String>,
-    terminal_stderr: String,
     package_producer_args: Option<Vec<String>>,
     package_args: Option<Vec<String>>,
 }
@@ -4348,7 +4347,6 @@ fn execute_planned_terminal_chain(
     let summary = plan.reference.as_ref().expect("Reference summary");
     let mut measurements = BTreeMap::new();
     let mut terminal_args = None;
-    let mut terminal_stderr = None;
     let mut package_producer_args = None;
     let mut package_args = None;
     let mut deferred_count = 0_usize;
@@ -4420,8 +4418,7 @@ fn execute_planned_terminal_chain(
                 deferred_count += 1;
                 let resolved = resolve_reference_deferred_command(deferred, &measurements)?;
                 terminal_args = Some(resolved.args.clone());
-                let output = run_planned_command(&resolved, sox, ffmpeg);
-                terminal_stderr = Some(combined(&output));
+                let _ = run_planned_command(&resolved, sox, ffmpeg);
             }
         }
     }
@@ -4445,8 +4442,6 @@ fn execute_planned_terminal_chain(
     Ok(PlannedChainResult {
         measurements,
         terminal_args: terminal_args.ok_or_else(|| "terminal command missing".to_string())?,
-        terminal_stderr: terminal_stderr
-            .ok_or_else(|| "terminal command output missing".to_string())?,
         package_producer_args,
         package_args,
     })
@@ -5224,7 +5219,7 @@ fn qualify_lossless_package_cells(
                             );
                             post_metadata_identity_comparison_count += 1;
                         }
-                        let mut generated = BTreeSet::from([
+                        let generated = BTreeSet::from([
                             summary.r64_path.clone(),
                             summary.qpcm_path.clone(),
                             summary.packaged_path.clone(),

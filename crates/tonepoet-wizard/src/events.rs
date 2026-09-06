@@ -140,11 +140,6 @@ impl SimpleWizard {
                 self.should_exit = true; // Set flag to exit wizard
                 true // Button was handled
             }
-            Some(ButtonId::SavePreset) => {
-                // Legacy wizard preset writes are intentionally disabled.
-                // The main Tonepoet preset manager owns coordinated persistence.
-                true
-            }
             Some(ButtonId::BrowseButton) => {
                 // Browse button clicked - open file browser
                 use std::env;
@@ -214,9 +209,6 @@ impl SimpleWizard {
                     match &popup_state.popup_type {
                         PopupType::PresetName => {
                             // Read-only legacy wizard: no direct preset persistence.
-                        }
-                        PopupType::OverwriteConfirm { .. } => {
-                            // Read-only legacy wizard: overwrite is not performed here.
                         }
                         PopupType::TextInput { field } => {
                             // Apply the text input to the appropriate field
@@ -1694,7 +1686,6 @@ impl SimpleWizard {
                 KeyCode::Tab => {
                     // Tab through navigation buttons
                     match nav_button {
-                        ButtonId::SavePreset => self.focused_nav_button = Some(ButtonId::Back),
                         ButtonId::Back => self.focused_nav_button = Some(ButtonId::Next),
                         ButtonId::Next => self.focused_nav_button = Some(ButtonId::Cancel),
                         ButtonId::Cancel => self.focused_nav_button = Some(ButtonId::Back),
@@ -1705,9 +1696,6 @@ impl SimpleWizard {
                 KeyCode::Enter => {
                     // Activate the focused button
                     match nav_button {
-                        ButtonId::SavePreset => {
-                            self.focused_nav_button = Some(ButtonId::Back);
-                        }
                         ButtonId::Back => {
                             self.previous_step();
                             self.focused_nav_button = None;
@@ -1932,9 +1920,6 @@ impl SimpleWizard {
                     match popup_type {
                         PopupType::PresetName => {
                             // Read-only legacy wizard: no direct preset persistence.
-                        }
-                        PopupType::OverwriteConfirm { .. } => {
-                            // Read-only legacy wizard: overwrite is not performed here.
                         }
                         PopupType::TextInput { field } => {
                             // Apply the text input to the appropriate field
@@ -2498,17 +2483,4 @@ mod release_gate_no_mutation_tests {
         assert!(!wizard.needs_destination_selection);
     }
 
-    #[test]
-    fn legacy_save_preset_control_has_no_write_flow() {
-        let mut wizard = SimpleWizard::new();
-        wizard.current_step = 3;
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::empty(),
-        };
-        assert!(wizard.handle_mouse(mouse, Some(ButtonId::SavePreset)));
-        assert!(wizard.popup_state.is_none(), "legacy SavePreset must not open a persistence dialog");
-    }
 }

@@ -35053,7 +35053,7 @@ fn metadata_editor_handle_chapter_key(
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     use crate::tui::chapter_authoring::{
-        ChapterAuthoringLoadState, ChapterColumn, ChapterEditKind, ChapterGenerationField,
+        ChapterAuthoringLoadState, ChapterEditKind, ChapterGenerationField,
     };
 
     if state.content_tab != crate::tui::app::ContentTab::Chapters {
@@ -69342,7 +69342,7 @@ mod phase4_tests {
     use super::super::probe::TagEntry;
     use super::*;
     use super::single_image_metadata_editor_regression_tests::{
-        create_flac_fixture, create_foxy_route_fixture, fixture_tool_available,
+        create_flac_fixture, fixture_tool_available,
         select_foxy_route,
     };
     use crate::config::TonepoetConfig;
@@ -69967,7 +69967,7 @@ mod phase4_tests {
 
     #[test]
     fn all_blocked_title_enter_preserves_refusal() {
-        let mut state = two_file_editor_with_second_blocked(vec![entry(
+        let state = two_file_editor_with_second_blocked(vec![entry(
             "TITLE",
             ItemKey::TrackTitle,
             &["One", "Two"],
@@ -70389,7 +70389,7 @@ mod phase4_tests {
 
     #[test]
     fn tab_navigation_into_uniform_title_remains_inline() {
-        let mut state = two_file_editor(vec![
+        let state = two_file_editor(vec![
             entry(
                 "ALBUM",
                 ItemKey::AlbumTitle,
@@ -95665,7 +95665,7 @@ FILE "a.flac" WAVE
             );
         }
 
-        let (mut state, results, status) = save_through_production_path(&mut app, state).await;
+        let (state, results, status) = save_through_production_path(&mut app, state).await;
         assert!(
             !results.iter().any(|result| matches!(
                 &result.outcome,
@@ -98774,16 +98774,17 @@ mod untaggable_carrier_sidecar_regression_tests {
             assert!(plan.create_if_missing);
             assert!(plan.sidecar_only);
             assert!(plan.required_audio_paths.is_empty());
+            let (session_id, generation) = state.begin_write();
             let result = cue_sidecar_writeback_result_after_successful_image_save(plan, &[])
                 .expect("sidecar-only result");
-            assert!(matches!(
-                result.outcome,
-                crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved {
-                    created: true,
-                    unchanged: false,
-                    ..
-                }
-            ));
+            assert_sidecar_created_once(std::slice::from_ref(&result), &cue_path);
+            let summary = state
+                .apply_write_results(session_id, generation, vec![result])
+                .expect("created sidecar completion should reduce editor state");
+            assert_eq!(summary.sidecar_cue_saved, 1);
+            assert_eq!(summary.sidecar_cue_created, 1);
+            assert!(summary.all_saved(), "unexpected created-sidecar summary: {summary:?}");
+            assert_sidecar_created_success_status(&summary.status_line());
             assert!(cue_path.exists());
             let parsed = crate::tui::cue_parser::parse_cue_file(&cue_path)
                 .expect("created sidecar parses");

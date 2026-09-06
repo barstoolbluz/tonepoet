@@ -166,15 +166,6 @@ fn parses_phase0_fixture_directories() {
             }
         }
 
-        if fixture.name == "mgletsgetiton" {
-            // TODO: The multi-format assertion is disabled because real discs
-            // do NOT encode the audio-format table index in the low 3 bits of
-            // track_type. All MGLETSGETITON tracks have format_index=0 by that
-            // logic, but titles 131+ are actually 192/24 stereo (format 2).
-            // The format-to-title mapping likely comes from the AOTT table or
-            // from AOB packet stream headers, not from track_type.
-            // assert_mgletsgetiton_multi_format_ats(&disc);
-        }
     }
 }
 
@@ -226,40 +217,6 @@ fn assert_aott_entries_resolve(fixture_name: &str, disc: &dvda_demuxer::tui::dvd
             entry.title_nr
         );
     }
-}
-
-fn assert_mgletsgetiton_multi_format_ats(disc: &dvda_demuxer::tui::dvda::DvdaDisc) {
-    let ats1 = disc
-        .title_sets
-        .iter()
-        .find(|ts| ts.number == 1)
-        .expect("MGLETSGETITON should contain ATS 01");
-
-    let mut active_indices = BTreeSet::new();
-    for title in &ats1.titles {
-        for index in &title.track_type_low_bits_candidates {
-            active_indices.insert(*index);
-        }
-    }
-
-    assert!(
-        active_indices.contains(&0),
-        "MGLETSGETITON ATS 01 should expose format 0 for the 96/24 multichannel presentation"
-    );
-    assert!(
-        active_indices.contains(&2),
-        "MGLETSGETITON ATS 01 should expose format 2 for the 192/24 stereo presentation"
-    );
-
-    let format0 = ats1.audio_formats.iter().find(|format| format.format_index == 0).unwrap();
-    assert!(format0.present, "MGLETSGETITON ATS 01 format 0 should be present");
-    assert_eq!(format0.channel_format.group1_sample_rate, Some(96_000));
-    assert_eq!(format0.channel_format.group1_bits, Some(24));
-
-    let format2 = ats1.audio_formats.iter().find(|format| format.format_index == 2).unwrap();
-    assert!(format2.present, "MGLETSGETITON ATS 01 format 2 should be present");
-    assert_eq!(format2.channel_format.group1_sample_rate, Some(192_000));
-    assert_eq!(format2.channel_format.group1_bits, Some(24));
 }
 
 fn fixture_root() -> PathBuf {

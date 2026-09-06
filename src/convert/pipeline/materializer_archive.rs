@@ -1512,14 +1512,16 @@ pub fn archive_native_rename_available(
     }
 }
 
+/// One archive-relative member rename requested by the native archive editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ArchiveNativeRenamePair {
+pub struct ArchiveNativeRenamePair {
     pub(crate) old_inner_path: String,
     pub(crate) new_inner_path: String,
 }
 
 impl ArchiveNativeRenamePair {
-    pub(crate) fn new(old_inner_path: impl Into<String>, new_inner_path: impl Into<String>) -> Self {
+    /// Create an archive-relative rename from `old_inner_path` to `new_inner_path`.
+    pub fn new(old_inner_path: impl Into<String>, new_inner_path: impl Into<String>) -> Self {
         Self {
             old_inner_path: old_inner_path.into(),
             new_inner_path: new_inner_path.into(),
@@ -1527,10 +1529,21 @@ impl ArchiveNativeRenamePair {
     }
 }
 
+/// One member in the archive table used to validate a native rename plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ArchiveNativeMember {
+pub struct ArchiveNativeMember {
     pub(crate) path: String,
     pub(crate) is_dir: bool,
+}
+
+impl ArchiveNativeMember {
+    /// Create an archive member descriptor for `path`.
+    pub fn new(path: impl Into<String>, is_dir: bool) -> Self {
+        Self {
+            path: path.into(),
+            is_dir,
+        }
+    }
 }
 
 fn normalize_archive_relative_path(path: &Path) -> Result<PathBuf, String> {

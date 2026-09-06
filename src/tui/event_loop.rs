@@ -4658,9 +4658,11 @@ fn start_browse_archive_repackage_inner(
                     .listing
                     .entries
                     .iter()
-                    .map(|entry| crate::convert::pipeline::materializer_archive::ArchiveNativeMember {
-                        path: entry.path.clone(),
-                        is_dir: entry.is_dir,
+                    .map(|entry| {
+                        crate::convert::pipeline::materializer_archive::ArchiveNativeMember::new(
+                            entry.path.clone(),
+                            entry.is_dir,
+                        )
                     })
                     .collect(),
                 expected_fingerprint: (

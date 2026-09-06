@@ -1,3 +1,5 @@
+//! Integration tests for deterministic pipeline settings fingerprints.
+
 use tonepoet_pipeline::{
     settings_fingerprint, AacProfile, AacSettings, AudioFormat, BitDepthTarget, DbNano, DitherType,
     DsdAutoGainScope, DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings,

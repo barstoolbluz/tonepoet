@@ -100,14 +100,6 @@ impl PresetManager {
         Ok(presets)
     }
 
-
-
-    pub fn preset_exists(&self, name: &str) -> bool {
-        let filename = format!("{}.toml", name);
-        let file_path = self.presets_dir.join(&filename);
-
-        file_path.exists()
-    }
 }
 
 impl From<&crate::types::SimpleWizard> for ConversionPreset {

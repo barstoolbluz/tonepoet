@@ -2446,7 +2446,7 @@ mod metadata_pruning_tests {
     use super::*;
     use crate::enums::{AudioCodec, AudioFormat, PcmBitDepth, SampleKind};
     use crate::settings::PipelineSettings;
-    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use crate::source::SourceInfo;
     use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
     use std::path::PathBuf;
 

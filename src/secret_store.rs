@@ -994,7 +994,7 @@ mod backend {
             BackendError::new(kind, format!("{context}: {error}"))
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, not(target_os = "linux")))]
         pub(super) fn default_backend_is_mock() -> Result<bool, String> {
             let entry = keyring::Entry::new(
                 "dev.flox.tonepoet.backend-boundary-test",

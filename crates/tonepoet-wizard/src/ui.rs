@@ -27,7 +27,6 @@ pub enum ButtonId {
     Back,
     Next,
     Cancel,
-    SavePreset,
     LoadPreset,
     FormatOption(usize),
     QualityOption(usize), // Add this for MP3/AAC/Opus quality selection
@@ -3608,7 +3607,6 @@ fn draw_popup(
             };
             (80, 9, title) // Keep height constant
         }
-        PopupType::OverwriteConfirm { .. } => (60, 8, " Confirm Overwrite "),
         PopupType::PresetList { presets, .. } => {
             let height = (presets.len() as u16 + 4).min(20); // +4 for title, spacing, and buttons
             (60, height, " Load Preset ")
@@ -3657,17 +3655,6 @@ fn draw_popup(
                 hovered_button,
                 "",
                 "",
-            );
-        }
-        PopupType::OverwriteConfirm { preset_name } => {
-            draw_overwrite_confirm_popup(
-                f,
-                ctx,
-                inner_area,
-                preset_name,
-                mouse_areas,
-                popup_state,
-                hovered_button,
             );
         }
         PopupType::PresetList {
@@ -3946,55 +3933,6 @@ fn draw_input_field(
         let cursor_y = inner_area.y;
         f.set_cursor(cursor_x, cursor_y);
     }
-}
-
-fn draw_overwrite_confirm_popup(
-    f: &mut Frame,
-    ctx: &WizardRenderCtx,
-    area: Rect,
-    preset_name: &str,
-    mouse_areas: &mut MouseAreas,
-    popup_state: &PopupState,
-    hovered_button: Option<ButtonId>,
-) {
-    // Split area for message and buttons
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),    // Message area
-            Constraint::Length(2), // Buttons
-        ])
-        .split(area);
-
-    // Register popup background area (excluding button area)
-    let bg_area = Rect::new(area.x, area.y, area.width, area.height - 2);
-    mouse_areas.add(bg_area, ButtonId::PopupBackground);
-
-    // Draw warning message
-    let message = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("Preset '"),
-            Span::styled(
-                preset_name,
-                Style::default()
-                    .fg(ctx.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("' already exists!"),
-        ]),
-        Line::from(""),
-        Line::from("Do you want to overwrite it?"),
-    ];
-
-    let paragraph = Paragraph::new(message)
-        .style(Style::default().fg(ctx.theme.text))
-        .alignment(Alignment::Center);
-    f.render_widget(paragraph, chunks[0]);
-
-    // Draw buttons (Yes and No) - reuse popup buttons
-    let button_area = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
-    draw_popup_buttons(f, ctx, button_area, mouse_areas, popup_state, hovered_button);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

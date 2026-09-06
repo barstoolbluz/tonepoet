@@ -10011,7 +10011,7 @@ fn track_label(track: &PreparedTrack) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, HashMap};
     use tonepoet_pipeline::{extract_single_loudnorm_report, parse_reference_true_peak_measurement};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -12946,7 +12946,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
         PipelineStage, SourceAudioDescriptor, TrackId, TrackMetadata, TrackOutcome, TrackRecord,
         TrackSourceRef,
     };
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;

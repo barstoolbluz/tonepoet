@@ -30516,11 +30516,12 @@ fn album_peak_measurement_from_true_peak(
     }
 }
 
+#[cfg(test)]
 fn scan_album_gain_true_peak_carrier_with_cancel<F>(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
-    mut is_cancelled: F,
+    is_cancelled: F,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
 where
     F: FnMut() -> bool,
@@ -38647,8 +38648,7 @@ mod companion_copy_hardening_tests {
     use super::*;
     use crate::convert::cap_fs::ScopeId;
     use crate::convert::pipeline::actions::{
-        ActionFilesystem, ConversionAction, CreateFolderAction, RenameAction, RenameMode,
-        RunScriptAction, TargetSpec,
+        ActionFilesystem, ConversionAction, CreateFolderAction, RenameAction, RenameMode, TargetSpec,
     };
 
     #[test]
@@ -51712,7 +51712,7 @@ mod naming_template_tests {
         write_fragment_json,
     };
     use crate::convert::pipeline::actions::{
-        ConversionAction, CreateFolderAction, RunScriptAction,
+        ConversionAction, CreateFolderAction,
     };
 
     pub(super) fn template_source() -> PreparedSource {

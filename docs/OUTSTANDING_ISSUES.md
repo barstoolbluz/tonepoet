@@ -187,6 +187,25 @@ recovery; the second instance also had a pending archive session waiting.
 
 ## 3. `current_exe()`-deleted → cryptic ENOENT when a file op runs from a pre-rebuild TUI
 
+> ### >>> NEXT UP — scheduled to be worked immediately after the compiler-warnings round returns <<<
+>
+> **Field-reproduced again 2026-09-06**, on a Ctrl+X from `/home/daedalus/torrents/2025 Immersed Box`
+> to `/home/daedalus/temp/other/archive/audio-isos/blu-ray`. Direct evidence this time, not inference:
+> the running TUI was pid 2582490 with
+> `readlink /proc/2582490/exe` → `/home/daedalus/dev/tonepoet/target/release/tonepoet (deleted)`.
+> The binary had been replaced by release rebuilds during the chapter/Opus delivery work while that
+> session stayed open. No data was at risk — the failure is at helper spawn, before any copy or
+> removal — but the user hit it during ordinary use, which is the argument for fixing it now.
+>
+> **Anchors re-verified 2026-09-06** (the file has grown since the last correction):
+> `current_exe()` is now at `src/tui/keybindings.rs:57019` (was cited `:49710`), and the handler that
+> formats `"start isolated file-task helper: {error}"` is now at **`:57062`** (was cited `:49753`).
+> Re-locate by string rather than line number; these anchors drift every round.
+>
+> **Worth folding in:** issue #4 below is the same user journey. Restarting to recover from this error
+> is what triggers the un-prompted replay of every journalled failed operation. A fix for #3 that
+> leaves #4 alone still leaves the user surprised on relaunch.
+
 > **Verified STILL OPEN 2026-08-25** (read, not grepped). **Anchor correction:** `current_exe()` is at `src/tui/keybindings.rs:49710`, not `:44365` — and its `Err` arm (`:49712`) is **NOT** the failing path, because `current_exe()` *succeeds* on a deleted binary and returns `"<path> (deleted)"`. The real failure is downstream at `command.spawn()`, whose handler formats the raw `"start isolated file-task helper: {error}"` at **`:49753`**. No `(deleted)` detection and no un-suffixed-path fallback exist. Both fix directions unimplemented.
 
 **Discovered:** 2026-08-09, on a Ctrl+X (cut/move) in a stale tonepoet instance.

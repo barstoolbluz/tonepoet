@@ -18305,7 +18305,7 @@ mod conversion_actions_tests {
         let album = temp.path().join("album");
         fs::create_dir(&album).unwrap();
 
-        let mut lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
+        let lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
         assert!(!temp.path().join(".tonepoet-action-lock-registry.lock").exists());
         assert!(!temp.path().join(".tonepoet-action-locks").exists());
         assert!(!album.join(".tonepoet-actions-manual/.manual-run.lock").exists());
@@ -18322,7 +18322,7 @@ mod conversion_actions_tests {
         fs::create_dir(&album).unwrap();
         let path = shared_album_publication_lock_display_path_for_test(&album).unwrap();
 
-        let mut lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
+        let lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
         assert!(path.is_file());
         drop(lock);
         assert!(!path.exists(), "ordinary publication authority must not leave an artifact");
@@ -18449,7 +18449,7 @@ mod conversion_actions_tests {
     fn acquiring_manual_authority_does_not_materialize_the_album_or_journal_root() {
         let temp = tempfile::tempdir().unwrap();
         let album = temp.path().join("not-yet-published");
-        let mut lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
+        let lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
         assert!(!album.exists());
         assert!(!album.join(".tonepoet-actions-manual").exists());
         drop(lock);
@@ -18464,7 +18464,7 @@ mod conversion_actions_tests {
         fs::create_dir_all(&manual_root).unwrap();
         fs::write(manual_root.join("actions-post.write-tmp"), b"unresolved").unwrap();
 
-        let mut lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
+        let lock = acquire_explicit_action_run_lock_for_album(&album).unwrap();
         let error = ensure_album_publication_has_no_unresolved_explicit_state(&lock, &album)
             .expect_err("publishing must not replace the only manual recovery authority");
         assert!(matches!(error, ActionError::Conflict(_)));
@@ -20509,7 +20509,7 @@ mod conversion_actions_tests {
             filesystem: &filesystem,
             scripts: &runner,
         };
-        let mut lock = acquire_explicit_action_run_lock(&context).unwrap();
+        let lock = acquire_explicit_action_run_lock(&context).unwrap();
         let prepared = action_engine
             .prepare_explicit_invocation_with_lock(
                 &pipeline,
@@ -20563,7 +20563,7 @@ mod conversion_actions_tests {
         let runner = RecordingRunner::default();
         let filesystem = CapabilityActionFilesystem::new();
         let action_engine = ActionEngine { filesystem: &filesystem, scripts: &runner };
-        let mut lock = acquire_explicit_action_run_lock(&context).unwrap();
+        let lock = acquire_explicit_action_run_lock(&context).unwrap();
         let prepared = action_engine
             .prepare_explicit_invocation_with_lock(&pipeline, &context, &"b".repeat(64), &lock)
             .unwrap();
@@ -20680,7 +20680,7 @@ mod conversion_actions_tests {
         let runner = RecordingRunner::default();
         let filesystem = CapabilityActionFilesystem::new();
         let action_engine = ActionEngine { filesystem: &filesystem, scripts: &runner };
-        let mut lock = acquire_explicit_action_run_lock(&context).unwrap();
+        let lock = acquire_explicit_action_run_lock(&context).unwrap();
         let first = action_engine
             .prepare_explicit_invocation_with_lock(&pipeline, &context, &"f".repeat(64), &lock)
             .unwrap();
@@ -20884,7 +20884,7 @@ mod conversion_actions_tests {
         let runner = RecordingRunner::default();
         let filesystem = CapabilityActionFilesystem::new();
         let action_engine = ActionEngine { filesystem: &filesystem, scripts: &runner };
-        let mut lock = acquire_explicit_action_run_lock(&context).unwrap();
+        let lock = acquire_explicit_action_run_lock(&context).unwrap();
         let prepared = action_engine
             .prepare_explicit_invocation_with_lock(&pipeline, &context, &"1".repeat(64), &lock)
             .unwrap();
@@ -20965,7 +20965,7 @@ mod conversion_actions_tests {
         let runner = RecordingRunner::default();
         let filesystem = CapabilityActionFilesystem::new();
         let action_engine = ActionEngine { filesystem: &filesystem, scripts: &runner };
-        let mut lock = acquire_explicit_action_run_lock(&context).unwrap();
+        let lock = acquire_explicit_action_run_lock(&context).unwrap();
         let prepared = action_engine
             .prepare_explicit_invocation_with_lock(&pipeline, &context, &"3".repeat(64), &lock)
             .unwrap();
