@@ -1,7 +1,8 @@
 //! PR 1 — every error type the pipeline contracts use.
 //!
-//! All `thiserror`-derived. No later PR adds a new error type.
+//! Error contracts shared across the conversion pipeline.
 
+use std::fmt;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -76,32 +77,110 @@ pub enum PlanError {
     PathOutsideOutputRoot(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ToolRunnerError {
-    #[error("failed to spawn tool")]
     Spawn { command: CommandRecord },
-    #[error("tool timed out after {elapsed:?}")]
     Timeout {
         elapsed: Duration,
         command: CommandRecord,
     },
-    #[error("tool cancelled")]
     Cancelled { command: CommandRecord },
-    #[error("tool runner does not support typed pipelines")]
     UnsupportedPipeline,
-    #[error("tool termination/reaping failed: {message}")]
     Termination {
         message: String,
         command: CommandRecord,
     },
-    #[error("tool exited non-zero")]
     NonZeroExit {
         exit: ProcessExit,
         stderr_tail: String,
         command: CommandRecord,
     },
-    #[error("io error running tool: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+}
+
+const TOOL_ERROR_STDERR_DISPLAY_CHARS: usize = 512;
+
+fn compact_tool_stderr(stderr: &str) -> Option<String> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut chars = trimmed.chars().rev();
+    let mut tail = chars
+        .by_ref()
+        .take(TOOL_ERROR_STDERR_DISPLAY_CHARS)
+        .collect::<Vec<_>>();
+    let truncated = chars.next().is_some();
+    tail.reverse();
+    let compact = tail
+        .into_iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(if truncated {
+        format!("... {compact}")
+    } else {
+        compact
+    })
+}
+
+fn process_exit_text(exit: ProcessExit) -> String {
+    match exit {
+        ProcessExit::Code(code) => format!("exit code {code}"),
+        ProcessExit::Signal(signal) => format!("signal {signal}"),
+        ProcessExit::Unknown => "unknown exit status".to_string(),
+    }
+}
+
+impl fmt::Display for ToolRunnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn { .. } => f.write_str("failed to spawn tool"),
+            Self::Timeout { elapsed, .. } => write!(f, "tool timed out after {elapsed:?}"),
+            Self::Cancelled { .. } => f.write_str("tool cancelled"),
+            Self::UnsupportedPipeline => {
+                f.write_str("tool runner does not support typed pipelines")
+            }
+            Self::Termination { message, .. } => {
+                write!(f, "tool termination/reaping failed: {message}")
+            }
+            Self::NonZeroExit {
+                exit,
+                stderr_tail,
+                command,
+            } => {
+                write!(
+                    f,
+                    "{}: tool exited non-zero ({})",
+                    command.binary.canonical_name(),
+                    process_exit_text(*exit),
+                )?;
+                if let Some(stderr) = compact_tool_stderr(stderr_tail) {
+                    write!(f, "; stderr: {stderr}")
+                } else {
+                    f.write_str("; no stderr output")
+                }
+            }
+            Self::Io(error) => write!(f, "io error running tool: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolRunnerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for ToolRunnerError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 #[derive(Debug, Error)]

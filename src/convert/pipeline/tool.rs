@@ -156,6 +156,34 @@ impl ToolCommand {
     }
 }
 
+fn validate_tool_command_process_boundary(cmd: &ToolCommand) -> Result<(), ToolRunnerError> {
+    if let Some(index) = cmd.args.iter().position(|argument| argument.contains('\0')) {
+        return Err(ToolRunnerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to start {}: argument {} contains an embedded NUL byte",
+                cmd.binary.canonical_name(),
+                index + 1,
+            ),
+        )));
+    }
+
+    if let Some(index) = cmd.env.iter().position(|entry| {
+        entry.key.contains('\0') || entry.value.expose().contains('\0')
+    }) {
+        return Err(ToolRunnerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to start {}: environment entry {} contains an embedded NUL byte",
+                cmd.binary.canonical_name(),
+                index + 1,
+            ),
+        )));
+    }
+
+    Ok(())
+}
+
 /// Process termination — handles signal death and missing exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcessExit {
@@ -1309,6 +1337,11 @@ impl RealToolRunner {
         stdout_file: Option<Arc<std::fs::File>>,
         stderr_file: Option<Arc<std::fs::File>>,
     ) -> Result<ToolOutput, ToolRunnerError> {
+        // Process arguments and environment entries are C strings at exec.
+        // Reject embedded NULs here, before containment turns the protocol
+        // error into a generic worker exit status and discards the cause.
+        validate_tool_command_process_boundary(&cmd)?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -2527,6 +2560,38 @@ pub(crate) mod blocking_test_runner {
         }
 
         #[tokio::test]
+        async fn nonzero_error_display_reports_exit_and_compact_stderr() {
+            let runner = StubToolRunner::new();
+            runner.push_failure("first line\nmetadata writer rejected input\n");
+            let error = runner
+                .run(
+                    cmd(ToolBinary::Metaflac, "--set-tag=COMMENT=not-for-display"),
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("stub failure");
+            let displayed = error.to_string();
+
+            assert!(displayed.contains("metaflac: tool exited non-zero"));
+            assert!(displayed.contains("exit code 1"));
+            assert!(displayed.contains("stderr: first line metadata writer rejected input"));
+            assert!(!displayed.contains("not-for-display"));
+
+            runner.push_failure("");
+            let empty_stderr = runner
+                .run(
+                    cmd(ToolBinary::Metaflac, "--set-tag=COMMENT=still-not-for-display"),
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("stub failure with empty stderr");
+            let displayed = empty_stderr.to_string();
+            assert!(displayed.contains("exit code 1"));
+            assert!(displayed.contains("no stderr output"));
+            assert!(!displayed.contains("still-not-for-display"));
+        }
+
+        #[tokio::test]
         async fn succeeds_fails_and_records_in_order() {
             let runner = BlockingToolRunner::with_behaviors([
                 ToolBehavior::Succeed,
@@ -2666,6 +2731,26 @@ mod real_tool_runner_tests {
         let mut paths = HashMap::new();
         paths.insert(binary.canonical_name().to_string(), PathBuf::from(program));
         RealToolRunner::new(paths)
+    }
+
+    #[test]
+    fn process_boundary_validation_rejects_nul_without_echoing_argument() {
+        let command = closed_command(
+            ToolBinary::Metaflac,
+            vec!["--set-tag=COMMENT=combatexe\0".to_string()],
+            Duration::from_secs(1),
+        );
+        let error = validate_tool_command_process_boundary(&command)
+            .expect_err("embedded NUL must be rejected before execution");
+        let displayed = error.to_string();
+
+        assert!(matches!(
+            error,
+            ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(displayed.contains("refusing to start metaflac"));
+        assert!(displayed.contains("argument 1 contains an embedded NUL byte"));
+        assert!(!displayed.contains("combatexe"));
     }
 
     #[cfg(unix)]

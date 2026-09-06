@@ -4089,6 +4089,59 @@ mod tests {
     }
 
     #[test]
+    fn dsf_comment_nul_terminator_is_preserved_until_output_projection() {
+        use id3::frame::Comment;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("nul-comment.dsf");
+        let mut tag = id3::Tag::new();
+        tag.add_frame(
+            id3::Frame::with_content(
+                "COMM",
+                id3::Content::Comment(Comment {
+                    lang: "eng".to_string(),
+                    description: String::new(),
+                    text: "combatexe\0".to_string(),
+                }),
+            )
+            .set_encoding(Some(id3::Encoding::UTF16)),
+        );
+        let mut metadata_bytes = Vec::new();
+        tag.write_to(&mut metadata_bytes, id3::Version::Id3v24)
+            .expect("serialize UTF-16 NUL-bearing ID3 fixture");
+        let comm_offset = metadata_bytes
+            .windows(4)
+            .position(|window| window == b"COMM")
+            .expect("serialized fixture must contain COMM");
+        assert_eq!(
+            metadata_bytes.get(comm_offset + 10),
+            Some(&1),
+            "COMM fixture must use ID3 UTF-16-with-BOM encoding",
+        );
+        write_test_dsf_fixture(&path, Some(&metadata_bytes)).expect("write DSF fixture");
+
+        let outcome = read_with_warnings(&path).expect("read NUL-bearing DSF tag");
+        assert_eq!(outcome.snapshot.first("COMMENT"), Some("combatexe\0"));
+        let track = to_track_metadata(&outcome.snapshot);
+        assert_eq!(track.comment.as_deref(), Some("combatexe\0"));
+
+        let output_tags = crate::convert::pipeline::authoritative_metadata_tags(
+            &track,
+            &crate::convert::pipeline::AlbumMetadata::default(),
+        );
+        assert!(output_tags.contains(&(
+            "COMMENT".to_string(),
+            "combatexe".to_string(),
+        )));
+        assert!(
+            output_tags
+                .iter()
+                .all(|(_, value)| !value.contains('\0')),
+            "process-boundary metadata must be NUL-free",
+        );
+    }
+
+    #[test]
     fn dsf_read_preserves_all_six_pipeline_value_lists_and_writer_scope() {
         use id3::frame::ExtendedText;
 

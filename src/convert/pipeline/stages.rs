@@ -4645,7 +4645,10 @@ fn prepared_artifact_requires_post_encode_metadata(
     let Some(track) = source.tracks.iter().find(|track| track.id == artifact.track_id) else {
         return false;
     };
-    let tags = authoritative_metadata_tags(&track.metadata, &source.album_metadata);
+    let (tags, requires_nul_projection) = authoritative_metadata_tags_with_nul_projection(
+        &track.metadata,
+        &source.album_metadata,
+    );
     let ext = artifact
         .staged_path
         .extension()
@@ -4659,8 +4662,11 @@ fn prepared_artifact_requires_post_encode_metadata(
         // source provenance with embedded NUL separators likewise needs the
         // authoritative boundary to project every logical value into one
         // legal scalar carrier instead of trusting FFmpeg's first-value view.
+        // Canonical prepared values with a retained NUL terminator need that
+        // same boundary even when they are otherwise scalar.
         "flac" | "wv" => {
-            !pipeline_multivalue_write_changes(&tags).is_empty()
+            requires_nul_projection
+                || !pipeline_multivalue_write_changes(&tags).is_empty()
                 || source_provenance_requires_scalar_projection(
                     &track.metadata,
                     &source.album_metadata,
@@ -4686,7 +4692,8 @@ fn prepared_artifact_requires_post_encode_metadata(
                 || tags.iter().any(|(key, _)| {
                     !matches!(key.as_str(), "TRACKTOTAL" | "DISCTOTAL")
                 });
-            (req.settings.metadata.transfer_tags && requested_source_tags_present)
+            requires_nul_projection
+                || (req.settings.metadata.transfer_tags && requested_source_tags_present)
                 || !pipeline_multivalue_write_changes(&tags).is_empty()
                 || source_provenance_requires_scalar_projection(
                     &track.metadata,
@@ -4699,7 +4706,8 @@ fn prepared_artifact_requires_post_encode_metadata(
         // M4A/MP4 custom/freeform provenance is already covered by
         // m4a_artifact_has_freeform_metadata.
         "mp3" | "wav" | "aiff" | "aif" => {
-            !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
+            requires_nul_projection
+                || !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
                 || source_provenance_requires_scalar_projection(
                     &track.metadata,
                     &source.album_metadata,
@@ -4707,15 +4715,19 @@ fn prepared_artifact_requires_post_encode_metadata(
                 )
         }
         "m4a" | "m4b" | "mp4" => {
-            !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
+            requires_nul_projection
+                || !pipeline_multivalue_overlay_changes_for_extension(&tags, &ext).is_empty()
         }
         // W64 metadata mutation is intentionally fail-closed. Never let a
         // planner-transfer satisfaction bit bypass that safety boundary.
-        "w64" => authoritative_metadata_mutation_required(
-            &track.metadata,
-            &source.album_metadata,
-            &tags,
-        ),
+        "w64" => {
+            requires_nul_projection
+                || authoritative_metadata_mutation_required(
+                    &track.metadata,
+                    &source.album_metadata,
+                    &tags,
+                )
+        },
         _ => false,
     }
 }
@@ -5481,7 +5493,7 @@ fn source_provenance_requires_scalar_projection(
     })
 }
 
-pub(crate) fn authoritative_metadata_tags(
+fn authoritative_metadata_tags_unprojected(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
 ) -> Vec<(String, String)> {
@@ -5841,6 +5853,60 @@ pub(crate) fn authoritative_metadata_tags(
     }
 
     tags
+}
+
+/// Convert text metadata into values that can cross an OS process boundary.
+///
+/// Tonepoet deliberately uses NUL as an internal separator for some ordered
+/// text fields. A retained terminator from a source text frame is therefore
+/// indistinguishable from an empty final member until the output boundary.
+/// Preserve ordered-list semantics by expanding non-empty members into native
+/// repeated values; project scalar fields to the same semicolon-separated
+/// representation already used for custom source provenance. The prepared
+/// metadata itself remains untouched.
+fn project_metadata_output_tags(
+    tags: Vec<(String, String)>,
+) -> (Vec<(String, String)>, bool) {
+    if !tags.iter().any(|(_, value)| value.contains('\0')) {
+        return (tags, false);
+    }
+
+    let mut projected = Vec::with_capacity(tags.len());
+    for (key, value) in tags {
+        if !value.contains('\0') {
+            projected.push((key, value));
+            continue;
+        }
+        if pipeline_set_valued_tag_key(&key) {
+            for component in value.split('\0').filter(|component| !component.is_empty()) {
+                projected.push((key.clone(), component.to_string()));
+            }
+        } else {
+            let components = value
+                .split('\0')
+                .filter(|component| !component.is_empty())
+                .collect::<Vec<_>>();
+            if !components.is_empty() {
+                projected.push((key, components.join("; ")));
+            }
+        }
+    }
+
+    (projected, true)
+}
+
+fn authoritative_metadata_tags_with_nul_projection(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> (Vec<(String, String)>, bool) {
+    project_metadata_output_tags(authoritative_metadata_tags_unprojected(meta, album))
+}
+
+pub(crate) fn authoritative_metadata_tags(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> Vec<(String, String)> {
+    authoritative_metadata_tags_with_nul_projection(meta, album).0
 }
 
 fn tag_value<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -7311,6 +7377,9 @@ pub async fn qualify_production_metadata_mutation(
 
 #[cfg(test)]
 mod metadata_writer_command_tests {
+    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::{
+        fixture, planner_source_tag_satisfaction, stage_policy, successful_output,
+    };
     use super::*;
     use std::collections::BTreeMap;
     use std::process::Command as ProcessCommand;
@@ -8741,6 +8810,107 @@ mod metadata_writer_command_tests {
             "one; two; one".to_string(),
         )));
         assert!(fallback_tags.iter().all(|(_, value)| !value.contains('\0')));
+    }
+
+    #[test]
+    fn writer_owned_nul_values_are_projected_before_external_metadata_commands() {
+        let track = TrackMetadata {
+            artist: vec!["A\0B\0A".to_string()].into(),
+            comment: Some("combatexe\0".to_string()),
+            ..TrackMetadata::default()
+        };
+        let album = AlbumMetadata::default();
+        let (tags, requires_nul_projection) =
+            authoritative_metadata_tags_with_nul_projection(&track, &album);
+        let values = |key: &str| {
+            tags.iter()
+                .filter(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(requires_nul_projection);
+        assert_eq!(values("ARTIST"), vec!["A", "B", "A"]);
+        assert_eq!(values("COMMENT"), vec!["combatexe"]);
+        assert!(tags.iter().all(|(_, value)| !value.contains('\0')));
+        assert_eq!(track.comment.as_deref(), Some("combatexe\0"));
+        assert_eq!(track.artist.values(), &["A\0B\0A".to_string()]);
+
+        let (projected_again, second_projection_required) =
+            project_metadata_output_tags(tags.clone());
+        assert!(!second_projection_required);
+        assert_eq!(projected_again, tags, "NUL projection must be idempotent");
+
+        for (path, ext) in [
+            (Path::new("track.flac"), "flac"),
+            (Path::new("track.opus"), "opus"),
+            (Path::new("track.wv"), "wv"),
+        ] {
+            let (command, _) = metadata_tag_command(path, ext, &tags, &BTreeSet::new())
+                .expect("projected tags must construct a legal metadata command");
+            assert!(
+                command.args.iter().all(|argument| !argument.contains('\0')),
+                "{ext} metadata argv must not contain embedded NUL bytes",
+            );
+            assert!(
+                command.args.iter().any(|argument| argument.contains("COMMENT=combatexe")),
+                "{ext} command must persist the projected source comment",
+            );
+        }
+
+        let ffmpeg_args = ffmpeg_metadata_rewrite_args(
+            Path::new("track.m4a"),
+            Path::new(".track.m4a.tmp.m4a"),
+            &tags,
+            FfmpegMetadataCarrier::Auto,
+        );
+        assert!(ffmpeg_args.iter().all(|argument| !argument.contains('\0')));
+        assert_pair(&ffmpeg_args, "-metadata", "comment=combatexe");
+    }
+
+    #[test]
+    fn nul_projection_defeats_planner_source_tag_satisfaction() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(true, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.settings.metadata.transfer_tags = true;
+        fixture.album.source.tracks[0].metadata = TrackMetadata {
+            comment: Some("combatexe\0".to_string()),
+            ..TrackMetadata::default()
+        };
+
+        let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
+        artifact.metadata_required = planner_source_tag_satisfaction();
+        artifact.metadata_satisfaction = planner_source_tag_satisfaction();
+
+        for ext in [
+            "flac", "wv", "opus", "ogg", "mp3", "wav", "aiff", "aif", "m4a", "m4b", "mp4",
+            "w64",
+        ] {
+            artifact.staged_path.set_extension(ext);
+            assert!(
+                prepared_artifact_requires_post_encode_metadata(
+                    &artifact,
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "a NUL-bearing scalar must keep the {ext} authoritative metadata boundary",
+            );
+            assert!(
+                !planner_metadata_already_satisfied(
+                    &ArtifactSet {
+                        audio: AudioArtifacts::Tracks(vec![artifact.clone()]),
+                        sidecars: Vec::new(),
+                    },
+                    &fixture.album.source,
+                    &fixture.album.req,
+                ),
+                "planner source-tag satisfaction must not bypass {ext} NUL projection",
+            );
+        }
     }
 
     #[test]
@@ -54346,9 +54516,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     use async_trait::async_trait;
     use tonepoet_pipeline::PipelineSettings;
 
-    struct AlbumFixture {
+    pub(super) struct AlbumFixture {
         _temp: TempDir,
-        album: ScheduledAlbum,
+        pub(super) album: ScheduledAlbum,
         track_ids: Vec<TrackId>,
         staged_paths: Vec<PathBuf>,
         final_paths: Vec<PathBuf>,
@@ -56045,7 +56215,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
-    fn fixture(
+    pub(super) fn fixture(
         policy: FailurePolicy,
         track_count: usize,
         stages: StagePolicy,
@@ -56114,7 +56284,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         }
     }
 
-    fn successful_output(fixture: &AlbumFixture, index: usize) -> ScheduledTrackOutput {
+    pub(super) fn successful_output(fixture: &AlbumFixture, index: usize) -> ScheduledTrackOutput {
         let id = fixture.track_ids[index].clone();
         ScheduledTrackOutput {
             index,
@@ -57274,7 +57444,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
 
-    fn planner_source_tag_satisfaction() -> PlannedMetadataSatisfaction {
+    pub(super) fn planner_source_tag_satisfaction() -> PlannedMetadataSatisfaction {
         PlannedMetadataSatisfaction {
             source_tags_transferred: true,
             ..PlannedMetadataSatisfaction::none()
