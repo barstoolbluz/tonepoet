@@ -6001,6 +6001,45 @@ mod direct_queue_source_policy_expansion_tests {
     }
 
     #[test]
+    fn matroska_webm_are_conversion_sources_without_widening_metadata_enumeration() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let carriers = ["album.mka", "album.mkv", "album.webm", "album.weba"]
+            .into_iter()
+            .map(|name| {
+                let path = td.path().join(name);
+                std::fs::write(&path, b"container fixture").expect("container fixture");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        for path in &carriers {
+            let explicit = expand_paths_to_audio_with_metadata(std::slice::from_ref(path));
+            assert_eq!(
+                explicit.paths,
+                vec![path.clone()],
+                "explicit Matroska/WebM source must reach the conversion queue"
+            );
+        }
+
+        let recursive_conversion =
+            expand_paths_to_audio_with_metadata(&[td.path().to_path_buf()]);
+        for path in &carriers {
+            assert!(
+                path_list_contains(&recursive_conversion.paths, path),
+                "recursive conversion should admit chapter-capable direct sources"
+            );
+        }
+
+        let metadata_sources = expand_paths_to_all_audio(&[td.path().to_path_buf()]);
+        for path in &carriers {
+            assert!(
+                !path_list_contains(&metadata_sources, path),
+                "folder-level metadata enumeration must remain on the established AudioFile classifier"
+            );
+        }
+    }
+
+    #[test]
     fn queue_expansion_preserves_probe_admitted_disc_images_and_rejects_generic_iso() {
         let td = tempfile::tempdir().expect("tempdir");
         let sacd = td.path().join("sacd.iso");

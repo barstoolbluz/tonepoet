@@ -2,7 +2,7 @@
 //!
 //! Structural sources are represented downstream as ordinary `PreparedTrack`s.
 //! When those tracks are intentionally merged, this module emits the default
-//! companion CUE and, for MP4-family output, serializes the same ordered
+//! companion CUE and, for chapter-capable output, serializes the same ordered
 //! structure as embedded chapters. It does not own a second chapter/CUE model:
 //! boundaries come from the target-domain merged timeline and titles/metadata
 //! come from the already-authoritative prepared source.
@@ -135,7 +135,10 @@ pub(crate) async fn finalize_structured_chapters_before_publish(
         )
         .await?;
 
-        if restore_authoritative_mp4_metadata {
+        if restore_authoritative_mp4_metadata
+            && crate::convert::chapter_structure::chapter_container_capability(&merged.final_path)
+                .is_some_and(|capability| capability.is_mp4_family())
+        {
             super::stages::restore_merged_mp4_terminal_metadata_after_structural_remux(
                 &merged.staged_path,
                 source,
@@ -311,7 +314,7 @@ async fn write_embedded_chapters_for_merged(
     Ok(())
 }
 
-/// Rewrite embedded MP4-family chapters on an existing file for the metadata
+/// Rewrite embedded container chapters on an existing file for the metadata
 /// editor's chapter-authoring surface.
 ///
 /// The caller may pass a private same-directory batch stage instead of the
@@ -368,13 +371,18 @@ pub(crate) async fn rewrite_embedded_chapters_for_authoring(
         previous_end = Some(*end_sample);
     }
 
-    let muxer = chapter_output_muxer(path)
-        .ok_or_else(|| format!("{} is not an MP4-family chapter carrier", path.display()))?;
+    let capability = crate::convert::chapter_structure::chapter_container_capability(path)
+        .ok_or_else(|| format!("{} is not a chapter-capable container", path.display()))?;
+    let muxer = capability.output_muxer();
     // Structural MOV remuxes do not faithfully preserve the complete iTunes
     // ilst (notably freeform atoms and repeated values). Snapshot the concrete
-    // parsed ilst before FFmpeg and restore that exact logical atom structure
-    // onto the guarded rewrite before publication.
-    let ilst_snapshot = snapshot_mp4_ilst(path)?;
+    // parsed ilst only for MP4-family carriers; Matroska/WebM retain their
+    // metadata through the ordinary stream-copy remux and cannot be parsed as
+    // MP4 by Lofty.
+    let ilst_snapshot = capability
+        .is_mp4_family()
+        .then(|| snapshot_mp4_ilst(path))
+        .transpose()?;
     let ffmetadata = render_ffmetadata(&entries, sample_rate)
         .map_err(|error| error.to_string())?;
     let parent = path
@@ -412,18 +420,20 @@ pub(crate) async fn rewrite_embedded_chapters_for_authoring(
         rewrite.cleanup_best_effort();
         return Err(error.to_string());
     }
-    if let Err(error) = restore_mp4_ilst(rewrite.path(), &ilst_snapshot) {
-        rewrite.cleanup_best_effort();
-        return Err(error);
-    }
-    // Lofty's ilst restoration is the final metadata mutation in this
-    // authoring rewrite. Verify the chapter table again afterwards so the
-    // file is published only if both structure and unrelated metadata survive.
-    if let Err(error) = verify_written_chapters(rewrite.path(), &entries, sample_rate) {
-        rewrite.cleanup_best_effort();
-        return Err(format!(
-            "chapter verification after MP4 ilst restoration failed: {error}"
-        ));
+    if let Some(ilst_snapshot) = ilst_snapshot.as_ref() {
+        if let Err(error) = restore_mp4_ilst(rewrite.path(), ilst_snapshot) {
+            rewrite.cleanup_best_effort();
+            return Err(error);
+        }
+        // Lofty's ilst restoration is the final metadata mutation in this
+        // authoring rewrite. Verify the chapter table again afterwards so the
+        // file is published only if both structure and unrelated metadata survive.
+        if let Err(error) = verify_written_chapters(rewrite.path(), &entries, sample_rate) {
+            rewrite.cleanup_best_effort();
+            return Err(format!(
+                "chapter verification after MP4 ilst restoration failed: {error}"
+            ));
+        }
     }
     replace_rewritten_metadata_file(path, rewrite).map_err(|error| {
         format!(
@@ -501,16 +511,8 @@ fn chapter_capable_output_path(path: &Path) -> bool {
 }
 
 fn chapter_output_muxer(path: &Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("m4a" | "m4b") => Some("ipod"),
-        Some("mp4") => Some("mp4"),
-        _ => None,
-    }
+    crate::convert::chapter_structure::chapter_container_capability(path)
+        .map(|capability| capability.output_muxer())
 }
 
 fn chapter_entries_for_merged(
@@ -1541,6 +1543,92 @@ mod tests {
         .expect("chapters survive repeated ilst restoration");
     }
 
+    #[tokio::test]
+    async fn authoring_real_ffmpeg_round_trips_matroska_and_webm_on_repeat_save_when_available() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map_or(true, |output| !output.status.success())
+        {
+            eprintln!("skipping real Matroska/WebM chapter rewrite: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let chapters = vec![
+            ("One".to_string(), 0, 48_000),
+            ("Two".to_string(), 48_000, 96_000),
+        ];
+        let expected = [
+            ChapterWriteEntry {
+                title: "One".to_string(),
+                start_sample: 0,
+                end_sample: 48_000,
+            },
+            ChapterWriteEntry {
+                title: "Two".to_string(),
+                start_sample: 48_000,
+                end_sample: 96_000,
+            },
+        ];
+        let runner = crate::convert::pipeline::tool::RealToolRunner::new(
+            std::collections::HashMap::new(),
+        );
+        let cancel = CancellationToken::new();
+
+        for (extension, muxer) in [
+            ("mka", "matroska"),
+            ("mkv", "matroska"),
+            ("webm", "webm"),
+            ("weba", "webm"),
+        ] {
+            let path = temp.path().join(format!("chapter-roundtrip.{extension}"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=1000:sample_rate=48000:duration=2",
+                    "-c:a",
+                    "libopus",
+                    "-f",
+                    muxer,
+                ])
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("launch ffmpeg fixture seed");
+            if !status.success() {
+                eprintln!(
+                    "skipping real {extension} chapter rewrite: ffmpeg could not seed a libopus fixture"
+                );
+                continue;
+            }
+
+            for attempt in 1..=2 {
+                rewrite_embedded_chapters_for_authoring(
+                    &path,
+                    &chapters,
+                    48_000,
+                    &runner,
+                    &cancel,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{extension} chapter rewrite attempt {attempt} failed: {error}")
+                });
+                verify_written_chapters(&path, &expected, 48_000).unwrap_or_else(|error| {
+                    panic!("{extension} chapter verification attempt {attempt} failed: {error}")
+                });
+            }
+        }
+    }
+
     #[test]
     fn remux_is_stream_copy_and_replaces_chapters_only() {
         let command = chapter_remux_command(
@@ -1563,10 +1651,14 @@ mod tests {
     }
 
     #[test]
-    fn mp4_family_muxer_selection_is_explicit() {
+    fn chapter_muxer_selection_uses_central_container_capability() {
         assert_eq!(chapter_output_muxer(Path::new("book.m4a")), Some("ipod"));
         assert_eq!(chapter_output_muxer(Path::new("book.m4b")), Some("ipod"));
         assert_eq!(chapter_output_muxer(Path::new("book.mp4")), Some("mp4"));
-        assert_eq!(chapter_output_muxer(Path::new("book.mkv")), None);
+        assert_eq!(chapter_output_muxer(Path::new("book.mka")), Some("matroska"));
+        assert_eq!(chapter_output_muxer(Path::new("book.mkv")), Some("matroska"));
+        assert_eq!(chapter_output_muxer(Path::new("book.webm")), Some("webm"));
+        assert_eq!(chapter_output_muxer(Path::new("book.weba")), Some("webm"));
+        assert_eq!(chapter_output_muxer(Path::new("book.flac")), None);
     }
 }

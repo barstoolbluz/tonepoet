@@ -45,17 +45,63 @@ fn ensure_ffmpeg_initialized() -> Result<(), String> {
         .clone()
 }
 
+/// The container-level facts shared by chapter discovery, editor visibility,
+/// authoring, and merged-output serialization. Keep extension admission here
+/// so a format cannot quietly become readable but unwritable (or vice versa)
+/// at a different call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChapterContainerCapability {
+    Mp4Ipod,
+    Mp4,
+    Matroska,
+    WebM,
+}
+
+impl ChapterContainerCapability {
+    #[must_use]
+    pub(crate) fn output_muxer(self) -> &'static str {
+        match self {
+            Self::Mp4Ipod => "ipod",
+            Self::Mp4 => "mp4",
+            Self::Matroska => "matroska",
+            Self::WebM => "webm",
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_mp4_family(self) -> bool {
+        matches!(self, Self::Mp4Ipod | Self::Mp4)
+    }
+}
+
+/// Return the authoritative chapter capability for a file extension.
+///
+/// WebM/WebA are intentionally admitted on pragmatic toolchain behavior:
+/// Tonepoet's FFmpeg path writes and reads their chapter tables reliably, and
+/// WebA already requires the explicit `webm` muxer elsewhere in the format
+/// planner. A strict WebM consumer may ignore those chapters, but Tonepoet must
+/// not split read/write/UI support for containers it deliberately supports.
+#[must_use]
+pub(crate) fn chapter_container_capability(path: &Path) -> Option<ChapterContainerCapability> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("m4a") || extension.eq_ignore_ascii_case("m4b") {
+        Some(ChapterContainerCapability::Mp4Ipod)
+    } else if extension.eq_ignore_ascii_case("mp4") {
+        Some(ChapterContainerCapability::Mp4)
+    } else if extension.eq_ignore_ascii_case("mka") || extension.eq_ignore_ascii_case("mkv") {
+        Some(ChapterContainerCapability::Matroska)
+    } else if extension.eq_ignore_ascii_case("webm") || extension.eq_ignore_ascii_case("weba") {
+        Some(ChapterContainerCapability::WebM)
+    } else {
+        None
+    }
+}
+
 /// Extensions for which Tonepoet should cheaply inspect embedded chapters
 /// before choosing the ordinary one-track single-file fast path.
 #[must_use]
 pub fn chapter_capable_source_extension(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .as_deref(),
-        Some("m4a" | "m4b" | "mp4")
-    )
+    chapter_container_capability(path).is_some()
 }
 
 #[must_use]
@@ -235,13 +281,41 @@ mod tests {
     }
 
     #[test]
-    fn mp4_family_chapter_admission_is_case_insensitive() {
-        assert!(chapter_capable_source_extension(Path::new("book.m4b")));
-        assert!(chapter_capable_source_extension(Path::new("book.M4B")));
-        assert!(chapter_capable_source_extension(Path::new("album.m4a")));
-        assert!(chapter_capable_source_extension(Path::new("movie.mp4")));
+    fn chapter_container_admission_is_case_insensitive_and_centralized() {
+        for path in [
+            "book.m4b",
+            "book.M4B",
+            "album.m4a",
+            "movie.mp4",
+            "audio.mka",
+            "video.MKV",
+            "program.webm",
+            "program.WEBA",
+        ] {
+            assert!(chapter_capable_source_extension(Path::new(path)), "{path}");
+        }
         assert!(!chapter_capable_source_extension(Path::new("track.flac")));
+        assert!(!chapter_capable_source_extension(Path::new("track.wav")));
         assert!(is_m4b_path(Path::new("book.M4B")));
+    }
+
+    #[test]
+    fn chapter_container_capability_owns_output_muxer_selection() {
+        let cases = [
+            ("book.m4a", "ipod", true),
+            ("book.m4b", "ipod", true),
+            ("movie.mp4", "mp4", true),
+            ("audio.mka", "matroska", false),
+            ("movie.mkv", "matroska", false),
+            ("audio.webm", "webm", false),
+            ("audio.weba", "webm", false),
+        ];
+        for (path, muxer, is_mp4_family) in cases {
+            let capability = chapter_container_capability(Path::new(path))
+                .unwrap_or_else(|| panic!("missing chapter capability for {path}"));
+            assert_eq!(capability.output_muxer(), muxer, "{path}");
+            assert_eq!(capability.is_mp4_family(), is_mp4_family, "{path}");
+        }
     }
 
     #[test]

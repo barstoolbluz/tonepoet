@@ -214,16 +214,19 @@ fn compute_freedb_id(offsets: &[u32], n_tracks: usize) -> u32 {
     (checksum << 24) | ((total_secs & 0xFFFF) << 8) | (n_tracks as u32 & 0xFF)
 }
 
-/// Probe a file and return its exact sample count.
+/// Probe a file and return its audio timeline length in samples.
 ///
-/// Uses ffmpeg's stream duration in time_base units, which for FLAC
-/// and other lossless formats is the exact sample count.
+/// Prefer ffmpeg's stream duration in time-base units, which is exact for
+/// FLAC and other lossless formats. Matroska/WebM may omit stream duration;
+/// for those chapter-capable containers only, count decoded audio samples so
+/// container duration, video duration, and timestamp quantization never become
+/// structural audio EOF authority.
 pub fn probe_sample_count(path: &std::path::Path) -> Result<(u64, u32), String> {
     // Try ffmpeg first (handles most formats).
-    match probe_sample_count_ffmpeg(path) {
+    let ffmpeg_error = match probe_sample_count_ffmpeg(path) {
         Ok(result) => return Ok(result),
-        Err(_) => {}
-    }
+        Err(error) => error,
+    };
 
     // Fallback: format-specific native tools for files ffmpeg can't handle.
     let ext = path
@@ -233,7 +236,7 @@ pub fn probe_sample_count(path: &std::path::Path) -> Result<(u64, u32), String> 
         .to_ascii_lowercase();
     match ext.as_str() {
         "wv" => probe_sample_count_wvunpack(path),
-        _ => Err(format!("cannot probe {}", path.display())),
+        _ => Err(format!("cannot probe {}: {ffmpeg_error}", path.display())),
     }
 }
 
@@ -262,19 +265,88 @@ fn probe_sample_count_ffmpeg(path: &std::path::Path) -> Result<(u64, u32), Strin
         .map_err(|e| format!("decoder: {}", e))?;
     let sample_rate = audio.rate();
 
-    if duration <= 0 {
-        return Err("no duration in stream".into());
+    if duration > 0 {
+        let samples = if time_base.denominator() == sample_rate as i32
+            && time_base.numerator() == 1
+        {
+            duration as u64
+        } else {
+            (duration as f64 * time_base.numerator() as f64 / time_base.denominator() as f64
+                * sample_rate as f64)
+                .round() as u64
+        };
+        return Ok((samples, sample_rate));
     }
 
-    let samples = if time_base.denominator() == sample_rate as i32 && time_base.numerator() == 1 {
-        duration as u64
-    } else {
-        (duration as f64 * time_base.numerator() as f64 / time_base.denominator() as f64
-            * sample_rate as f64)
-            .round() as u64
+    if matches!(
+        crate::convert::chapter_structure::chapter_container_capability(path),
+        Some(crate::convert::chapter_structure::ChapterContainerCapability::Matroska)
+            | Some(crate::convert::chapter_structure::ChapterContainerCapability::WebM)
+    ) {
+        return probe_decoded_sample_count_ffmpeg(path)
+            .map_err(|error| format!("decoded sample-count fallback failed: {error}"));
+    }
+
+    Err("no duration in stream".into())
+}
+
+/// Count the selected audio stream's decoded samples exactly.
+///
+/// This is intentionally a narrow fallback for Matroska/WebM streams whose
+/// `AVStream::duration` is unavailable. Reopening the input keeps the ordinary
+/// duration fast path simple and avoids treating container duration as audio
+/// structure. No PCM is retained; one decoded frame buffer and a u64 counter
+/// are sufficient.
+fn probe_decoded_sample_count_ffmpeg(path: &std::path::Path) -> Result<(u64, u32), String> {
+    use ffmpeg_next as ffmpeg;
+
+    let mut ctx = ffmpeg::format::input(&path).map_err(|e| format!("open failed: {e}"))?;
+
+    let (stream_idx, mut decoder, sample_rate) = {
+        let stream = ctx
+            .streams()
+            .best(ffmpeg::media::Type::Audio)
+            .ok_or("no audio stream")?;
+        let stream_idx = stream.index();
+        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| format!("codec params: {e}"))?;
+        let decoder = codec_ctx
+            .decoder()
+            .audio()
+            .map_err(|e| format!("decoder: {e}"))?;
+        let sample_rate = decoder.rate();
+        (stream_idx, decoder, sample_rate)
     };
 
-    Ok((samples, sample_rate))
+    let mut decoded = ffmpeg::util::frame::Audio::empty();
+    let mut total_samples = 0u64;
+
+    for (stream, packet) in ctx.packets() {
+        if stream.index() != stream_idx {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("send_packet: {e}"))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            total_samples = total_samples
+                .checked_add(decoded.samples() as u64)
+                .ok_or_else(|| "decoded sample count exceeds u64".to_string())?;
+        }
+    }
+
+    decoder.send_eof().map_err(|e| format!("send_eof: {e}"))?;
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        total_samples = total_samples
+            .checked_add(decoded.samples() as u64)
+            .ok_or_else(|| "decoded sample count exceeds u64".to_string())?;
+    }
+
+    if total_samples == 0 {
+        return Err("no audio samples decoded".into());
+    }
+
+    Ok((total_samples, sample_rate))
 }
 
 /// Probe sample count via wvunpack (fallback for WavPack files ffmpeg can't read).

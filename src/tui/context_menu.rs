@@ -1138,7 +1138,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             | EntryKind::BlurayDir
             | EntryKind::Directory
     ) || matches!(&effective_kind, EntryKind::OtherFile)
-        && crate::convert::classify::is_cue_sheet_path(&entry.path);
+        && (crate::convert::classify::is_cue_sheet_path(&entry.path)
+            || matches!(
+                crate::convert::source_admission::direct_source_kind(&entry.path),
+                Some(crate::convert::source_admission::DirectSourceKind::Audio)
+            ));
     let selected_path_is_marked = app
         .browse
         .multi_selected
@@ -1320,14 +1324,23 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_select_submenu(false));
         }
         EntryKind::OtherFile => {
-            // CUE files are convertible (they reference an image file).
+            // CUE files are convertible because they reference an image.
+            // Codec-ambiguous Matroska/WebM carriers are also direct audio
+            // sources, but this brief establishes only Convert + Properties
+            // for them; do not opportunistically expose the tagging submenu.
             let is_cue = crate::convert::classify::is_cue_sheet_path(&entry.path);
-            if is_cue {
+            let is_direct_audio = matches!(
+                crate::convert::source_admission::direct_source_kind(&entry.path),
+                Some(crate::convert::source_admission::DirectSourceKind::Audio)
+            );
+            if is_cue || is_direct_audio {
                 items.push(build_convert_submenu(app));
-                items.push(build_tagging_submenu(
-                    true,
-                    super::probe::EmbeddedCueAvailability::Absent,
-                ));
+                if is_cue {
+                    items.push(build_tagging_submenu(
+                        true,
+                        super::probe::EmbeddedCueAvailability::Absent,
+                    ));
+                }
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -7230,6 +7243,50 @@ mod tests {
             .unwrap_or("");
         assert!(status.contains("ARTIST restored to MusicBrainz values"));
         assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn matroska_webm_other_files_expose_convert_and_properties_without_tagging_menu() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        for name in ["album.mka", "album.mkv", "album.webm", "album.weba"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"fixture").expect("fixture file");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![BrowseEntry::new(
+                path.clone(),
+                name.to_string(),
+                EntryKind::OtherFile,
+                0,
+                None,
+            )];
+
+            let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
+            assert!(labels.iter().any(|label| label == "Convert"), "{name}");
+            assert!(labels.iter().any(|label| label == "Properties"), "{name}");
+            assert!(
+                !labels.iter().any(|label| label == "Tags & Tagging"),
+                "{name} must not gain the out-of-scope tagging submenu"
+            );
+        }
+
+        let notes = temp.path().join("notes.txt");
+        std::fs::write(&notes, b"notes").expect("text fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            notes,
+            "notes.txt".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        )];
+        let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
+        assert!(!labels.iter().any(|label| label == "Convert"));
+        assert!(!labels.iter().any(|label| label == "Properties"));
     }
 
     #[test]

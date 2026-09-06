@@ -607,7 +607,9 @@ pub fn detect_source_kind(req: &PipelineRequest) -> Result<SourceKind, SourceDet
     {
         return Ok(SourceKind::Archive);
     }
-    if is_single_audio_extension(&ext) {
+    if is_single_audio_extension(&ext)
+        || crate::convert::chapter_structure::chapter_capable_source_extension(&req.container)
+    {
         return Ok(SourceKind::SingleFile);
     }
     Err(SourceDetectError::UnknownSource)
@@ -50239,6 +50241,19 @@ mod bluray_routing_tests {
     }
 
     #[test]
+    fn pipeline_matroska_webm_chapter_carriers_route_as_single_file_sources() {
+        for name in ["album.mka", "album.mkv", "album.webm", "album.weba", "ALBUM.MKV"] {
+            let mut req = log_test_request();
+            req.container = PathBuf::from("/tmp").join(name);
+            assert_eq!(
+                detect_source_kind(&req).unwrap(),
+                SourceKind::SingleFile,
+                "{name} must reach the single-file materializer"
+            );
+        }
+    }
+
+    #[test]
     fn pipeline_m4b_routes_as_single_file_source() {
         let mut req = log_test_request();
         req.container = PathBuf::from("/tmp/book.M4B");
@@ -50255,6 +50270,111 @@ mod bluray_routing_tests {
         req.container = iso;
 
         assert_eq!(detect_source_kind(&req).unwrap(), SourceKind::Archive);
+    }
+}
+
+
+#[cfg(test)]
+mod chaptered_container_admission_tests {
+    use super::*;
+    use super::pipeline_test_helpers::log_test_request;
+    use std::process::Command;
+
+    fn executable_on_path(name: &str) -> bool {
+        Command::new(name)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn create_chaptered_mka(path: &Path) -> bool {
+        let metadata = path.with_extension("ffmeta");
+        if std::fs::write(
+            &metadata,
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=500\nEND=1000\ntitle=Closing\n",
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000"])
+            .args(["-f", "ffmetadata", "-i"])
+            .arg(&metadata)
+            .args(["-map", "0:a:0", "-map_metadata", "1", "-map_chapters", "1"])
+            .args(["-c:a", "flac", "-f", "matroska"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn chaptered_matroska_reaches_single_file_materialization_and_preserves_structure() {
+        if !executable_on_path("ffmpeg") || !executable_on_path("ffprobe") {
+            eprintln!("skipping Matroska materialization integration test: ffmpeg/ffprobe unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let carrier = temp.path().join("album.mka");
+        if !create_chaptered_mka(&carrier) {
+            eprintln!("skipping Matroska materialization integration test: fixture mux unavailable");
+            return;
+        }
+
+        assert_eq!(
+            crate::convert::classify::classify_file(&carrier),
+            crate::convert::classify::EntryKind::OtherFile,
+            "the cheap Browse classifier must remain codec-agnostic for Matroska"
+        );
+
+        let mut req = log_test_request();
+        req.container = carrier.clone();
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        assert_eq!(
+            detect_source_kind(&req).expect("Matroska source detection"),
+            SourceKind::SingleFile
+        );
+
+        let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
+        let runner = RealToolRunner::new(HashMap::new());
+        let cancel = CancellationToken::new();
+        let source = SingleFileMaterializer
+            .materialize(&req, &staging, &runner, None, &HashMap::new(), &cancel)
+            .await
+            .expect("chaptered Matroska materialization");
+
+        assert_eq!(source.kind, SourceKind::SingleFile);
+        assert_eq!(source.tracks.len(), 2, "embedded chapters must remain two tracks");
+        assert_eq!(source.album_metadata.total_tracks, 2);
+        assert_eq!(source.tracks[0].metadata.title.as_deref(), Some("Opening"));
+        assert_eq!(source.tracks[1].metadata.title.as_deref(), Some("Closing"));
+
+        for (track, expected_start) in source.tracks.iter().zip([0_u64, 24_000]) {
+            match &track.source_ref {
+                TrackSourceRef::EmbeddedChapterCarrier {
+                    source_image,
+                    start_sample,
+                    samples,
+                    path,
+                    ..
+                } => {
+                    assert_eq!(source_image, &carrier);
+                    assert_eq!(*start_sample, expected_start);
+                    assert_eq!(*samples, 24_000);
+                    assert!(path.is_file(), "materialized chapter carrier must exist");
+                }
+                other => panic!(
+                    "chaptered Matroska must not collapse to an undifferentiated track: {other:?}"
+                ),
+            }
+        }
     }
 }
 

@@ -22691,7 +22691,7 @@ pub fn regenerate_cuesheet_for_save(
     }
     if state.active_surface().cue_album_synthetic_sheet.is_some() {
         if state.active_surface().chapter_authoring.projection_only {
-            // The Chapters tab may temporarily project embedded MP4 chapters
+            // The Chapters tab may temporarily project embedded container chapters
             // (or a chapterless single file) into unified-CUE-shaped rows for
             // editing. Until a CUE carrier is actually saved, ordinary
             // Metadata-tab writes must remain native file-tag writes.
@@ -29655,6 +29655,20 @@ fn stage_cueless_untaggable_album_surface(
         return Ok(false);
     }
 
+    // Matroska/WebM carriers have a native embedded chapter authority even
+    // when their ordinary tags are not writable through Lofty. Do not let the
+    // legacy untaggable-carrier fallback fabricate a one-track sidecar before
+    // the Chapters tab's lazy FFmpeg probe can import that structure.
+    if tab.paths.len() == 1
+        && matches!(
+            crate::convert::chapter_structure::chapter_container_capability(&tab.paths[0]),
+            Some(crate::convert::chapter_structure::ChapterContainerCapability::Matroska)
+                | Some(crate::convert::chapter_structure::ChapterContainerCapability::WebM)
+        )
+    {
+        return Ok(false);
+    }
+
     let Some(seed) = cue_less_untaggable_sidecar_seed(&tab.paths)? else {
         return Ok(false);
     };
@@ -33838,7 +33852,7 @@ fn metadata_editor_chapter_renumber(surface: &mut crate::tui::app::PresentationT
 }
 
 fn metadata_editor_chapter_refresh_cuesheet_preview(surface: &mut crate::tui::app::PresentationTab) {
-    // Only maintain an already-present CUESHEET preview. Embedded MP4 chapter
+    // Only maintain an already-present CUESHEET preview. Embedded container chapter
     // sources do not gain a synthetic CUE carrier merely because the user
     // edits their chapter map; the save dialog is the sole place that chooses
     // whether to create one.
@@ -34278,9 +34292,13 @@ fn metadata_editor_chapter_has_pregaps(surface: &crate::tui::app::PresentationTa
 fn metadata_editor_chapter_in_file_destination(
     path: &std::path::Path,
 ) -> Option<crate::tui::chapter_authoring::ChapterInFileDestination> {
+    if crate::convert::chapter_structure::chapter_capable_source_extension(path) {
+        return Some(
+            crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters,
+        );
+    }
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
-        "m4a" | "m4b" | "mp4" => Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters),
         "flac" => Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue),
         _ => None,
     }
@@ -34470,7 +34488,7 @@ fn metadata_editor_chapter_refresh_committed_snapshots(
     }
 }
 
-async fn metadata_editor_chapter_execute_mp4_transaction(
+async fn metadata_editor_chapter_execute_embedded_transaction(
     mut sidecar_plan: Option<MetadataAlbumWritePlan>,
     program_path: std::path::PathBuf,
     chapters: Vec<(String, u64, u64)>,
@@ -34534,19 +34552,22 @@ async fn metadata_editor_chapter_execute_mp4_transaction(
         }
     }
 
-    let mp4_stage = crate::convert::pipeline::metadata_rewrite::stage_existing_metadata_batch_file(&admitted_program)
+    let chapter_stage =
+        crate::convert::pipeline::metadata_rewrite::stage_existing_metadata_batch_file(
+            &admitted_program,
+        )
         .map_err(|error| format!("cannot stage '{}': {error}", program_path.display()))?;
     let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
     let cancel = tokio_util::sync::CancellationToken::new();
     crate::convert::pipeline::chapter_write::rewrite_embedded_chapters_for_authoring(
-        mp4_stage.staged_path(),
+        chapter_stage.staged_path(),
         &chapters,
         sample_rate,
         &runner,
         &cancel,
     )
     .await?;
-    stages.push(mp4_stage);
+    stages.push(chapter_stage);
 
     if let Some(plan) = sidecar_plan.as_ref() {
         metadata_album_view_revalidate_plan(plan)
@@ -34729,14 +34750,20 @@ fn metadata_editor_start_chapter_save(
             || (dialog.in_file_selected
                 && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)))
     {
-        return Err("CUE destinations support at most 99 tracks; use embedded MP4 chapters or reduce the chapter count".to_string());
+        return Err(
+            "CUE destinations support at most 99 tracks; use embedded chapter entries or reduce the chapter count"
+                .to_string(),
+        );
     }
     if metadata_editor_chapter_has_pregaps(state.active_surface())
         && dialog.in_file_selected
         && dialog.in_file == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters)
         && !dialog.sidecar_selected
     {
-        return Err("MP4 chapter entries do not carry CUE pregaps; keep Sidecar CUE selected so authored pregaps have a durable representation".to_string());
+        return Err(
+            "embedded chapter entries do not carry CUE pregaps; keep Sidecar CUE selected so authored pregaps have a durable representation"
+                .to_string(),
+        );
     }
     let writes_cue = dialog.sidecar_selected
         || (dialog.in_file_selected
@@ -34757,7 +34784,7 @@ fn metadata_editor_start_chapter_save(
     let chapters = metadata_editor_chapter_records(state.active_surface(), dialog.snap_to_cue_grid)?;
 
     let mut cue_plan: Option<MetadataAlbumWritePlan> = None;
-    let mut sidecar_plan_for_mp4: Option<MetadataAlbumWritePlan> = None;
+    let mut sidecar_plan_for_embedded: Option<MetadataAlbumWritePlan> = None;
     if dialog.sidecar_selected {
         let plan = metadata_editor_chapter_structural_cue_plan(
             state,
@@ -34766,7 +34793,7 @@ fn metadata_editor_start_chapter_save(
         if plan.sidecars.is_empty() {
             return Err("selected Sidecar CUE destination produced no writable sidecar plan".to_string());
         }
-        sidecar_plan_for_mp4 = Some(plan.clone());
+        sidecar_plan_for_embedded = Some(plan.clone());
         cue_plan = Some(plan);
     }
     if dialog.in_file_selected
@@ -34810,8 +34837,8 @@ fn metadata_editor_start_chapter_save(
 
     if in_file_destination == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters) {
         tokio::spawn(async move {
-            let result = metadata_editor_chapter_execute_mp4_transaction(
-                sidecar_plan_for_mp4,
+            let result = metadata_editor_chapter_execute_embedded_transaction(
+                sidecar_plan_for_embedded,
                 program_path,
                 chapters,
                 sample_rate,
@@ -34871,14 +34898,14 @@ fn metadata_editor_chapter_save_requires_cue_canonicalization(
     let has_cue_carrier = outcome.sidecar_path.is_some()
         || outcome.in_file_destination
             == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue);
-    let has_exact_mp4_carrier = outcome.in_file_destination
+    let has_exact_embedded_carrier = outcome.in_file_destination
         == Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters);
 
     // Explicit global Snap intentionally makes every selected destination use
     // CUE-grid coordinates. Without Snap, a CUE-only save must reconcile to
-    // the frames it actually serialized, but a dual CUE+MP4 save must keep the
-    // sample-native geometry that the MP4 carrier preserved exactly.
-    outcome.snapped_to_cue_grid || (has_cue_carrier && !has_exact_mp4_carrier)
+    // the frames it actually serialized, but a dual CUE+embedded-chapter save
+    // must keep the sample-native geometry that the in-file carrier preserved.
+    outcome.snapped_to_cue_grid || (has_cue_carrier && !has_exact_embedded_carrier)
 }
 
 fn metadata_editor_chapter_reconcile_saved_geometry(
@@ -34924,10 +34951,10 @@ pub(super) fn complete_metadata_editor_chapter_save(
         Err(reason) => return format!("chapter authoring: save failed: {reason}"),
     };
     // Reconcile only when CUE is the sole durable geometry or the user
-    // explicitly selected global Snap. In a dual CUE+MP4 save with Snap off,
-    // MP4 contains the exact sample positions just written; rewriting the live
-    // model to the sidecar's quantized coordinates would make a title-only
-    // second save silently move those embedded chapters.
+    // explicitly selected global Snap. In a dual CUE+embedded-chapter save
+    // with Snap off, the in-file carrier contains the exact sample positions
+    // just written; rewriting the live model to the sidecar's quantized
+    // coordinates would make a title-only second save silently move them.
     if let Err(reason) = metadata_editor_chapter_reconcile_saved_geometry(surface, &outcome) {
         surface.refresh_failed = true;
         return format!("chapter authoring: carriers saved, but editor reconciliation failed: {reason}");
@@ -39350,9 +39377,17 @@ fn open_metadata_editor_impl_for_selection(
         && sel.iter().all(|path| {
             !path.is_dir()
                 && matches!(
-                    crate::convert::classify::classify_file(path),
-                    crate::convert::classify::EntryKind::AudioFile(_)
+                    crate::convert::source_admission::direct_source_kind(path),
+                    Some(crate::convert::source_admission::DirectSourceKind::Audio)
                 )
+        });
+    let explicit_matroska_webm_selection = explicit_audio_selection
+        && sel.iter().all(|path| {
+            matches!(
+                crate::convert::chapter_structure::chapter_container_capability(path),
+                Some(crate::convert::chapter_structure::ChapterContainerCapability::Matroska)
+                    | Some(crate::convert::chapter_structure::ChapterContainerCapability::WebM)
+            )
         });
     if explicit_cue_selection {
         cue_policy = crate::convert::pipeline::CueSidecarPolicy::SidecarOnly;
@@ -39496,7 +39531,7 @@ fn open_metadata_editor_impl_for_selection(
     // CUE. This deliberately excludes one-track-per-FILE metadata sidecars and
     // every ordinary pre-split selection.
     let explicit_native_multi_file_sidecar_surface =
-        if explicit_audio_selection && sel.len() == 1 {
+        if explicit_audio_selection && !explicit_matroska_webm_selection && sel.len() == 1 {
             match native_multi_file_sidecar_surface_for_member_audio(&sel[0]) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -39532,6 +39567,7 @@ fn open_metadata_editor_impl_for_selection(
     let directory_audio_paths = aggregate_directory_selection
         .then(|| super::command::expand_audio_paths_for_metadata(&sel));
     let explicit_embedded_surfaces = if explicit_audio_selection
+        && !explicit_matroska_webm_selection
         && sel.len() == 1
         && !explicit_native_multi_file_sidecar_set
     {
@@ -39805,7 +39841,9 @@ fn open_metadata_editor_impl_for_selection(
     // Omitting the row leaves the existing tag untouched because the writer
     // only applies explicit entry changes/deletions.
     if cue_policy == crate::convert::pipeline::CueSidecarPolicy::IgnoreCue
-        && !(explicit_audio_selection && paths.len() == 1)
+        && !(explicit_audio_selection
+            && !explicit_matroska_webm_selection
+            && paths.len() == 1)
     {
         suppress_cuesheet_entry_for_individual_file_target(&mut entries);
     }
@@ -39818,7 +39856,10 @@ fn open_metadata_editor_impl_for_selection(
         && metadata_entries_contain_embedded_cuesheet(&entries);
     let mut sidecar_cuesheet_shadow_present = false;
     let mut cue_source = None;
-    if explicit_audio_selection && paths.len() == 1 {
+    if explicit_audio_selection
+        && !explicit_matroska_webm_selection
+        && paths.len() == 1
+    {
         match embedded_cue_candidate_for_metadata(&entries, &paths[0]) {
             EmbeddedCueCandidate::Valid {
                 audio_path,
@@ -83601,6 +83642,158 @@ mod single_image_metadata_editor_regression_tests {
     }
 
 
+    pub(super) fn create_chapter_container_fixture(
+        path: &std::path::Path,
+        codec: &str,
+        muxer: &str,
+    ) -> bool {
+        let metadata_path = path.with_extension(format!(
+            "{}.ffmetadata",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("container")
+        ));
+        if std::fs::write(
+            &metadata_path,
+            concat!(
+                ";FFMETADATA1\n",
+                "[CHAPTER]\n",
+                "TIMEBASE=1/1000\n",
+                "START=0\n",
+                "END=500\n",
+                "title=Opening\n",
+                "[CHAPTER]\n",
+                "TIMEBASE=1/1000\n",
+                "START=500\n",
+                "END=1000\n",
+                "title=Closing\n",
+            ),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=1",
+                "-f",
+                "ffmetadata",
+                "-i",
+            ])
+            .arg(&metadata_path)
+            .args([
+                "-map",
+                "0:a:0",
+                "-map_metadata",
+                "1",
+                "-map_chapters",
+                "1",
+                "-c:a",
+                codec,
+                "-f",
+                muxer,
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(metadata_path);
+        status
+    }
+
+    pub(super) fn browse_other_file_app(path: &std::path::Path) -> AppState {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        app.browse.entries = vec![super::super::browse::BrowseEntry::new(
+            path.to_path_buf(),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("container")
+                .to_string(),
+            crate::convert::classify::EntryKind::OtherFile,
+            std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app
+    }
+
+    pub(super) async fn open_and_complete_chapter_probe(
+        app: &mut AppState,
+        path: &std::path::Path,
+    ) {
+        let (tx, mut rx) = mpsc::channel(4);
+        open_metadata_editor_with_tx(app, &tx);
+        {
+            let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+                panic!("explicit Matroska/WebM carrier must open the metadata editor");
+            };
+            assert_eq!(state.active_surface().paths, vec![path.to_path_buf()]);
+            assert!(state.active_surface().cue_source.is_none());
+            assert!(
+                state
+                    .visible_content_tabs()
+                    .contains(&crate::tui::app::ContentTab::Chapters),
+                "chapter-capable direct carrier must expose Chapters"
+            );
+            assert!(state.set_content_tab(crate::tui::app::ContentTab::Chapters));
+            assert!(
+                metadata_editor_request_chapter_probe(state, &tx),
+                "first Chapters visit must launch the lazy probe"
+            );
+        }
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("chapter probe completion timeout")
+            .expect("chapter probe completion");
+        let AppMessage::MetadataEditorChapterProbeComplete {
+            session_id,
+            generation,
+            path: completed_path,
+            sample_rate,
+            total_samples,
+            embedded_chapters,
+            sidecar_path,
+            sidecar_exists,
+            sidecar_snapshot,
+            embedded_cuesheet_snapshot,
+        } = message
+        else {
+            panic!("expected MetadataEditorChapterProbeComplete");
+        };
+        assert_eq!(completed_path.as_path(), path);
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            panic!("editor must remain open while the chapter probe completes");
+        };
+        let status = complete_metadata_editor_chapter_probe(
+            state,
+            session_id,
+            generation,
+            completed_path,
+            sample_rate,
+            total_samples,
+            embedded_chapters,
+            sidecar_path,
+            sidecar_exists,
+            sidecar_snapshot,
+            embedded_cuesheet_snapshot,
+        );
+        assert!(status.contains("loaded 2 chapters"), "unexpected probe status: {status}");
+    }
+
     fn fixture_cue(stem: &str, album_title: &str, side_prefix: &str, n_tracks: usize) -> String {
         let mut cue = format!(
             "PERFORMER \"Pink Floyd\"\nTITLE \"{album_title}\"\nFILE \"{stem}.flac\" WAVE\n"
@@ -83896,6 +84089,33 @@ mod single_image_metadata_editor_regression_tests {
         state
     }
 
+    #[test]
+    fn chapter_in_file_destination_uses_central_container_capability() {
+        for path in [
+            "book.m4a",
+            "book.m4b",
+            "movie.mp4",
+            "audio.mka",
+            "movie.mkv",
+            "audio.webm",
+            "audio.weba",
+        ] {
+            assert_eq!(
+                metadata_editor_chapter_in_file_destination(std::path::Path::new(path)),
+                Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            metadata_editor_chapter_in_file_destination(std::path::Path::new("image.flac")),
+            Some(crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedCue)
+        );
+        assert_eq!(
+            metadata_editor_chapter_in_file_destination(std::path::Path::new("audio.wav")),
+            None
+        );
+    }
+
     fn dual_cue_mp4_outcome(snapped_to_cue_grid: bool) -> crate::tui::chapter_authoring::ChapterSaveOutcome {
         crate::tui::chapter_authoring::ChapterSaveOutcome {
             sidecar_path: Some(std::path::PathBuf::from("book.cue")),
@@ -84015,7 +84235,7 @@ mod single_image_metadata_editor_regression_tests {
             ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
         };
 
-        let outcome = metadata_editor_chapter_execute_mp4_transaction(
+        let outcome = metadata_editor_chapter_execute_embedded_transaction(
             Some(plan),
             program_path.clone(),
             vec![
@@ -84027,7 +84247,7 @@ mod single_image_metadata_editor_regression_tests {
             outcome,
         )
         .await
-        .expect("combined sidecar + MP4 chapter transaction");
+        .expect("combined sidecar + embedded chapter transaction");
 
         assert_eq!(std::fs::read_to_string(&sidecar_path).unwrap(), replacement_cuesheet);
         assert_eq!(outcome.sidecar_snapshot, Some(std::fs::read(&sidecar_path).unwrap()));
@@ -91145,13 +91365,81 @@ mod single_image_metadata_editor_regression_tests {
 #[cfg(test)]
 mod metadata_cue_source_coverage_tests {
     use super::single_image_metadata_editor_regression_tests::{
-        create_flac_fixture, fixture_tool_available, select_foxy_route,
+        browse_other_file_app, create_chapter_container_fixture, create_flac_fixture,
+        fixture_tool_available, open_and_complete_chapter_probe, select_foxy_route,
     };
     use super::untaggable_carrier_sidecar_regression_tests::{
         open_folder_editor_with_priority, save_through_production_path,
     };
     use super::*;
     use crate::config::TonepoetConfig;
+
+    fn create_mkv_audio_shorter_than_video_fixture(path: &std::path::Path) -> bool {
+        let metadata_path = path.with_extension("mkv.ffmetadata");
+        if std::fs::write(
+            &metadata_path,
+            concat!(
+                ";FFMETADATA1\n",
+                "[CHAPTER]\n",
+                "TIMEBASE=1/1000\n",
+                "START=0\n",
+                "END=500\n",
+                "title=Opening\n",
+                "[CHAPTER]\n",
+                "TIMEBASE=1/1000\n",
+                "START=500\n",
+                "END=1000\n",
+                "title=Closing\n",
+            ),
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=2",
+                "-f",
+                "ffmetadata",
+                "-i",
+            ])
+            .arg(&metadata_path)
+            .args([
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:v:0",
+                "-map_metadata",
+                "2",
+                "-map_chapters",
+                "2",
+                "-c:a",
+                "flac",
+                "-c:v",
+                "ffv1",
+                "-f",
+                "matroska",
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(metadata_path);
+        status
+    }
 
     fn policy_surface() -> MetadataCueSurface {
         let cue_text = concat!(
@@ -93862,6 +94150,232 @@ FILE "a.flac" WAVE
             .entries
             .iter()
             .all(|entry| !entry.display_key.eq_ignore_ascii_case("CUESHEET")));
+    }
+
+    #[tokio::test]
+    async fn explicit_matroska_webm_other_file_selection_opens_chapters_and_lazy_probe_reads_structure() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("ffprobe") {
+            eprintln!("skipping direct Matroska/WebM editor integration: ffmpeg/ffprobe unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (name, codec, muxer) in [
+            ("album.mka", "flac", "matroska"),
+            ("program.weba", "libopus", "webm"),
+        ] {
+            let path = temp.path().join(name);
+            if !create_chapter_container_fixture(&path, codec, muxer) {
+                eprintln!(
+                    "skipping direct Matroska/WebM editor integration: ffmpeg cannot create {codec}/{muxer} fixture"
+                );
+                return;
+            }
+            assert_eq!(
+                crate::convert::classify::classify_file(&path),
+                crate::convert::classify::EntryKind::OtherFile,
+                "the normal Browse classifier must remain codec-agnostic"
+            );
+
+            let mut app = browse_other_file_app(&path);
+            open_and_complete_chapter_probe(&mut app, &path).await;
+
+            let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+                panic!("editor must remain open after chapter probe");
+            };
+            let sheet = state
+                .active_surface()
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .expect("embedded chapter projection");
+            assert_eq!(sheet.track_sources.len(), 2);
+            assert_eq!(sheet.program_sample_rate, Some(48_000));
+            assert_eq!(sheet.program_total_samples, Some(48_000));
+            assert_eq!(sheet.track_sources[0].index01_sample, Some(0));
+            assert_eq!(sheet.track_sources[1].index01_sample, Some(24_000));
+            assert_eq!(
+                metadata_editor_chapter_title_for_render(state.active_surface(), 0),
+                "Opening"
+            );
+            assert_eq!(
+                metadata_editor_chapter_title_for_render(state.active_surface(), 1),
+                "Closing"
+            );
+            assert_eq!(
+                state.active_surface().chapter_authoring.origin,
+                crate::tui::chapter_authoring::ChapterStructureOrigin::EmbeddedChapters
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matroska_video_duration_does_not_extend_audio_eof_or_title_only_save() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("ffprobe") {
+            eprintln!("skipping Matroska audio-EOF regression: ffmpeg/ffprobe unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("audio-shorter-than-video.mkv");
+        if !create_mkv_audio_shorter_than_video_fixture(&path) {
+            eprintln!(
+                "skipping Matroska audio-EOF regression: ffmpeg cannot create FLAC/FFV1 fixture"
+            );
+            return;
+        }
+
+        assert_eq!(
+            crate::tui::accuraterip::probe_sample_count(&path),
+            Ok((48_000, 48_000)),
+            "sample-count authority must be the selected audio stream, not container/video duration"
+        );
+
+        let mut app = browse_other_file_app(&path);
+        open_and_complete_chapter_probe(&mut app, &path).await;
+
+        let (records, sample_rate) = {
+            let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+                panic!("editor must remain open after chapter probe");
+            };
+            let sheet = state
+                .active_surface()
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .expect("embedded chapter projection");
+            assert_eq!(sheet.program_sample_rate, Some(48_000));
+            assert_eq!(sheet.program_total_samples, Some(48_000));
+            let sample_rate = sheet.program_sample_rate.expect("chapter sample rate");
+            let views = crate::tui::chapter_authoring::boundary_views(sheet)
+                .expect("exact chapter boundary projection");
+            assert_eq!(
+                views
+                    .iter()
+                    .map(|view| (view.start_sample, view.end_sample))
+                    .collect::<Vec<_>>(),
+                vec![(0, 24_000), (24_000, 48_000)]
+            );
+
+            metadata_editor_chapter_set_title(
+                state.active_surface_mut(),
+                1,
+                "Retitled only".to_string(),
+            )
+            .expect("edit chapter title");
+            let records = metadata_editor_chapter_records(state.active_surface(), false)
+                .expect("title-only chapter records");
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|(_, start, end)| (*start, *end))
+                    .collect::<Vec<_>>(),
+                vec![(0, 24_000), (24_000, 48_000)]
+            );
+            (records, sample_rate)
+        };
+
+        let outcome = crate::tui::chapter_authoring::ChapterSaveOutcome {
+            in_file_path: Some(path.clone()),
+            in_file_destination: Some(
+                crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters,
+            ),
+            ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
+        };
+        metadata_editor_chapter_execute_embedded_transaction(
+            None,
+            path.clone(),
+            records,
+            sample_rate,
+            std::collections::HashMap::new(),
+            outcome,
+        )
+        .await
+        .expect("title-only Matroska chapter transaction must preserve exact audio EOF");
+
+        let raw = crate::convert::chapter_structure::read_embedded_chapters(&path)
+            .expect("read title-only saved Matroska chapters");
+        let normalized = crate::convert::chapter_structure::normalize_embedded_chapters(
+            &raw,
+            sample_rate,
+        )
+        .expect("normalize title-only saved Matroska chapters");
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].boundary.start_sample, 0);
+        assert_eq!(normalized[1].boundary.start_sample, 24_000);
+        assert_eq!(normalized[1].title.as_deref(), Some("Retitled only"));
+        assert_eq!(
+            normalized[1]
+                .boundary
+                .start_sample
+                .checked_add(normalized[1].boundary.samples),
+            Some(48_000),
+            "title-only save must not extend the final chapter to video/container EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn matroska_editor_chapter_edit_round_trips_through_the_ui_transaction_layer() {
+        if !fixture_tool_available("ffmpeg") || !fixture_tool_available("ffprobe") {
+            eprintln!("skipping Matroska chapter edit transaction: ffmpeg/ffprobe unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.mka");
+        if !create_chapter_container_fixture(&path, "flac", "matroska") {
+            eprintln!("skipping Matroska chapter edit transaction: ffmpeg cannot create fixture");
+            return;
+        }
+        let mut app = browse_other_file_app(&path);
+        open_and_complete_chapter_probe(&mut app, &path).await;
+
+        let (records, sample_rate) = {
+            let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+                panic!("editor must remain open after chapter probe");
+            };
+            metadata_editor_chapter_set_title(
+                state.active_surface_mut(),
+                1,
+                "Retitled".to_string(),
+            )
+            .expect("edit chapter title");
+            metadata_editor_chapter_apply_start(state.active_surface_mut(), 1, 25_000)
+                .expect("edit chapter boundary");
+            let sample_rate = state
+                .active_surface()
+                .cue_album_synthetic_sheet
+                .as_ref()
+                .and_then(|sheet| sheet.program_sample_rate)
+                .expect("chapter sample rate");
+            let records = metadata_editor_chapter_records(state.active_surface(), false)
+                .expect("edited chapter records");
+            (records, sample_rate)
+        };
+
+        let outcome = crate::tui::chapter_authoring::ChapterSaveOutcome {
+            in_file_path: Some(path.clone()),
+            in_file_destination: Some(
+                crate::tui::chapter_authoring::ChapterInFileDestination::EmbeddedChapters,
+            ),
+            ..crate::tui::chapter_authoring::ChapterSaveOutcome::default()
+        };
+        metadata_editor_chapter_execute_embedded_transaction(
+            None,
+            path.clone(),
+            records,
+            sample_rate,
+            std::collections::HashMap::new(),
+            outcome,
+        )
+        .await
+        .expect("UI chapter transaction must save and verify Matroska chapters");
+
+        let raw = crate::convert::chapter_structure::read_embedded_chapters(&path)
+            .expect("read saved Matroska chapters");
+        let normalized = crate::convert::chapter_structure::normalize_embedded_chapters(&raw, sample_rate)
+            .expect("normalize saved Matroska chapters");
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[1].title.as_deref(), Some("Retitled"));
+        assert_eq!(normalized[1].boundary.start_sample, 25_000);
     }
 
     #[test]
@@ -98192,6 +98706,24 @@ mod untaggable_carrier_sidecar_regression_tests {
             sidecar_before,
             "regeneration must stage the CUE text without performing I/O",
         );
+    }
+
+    #[test]
+    fn matroska_webm_untaggable_surface_does_not_stage_generated_sidecar() {
+        for extension in ["mka", "weba"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let carrier = temp.path().join(format!("album.{extension}"));
+            std::fs::write(&carrier, b"unsupported tag carrier").expect("carrier");
+
+            let mut tab = unsupported_tab(vec![carrier]);
+            assert!(
+                !stage_cueless_untaggable_album_surface(&mut tab).expect("stage decision"),
+                "{extension} must preserve its embedded chapter authority"
+            );
+            assert!(tab.cue_source.is_none());
+            assert!(!tab.pending_sidecar_cue_creation);
+            assert!(tab.cue_album_synthetic_sheet.is_none());
+        }
     }
 
     #[test]

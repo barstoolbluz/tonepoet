@@ -196,7 +196,7 @@ pub struct ChapterSaveDialog {
     pub split_on_conversion: bool,
     /// When selected, all authored sample positions are deliberately snapped
     /// down to the CUE 75 Hz grid before any selected destination is written.
-    /// This is opt-in because MP4 chapter entries otherwise retain exact
+    /// This is opt-in because embedded chapter entries otherwise retain exact
     /// sample positions.
     pub snap_to_cue_grid: bool,
 }

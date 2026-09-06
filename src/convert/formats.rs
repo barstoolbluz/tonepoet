@@ -1012,6 +1012,11 @@ impl FormatDetector {
             // M4A/MP4 need codec probing to distinguish AAC from ALAC; the
             // extension-only classifier deliberately stays conservative there.
             "m4a" | "mp4" => Ok(FileFormat::Audio(Self::detect_m4a_codec(path))),
+            _ if matches!(
+                crate::convert::chapter_structure::chapter_container_capability(path),
+                Some(crate::convert::chapter_structure::ChapterContainerCapability::Matroska)
+                    | Some(crate::convert::chapter_structure::ChapterContainerCapability::WebM)
+            ) => Ok(FileFormat::Audio(Self::detect_matroska_webm_codec(path)?)),
             _ => match crate::convert::classify::classify_file(path) {
                 crate::convert::classify::EntryKind::Archive => Ok(FileFormat::Archive),
                 crate::convert::classify::EntryKind::AudioFile(format) => {
@@ -1051,6 +1056,87 @@ impl FormatDetector {
         }
         // Default to AAC if probe fails or codec isn't ALAC
         AudioFormat::Aac
+    }
+
+    /// Detect the actual audio codec in codec-ambiguous Matroska/WebM carriers.
+    ///
+    /// This deliberately runs only at queue/source admission, never during
+    /// Browse rendering. The cheap classifier remains extension-only while the
+    /// executable conversion path refuses containers with no supported audio
+    /// stream instead of guessing a codec from `.mka`/`.mkv`/WebM.
+    fn detect_matroska_webm_codec(
+        path: &Path,
+    ) -> Result<AudioFormat, super::ConversionError> {
+        static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| ffmpeg_next::init().map_err(|error| error.to_string()))
+            .clone()
+            .map_err(|error| {
+                super::ConversionError::UnsupportedFormat(format!(
+                    "cannot initialize FFmpeg while probing '{}': {error}",
+                    path.display()
+                ))
+            })?;
+
+        let input = ffmpeg_next::format::input(&path).map_err(|error| {
+            super::ConversionError::UnsupportedFormat(format!(
+                "cannot inspect audio streams in '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .ok_or_else(|| {
+                super::ConversionError::UnsupportedFormat(format!(
+                    "container '{}' has no audio stream",
+                    path.display()
+                ))
+            })?;
+        let codec_context = ffmpeg_next::codec::context::Context::from_parameters(
+            stream.parameters(),
+        )
+        .map_err(|error| {
+            super::ConversionError::UnsupportedFormat(format!(
+                "cannot inspect the audio codec in '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let codec_id = codec_context.id();
+
+        use ffmpeg_next::codec::Id;
+        let format = match codec_id {
+            Id::FLAC => Some(AudioFormat::Flac),
+            Id::WAVPACK => Some(AudioFormat::WavPack),
+            Id::MP3 => Some(AudioFormat::Mp3),
+            Id::AAC | Id::AAC_LATM => Some(AudioFormat::Aac),
+            Id::OPUS => Some(AudioFormat::Opus),
+            Id::ALAC => Some(AudioFormat::Alac),
+            Id::DTS => Some(AudioFormat::Dts),
+            Id::AC3 => Some(AudioFormat::Ac3),
+            Id::VORBIS => Some(AudioFormat::Ogg),
+            Id::APE => Some(AudioFormat::Ape),
+            Id::MUSEPACK7 | Id::MUSEPACK8 => Some(AudioFormat::Musepack),
+            Id::SHORTEN => Some(AudioFormat::Shorten),
+            Id::TTA => Some(AudioFormat::Tta),
+            _ => None,
+        };
+        if let Some(format) = format {
+            return Ok(format);
+        }
+
+        // FFmpeg models every PCM sample representation as a separate codec
+        // id whose stable name is a `pcm_*` identifier, and Tonepoet
+        // models all such Matroska payloads as linear PCM rather than inventing
+        // a WAV/AIFF container identity.
+        let pcm = codec_id.name().starts_with("pcm_");
+        if pcm {
+            return Ok(AudioFormat::Lpcm);
+        }
+
+        Err(super::ConversionError::UnsupportedFormat(format!(
+            "unsupported audio codec {codec_id:?} in '{}'",
+            path.display()
+        )))
     }
 
     /// Detect audio format specifically
@@ -1144,6 +1230,7 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
@@ -1169,6 +1256,63 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn create_audio_container_fixture(path: &Path, codec: &str, muxer: &str) -> bool {
+        Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.08",
+                "-map",
+                "0:a:0",
+                "-c:a",
+                codec,
+                "-f",
+                muxer,
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn create_video_only_matroska_fixture(path: &Path) -> bool {
+        Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1:d=1",
+                "-an",
+                "-c:v",
+                "ffv1",
+                "-f",
+                "matroska",
+            ])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     fn write_minimal_bluray_layout(root: &Path) {
@@ -1315,6 +1459,74 @@ mod tests {
             parse_companion_folders("Scans, Artwork, ../escape, foo/bar, Scans, .., ."),
             vec!["Scans", "Artwork"]
         );
+    }
+
+    #[test]
+    fn detect_matroska_webm_uses_the_best_audio_stream_codec_instead_of_extension_guessing() {
+        if !ffmpeg_available() {
+            eprintln!("skipping Matroska/WebM FormatDetector integration: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = TempDir::new("matroska-webm-codecs");
+        let cases = [
+            ("album.mka", "flac", "matroska", AudioFormat::Flac),
+            ("program.mkv", "pcm_s24le", "matroska", AudioFormat::Lpcm),
+            ("stream.webm", "libopus", "webm", AudioFormat::Opus),
+            ("stream.weba", "libopus", "webm", AudioFormat::Opus),
+        ];
+        for (name, codec, muxer, expected) in cases {
+            let path = temp.path.join(name);
+            if !create_audio_container_fixture(&path, codec, muxer) {
+                eprintln!(
+                    "skipping Matroska/WebM FormatDetector integration: ffmpeg cannot create {codec}/{muxer} fixture"
+                );
+                return;
+            }
+            assert_eq!(
+                FormatDetector::detect(&path).expect("supported container codec"),
+                FileFormat::Audio(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_matroska_without_a_supported_audio_stream_fails_normally() {
+        if !ffmpeg_available() {
+            eprintln!("skipping no-audio Matroska FormatDetector integration: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = TempDir::new("matroska-no-audio");
+        let path = temp.path.join("video-only.mkv");
+        if !create_video_only_matroska_fixture(&path) {
+            eprintln!("skipping no-audio Matroska FormatDetector integration: ffmpeg cannot create fixture");
+            return;
+        }
+        let error = FormatDetector::detect(&path)
+            .expect_err("video-only Matroska must not be admitted as audio")
+            .to_string();
+        assert!(error.contains("has no audio stream"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn detect_matroska_with_an_unsupported_audio_codec_fails_normally() {
+        if !ffmpeg_available() {
+            eprintln!("skipping unsupported-codec Matroska FormatDetector integration: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = TempDir::new("matroska-unsupported-audio");
+        let path = temp.path.join("unsupported.mka");
+        if !create_audio_container_fixture(&path, "mp2", "matroska") {
+            eprintln!("skipping unsupported-codec Matroska FormatDetector integration: ffmpeg cannot create MP2 fixture");
+            return;
+        }
+        let error = FormatDetector::detect(&path)
+            .expect_err("codec-ambiguous container must not be admitted with an unsupported audio codec")
+            .to_string();
+        assert!(error.contains("unsupported audio codec"), "unexpected error: {error}");
     }
 
     #[test]

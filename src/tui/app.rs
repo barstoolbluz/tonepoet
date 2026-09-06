@@ -6803,6 +6803,13 @@ impl ContentTab {
         ContentTab::Artwork,
     ];
 
+    pub const WITHOUT_CHAPTERS: [ContentTab; Self::COUNT - 1] = [
+        ContentTab::Metadata,
+        ContentTab::Details,
+        ContentTab::ReplayGain,
+        ContentTab::Artwork,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             ContentTab::Metadata => "Metadata",
@@ -9736,6 +9743,13 @@ impl MetadataEditorState {
         self.model.presentation_selector_cursor = active_tab;
         self.model.presentation_selector_scroll = active_tab;
         self.model.presentation_selector_open = false;
+        if !self.visible_content_tabs().contains(&self.content_tab) {
+            self.save_active_content_tab_scroll();
+            self.content_tab = ContentTab::Metadata;
+            self.scroll = self.cursor.min(self.active_surface().entries.len());
+            self.content_tab_scrolls[ContentTab::Metadata.index()] = self.scroll;
+            self.reset_content_tab_interaction();
+        }
         self.invalidate_artwork_preview_cache();
     }
 
@@ -9747,9 +9761,42 @@ impl MetadataEditorState {
         self.presentation_tabs.len() > 1
     }
 
+    /// Whether the active editor surface has one continuous carrier whose
+    /// container supports embedded chapters.
+    ///
+    /// Multi-file and mixed selections deliberately hide Chapters: the
+    /// authoring surface itself requires one continuous program, so exposing
+    /// the tab there would lead only to a rejected operation. Synthetic CUE
+    /// album surfaces use their physical audio-carrier list rather than their
+    /// flattened metadata row paths.
+    #[must_use]
+    pub fn chapters_content_tab_available(&self) -> bool {
+        let surface = self.active_surface();
+        let paths = surface
+            .cue_album_synthetic_sheet
+            .as_ref()
+            .map(|sheet| sheet.audio_paths.as_slice())
+            .unwrap_or_else(|| surface.paths.as_slice());
+        let Some(first) = paths.first() else {
+            return false;
+        };
+        if paths.iter().skip(1).any(|path| path != first) {
+            return false;
+        }
+        crate::convert::chapter_structure::chapter_capable_source_extension(first)
+    }
+
+    #[must_use]
+    pub fn visible_content_tabs(&self) -> &'static [ContentTab] {
+        if self.chapters_content_tab_available() {
+            &ContentTab::ALL
+        } else {
+            &ContentTab::WITHOUT_CHAPTERS
+        }
+    }
 
     pub fn set_content_tab(&mut self, tab: ContentTab) -> bool {
-        if self.content_tab == tab {
+        if self.content_tab == tab || !self.visible_content_tabs().contains(&tab) {
             return false;
         }
         self.save_active_content_tab_scroll();
@@ -9767,18 +9814,26 @@ impl MetadataEditorState {
     }
 
     pub fn next_content_tab(&mut self) -> bool {
-        let next = (self.content_tab.index() + 1) % ContentTab::ALL.len();
-        self.set_content_tab(ContentTab::ALL[next])
+        let tabs = self.visible_content_tabs();
+        let current = tabs
+            .iter()
+            .position(|tab| *tab == self.content_tab)
+            .unwrap_or(0);
+        self.set_content_tab(tabs[(current + 1) % tabs.len()])
     }
 
     pub fn previous_content_tab(&mut self) -> bool {
-        let index = self.content_tab.index();
-        let next = if index == 0 {
-            ContentTab::ALL.len() - 1
+        let tabs = self.visible_content_tabs();
+        let current = tabs
+            .iter()
+            .position(|tab| *tab == self.content_tab)
+            .unwrap_or(0);
+        let next = if current == 0 {
+            tabs.len() - 1
         } else {
-            index - 1
+            current - 1
         };
-        self.set_content_tab(ContentTab::ALL[next])
+        self.set_content_tab(tabs[next])
     }
 
     fn save_active_content_tab_scroll(&mut self) {
@@ -9991,6 +10046,9 @@ impl MetadataEditorState {
         self.active_tab = next;
         self.cursor = self.cursor.min(self.active_surface().entries.len());
         self.repair_metadata_cursor_visibility();
+        if !self.visible_content_tabs().contains(&self.content_tab) {
+            self.content_tab = ContentTab::Metadata;
+        }
         self.content_tab_scrolls = [0; ContentTab::COUNT];
         let ct_idx = self.content_tab.index();
         self.scroll = if self.content_tab == ContentTab::Metadata {
@@ -18689,6 +18747,87 @@ mod metadata_presentation_tab_tests {
 
         assert!(state.set_content_tab(ContentTab::Metadata));
         assert_eq!(state.scroll, 92, "Metadata scroll should not be clobbered by read-only tab scrolling");
+    }
+
+    #[test]
+    fn chapter_tab_visibility_and_navigation_follow_single_carrier_capability() {
+        let mut surface = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Program",
+            vec![tag("TITLE", "Program", vec!["Program"])],
+            1,
+        );
+        surface.paths[0] = std::path::PathBuf::from("/music/program.flac");
+        let mut state = state_with_tabs(vec![surface], 0);
+
+        assert_eq!(state.visible_content_tabs(), &ContentTab::WITHOUT_CHAPTERS);
+        assert!(!state.set_content_tab_by_index(ContentTab::Chapters.index()));
+        assert!(state.next_content_tab());
+        assert_eq!(state.content_tab, ContentTab::Details);
+        assert!(state.previous_content_tab());
+        assert_eq!(state.content_tab, ContentTab::Metadata);
+
+        state.active_surface_mut().paths[0] = std::path::PathBuf::from("/music/program.MKA");
+        assert_eq!(state.visible_content_tabs(), &ContentTab::ALL);
+        assert!(state.next_content_tab());
+        assert_eq!(state.content_tab, ContentTab::Chapters);
+        assert!(state.next_content_tab());
+        assert_eq!(state.content_tab, ContentTab::Details);
+        assert!(state.previous_content_tab());
+        assert_eq!(state.content_tab, ContentTab::Chapters);
+    }
+
+    #[test]
+    fn chapter_tab_hides_for_multi_carrier_and_mixed_surfaces() {
+        let mut two_mka = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Two MKA files",
+            vec![tag("TITLE", "Album", vec!["One", "Two"])],
+            2,
+        );
+        two_mka.paths = vec![
+            std::path::PathBuf::from("/music/one.mka"),
+            std::path::PathBuf::from("/music/two.mka"),
+        ];
+        let state = state_with_tabs(vec![two_mka], 0);
+        assert!(!state.chapters_content_tab_available());
+
+        let mut mixed = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Mixed",
+            vec![tag("TITLE", "Album", vec!["One", "Two"])],
+            2,
+        );
+        mixed.paths = vec![
+            std::path::PathBuf::from("/music/one.m4b"),
+            std::path::PathBuf::from("/music/two.flac"),
+        ];
+        let state = state_with_tabs(vec![mixed], 0);
+        assert!(!state.chapters_content_tab_available());
+    }
+
+    #[test]
+    fn switching_to_incapable_presentation_repairs_active_chapters_tab() {
+        let mut capable = tab(
+            PresentationId::DvdAudioGroup(1),
+            "Capable",
+            vec![tag("TITLE", "Capable", vec!["Capable"])],
+            1,
+        );
+        capable.paths[0] = std::path::PathBuf::from("/music/book.m4b");
+        let incapable = tab(
+            PresentationId::DvdAudioGroup(2),
+            "Incapable",
+            vec![tag("TITLE", "Incapable", vec!["Incapable"])],
+            1,
+        );
+        let mut state = state_with_tabs(vec![capable, incapable], 0);
+
+        assert!(state.set_content_tab(ContentTab::Chapters));
+        assert_eq!(state.content_tab, ContentTab::Chapters);
+        assert!(state.switch_presentation_tab(1));
+        assert_eq!(state.content_tab, ContentTab::Metadata);
+        assert_eq!(state.visible_content_tabs(), &ContentTab::WITHOUT_CHAPTERS);
     }
 
     #[test]

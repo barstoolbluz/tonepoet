@@ -8,6 +8,9 @@
 use std::path::Path;
 
 use crate::convert::classify::{classify_file, is_cue_sheet_path, EntryKind};
+use crate::convert::chapter_structure::{
+    chapter_container_capability, ChapterContainerCapability,
+};
 
 /// Supported direct-source workflow selected at the admission boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,18 @@ pub enum DirectSourceKind {
 pub fn direct_source_kind(path: &Path) -> Option<DirectSourceKind> {
     if is_cue_sheet_path(path) {
         return Some(DirectSourceKind::Cue);
+    }
+
+    // Matroska/WebM admission is intentionally independent of the
+    // extension-only codec classifier. These containers can carry several
+    // audio codecs, so Browse must not pretend that `.mka`/`.mkv` imply one
+    // format; the queue-time FormatDetector performs the real stream probe.
+    if matches!(
+        chapter_container_capability(path),
+        Some(ChapterContainerCapability::Matroska)
+            | Some(ChapterContainerCapability::WebM)
+    ) {
+        return Some(DirectSourceKind::Audio);
     }
 
     match classify_file(path) {
@@ -129,6 +144,24 @@ mod tests {
                 Some(DirectSourceKind::Audio),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn chapter_capable_matroska_webm_are_direct_audio_without_fake_codec_classification() {
+        for name in ["album.mka", "album.mkv", "album.webm", "album.weba", "ALBUM.MKA"] {
+            let path = Path::new(name);
+            assert_eq!(
+                classify_file(path),
+                EntryKind::OtherFile,
+                "{name} must remain codec-ambiguous in the cheap Browse classifier"
+            );
+            assert_eq!(
+                direct_source_kind(path),
+                Some(DirectSourceKind::Audio),
+                "{name} must be admitted as a direct audio carrier"
+            );
+            assert!(is_direct_queue_source_path(path), "{name}");
         }
     }
 

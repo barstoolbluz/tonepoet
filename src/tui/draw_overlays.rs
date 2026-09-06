@@ -4551,7 +4551,11 @@ fn draw_content_tabs(
     // tab strip. With room for only a few tabs, the active tab becomes the
     // left edge while later tabs exist; the final tab shifts left only enough
     // to keep useful neighboring context visible.
-    let slots = content_tab_slots_for_width(state.content_tab, area.width);
+    let slots = content_tab_slots_for_width(
+        state.visible_content_tabs(),
+        state.content_tab,
+        area.width,
+    );
 
     let border_style = Style::default().fg(theme.cyan);
     let active_label_style = Style::default()
@@ -4657,13 +4661,15 @@ struct ContentTabSlot {
 }
 
 fn content_tab_slots_for_width(
+    tabs: &[super::app::ContentTab],
     active_tab: super::app::ContentTab,
     area_width: u16,
 ) -> Vec<ContentTabSlot> {
-    let tabs = super::app::ContentTab::ALL;
     let tab_count = tabs.len();
-    let active_index = active_tab.index();
-    if area_width == 0 || active_index >= tab_count {
+    let Some(active_index) = tabs.iter().position(|tab| *tab == active_tab) else {
+        return Vec::new();
+    };
+    if area_width == 0 || tab_count == 0 {
         return Vec::new();
     }
 
@@ -4671,7 +4677,7 @@ fn content_tab_slots_for_width(
         .max(8)
         .min(32);
 
-    let full_strip = content_tab_slots_from_start(&tabs, active_tab, 0, area_width, max_label_chars);
+    let full_strip = content_tab_slots_from_start(tabs, active_tab, 0, area_width, max_label_chars);
     if full_strip.len() == tab_count && full_strip.iter().any(|slot| slot.active) {
         return full_strip;
     }
@@ -4683,7 +4689,7 @@ fn content_tab_slots_for_width(
     // show useful context without accepting a clipped active tab when a full one
     // is possible.
     if active_index + 1 < tab_count {
-        return content_tab_slots_from_start(&tabs, active_tab, active_index, area_width, max_label_chars);
+        return content_tab_slots_from_start(tabs, active_tab, active_index, area_width, max_label_chars);
     }
 
     let mut best_slots: Vec<ContentTabSlot> = Vec::new();
@@ -4691,8 +4697,8 @@ fn content_tab_slots_for_width(
     let mut best_active_full = false;
 
     for start in 0..=active_index {
-        let slots = content_tab_slots_from_start(&tabs, active_tab, start, area_width, max_label_chars);
-        let Some(active_slot) = slots.iter().find(|slot| slot.index == active_index) else {
+        let slots = content_tab_slots_from_start(tabs, active_tab, start, area_width, max_label_chars);
+        let Some(active_slot) = slots.iter().find(|slot| slot.active) else {
             continue;
         };
         let active_full = !active_slot.clipped;
@@ -6128,7 +6134,7 @@ fn draw_metadata_chapter_save_dialog(
         snap_style,
     )));
     lines.push(Line::from(Span::styled(
-        "MP4-family chapter entries keep exact sample positions unless snapping is selected; CUE always floors.",
+        "Embedded chapter entries keep exact sample positions unless snapping is selected; CUE always floors.",
         theme.muted(),
     )));
     if let Some((moved, max_ms)) = snap_preview {
@@ -10399,7 +10405,11 @@ mod tests {
 
     #[test]
     fn narrow_content_tabs_shift_forward_from_details() {
-        let slots = content_tab_slots_for_width(super::super::app::ContentTab::Details, 26);
+        let slots = content_tab_slots_for_width(
+            &super::super::app::ContentTab::ALL,
+            super::super::app::ContentTab::Details,
+            26,
+        );
         assert_eq!(slots.first().map(|slot| slot.index), Some(2));
         assert!(slots.iter().any(|slot| slot.index == 3));
         assert!(slots.iter().any(|slot| slot.active && slot.index == 2));
@@ -10407,7 +10417,11 @@ mod tests {
 
     #[test]
     fn narrow_content_tabs_shift_forward_from_replaygain() {
-        let slots = content_tab_slots_for_width(super::super::app::ContentTab::ReplayGain, 26);
+        let slots = content_tab_slots_for_width(
+            &super::super::app::ContentTab::ALL,
+            super::super::app::ContentTab::ReplayGain,
+            26,
+        );
         assert_eq!(slots.first().map(|slot| slot.index), Some(3));
         assert!(slots.iter().any(|slot| slot.index == 4));
         assert!(slots.iter().any(|slot| slot.active && slot.index == 3));
@@ -10415,9 +10429,27 @@ mod tests {
 
     #[test]
     fn narrow_content_tabs_keep_late_active_tab_visible() {
-        let slots = content_tab_slots_for_width(super::super::app::ContentTab::Artwork, 26);
+        let slots = content_tab_slots_for_width(
+            &super::super::app::ContentTab::ALL,
+            super::super::app::ContentTab::Artwork,
+            26,
+        );
         assert!(slots.iter().any(|slot| slot.active && slot.index == 4));
         assert_eq!(slots.last().map(|slot| slot.index), Some(4));
+    }
+
+    #[test]
+    fn content_tabs_without_chapters_keep_stable_enum_indices() {
+        let slots = content_tab_slots_for_width(
+            &super::super::app::ContentTab::WITHOUT_CHAPTERS,
+            super::super::app::ContentTab::Details,
+            80,
+        );
+        assert_eq!(
+            slots.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+            vec![0, 2, 3, 4]
+        );
+        assert!(slots.iter().any(|slot| slot.active && slot.index == 2));
     }
 
     #[test]

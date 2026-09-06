@@ -9362,7 +9362,11 @@ pub(crate) fn direct_queue_expansion_for_cached_browse_entry(
     let direct = matches!(kind, EntryKind::AudioFile(_))
         || (matches!(kind, EntryKind::Archive) && !archive_is_plain_iso)
         || (matches!(kind, EntryKind::OtherFile)
-            && crate::convert::classify::is_cue_sheet_path(path))
+            && (crate::convert::classify::is_cue_sheet_path(path)
+                || matches!(
+                    crate::convert::source_admission::direct_source_kind(path),
+                    Some(crate::convert::source_admission::DirectSourceKind::Audio)
+                )))
         || matches!(
             kind,
             EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir
@@ -19268,6 +19272,14 @@ mod execute_queue_state_consistency_tests {
                 EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
             ),
             (PathBuf::from("missing.cue"), EntryKind::OtherFile),
+            // Matroska/WebM stay OtherFile in the cheap Browse classifier,
+            // but direct-source admission establishes that they are audio
+            // carriers. Cached Browse conversion must preserve that decision
+            // rather than silently dropping the selected path.
+            (PathBuf::from("missing.mka"), EntryKind::OtherFile),
+            (PathBuf::from("missing.mkv"), EntryKind::OtherFile),
+            (PathBuf::from("missing.webm"), EntryKind::OtherFile),
+            (PathBuf::from("missing.weba"), EntryKind::OtherFile),
             (PathBuf::from("missing.zip"), EntryKind::Archive),
             (PathBuf::from("missing-dvda"), EntryKind::DvdAudioDir),
             (PathBuf::from("missing-dvdv"), EntryKind::DvdVideoDir),
