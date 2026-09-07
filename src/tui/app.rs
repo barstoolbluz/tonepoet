@@ -6461,6 +6461,8 @@ pub enum ActiveOverlay {
     /// renderer live in the file-picker crate; this wrapper only stores the
     /// app-side control channel and session identity.
     FileTaskProgress(FileTaskProgressSession),
+    /// Interrupted copy/move recovery prompt, window, and epi-popups.
+    FileRecovery,
     /// Full metadata tag editor overlay.
     MetadataEditor(Box<MetadataEditorState>),
     /// Custom metadata auto-number preview/editor. The owning metadata editor
@@ -7073,6 +7075,8 @@ pub struct FileTransferQueueState {
     pub(crate) pending_by_session: BTreeMap<u64, crate::tui::browse::PendingClipboardPaste>,
     pub keep_minimized_across_jobs: bool,
     pub blocked_for_attention: bool,
+    /// All unresolved copy/move records, including live and unreadable entries.
+    pub unresolved_recovery_count: usize,
 }
 
 impl FileTransferQueueState {
@@ -7090,12 +7094,14 @@ impl FileTransferQueueState {
         self.active_session_id.is_some()
             || !self.queued.is_empty()
             || !self.recovery_queued.is_empty()
+            || self.unresolved_recovery_count > 0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FileTaskFooterState {
     pub live: bool,
+    pub recovery_unresolved: usize,
     pub ratio: Option<f64>,
     pub queued: usize,
     pub attention: bool,
@@ -13182,6 +13188,9 @@ pub struct AppState {
     /// Serial Browse transfer scheduler plus per-session reconciliation state.
     pub file_transfers: FileTransferQueueState,
 
+    /// Session presentation state for unresolved copy/move recovery.
+    pub recovery_ui: crate::tui::recovery_ui::RecoveryUiState,
+
     /// Host-managed artwork-picker paste jobs keyed by file-task session id.
     /// These use the same worker/admission path as Browse but reconcile their
     /// logical clipboard and selection back into the embedded picker.
@@ -14220,12 +14229,16 @@ impl AppState {
         crate::tui::presets::import_presets_to_db(&db);
         let mut browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
         let mut file_transfers = FileTransferQueueState::default();
+        let mut recovery_surface_records = Vec::new();
         if startup_options.recover_pending_file_operations {
             let crate::tui::file_task_runtime::StartupFileTaskRecoveryInventory {
                 total_pending_jobs,
                 recoveries,
+                recovery_surface_records: startup_recovery_surface_records,
                 unreconstructable_journals,
             } = crate::tui::file_task_runtime::startup_file_task_recovery_inventory();
+            recovery_surface_records = startup_recovery_surface_records;
+            file_transfers.unresolved_recovery_count = recovery_surface_records.len();
             if let Some(newest) = recoveries.last().cloned() {
                 // Preserve the historical user-facing clipboard/retry surface
                 // for the newest job while also admitting every reconstructable
@@ -14265,15 +14278,19 @@ impl AppState {
                     String::new()
                 } else {
                     format!(
-                        "; {unreconstructable} journal(s) remain on disk and require manual inspection"
+                        "; {unreconstructable} operation{} need record inspection",
+                        if unreconstructable == 1 { "" } else { "s" },
                     )
                 };
                 let recovery_status = format!(
-                    "file-operation recovery: {} interrupted job(s); {} exact journal reconciliation job(s) await explicit review (use :recovery-resume [id] or :recovery-defer [id]); {} deferred temp artifact(s), {} source quarantine(s); journals remain authoritative{}",
+                    "Found {} interrupted copy/move operation{}; {} can be resumed after review, with {} incomplete output{} and {} renamed source{}{}",
                     total_pending_jobs,
+                    if total_pending_jobs == 1 { "" } else { "s" },
                     queued_recoveries,
                     total_temp,
+                    if total_temp == 1 { "" } else { "s" },
                     total_quarantine,
+                    if total_quarantine == 1 { "" } else { "s" },
                     inspection_suffix,
                 );
                 theme_startup_status = Some(match theme_startup_status.take() {
@@ -14282,8 +14299,9 @@ impl AppState {
                 });
             } else if total_pending_jobs > 0 {
                 let recovery_status = format!(
-                    "file-operation recovery: {} interrupted journal(s) remain on disk but none could be reconstructed automatically; manual inspection is required",
-                    total_pending_jobs
+                    "Found {} unresolved copy/move operation{}; open Recovery to review the current state",
+                    total_pending_jobs,
+                    if total_pending_jobs == 1 { "" } else { "s" },
                 );
                 theme_startup_status = Some(match theme_startup_status.take() {
                     Some(existing) => format!("{existing}; {recovery_status}"),
@@ -14291,6 +14309,11 @@ impl AppState {
                 });
             }
         }
+        let recovery_ui = crate::tui::recovery_ui::RecoveryUiState::from_records(
+            recovery_surface_records,
+            &file_transfers.recovery_queued,
+        );
+
         let file_task_verbose_degrade_notices = matches!(
             config.file_operations.status_verbosity,
             crate::config::FileOperationStatusVerbosity::Verbose
@@ -14346,6 +14369,7 @@ impl AppState {
             minimized_file_task_progress: None,
             file_task_preempted_overlay: None,
             file_transfers,
+            recovery_ui,
             artwork_picker_file_tasks: BTreeMap::new(),
             artwork_picker_paste_retries: BTreeMap::new(),
             queued_quit_preempted_overlay: None,
@@ -14946,6 +14970,7 @@ impl AppState {
         if let Some(progress) = live_progress {
             return Some(FileTaskFooterState {
                 live: true,
+                recovery_unresolved: 0,
                 ratio: progress.totals.ratio(),
                 queued: self.file_transfers.queued.len(),
                 attention: progress.conflict.is_some()
@@ -14956,8 +14981,18 @@ impl AppState {
                     ),
             });
         }
+        if self.file_transfers.unresolved_recovery_count > 0 {
+            return Some(FileTaskFooterState {
+                live: false,
+                recovery_unresolved: self.file_transfers.unresolved_recovery_count,
+                ratio: None,
+                queued: self.file_transfers.queued.len(),
+                attention: false,
+            });
+        }
         self.last_file_task_progress.as_ref().map(|(_, progress)| FileTaskFooterState {
             live: false,
+            recovery_unresolved: 0,
             ratio: progress.totals.ratio(),
             queued: self.file_transfers.queued.len(),
             attention: matches!(progress.phase, tui_file_picker::FileTaskPhase::Failed),
@@ -15228,7 +15263,16 @@ impl AppState {
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
-        self.status_message = Some((msg.into(), std::time::Instant::now()));
+        let msg = msg.into();
+        if msg.contains("filesystem mutation conflicts with recovery reservation") {
+            let _ = crate::tui::recovery_ui::intercept_recovery_conflict_status(self, &msg);
+            self.status_message = Some((
+                "That file change is blocked by an unresolved copy or move; review recovery details before changing the overlapping path".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        self.status_message = Some((msg, std::time::Instant::now()));
     }
 
     #[must_use]

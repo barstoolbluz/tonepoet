@@ -15,6 +15,7 @@
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -382,6 +383,49 @@ impl DurableFileTaskRecord {
             || !self.native_rename_intents.is_empty()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryRecordVersion {
+    pub generation: u64,
+    pub updated_unix_ms: u64,
+    pub committed_len: u64,
+    pub committed_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverySurfaceAvailability {
+    Live,
+    Recoverable,
+    Unreadable,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoverySurfaceRecord {
+    pub journal_path: PathBuf,
+    pub record: Option<DurableFileTaskRecord>,
+    pub version: Option<RecoveryRecordVersion>,
+    pub availability: RecoverySurfaceAvailability,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryDiscardSummary {
+    pub deleted_incomplete: usize,
+    pub restored_sources: usize,
+    pub released_paths: usize,
+}
+
+pub(super) fn recovery_blocked_path_count(record: &DurableFileTaskRecord) -> usize {
+    record
+        .path_claims
+        .iter()
+        .map(|claim| claim.identity.original.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+const RECOVERY_DISCARDING_MARKER: &str = "recovery-ui-discard-in-progress";
+const RECOVERY_DISCARDED_MARKER: &str = "recovery-ui-discarded";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableFileTaskJournalEntry {
@@ -928,6 +972,43 @@ impl FileTaskJournalHandle {
         )
     }
 
+    /// Clear a source-restoration obligation from the controlling process after
+    /// recovery has acquired the durable operation lease. This remains allowed
+    /// after an abandon marker because the helper no longer owns mutation.
+    pub fn clear_recovered_quarantine_artifact(&self, path: &Path) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            false,
+            DurableFileTaskJournalMutation::QuarantineArtifactRemove {
+                path: path.to_path_buf(),
+            },
+        )
+    }
+
+    fn mark_recovery_discard_started(&self) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            false,
+            DurableFileTaskJournalMutation::Lifecycle {
+                lifecycle: DurableFileTaskLifecycle::AwaitingReconciliation,
+                status: RECOVERY_DISCARDING_MARKER.to_string(),
+                abandoned_reason: None,
+            },
+        )
+    }
+
+    fn mark_recovery_discarded(&self) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            false,
+            DurableFileTaskJournalMutation::Lifecycle {
+                lifecycle: DurableFileTaskLifecycle::Reconciled,
+                status: RECOVERY_DISCARDED_MARKER.to_string(),
+                abandoned_reason: None,
+            },
+        )
+    }
+
     pub fn record_native_rename_intent(
         &self,
         source: &Path,
@@ -951,6 +1032,19 @@ impl FileTaskJournalHandle {
         self.append_mutation(
             false,
             true,
+            DurableFileTaskJournalMutation::NativeRenameIntentRemove {
+                source: source.to_path_buf(),
+            },
+        )
+    }
+
+    /// Clear an interrupted direct-rename obligation after the controlling
+    /// process has acquired the durable recovery lease. As with recovered
+    /// source-quarantine cleanup, this is permitted after helper abandonment.
+    pub fn clear_recovered_native_rename_intent(&self, source: &Path) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            false,
             DurableFileTaskJournalMutation::NativeRenameIntentRemove {
                 source: source.to_path_buf(),
             },
@@ -1117,9 +1211,42 @@ pub fn load_record(path: &Path) -> Result<DurableFileTaskRecord, String> {
     result
 }
 
+fn load_record_with_version(
+    path: &Path,
+) -> Result<(DurableFileTaskRecord, RecoveryRecordVersion), String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| format!("open file-operation journal {}: {error}", path.display()))?;
+    file.lock_shared()
+        .map_err(|error| format!("lock file-operation journal {}: {error}", path.display()))?;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let (record, committed_len) =
+            scan_record_file_inner(&mut file, path, Some(&mut hasher))?;
+        let version = RecoveryRecordVersion {
+            generation: record.generation,
+            updated_unix_ms: record.updated_unix_ms,
+            committed_len,
+            committed_sha256: hasher.finalize().into(),
+        };
+        Ok((record, version))
+    })();
+    let _ = FileExt::unlock(&file);
+    result
+}
+
 fn scan_record_file(
     file: &mut File,
     path: &Path,
+) -> Result<(DurableFileTaskRecord, u64), String> {
+    scan_record_file_inner(file, path, None)
+}
+
+fn scan_record_file_inner(
+    file: &mut File,
+    path: &Path,
+    mut committed_hasher: Option<&mut Sha256>,
 ) -> Result<(DurableFileTaskRecord, u64), String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek file-operation journal {}: {error}", path.display()))?;
@@ -1144,12 +1271,18 @@ fn scan_record_file(
             break;
         }
         if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            if let Some(hasher) = committed_hasher.as_deref_mut() {
+                hasher.update(&line);
+            }
             valid_len = consumed;
             continue;
         }
         match decode_journal_line(&line) {
             Ok(DecodedJournalLine::Entry(entry)) => {
                 apply_journal_entry(&mut latest, entry, path)?;
+                if let Some(hasher) = committed_hasher.as_deref_mut() {
+                    hasher.update(&line);
+                }
                 valid_len = consumed;
             }
             Ok(DecodedJournalLine::LegacySnapshot(record)) => {
@@ -1160,6 +1293,9 @@ fn scan_record_file(
                     ));
                 }
                 latest = Some(record);
+                if let Some(hasher) = committed_hasher.as_deref_mut() {
+                    hasher.update(&line);
+                }
                 valid_len = consumed;
             }
             Err(_) => {
@@ -1545,80 +1681,342 @@ pub fn cleanup_setup_orphan_journal_descriptors() {
     }
 }
 
-pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
+fn recovery_record_is_discarding(record: &DurableFileTaskRecord) -> bool {
+    record.lifecycle == DurableFileTaskLifecycle::AwaitingReconciliation
+        && record.last_status.as_deref() == Some(RECOVERY_DISCARDING_MARKER)
+}
+
+fn recovery_record_is_discarded(record: &DurableFileTaskRecord) -> bool {
+    record.lifecycle == DurableFileTaskLifecycle::Reconciled
+        && record.last_status.as_deref() == Some(RECOVERY_DISCARDED_MARKER)
+}
+
+pub(super) fn recovery_record_is_discard_cleanup(record: &DurableFileTaskRecord) -> bool {
+    recovery_record_is_discarding(record) || recovery_record_is_discarded(record)
+}
+
+fn recovery_descriptor_path(
+    path: &Path,
+    record: &DurableFileTaskRecord,
+) -> Result<Option<PathBuf>, String> {
+    let job_id = uuid::Uuid::parse_str(&record.job_id).map_err(|error| {
+        format!(
+            "file-operation record {} has an invalid job identifier: {error}",
+            path.display()
+        )
+    })?;
+    let family = LeaseFamily::JournalOperation { job_id };
+    if let Some(descriptor) = record
+        .lease_descriptor
+        .clone()
+        .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten())
+    {
+        return Ok(Some(descriptor));
+    }
+
+    if recovery_record_is_discarded(record) {
+        // Discard already completed its filesystem work. A prior cleanup may
+        // have retired the descriptor before a crash left the clean marker.
+        return Ok(None);
+    }
+
+    let current = OwnerProcessIdentity::current();
+    let prior_boot = record
+        .origin_owner
+        .map(|owner| {
+            owner.boot_id_hash != 0
+                && current.boot_id_hash != 0
+                && owner.boot_id_hash != current.boot_id_hash
+        })
+        .unwrap_or(false);
+    if prior_boot && !record.path_claims.is_empty() {
+        let guard = MutationClaimGuard::acquire(family, record.path_claims.clone()).map_err(|error| {
+            format!(
+                "could not reconstruct the prior-session recovery reservation for {}: {error}",
+                path.display()
+            )
+        })?;
+        let descriptor = guard.lease().descriptor_path().to_path_buf();
+        drop(guard); // final-family descriptor remains RecoveryReserved
+        return Ok(Some(descriptor));
+    }
+
+    Err(format!(
+        "file-operation record {} has no recoverable ownership descriptor",
+        path.display()
+    ))
+}
+
+fn classify_recovery_surface(
+    path: &Path,
+    record: &DurableFileTaskRecord,
+) -> Result<RecoverySurfaceAvailability, String> {
+    let Some(descriptor) = recovery_descriptor_path(path, record)? else {
+        return Ok(RecoverySurfaceAvailability::Recoverable);
+    };
+    let availability = if permits_same_process_recovery_handoff(path, record) {
+        crate::concurrency::descriptor_recovery_availability_with_local_handoff(&descriptor)
+    } else {
+        crate::concurrency::descriptor_availability(&descriptor)
+    }?;
+    match availability.1 {
+        crate::concurrency::ClaimAvailability::Live => Ok(RecoverySurfaceAvailability::Live),
+        crate::concurrency::ClaimAvailability::RecoveryReserved => {
+            Ok(RecoverySurfaceAvailability::Recoverable)
+        }
+        crate::concurrency::ClaimAvailability::ReclaimableEphemeral => Err(format!(
+            "file-operation record {} references a non-durable ownership family",
+            path.display()
+        )),
+    }
+}
+
+/// Return every unresolved copy/move record that needs a recovery surface.
+/// Unlike `pending_journals`, this includes live and unreadable records so the
+/// UI can explain why no automatic action is currently offered.
+pub fn recovery_surface_records() -> Vec<RecoverySurfaceRecord> {
     cleanup_setup_orphan_journal_descriptors();
+    cleanup_discarded_recovery_records();
     let root = file_task_journal_dir();
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();
     };
-    let mut pending = entries
+    let mut records = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter_map(|path| match load_record(&path) {
-            Ok(record) if record.needs_reconciliation() => {
-                let Ok(job_id) = uuid::Uuid::parse_str(&record.job_id) else {
-                    log::warn!("legacy file-operation journal {} has no protocol-v2 UUID; automatic recovery is disabled", path.display());
-                    return None;
-                };
-                let family = LeaseFamily::JournalOperation { job_id };
-                let descriptor = record.lease_descriptor.clone()
-                    .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
-                let descriptor = match descriptor {
-                    Some(descriptor) => descriptor,
-                    None => {
-                        let current = OwnerProcessIdentity::current();
-                        let prior_boot = record.origin_owner
-                            .map(|owner| owner.boot_id_hash != 0 && current.boot_id_hash != 0 && owner.boot_id_hash != current.boot_id_hash)
-                            .unwrap_or(false);
-                        if prior_boot && !record.path_claims.is_empty() {
-                            match MutationClaimGuard::acquire(family.clone(), record.path_claims.clone()) {
-                                Ok(guard) => {
-                                    let descriptor = guard.lease().descriptor_path().to_path_buf();
-                                    drop(guard); // final-family descriptor remains RecoveryReserved
-                                    descriptor
-                                }
-                                Err(error) => {
-                                    log::warn!("could not reconstruct prior-boot recovery reservation for {}: {error}", path.display());
-                                    return None;
-                                }
-                            }
-                        } else {
-                            log::warn!("file-operation journal {} is missing its same-boot ownership descriptor; fail closed for manual recovery", path.display());
-                            return None;
-                        }
-                    }
-                };
-                let availability = if permits_same_process_recovery_handoff(&path, &record) {
-                    crate::concurrency::descriptor_recovery_availability_with_local_handoff(&descriptor)
-                } else {
-                    crate::concurrency::descriptor_availability(&descriptor)
-                };
-                match availability {
-                    Ok((_family, crate::concurrency::ClaimAvailability::Live)) => {
-                        log::debug!("file-operation journal {} remains live-owned; omit from recovery", path.display());
-                        None
-                    }
-                    Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved)) => Some((path, record)),
-                    Ok((_family, crate::concurrency::ClaimAvailability::ReclaimableEphemeral)) => {
-                        log::warn!("file-operation journal {} referenced a non-durable descriptor family; fail closed", path.display());
-                        None
-                    }
-                    Err(error) => {
-                        log::warn!("could not classify file-operation ownership for {}: {error}", path.display());
-                        None
-                    }
+        .filter_map(|path| match load_record_with_version(&path) {
+            Ok((record, version))
+                if record.needs_reconciliation() || recovery_record_is_discarded(&record) =>
+            {
+                match classify_recovery_surface(&path, &record) {
+                    Ok(availability) => Some(RecoverySurfaceRecord {
+                        journal_path: path,
+                        record: Some(record),
+                        version: Some(version),
+                        availability,
+                        diagnostic: None,
+                    }),
+                    Err(error) => Some(RecoverySurfaceRecord {
+                        journal_path: path,
+                        record: Some(record),
+                        version: Some(version),
+                        availability: RecoverySurfaceAvailability::Unreadable,
+                        diagnostic: Some(error),
+                    }),
                 }
             }
             Ok(_) => None,
-            Err(error) => {
-                log::warn!("ignoring unreadable file-operation journal {}: {error}", path.display());
-                None
-            }
+            Err(error) => Some(RecoverySurfaceRecord {
+                journal_path: path,
+                record: None,
+                version: None,
+                availability: RecoverySurfaceAvailability::Unreadable,
+                diagnostic: Some(error),
+            }),
         })
         .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        let left_key = left
+            .record
+            .as_ref()
+            .map(|record| (0u8, record.created_unix_ms, record.updated_unix_ms))
+            .unwrap_or((1u8, u64::MAX, u64::MAX));
+        let right_key = right
+            .record
+            .as_ref()
+            .map(|record| (0u8, record.created_unix_ms, record.updated_unix_ms))
+            .unwrap_or((1u8, u64::MAX, u64::MAX));
+        left_key
+            .cmp(&right_key)
+            .then_with(|| left.journal_path.cmp(&right.journal_path))
+    });
+    records
+}
+
+fn pending_journals_from_surfaces(
+    surfaces: &[RecoverySurfaceRecord],
+) -> Vec<(PathBuf, DurableFileTaskRecord)> {
+    let mut pending = surfaces
+        .iter()
+        .filter(|surface| surface.availability == RecoverySurfaceAvailability::Recoverable)
+        .filter_map(|surface| {
+            let record = surface.record.as_ref()?;
+            (record.needs_reconciliation() && !recovery_record_is_discard_cleanup(record))
+                .then_some((surface.journal_path.clone(), record.clone()))
+        })
+        .collect::<Vec<_>>();
+    // Preserve the existing executable-recovery ordering: the historical
+    // scanner sorted by last update, while the new presentation surface is
+    // deliberately sorted by creation time (oldest operation first).
     pending.sort_by_key(|(_, record)| record.updated_unix_ms);
     pending
+}
+
+pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
+    let surfaces = recovery_surface_records();
+    pending_journals_from_surfaces(&surfaces)
+}
+
+pub enum RecoveryDiscardPreparation {
+    Ready {
+        handle: FileTaskJournalHandle,
+        record: DurableFileTaskRecord,
+    },
+    CleanupOnly {
+        released_paths: usize,
+    },
+}
+
+pub fn prepare_recovery_discard(
+    path: &Path,
+    expected_version: RecoveryRecordVersion,
+) -> Result<RecoveryDiscardPreparation, String> {
+    let (record, version) = load_record_with_version(path)?;
+    if version != expected_version {
+        return Err("The interrupted operation changed after it was reviewed; review it again before discarding.".to_string());
+    }
+    if recovery_record_is_discarded(&record) {
+        let released_paths = recovery_blocked_path_count(&record);
+        finish_discarded_recovery_retirement(path, &record)?;
+        return Ok(RecoveryDiscardPreparation::CleanupOnly { released_paths });
+    }
+    if !record.needs_reconciliation() {
+        return Err("This copy or move no longer needs recovery.".to_string());
+    }
+    let job_id = uuid::Uuid::parse_str(&record.job_id)
+        .map_err(|error| format!("invalid interrupted-operation identifier: {error}"))?;
+    let family = LeaseFamily::JournalOperation { job_id };
+    let descriptor = recovery_descriptor_path(path, &record)?
+        .ok_or_else(|| "The interrupted operation no longer has a recovery reservation.".to_string())?;
+    let recovery = JournalRecoveryLease::acquire(
+        &descriptor,
+        &family,
+        permits_same_process_recovery_handoff(path, &record),
+    )?;
+
+    // The durable lease prevents another Tonepoet mutation from changing the
+    // record while discard owns it. Re-read the exact committed revision only
+    // after acquiring that lease so a screen snapshot can never authorize a
+    // later journal state.
+    let (record, locked_version) = load_record_with_version(path)?;
+    if locked_version != expected_version {
+        return Err("The interrupted operation changed after it was reviewed; review it again before discarding.".to_string());
+    }
+    if recovery_record_is_discarded(&record) {
+        drop(recovery);
+        let released_paths = recovery_blocked_path_count(&record);
+        finish_discarded_recovery_retirement(path, &record)?;
+        return Ok(RecoveryDiscardPreparation::CleanupOnly { released_paths });
+    }
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let handle = FileTaskJournalHandle {
+        path: path.to_path_buf(),
+        abandon_marker: abandon_marker_path(root, &record.job_id, record.generation),
+        job_id: record.job_id.clone(),
+        generation: record.generation,
+        lease: Some(recovery.holder()),
+    };
+    // Persist the reviewed destructive choice before the first filesystem
+    // mutation. If Tonepoet exits during cleanup, startup must resume cleanup
+    // rather than ever presenting this record as resumable transfer work.
+    if !recovery_record_is_discarding(&record) {
+        handle.mark_recovery_discard_started()?;
+    }
+    let record = handle.load()?;
+    Ok(RecoveryDiscardPreparation::Ready { handle, record })
+}
+
+pub fn commit_recovery_discard(handle: FileTaskJournalHandle) -> Result<(), String> {
+    let before = handle.load()?;
+    if !before.temp_artifacts.is_empty()
+        || !before.quarantine_artifacts.is_empty()
+        || !before.native_rename_intents.is_empty()
+    {
+        return Err("Discard cleanup is incomplete; the recovery record was kept for another review.".to_string());
+    }
+    handle.mark_recovery_discarded()?;
+    let path = handle.path.clone();
+    let record = handle.load()?;
+    drop(handle);
+    finish_discarded_recovery_retirement(&path, &record)
+}
+
+fn finish_discarded_recovery_retirement(
+    path: &Path,
+    record: &DurableFileTaskRecord,
+) -> Result<(), String> {
+    if !recovery_record_is_discarded(record)
+        || !record.temp_artifacts.is_empty()
+        || !record.quarantine_artifacts.is_empty()
+        || !record.native_rename_intents.is_empty()
+    {
+        return Err("refused to retire an interrupted-operation record before discard cleanup was durable".to_string());
+    }
+    let job_id = uuid::Uuid::parse_str(&record.job_id)
+        .map_err(|error| format!("invalid interrupted-operation identifier: {error}"))?;
+    let family = LeaseFamily::JournalOperation { job_id };
+    let descriptor = record
+        .lease_descriptor
+        .clone()
+        .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
+    if let Some(descriptor) = descriptor {
+        match fs::symlink_metadata(&descriptor) {
+            Ok(_) => crate::concurrency::retire_descriptor_after_lifecycle_release(
+                &descriptor,
+                &family,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect interrupted-operation reservation {}: {error}",
+                    descriptor.display()
+                ))
+            }
+        }
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|error| {
+                        format!(
+                            "sync interrupted-operation record directory {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove resolved interrupted-operation record {}: {error}",
+                path.display()
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_discarded_recovery_records() {
+    let root = file_task_journal_dir();
+    let Ok(entries) = fs::read_dir(&root) else { return };
+    for path in entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+    {
+        let Ok(record) = load_record(&path) else { continue };
+        if recovery_record_is_discarded(&record) {
+            if let Err(error) = finish_discarded_recovery_retirement(&path, &record) {
+                log::debug!(
+                    "resolved interrupted-operation cleanup remains pending for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1636,10 +2034,28 @@ pub struct StartupFileTaskRecovery {
 pub struct StartupFileTaskRecoveryInventory {
     pub total_pending_jobs: usize,
     pub recoveries: Vec<StartupFileTaskRecovery>,
+    /// Immutable presentation snapshots captured by the same control-plane
+    /// scan used to reconstruct the executable recovery queue. Reusing these
+    /// avoids a second startup read/hash pass over every saved operation.
+    pub recovery_surface_records: Vec<RecoverySurfaceRecord>,
     /// Valid, reconciliation-required journals that could not be represented as
     /// an executable recovery snapshot. They remain on disk and are surfaced to
     /// the user rather than being silently omitted.
     pub unreconstructable_journals: Vec<PathBuf>,
+}
+
+fn mark_recovery_surface_unreadable(
+    surfaces: &mut [RecoverySurfaceRecord],
+    journal_path: &Path,
+    diagnostic: impl Into<String>,
+) {
+    if let Some(surface) = surfaces
+        .iter_mut()
+        .find(|surface| surface.journal_path == journal_path)
+    {
+        surface.availability = RecoverySurfaceAvailability::Unreadable;
+        surface.diagnostic = Some(diagnostic.into());
+    }
 }
 
 /// Inspect every interrupted job without touching source/destination mounts.
@@ -1648,10 +2064,12 @@ pub struct StartupFileTaskRecoveryInventory {
 /// clipboard/plan snapshots; actual verification and cleanup still run inside
 /// the cancellable helper process when each recovery is dispatched.
 pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventory {
-    let pending = pending_journals();
-    let total_pending_jobs = pending.len();
+    let recovery_surface_records = recovery_surface_records();
+    let pending = pending_journals_from_surfaces(&recovery_surface_records);
+    let total_pending_jobs = recovery_surface_records.len();
     let mut inventory = StartupFileTaskRecoveryInventory {
         total_pending_jobs,
+        recovery_surface_records,
         ..StartupFileTaskRecoveryInventory::default()
     };
 
@@ -1667,6 +2085,11 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
             log::warn!(
                 "pending file-operation journal {} has no reconstructable mappings; leaving it on disk for inspection",
                 journal_path.display()
+            );
+            mark_recovery_surface_unreadable(
+                &mut inventory.recovery_surface_records,
+                &journal_path,
+                "The saved operation has no file mappings that can be resumed safely.",
             );
             inventory.unreconstructable_journals.push(journal_path);
             continue;
@@ -1684,6 +2107,11 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
             log::warn!(
                 "pending file-operation journal {} produced an empty clipboard snapshot; leaving it on disk for inspection",
                 journal_path.display()
+            );
+            mark_recovery_surface_unreadable(
+                &mut inventory.recovery_surface_records,
+                &journal_path,
+                "The saved operation has no source items that can be resumed safely.",
             );
             inventory.unreconstructable_journals.push(journal_path);
             continue;
@@ -1706,6 +2134,11 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
             log::warn!(
                 "pending file-operation journal {} has no recoverable destination directory; leaving it on disk for inspection",
                 journal_path.display()
+            );
+            mark_recovery_surface_unreadable(
+                &mut inventory.recovery_surface_records,
+                &journal_path,
+                "The saved operation has no destination that can be resumed safely.",
             );
             inventory.unreconstructable_journals.push(journal_path);
             continue;
@@ -3069,6 +3502,52 @@ mod tests {
         let recovery = startup_file_task_recovery().expect("cleanup-only recovery");
         assert_eq!(recovery.retry_plan.plan.mappings.as_slice(), &[mapping]);
         assert_eq!(recovery.temp_artifact_count, 1);
+    }
+
+    #[test]
+    fn confirmed_discard_is_durable_and_never_reenters_resume_inventory() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _environment = JournalDirGuard::install(temp.path());
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![sample_mapping()],
+        };
+        let handle = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(),
+            1,
+            30,
+            false,
+            tui_file_picker::VerificationMode::Standard,
+            8,
+            plan.mappings.clone(),
+            Some(BrowsePasteRetryPlan::from_plan(plan)),
+            serde_json::json!({"test": true}),
+        )
+        .expect("create journal");
+        handle.mark_abandoned("restart test").expect("abandon");
+        handle
+            .mark_recovery_discard_started()
+            .expect("persist confirmed discard");
+        let path = handle.path().to_path_buf();
+        drop(handle);
+
+        let record = load_record(&path).expect("reload confirmed discard");
+        assert!(record.needs_reconciliation());
+        assert!(recovery_record_is_discard_cleanup(&record));
+        assert_eq!(
+            record.last_status.as_deref(),
+            Some(RECOVERY_DISCARDING_MARKER)
+        );
+
+        let inventory = startup_file_task_recovery_inventory();
+        assert_eq!(inventory.total_pending_jobs, 1);
+        assert!(inventory.recoveries.is_empty());
+        assert_eq!(inventory.recovery_surface_records.len(), 1);
+        assert!(inventory.recovery_surface_records[0]
+            .record
+            .as_ref()
+            .is_some_and(recovery_record_is_discard_cleanup));
     }
 
     #[test]

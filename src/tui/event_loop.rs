@@ -102,6 +102,8 @@ pub async fn run_app(
         {
             app.set_status("archive edit preparation cancelled: Browse screen changed");
         }
+        super::recovery_ui::maybe_open_startup_prompt(app);
+
         if app.current_screen != AppScreen::Convert {
             let archive_preview_owned_or_pending = app.convert.pending_archive_preview.is_some()
                 || matches!(
@@ -8711,6 +8713,19 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             retry_plan,
         } => {
             reduce_file_task_complete(app, session_id, report, retry_plan, tx);
+            // Control-plane only: scans journal files beside the config, never
+            // source/destination mounts. This keeps the footer indicator in
+            // sync when a running transfer becomes (or ceases to be) unresolved.
+            super::recovery_ui::refresh_from_runtime(app);
+        }
+        AppMessage::RecoveryDiscardComplete {
+            journal_path,
+            result,
+        } => {
+            super::recovery_ui::complete_discard(app, journal_path, result);
+        }
+        AppMessage::RecoveryIncompleteSizesLoaded { journal_path, sizes } => {
+            super::recovery_ui::complete_incomplete_sizes(app, journal_path, sizes);
         }
         AppMessage::RenamePlanComplete {
             description,

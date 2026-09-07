@@ -2578,7 +2578,7 @@ fn execute_file_operation_undo(
 
 fn request_file_operation_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     if app.file_transfers.is_busy() {
-        app.set_status("Undo is unavailable while file transfers are running or queued");
+        app.set_status("Undo is unavailable while file transfers are running, queued, or unresolved");
         return;
     }
     let Some(entry) = app.file_operation_undo.undo_entry().cloned() else {
@@ -2601,7 +2601,7 @@ fn request_file_operation_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>
 
 fn execute_file_operation_redo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     if app.file_transfers.is_busy() {
-        app.set_status("Redo is unavailable while file transfers are running or queued");
+        app.set_status("Redo is unavailable while file transfers are running, queued, or unresolved");
         return;
     }
     let Some(entry_snapshot) = app.file_operation_undo.redo_entry().cloned() else {
@@ -9802,6 +9802,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 app.set_status(format!("file picker: failed to queue completion: {err}"));
             }
             app.active_overlay = ActiveOverlay::FilePicker(session);
+        }
+        ActiveOverlay::FileRecovery => {
+            super::recovery_ui::handle_key(app, key, tx);
         }
         ActiveOverlay::FileTaskProgress(mut session) => {
             if matches!(key.code, KeyCode::Char('v' | 'p'))
@@ -51353,7 +51356,7 @@ pub(super) fn start_filesystem_clipboard_paste(
         .map(|index| index + 1)
     {
         let recovery_note = if duplicate_recovery_demoted {
-            "; an earlier queued/running job owns the durable recovery journal, so this snapshot will re-plan fresh at start"
+            "; an earlier queued/running job owns this recovery state, so this snapshot will re-plan fresh at start"
         } else {
             ""
         };
@@ -51497,15 +51500,28 @@ pub(super) fn cancel_queued_file_transfer(
         .position(|job| job.queue_id == queue_id)
     {
         let Some(deferred) = app.file_transfers.recovery_queued.remove(index) else {
-            app.set_status("Recovery entry was already removed");
+            app.set_status("Interrupted operation was already removed from this session's review queue");
             return;
         };
+        if let Some(journal_path) = deferred
+            .retry_plan
+            .as_ref()
+            .and_then(|retry| retry.recovery_journal_path.as_ref())
+        {
+            app.recovery_ui
+                .session_deferred
+                .insert(journal_path.clone());
+        }
+        let kind = if deferred.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut {
+            "move"
+        } else {
+            "copy"
+        };
+        let count = deferred.clipboard.paths().len();
         app.sync_file_transfer_queue_surfaces();
         app.set_status(format!(
-            "Deferred interrupted {} of {} item{}; its durable journal and RecoveryReserved claims remain unchanged",
-            if deferred.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut { "move" } else { "copy" },
-            deferred.clipboard.paths().len(),
-            if deferred.clipboard.paths().len() == 1 { "" } else { "s" },
+            "Interrupted {kind} of {count} item{} saved for later; its paths stay unavailable to overlapping file changes and undo/redo remains unavailable until it is resolved",
+            if count == 1 { "" } else { "s" },
         ));
         maybe_start_next_file_transfer(app, tx);
         return;
@@ -51543,30 +51559,67 @@ pub(super) fn resume_file_transfer_recovery(
     queue_id: Option<u64>,
     tx: &mpsc::Sender<AppMessage>,
 ) {
-    let index = match queue_id {
-        Some(queue_id) => app
+    let queue_id = match queue_id {
+        Some(queue_id) => queue_id,
+        None => match app.file_transfers.recovery_queued.front() {
+            Some(job) => job.queue_id,
+            None => {
+                app.set_status("No matching interrupted file operation is awaiting recovery review");
+                return;
+            }
+        },
+    };
+    resume_file_transfer_recoveries(app, &[queue_id], tx);
+}
+
+/// Promote an explicitly reviewed set of recoveries as one queue mutation.
+/// `queue_ids` is ordered oldest-first; all selected jobs are prepended in
+/// that same order before the scheduler is invoked once. This avoids a bulk
+/// review accidentally starting a later recovery while the remaining entries
+/// are still being promoted.
+pub(super) fn resume_file_transfer_recoveries(
+    app: &mut AppState,
+    queue_ids: &[u64],
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let mut promoted = Vec::with_capacity(queue_ids.len());
+    for queue_id in queue_ids {
+        let Some(index) = app
             .file_transfers
             .recovery_queued
             .iter()
-            .position(|job| job.queue_id == queue_id),
-        None => (!app.file_transfers.recovery_queued.is_empty()).then_some(0),
-    };
-    let Some(index) = index else {
+            .position(|job| job.queue_id == *queue_id)
+        else {
+            continue;
+        };
+        if let Some(recovery) = app.file_transfers.recovery_queued.remove(index) {
+            promoted.push(recovery);
+        }
+    }
+    if promoted.is_empty() {
         app.set_status("No matching interrupted file operation is awaiting recovery review");
         return;
-    };
-    let Some(recovery) = app.file_transfers.recovery_queued.remove(index) else {
-        app.set_status("Recovery entry was already removed");
-        return;
-    };
-    let queue_id = recovery.queue_id;
-    let count = recovery.clipboard.paths().len();
-    app.file_transfers.queued.push_front(recovery);
+    }
+
+    let promoted_count = promoted.len();
+    let one_summary = (promoted_count == 1).then(|| {
+        let recovery = &promoted[0];
+        recovery.clipboard.paths().len()
+    });
+    for recovery in promoted.into_iter().rev() {
+        app.file_transfers.queued.push_front(recovery);
+    }
     app.sync_file_transfer_queue_surfaces();
-    app.set_status(format!(
-        "Resume approved for recovery #{queue_id} ({count} item{}); exact journal ownership and path admission will be reacquired before execution",
-        if count == 1 { "" } else { "s" },
-    ));
+    if let Some(item_count) = one_summary {
+        app.set_status(format!(
+            "Resume approved for an interrupted operation ({item_count} item{}); its saved recovery state will be rechecked before any files change",
+            if item_count == 1 { "" } else { "s" },
+        ));
+    } else {
+        app.set_status(format!(
+            "Resume approved for {promoted_count} interrupted operations; each saved recovery state will be rechecked before any files change"
+        ));
+    }
     maybe_start_next_file_transfer(app, tx);
 }
 
@@ -51589,6 +51642,480 @@ pub(super) fn defer_file_transfer_recovery(
         return;
     };
     cancel_queued_file_transfer(app, queue_id, tx);
+}
+
+
+fn recovery_source_quarantine_path_is_private(
+    artifact: &super::file_task_runtime::DurableQuarantineArtifact,
+) -> bool {
+    if artifact.path.file_name().and_then(|name| name.to_str()) != Some("payload") {
+        return false;
+    }
+    let Some(container) = artifact.path.parent() else { return false };
+    if container.parent() != artifact.original_source.parent() {
+        return false;
+    }
+    let Some(name) = container.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(".tonepoet-source-quarantine-") else {
+        return false;
+    };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn log_recovery_discard_persistence_failure(action: &str, error: &str) -> String {
+    log::error!("could not persist interrupted-operation discard after {action}: {error}");
+    format!(
+        "Could not save recovery progress after {action}; the operation remains unresolved."
+    )
+}
+
+fn verify_recovery_destination(
+    endpoints: &mut FileTaskEndpointVerificationCache<'_>,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    endpoints.destination(destination).map_err(|error| {
+        log::warn!(
+            "interrupted-operation discard refused destination {}: {error}",
+            destination.display()
+        );
+        format!(
+            "The destination containing {} is unavailable or no longer matches the reviewed operation.",
+            destination.display()
+        )
+    })
+}
+
+fn verify_recovery_source(
+    endpoints: &mut FileTaskEndpointVerificationCache<'_>,
+    source: &std::path::Path,
+) -> Result<(), String> {
+    endpoints.source(source).map_err(|error| {
+        log::warn!(
+            "interrupted-operation discard refused source {}: {error}",
+            source.display()
+        );
+        format!(
+            "The source containing {} is unavailable or no longer matches the reviewed operation.",
+            source.display()
+        )
+    })
+}
+
+fn verify_discarded_recovery_source_survivors(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+    manifest: &tui_file_picker::SourceManifest,
+) -> Result<(), String> {
+    let path = if relative.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect saved source {}: {error}", path.display())),
+    };
+    let expected = manifest.expected_snapshot(relative).ok_or_else(|| {
+        format!("saved source contains an unplanned entry at {}", path.display())
+    })?;
+    if expected.kind() == tui_file_picker::SourceKind::Directory {
+        if !metadata.file_type().is_dir() {
+            return Err(format!("saved source entry changed type at {}", path.display()));
+        }
+        let current = tui_file_picker::snapshot_path(&path)
+            .map_err(|error| format!("re-identify saved source directory {}: {error}", path.display()))?;
+        expected
+            .verify_same_identity_with_policy(
+                &current,
+                tui_file_picker::filesystem_identity_policy(&path),
+            )
+            .map_err(|error| {
+                format!("saved source directory identity changed at {}: {error}", path.display())
+            })?;
+        let actual_children = std::fs::read_dir(&path)
+            .map_err(|error| format!("read saved source directory {}: {error}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|error| format!("read saved source entry under {}: {error}", path.display()))?;
+        let expected_children = manifest.expected_direct_children(relative);
+        let unexpected = actual_children
+            .difference(&expected_children)
+            .take(8)
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if !unexpected.is_empty() {
+            return Err(format!(
+                "saved source has unexpected entr{} under {}: {}",
+                if unexpected.len() == 1 { "y" } else { "ies" },
+                path.display(),
+                unexpected.join(", ")
+            ));
+        }
+        for child in expected_children {
+            let child_relative = if relative.as_os_str().is_empty() {
+                std::path::PathBuf::from(child)
+            } else {
+                relative.join(std::path::PathBuf::from(child))
+            };
+            verify_discarded_recovery_source_survivors(root, &child_relative, manifest)?;
+        }
+    } else {
+        manifest
+            .verify_cleanup_entry_at(relative, &path)
+            .map_err(|error| format!("saved source entry changed at {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn restore_discarded_recovery_source(
+    artifact: &super::file_task_runtime::DurableQuarantineArtifact,
+    manifest: Option<&tui_file_picker::SourceManifest>,
+) -> Result<bool, String> {
+    if !recovery_source_quarantine_path_is_private(artifact) {
+        return Err(format!(
+            "The saved source location for {} no longer has the expected private recovery shape; no source was replaced.",
+            artifact.original_source.display()
+        ));
+    }
+    let held = match std::fs::symlink_metadata(&artifact.path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the saved source for {}: {error}",
+                artifact.original_source.display()
+            ))
+        }
+    };
+    let original = match std::fs::symlink_metadata(&artifact.original_source) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the original source name {}: {error}",
+                artifact.original_source.display()
+            ))
+        }
+    };
+
+    match (held, original) {
+        (false, true) => {
+            let manifest = manifest.ok_or_else(|| {
+                format!(
+                    "The saved identity for {} is incomplete; discard stopped without moving anything.",
+                    artifact.original_source.display()
+                )
+            })?;
+            verify_discarded_recovery_source_survivors(
+                &artifact.original_source,
+                std::path::Path::new(""),
+                manifest,
+            )
+            .map_err(|error| {
+                log::warn!(
+                    "interrupted-operation discard refused already-restored source {}: {error}",
+                    artifact.original_source.display()
+                );
+                format!(
+                    "The source at {} no longer matches the reviewed operation; discard stopped without changing it.",
+                    artifact.original_source.display()
+                )
+            })?;
+            // A prior attempt may have restored the pathname before crashing
+            // ahead of the durable clear. Re-sync before clearing the saved
+            // obligation; unsupported directory sync is handled like the
+            // normal move path and remains a warning rather than a dead end.
+            if let Some(parent) = artifact.original_source.parent() {
+                if let Err(error) = sync_file_task_directory(parent) {
+                    log::warn!(
+                        "interrupted-operation discard found an already-restored source but could not synchronize directory {}: {error}",
+                        parent.display()
+                    );
+                }
+            }
+            return Ok(false);
+        }
+        (false, false) if artifact.state.is_irreversibly_committed() => return Ok(false),
+        (false, false) => {
+            return Err(format!(
+                "Neither the saved source nor its original name exists for {}; discard stopped without replacing anything.",
+                artifact.original_source.display()
+            ))
+        }
+        (true, true) => {
+            return Err(format!(
+                "Both the saved source and the original name exist for {}; discard stopped to avoid replacing either one.",
+                artifact.original_source.display()
+            ))
+        }
+        (true, false) => {}
+    }
+
+    let manifest = manifest.ok_or_else(|| {
+        format!(
+            "The saved identity for {} is incomplete; discard stopped without moving anything.",
+            artifact.original_source.display()
+        )
+    })?;
+    verify_discarded_recovery_source_survivors(
+        &artifact.path,
+        std::path::Path::new(""),
+        manifest,
+    )
+    .map_err(|error| {
+        log::warn!(
+            "interrupted-operation discard refused saved source {}: {error}",
+            artifact.path.display()
+        );
+        format!(
+            "The saved source for {} no longer matches the reviewed operation; discard stopped without moving it.",
+            artifact.original_source.display()
+        )
+    })?;
+
+    try_no_clobber_rename(&artifact.path, &artifact.original_source).map_err(|error| {
+        format!(
+            "Could not restore {} without replacing an existing path: {error}",
+            artifact.original_source.display()
+        )
+    })?;
+    if let Some(container) = artifact.path.parent() {
+        match std::fs::remove_dir(container) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::debug!(
+                "restored interrupted source but could not remove empty recovery directory {}: {error}",
+                container.display()
+            ),
+        }
+    }
+    if let Some(parent) = artifact.original_source.parent() {
+        if let Err(error) = sync_file_task_directory(parent) {
+            log::warn!(
+                "interrupted-operation discard restored {} but could not synchronize directory {}: {error}",
+                artifact.original_source.display(),
+                parent.display()
+            );
+        }
+    }
+    Ok(true)
+}
+
+
+fn snapshot_recovery_rename_path(
+    path: &std::path::Path,
+    role: &str,
+) -> Result<Option<tui_file_picker::SourceSnapshot>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => tui_file_picker::snapshot_path(path)
+            .map(Some)
+            .map_err(|error| format!("Could not inspect the {role} path {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Could not inspect the {role} path {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn sync_recovery_rename_parents(source: &std::path::Path, destination: &std::path::Path) {
+    for parent in [source.parent(), destination.parent()]
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if let Err(error) = sync_file_task_directory(parent) {
+            log::warn!(
+                "interrupted-operation discard restored a direct rename but could not synchronize directory {}: {error}",
+                parent.display()
+            );
+        }
+    }
+}
+
+/// Resolve the crash window around a same-filesystem move's durable rename
+/// intent. The intent is written before the rename, so its presence alone does
+/// not say whether the rename committed. We prove one of the two safe states
+/// from the retained manifest: either the original source is still intact, or
+/// the destination is exactly the renamed source and can be moved back without
+/// replacing anything. Every ambiguous or externally changed state fails closed.
+fn restore_discarded_native_rename(
+    intent: &super::file_task_runtime::DurableNativeRenameIntent,
+) -> Result<bool, String> {
+    let source = intent.source.as_path();
+    let destination = intent.destination.as_path();
+
+    let source_snapshot = snapshot_recovery_rename_path(source, "original source")?;
+    let destination_snapshot = snapshot_recovery_rename_path(destination, "move destination")?;
+    let source_matches = source_snapshot.is_some()
+        && intent.source_manifest.verify_cleanup_tree_at(source).is_ok();
+    let destination_matches = destination_snapshot.is_some()
+        && intent
+            .source_manifest
+            .verify_cleanup_tree_at(destination)
+            .is_ok();
+
+    if source_matches {
+        if destination_matches {
+            return Err(format!(
+                "Both the original source {} and move destination {} match the reviewed item; discard stopped to avoid choosing between them.",
+                source.display(),
+                destination.display()
+            ));
+        }
+        // Either the rename never happened or a previous discard attempt
+        // already restored it. The rename-aware whole-tree proof above accepts
+        // either state while still rejecting changed descendants.
+        sync_recovery_rename_parents(source, destination);
+        return Ok(false);
+    }
+
+    if source_snapshot.is_some() {
+        return Err(format!(
+            "The original source name {} now refers to a different item; discard stopped without replacing it.",
+            source.display()
+        ));
+    }
+    if !destination_matches {
+        return Err(match destination_snapshot {
+            Some(_) => format!(
+                "The move destination {} no longer matches the reviewed source; discard stopped without moving it.",
+                destination.display()
+            ),
+            None => format!(
+                "Neither the original source {} nor its reviewed move destination exists; discard stopped for manual review.",
+                source.display()
+            ),
+        });
+    }
+
+    try_no_clobber_rename(destination, source).map_err(|error| {
+        format!(
+            "Could not restore {} from {} without replacing an existing path: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    intent
+        .source_manifest
+        .verify_cleanup_tree_at(source)
+        .map_err(|error| {
+            log::warn!(
+                "interrupted-operation discard restored direct rename {} but verification failed: {error}",
+                source.display()
+            );
+            format!(
+                "Restored {} but the restored item no longer matches the reviewed operation; recovery remains unresolved.",
+                source.display()
+            )
+        })?;
+    sync_recovery_rename_parents(source, destination);
+    Ok(true)
+}
+
+/// Apply the explicitly reviewed discard semantics for one interrupted copy or
+/// move. The durable runtime acquires and revalidates the exact record revision;
+/// this worker then reuses the normal transfer endpoint and filesystem safety
+/// primitives for the actual cleanup.
+pub(super) fn discard_file_transfer_recovery(
+    journal_path: &std::path::Path,
+    version: super::file_task_runtime::RecoveryRecordVersion,
+) -> Result<super::file_task_runtime::RecoveryDiscardSummary, String> {
+    let preparation = super::file_task_runtime::prepare_recovery_discard(
+        journal_path,
+        version,
+    )?;
+    let (handle, record) = match preparation {
+        super::file_task_runtime::RecoveryDiscardPreparation::Ready { handle, record } => {
+            (handle, record)
+        }
+        super::file_task_runtime::RecoveryDiscardPreparation::CleanupOnly { released_paths } => {
+            return Ok(super::file_task_runtime::RecoveryDiscardSummary {
+                released_paths,
+                ..Default::default()
+            });
+        }
+    };
+
+    let mut summary = super::file_task_runtime::RecoveryDiscardSummary {
+        released_paths: super::file_task_runtime::recovery_blocked_path_count(&record),
+        ..Default::default()
+    };
+    let mut endpoints = FileTaskEndpointVerificationCache::new(&record);
+
+    for artifact in record.temp_artifacts.iter().cloned() {
+        verify_recovery_destination(&mut endpoints, &artifact.destination)?;
+        if !artifact.is_safe_private_artifact(&record.job_id) {
+            return Err(format!(
+                "The incomplete file at {} no longer matches the reviewed operation; discard stopped without deleting it.",
+                artifact.path.display()
+            ));
+        }
+        let existed = match std::fs::symlink_metadata(&artifact.path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect incomplete output {}: {error}",
+                    artifact.path.display()
+                ))
+            }
+        };
+        remove_derived_private_artifact(&artifact.path, artifact.kind).map_err(|error| {
+            log::warn!(
+                "interrupted-operation discard could not remove {}: {error}",
+                artifact.path.display()
+            );
+            format!("Could not delete incomplete output {}.", artifact.path.display())
+        })?;
+        handle
+            .clear_recovered_temp_artifact(&artifact.path)
+            .map_err(|error| log_recovery_discard_persistence_failure("deleting an incomplete file", &error))?;
+        if existed {
+            summary.deleted_incomplete = summary.deleted_incomplete.saturating_add(1);
+        }
+    }
+
+    for artifact in record.quarantine_artifacts.iter().cloned() {
+        verify_recovery_source(&mut endpoints, &artifact.original_source)?;
+        let source_manifest = record.retry_plan.as_ref().and_then(|retry| {
+            record
+                .logical_source_for_admitted(&artifact.original_source)
+                .and_then(|logical_source| retry.recovery_by_source.get(&logical_source))
+                .or_else(|| retry.recovery_by_source.get(&artifact.original_source))
+                .map(|proof| &proof.source_manifest)
+        });
+        if restore_discarded_recovery_source(&artifact, source_manifest)? {
+            summary.restored_sources = summary.restored_sources.saturating_add(1);
+        }
+        handle
+            .clear_recovered_quarantine_artifact(&artifact.path)
+            .map_err(|error| log_recovery_discard_persistence_failure("restoring a source name", &error))?;
+    }
+
+    for intent in record.native_rename_intents.iter().cloned() {
+        verify_recovery_source(&mut endpoints, &intent.source)?;
+        verify_recovery_destination(&mut endpoints, &intent.destination)?;
+        if restore_discarded_native_rename(&intent)? {
+            summary.restored_sources = summary.restored_sources.saturating_add(1);
+        }
+        handle
+            .clear_recovered_native_rename_intent(&intent.source)
+            .map_err(|error| log_recovery_discard_persistence_failure("restoring a directly moved source", &error))?;
+    }
+
+    super::file_task_runtime::commit_recovery_discard(handle)?;
+    Ok(summary)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52299,7 +52826,7 @@ impl FileTaskWorker {
                 }
                 if self.stop_after_committed_cleanup {
                     status.push_str(
-                        "; move committed; source cleanup remains journaled for reconciliation",
+                        "; move committed; source cleanup remains unresolved and will be reviewed in Recovery",
                     );
                 }
                 if let Some(error) = self.terminal_error.as_ref() {
@@ -53266,7 +53793,7 @@ impl FileTaskWorker {
                     },
                     Some(if committed {
                         format!(
-                            "move remains committed; source cleanup stays journaled because this source endpoint is unavailable: {error}"
+                            "move remains committed; source cleanup stays unresolved because this source location is unavailable: {error}"
                         )
                     } else {
                         format!(
@@ -53437,7 +53964,7 @@ impl FileTaskWorker {
                                         tui_file_picker::FileTaskRootDisposition::Failed
                                     },
                                     Some(format!(
-                                        "source cleanup remains journaled because its destination endpoint is unavailable: {error}"
+                                        "source cleanup remains unresolved because its destination location is unavailable: {error}"
                                     )),
                                 );
                                 terminal_sources.insert(source);
@@ -56020,7 +56547,7 @@ impl FileTaskWorker {
                     self.record_active_root_notice(
                         &node.source,
                         format!(
-                            "directory published at {}, but empty staging directory {} remains journaled for deferred cleanup",
+                            "directory published at {}, but empty staging directory {} remains for later cleanup",
                             node.target.display(),
                             staging_container.display()
                         ),
@@ -57552,7 +58079,7 @@ fn summarize_abandoned_file_task(
                     destination: mapping.destination.clone(),
                     disposition: tui_file_picker::FileTaskRootDisposition::CompletedWithWarning,
                     message: Some(format!(
-                        "move crossed the durably confirmed source-deletion boundary before the helper stopped; verified cleanup remains journaled for reconciliation ({reason})"
+                        "source deletion had already begun before the move stopped; verified cleanup remains unresolved in Recovery ({reason})"
                     )),
                     undo_disposition: tui_file_picker::FileTaskUndoDisposition::NotReversible,
                     proof: None,
@@ -57638,18 +58165,14 @@ fn emit_abandoned_completion(
     };
     let update = if errors == 0 && summary.committed_deferred > 0 {
         tui_file_picker::FileTaskProgressUpdate::Finished {
-            status: format!(
-                "Move committed; source cleanup remains journaled for reconciliation at {}",
-                journal.path().display()
-            ),
+            status: "Move committed; source cleanup remains unresolved. Open Recovery to review it."
+                .to_string(),
             totals,
         }
     } else {
         tui_file_picker::FileTaskProgressUpdate::Failed {
-            status: format!(
-                "File task stopped unexpectedly. Recovery journal retained at {}",
-                journal.path().display()
-            ),
+            status: "File task stopped unexpectedly. The interrupted operation is saved for Recovery."
+                .to_string(),
             totals,
         }
     };
@@ -57693,18 +58216,14 @@ fn emit_forced_abandon_completion(
     };
     let update = if errors == 0 && summary.committed_deferred > 0 {
         tui_file_picker::FileTaskProgressUpdate::Finished {
-            status: format!(
-                "Move committed; cancellation stopped source cleanup. Reconcile the retained journal at {}",
-                journal.path().display()
-            ),
+            status: "Move committed; cancellation stopped source cleanup. Open Recovery to review the unresolved operation."
+                .to_string(),
             totals,
         }
     } else {
         tui_file_picker::FileTaskProgressUpdate::Aborted {
-            status: format!(
-                "Cancelled immediately. Recovery journal retained at {}",
-                journal.path().display()
-            ),
+            status: "Cancelled immediately. The interrupted operation is saved for Recovery."
+                .to_string(),
             totals,
         }
     };
@@ -67503,6 +68022,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         handle_file_task_progress_mouse(app, mouse, tx);
         return;
     }
+    if matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+        super::recovery_ui::handle_mouse(app, mouse, tx);
+        return;
+    }
     if matches!(app.active_overlay, ActiveOverlay::ThemeBuilder(_)) {
         handle_theme_builder_mouse(app, mouse);
         return;
@@ -69280,6 +69803,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataAutoNumberRow(_)
             | TuiButton::MetadataAutoNumberApply
             | TuiButton::MetadataAutoNumberCancel
+            | TuiButton::RecoveryTitle
+            | TuiButton::RecoveryPromptAction(_)
+            | TuiButton::RecoveryListRow(_)
+            | TuiButton::RecoveryAction(_)
+            | TuiButton::RecoveryBulkResume
+            | TuiButton::RecoveryBulkDiscard
+            | TuiButton::RecoveryDetailsTab(_)
+            | TuiButton::RecoveryDetailsClose
+            | TuiButton::RecoveryConfirm(_)
             => {
                 // Handled in dedicated mouse/overlay handlers; no-op here.
             }
@@ -105643,6 +106175,59 @@ mod file_transfer_queue_state_tests {
     }
 
     #[test]
+    fn deferring_one_recovery_removes_only_that_review_entry_for_the_session() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-file-transfer-recovery-defer-one",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&destination).expect("destination");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+
+        let mut journals = Vec::new();
+        for (queue_id, name) in [(71, "a.flac"), (72, "b.flac")] {
+            let source = temp.path().join(name);
+            std::fs::write(&source, name.as_bytes()).expect("source");
+            let clipboard = tui_file_picker::FilesystemClipboard::new(
+                tui_file_picker::FilePickerClipboardMode::Copy,
+                vec![source.clone()],
+            )
+            .expect("clipboard");
+            let plan = tui_file_picker::PastePlan {
+                mode: tui_file_picker::FilePickerClipboardMode::Copy,
+                mappings: vec![tui_file_picker::PasteMapping {
+                    source,
+                    destination: destination.join(name),
+                }],
+            };
+            let journal = temp.path().join(format!("{name}.jsonl"));
+            let mut retry = super::super::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+            retry.recovery_journal_path = Some(journal.clone());
+            journals.push(journal);
+            app.file_transfers.recovery_queued.push_back(QueuedFileTransfer {
+                queue_id,
+                clipboard,
+                clipboard_owner_generation: None,
+                destination_dir: destination.clone(),
+                enqueue_plan: plan,
+                retry_plan: Some(retry),
+                recovered: true,
+            });
+        }
+        let (tx, _rx) = mpsc::channel(8);
+
+        defer_file_transfer_recovery(&mut app, Some(72), &tx);
+
+        assert_eq!(app.file_transfers.recovery_queued.len(), 1);
+        assert_eq!(app.file_transfers.recovery_queued[0].queue_id, 71);
+        assert!(!app.recovery_ui.session_deferred.contains(&journals[0]));
+        assert!(app.recovery_ui.session_deferred.contains(&journals[1]));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("saved for later") && message.contains("paths stay unavailable")
+        }));
+    }
+
+    #[test]
     fn repeated_paste_does_not_duplicate_exact_recovery_journal_ownership() {
         let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-file-transfer-queue-recovery-owner",
@@ -105690,7 +106275,7 @@ mod file_transfer_queue_state_tests {
             .as_ref()
             .is_some_and(|retry| retry.recovery_journal_path.is_none()));
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.contains("owns the durable recovery journal")
+            message.contains("owns this recovery state")
         }));
         assert!(recovery_journal_is_already_claimed(&app, &journal_path));
     }

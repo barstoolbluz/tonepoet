@@ -561,6 +561,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         return;
     }
 
+    if matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+        super::recovery_ui::draw(f, app, theme);
+        return;
+    }
+
     if let ActiveOverlay::ThemeBuilder(state) = &mut app.active_overlay {
         super::theme_builder::draw_theme_builder(f, state.as_ref(), &mut app.button_map, theme);
         return;
@@ -646,6 +651,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
         }
         ActiveOverlay::FilePicker(_) => {}
         ActiveOverlay::FileTaskProgress(_) => {}
+        ActiveOverlay::FileRecovery => {}
         ActiveOverlay::MetadataEditor(_) => {}
         ActiveOverlay::MetadataAutoNumber(_) => {}
         ActiveOverlay::CuePreview(ref state) => {

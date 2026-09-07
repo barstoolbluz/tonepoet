@@ -3459,6 +3459,11 @@ pub const COMMAND_NAMES: &[&str] = &[
     "messages",
     "task-messages",
     "file-notices",
+    "recovery",
+    "recovery-resume",
+    "recovery-defer",
+    "recovery-discard",
+    "recovery-details",
     "new-file",
     "new-folder",
     "rename",
@@ -3733,10 +3738,16 @@ pub enum Command {
     FileTaskMessages,
     /// Query or set routine file-operation capability-notice verbosity.
     FileTaskNotices(Option<String>),
+    /// Open the interrupted copy/move recovery window.
+    FileRecovery,
     /// Explicitly resume a reviewed crash-recovery entry. Optional queue id.
     FileRecoveryResume(Option<u64>),
-    /// Defer a reviewed crash-recovery entry without changing its durable journal.
+    /// Defer a reviewed crash-recovery entry without changing durable state.
     FileRecoveryDefer(Option<u64>),
+    /// Open discard confirmation for a reviewed recovery entry. Optional queue id.
+    FileRecoveryDiscard(Option<u64>),
+    /// Open recovery details for a reviewed entry. Optional queue id.
+    FileRecoveryDetails(Option<u64>),
     /// Create a file in the current browse directory. Empty opens an inline prompt.
     NewFile(Option<String>),
     /// Create a folder in the current browse directory. Empty opens an inline prompt.
@@ -4091,8 +4102,11 @@ impl std::fmt::Debug for Command {
             Command::EditFile(path) => f.debug_tuple("EditFile").field(path).finish(),
             Command::FileTaskMessages => f.write_str("FileTaskMessages"),
             Command::FileTaskNotices(value) => f.debug_tuple("FileTaskNotices").field(value).finish(),
+            Command::FileRecovery => f.write_str("FileRecovery"),
             Command::FileRecoveryResume(id) => f.debug_tuple("FileRecoveryResume").field(id).finish(),
             Command::FileRecoveryDefer(id) => f.debug_tuple("FileRecoveryDefer").field(id).finish(),
+            Command::FileRecoveryDiscard(id) => f.debug_tuple("FileRecoveryDiscard").field(id).finish(),
+            Command::FileRecoveryDetails(id) => f.debug_tuple("FileRecoveryDetails").field(id).finish(),
             Command::Unknown(arg) => f.debug_tuple("Unknown").field(arg).finish(),
         }
     }
@@ -4270,6 +4284,7 @@ pub fn parse_command(input: &str) -> Command {
         "file-notices" => Command::FileTaskNotices(
             (!args.is_empty()).then(|| args.to_string()),
         ),
+        "recovery" => Command::FileRecovery,
         "recovery-resume" => {
             let id = if args.trim().is_empty() {
                 None
@@ -4291,6 +4306,28 @@ pub fn parse_command(input: &str) -> Command {
                 }
             };
             Command::FileRecoveryDefer(id)
+        }
+        "recovery-discard" => {
+            let id = if args.trim().is_empty() {
+                None
+            } else {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => return Command::Unknown("usage: :recovery-discard [queue-id]".into()),
+                }
+            };
+            Command::FileRecoveryDiscard(id)
+        }
+        "recovery-details" => {
+            let id = if args.trim().is_empty() {
+                None
+            } else {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => return Command::Unknown("usage: :recovery-details [queue-id]".into()),
+                }
+            };
+            Command::FileRecoveryDetails(id)
         }
         "new-file" => Command::NewFile((!args.is_empty()).then(|| args.to_string())),
         "new-folder" => Command::NewFolder((!args.is_empty()).then(|| args.to_string())),
@@ -5228,6 +5265,10 @@ Native helper failures, missing displays, denied clipboard access, and oversized
                 app.set_status("Live file-transfer progress is already open");
                 return;
             }
+            if app.file_transfers.unresolved_recovery_count > 0 {
+                super::recovery_ui::open_recovery_window(app);
+                return;
+            }
             let Some((session_id, mut progress)) = app.last_file_task_progress.clone() else {
                 app.set_status("No file-task details are available");
                 return;
@@ -5325,11 +5366,48 @@ Native helper failures, missing displays, denied clipboard access, and oversized
         Command::Delete => {
             execute_delete(app, tx);
         }
+        Command::FileRecovery => {
+            super::recovery_ui::open_recovery_window(app);
+        }
         Command::FileRecoveryResume(queue_id) => {
-            super::keybindings::resume_file_transfer_recovery(app, queue_id, tx);
+            super::recovery_ui::refresh_from_runtime(app);
+            let selected = super::recovery_ui::selected_queue_id(app);
+            if queue_id.is_none() && !app.recovery_ui.entries.is_empty() && selected.is_none() {
+                app.set_status(
+                    "The selected interrupted operation cannot be resumed automatically in this session",
+                );
+            } else {
+                super::keybindings::resume_file_transfer_recovery(
+                    app,
+                    queue_id.or(selected),
+                    tx,
+                );
+            }
         }
         Command::FileRecoveryDefer(queue_id) => {
-            super::keybindings::defer_file_transfer_recovery(app, queue_id, tx);
+            super::recovery_ui::refresh_from_runtime(app);
+            let selected = super::recovery_ui::selected_queue_id(app);
+            if queue_id.is_none() && !app.recovery_ui.entries.is_empty() && selected.is_none() {
+                app.set_status(
+                    "The selected interrupted operation is already saved for later or is not available to defer",
+                );
+            } else {
+                super::keybindings::defer_file_transfer_recovery(
+                    app,
+                    queue_id.or(selected),
+                    tx,
+                );
+            }
+            if matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+                app.recovery_ui.minimize();
+                app.active_overlay = ActiveOverlay::None;
+            }
+        }
+        Command::FileRecoveryDiscard(queue_id) => {
+            super::recovery_ui::open_discard_for_queue_id(app, queue_id);
+        }
+        Command::FileRecoveryDetails(queue_id) => {
+            super::recovery_ui::open_details_for_queue_id(app, queue_id, tx);
         }
         Command::NewFile(name) => {
             execute_browse_create_command(app, super::app::BrowseCreateKind::File, name, tx);
@@ -16190,6 +16268,23 @@ mod completion_tests {
         assert!(matches!(
             parse_command("file-notices verbose"),
             Command::FileTaskNotices(Some(value)) if value == "verbose"
+        ));
+        assert!(matches!(parse_command("recovery"), Command::FileRecovery));
+        assert!(matches!(
+            parse_command("recovery-resume 7"),
+            Command::FileRecoveryResume(Some(7))
+        ));
+        assert!(matches!(
+            parse_command("recovery-defer"),
+            Command::FileRecoveryDefer(None)
+        ));
+        assert!(matches!(
+            parse_command("recovery-discard 9"),
+            Command::FileRecoveryDiscard(Some(9))
+        ));
+        assert!(matches!(
+            parse_command("recovery-details"),
+            Command::FileRecoveryDetails(None)
         ));
 
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());

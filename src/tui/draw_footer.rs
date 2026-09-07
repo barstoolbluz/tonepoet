@@ -166,8 +166,15 @@ fn draw_context_bar(
     if let Some(details_area) = file_task_details_rect(area, file_task) {
         buttons.record_button(TuiButton::FileTaskMessages, details_area);
         let attention = file_task.is_some_and(|state| state.attention);
+        let recovery = file_task.is_some_and(|state| state.recovery_unresolved > 0);
         let style = Style::default()
-            .fg(if attention { theme.destructive } else { theme.cyan })
+            .fg(if attention {
+                theme.destructive
+            } else if recovery {
+                theme.warning
+            } else {
+                theme.cyan
+            })
             .add_modifier(Modifier::BOLD);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(details_label, style))),
@@ -211,6 +218,23 @@ fn file_task_details_label(width: u16, file_task: Option<FileTaskFooterState>) -
         return String::new();
     }
     if !state.live {
+        if state.recovery_unresolved > 0 {
+            let count = if state.recovery_unresolved > 999 {
+                "999+".to_string()
+            } else {
+                state.recovery_unresolved.to_string()
+            };
+            let candidates = [
+                format!(" ▲ {count} unresolved "),
+                format!(" {count} unresolved "),
+                format!("{count}!"),
+                "!".to_string(),
+            ];
+            return candidates
+                .into_iter()
+                .find(|label| label.chars().count() <= width as usize)
+                .unwrap_or_default();
+        }
         return if width >= 18 {
             " details ".to_string()
         } else if width >= 7 {
@@ -384,6 +408,7 @@ mod tests {
     fn retained() -> Option<FileTaskFooterState> {
         Some(FileTaskFooterState {
             live: false,
+            recovery_unresolved: 0,
             ratio: Some(1.0),
             queued: 0,
             attention: false,
@@ -393,9 +418,20 @@ mod tests {
     fn live(queued: usize, attention: bool) -> Option<FileTaskFooterState> {
         Some(FileTaskFooterState {
             live: true,
+            recovery_unresolved: 0,
             ratio: Some(0.61),
             queued,
             attention,
+        })
+    }
+
+    fn unresolved(count: usize) -> Option<FileTaskFooterState> {
+        Some(FileTaskFooterState {
+            live: false,
+            recovery_unresolved: count,
+            ratio: None,
+            queued: 0,
+            attention: false,
         })
     }
 
@@ -430,6 +466,18 @@ mod tests {
             Some(Rect::new(9, 4, 1, 1)),
         );
         assert_eq!(file_task_details_rect(Rect::new(9, 4, 0, 1), retained()), None);
+    }
+
+    #[test]
+    fn unresolved_recovery_label_shares_the_restore_slot_at_every_width() {
+        assert_eq!(file_task_details_label(30, unresolved(2)), " ▲ 2 unresolved ");
+        assert_eq!(file_task_details_label(14, unresolved(2)), " 2 unresolved ");
+        assert_eq!(file_task_details_label(2, unresolved(2)), "2!");
+        assert_eq!(file_task_details_label(1, unresolved(2)), "!");
+        assert_eq!(
+            file_task_details_rect(Rect::new(9, 4, 1, 1), unresolved(2)),
+            Some(Rect::new(9, 4, 1, 1)),
+        );
     }
 
     #[test]
