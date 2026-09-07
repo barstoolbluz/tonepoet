@@ -40,11 +40,14 @@ const CONFIRM_MAX_HEIGHT: u16 = 21;
 // The HTML mockups establish readability floors, not restored-window targets.
 // Let the primary recovery surfaces use the terminal when it has room, while
 // keeping the narrower epi-popups from becoming needlessly full-width.
-const PROMPT_WIDTH_PERCENT: u16 = 75;
-const PROMPT_HEIGHT_PERCENT: u16 = 55;
-const WINDOW_WIDTH_PERCENT: u16 = 90;
-const WINDOW_HEIGHT_PERCENT: u16 = 80;
-const EPI_POPUP_WIDTH_PERCENT: u16 = 70;
+const PROMPT_WIDTH_PERCENT: u16 = 60;
+const PROMPT_HEIGHT_PERCENT: u16 = 40;
+const WINDOW_WIDTH_PERCENT: u16 = 75;
+const WINDOW_HEIGHT_PERCENT: u16 = 55;
+// Layer-3 surfaces open over the recovery window, so they are sized against
+// that window rather than the terminal. Sizing them against the terminal would
+// make an epi-popup nearly as wide as the surface it sits on.
+const EPI_POPUP_WIDTH_PERCENT: u16 = 78;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySurface {
@@ -1527,6 +1530,21 @@ fn scaled_extent(total: u16, floor: u16, percent: u16) -> u16 {
     scaled.max(floor.min(total)).min(total)
 }
 
+/// The rect the recovery window occupies. Layer-3 surfaces open over that
+/// window, so they take their proportions from it rather than from the whole
+/// terminal — an epi-popup sized against the terminal ends up nearly as wide as
+/// the surface it sits on.
+fn parent_window_rect(area: Rect, maximized: bool) -> Rect {
+    surface_rect(
+        area,
+        WINDOW_MIN_WIDTH,
+        WINDOW_MIN_HEIGHT,
+        WINDOW_WIDTH_PERCENT,
+        Some(WINDOW_HEIGHT_PERCENT),
+        maximized,
+    )
+}
+
 fn surface_rect(
     area: Rect,
     min_width: u16,
@@ -2292,7 +2310,7 @@ fn details_restored_height(state: &RecoveryUiState) -> u16 {
 
 fn draw_details(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
-        f.size(),
+        parent_window_rect(f.size(), app.recovery_ui.maximized),
         DETAILS_MIN_WIDTH,
         details_restored_height(&app.recovery_ui),
         EPI_POPUP_WIDTH_PERCENT,
@@ -2682,7 +2700,7 @@ fn draw_discard_confirm(
         .saturating_add(itemized_rows.min(12) as u16)
         .clamp(13, CONFIRM_MAX_HEIGHT);
     let popup = surface_rect(
-        f.size(),
+        parent_window_rect(f.size(), app.recovery_ui.maximized),
         CONFIRM_MIN_WIDTH,
         restored_height,
         EPI_POPUP_WIDTH_PERCENT,
@@ -2960,7 +2978,7 @@ fn draw_bulk_discard_items(
 
 fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
-        f.size(),
+        parent_window_rect(f.size(), app.recovery_ui.maximized),
         DETAILS_MIN_WIDTH,
         13,
         EPI_POPUP_WIDTH_PERCENT,
@@ -3357,7 +3375,7 @@ mod tests {
             Some(PROMPT_HEIGHT_PERCENT),
             false,
         );
-        assert_eq!((prompt.width, prompt.height), (150, 33));
+        assert_eq!((prompt.width, prompt.height), (120, 24));
 
         let window = surface_rect(
             large,
@@ -3367,7 +3385,7 @@ mod tests {
             Some(WINDOW_HEIGHT_PERCENT),
             false,
         );
-        assert_eq!((window.width, window.height), (180, 48));
+        assert_eq!((window.width, window.height), (150, 33));
 
         let details = surface_rect(
             large,
@@ -3377,7 +3395,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!((details.width, details.height), (140, 17));
+        assert_eq!((details.width, details.height), (156, 17));
 
         let near_floor = Rect::new(0, 0, 120, 30);
         let window = surface_rect(
@@ -3388,7 +3406,7 @@ mod tests {
             Some(WINDOW_HEIGHT_PERCENT),
             false,
         );
-        assert_eq!((window.width, window.height), (116, 24));
+        assert_eq!((window.width, window.height), (116, 23));
 
         let constrained = Rect::new(0, 0, 90, 20);
         let window = surface_rect(
@@ -3400,6 +3418,32 @@ mod tests {
             false,
         );
         assert_eq!((window.width, window.height), (90, 20));
+    }
+
+    #[test]
+    fn epi_popups_are_sized_against_the_recovery_window_not_the_terminal() {
+        let terminal = Rect::new(0, 0, 200, 60);
+        let window = parent_window_rect(terminal, false);
+        assert_eq!((window.width, window.height), (150, 33));
+
+        let details = surface_rect(
+            window,
+            DETAILS_MIN_WIDTH,
+            17,
+            EPI_POPUP_WIDTH_PERCENT,
+            None,
+            false,
+        );
+        // 78% of the window's 150 columns, not of the terminal's 200.
+        assert_eq!(details.width, 117);
+        assert!(
+            details.width < window.width,
+            "an epi-popup must read as sitting on the window, not replacing it",
+        );
+        assert!(
+            details.x >= window.x && details.x + details.width <= window.x + window.width,
+            "an epi-popup must stay within its parent window",
+        );
     }
 
     #[test]
