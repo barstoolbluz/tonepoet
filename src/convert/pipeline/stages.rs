@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use async_trait::async_trait;
@@ -111,6 +111,7 @@ use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const STAGING_PARENT_NAME: &str = ".tonepoet-staging";
+const CONVERSION_LOG_TIMING_MODEL: &str = "wall-clock-v2";
 const CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION: u8 = 13;
 const CONVERSION_LOG_FRAGMENT_DIR: &str = ".tonepoet-log-fragments";
 const CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR: &str = ".tonepoet-log-fragments.quarantine";
@@ -14890,6 +14891,31 @@ async fn run_features_with_album_gain_scope(
     runner: &dyn ToolRunner,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
 ) -> Result<(ArtifactSet, StageRecord), FeatureError> {
+    run_features_with_album_gain_scope_and_timing(
+        artifacts,
+        outcome,
+        source,
+        req,
+        staging,
+        runner,
+        album_gain_scope_disclosure,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn run_features_with_album_gain_scope_and_timing(
+    artifacts: ArtifactSet,
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    run_timing: Option<&ConversionRunTiming>,
+) -> Result<(ArtifactSet, StageRecord), FeatureError> {
     #[cfg(test)]
     if let Some(error) = injected_post_materialization_stage_error_for_test(
         PipelineStage::Features,
@@ -14910,7 +14936,7 @@ async fn run_features_with_album_gain_scope(
         ));
     }
 
-    let artifacts = stage_conversion_log_sidecars(
+    let artifacts = stage_conversion_log_sidecars_with_timing(
         artifacts,
         outcome,
         source,
@@ -14918,6 +14944,8 @@ async fn run_features_with_album_gain_scope(
         staging,
         Some(runner),
         album_gain_scope_disclosure,
+        album_gain_timings,
+        run_timing,
     )?;
 
     Ok((
@@ -14931,6 +14959,28 @@ async fn run_features_with_album_gain_scope(
 }
 
 fn stage_conversion_log_sidecars(
+    artifacts: ArtifactSet,
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    staging: &StagingDir,
+    runner: Option<&dyn ToolRunner>,
+    album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+) -> io::Result<ArtifactSet> {
+    stage_conversion_log_sidecars_with_timing(
+        artifacts,
+        outcome,
+        source,
+        req,
+        staging,
+        runner,
+        album_gain_scope_disclosure,
+        None,
+        None,
+    )
+}
+
+fn stage_conversion_log_sidecars_with_timing(
     mut artifacts: ArtifactSet,
     outcome: &AlbumOutcome,
     source: &PreparedSource,
@@ -14938,6 +14988,8 @@ fn stage_conversion_log_sidecars(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    run_timing: Option<&ConversionRunTiming>,
 ) -> io::Result<ArtifactSet> {
     let album_dir = conversion_log_album_dir(source, req, &artifacts);
 
@@ -14962,6 +15014,8 @@ fn stage_conversion_log_sidecars(
             staging,
             runner,
             album_gain_scope_disclosure,
+            album_gain_timings,
+            run_timing,
         )? {
             artifacts.sidecars.push(SidecarArtifact {
                 kind: SidecarKind::Other(CONVERSION_LOG_FRAGMENT_SIDE_KIND.to_string()),
@@ -14982,7 +15036,7 @@ fn stage_conversion_log_sidecars(
         // but the visible standalone conversion.log is never built.
     } else {
         let log_staged = staging.root.join("conversion.log");
-        let log_content = build_conversion_log_at_with_runner(
+        let log_content = build_conversion_log_at_with_runner_and_timing(
             outcome,
             source,
             req,
@@ -14991,6 +15045,8 @@ fn stage_conversion_log_sidecars(
             log_generated_at,
             runner,
             album_gain_scope_disclosure,
+            album_gain_timings,
+            run_timing,
         );
         fs::write(&log_staged, &log_content)?;
         artifacts.sidecars.push(SidecarArtifact {
@@ -15428,6 +15484,7 @@ fn stage_pre_materialization_conversion_log_fragment(
         req,
         metadata_stage_outcome(outcome),
         None,
+        None,
     );
 
     let fragment = ConversionLogFragment {
@@ -15435,6 +15492,7 @@ fn stage_pre_materialization_conversion_log_fragment(
         expected_track_count: conversion_log_expected_track_count(req)?,
         sort_key,
         generated_at,
+        timing: None,
         settings_fingerprint: Some(settings_fingerprint),
         batch_identity,
         rendered_album_dir: None,
@@ -15522,6 +15580,46 @@ fn append_request_only_conversion_settings_section(log: &mut String, req: &Pipel
     push_kv_line(log, "Filename template", &req.naming.template);
 }
 
+/// Runtime-only wall-clock timing for one live pipeline request.
+///
+/// `Instant` is authoritative for elapsed time inside one request. The UTC
+/// anchor exists so independently scheduled album fragments can be combined
+/// into one album wall-clock span without summing overlapping worker time.
+#[derive(Debug, Clone)]
+struct ConversionRunTiming {
+    started_at_utc: chrono::DateTime<chrono::Utc>,
+    started_at: Instant,
+}
+
+impl ConversionRunTiming {
+    fn start() -> Self {
+        Self {
+            started_at_utc: chrono::Utc::now(),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn snapshot(&self) -> ConversionLogFragmentTiming {
+        let elapsed = self.started_at.elapsed();
+        let finished_at_utc = chrono::Duration::from_std(elapsed)
+            .ok()
+            .and_then(|delta| self.started_at_utc.clone().checked_add_signed(delta))
+            .unwrap_or_else(chrono::Utc::now);
+        ConversionLogFragmentTiming {
+            started_at_utc: self.started_at_utc.clone(),
+            finished_at_utc,
+            elapsed_millis: duration_to_millis_saturating(elapsed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ConversionLogFragmentTiming {
+    started_at_utc: chrono::DateTime<chrono::Utc>,
+    finished_at_utc: chrono::DateTime<chrono::Utc>,
+    elapsed_millis: u64,
+}
+
 #[cfg(test)]
 fn build_conversion_log(
     outcome: &AlbumOutcome,
@@ -15562,6 +15660,7 @@ fn build_conversion_log_at(
     )
 }
 
+#[cfg(test)]
 fn build_conversion_log_at_with_runner(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
@@ -15571,6 +15670,32 @@ fn build_conversion_log_at_with_runner(
     generated_at: chrono::DateTime<chrono::Utc>,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+) -> String {
+    build_conversion_log_at_with_runner_and_timing(
+        outcome,
+        source,
+        req,
+        artifacts,
+        settings_fingerprint,
+        generated_at,
+        runner,
+        album_gain_scope_disclosure,
+        None,
+        None,
+    )
+}
+
+fn build_conversion_log_at_with_runner_and_timing(
+    outcome: &AlbumOutcome,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+    artifacts: &ArtifactSet,
+    settings_fingerprint: Option<&str>,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    runner: Option<&dyn ToolRunner>,
+    album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    run_timing: Option<&ConversionRunTiming>,
 ) -> String {
     let tracks = collect_outcome_tracks(outcome);
     let source_tracks_by_ordinal = build_source_track_index(source);
@@ -15601,11 +15726,15 @@ fn build_conversion_log_at_with_runner(
         .iter()
         .filter(|track| track.bytes_out.is_none())
         .count();
-    let missing_durations = tracks
+    let missing_encode_durations = tracks
         .iter()
         .filter(|track| track.duration.is_none())
         .count();
-    let total_duration = total_track_duration(&tracks);
+    let encode_duration_sum = total_track_duration(&tracks);
+    let timing_checkpoint = run_timing.map(ConversionRunTiming::snapshot);
+    let elapsed_wall_time = timing_checkpoint
+        .as_ref()
+        .map(|timing| duration_from_millis(timing.elapsed_millis));
 
     let mut source_blocking_lines = String::new();
     append_source_blocking_lines(&mut source_blocking_lines, source);
@@ -15643,6 +15772,7 @@ fn build_conversion_log_at_with_runner(
             req,
             metadata_stage_result,
             album_gain_scope_disclosure,
+            album_gain_timings,
         );
         track_sections.push(section);
     }
@@ -15674,8 +15804,16 @@ fn build_conversion_log_at_with_runner(
             total_bytes_out,
             missing_input_sizes,
             missing_output_sizes,
-            total_duration,
-            missing_durations,
+            encode_duration_sum,
+            missing_encode_durations,
+            elapsed_wall_time,
+            timing_started_at_utc: timing_checkpoint
+                .as_ref()
+                .map(|timing| timing.started_at_utc.clone()),
+            timing_checkpoint_finished_at_utc: timing_checkpoint
+                .as_ref()
+                .map(|timing| timing.finished_at_utc.clone()),
+            missing_wall_timings: usize::from(run_timing.is_none()),
         },
         batch_status: None,
         result_label: outcome_result_label(outcome, successful_count, failed_count, total_track_count),
@@ -15716,8 +15854,12 @@ struct ConversionLogTotalSummary {
     total_bytes_out: u64,
     missing_input_sizes: usize,
     missing_output_sizes: usize,
-    total_duration: Duration,
-    missing_durations: usize,
+    encode_duration_sum: Duration,
+    missing_encode_durations: usize,
+    elapsed_wall_time: Option<Duration>,
+    timing_started_at_utc: Option<chrono::DateTime<chrono::Utc>>,
+    timing_checkpoint_finished_at_utc: Option<chrono::DateTime<chrono::Utc>>,
+    missing_wall_timings: usize,
 }
 
 fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
@@ -15815,10 +15957,43 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
         input.total_summary.missing_input_sizes,
         input.total_summary.missing_output_sizes,
     );
-    append_total_duration_line(
+    push_kv_line(&mut log, "Timing model", CONVERSION_LOG_TIMING_MODEL);
+    if input.total_summary.missing_wall_timings == 0 {
+        if let Some(started_at) = input.total_summary.timing_started_at_utc.as_ref() {
+            push_kv_line(
+                &mut log,
+                "Timing started (UTC)",
+                started_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            );
+        }
+    }
+    append_elapsed_processing_wall_time_line(
         &mut log,
-        input.total_summary.total_duration,
-        input.total_summary.missing_durations,
+        input.total_summary.elapsed_wall_time,
+        input.total_summary.missing_wall_timings,
+    );
+    if input.total_summary.missing_wall_timings == 0 {
+        if let Some(checkpoint) = input
+            .total_summary
+            .timing_checkpoint_finished_at_utc
+            .as_ref()
+        {
+            push_kv_line(
+                &mut log,
+                "Timing checkpoint (UTC)",
+                checkpoint.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            );
+        }
+    }
+    append_encode_duration_sum_line(
+        &mut log,
+        input.total_summary.encode_duration_sum,
+        input.total_summary.missing_encode_durations,
+    );
+    push_kv_line(
+        &mut log,
+        "Timing scope",
+        "processing wall time starts when pipeline execution begins and is finalized immediately before durable-log and terminal-report bookkeeping, after publication and post-actions; queue wait before pipeline entry is excluded; album-batch wall time spans the earliest participant start through the finalizing participant; per-track Encode duration retains its existing meaning and times the executed track plan after source realization, so it includes DSD-to-PCM work when that work is part of the plan and excludes DSD album-gain prepass work; DSD album-gain prepass timings are reported separately; per-track and prepass timings may overlap across workers and must not be summed as wall time",
     );
     push_kv_line(&mut log, "Result", &input.result_label);
     log.push('\n');
@@ -15833,6 +16008,8 @@ struct ConversionLogFragment {
     expected_track_count: usize,
     sort_key: ConversionLogTrackSortKey,
     generated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timing: Option<ConversionLogFragmentTiming>,
     settings_fingerprint: Option<String>,
     batch_identity: ConversionLogBatchIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -16184,6 +16361,8 @@ fn stage_conversion_log_fragment(
         staging,
         runner,
         None,
+        None,
+        None,
     )?;
     if fragments.len() != 1 {
         return Err(io::Error::new(
@@ -16208,6 +16387,8 @@ fn stage_conversion_log_fragments(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    run_timing: Option<&ConversionRunTiming>,
 ) -> io::Result<Vec<(PathBuf, String)>> {
     let track_records = conversion_log_fragment_track_records(outcome);
     if track_records.is_empty() {
@@ -16266,6 +16447,7 @@ fn stage_conversion_log_fragments(
             req,
             metadata_stage_result,
             album_gain_scope_disclosure,
+            album_gain_timings,
         );
 
         let fragment = ConversionLogFragment {
@@ -16273,6 +16455,7 @@ fn stage_conversion_log_fragments(
             expected_track_count,
             sort_key,
             generated_at,
+            timing: run_timing.map(ConversionRunTiming::snapshot),
             settings_fingerprint: settings_fingerprint.clone(),
             batch_identity: batch_identity.clone(),
             rendered_album_dir: conversion_log_rendered_album_dir_for_track(source, req, artifacts, &track_id)
@@ -20657,11 +20840,31 @@ fn build_conversion_log_from_fragments_with_status(
         .iter()
         .filter(|fragment| fragment.summary.bytes_out.is_none())
         .count();
-    let missing_durations = ordered
+    let missing_encode_durations = ordered
         .iter()
         .filter(|fragment| fragment.summary.duration_millis.is_none())
         .count();
-    let total_duration = total_fragment_duration(&ordered);
+    let encode_duration_sum = total_fragment_duration(&ordered);
+    let absent_fragments = total_track_count.saturating_sub(ordered.len());
+    let (
+        timing_started_at_utc,
+        elapsed_wall_time,
+        timing_checkpoint_finished_at_utc,
+        invalid_or_missing_wall_timings,
+    ) = fragment_elapsed_wall_time(&ordered);
+    let missing_wall_timings = invalid_or_missing_wall_timings
+        .saturating_add(absent_fragments)
+        .saturating_add(usize::from(assembly_status.is_some() && absent_fragments == 0));
+    let (timing_started_at_utc, elapsed_wall_time, timing_checkpoint_finished_at_utc) =
+        if missing_wall_timings == 0 {
+            (
+                timing_started_at_utc,
+                elapsed_wall_time,
+                timing_checkpoint_finished_at_utc,
+            )
+        } else {
+            (None, None, None)
+        };
     let track_sections = ordered
         .iter()
         .map(|fragment| fragment.track.section.clone())
@@ -20719,8 +20922,12 @@ fn build_conversion_log_from_fragments_with_status(
             total_bytes_out,
             missing_input_sizes,
             missing_output_sizes,
-            total_duration,
-            missing_durations,
+            encode_duration_sum,
+            missing_encode_durations,
+            elapsed_wall_time,
+            timing_started_at_utc,
+            timing_checkpoint_finished_at_utc,
+            missing_wall_timings,
         },
         batch_status,
         result_label,
@@ -20951,6 +21158,62 @@ fn total_fragment_duration(fragments: &[ConversionLogFragment]) -> Duration {
             .unwrap_or_else(|| Duration::from_secs(u64::MAX));
     }
     total
+}
+
+/// Compute one elapsed album span from independently timed fragments.
+///
+/// The span is earliest fragment start to latest fragment checkpoint, not a
+/// sum of per-track durations. Missing or malformed timing fails closed so an
+/// old/recovered fragment can never be relabeled as wall-clock authority.
+fn fragment_elapsed_wall_time(
+    fragments: &[ConversionLogFragment],
+) -> (
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<Duration>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    usize,
+) {
+    let mut earliest_start = None;
+    let mut latest_finish = None;
+    let mut invalid_or_missing = 0usize;
+
+    for fragment in fragments {
+        let Some(timing) = fragment.timing.as_ref() else {
+            invalid_or_missing = invalid_or_missing.saturating_add(1);
+            continue;
+        };
+        let Ok(fragment_elapsed) = timing
+            .finished_at_utc
+            .signed_duration_since(timing.started_at_utc.clone())
+            .to_std()
+        else {
+            invalid_or_missing = invalid_or_missing.saturating_add(1);
+            continue;
+        };
+        if duration_to_millis_saturating(fragment_elapsed) != timing.elapsed_millis {
+            invalid_or_missing = invalid_or_missing.saturating_add(1);
+            continue;
+        }
+        earliest_start = Some(match earliest_start {
+            Some(current) if current <= timing.started_at_utc => current,
+            _ => timing.started_at_utc.clone(),
+        });
+        latest_finish = Some(match latest_finish {
+            Some(current) if current >= timing.finished_at_utc => current,
+            _ => timing.finished_at_utc.clone(),
+        });
+    }
+
+    if invalid_or_missing != 0 {
+        return (None, None, None, invalid_or_missing);
+    }
+    let (Some(start), Some(finish)) = (earliest_start, latest_finish) else {
+        return (None, None, None, 0);
+    };
+    match finish.signed_duration_since(start.clone()).to_std() {
+        Ok(elapsed) => (Some(start), Some(elapsed), Some(finish), 0),
+        Err(_) => (None, None, None, 1),
+    }
 }
 
 fn fragment_result_label(
@@ -21800,6 +22063,7 @@ fn append_track_log(
     req: &PipelineRequest,
     metadata_stage_result: Option<&StageOutcome>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
 ) {
     log.push_str(&escape_log_value(&track_display_label(record, prepared)));
     log.push('\n');
@@ -21820,6 +22084,22 @@ fn append_track_log(
             log,
             "  Album gain scope",
             dsd_album_gain_scope_disclosure_label(disclosure),
+        );
+    }
+
+    if let Some(timing) = album_gain_timings
+        .and_then(|timings| timings.get(&record.track_id))
+        .copied()
+    {
+        push_kv_line(
+            log,
+            "  DSD album-gain prepass",
+            format!(
+                "source realization {}; DSD-to-PCM decode {}; true-peak scan {}",
+                format_duration_precise(timing.realization),
+                format_duration_precise(timing.dsd_to_pcm_decode),
+                format_duration_precise(timing.true_peak_scan),
+            ),
         );
     }
 
@@ -21905,7 +22185,7 @@ fn append_track_log(
     }
 
     if let Some(duration) = record.duration {
-        push_kv_line(log, "  Encode duration", format_duration(duration));
+        push_kv_line(log, "  Encode duration", format_duration_precise(duration));
     }
 
     if record.commands.is_empty() {
@@ -21917,7 +22197,7 @@ fn append_track_log(
                 "    {}. {} [{}; {}]\n",
                 index + 1,
                 command_line_label(command),
-                format_duration(command.elapsed),
+                format_duration_precise(command.elapsed),
                 process_exit_label(command.exit)
             ));
         }
@@ -24528,18 +24808,200 @@ fn append_total_size_line(
     push_kv_line(log, "Total size", line);
 }
 
-fn append_total_duration_line(
+fn append_elapsed_processing_wall_time_line(
     log: &mut String,
-    total_duration: Duration,
-    missing_durations: usize,
+    elapsed_wall_time: Option<Duration>,
+    missing_wall_timings: usize,
 ) {
-    let mut line = format_duration(total_duration);
-    if missing_durations > 0 {
+    match elapsed_wall_time {
+        Some(elapsed) if missing_wall_timings == 0 => {
+            push_kv_line(
+                log,
+                "Elapsed processing wall time",
+                format!(
+                    "pending finalization (checkpoint {})",
+                    format_duration_precise(elapsed),
+                ),
+            );
+        }
+        _ if missing_wall_timings > 0 => {
+            push_kv_line(
+                log,
+                "Elapsed processing wall time",
+                format!(
+                    "unavailable [{missing_wall_timings} missing or incompatible timing span(s)]"
+                ),
+            );
+        }
+        _ => push_kv_line(log, "Elapsed processing wall time", "unavailable"),
+    }
+}
+
+fn append_encode_duration_sum_line(
+    log: &mut String,
+    encode_duration_sum: Duration,
+    missing_encode_durations: usize,
+) {
+    let mut line = format_duration_precise(encode_duration_sum);
+    if missing_encode_durations > 0 {
         line.push_str(&format!(
-            " [partial data: {missing_durations} missing duration(s)]"
+            " [partial data: {missing_encode_durations} missing encode duration(s)]"
         ));
     }
-    push_kv_line(log, "Total conversion time", line);
+    push_kv_line(log, "Per-track Encode duration sum", line);
+}
+
+fn unique_conversion_log_value<'a>(log: &'a str, label: &str) -> io::Result<Option<&'a str>> {
+    let prefix = format!("{label}: ");
+    let mut value = None;
+    for line in log.lines() {
+        let Some(candidate) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        if value.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("conversion log contains duplicate {label:?} timing fields"),
+            ));
+        }
+        value = Some(candidate);
+    }
+    Ok(value)
+}
+
+fn parse_conversion_log_utc_timestamp(value: &str, label: &str) -> io::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("conversion log has invalid {label} timestamp {value:?}: {error}"),
+            )
+        })
+}
+
+/// Finalize the wall-clock checkpoint already embedded in a conversion log.
+///
+/// This is intentionally idempotent. A completed wall-clock-v2 log is left
+/// byte-for-byte alone, while a legacy/incomplete log without timing authority
+/// is never upgraded from an encode-duration sum.
+fn finalize_conversion_log_timing_text(
+    log: &str,
+    terminal_timing: &ConversionLogFragmentTiming,
+) -> io::Result<Option<String>> {
+    let Some(model) = unique_conversion_log_value(log, "Timing model")? else {
+        return Ok(None);
+    };
+    if model != CONVERSION_LOG_TIMING_MODEL {
+        return Ok(None);
+    }
+
+    let Some(elapsed_value) = unique_conversion_log_value(log, "Elapsed processing wall time")? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wall-clock-v2 conversion log is missing Elapsed processing wall time",
+        ));
+    };
+    let existing_finished = unique_conversion_log_value(log, "Timing finished (UTC)")?;
+    let existing_checkpoint = unique_conversion_log_value(log, "Timing checkpoint (UTC)")?;
+
+    if existing_finished.is_some() {
+        if existing_checkpoint.is_some() || elapsed_value.starts_with("pending finalization") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wall-clock-v2 conversion log mixes finalized and pending timing fields",
+            ));
+        }
+        return Ok(None);
+    }
+    if elapsed_value.starts_with("unavailable") {
+        return Ok(None);
+    }
+    if !elapsed_value.starts_with("pending finalization") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "wall-clock-v2 conversion log has unrecognized elapsed timing value {elapsed_value:?}"
+            ),
+        ));
+    }
+
+    let started_value = unique_conversion_log_value(log, "Timing started (UTC)")?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pending wall-clock-v2 conversion log is missing Timing started (UTC)",
+        )
+    })?;
+    let checkpoint_value = existing_checkpoint.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pending wall-clock-v2 conversion log is missing Timing checkpoint (UTC)",
+        )
+    })?;
+    let started = parse_conversion_log_utc_timestamp(started_value, "start")?;
+    let checkpoint = parse_conversion_log_utc_timestamp(checkpoint_value, "checkpoint")?;
+    if checkpoint < started {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wall-clock-v2 conversion log checkpoint precedes its start",
+        ));
+    }
+
+    // The terminal snapshot is derived from Instant for the finalizing request.
+    // For a multi-part album the latest fragment checkpoint can have a later
+    // UTC anchor than that request's endpoint if the wall clock moved between
+    // participant starts; never let finalization shorten an already observed
+    // interval.
+    let finished = if terminal_timing.finished_at_utc < checkpoint {
+        checkpoint
+    } else {
+        terminal_timing.finished_at_utc.clone()
+    };
+    let elapsed = finished
+        .signed_duration_since(started)
+        .to_std()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wall-clock-v2 conversion log finish precedes its start",
+            )
+        })?;
+
+    let elapsed_prefix = "Elapsed processing wall time: ";
+    let checkpoint_prefix = "Timing checkpoint (UTC): ";
+    let mut replaced_elapsed = false;
+    let mut replaced_checkpoint = false;
+    let had_trailing_newline = log.ends_with('\n');
+    let mut lines = Vec::new();
+    for line in log.lines() {
+        if line.starts_with(elapsed_prefix) {
+            lines.push(format!(
+                "Elapsed processing wall time: {}",
+                format_duration_precise(elapsed),
+            ));
+            replaced_elapsed = true;
+        } else if line.starts_with(checkpoint_prefix) {
+            lines.push(format!(
+                "Timing finished (UTC): {}",
+                finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ));
+            replaced_checkpoint = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced_elapsed || !replaced_checkpoint {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wall-clock-v2 conversion log timing fields changed during finalization",
+        ));
+    }
+
+    let mut finalized = lines.join("\n");
+    if had_trailing_newline {
+        finalized.push('\n');
+    }
+    Ok(Some(finalized))
 }
 
 fn track_display_label(record: &TrackRecord, prepared: Option<&PreparedTrack>) -> String {
@@ -24973,6 +25435,7 @@ fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+#[cfg(test)]
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let millis = duration.subsec_millis();
@@ -24996,6 +25459,38 @@ fn format_duration(duration: Duration) -> String {
     let hours = minutes / 60;
     let remaining_minutes = minutes % 60;
     format!("{hours}h {remaining_minutes}m {remaining_seconds}s")
+}
+
+fn format_duration_precise(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let millis = duration.subsec_millis();
+    if seconds == 0 {
+        if millis == 0 {
+            return "0s".to_string();
+        }
+        return format!("0.{millis:03}s");
+    }
+    if seconds < 60 {
+        if millis == 0 {
+            return format!("{seconds}s");
+        }
+        return format!("{seconds}.{millis:03}s");
+    }
+
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    let seconds_field = if millis == 0 {
+        format!("{remaining_seconds}s")
+    } else {
+        format!("{remaining_seconds}.{millis:03}s")
+    };
+    if minutes < 60 {
+        return format!("{minutes}m {seconds_field}");
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}h {remaining_minutes}m {seconds_field}")
 }
 
 fn compression_ratio(bytes_in: u64, bytes_out: u64) -> String {
@@ -29268,6 +29763,13 @@ pub(crate) struct DsdAlbumGainScopeParticipant {
     pub track_id: TrackId,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DsdAlbumGainTiming {
+    realization: Duration,
+    dsd_to_pcm_decode: Duration,
+    true_peak_scan: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DsdAlbumGainScopeDisclosure {
     pub submitted_item_count: usize,
@@ -29288,7 +29790,9 @@ pub struct ScheduledAlbum {
     pub stages: Vec<StageRecord>,
     pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
     pub(crate) album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+    album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
+    run_timing: ConversionRunTiming,
     pub(crate) pre_actions_completed_before_album_gain_rerun: bool,
     action_output: Option<PipelineOutputCapability>,
     _run_lock: FileLock,
@@ -29331,7 +29835,9 @@ struct DsdAlbumGainScratchRetrySeed {
     stages: Vec<StageRecord>,
     source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
     album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+    album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     album_gain_scope_disclosure: DsdAlbumGainScopeDisclosure,
+    run_timing: ConversionRunTiming,
     pre_actions_completed_before_album_gain_rerun: bool,
     action_output: Option<PipelineOutputCapability>,
 }
@@ -29393,7 +29899,9 @@ impl DsdAlbumGainScratchRetrySeed {
             stages: album.stages.clone(),
             source_replaygain: album.source_replaygain.clone(),
             album_gain_measurements: album.album_gain_measurements.clone(),
+            album_gain_timings: album.album_gain_timings.clone(),
             album_gain_scope_disclosure: disclosure,
+            run_timing: album.run_timing.clone(),
             pre_actions_completed_before_album_gain_rerun: album
                 .pre_actions_completed_before_album_gain_rerun,
             action_output,
@@ -29505,7 +30013,9 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
         album_gain_measurements: seed.album_gain_measurements,
+        album_gain_timings: seed.album_gain_timings,
         album_gain_scope_disclosure: Some(seed.album_gain_scope_disclosure),
+        run_timing: seed.run_timing,
         pre_actions_completed_before_album_gain_rerun: seed
             .pre_actions_completed_before_album_gain_rerun,
         action_output: seed.action_output,
@@ -29577,7 +30087,9 @@ pub(crate) fn scheduled_album_for_test(
         stages,
         source_replaygain: None,
         album_gain_measurements: Vec::new(),
+        album_gain_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
+        run_timing: ConversionRunTiming::start(),
         pre_actions_completed_before_album_gain_rerun: false,
         action_output: None,
         _run_lock: run_lock,
@@ -31581,6 +32093,13 @@ mod album_true_peak_carrier_tests {
 struct PreparedAlbumGainCarrier {
     source_ref: TrackSourceRef,
     measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    timing: DsdAlbumGainTiming,
+}
+
+#[derive(Default)]
+struct PreparedAlbumGainCarriers {
+    measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+    timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
 }
 
 async fn prepare_album_gain_carrier_for_track(
@@ -31598,6 +32117,7 @@ async fn prepare_album_gain_carrier_for_track(
 
     let original_source_path = track_source_identity_path(&track).to_path_buf();
     let source_ref = track.source_ref.clone();
+    let realization_started = Instant::now();
     let realized = realize_track_with_tool_limits_and_stats(
         &source_ref,
         Some(&track),
@@ -31615,6 +32135,7 @@ async fn prepare_album_gain_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    let realization_elapsed = realization_started.elapsed();
     let source = super::plan_bridge::source_info_for_realized_track(&track, &realized.path)
         .map_err(|error| {
             format!(
@@ -31655,7 +32176,7 @@ async fn prepare_album_gain_carrier_for_track(
     .map_err(|error| error.to_string())?;
     let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
         .map_err(|error| error.to_string())?;
-    run_tool_command_with_concurrency(
+    let decode_output = run_tool_command_with_concurrency(
         command,
         runner,
         cancel,
@@ -31669,6 +32190,7 @@ async fn prepare_album_gain_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    let dsd_to_pcm_decode_elapsed = decode_output.elapsed;
     let carrier_len = fs::metadata(&carrier_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -31685,6 +32207,7 @@ async fn prepare_album_gain_carrier_for_track(
     let scan_path = carrier_path.clone();
     let scan_cancel = cancel.clone();
     let scan_mode = req.settings.dsd.true_peak_scan_mode();
+    let scan_started = Instant::now();
     let measurement = tokio::task::spawn_blocking(move || {
         scan_album_gain_true_peak_carrier(
             &scan_path,
@@ -31709,6 +32232,7 @@ async fn prepare_album_gain_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    let true_peak_scan_elapsed = scan_started.elapsed();
     log::info!(
         "album-scoped DSD analysis measured item={} track={} true_peak={:?} carrier={} rate={} channels={} scan_mode={:?}",
         req.item_id,
@@ -31728,6 +32252,11 @@ async fn prepare_album_gain_carrier_for_track(
             duration: source.duration,
         },
         measurement,
+        timing: DsdAlbumGainTiming {
+            realization: realization_elapsed,
+            dsd_to_pcm_decode: dsd_to_pcm_decode_elapsed,
+            true_peak_scan: true_peak_scan_elapsed,
+        },
     })
 }
 
@@ -31739,9 +32268,9 @@ async fn prepare_album_gain_carriers(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
-) -> Result<Vec<tonepoet_pipeline::AlbumPeakMeasurement>, String> {
+) -> Result<PreparedAlbumGainCarriers, String> {
     if !req.settings.dsd.album_auto_gain_selected() {
-        return Ok(Vec::new());
+        return Ok(PreparedAlbumGainCarriers::default());
     }
     if matches!(req.settings.target_format, tonepoet_pipeline::AudioFormat::WavPack)
         && req.settings.wavpack.hybrid
@@ -31772,7 +32301,7 @@ async fn prepare_album_gain_carriers(
         .map(|(index, track)| (index, track.clone()))
         .collect::<Vec<_>>();
     if jobs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PreparedAlbumGainCarriers::default());
     }
 
     // Keep the expensive DSD work parallel for multi-track sources. Every
@@ -31810,6 +32339,7 @@ async fn prepare_album_gain_carriers(
         .collect();
     let mut remaining = pending.len();
     let mut measurements = vec![None; prepared.tracks.len()];
+    let mut timings = BTreeMap::new();
     let mut first_error = None;
 
     while remaining > 0 {
@@ -31832,8 +32362,10 @@ async fn prepare_album_gain_carriers(
         remaining -= 1;
         match result {
             Ok(carrier) if first_error.is_none() => {
+                let track_id = prepared.tracks[track_index].id.clone();
                 prepared.tracks[track_index].source_ref = carrier.source_ref;
                 measurements[track_index] = Some(carrier.measurement);
+                timings.insert(track_id, carrier.timing);
             }
             Ok(_) => {
                 // A sibling already failed. The staging directory owns this
@@ -31851,7 +32383,10 @@ async fn prepare_album_gain_carriers(
     if let Some(error) = first_error {
         return Err(error);
     }
-    Ok(measurements.into_iter().flatten().collect())
+    Ok(PreparedAlbumGainCarriers {
+        measurements: measurements.into_iter().flatten().collect(),
+        timings,
+    })
 }
 
 /// Run validation, staging setup, source materialization, and output planning.
@@ -31881,17 +32416,30 @@ pub async fn prepare_pipeline_item_for_scheduler_with_tool_limits(
 ) -> ScheduledMaterialization {
     let req = req;
     let item_id = req.item_id.clone();
+    let run_timing = ConversionRunTiming::start();
     if crate::concurrency::runtime_execution_id(&item_id).is_some() {
         crate::concurrency::with_runtime_execution_scope(
             item_id,
             prepare_pipeline_item_for_scheduler_scoped_inner(
-                req, runner, reporter, cancel, tool_paths, tool_concurrency_limits,
+                req,
+                runner,
+                reporter,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                run_timing,
             ),
         )
         .await
     } else {
         prepare_pipeline_item_for_scheduler_scoped_inner(
-            req, runner, reporter, cancel, tool_paths, tool_concurrency_limits,
+            req,
+            runner,
+            reporter,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits,
+            run_timing,
         )
         .await
     }
@@ -31904,6 +32452,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    run_timing: ConversionRunTiming,
 ) -> ScheduledMaterialization {
     let item_id = req.item_id.clone();
     let mut stages = Vec::new();
@@ -32280,7 +32829,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         pre_actions_completed_before_album_gain_rerun = true;
     }
 
-    let album_gain_measurements = match prepare_album_gain_carriers(
+    let prepared_album_gain_carriers = match prepare_album_gain_carriers(
         &req,
         &mut prepared,
         &album_plan,
@@ -32291,7 +32840,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     )
     .await
     {
-        Ok(measurements) => measurements,
+        Ok(carriers) => carriers,
         Err(error) => {
             let record = stage_record(
                 PipelineStage::Convert,
@@ -32331,6 +32880,11 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         }
     };
 
+    let PreparedAlbumGainCarriers {
+        measurements: album_gain_measurements,
+        timings: album_gain_timings,
+    } = prepared_album_gain_carriers;
+
     ScheduledMaterialization::Ready(ScheduledAlbum {
         item_id,
         req,
@@ -32340,7 +32894,9 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         stages,
         source_replaygain: None,
         album_gain_measurements,
+        album_gain_timings,
         album_gain_scope_disclosure: None,
+        run_timing,
         pre_actions_completed_before_album_gain_rerun,
         action_output,
         _run_lock,
@@ -34201,8 +34757,10 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         } else {
             (None, None)
         };
+    let run_timing = album.run_timing.clone();
     let action_output = album.action_output;
     let source_replaygain = album.source_replaygain;
+    let album_gain_timings = album.album_gain_timings;
     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
     let req = album.req;
     let item_id = req.item_id.clone();
@@ -34541,7 +35099,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
 
     if req.stages.features == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::Features).await;
-        match Box::pin(run_features_with_album_gain_scope(
+        match Box::pin(run_features_with_album_gain_scope_and_timing(
             artifacts.take().expect("artifacts present"),
             &current_outcome,
             source.as_ref().expect("source present"),
@@ -34549,6 +35107,8 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             &staging,
             runner,
             album_gain_scope_disclosure.as_ref(),
+            Some(&album_gain_timings),
+            Some(&run_timing),
         ))
         .await
         {
@@ -34748,7 +35308,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         }
     }
 
-    Box::pin(finalize_report_with_binding(
+    Box::pin(finalize_report_with_binding_and_timing(
         &req,
         reporter,
         source,
@@ -34757,6 +35317,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         published,
         current_outcome,
         publication_binding,
+        Some(&run_timing),
     ))
     .await
 }
@@ -34802,18 +35363,51 @@ pub async fn run_pipeline_item_with_tool_paths_and_tool_limits(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> PipelineReport {
+    run_pipeline_item_with_tool_paths_and_tool_limits_with_timing(
+        req,
+        runner,
+        reporter,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+        ConversionRunTiming::start(),
+    )
+    .await
+}
+
+async fn run_pipeline_item_with_tool_paths_and_tool_limits_with_timing(
+    req: PipelineRequest,
+    runner: &dyn ToolRunner,
+    reporter: &dyn PipelineReporter,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    run_timing: ConversionRunTiming,
+) -> PipelineReport {
     let req = req;
     let item_id = req.item_id.clone();
     if crate::concurrency::runtime_execution_id(&item_id).is_some() {
         crate::concurrency::with_runtime_execution_scope(
             item_id,
             Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
-                req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
+                req,
+                runner,
+                reporter,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                run_timing,
             )),
         ).await
     } else {
         Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
-            req, runner, reporter, cancel, tool_paths, tool_concurrency_limits
+            req,
+            runner,
+            reporter,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits,
+            run_timing,
         )).await
     }
 }
@@ -34825,6 +35419,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    run_timing: ConversionRunTiming,
 ) -> PipelineReport {
     let scratch_retry_root = req.scratch_staging.as_ref().map(|scratch| scratch.root().to_path_buf());
     let retry_on_disk = scratch_retry_root.is_some();
@@ -34838,6 +35433,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
         cancel,
         tool_paths,
         tool_concurrency_limits.clone(),
+        &run_timing,
     ))
     .await;
 
@@ -34867,6 +35463,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
         cancel,
         tool_paths,
         tool_concurrency_limits,
+        &run_timing,
     ))
     .await
 }
@@ -34878,6 +35475,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    run_timing: &ConversionRunTiming,
 ) -> PipelineReport {
     let item_id = req.item_id.clone();
     let mut source = None;
@@ -35576,14 +36174,16 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
 
     if req.stages.features == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::Features).await;
-        match run_features(
+        match run_features_with_album_gain_scope_and_timing(
             artifacts.take().expect("artifacts present"),
             &current_outcome,
             source.as_ref().expect("source present"),
             &req,
             &staging,
             runner,
-            cancel,
+            None,
+            None,
+            Some(run_timing),
         )
         .await
         {
@@ -35816,7 +36416,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         }
     }
 
-    finalize_report_with_binding(
+    finalize_report_with_binding_and_timing(
         &req,
         reporter,
         source,
@@ -35825,6 +36425,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         published,
         current_outcome,
         publication_binding,
+        Some(run_timing),
     )
     .await
 }
@@ -43128,6 +43729,74 @@ fn pipeline_report_manifest_path(published: &Option<PublishedAlbum>) -> Option<s
         .and_then(|album| album.manifest_path.clone())
 }
 
+fn finalize_published_conversion_log_timing_best_effort(
+    req: &PipelineRequest,
+    published: &mut Option<PublishedAlbum>,
+    binding: Option<&PublicationCapabilityBinding>,
+    run_timing: &ConversionRunTiming,
+) {
+    let Some(album) = published.as_mut() else {
+        return;
+    };
+    if !album.entries.iter().any(conversion_log_entry_predicate) {
+        return;
+    }
+
+    let terminal_timing = run_timing.snapshot();
+    for entry in album
+        .entries
+        .iter_mut()
+        .filter(|entry| conversion_log_entry_predicate(entry))
+    {
+        let runtime_path = binding
+            .and_then(|binding| binding.io_path(&entry.final_path).ok())
+            .unwrap_or_else(|| entry.final_path.clone());
+        let bytes = match read_regular_file_no_follow(&runtime_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!(
+                    "could not read published conversion.log to finalize timing for {} at {}: {error}",
+                    req.item_id,
+                    entry.final_path.display(),
+                );
+                continue;
+            }
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                log::warn!(
+                    "published conversion.log is not UTF-8 while finalizing timing for {} at {}: {error}",
+                    req.item_id,
+                    entry.final_path.display(),
+                );
+                continue;
+            }
+        };
+        let finalized = match finalize_conversion_log_timing_text(&text, &terminal_timing) {
+            Ok(Some(finalized)) => finalized,
+            Ok(None) => continue,
+            Err(error) => {
+                log::warn!(
+                    "could not finalize published conversion.log timing for {} at {}: {error}",
+                    req.item_id,
+                    entry.final_path.display(),
+                );
+                continue;
+            }
+        };
+        if let Err(error) = write_bytes_atomically(&runtime_path, finalized.as_bytes()) {
+            log::warn!(
+                "could not atomically rewrite published conversion.log timing for {} at {}: {error}",
+                req.item_id,
+                entry.final_path.display(),
+            );
+            continue;
+        }
+        entry.bytes = u64::try_from(finalized.len()).unwrap_or(u64::MAX);
+    }
+}
+
 async fn finalize_report(
     req: &PipelineRequest,
     reporter: &dyn PipelineReporter,
@@ -43157,9 +43826,43 @@ async fn finalize_report_with_binding(
     plan: Option<AlbumPlan>,
     artifacts: Option<ArtifactSet>,
     published: Option<PublishedAlbum>,
-    mut outcome: AlbumOutcome,
+    outcome: AlbumOutcome,
     binding: Option<PublicationCapabilityBinding>,
 ) -> PipelineReport {
+    finalize_report_with_binding_and_timing(
+        req,
+        reporter,
+        source,
+        plan,
+        artifacts,
+        published,
+        outcome,
+        binding,
+        None,
+    )
+    .await
+}
+
+async fn finalize_report_with_binding_and_timing(
+    req: &PipelineRequest,
+    reporter: &dyn PipelineReporter,
+    source: Option<PreparedSource>,
+    plan: Option<AlbumPlan>,
+    artifacts: Option<ArtifactSet>,
+    mut published: Option<PublishedAlbum>,
+    mut outcome: AlbumOutcome,
+    binding: Option<PublicationCapabilityBinding>,
+    run_timing: Option<&ConversionRunTiming>,
+) -> PipelineReport {
+    if let Some(run_timing) = run_timing {
+        finalize_published_conversion_log_timing_best_effort(
+            req,
+            &mut published,
+            binding.as_ref(),
+            run_timing,
+        );
+    }
+
     let item_id = req.item_id.clone();
     let mut durable_log = None;
     let mut terminal_error_override: Option<String> = None;
@@ -50616,6 +51319,114 @@ mod conversion_log_tests {
     }
 
     #[test]
+    fn conversion_log_separates_processing_wall_time_from_encode_occupancy() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let mut record = ok_record();
+        record.duration = Some(Duration::from_millis(65_432));
+        record.commands[0].elapsed = Duration::from_millis(65_432);
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+
+        // The legacy test helper deliberately has no live run timer. That must
+        // fail closed rather than relabeling the per-track encode sum as wall time.
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Timing model: wall-clock-v2"));
+        assert!(log.contains("Elapsed processing wall time: unavailable"));
+        assert!(log.contains("Per-track Encode duration sum: 1m 5.432s"));
+        assert!(log.contains("Encode duration: 1m 5.432s"));
+        assert!(log.contains("[1m 5.432s; exit 0]"));
+        assert!(!log.contains("Total conversion time:"));
+    }
+
+    #[test]
+    fn conversion_log_discloses_dsd_album_gain_prepass_components() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let record = ok_record();
+        let mut album_gain_timings = BTreeMap::new();
+        album_gain_timings.insert(
+            record.track_id.clone(),
+            DsdAlbumGainTiming {
+                realization: Duration::from_millis(125),
+                dsd_to_pcm_decode: Duration::from_millis(65_250),
+                true_peak_scan: Duration::from_millis(2_500),
+            },
+        );
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log_at_with_runner_and_timing(
+            &outcome,
+            &source,
+            &req,
+            &artifacts,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            Some(&album_gain_timings),
+            None,
+        );
+
+        assert!(log.contains(
+            "DSD album-gain prepass: source realization 0.125s; DSD-to-PCM decode 1m 5.250s; true-peak scan 2.500s"
+        ));
+    }
+
+    #[test]
+    fn conversion_log_wall_timing_finalization_is_idempotent() {
+        let started = parse_conversion_log_utc_timestamp(
+            "2026-09-07T12:00:00.000Z",
+            "test start",
+        )
+        .expect("test start timestamp");
+        let checkpoint = started.clone() + chrono::Duration::seconds(5);
+        let finished = started.clone() + chrono::Duration::milliseconds(65_432);
+        let log = format!(
+            "Timing model: wall-clock-v2\nTiming started (UTC): {}\nElapsed processing wall time: pending finalization (checkpoint 5s)\nTiming checkpoint (UTC): {}\nPer-track Encode duration sum: 2m 10s\n",
+            started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            checkpoint.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        let terminal = ConversionLogFragmentTiming {
+            started_at_utc: started,
+            finished_at_utc: finished.clone(),
+            elapsed_millis: 65_432,
+        };
+
+        let finalized = finalize_conversion_log_timing_text(&log, &terminal)
+            .expect("timing finalization")
+            .expect("pending log should finalize");
+        assert!(finalized.contains("Elapsed processing wall time: 1m 5.432s"));
+        assert!(finalized.contains(&format!(
+            "Timing finished (UTC): {}",
+            finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )));
+        assert!(!finalized.contains("pending finalization"));
+        assert!(!finalized.contains("Timing checkpoint (UTC):"));
+        assert!(
+            finalize_conversion_log_timing_text(&finalized, &terminal)
+                .expect("idempotent finalized timing read")
+                .is_none(),
+            "a finalized log must be left byte-for-byte alone on retry",
+        );
+
+        let unavailable = "Timing model: wall-clock-v2\nElapsed processing wall time: unavailable [1 missing or incompatible timing span(s)]\nPer-track Encode duration sum: 2m 10s\n";
+        assert!(
+            finalize_conversion_log_timing_text(unavailable, &terminal)
+                .expect("unavailable timing remains readable")
+                .is_none(),
+            "legacy or partial timing must never be synthesized during finalization",
+        );
+    }
+
+    #[test]
     fn build_conversion_log_discloses_tag_read_degradation_per_track() {
         let mut source = log_test_source();
         source.tracks[0].warnings.push(
@@ -51867,6 +52678,10 @@ mod conversion_log_tests {
         assert_eq!(format_duration(Duration::from_millis(250)), "0.250s");
         assert_eq!(format_duration(Duration::from_secs(5)), "5s");
         assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(
+            format_duration_precise(Duration::from_millis(65_432)),
+            "1m 5.432s"
+        );
         assert_eq!(compression_ratio(1000, 500), "50.0% smaller");
         assert_eq!(compression_ratio(1000, 1250), "25.0% larger");
         assert_eq!(compression_ratio(1000, 1000), "0.0% change");
@@ -56272,7 +57087,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 stages: Vec::new(),
                 source_replaygain: None,
                 album_gain_measurements: Vec::new(),
+                album_gain_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
+                run_timing: ConversionRunTiming::start(),
                 pre_actions_completed_before_album_gain_rerun: false,
                 _run_lock: run_lock,
             },
@@ -60196,6 +61013,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 source_ordinal: track_number,
             },
             generated_at,
+            timing: None,
             settings_fingerprint: settings_fingerprint.map(str::to_string),
             batch_identity: fragment_test_identity(album_dir, batch_id, settings_fingerprint),
             rendered_album_dir: Some(normalize_path(album_dir).to_string_lossy().to_string()),
@@ -60223,6 +61041,77 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 dsd_dst_stats: None,
             }],
         }
+    }
+
+    #[test]
+    fn fragment_wall_time_spans_parallel_participants_and_rejects_legacy_gaps() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_dir = temp.path().join("Album");
+        let start = fragment_test_time(10);
+        let mut first = fragment_test_fragment(
+            &album_dir,
+            "batch-wall-time",
+            Some("settings-a"),
+            1,
+            2,
+            "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(1),
+        );
+        first.timing = Some(ConversionLogFragmentTiming {
+            started_at_utc: start.clone(),
+            finished_at_utc: start.clone() + chrono::Duration::seconds(10),
+            elapsed_millis: 10_000,
+        });
+        let mut second = fragment_test_fragment(
+            &album_dir,
+            "batch-wall-time",
+            Some("settings-a"),
+            2,
+            2,
+            "Track 2\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success,
+            fragment_test_time(2),
+        );
+        second.timing = Some(ConversionLogFragmentTiming {
+            started_at_utc: start.clone() + chrono::Duration::seconds(2),
+            finished_at_utc: start.clone() + chrono::Duration::seconds(12),
+            elapsed_millis: 10_000,
+        });
+
+        let (observed_start, elapsed, observed_finish, missing) =
+            fragment_elapsed_wall_time(&[first.clone(), second.clone()]);
+        assert_eq!(observed_start, Some(start.clone()));
+        assert_eq!(elapsed, Some(Duration::from_secs(12)));
+        assert_eq!(
+            observed_finish,
+            Some(start.clone() + chrono::Duration::seconds(12))
+        );
+        assert_eq!(missing, 0);
+        assert_ne!(
+            elapsed,
+            Some(Duration::from_secs(20)),
+            "parallel track occupancy must never be summed into elapsed wall time",
+        );
+
+        let mut malformed = first.clone();
+        malformed
+            .timing
+            .as_mut()
+            .expect("test timing")
+            .elapsed_millis = 9_999;
+        let (_, elapsed, _, missing) =
+            fragment_elapsed_wall_time(&[malformed, second.clone()]);
+        assert!(elapsed.is_none());
+        assert_eq!(missing, 1, "inconsistent serialized timing must fail closed");
+
+        second.timing = None;
+        let (observed_start, elapsed, observed_finish, missing) =
+            fragment_elapsed_wall_time(&[first, second]);
+        assert!(observed_start.is_none());
+        assert!(elapsed.is_none());
+        assert!(observed_finish.is_none());
+        assert_eq!(missing, 1, "one legacy timing gap must fail closed");
     }
 
     pub(super) fn write_fragment_json(path: &Path, fragment: &ConversionLogFragment) {
@@ -60515,6 +61404,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             req,
             metadata_stage_result,
             None,
+            None,
         );
 
         ConversionLogFragment {
@@ -60527,6 +61417,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             sort_key: conversion_log_fragment_sort_key(req, &record.track_id)
                 .expect("dispatcher track context supplies canonical fragment sort key"),
             generated_at,
+            timing: None,
             settings_fingerprint: None,
             batch_identity: fragment_test_identity_for_request(req, album_dir, None),
             rendered_album_dir: conversion_log_rendered_album_dir_for_track(source, req, artifacts, &record.track_id)
@@ -66167,6 +67058,7 @@ mod publish_lock_soundness_tests {
                 source_ordinal: track_number,
             },
             generated_at: chrono::Utc::now(),
+            timing: None,
             settings_fingerprint: None,
             batch_identity: identity.clone(),
             rendered_album_dir: Some(normalize_path(rendered_album_dir).to_string_lossy().to_string()),
