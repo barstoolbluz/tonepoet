@@ -7082,9 +7082,12 @@ pub struct FileTransferQueueState {
 impl FileTransferQueueState {
     #[must_use]
     pub fn queued_summaries(&self) -> Vec<tui_file_picker::QueuedFileTaskSummary> {
+        // `recovery_queued` is a review queue, not a live transfer queue. Its
+        // entries are presented by the dedicated recovery surfaces until the
+        // user explicitly resumes one; only then is it promoted into `queued`
+        // and becomes an ordinary runnable transfer row.
         self.queued
             .iter()
-            .chain(self.recovery_queued.iter())
             .map(QueuedFileTransfer::summary)
             .collect()
     }

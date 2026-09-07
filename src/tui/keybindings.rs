@@ -106157,6 +106157,7 @@ mod file_transfer_queue_state_tests {
             retry_plan: Some(retry),
             recovered: true,
         });
+        assert!(app.file_transfers.queued_summaries().is_empty());
         let (tx, _rx) = mpsc::channel(8);
 
         for _ in 0..4 {
@@ -106172,6 +106173,15 @@ mod file_transfer_queue_state_tests {
         assert!(app.file_transfers.active_session_id.is_some());
         assert_eq!(app.test_file_task_dispatches.as_ref().unwrap().len(), 1);
         assert_eq!(app.test_file_task_dispatches.as_ref().unwrap()[0].1, vec![source]);
+    }
+
+    #[test]
+    fn unresolved_recovery_busy_block_does_not_depend_on_visible_queue_rows() {
+        let mut state = FileTransferQueueState::default();
+        state.unresolved_recovery_count = 1;
+
+        assert!(state.queued_summaries().is_empty());
+        assert!(state.is_busy());
     }
 
     #[test]

@@ -28,14 +28,23 @@ use super::file_task_runtime::{
 };
 use super::message::AppMessage;
 
-const PROMPT_WIDTH: u16 = 84;
-const PROMPT_HEIGHT: u16 = 14;
-const WINDOW_WIDTH: u16 = 116;
-const WINDOW_HEIGHT: u16 = 23;
-const DETAILS_WIDTH: u16 = 78;
+const PROMPT_MIN_WIDTH: u16 = 84;
+const PROMPT_MIN_HEIGHT: u16 = 14;
+const WINDOW_MIN_WIDTH: u16 = 116;
+const WINDOW_MIN_HEIGHT: u16 = 23;
+const DETAILS_MIN_WIDTH: u16 = 78;
 const DETAILS_MAX_HEIGHT: u16 = 21;
-const CONFIRM_WIDTH: u16 = 78;
+const CONFIRM_MIN_WIDTH: u16 = 78;
 const CONFIRM_MAX_HEIGHT: u16 = 21;
+
+// The HTML mockups establish readability floors, not restored-window targets.
+// Let the primary recovery surfaces use the terminal when it has room, while
+// keeping the narrower epi-popups from becoming needlessly full-width.
+const PROMPT_WIDTH_PERCENT: u16 = 75;
+const PROMPT_HEIGHT_PERCENT: u16 = 55;
+const WINDOW_WIDTH_PERCENT: u16 = 90;
+const WINDOW_HEIGHT_PERCENT: u16 = 80;
+const EPI_POPUP_WIDTH_PERCENT: u16 = 70;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySurface {
@@ -1513,7 +1522,19 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     )
 }
 
-fn surface_rect(area: Rect, width: u16, height: u16, maximized: bool) -> Rect {
+fn scaled_extent(total: u16, floor: u16, percent: u16) -> u16 {
+    let scaled = (u32::from(total) * u32::from(percent.min(100)) / 100) as u16;
+    scaled.max(floor.min(total)).min(total)
+}
+
+fn surface_rect(
+    area: Rect,
+    min_width: u16,
+    min_height: u16,
+    width_percent: u16,
+    height_percent: Option<u16>,
+    maximized: bool,
+) -> Rect {
     if maximized {
         Rect::new(
             area.x.saturating_add(1),
@@ -1522,6 +1543,10 @@ fn surface_rect(area: Rect, width: u16, height: u16, maximized: bool) -> Rect {
             area.height.saturating_sub(2),
         )
     } else {
+        let width = scaled_extent(area.width, min_width, width_percent);
+        let height = height_percent.map_or(min_height.min(area.height), |percent| {
+            scaled_extent(area.height, min_height, percent)
+        });
         centered_rect(width, height, area)
     }
 }
@@ -1560,8 +1585,10 @@ fn recovery_block(
 fn draw_prompt(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
         f.size(),
-        PROMPT_WIDTH,
-        PROMPT_HEIGHT,
+        PROMPT_MIN_WIDTH,
+        PROMPT_MIN_HEIGHT,
+        PROMPT_WIDTH_PERCENT,
+        Some(PROMPT_HEIGHT_PERCENT),
         app.recovery_ui.maximized,
     );
     let count = app.recovery_ui.entries.len();
@@ -1724,8 +1751,10 @@ fn state_color(entry: &RecoveryEntry, theme: super::theme::Theme) -> Color {
 fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
         f.size(),
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT,
+        WINDOW_MIN_WIDTH,
+        WINDOW_MIN_HEIGHT,
+        WINDOW_WIDTH_PERCENT,
+        Some(WINDOW_HEIGHT_PERCENT),
         app.recovery_ui.maximized,
     );
     let count = app.recovery_ui.entries.len();
@@ -1752,7 +1781,9 @@ fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let body_y = inner.y.saturating_add(1);
     let body_height = inner.height.saturating_sub(1 + footer_height);
     let left_width = if inner.width >= 70 {
-        (inner.width * 43 / 100).max(30).min(inner.width.saturating_sub(20))
+        ((u32::from(inner.width) * 43 / 100) as u16)
+            .max(30)
+            .min(inner.width.saturating_sub(20))
     } else {
         inner.width / 2
     };
@@ -2262,8 +2293,10 @@ fn details_restored_height(state: &RecoveryUiState) -> u16 {
 fn draw_details(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
         f.size(),
-        DETAILS_WIDTH,
+        DETAILS_MIN_WIDTH,
         details_restored_height(&app.recovery_ui),
+        EPI_POPUP_WIDTH_PERCENT,
+        None,
         app.recovery_ui.maximized,
     );
     let inner = recovery_block(
@@ -2650,8 +2683,10 @@ fn draw_discard_confirm(
         .clamp(13, CONFIRM_MAX_HEIGHT);
     let popup = surface_rect(
         f.size(),
-        CONFIRM_WIDTH,
+        CONFIRM_MIN_WIDTH,
         restored_height,
+        EPI_POPUP_WIDTH_PERCENT,
+        None,
         app.recovery_ui.maximized,
     );
     let irreversible = !bulk
@@ -2926,8 +2961,10 @@ fn draw_bulk_discard_items(
 fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let popup = surface_rect(
         f.size(),
-        DETAILS_WIDTH,
+        DETAILS_MIN_WIDTH,
         13,
+        EPI_POPUP_WIDTH_PERCENT,
+        None,
         app.recovery_ui.maximized,
     );
     let inner = recovery_block(
@@ -3307,6 +3344,62 @@ mod tests {
         assert_eq!(human_bytes(999), "999 B");
         assert_eq!(human_bytes(1_000), "1.0 KB");
         assert_eq!(human_bytes(1_000_000), "1.0 MB");
+    }
+
+    #[test]
+    fn restored_surface_sizing_uses_mockups_as_floors_and_terminal_as_headroom() {
+        let large = Rect::new(0, 0, 200, 60);
+        let prompt = surface_rect(
+            large,
+            PROMPT_MIN_WIDTH,
+            PROMPT_MIN_HEIGHT,
+            PROMPT_WIDTH_PERCENT,
+            Some(PROMPT_HEIGHT_PERCENT),
+            false,
+        );
+        assert_eq!((prompt.width, prompt.height), (150, 33));
+
+        let window = surface_rect(
+            large,
+            WINDOW_MIN_WIDTH,
+            WINDOW_MIN_HEIGHT,
+            WINDOW_WIDTH_PERCENT,
+            Some(WINDOW_HEIGHT_PERCENT),
+            false,
+        );
+        assert_eq!((window.width, window.height), (180, 48));
+
+        let details = surface_rect(
+            large,
+            DETAILS_MIN_WIDTH,
+            17,
+            EPI_POPUP_WIDTH_PERCENT,
+            None,
+            false,
+        );
+        assert_eq!((details.width, details.height), (140, 17));
+
+        let near_floor = Rect::new(0, 0, 120, 30);
+        let window = surface_rect(
+            near_floor,
+            WINDOW_MIN_WIDTH,
+            WINDOW_MIN_HEIGHT,
+            WINDOW_WIDTH_PERCENT,
+            Some(WINDOW_HEIGHT_PERCENT),
+            false,
+        );
+        assert_eq!((window.width, window.height), (116, 24));
+
+        let constrained = Rect::new(0, 0, 90, 20);
+        let window = surface_rect(
+            constrained,
+            WINDOW_MIN_WIDTH,
+            WINDOW_MIN_HEIGHT,
+            WINDOW_WIDTH_PERCENT,
+            Some(WINDOW_HEIGHT_PERCENT),
+            false,
+        );
+        assert_eq!((window.width, window.height), (90, 20));
     }
 
     #[test]

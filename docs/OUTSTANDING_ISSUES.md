@@ -2341,3 +2341,66 @@ cannot have influenced how often it appears.
   reclamation publishes its result.
 - Related history is recorded in the coordination-descriptor reclamation work; that fix's own
   race was real, so treat a genuine ordering defect as plausible rather than assuming a test bug.
+
+---
+
+## 32. Gate flake family: `archive_listing` fake-executable tests fail with `Text file busy`
+
+**Status:** open. Observed twice on 2026-09-07, on two different members of the same family,
+during the gate for the recovery-surfaces sizing corrective.
+
+### The failure
+
+```
+---- tui::archive_listing::tests::cached_password_cycle_stops_immediately_on_unsupported_encryption ----
+panicked at src/tui/archive_listing.rs:1498:
+failed to run /tmp/nix-shell.ClSrkP/.tmpOJfI4W/fake-7z: Text file busy (os error 26)
+
+---- tui::archive_listing::tests::cached_password_cycle_stops_at_the_first_success_without_global_path_mutation ----
+panicked at src/tui/archive_listing.rs:1470:
+third cached password should open the archive: "... fake-7z: Text file busy (os error 26)"
+```
+
+Each failing test passes in isolation. Both failures came from full-workspace runs.
+
+### Mechanism, as far as we have established it
+
+`fake_password_listing_tool` (`src/tui/archive_listing.rs:1163`) writes a shell script to a
+temp path, chmods it `0o755`, and the test then executes it. Six tests share that helper
+(callers at `:1318`, `:1362`, `:1410`, `:1454`, `:1485`, `:1509`), each with its own
+`TempDir`, so the tests are not fighting over one path.
+
+`ETXTBSY` on exec means some process still holds the file open for writing. `std::fs::write`
+closes its handle before returning, so the likely mechanism is the standard multithreaded
+fork/exec inheritance race: one thread's write descriptor is briefly live while another test
+spawns a subprocess, the fork inherits that descriptor, and exec of the path fails until the
+child clears it. This is a property of writing an executable and running it inside a parallel
+test process, not of anything in `archive_listing` itself.
+
+**We have not proven that mechanism** — it is inference from the error and the shape of the
+code, and it should be confirmed before a fix is designed around it.
+
+### Why it is filed now
+
+It appeared in **both** gate runs of one delivery, on different tests, having appeared in
+neither run of the delivery immediately before. The change under test (removing recovery rows
+from the transfer queue) has no connection to archive listing. The likeliest explanation is
+that the test count shifting perturbed parallel scheduling and exposed a latent race, but two
+runs are not enough to establish that, and a genuine ordering defect should not be assumed
+away.
+
+### Fix directions, unranked
+
+1. Retry the exec on `ETXTBSY`, which is the conventional remedy and is honest about the race
+   being environmental rather than a defect in the code under test.
+2. Have the helper produce a uniquely named executable per invocation, narrowing the window in
+   which any inherited descriptor refers to the path about to be executed.
+3. Establish whether the descriptor really is inherited across a concurrent spawn, and if so
+   whether the production spawn path should be setting `O_CLOEXEC` more aggressively — this
+   is the only direction that could indicate a product defect rather than a test one.
+
+### Cost
+
+Two full gate re-runs on 2026-09-07, at roughly 10-12 minutes each. Together with #20 and #31
+this is the third distinct flake costing re-runs; the three are unrelated in mechanism but
+identical in effect on the workflow.
