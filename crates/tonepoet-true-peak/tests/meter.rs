@@ -1580,8 +1580,13 @@ fn accelerated_reference_one_frame_has_no_spurious_interval() {
 
 #[test]
 fn accelerated_reference_budget_exhaustion_keeps_reference_containment() {
+    // A smooth periodic signal keeps many coarse intervals close to the
+    // tile peak while the tile-wide residual enclosure remains nontrivial.
+    // Unlike a Nyquist-alternating stream, refining one such interval does
+    // not discover a much larger peak that raises the threshold and prevents
+    // the fixed per-tile work budget from being consumed.
     let signal = (0..8193)
-        .map(|index| if index % 2 == 0 { 0.93 } else { -0.93 })
+        .map(|index| 0.93 * (2.0 * PI * index as f64 / 256.0).sin())
         .collect::<Vec<_>>();
 
     let mut reference = HeadroomCeilingMeter::new_with_scan_mode(
