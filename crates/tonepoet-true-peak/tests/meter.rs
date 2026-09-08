@@ -1,11 +1,15 @@
 use std::f64::consts::PI;
 
 use tonepoet_true_peak::{
-    headroom16x_authority, headroom64x_authority, headroom8x_authority, EdgePolicy,
+    headroom16x_authority, headroom64x_authority, headroom8x_authority,
+    headroom_standard16x_authority, EdgePolicy,
     HeadroomAuthorityError, HeadroomCeilingMeter, HeadroomScanMode, PeakLevel, TruePeakConfig,
     TruePeakMeter, TruePeakMode, HEADROOM16X_MAX_UNDERREAD_DB, HEADROOM64X_GRID_MAX_UNDERREAD_DB,
     HEADROOM64X_MAX_UNDERREAD_DB, HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
-    HEADROOM8X_MAX_UNDERREAD_DB,
+    HEADROOM8X_MAX_UNDERREAD_DB, HEADROOM_FAST_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
+    HEADROOM_STANDARD16X_GRID_MAX_UNDERREAD_DB,
+    HEADROOM_STANDARD16X_MAX_UNDERREAD_DB, HEADROOM_STANDARD16X_NUMERICAL_ALLOWANCE_DB,
+    HEADROOM_STANDARD16X_RESPONSE_COMPONENT_DB,
 };
 
 fn meter_at_rate_with_edge(
@@ -158,6 +162,7 @@ fn identical_frames_one_block_or_irregular_blocks_are_bit_identical() {
     for mode in [
         TruePeakMode::Reporting4x,
         TruePeakMode::Headroom64x,
+        TruePeakMode::HeadroomStandard16x,
         TruePeakMode::Headroom16x,
         TruePeakMode::Headroom8x,
     ] {
@@ -205,6 +210,7 @@ fn silence_is_negative_infinity_and_near_silence_is_finite() {
     for mode in [
         TruePeakMode::Reporting4x,
         TruePeakMode::Headroom64x,
+        TruePeakMode::HeadroomStandard16x,
         TruePeakMode::Headroom16x,
         TruePeakMode::Headroom8x,
     ] {
@@ -432,7 +438,13 @@ fn ceiling_reconstruction_contains_independent_analytical_and_edge_references() 
     ];
 
     for (name, signal, edge, independent_raw, ideal_truth) in cases {
-        let mut meter = HeadroomCeilingMeter::new(44_100, 1, edge).unwrap();
+        let mut meter = HeadroomCeilingMeter::new_with_scan_mode(
+            44_100,
+            1,
+            edge,
+            HeadroomScanMode::Reference,
+        )
+        .unwrap();
         meter.push_interleaved(signal).unwrap();
         let result = meter.finalize().unwrap();
         let upper = result.reconstruction_upper.linear();
@@ -465,7 +477,13 @@ fn ceiling_meter_preserves_headroom64_point_bits() {
     ordinary.push_interleaved(&signal).unwrap();
     let ordinary = ordinary.finalize().unwrap();
 
-    let mut ceiling = HeadroomCeilingMeter::new(44_100, 1, EdgePolicy::RepeatEndpoints).unwrap();
+    let mut ceiling = HeadroomCeilingMeter::new_with_scan_mode(
+        44_100,
+        1,
+        EdgePolicy::RepeatEndpoints,
+        HeadroomScanMode::Reference,
+    )
+    .unwrap();
     ceiling.push_interleaved(&signal).unwrap();
     let ceiling = ceiling.finalize().unwrap();
 
@@ -495,7 +513,13 @@ fn real_program_material_ceiling_reconstruction_matches_independent_convolution(
         .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
 
-    let mut meter = HeadroomCeilingMeter::new(48_000, 2, EdgePolicy::RepeatEndpoints).unwrap();
+    let mut meter = HeadroomCeilingMeter::new_with_scan_mode(
+        48_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+        HeadroomScanMode::Reference,
+    )
+    .unwrap();
     for chunk in samples.chunks(997 * 2) {
         meter.push_interleaved(chunk).unwrap();
     }
@@ -624,6 +648,10 @@ fn reporting_profile_exposes_its_rate_dependent_factor() {
         64
     );
     assert_eq!(
+        TruePeakMode::HeadroomStandard16x.oversample_factor_for_sample_rate(384_000),
+        16
+    );
+    assert_eq!(
         TruePeakMode::Headroom16x.oversample_factor_for_sample_rate(384_000),
         16
     );
@@ -649,10 +677,147 @@ fn headroom_declared_one_sided_bound_meets_hard_authority_contract() {
     assert!(HEADROOM64X_MAX_UNDERREAD_DB < HEADROOM16X_MAX_UNDERREAD_DB);
     assert!(HEADROOM16X_MAX_UNDERREAD_DB < HEADROOM8X_MAX_UNDERREAD_DB);
     assert_eq!(HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE, 0.495);
-    assert_eq!(HeadroomScanMode::default(), HeadroomScanMode::Reference);
+    assert_eq!(HeadroomScanMode::default(), HeadroomScanMode::Standard);
+    assert_eq!(
+        HeadroomScanMode::Standard.max_underread_db(),
+        HEADROOM_STANDARD16X_MAX_UNDERREAD_DB,
+    );
     assert_eq!(HeadroomScanMode::Reference.max_underread_db(), 0.030);
     assert_eq!(HeadroomScanMode::Fast.max_underread_db(), 0.044);
     assert_eq!(HeadroomScanMode::Fastest.max_underread_db(), 0.084);
+    let standard_component_budget = HEADROOM_STANDARD16X_GRID_MAX_UNDERREAD_DB
+        + HEADROOM_STANDARD16X_RESPONSE_COMPONENT_DB
+        + HEADROOM_STANDARD16X_NUMERICAL_ALLOWANCE_DB;
+    assert!(standard_component_budget < HEADROOM_STANDARD16X_MAX_UNDERREAD_DB);
+    assert_eq!(
+        HEADROOM_FAST_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
+        HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE
+    );
+}
+
+#[test]
+fn scan_mode_reserve_spends_the_declared_point_margin_without_claiming_band_support() {
+    let point = PeakLevel::Finite {
+        linear: 0.5,
+        dbtp: 20.0 * 0.5_f64.log10(),
+    };
+    for mode in [
+        HeadroomScanMode::Standard,
+        HeadroomScanMode::Reference,
+        HeadroomScanMode::Fast,
+        HeadroomScanMode::Fastest,
+    ] {
+        let reserved = mode.reserve_point_estimate(point);
+        assert!(reserved.linear() > point.linear());
+        assert!((reserved.dbtp() - point.dbtp() - mode.max_underread_db()).abs() < 1.0e-12);
+    }
+}
+
+#[test]
+fn ceiling_meter_default_constructor_uses_the_standard_scan_rung() {
+    let signal = aligned_multitone(2049, 0, 1000.375, &[(0.17, 0.6), (0.491, 0.3)]);
+    let mut default_meter = HeadroomCeilingMeter::new(192_000, 1, EdgePolicy::RepeatEndpoints)
+        .expect("default ceiling meter");
+    let mut standard_meter = HeadroomCeilingMeter::new_with_scan_mode(
+        192_000,
+        1,
+        EdgePolicy::RepeatEndpoints,
+        HeadroomScanMode::Standard,
+    )
+    .expect("standard ceiling meter");
+    default_meter.push_interleaved(&signal).unwrap();
+    standard_meter.push_interleaved(&signal).unwrap();
+    assert_eq!(default_meter.finalize().unwrap(), standard_meter.finalize().unwrap());
+}
+
+#[test]
+fn standard_fft_executor_matches_direct_16x_within_declared_numerical_allowance() {
+    let carriers = [
+        aligned_multitone(
+            4097,
+            0,
+            2000.375,
+            &[(0.17, 0.19), (0.31, 0.27), (0.49, 0.23)],
+        ),
+        bandlimited_enveloped_aligned_multitone(
+            3073,
+            1511.8125,
+            &[0.418, 0.437, 0.462, 0.491],
+        ),
+    ];
+
+    for edge in [EdgePolicy::RepeatEndpoints, EdgePolicy::ZeroExtend] {
+        for signal in &carriers {
+            let mut direct = meter_at_rate_with_edge(
+                TruePeakMode::Headroom16x,
+                1,
+                192_000,
+                edge,
+            );
+            let mut standard = meter_at_rate_with_edge(
+                TruePeakMode::HeadroomStandard16x,
+                1,
+                192_000,
+                edge,
+            );
+            for chunk in signal.chunks(113) {
+                direct.push_interleaved(chunk).unwrap();
+            }
+            for chunk in signal.chunks(257) {
+                standard.push_interleaved(chunk).unwrap();
+            }
+            let direct = finite_dbtp(direct.finalize().unwrap().overall);
+            let standard = finite_dbtp(standard.finalize().unwrap().overall);
+            assert!(
+                (standard - direct).abs() <= HEADROOM_STANDARD16X_NUMERICAL_ALLOWANCE_DB,
+                "edge={edge:?}: standard={standard:.12} direct={direct:.12}",
+            );
+        }
+    }
+}
+
+#[test]
+fn standard_fft_executor_matches_direct_16x_for_packed_stereo_channels() {
+    let left = aligned_multitone(4097, 0, 2000.375, &[(0.17, 0.41), (0.491, 0.27)]);
+    let right = aligned_multitone(4097, 0, 1991.625, &[(0.23, 0.37), (0.487, 0.31)]);
+    let mut signal = Vec::with_capacity(left.len() * 2);
+    for (left, right) in left.into_iter().zip(right) {
+        signal.extend_from_slice(&[left, right]);
+    }
+
+    let mut direct = meter_at_rate_with_edge(
+        TruePeakMode::Headroom16x,
+        2,
+        192_000,
+        EdgePolicy::RepeatEndpoints,
+    );
+    let mut standard = meter_at_rate_with_edge(
+        TruePeakMode::HeadroomStandard16x,
+        2,
+        192_000,
+        EdgePolicy::RepeatEndpoints,
+    );
+    for chunk in signal.chunks(226) {
+        direct.push_interleaved(chunk).unwrap();
+    }
+    for chunk in signal.chunks(514) {
+        standard.push_interleaved(chunk).unwrap();
+    }
+    let direct = direct.finalize().unwrap();
+    let standard = standard.finalize().unwrap();
+    for (channel, (standard_peak, direct_peak)) in standard
+        .channel_linear_peaks
+        .iter()
+        .zip(direct.channel_linear_peaks.iter())
+        .enumerate()
+    {
+        let standard_db = 20.0 * standard_peak.log10();
+        let direct_db = 20.0 * direct_peak.log10();
+        assert!(
+            (standard_db - direct_db).abs() <= HEADROOM_STANDARD16X_NUMERICAL_ALLOWANCE_DB,
+            "channel={channel}: standard={standard_db:.12} direct={direct_db:.12}",
+        );
+    }
 }
 
 #[test]
@@ -671,6 +836,7 @@ fn fast_headroom_required_upper_band_regression_meets_declared_bounds() {
         .collect::<Vec<_>>();
 
     for (mode, reserve) in [
+        (TruePeakMode::HeadroomStandard16x, HEADROOM_STANDARD16X_MAX_UNDERREAD_DB),
         (TruePeakMode::Headroom16x, HEADROOM16X_MAX_UNDERREAD_DB),
         (TruePeakMode::Headroom8x, HEADROOM8X_MAX_UNDERREAD_DB),
     ] {
@@ -747,8 +913,13 @@ fn fast_headroom_authorities_apply_their_own_reserves_and_band_gate() {
         linear: 0.5,
         dbtp: 20.0 * 0.5_f64.log10(),
     };
+    let standard = headroom_standard16x_authority(point, 0.495).unwrap();
     let fast = headroom16x_authority(point, 0.495).unwrap();
     let fastest = headroom8x_authority(point, 0.495).unwrap();
+    assert!(
+        (standard.dbtp() - (point.dbtp() + HEADROOM_STANDARD16X_MAX_UNDERREAD_DB)).abs()
+            < 1.0e-15
+    );
     assert!((fast.dbtp() - (point.dbtp() + HEADROOM16X_MAX_UNDERREAD_DB)).abs() < 1.0e-15);
     assert!((fastest.dbtp() - (point.dbtp() + HEADROOM8X_MAX_UNDERREAD_DB)).abs() < 1.0e-15);
     assert_eq!(
@@ -787,11 +958,21 @@ fn fast_ceiling_modes_bound_the_reference_finite_reconstruction_at_edges_and_int
 
     for edge in [EdgePolicy::RepeatEndpoints, EdgePolicy::ZeroExtend] {
         for signal in &carriers {
-            let mut reference = HeadroomCeilingMeter::new(176_400, 1, edge).unwrap();
+            let mut reference = HeadroomCeilingMeter::new_with_scan_mode(
+                176_400,
+                1,
+                edge,
+                HeadroomScanMode::Reference,
+            )
+            .unwrap();
             reference.push_interleaved(signal).unwrap();
             let reference = reference.finalize().unwrap();
 
-            for scan_mode in [HeadroomScanMode::Fast, HeadroomScanMode::Fastest] {
+            for scan_mode in [
+                HeadroomScanMode::Standard,
+                HeadroomScanMode::Fast,
+                HeadroomScanMode::Fastest,
+            ] {
                 let mut fast =
                     HeadroomCeilingMeter::new_with_scan_mode(176_400, 1, edge, scan_mode).unwrap();
                 for chunk in signal.chunks(37) {
@@ -819,6 +1000,7 @@ fn fast_ceiling_point_estimates_match_ordinary_fast_meters_bit_for_bit() {
         &[(0.31, 0.25), (0.41, 0.25), (0.49, 0.25)],
     );
     for (scan_mode, point_mode) in [
+        (HeadroomScanMode::Standard, TruePeakMode::HeadroomStandard16x),
         (HeadroomScanMode::Fast, TruePeakMode::Headroom16x),
         (HeadroomScanMode::Fastest, TruePeakMode::Headroom8x),
     ] {
@@ -1255,4 +1437,217 @@ fn high_resolution_mode_resolves_known_between_grid_peak_more_closely() {
     assert!(report < 0.99, "4x grid should deliberately under-read this phase");
     assert!((1.0 - headroom).abs() < 0.004, "64x headroom peak={headroom}");
     assert!(headroom > report + 0.01);
+}
+
+#[test]
+fn accelerated_reference_is_chunk_invariant_and_carries_a_certificate() {
+    let mut samples = Vec::new();
+    for frame in 0..12_345 {
+        samples.push((frame as f64 * 0.017).sin() * 0.81);
+        samples.push((frame as f64 * 0.031).cos() * 0.63);
+    }
+
+    let mut one = HeadroomCeilingMeter::new_accelerated_reference(
+        48_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    one.push_interleaved(&samples).unwrap();
+    let one = one.finalize().unwrap();
+
+    let mut chunked = HeadroomCeilingMeter::new_accelerated_reference(
+        48_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    let frame_chunks = [1usize, 7, 29, 3, 257, 11, 64, 1021];
+    let mut frame = 0usize;
+    let mut which = 0usize;
+    while frame < samples.len() / 2 {
+        let count = frame_chunks[which % frame_chunks.len()].min(samples.len() / 2 - frame);
+        chunked
+            .push_interleaved(&samples[frame * 2..(frame + count) * 2])
+            .unwrap();
+        frame += count;
+        which += 1;
+    }
+    let chunked = chunked.finalize().unwrap();
+
+    assert_eq!(
+        one.point_estimate.overall.linear().to_bits(),
+        chunked.point_estimate.overall.linear().to_bits()
+    );
+    assert_eq!(
+        one.reconstruction_upper.linear().to_bits(),
+        chunked.reconstruction_upper.linear().to_bits()
+    );
+    assert_eq!(one.reference_scan, chunked.reference_scan);
+    let scan = one.reference_scan.expect("accelerated scan diagnostics");
+    assert!(scan.interval_width_db.is_some());
+    assert!(scan.refined_intervals <= scan.candidate_intervals);
+}
+
+#[test]
+fn accelerated_reference_upper_contains_direct_reference_on_directed_signals() {
+    let signals = [
+        vec![0.25, -0.4, 0.1],
+        (0..4097)
+            .map(|index| if index % 2 == 0 { 0.93 } else { -0.93 })
+            .collect::<Vec<_>>(),
+        aligned_multitone(
+            8192,
+            256,
+            4095.5,
+            &[(0.30, 0.18), (0.35, 0.17), (0.40, 0.15)],
+        ),
+        {
+            let mut endpoint = vec![0.0; 4097];
+            endpoint[0] = 1.0;
+            endpoint[4096] = -0.8;
+            endpoint
+        },
+    ];
+
+    for edge in [EdgePolicy::RepeatEndpoints, EdgePolicy::ZeroExtend] {
+        for signal in &signals {
+            let mut reference = HeadroomCeilingMeter::new_with_scan_mode(
+                48_000,
+                1,
+                edge,
+                HeadroomScanMode::Reference,
+            )
+            .unwrap();
+            reference.push_interleaved(signal).unwrap();
+            let reference = reference.finalize().unwrap();
+
+            let mut accelerated =
+                HeadroomCeilingMeter::new_accelerated_reference(48_000, 1, edge).unwrap();
+            accelerated.push_interleaved(signal).unwrap();
+            let accelerated = accelerated.finalize().unwrap();
+            let scan = accelerated.reference_scan.expect("accelerated diagnostics");
+
+            assert!(
+                accelerated.reconstruction_upper.linear() >= reference.reconstruction_upper.linear(),
+                "edge={edge:?} accelerated={} reference={} width={:?}",
+                accelerated.reconstruction_upper.linear(),
+                reference.reconstruction_upper.linear(),
+                scan.interval_width_db,
+            );
+            assert!(scan.lower_linear <= reference.reconstruction_upper.linear());
+        }
+    }
+}
+
+#[test]
+fn accelerated_reference_centered_screen_does_not_refine_a_constant_stream() {
+    let signal = vec![0.25; 10_000];
+    let mut meter = HeadroomCeilingMeter::new_accelerated_reference(
+        48_000,
+        1,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    meter.push_interleaved(&signal).unwrap();
+    let result = meter.finalize().unwrap();
+    let scan = result.reference_scan.expect("accelerated diagnostics");
+
+    assert_eq!(scan.candidate_intervals, 0);
+    assert_eq!(scan.refined_intervals, 0);
+    assert_eq!(scan.budget_exhausted_tiles, 0);
+    assert!(scan.interval_width_db.unwrap() < 0.001);
+    assert!(result.reconstruction_upper.linear() >= 0.25);
+}
+
+#[test]
+fn accelerated_reference_one_frame_has_no_spurious_interval() {
+    let mut meter = HeadroomCeilingMeter::new_accelerated_reference(
+        48_000,
+        1,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    meter.push_interleaved(&[0.75]).unwrap();
+    let result = meter.finalize().unwrap();
+    let scan = result.reference_scan.expect("accelerated diagnostics");
+
+    assert_eq!(result.point_estimate.frames, 1);
+    assert_eq!(scan.candidate_intervals, 0);
+    assert_eq!(scan.refined_intervals, 0);
+    assert!(result.reconstruction_upper.linear() >= 0.75);
+}
+
+#[test]
+fn accelerated_reference_budget_exhaustion_keeps_reference_containment() {
+    let signal = (0..8193)
+        .map(|index| if index % 2 == 0 { 0.93 } else { -0.93 })
+        .collect::<Vec<_>>();
+
+    let mut reference = HeadroomCeilingMeter::new_with_scan_mode(
+        192_000,
+        1,
+        EdgePolicy::RepeatEndpoints,
+        HeadroomScanMode::Reference,
+    )
+    .unwrap();
+    reference.push_interleaved(&signal).unwrap();
+    let reference = reference.finalize().unwrap();
+
+    let mut accelerated = HeadroomCeilingMeter::new_accelerated_reference(
+        192_000,
+        1,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    accelerated.push_interleaved(&signal).unwrap();
+    let accelerated = accelerated.finalize().unwrap();
+    let scan = accelerated.reference_scan.expect("accelerated diagnostics");
+
+    assert!(scan.budget_exhausted_tiles > 0, "fixture must exercise the work cap");
+    assert!(scan.refined_intervals < scan.candidate_intervals);
+    assert!(
+        accelerated.reconstruction_upper.linear() >= reference.reconstruction_upper.linear(),
+        "unresolved intervals must remain in the finite-Reference certificate",
+    );
+}
+
+#[test]
+fn accelerated_reference_keeps_channel_sample_peaks_independent() {
+    let mut meter = HeadroomCeilingMeter::new_accelerated_reference(
+        48_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    meter.push_interleaved(&[0.9, 0.1]).unwrap();
+    let result = meter.finalize().unwrap();
+
+    assert_eq!(result.point_estimate.channel_linear_peaks.len(), 2);
+    assert_eq!(result.reconstruction_channel_linear_peaks.len(), 2);
+    assert!(result.point_estimate.channel_linear_peaks[0] >= 0.9);
+    assert!(result.point_estimate.channel_linear_peaks[1] < 0.2);
+    assert!(result.reconstruction_channel_linear_peaks[0] >= 0.9);
+    assert!(result.reconstruction_channel_linear_peaks[1] < 0.2);
+}
+
+#[test]
+fn accelerated_reference_silence_stays_silence_without_candidates() {
+    let signal = vec![0.0; 10_000 * 2];
+    let mut meter = HeadroomCeilingMeter::new_accelerated_reference(
+        192_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+    )
+    .unwrap();
+    meter.push_interleaved(&signal).unwrap();
+    let result = meter.finalize().unwrap();
+    let scan = result.reference_scan.expect("accelerated diagnostics");
+
+    assert_eq!(result.point_estimate.overall, PeakLevel::Silence);
+    assert_eq!(result.reconstruction_upper, PeakLevel::Silence);
+    assert_eq!(scan.interval_width_db, None);
+    assert_eq!(scan.candidate_intervals, 0);
+    assert_eq!(scan.refined_intervals, 0);
+    assert_eq!(scan.budget_exhausted_tiles, 0);
 }

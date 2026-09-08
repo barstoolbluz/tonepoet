@@ -1456,6 +1456,42 @@ fn plan_from_pcm(
     }
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
+
+    let pcm_true_peak_wavpack_hybrid = request.settings.pcm_true_peak.enabled
+        && request.settings.target_format == AudioFormat::WavPack
+        && request.settings.wavpack.hybrid;
+    if pcm_true_peak_wavpack_hybrid {
+        if processing_rate.is_some() {
+            return Err(PlanningError::invalid_source(
+                "sample_rate_hz",
+                "PCM true-peak WavPack hybrid carrier must already be at the final sample rate; post-measurement resampling is forbidden",
+            ));
+        }
+        let encoder_input = context.intermediate_path(steps.len(), "wav");
+        push_step(
+            steps,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_rate_hz: None,
+                target_bit_depth: target_depth,
+                apply_processing: true,
+            },
+            current_input.clone(),
+            OutputSink::Path(encoder_input.clone()),
+            "Realize final-rate integer PCM for WavPack hybrid encoder input",
+        );
+        *current_input = InputSource::Path(encoder_input);
+        push_encode_final(
+            request,
+            steps,
+            current_input,
+            final_work,
+            None,
+            target_depth,
+            false,
+        )?;
+        return Ok(());
+    }
     let depth_change = match request.settings.target_bit_depth {
         BitDepthTarget::Source => false,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
@@ -1514,11 +1550,12 @@ fn plan_from_pcm(
         return Ok(());
     }
 
-    let hard_ceiling_needs_proved_dither_terminal = request
+    let hard_ceiling_needs_proved_dither_terminal = (request
         .settings
         .dsd
         .runtime_album_gain_db()
         .is_some()
+        || request.settings.pcm_true_peak.enabled)
         && request.settings.target_format.is_pcm_lossless()
         && request.settings.dither_type != DitherType::None
         && matches!(
@@ -2163,6 +2200,104 @@ mod dsd_album_gain_carrier_planning_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pcm_true_peak_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
+        let mut request = carrier_request(96_000);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.enabled = true;
+        request.settings.target_format = AudioFormat::Alac;
+        request.settings.dither_type = crate::enums::DitherType::Tpdf;
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("PCM true-peak ALAC hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("PCM true-peak carrier must force executable ALAC encode");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Alac,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pcm_true_peak_wavpack_hybrid_realizes_one_integer_encoder_input_without_resampling() {
+        for scope in [
+            crate::enums::PcmTruePeakScope::Track,
+            crate::enums::PcmTruePeakScope::Album,
+        ] {
+            let mut request = carrier_request(96_000);
+            request.settings.dsd = crate::settings::DsdSettings::default();
+            request.settings.pcm_true_peak.enabled = true;
+            request.settings.pcm_true_peak.scope = scope;
+            request.settings.target_format = AudioFormat::WavPack;
+            request.settings.wavpack.hybrid = true;
+            request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+            request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+            request.source.source_representation = SourceRepresentationKind::Pcm;
+            request.output_path = PathBuf::from("output.wv");
+
+            let topology =
+                plan_topology(&request).expect("PCM true-peak hybrid WavPack topology");
+            let TopologyPlan::Execute { steps, .. } = topology else {
+                panic!("PCM true-peak WavPack hybrid must force executable encode");
+            };
+            let audio_steps: Vec<_> = steps
+                .iter()
+                .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+                .collect();
+            assert_eq!(audio_steps.len(), 2, "scope={scope:?}: {steps:#?}");
+            assert!(matches!(
+                &audio_steps[0].operation,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::Wav,
+                    target_rate_hz: None,
+                    target_bit_depth: PcmBitDepth::Int24,
+                    apply_processing: true,
+                }
+            ));
+            assert!(matches!(
+                &audio_steps[1].operation,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::WavPack,
+                    target_rate_hz: None,
+                    target_bit_depth: PcmBitDepth::Int24,
+                    apply_processing: false,
+                }
+            ));
+            assert_eq!(
+                audio_steps[0].output.as_path(),
+                audio_steps[1].input.as_path(),
+                "native wavpack must receive the exact admitted integer PCM carrier",
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+                "scope={scope:?}: post-measurement resampling would invalidate the governed encoder input: {steps:#?}",
+            );
+        }
     }
 }
 

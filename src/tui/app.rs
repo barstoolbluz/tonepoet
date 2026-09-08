@@ -12,6 +12,7 @@ use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
 use tonepoet_pipeline::enums::{
     DsdAutoGainScope, DsdFilterPreset, DsdNoiseShaper, DsdTruePeakScanMode, ModulatorOrder,
+    PcmTruePeakScanMode, PcmTruePeakScope,
 };
 use tonepoet_pipeline::{DbNano, DsdReconstructionSelection, DsdSourcePathway};
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
@@ -3740,6 +3741,16 @@ pub enum FormatField {
     Resampler,
     Dither,
     ReplayGain,
+    /// Enable the ordinary-PCM true-peak measure/gain step.
+    PcmTruePeak,
+    /// True-peak target in dBTP.
+    PcmTruePeakTarget,
+    /// Per-track or submitted-batch scope.
+    PcmTruePeakScope,
+    /// Whether positive gain is permitted below the target.
+    PcmTruePeakBoost,
+    /// Standard fast rung or 64x Reference measurement.
+    PcmTruePeakScan,
     // DSD rows
     DsdRate,
     NoiseShaper,
@@ -3963,6 +3974,11 @@ pub struct FormatState {
     pub resampler: PillState<ResamplerChoice>,
     pub dither: PillState<DitherType>,
     pub replaygain: PillState<ReplayGainChoice>,
+    pub pcm_true_peak_enabled: PillState<bool>,
+    pub pcm_true_peak_scope: PillState<PcmTruePeakScope>,
+    pub pcm_true_peak_boost: PillState<bool>,
+    pub pcm_true_peak_scan_mode: PillState<PcmTruePeakScanMode>,
+    pub pcm_true_peak_target_dbtp: DbNano,
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
     pub conversion_preset: PillState<DsdConversionPreset>,
@@ -4208,6 +4224,18 @@ impl FormatState {
             (ReplayGainChoice::Off, "off"),
         ]);
 
+        let pcm_true_peak_enabled = PillState::new(vec![(false, "off"), (true, "on")]);
+        let pcm_true_peak_scope = PillState::new(vec![
+            (PcmTruePeakScope::Track, "track"),
+            (PcmTruePeakScope::Album, "album"),
+        ]);
+        let pcm_true_peak_boost = PillState::new(vec![(false, "off"), (true, "on")]);
+        let pcm_true_peak_scan_mode = PillState::new(vec![
+            (PcmTruePeakScanMode::Standard, "0.044 dB / standard"),
+            (PcmTruePeakScanMode::Fast, "adaptive / fast"),
+            (PcmTruePeakScanMode::Reference, "0.030 dB / reference"),
+        ]);
+
         let noise_shaper = PillState::new(vec![
             (DsdNoiseShaper::Clans, "CLANS"),
             (DsdNoiseShaper::Sdm, "SDM"),
@@ -4262,6 +4290,11 @@ impl FormatState {
             resampler,
             dither,
             replaygain,
+            pcm_true_peak_enabled,
+            pcm_true_peak_scope,
+            pcm_true_peak_boost,
+            pcm_true_peak_scan_mode,
+            pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             noise_shaper,
             modulator_order,
             conversion_preset,
@@ -4549,6 +4582,19 @@ impl FormatState {
                     FormatPaneRow::Field(FormatField::Dither),
                 ]);
             }
+            if !self.source_is_dsd {
+                rows.push(FormatPaneRow::Field(FormatField::PcmTruePeak));
+                if *self.pcm_true_peak_enabled.selected_value() {
+                    rows.extend([
+                        FormatPaneRow::Field(FormatField::PcmTruePeakTarget),
+                        FormatPaneRow::Field(FormatField::PcmTruePeakScope),
+                        FormatPaneRow::Field(FormatField::PcmTruePeakBoost),
+                        FormatPaneRow::Field(FormatField::PcmTruePeakScan),
+                    ]);
+                }
+            }
+            // ReplayGain is intentionally presented after the sample-changing
+            // true-peak step; the pipeline measures its tags after gain.
             rows.push(FormatPaneRow::Field(FormatField::ReplayGain));
 
             if self.dsd_to_pcm_gain_available() {
@@ -4648,6 +4694,19 @@ impl FormatState {
             *self.format.selected_value(),
             AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus
         )
+    }
+
+    pub fn pcm_true_peak_lossy_floor_applies(&self) -> bool {
+        tonepoet_pipeline::pcm_true_peak_lossy_floor_applies(
+            &crate::convert::pipeline::planner_format_from_main(*self.format.selected_value()),
+            self.wavpack_hybrid,
+        )
+    }
+
+    pub fn pcm_true_peak_target_is_capped(&self) -> bool {
+        self.pcm_true_peak_lossy_floor_applies()
+            && self.pcm_true_peak_target_dbtp
+                > tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP
     }
 
     pub fn lossy_preset_labels(&self) -> Option<Vec<String>> {
@@ -4863,6 +4922,24 @@ impl FormatState {
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
             FormatField::ReplayGain => select_enabled_index(&mut self.replaygain, index),
+            FormatField::PcmTruePeak => {
+                select_enabled_index(&mut self.pcm_true_peak_enabled, index)
+            }
+            FormatField::PcmTruePeakScope => {
+                select_enabled_index(&mut self.pcm_true_peak_scope, index)
+            }
+            FormatField::PcmTruePeakBoost => {
+                select_enabled_index(&mut self.pcm_true_peak_boost, index)
+            }
+            FormatField::PcmTruePeakScan => {
+                select_enabled_index(&mut self.pcm_true_peak_scan_mode, index)
+            }
+            FormatField::PcmTruePeakTarget => {
+                self.pcm_true_peak_enabled.select_value(&true);
+                self.pcm_true_peak_target_dbtp =
+                    clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
+                true
+            }
             FormatField::NoiseShaper => select_enabled_index(&mut self.noise_shaper, index),
             FormatField::ModulatorOrder => select_enabled_index(&mut self.modulator_order, index),
             FormatField::ConversionPreset => {
@@ -5449,6 +5526,11 @@ impl FormatState {
         clamp_pill(&mut self.resampler);
         clamp_pill(&mut self.dither);
         clamp_pill(&mut self.replaygain);
+        clamp_pill(&mut self.pcm_true_peak_enabled);
+        clamp_pill(&mut self.pcm_true_peak_scope);
+        clamp_pill(&mut self.pcm_true_peak_boost);
+        clamp_pill(&mut self.pcm_true_peak_scan_mode);
+        self.pcm_true_peak_target_dbtp = clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
         clamp_pill(&mut self.noise_shaper);
         clamp_pill(&mut self.modulator_order);
         clamp_pill(&mut self.conversion_preset);
@@ -5478,6 +5560,20 @@ impl FormatState {
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
             FormatField::ReplayGain => FocusedPill::ReplayGain(&mut self.replaygain),
+            FormatField::PcmTruePeak => FocusedPill::PcmTruePeak(&mut self.pcm_true_peak_enabled),
+            FormatField::PcmTruePeakScope => {
+                FocusedPill::PcmTruePeakScope(&mut self.pcm_true_peak_scope)
+            }
+            FormatField::PcmTruePeakBoost => {
+                FocusedPill::PcmTruePeakBoost(&mut self.pcm_true_peak_boost)
+            }
+            FormatField::PcmTruePeakScan => {
+                FocusedPill::PcmTruePeakScan(&mut self.pcm_true_peak_scan_mode)
+            }
+            FormatField::PcmTruePeakTarget => FocusedPill::PcmTruePeakTarget {
+                target_dbtp: &mut self.pcm_true_peak_target_dbtp,
+                enabled: &mut self.pcm_true_peak_enabled,
+            },
             FormatField::NoiseShaper => FocusedPill::NoiseShaper(&mut self.noise_shaper),
             FormatField::ModulatorOrder => FocusedPill::ModulatorOrder(&mut self.modulator_order),
             FormatField::ConversionPreset => FocusedPill::ConversionPreset(&mut self.conversion_preset),
@@ -5509,6 +5605,17 @@ impl FormatState {
             }
         }
     }
+}
+
+fn clamp_pcm_true_peak_target(value: DbNano) -> DbNano {
+    DbNano(value.0.clamp(
+        DbNano::MIN_NORMALIZE_TARGET.0,
+        DbNano::MAX_NORMALIZE_TARGET.0,
+    ))
+}
+
+fn step_pcm_true_peak_target(value: &mut DbNano, delta_nano: i64) {
+    *value = clamp_pcm_true_peak_target(DbNano(value.0.saturating_add(delta_nano)));
 }
 
 fn clamp_dsd_to_pcm_gain_db(value: DbNano) -> DbNano {
@@ -5655,6 +5762,14 @@ pub enum FocusedPill<'a> {
     Resampler(&'a mut PillState<ResamplerChoice>),
     Dither(&'a mut PillState<DitherType>),
     ReplayGain(&'a mut PillState<ReplayGainChoice>),
+    PcmTruePeak(&'a mut PillState<bool>),
+    PcmTruePeakScope(&'a mut PillState<PcmTruePeakScope>),
+    PcmTruePeakBoost(&'a mut PillState<bool>),
+    PcmTruePeakScan(&'a mut PillState<PcmTruePeakScanMode>),
+    PcmTruePeakTarget {
+        target_dbtp: &'a mut DbNano,
+        enabled: &'a mut PillState<bool>,
+    },
     NoiseShaper(&'a mut PillState<DsdNoiseShaper>),
     ModulatorOrder(&'a mut PillState<ModulatorOrder>),
     ConversionPreset(&'a mut PillState<DsdConversionPreset>),
@@ -5686,6 +5801,14 @@ impl FocusedPill<'_> {
             Self::Resampler(p) => p.select_next(),
             Self::Dither(p) => p.select_next(),
             Self::ReplayGain(p) => p.select_next(),
+            Self::PcmTruePeak(p) => p.select_next(),
+            Self::PcmTruePeakScope(p) => p.select_next(),
+            Self::PcmTruePeakBoost(p) => p.select_next(),
+            Self::PcmTruePeakScan(p) => p.select_next(),
+            Self::PcmTruePeakTarget { target_dbtp, enabled } => {
+                (*enabled).select_value(&true);
+                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
+            }
             Self::NoiseShaper(p) => p.select_next(),
             Self::ModulatorOrder(p) => p.select_next(),
             Self::ConversionPreset(p) => p.select_next(),
@@ -5717,6 +5840,14 @@ impl FocusedPill<'_> {
             Self::Resampler(p) => p.select_prev(),
             Self::Dither(p) => p.select_prev(),
             Self::ReplayGain(p) => p.select_prev(),
+            Self::PcmTruePeak(p) => p.select_prev(),
+            Self::PcmTruePeakScope(p) => p.select_prev(),
+            Self::PcmTruePeakBoost(p) => p.select_prev(),
+            Self::PcmTruePeakScan(p) => p.select_prev(),
+            Self::PcmTruePeakTarget { target_dbtp, enabled } => {
+                (*enabled).select_value(&true);
+                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
+            }
             Self::NoiseShaper(p) => p.select_prev(),
             Self::ModulatorOrder(p) => p.select_prev(),
             Self::ConversionPreset(p) => p.select_prev(),
@@ -17040,6 +17171,66 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
         next += 1;
     }
     next
+}
+
+#[cfg(test)]
+mod pcm_true_peak_lossy_floor_ui_tests {
+    use super::*;
+
+    fn state(format: AudioFormat, target: &str) -> FormatState {
+        let mut state = FormatState::new();
+        state.format.select_value(&format);
+        state.pcm_true_peak_target_dbtp = target.parse().unwrap();
+        state
+    }
+
+    #[test]
+    fn disclosure_covers_every_builtin_lossy_pcm_target_without_widening_codec_ui_policy() {
+        for format in [
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Opus,
+            AudioFormat::Dts,
+            AudioFormat::Ac3,
+        ] {
+            let capped = state(format.clone(), "-0.500000000");
+            assert!(capped.pcm_true_peak_target_is_capped(), "{format:?}");
+
+            let at_floor = state(format.clone(), "-1.000000000");
+            assert!(!at_floor.pcm_true_peak_target_is_capped());
+
+            let below_floor = state(format, "-1.500000000");
+            assert!(!below_floor.pcm_true_peak_target_is_capped());
+        }
+
+        for format in [
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Aiff,
+            AudioFormat::Alac,
+            AudioFormat::WavPack,
+        ] {
+            let lossless = state(format, "-0.500000000");
+            assert!(!lossless.pcm_true_peak_target_is_capped());
+        }
+
+        let mut hybrid = state(AudioFormat::WavPack, "-0.500000000");
+        hybrid.wavpack_hybrid = true;
+        assert!(hybrid.pcm_true_peak_target_is_capped());
+        hybrid.pcm_true_peak_target_dbtp = "-1.000000000".parse().unwrap();
+        assert!(!hybrid.pcm_true_peak_target_is_capped());
+        hybrid.pcm_true_peak_target_dbtp = "-1.500000000".parse().unwrap();
+        assert!(!hybrid.pcm_true_peak_target_is_capped());
+    }
+
+    #[test]
+    fn legacy_lossy_codec_helper_stays_narrow_for_preset_and_bit_depth_ui() {
+        for format in [AudioFormat::Dts, AudioFormat::Ac3, AudioFormat::WavPack] {
+            let mut state = state(format, "-0.500000000");
+            state.wavpack_hybrid = true;
+            assert!(!state.is_lossy_codec_selected());
+        }
+    }
 }
 
 #[cfg(test)]

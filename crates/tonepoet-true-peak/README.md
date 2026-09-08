@@ -68,30 +68,49 @@ HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE = 0.495
 
 None of the modes clamp input samples to full scale; decoded values above `1.0` can produce positive dBTP.
 
-### Opt-in faster headroom scans
+### PCM Standard, Fast, and Reference scans
 
-The headroom question now has a deliberately small three-rung ladder. `Headroom64x` remains the default and the gold standard. `Headroom16x` and `Headroom8x` are explicit speed opt-ins; `Reporting4x` is not part of this ladder because it remains a different reporting contract.
+`HeadroomScanMode::Standard` is the default. It evaluates the already-qualified 16x mathematical prefix, but executes the expensive 384-tap first-stage half phase with bounded-memory 2048-point overlap-save FFT convolution. Each full block accepts 1665 new original-rate frames, retains only the required 383-frame overlap, and packs two real channels into one complex transform because both channels use the same real impulse response. The integer phase, coefficients, calibration, later three stages, 16x grid, and `<= 0.495 * Fs` qualification domain are unchanged, so the published one-sided bound remains `0.044 dB`. The bound is decomposed as an analytic `0.041090312 dB` grid term, a `0.000145995 dB` worst calibrated-response under-read term, and a `0.000010 dB` numerical allowance. Their `0.041246307 dB` sum leaves about `0.002754 dB` below the declared reserve. The same numerical allowance is also charged to the finite-reconstruction ceiling; it is not consumed silently by the faster executor.
 
-| scan rung | point mode | qualified one-sided under-read bound | role |
-|---|---|---:|---|
-| `Reference` | `Headroom64x` | `0.030 dB` | default, unchanged |
-| `Fast` | `Headroom16x` | `0.044 dB` | middle-speed opt-in |
-| `Fastest` | `Headroom8x` | `0.084 dB` | largest accepted speed/accuracy trade |
+`Headroom64x` remains the explicit `Reference` gold standard at `0.030 dB`. The prior direct-prefix `Fast` (16x, `0.044 dB`) and `Fastest` (8x, `0.084 dB`) tokens remain available for now because existing DSD policy names them; they are no longer the default and can be removed when that separate surface is intentionally simplified. `Reporting4x` remains a different interoperability contract.
 
-Both fast modes reuse prefixes of the frozen Headroom64 cascade and the same `<= 0.495 * Fs` authority domain. `Headroom16x` carries a `+0.007 dB` one-sided calibration and `Headroom8x` carries a `+0.088 dB` calibration so that its coarser grid can still support a useful one-sided under-read contract. The independent qualification program recomputes the exact runtime filters, response and grid components, deterministic exact-peak cases, and the finite-ceiling bridge constants.
+The ordinary PCM UI has a separate `Fast` choice implemented by
+`HeadroomCeilingMeter::new_accelerated_reference()`. Do not confuse it with the
+historical `HeadroomScanMode::Fast` token above. The PCM Fast scanner computes
+a Reference-quality 4x prefix everywhere, using the frozen 49-tap second stage
+through its symmetric pair-product executor. It screens every 4x interval with
+a Bernstein cubic plus an independently qualified finite-operator residual and
+selectively evaluates missing 64x knots with the exact composed Reference tail.
+Its deterministic refinement cap targets a `0.010 dB` or narrower finite-
+Reference search interval; that width is a preferred target rather than a
+promised result. If the cap is exhausted, every unrefined interval keeps its
+certified upper, so hard-ceiling safety does not depend on meeting the target.
+The scanner is intended to be the fastest ordinary-PCM choice, but its
+two-minute commissioning goal remains a release benchmark, not a source-code
+claim.
 
-The public helpers `headroom16x_authority()` and `headroom8x_authority()` apply only their rung's declared reserve and refuse out-of-domain promotion exactly as `headroom64x_authority()` does. `HeadroomScanMode::default()` is `Reference`.
+The public helpers `headroom16x_authority()` and `headroom8x_authority()` apply only their rung's declared reserve and refuse out-of-domain promotion exactly as `headroom64x_authority()` does.
 
 ### Finite ceiling reconstruction
 
-Album-scoped `NormalizePeak` does **not** promote any point estimate with its dB reserve. The production DSD carrier has no fabricated `<= 0.495 * Fs` spectral-support declaration. Instead, `HeadroomCeilingMeter` evaluates a separately named finite waveform contract:
+The existing DSD album `NormalizePeak` path does **not** promote any point estimate with its dB reserve. The production DSD carrier has no fabricated `<= 0.495 * Fs` spectral-support declaration. Instead, `HeadroomCeilingMeter` evaluates a separately named finite waveform contract.
+
+The ordinary-PCM true-peak gain step deliberately combines the two ideas rather than conflating them. `Standard` and `Reference` spend their declared `0.044 dB` and `0.030 dB` point reserves as aim-point margins, but do **not** call a band-authority API with invented spectral support; their gain solver receives the maximum of the reserved point and the independent finite-reconstruction upper. PCM `Fast` instead feeds its certified finite-Reference `upper_linear` directly into the signal-authority slot. Its measured point and achieved interval remain diagnostics, not hidden additive reserves. Within the qualified `<= 0.495 * Fs` domain the fixed-rung point reserves retain their published one-sided meaning; outside it, Tonepoet promises only the separately defined finite-reconstruction ceiling, not an arbitrary ideal-sinc/DAC peak.
+
+`HeadroomCeilingMeter` evaluates that finite waveform contract as follows:
 
 - the signal is each channel of the retained final-rate Float64 PCM carrier;
 - production uses `RepeatEndpoints` outside the finite stream (the meter also retains `ZeroExtend` for regression coverage);
 - the governed reconstruction is always the same uncalibrated full six-stage Headroom64 cascade;
 - `Reference` evaluates all 64x knots directly;
-- `Fast` evaluates the 16x prefix, bounds its four-point cubic interpolant through Bernstein controls, and adds a conservative `0.0030` induced-L-infinity difference bound to the full 64x reconstruction;
-- `Fastest` does the same from the 8x prefix with its own independently recomputed `0.0030` induced-L-infinity difference bound;
+- `Standard` evaluates the 16x prefix with the FFT first-stage implementation and uses the same independently qualified 16x-to-64x bridge;
+- ordinary-PCM `Fast` evaluates a Reference-quality 4x prefix with its tiny
+  paired-stage execution delta covered by the explicit numerical enclosure,
+  conservatively screens every interval, and selectively completes candidates
+  with the exact 4x-to-64x Reference tail; unresolved screen uppers remain in the final
+  certificate when the deterministic refinement budget is exhausted;
+- historical `HeadroomScanMode::Fast` evaluates the 16x prefix, bounds its four-point cubic interpolant through Bernstein controls, and adds a conservative `0.0030` induced-L-infinity difference bound to the full 64x reconstruction;
+- historical `HeadroomScanMode::Fastest` does the same from the 8x prefix with its own independently recomputed `0.0030` induced-L-infinity difference bound;
 - over the nominal interval from the first input frame through the last, the governed continuous waveform is straight-line interpolation between adjacent full-64x reconstruction knots;
 - channels are independent and the ceiling peak is the maximum absolute reconstructed value over all channels.
 
@@ -116,7 +135,7 @@ stage 6: 32 * (1 +  4)  =   160
 
 The optimized exhaustive `Headroom64x` implementation preserves that mathematical cascade and accumulation order but specializes the exact identity phases, eliminating their coefficient-1 multiplies, and uses doubled circular buffers so every nontrivial FIR history window is contiguous. The resulting count is **576 coefficient products per original input frame/channel** (192 + 48 + 48 + 64 + 96 + 128), while also removing modulo/index adjustment from the FIR inner loops.
 
-The opt-in fast modes do not alter this reference path. They stop at a qualified prefix and pair the mathematically symmetric Blackman half-phase taps only in their own execution path:
+The reference path is unchanged. The legacy opt-in fast modes stop at a qualified prefix and pair the mathematically symmetric Blackman half-phase taps only in their own execution path:
 
 ```text
 Headroom64x reference: 576 coefficient products / original frame / channel
@@ -124,11 +143,13 @@ Headroom16x fast:      272 coefficient products / original frame / channel
 Headroom8x fastest:    240 coefficient products / original frame / channel
 ```
 
-Those FIR counts are a design model, not a throughput claim. In the production hard-ceiling path, each fast mode computes only the two interior Bernstein controls of its cubic bridge. That adds 32 floating multiplies per original frame/channel for `Fast` and 16 for `Fastest`, for static totals of 304 and 256 modeled multiplies respectively versus 576 for `Reference`. Relative to the supplied 12.7 CPU-minute Headroom64x baseline, the multiply model extrapolates to about 6.70 CPU-minutes for `Fast` and 5.64 for `Fastest`; those figures are explicitly designed-for, not measured. Additions, abs/max work, memory traffic, and I/O are deliberately not converted into fake throughput numbers. `examples/bench_ceiling_f64le.rs` benchmarks the exact production ceiling meter for `reference`, `fast`, and `fastest` and reports realtime plus extrapolated single-scan wall minutes for a 40-minute carrier. It deliberately does not label wall time as CPU time. The operator must collect release acceptance CPU numbers with the shipping Nix/Rust codegen and a process CPU timer (for example, user+system time from the platform's `time` utility) on a clean machine. `examples/scan_f64le.rs` remains available for point-meter profiling.
+`Standard` is deliberately not assigned a fake per-frame FIR product count: its dominant first stage is block FFT convolution, so the meaningful metric is measured time per original frame/channel. It amortizes one forward and inverse 2048-point complex FFT across 1665 new frames and, for stereo/even channel counts, across two channels at once. Later 2x stages remain the same direct 16x-prefix implementation.
+
+The direct-FIR counts above are a design model, not a throughput claim. In the production hard-ceiling path, each prefix mode computes only the two interior Bernstein controls of its cubic bridge. `examples/bench_ceiling_f64le.rs` benchmarks the production ceiling meter for `standard`, PCM `accelerated`, `reference`, and the historical `fast`/`fastest` rungs, and reports realtime plus extrapolated single-scan wall minutes for a 40-minute carrier. It deliberately does not label wall time as CPU time. The operator must collect release acceptance numbers with the shipping Nix/Rust codegen on the same material used for comparison; no throughput figure is asserted until that benchmark is run. `examples/scan_f64le.rs` remains available for point-meter profiling.
 
 ## Finite-stream edges
 
-All three headroom rungs retain the selectable `RepeatEndpoints` and `ZeroExtend` finite-stream policies. Measurement is clipped to the nominal input-time interval. `Reporting4x` intentionally ignores those policies and keeps its libebur128-compatible finite-stream semantics.
+All headroom modes retain the selectable `RepeatEndpoints` and `ZeroExtend` finite-stream policies. Measurement is clipped to the nominal input-time interval. `Reporting4x` intentionally ignores those policies and keeps its libebur128-compatible finite-stream semantics.
 
 All engines are incremental and bounded-state. Feeding identical frames in one block or arbitrary whole-frame chunks produces bit-identical results for a fixed mode.
 

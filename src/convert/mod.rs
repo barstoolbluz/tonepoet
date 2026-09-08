@@ -831,7 +831,12 @@ impl ConversionManager {
         let album_scope_requested = options
             .pipeline_settings
             .as_ref()
-            .map(|settings| settings.dsd.album_auto_gain_selected())
+            .map(|settings| {
+                settings.dsd.album_auto_gain_selected()
+                    || (settings.pcm_true_peak.enabled
+                        && settings.pcm_true_peak.scope
+                            == tonepoet_pipeline::PcmTruePeakScope::Album)
+            })
             .unwrap_or(false);
         let mut outcome = CommitBatchOutcome::success();
         if batch.is_empty() {
@@ -859,7 +864,7 @@ impl ConversionManager {
         }
         if album_scope_requested && outcome.errors > 0 {
             outcome.last_error = Some(
-                "album-scoped DSD auto-gain requires every item in the submitted batch to be admitted; source detection failed for at least one item"
+                "album-scoped true-peak gain requires every item in the submitted batch to be admitted; source detection failed for at least one item"
                     .to_string(),
             );
             return CommitBatchCueArtifactTransaction::failed_without_queue_mutation(
@@ -909,7 +914,7 @@ impl ConversionManager {
                 if album_scope_requested {
                     outcome.errors += 1;
                     outcome.last_error = Some(format!(
-                        "album-scoped DSD auto-gain requires the exact submitted batch; {} is already present as live queue item {}",
+                        "album-scoped true-peak gain requires the exact submitted batch; {} is already present as live queue item {}",
                         file.display(),
                         existing_id,
                     ));
@@ -4942,6 +4947,46 @@ mod per_track_epoch_tests {
         assert!(item.closed_track_epochs.is_empty());
     }
 
+
+    #[test]
+    fn pcm_true_peak_album_scope_rejects_partial_batch_before_queue_mutation() {
+        let manager = ConversionManager::new(ConversionConfig::default());
+        let (artifact_dir, artifact) =
+            synthetic_artifact_for("pcm-true-peak-album", "pcm-true-peak-album");
+        let unsupported = artifact_dir.join("unsupported.not-audio");
+        fs::write(&unsupported, b"not an admitted conversion source")
+            .expect("write unsupported batch member");
+        let source_artifacts = [artifact.clone()].into_iter().collect::<HashSet<_>>();
+
+        let mut options = ConversionOptions::default();
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
+        options.pipeline_settings = Some(settings);
+
+        let transaction = manager.commit_batch_with_cue_artifacts(
+            &[artifact.clone(), unsupported],
+            &HashSet::new(),
+            &source_artifacts,
+            &options,
+            |_| panic!("album-scope detection failure must abort before item configuration"),
+        );
+
+        assert_eq!(transaction.outcome.enqueued, 0);
+        assert!(transaction.outcome.errors > 0);
+        assert!(
+            transaction
+                .outcome
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("album-scoped true-peak gain requires every item")
+        );
+        assert!(transaction.admitted_item_ids.is_empty());
+        assert!(transaction.artifacts_remaining_caller_owned.contains(&artifact));
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert!(queue.all_items().is_empty());
+    }
 
     #[test]
     fn commit_batch_replaces_completed_item_and_transfers_artifact_ownership() {

@@ -7,3 +7,4 @@ description = "Streaming true-peak measurement for decoded PCM audio"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+rustfft = "=6.4.1"

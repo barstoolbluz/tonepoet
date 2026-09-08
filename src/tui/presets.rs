@@ -73,6 +73,18 @@ pub struct TuiPreset {
     /// Album true-peak scan rung. Missing means the 0.030 dB reference path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsd_true_peak_scan: Option<String>,
+    /// Ordinary-PCM true-peak gain controls. Kept optional inside v4 so
+    /// pre-feature presets continue to mean disabled/default policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_true_peak_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_true_peak_target_dbtp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_true_peak_allow_boost: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_true_peak_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_true_peak_scan: Option<String>,
 
     // Metadata pane
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +188,16 @@ struct PresetWireV4 {
     dsd_auto_gain_scope: Option<String>,
     #[serde(default)]
     dsd_true_peak_scan: Option<String>,
+    #[serde(default)]
+    pcm_true_peak_enabled: Option<bool>,
+    #[serde(default)]
+    pcm_true_peak_target_dbtp: Option<String>,
+    #[serde(default)]
+    pcm_true_peak_allow_boost: Option<bool>,
+    #[serde(default)]
+    pcm_true_peak_scope: Option<String>,
+    #[serde(default)]
+    pcm_true_peak_scan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     album_artist_for_conversion: Option<String>,
     #[serde(default)]
@@ -253,6 +275,11 @@ impl PresetWireLegacy {
             dsd_normalize_target_dbfs: None,
             dsd_auto_gain_scope: None,
             dsd_true_peak_scan: None,
+            pcm_true_peak_enabled: None,
+            pcm_true_peak_target_dbtp: None,
+            pcm_true_peak_allow_boost: None,
+            pcm_true_peak_scope: None,
+            pcm_true_peak_scan: None,
             album_artist_for_conversion: self.album_artist_for_conversion,
             dest_path: self.dest_path,
             folder_template: self.folder_template,
@@ -299,6 +326,11 @@ impl PresetWireV4 {
             dsd_normalize_target_dbfs: self.dsd_normalize_target_dbfs,
             dsd_auto_gain_scope: self.dsd_auto_gain_scope,
             dsd_true_peak_scan: self.dsd_true_peak_scan,
+            pcm_true_peak_enabled: self.pcm_true_peak_enabled,
+            pcm_true_peak_target_dbtp: self.pcm_true_peak_target_dbtp,
+            pcm_true_peak_allow_boost: self.pcm_true_peak_allow_boost,
+            pcm_true_peak_scope: self.pcm_true_peak_scope,
+            pcm_true_peak_scan: self.pcm_true_peak_scan,
             album_artist_for_conversion: self.album_artist_for_conversion,
             dest_path: self.dest_path,
             folder_template: self.folder_template,
@@ -447,6 +479,18 @@ impl TuiPreset {
             } else {
                 None
             },
+            pcm_true_peak_enabled: Some(*format.pcm_true_peak_enabled.selected_value()),
+            pcm_true_peak_target_dbtp: Some(format.pcm_true_peak_target_dbtp.render(false)),
+            pcm_true_peak_allow_boost: Some(*format.pcm_true_peak_boost.selected_value()),
+            pcm_true_peak_scope: Some(match format.pcm_true_peak_scope.selected_value() {
+                tonepoet_pipeline::PcmTruePeakScope::Track => "track",
+                tonepoet_pipeline::PcmTruePeakScope::Album => "album",
+            }.to_string()),
+            pcm_true_peak_scan: Some(match format.pcm_true_peak_scan_mode.selected_value() {
+                tonepoet_pipeline::PcmTruePeakScanMode::Standard => "standard",
+                tonepoet_pipeline::PcmTruePeakScanMode::Fast => "fast",
+                tonepoet_pipeline::PcmTruePeakScanMode::Reference => "reference",
+            }.to_string()),
             album_artist_for_conversion: normalize_optional_text_override(
                 metadata.album_artist_for_conversion.as_deref(),
             ),
@@ -719,6 +763,46 @@ impl TuiPreset {
                 ),
                 None => report.record("replaygain", false),
             }
+            let enabled = self.pcm_true_peak_enabled.unwrap_or(false);
+            report.record(
+                "pcm_true_peak_enabled",
+                format_state.pcm_true_peak_enabled.select_value(&enabled),
+            );
+            if let Some(raw) = self.pcm_true_peak_target_dbtp.as_deref() {
+                match raw.parse::<tonepoet_pipeline::DbNano>() {
+                    Ok(value) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
+                        ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&value) => {
+                        format_state.pcm_true_peak_target_dbtp = value;
+                        report.record("pcm_true_peak_target_dbtp", true);
+                    }
+                    _ => report.record("pcm_true_peak_target_dbtp", false),
+                }
+            }
+            let boost = self.pcm_true_peak_allow_boost.unwrap_or(false);
+            report.record(
+                "pcm_true_peak_allow_boost",
+                format_state.pcm_true_peak_boost.select_value(&boost),
+            );
+            let scope = match self.pcm_true_peak_scope.as_deref().unwrap_or("track") {
+                "track" => Some(tonepoet_pipeline::PcmTruePeakScope::Track),
+                "album" => Some(tonepoet_pipeline::PcmTruePeakScope::Album),
+                _ => None,
+            };
+            report.record(
+                "pcm_true_peak_scope",
+                scope.is_some_and(|value| format_state.pcm_true_peak_scope.select_value(&value)),
+            );
+            let scan = match self.pcm_true_peak_scan.as_deref().unwrap_or("standard") {
+                "standard" => Some(tonepoet_pipeline::PcmTruePeakScanMode::Standard),
+                "fast" => Some(tonepoet_pipeline::PcmTruePeakScanMode::Fast),
+                "reference" => Some(tonepoet_pipeline::PcmTruePeakScanMode::Reference),
+                _ => None,
+            };
+            report.record(
+                "pcm_true_peak_scan",
+                scan.is_some_and(|value| format_state.pcm_true_peak_scan_mode.select_value(&value)),
+            );
+
             match parse_resampler(&self.resampler) {
                 Some(value) => {
                     let applied = Self::select_enabled(&mut format_state.resampler, &value);
@@ -950,6 +1034,13 @@ impl TuiPreset {
             dsd_gain: None,
             dsd_gain_db: None,
             dsd_normalize_target_dbfs: None,
+            // The legacy wizard preset carries no PCM true-peak state, exactly
+            // as it carries none of the DSD gain state above.
+            pcm_true_peak_enabled: None,
+            pcm_true_peak_target_dbtp: None,
+            pcm_true_peak_allow_boost: None,
+            pcm_true_peak_scope: None,
+            pcm_true_peak_scan: None,
             album_artist_for_conversion: None,
             dest_path: None,
             folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
@@ -2242,6 +2333,76 @@ merge = "multi-file"
         assert!(restored_format.resampler_overridden);
         assert_eq!(restored_format.source_derived_sample_rate, None);
         assert_eq!(restored_format.source_derived_bit_depth, None);
+    }
+
+    #[test]
+    fn pcm_true_peak_controls_round_trip_in_v4_preset() {
+        let mut format = FormatState::new();
+        assert!(format.pcm_true_peak_enabled.select_value(&true));
+        format.pcm_true_peak_target_dbtp = "-0.625000000".parse().unwrap();
+        assert!(format
+            .pcm_true_peak_scope
+            .select_value(&tonepoet_pipeline::PcmTruePeakScope::Album));
+        assert!(format.pcm_true_peak_boost.select_value(&true));
+        assert!(format
+            .pcm_true_peak_scan_mode
+            .select_value(&tonepoet_pipeline::PcmTruePeakScanMode::Reference));
+        let preset = TuiPreset::from_pill_state(
+            "pcm-true-peak",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        );
+
+        assert_eq!(preset.version, 4);
+        assert_eq!(preset.pcm_true_peak_enabled, Some(true));
+        assert_eq!(preset.pcm_true_peak_target_dbtp.as_deref(), Some("-0.625000000"));
+        assert_eq!(preset.pcm_true_peak_scope.as_deref(), Some("album"));
+        assert_eq!(preset.pcm_true_peak_allow_boost, Some(true));
+        assert_eq!(preset.pcm_true_peak_scan.as_deref(), Some("reference"));
+
+        let mut restored = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        let report = preset.apply_to_pills(&mut restored, &mut output, &mut metadata);
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(restored.pcm_true_peak_enabled.selected_value(), &true);
+        assert_eq!(restored.pcm_true_peak_target_dbtp, "-0.625000000".parse().unwrap());
+        assert_eq!(
+            restored.pcm_true_peak_scope.selected_value(),
+            &tonepoet_pipeline::PcmTruePeakScope::Album,
+        );
+        assert_eq!(restored.pcm_true_peak_boost.selected_value(), &true);
+        assert_eq!(
+            restored.pcm_true_peak_scan_mode.selected_value(),
+            &tonepoet_pipeline::PcmTruePeakScanMode::Reference,
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_fast_scan_round_trips_in_v4_preset() {
+        let mut format = FormatState::new();
+        assert!(format
+            .pcm_true_peak_scan_mode
+            .select_value(&tonepoet_pipeline::PcmTruePeakScanMode::Fast));
+        let preset = TuiPreset::from_pill_state(
+            "pcm-true-peak-fast",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        );
+
+        assert_eq!(preset.pcm_true_peak_scan.as_deref(), Some("fast"));
+
+        let mut restored = FormatState::new();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        let report = preset.apply_to_pills(&mut restored, &mut output, &mut metadata);
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(
+            restored.pcm_true_peak_scan_mode.selected_value(),
+            &tonepoet_pipeline::PcmTruePeakScanMode::Fast,
+        );
     }
 
     #[test]

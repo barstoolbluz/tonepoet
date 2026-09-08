@@ -152,6 +152,18 @@ pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.album_gain_db",
 ];
 
+/// Additive fingerprint fields for enabled PCM true-peak gain. Disabled
+/// settings write no extension fields, preserving the historical default
+/// fingerprint while making every byte-affecting enabled control visible.
+pub const PCM_TRUE_PEAK_FINGERPRINT_FIELD_PATHS: &[&str] = &[
+    "pcm_true_peak.enabled",
+    "pcm_true_peak.target_dbtp",
+    "pcm_true_peak.allow_boost",
+    "pcm_true_peak.scope",
+    "pcm_true_peak.scan_mode",
+    "pcm_true_peak.runtime_album_gain_db",
+];
+
 /// Native-v2 DSD settings paths written by [`settings_snapshot_fingerprint_v2`].
 ///
 /// This inventory is deliberately separate from [`SETTINGS_FINGERPRINT_FIELD_PATHS`],
@@ -502,6 +514,7 @@ fn push_pipeline_settings(writer: &mut FingerprintWriter, settings: &PipelineSet
     push_sox_resampler(writer, &settings.sox_resampler);
     push_soxr_resampler(writer, &settings.soxr_resampler);
     push_dsd(writer, &settings.dsd);
+    push_pcm_true_peak(writer, &settings.pcm_true_peak);
     push_metadata(writer, &settings.metadata);
     push_verification(writer, &settings.verification);
     push_replay_gain(writer, &settings.replay_gain);
@@ -528,9 +541,43 @@ fn push_pipeline_settings_v2(writer: &mut FingerprintWriter, settings: &Pipeline
     push_sox_resampler(writer, &settings.sox_resampler);
     push_soxr_resampler(writer, &settings.soxr_resampler);
     push_native_dsd_v2(writer, &settings.dsd);
+    push_pcm_true_peak(writer, &settings.pcm_true_peak);
     push_metadata(writer, &settings.metadata);
     push_verification(writer, &settings.verification);
     push_replay_gain(writer, &settings.replay_gain);
+}
+
+fn push_pcm_true_peak(
+    writer: &mut FingerprintWriter,
+    settings: &crate::PcmTruePeakGainSettings,
+) {
+    if !settings.enabled {
+        return;
+    }
+    writer.field_static("pcm_true_peak.enabled", "true");
+    writer.field_string("pcm_true_peak.target_dbtp", settings.target_dbtp.render(false));
+    writer.field_static("pcm_true_peak.allow_boost", bool_value(settings.allow_boost));
+    writer.field_static(
+        "pcm_true_peak.scope",
+        match settings.scope {
+            crate::PcmTruePeakScope::Track => "track",
+            crate::PcmTruePeakScope::Album => "album",
+        },
+    );
+    writer.field_static(
+        "pcm_true_peak.scan_mode",
+        match settings.scan_mode {
+            crate::PcmTruePeakScanMode::Standard => "standard",
+            crate::PcmTruePeakScanMode::Fast => "fast",
+            crate::PcmTruePeakScanMode::Reference => "reference",
+        },
+    );
+    if let Some(gain_db) = settings.runtime_album_gain_db() {
+        writer.field_string(
+            "pcm_true_peak.runtime_album_gain_db",
+            gain_db.render(false),
+        );
+    }
 }
 
 fn push_native_dsd_v2(writer: &mut FingerprintWriter, settings: &DsdSettings) {

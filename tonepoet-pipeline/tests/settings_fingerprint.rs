@@ -7,7 +7,8 @@ use tonepoet_pipeline::{
     GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
     DsdToPcmGainMode, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
     PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
-    DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS, SETTINGS_FINGERPRINT_FIELD_COUNT,
+    DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS, PCM_TRUE_PEAK_FINGERPRINT_FIELD_PATHS,
+    PcmTruePeakScanMode, PcmTruePeakScope, SETTINGS_FINGERPRINT_FIELD_COUNT,
     SETTINGS_FINGERPRINT_FIELD_PATHS,
     SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
     VerificationSettings, WavPackMode, WavPackSettings,
@@ -195,6 +196,7 @@ fn flac_md5_sentinel() -> PipelineSettings {
             phase: Some(25),
         },
         dsd: sentinel_dsd_settings(),
+        pcm_true_peak: Default::default(),
         metadata: MetadataSettings {
             transfer_tags: true,
             preserve_artwork: false,
@@ -272,6 +274,69 @@ fn album_gain_fingerprint_extension_is_separate_and_byte_affecting() {
         settings_fingerprint(&settings),
         "resolved gain is fingerprinted at nanodecibel precision"
     );
+}
+
+#[test]
+fn pcm_true_peak_fingerprint_extension_covers_every_enabled_byte_affecting_control() {
+    assert_eq!(
+        PCM_TRUE_PEAK_FINGERPRINT_FIELD_PATHS,
+        &[
+            "pcm_true_peak.enabled",
+            "pcm_true_peak.target_dbtp",
+            "pcm_true_peak.allow_boost",
+            "pcm_true_peak.scope",
+            "pcm_true_peak.scan_mode",
+            "pcm_true_peak.runtime_album_gain_db",
+        ],
+    );
+
+    let disabled = PipelineSettings::default();
+    let disabled_fingerprint = settings_fingerprint(&disabled);
+    let mut inert_disabled = disabled.clone();
+    inert_disabled.pcm_true_peak.target_dbtp = "-0.250000000".parse().unwrap();
+    inert_disabled.pcm_true_peak.allow_boost = true;
+    inert_disabled.pcm_true_peak.scope = PcmTruePeakScope::Album;
+    inert_disabled.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Reference;
+    assert_eq!(
+        disabled_fingerprint,
+        settings_fingerprint(&inert_disabled),
+        "disabled PCM true-peak state must remain fingerprint-inert",
+    );
+
+    let mut enabled = disabled.clone();
+    enabled.pcm_true_peak.enabled = true;
+    let base = settings_fingerprint(&enabled);
+    assert_ne!(disabled_fingerprint, base);
+
+    let mut changed = enabled.clone();
+    changed.pcm_true_peak.target_dbtp = "-0.750000000".parse().unwrap();
+    assert_ne!(base, settings_fingerprint(&changed));
+
+    let mut changed = enabled.clone();
+    changed.pcm_true_peak.allow_boost = true;
+    assert_ne!(base, settings_fingerprint(&changed));
+
+    let mut changed = enabled.clone();
+    changed.pcm_true_peak.scope = PcmTruePeakScope::Album;
+    assert_ne!(base, settings_fingerprint(&changed));
+
+    let mut changed = enabled.clone();
+    changed.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Reference;
+    assert_ne!(base, settings_fingerprint(&changed));
+
+    let mut fast = enabled.clone();
+    fast.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Fast;
+    let fast_fingerprint = settings_fingerprint(&fast);
+    assert_ne!(base, fast_fingerprint);
+    assert_ne!(fast_fingerprint, settings_fingerprint(&changed));
+
+    let mut changed = enabled;
+    changed.pcm_true_peak.scope = PcmTruePeakScope::Album;
+    let unbound = settings_fingerprint(&changed);
+    changed
+        .pcm_true_peak
+        .bind_runtime_album_gain("-1.125000000".parse().unwrap());
+    assert_ne!(unbound, settings_fingerprint(&changed));
 }
 
 #[test]
@@ -720,12 +785,12 @@ fn serde_recursive_field_count_matches_checked_inventory_for_known_shapes() {
     let default = serde_json::to_value(PipelineSettings::default()).unwrap();
     let sentinel = serde_json::to_value(flac_md5_sentinel()).unwrap();
 
-    assert_eq!(recursive_object_key_count(&default), 81);
+    assert_eq!(recursive_object_key_count(&default), 87);
     // The sentinel helper deliberately deserializes the frozen flat-v1 DSD
     // wire (see `sentinel_dsd_settings`), so it re-serializes the legacy
-    // shape: 81 default keys + 7 sentinel-specific non-default nested keys,
+    // shape: 87 default keys + 7 sentinel-specific non-default nested keys,
     // NOT the native-v2 shape that would be five keys larger.
-    assert_eq!(recursive_object_key_count(&sentinel), 88);
+    assert_eq!(recursive_object_key_count(&sentinel), 94);
 }
 
 #[cfg(feature = "serde")]

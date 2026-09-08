@@ -224,6 +224,30 @@ pub fn resolve_album_gain_constraints(
     })
 }
 
+/// Resolve the generic PCM true-peak gain policy on top of the shared hard-
+/// ceiling solver. Positive gain is applied only when explicitly requested;
+/// attenuation required by the ceiling is never suppressed.
+pub fn resolve_true_peak_gain_constraints(
+    target_dbtp: DbNano,
+    participants: &[(AlbumPeakMeasurement, AlbumTerminalBound)],
+    allow_boost: bool,
+) -> std::result::Result<AlbumGainAuthority, String> {
+    let mut authority = resolve_album_gain_constraints(target_dbtp, participants)
+        .map_err(relabel_album_gain_error_for_pcm)?;
+    if !allow_boost && authority.gain_db > DbNano::ZERO {
+        authority.maximum_linear_gain = 1.0;
+        authority.gain_db = DbNano::ZERO;
+    }
+    Ok(authority)
+}
+
+fn relabel_album_gain_error_for_pcm(error: String) -> String {
+    error
+        .replace("album DSD NormalizePeak", "PCM true-peak")
+        .replace("album DSD", "PCM true-peak")
+        .replace("measured DSD track", "measured track")
+}
+
 fn validate_terminal_bound(terminal_bound: AlbumTerminalBound) -> std::result::Result<(), String> {
     if !terminal_bound.pre_gain_reconstructed_error_linear.is_finite()
         || terminal_bound.pre_gain_reconstructed_error_linear < 0.0
@@ -280,6 +304,15 @@ const GAIN_REALIZATION_GUARD_NANODB: i64 = 16;
 
 fn db_nano_to_linear_lower(db: DbNano) -> std::result::Result<f64, String> {
     db_nano_to_linear_interval(db).map(|(lower, _)| lower)
+}
+
+/// Conservative binary64 amplitude multiplier for an exact nanodecibel gain.
+///
+/// The returned value is guaranteed not to exceed the mathematical
+/// `10^(dB/20)`. PCM carrier realization uses this instead of `powf` so the
+/// hard-ceiling proof does not depend on libm rounding behavior.
+pub fn conservative_linear_gain_lower(db: DbNano) -> std::result::Result<f64, String> {
+    db_nano_to_linear_lower(db)
 }
 
 fn db_nano_to_linear_upper(db: DbNano) -> std::result::Result<f64, String> {
@@ -809,6 +842,60 @@ mod tests {
 
     fn gain_linear(gain: DbNano) -> f64 {
         10.0_f64.powf(gain.0 as f64 / 20_000_000_000.0)
+    }
+
+    #[test]
+    fn generic_true_peak_gain_errors_are_pcm_labeled_without_changing_dsd_solver_text() {
+        let pcm_error = resolve_true_peak_gain_constraints(db("-1.000000000"), &[], false)
+            .expect_err("empty PCM participant set must fail");
+        assert_eq!(
+            pcm_error,
+            "PCM true-peak gain requires at least one measured track"
+        );
+
+        let dsd_error = resolve_album_gain_constraints(db("-1.000000000"), &[])
+            .expect_err("empty DSD participant set must fail");
+        assert_eq!(
+            dsd_error,
+            "album DSD gain requires at least one measured DSD track"
+        );
+    }
+
+    #[test]
+    fn generic_true_peak_gain_attenuates_above_target_even_when_boost_is_off() {
+        let authority = resolve_true_peak_gain_constraints(
+            db("-1.000000000"),
+            &[(finite_db("-0.250000000"), zero_terminal())],
+            false,
+        )
+        .expect("attenuation authority");
+        assert!(authority.gain_db < DbNano::ZERO);
+        assert!(authority.gain_db <= db("-0.750000000"));
+    }
+
+    #[test]
+    fn generic_true_peak_gain_leaves_quiet_material_unboosted_by_default() {
+        let authority = resolve_true_peak_gain_constraints(
+            db("-1.000000000"),
+            &[(finite_db("-6.000000000"), zero_terminal())],
+            false,
+        )
+        .expect("no-boost authority");
+        assert_eq!(authority.gain_db, DbNano::ZERO);
+        assert_eq!(authority.maximum_linear_gain, 1.0);
+    }
+
+    #[test]
+    fn generic_true_peak_gain_can_boost_quiet_material_when_opted_in() {
+        let authority = resolve_true_peak_gain_constraints(
+            db("-1.000000000"),
+            &[(finite_db("-6.000000000"), zero_terminal())],
+            true,
+        )
+        .expect("boost authority");
+        assert!(authority.gain_db > DbNano::ZERO);
+        assert!(authority.gain_db <= db("5.000000000"));
+        assert!(authority.gain_db >= db("4.999999970"));
     }
 
     #[test]

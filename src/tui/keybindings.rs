@@ -3644,6 +3644,11 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
+        FormatField::PcmTruePeak => format.pcm_true_peak_enabled.selected_label().to_string(),
+        FormatField::PcmTruePeakTarget => format!("{} dBTP", format.pcm_true_peak_target_dbtp.render(true)),
+        FormatField::PcmTruePeakScope => format.pcm_true_peak_scope.selected_label().to_string(),
+        FormatField::PcmTruePeakBoost => format.pcm_true_peak_boost.selected_label().to_string(),
+        FormatField::PcmTruePeakScan => format.pcm_true_peak_scan_mode.selected_label().to_string(),
         FormatField::NoiseShaper => format.noise_shaper.selected_label().to_string(),
         FormatField::ModulatorOrder => format.modulator_order.selected_label().to_string(),
         FormatField::ConversionPreset => format.conversion_preset.selected_label().to_string(),
@@ -69679,6 +69684,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ResamplerPill(_)
             | TuiButton::DitherPill(_)
             | TuiButton::ReplayGainPill(_)
+            | TuiButton::PcmTruePeakPill(_)
+            | TuiButton::PcmTruePeakScopePill(_)
+            | TuiButton::PcmTruePeakBoostPill(_)
+            | TuiButton::PcmTruePeakScanPill(_)
+            | TuiButton::PcmTruePeakTargetField
             | TuiButton::NoiseShaperPill(_)
             | TuiButton::ModulatorOrderPill(_)
             | TuiButton::ConversionPresetPill(_)

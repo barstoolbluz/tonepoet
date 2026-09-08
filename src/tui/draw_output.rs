@@ -134,6 +134,39 @@ pub fn draw_format_pane(
                             theme,
                         ));
                     }
+                    FormatField::PcmTruePeak => lines.push(pill_row(
+                        border_color, w, "true peak  ", "",
+                        &render_pill_spans(&format_state.pcm_true_peak_enabled, row_focused, theme),
+                        row_focused, theme,
+                    )),
+                    FormatField::PcmTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
+                        border_color,
+                        w,
+                        "TP target  ",
+                        format_state.pcm_true_peak_target_dbtp,
+                        row_focused,
+                        format_state.pcm_true_peak_target_is_capped(),
+                        theme,
+                    )),
+                    FormatField::PcmTruePeakScope => lines.push(pill_row(
+                        border_color, w, "TP scope   ", "",
+                        &render_pill_spans(&format_state.pcm_true_peak_scope, row_focused, theme),
+                        row_focused, theme,
+                    )),
+                    FormatField::PcmTruePeakBoost => lines.push(pill_row(
+                        border_color, w, "TP boost   ", "",
+                        &render_pill_spans(&format_state.pcm_true_peak_boost, row_focused, theme),
+                        row_focused, theme,
+                    )),
+                    FormatField::PcmTruePeakScan => lines.push(pill_row(
+                        border_color, w, "TP scan    ", "",
+                        &render_pill_spans(
+                            &format_state.pcm_true_peak_scan_mode,
+                            row_focused,
+                            theme,
+                        ),
+                        row_focused, theme,
+                    )),
                     FormatField::ReplayGain => lines.push(pill_row(
                         border_color,
                         w,
@@ -436,6 +469,39 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
         bar_style,
     ));
     spans.extend(right_spans);
+    Line::from(spans)
+}
+
+fn pcm_true_peak_db_value_row(
+    border_color: ratatui::style::Color,
+    width: usize,
+    label: &'static str,
+    value: tonepoet_pipeline::DbNano,
+    focused: bool,
+    lossy_capped: bool,
+    theme: super::theme::Theme,
+) -> Line<'static> {
+    let label_style = if focused { theme.bright() } else { theme.muted() };
+    let control_style = if focused {
+        theme.bright().add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted()
+    };
+    let mut spans = vec![
+        Span::styled("│", theme.border(border_color)),
+        Span::styled(format!("   {label}"), label_style),
+        Span::styled("< ", control_style),
+        Span::styled(format!("{} dBTP", value.render(true)), control_style),
+        Span::styled(" >", control_style),
+        Span::raw("  "),
+        Span::styled(
+            if lossy_capped { "lossy encoder input capped at -1.000 dBTP" } else { "left/right adjust" },
+            theme.muted(),
+        ),
+    ];
+    let content_width: usize = spans.iter().map(|span| span.width()).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(content_width + 1))));
+    spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
 }
 

@@ -70,10 +70,22 @@ pub fn handle_format_button(
             source_rate,
         ),
         TuiButton::ReplayGainPill(index) => format.select_row_index(
-            FormatField::ReplayGain,
-            index,
-            source_bits,
-            source_rate,
+            FormatField::ReplayGain, index, source_bits, source_rate,
+        ),
+        TuiButton::PcmTruePeakPill(index) => format.select_row_index(
+            FormatField::PcmTruePeak, index, source_bits, source_rate,
+        ),
+        TuiButton::PcmTruePeakScopePill(index) => format.select_row_index(
+            FormatField::PcmTruePeakScope, index, source_bits, source_rate,
+        ),
+        TuiButton::PcmTruePeakBoostPill(index) => format.select_row_index(
+            FormatField::PcmTruePeakBoost, index, source_bits, source_rate,
+        ),
+        TuiButton::PcmTruePeakScanPill(index) => format.select_row_index(
+            FormatField::PcmTruePeakScan, index, source_bits, source_rate,
+        ),
+        TuiButton::PcmTruePeakTargetField => format.select_row_index(
+            FormatField::PcmTruePeakTarget, 0, source_bits, source_rate,
         ),
         TuiButton::NoiseShaperPill(index) => format.select_row_index(
             FormatField::NoiseShaper,

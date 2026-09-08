@@ -74,18 +74,20 @@ impl ToolPlugin for FfmpegPlugin {
                     return ToolSupport::UNSUPPORTED;
                 }
                 let dither = context.request.settings.dither_type;
-                // A bound album NormalizePeak gain is a hard-ceiling path. For
-                // integer dithered lossless output, route the terminal stage to
-                // SoX so the deterministic dither/noise-shaping support bound
+                // A bound DSD album gain or enabled PCM true-peak gain is a
+                // hard-ceiling path. For integer dithered lossless output,
+                // route the terminal stage to SoX so the deterministic
+                // dither/noise-shaping support bound
                 // used by the resolver matches the implementation that writes
                 // the samples. This is ordinary planner selection, not runtime
                 // commissioning or executable fingerprinting.
-                let hard_ceiling_requires_sox_terminal = context
+                let hard_ceiling_requires_sox_terminal = (context
                     .request
                     .settings
                     .dsd
                     .runtime_album_gain_db()
                     .is_some()
+                    || context.request.settings.pcm_true_peak.enabled)
                     && *apply_processing
                     && target_format.is_pcm_lossless()
                     && target_format.sox_encodable()
@@ -240,6 +242,17 @@ impl ToolPlugin for SoxPlugin {
                 apply_processing,
                 ..
             } if target_format.sox_encodable() => {
+                if *target_format == AudioFormat::WavPack
+                    && context.request.settings.wavpack.hybrid
+                    && context.request.settings.pcm_true_peak.enabled
+                {
+                    // The PCM true-peak hybrid contract governs the integer
+                    // WAV carrier realized immediately before this step. The
+                    // final encode must therefore be native `wavpack -b` with
+                    // no additional PCM processing; the FFmpeg plugin owns
+                    // that deliberate native-CLI delegation.
+                    return ToolSupport::UNSUPPORTED;
+                }
                 let target_depth = match &step.operation {
                     PlanOperation::EncodePcm { target_bit_depth, .. } => *target_bit_depth,
                     _ => unreachable!("guarded by EncodePcm pattern"),
@@ -1332,7 +1345,7 @@ fn build_sox_dsd_rate_change(
     ))
 }
 
-fn album_gain_raw_f64le_input(
+fn internal_raw_f64le_input(
     context: &PlanContext<'_>,
     step: &PlanStep,
 ) -> Result<Option<(u32, u16)>> {
@@ -1347,8 +1360,14 @@ fn album_gain_raw_f64le_input(
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("f64le"));
     let source = &context.request.source;
-    if context.request.settings.dsd.runtime_album_gain_db().is_none()
-        || source.representation_kind() != crate::source::SourceRepresentationKind::Dsd
+    let retained_dsd_carrier = context.request.settings.dsd.runtime_album_gain_db().is_some()
+        && source.representation_kind() == crate::source::SourceRepresentationKind::Dsd;
+    let retained_pcm_gain_carrier = source.representation_kind()
+        == crate::source::SourceRepresentationKind::Pcm
+        && source.true_source_depth.is_none()
+        && source.format == AudioFormat::Wav
+        && source.codec == crate::enums::AudioCodec::PcmFloat;
+    if (!retained_dsd_carrier && !retained_pcm_gain_carrier)
         || source.bit_depth != Some(PcmBitDepth::Float64)
         || !input_is_request_source
         || !input_is_raw_f64le
@@ -1362,7 +1381,7 @@ fn album_gain_raw_f64le_input(
         .ok_or_else(|| {
             PlanningError::invalid_source(
                 "sample_rate_hz",
-                "raw DSD album-gain carrier requires an authoritative positive PCM sample rate",
+                "raw Float64 carrier requires an authoritative positive PCM sample rate",
             )
         })?;
     let channels = source
@@ -1371,7 +1390,7 @@ fn album_gain_raw_f64le_input(
         .ok_or_else(|| {
             PlanningError::invalid_source(
                 "channels",
-                "raw DSD album-gain carrier requires an authoritative positive channel count",
+                "raw Float64 carrier requires an authoritative positive channel count",
             )
         })?;
     Ok(Some((sample_rate_hz, channels)))
@@ -1387,7 +1406,7 @@ fn ffmpeg_base_input_args(
         "-hide_banner".into(),
         "-nostdin".into(),
     ];
-    if let Some((sample_rate_hz, channels)) = album_gain_raw_f64le_input(context, step)? {
+    if let Some((sample_rate_hz, channels)) = internal_raw_f64le_input(context, step)? {
         args.extend([
             "-f".into(),
             "f64le".into(),
@@ -1412,7 +1431,7 @@ fn add_sox_input_args(
     args: &mut Vec<String>,
     input: String,
 ) -> Result<()> {
-    if let Some((sample_rate_hz, channels)) = album_gain_raw_f64le_input(context, step)? {
+    if let Some((sample_rate_hz, channels)) = internal_raw_f64le_input(context, step)? {
         args.extend([
             "-t".into(),
             "raw".into(),
@@ -2533,6 +2552,26 @@ mod tests {
     }
 
     #[test]
+    fn pcm_true_peak_lossless_dither_routes_processing_encode_to_sox() {
+        let mut request = album_gain_pcm_request(AudioFormat::Flac);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.enabled = true;
+        request.source.source_representation = crate::source::SourceRepresentationKind::Pcm;
+        request.settings.dither_type = DitherType::Shibata;
+        request.settings.dither_explicit = true;
+        let step = album_gain_encode_step(AudioFormat::Flac, true);
+
+        assert!(
+            !FfmpegPlugin.supports(&request.context(), &step).is_supported(),
+            "FFmpeg must not own a dithered PCM true-peak terminal stage",
+        );
+        assert!(
+            SoxPlugin.supports(&request.context(), &step).is_supported(),
+            "SoX must own the dithered PCM true-peak terminal stage",
+        );
+    }
+
+    #[test]
     fn sox_pcm_album_gain_is_owned_only_by_processing_encode_step() {
         let request = album_gain_pcm_request(AudioFormat::Flac);
         for (apply_processing, expected_count) in [(false, 0), (true, 1)] {
@@ -3066,6 +3105,71 @@ mod tests {
                 .is_supported(),
             "hybrid WavPack Int24 keeps the ffmpeg plugin (wavpack CLI delegate)"
         );
+
+        let mut hard_ceiling_hybrid = hybrid_request.clone();
+        hard_ceiling_hybrid.settings.pcm_true_peak.enabled = true;
+        assert!(
+            !SoxPlugin
+                .supports(&hard_ceiling_hybrid.context(), &step(false))
+                .is_supported(),
+            "PCM true-peak hybrid final encode must not bypass native wavpack -b via SoX",
+        );
+        assert!(
+            FfmpegPlugin
+                .supports(&hard_ceiling_hybrid.context(), &step(false))
+                .is_supported(),
+            "PCM true-peak hybrid final encode keeps the native wavpack delegate",
+        );
+
+        hard_ceiling_hybrid.settings.dither_type = DitherType::Tpdf;
+        hard_ceiling_hybrid.settings.dither_explicit = true;
+        let integer_terminal_step = PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+            },
+            InputSource::Path(PathBuf::from("gained-carrier.f64le")),
+            OutputSink::Path(PathBuf::from("encoder-input.wav")),
+            "Realize WavPack hybrid encoder input",
+        );
+        assert!(
+            !FfmpegPlugin
+                .supports(&hard_ceiling_hybrid.context(), &integer_terminal_step)
+                .is_supported(),
+            "dithered hybrid integer-terminal realization must not use FFmpeg",
+        );
+        assert!(
+            SoxPlugin
+                .supports(&hard_ceiling_hybrid.context(), &integer_terminal_step)
+                .is_supported(),
+            "dithered hybrid integer-terminal realization must use the bounded SoX path",
+        );
+
+        let hybrid_step = PlanStep::new(
+            0,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::WavPack,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+            },
+            InputSource::Path(PathBuf::from("encoder-input.wav")),
+            OutputSink::Path(PathBuf::from("track.wv")),
+            "Encode WavPack hybrid output",
+        );
+        let command = FfmpegPlugin
+            .build_command(&hard_ceiling_hybrid.context(), &hybrid_step)
+            .expect("hard-ceiling hybrid command");
+        assert_eq!(command.tool, ToolIdentifier::Custom("wavpack".to_string()));
+        assert!(command.args.iter().any(|arg| arg == "-b"));
+        assert!(
+            command.args.iter().any(|arg| arg == "-c"),
+            "existing .wvc correction-file behavior must remain enabled",
+        );
+        assert!(command.args.iter().any(|arg| arg == "encoder-input.wav"));
     }
 
     #[test]

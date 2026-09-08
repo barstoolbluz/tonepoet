@@ -2803,8 +2803,16 @@ fn queued_item_pipeline_settings(item: &ConversionItem) -> Option<&PipelineSetti
 
 fn queued_item_album_auto_gain_selected(item: &ConversionItem) -> bool {
     queued_item_pipeline_settings(item)
-        .map(|settings| settings.dsd.album_auto_gain_selected())
+        .map(|settings| {
+            settings.dsd.album_auto_gain_selected()
+                || (settings.pcm_true_peak.enabled
+                    && settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album)
+        })
         .unwrap_or(false)
+}
+
+fn requires_measure_then_gain_materialization(settings: &PipelineSettings) -> bool {
+    settings.dsd.album_auto_gain_selected() || settings.pcm_true_peak.enabled
 }
 
 #[derive(Default)]
@@ -2825,7 +2833,7 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
         } else if queued_item_album_auto_gain_selected(item) {
             result.failures.insert(
                 item.id.clone(),
-                "album-scoped DSD auto-gain requires persisted submitted-batch identity; re-submit the complete batch"
+                "album-scoped true-peak gain requires persisted submitted-batch identity; re-submit the complete batch"
                     .to_string(),
             );
         }
@@ -2842,7 +2850,7 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
 
         let failure = if selected_count != members.len() {
             Some(
-                "submitted batch has mixed DSD auto-gain scopes; album mode requires one homogeneous scope across every queued member"
+                "submitted batch has mixed true-peak gain scopes; album mode requires one homogeneous scope across every queued member"
                     .to_string(),
             )
         } else if members.iter().skip(1).any(|item| {
@@ -2856,7 +2864,7 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
                 != album_gain_settings_fingerprint_key(reference)
         }) {
             Some(
-                "submitted batch has heterogeneous conversion settings; album-scoped DSD auto-gain requires one settings fingerprint for the complete submitted set"
+                "submitted batch has heterogeneous conversion settings; album-scoped true-peak gain requires one settings fingerprint for the complete submitted set"
                     .to_string(),
             )
         } else {
@@ -2866,7 +2874,7 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
                 .collect::<BTreeSet<_>>();
             if declared_sizes.len() != 1 {
                 Some(
-                    "submitted batch has missing or inconsistent persisted member counts; re-submit the complete batch for album-scoped DSD auto-gain"
+                    "submitted batch has missing or inconsistent persisted member counts; re-submit the complete batch for album-scoped true-peak gain"
                         .to_string(),
                 )
             } else {
@@ -2874,7 +2882,7 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
                     .unwrap_or(usize::MAX);
                 if declared != members.len() {
                     Some(format!(
-                        "album-scoped DSD auto-gain requires the complete submitted batch: {} queued member(s) are present but {} were admitted",
+                        "album-scoped true-peak gain requires the complete submitted batch: {} queued member(s) are present but {} were admitted",
                         members.len(),
                         declared,
                     ))
@@ -2931,7 +2939,9 @@ fn release_scheduled_album(
         .filter(|track| {
             matches!(
                 &track.source_ref,
-                TrackSourceRef::StagedFile(_) | TrackSourceRef::DsdAlbumGainCarrier { .. }
+                TrackSourceRef::StagedFile(_)
+                    | TrackSourceRef::DsdAlbumGainCarrier { .. }
+                    | TrackSourceRef::PcmTruePeakCarrier { .. }
             )
         })
         .count();
@@ -2976,7 +2986,7 @@ fn account_terminal_dsd_album_gain_participants(
         if state.completed_item_ids.insert(item_id.clone()) {
             state.failure.get_or_insert_with(|| {
                 format!(
-                    "participant {} ended before every submitted DSD track reached the album-gain barrier: {:?}",
+                    "participant {} ended before every submitted participant reached the album-gain barrier: {:?}",
                     item_id, status,
                 )
             });
@@ -3022,6 +3032,125 @@ fn build_dsd_album_gain_scope_disclosure<'a>(
         excluded_non_dsd_track_count,
         excluded_non_dsd_item_count,
     }
+}
+
+fn resolve_pcm_true_peak_submission_albums(
+    albums: &mut [ScheduledAlbum],
+) -> Result<(), String> {
+    let mut requested_target = None;
+    let mut effective_target = None;
+    let mut allow_boost = None;
+    let mut participants = Vec::new();
+    let mut carrier_count = 0usize;
+    let mut capped_count = 0usize;
+
+    for album in albums.iter() {
+        let settings = album.req.settings.pcm_true_peak;
+        if !settings.enabled || settings.scope != tonepoet_pipeline::PcmTruePeakScope::Album {
+            return Err(
+                "submitted-batch PCM true-peak settings changed before the measurement barrier completed"
+                    .to_string(),
+            );
+        }
+        let (album_effective_target, _) = settings.effective_target(
+            &album.req.settings.target_format,
+            album.req.settings.wavpack.hybrid,
+        );
+        if requested_target.is_some_and(|value| value != settings.target_dbtp)
+            || effective_target.is_some_and(|value| value != album_effective_target)
+            || allow_boost.is_some_and(|value| value != settings.allow_boost)
+        {
+            return Err(
+                "submitted-batch PCM true-peak members have different target/boost policies; refusing to derive a shared gain"
+                    .to_string(),
+            );
+        }
+        requested_target.get_or_insert(settings.target_dbtp);
+        effective_target.get_or_insert(album_effective_target);
+        allow_boost.get_or_insert(settings.allow_boost);
+
+        let album_carriers = album
+            .source
+            .tracks
+            .iter()
+            .filter_map(|track| match &track.source_ref {
+                TrackSourceRef::PcmTruePeakCarrier { lossy_target_capped, .. } => {
+                    if *lossy_target_capped {
+                        capped_count = capped_count.saturating_add(1);
+                    }
+                    Some(track.id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        carrier_count = carrier_count.saturating_add(album_carriers.len());
+        let measured_ids = album
+            .pcm_true_peak_measurements
+            .iter()
+            .map(|entry| entry.track_id.clone())
+            .collect::<BTreeSet<_>>();
+        if measured_ids != album_carriers {
+            return Err(format!(
+                "submitted-batch PCM true-peak item {} has {} measurement(s) for {} retained carrier(s)",
+                album.item_id,
+                measured_ids.len(),
+                album_carriers.len(),
+            ));
+        }
+        participants.extend(
+            album
+                .pcm_true_peak_measurements
+                .iter()
+                .map(|entry| (entry.measurement, entry.terminal_bound)),
+        );
+    }
+
+    if participants.is_empty() {
+        log::info!(
+            "submitted-batch PCM true-peak scope contained no ordinary PCM tracks: items={}",
+            albums.len(),
+        );
+        return Ok(());
+    }
+    let target = effective_target.ok_or_else(|| {
+        "submitted-batch PCM true-peak barrier has measurements but no common target".to_string()
+    })?;
+    let authority = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+        target,
+        &participants,
+        allow_boost.unwrap_or(false),
+    )?;
+    let loudest = authority
+        .loudest_peak_dbfs
+        .map(|value| value.render(false))
+        .unwrap_or_else(|| "-inf (verified silence)".to_string());
+    log::info!(
+        "PCM album true-peak gain: submitted items={}, tracks={}, loudest point={} dBTP, signal ceiling upper={:.12e} FS, target={} dBTP, fixed gain={} dB, lossy_target_capped_tracks={}",
+        albums.len(),
+        carrier_count,
+        loudest,
+        authority.loudest_signal_upper_linear,
+        authority.target_dbfs.render(false),
+        authority.gain_db.render(false),
+        capped_count,
+    );
+
+    for album in albums.iter_mut() {
+        if album.pcm_true_peak_measurements.is_empty() {
+            continue;
+        }
+        album
+            .req
+            .settings
+            .pcm_true_peak
+            .bind_runtime_album_gain(authority.gain_db);
+        for track in &mut album.source.tracks {
+            if let TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } = &mut track.source_ref {
+                *gain_db = Some(authority.gain_db);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scheduled_album_gain_carrier_rate_hz(album: &ScheduledAlbum) -> Result<u32, String> {
@@ -3077,7 +3206,7 @@ fn resolve_completed_dsd_album_gain_submission(
     }
     if state.ready_albums.len() != state.expected_items {
         return Some(Err((
-            "submitted-batch DSD album-gain barrier completed without a ready materialization for every member"
+            "submitted-batch album-gain barrier completed without a ready materialization for every member"
                 .to_string(),
             state.ready_albums,
         )));
@@ -3107,10 +3236,22 @@ fn resolve_completed_dsd_album_gain_submission(
         .collect::<Vec<_>>();
     if actual_order != expected_order {
         return Some(Err((
-            "submitted-batch DSD album-gain barrier could not reconstruct the persisted submission order"
+            "submitted-batch album-gain barrier could not reconstruct the persisted submission order"
                 .to_string(),
             state.ready_albums,
         )));
+    }
+
+    let pcm_album_scope = state.ready_albums.first().is_some_and(|album| {
+        album.req.settings.pcm_true_peak.enabled
+            && album.req.settings.pcm_true_peak.scope
+                == tonepoet_pipeline::PcmTruePeakScope::Album
+    });
+    if pcm_album_scope {
+        return Some(match resolve_pcm_true_peak_submission_albums(&mut state.ready_albums) {
+            Ok(()) => Ok(state.ready_albums),
+            Err(error) => Err((error, state.ready_albums)),
+        });
     }
 
     let scope_disclosure = build_dsd_album_gain_scope_disclosure(
@@ -3246,7 +3387,10 @@ fn apply_dsd_album_gain_barrier_resolution(
         Ok(albums) => {
             for album in albums {
                 if album.req.publish.overwrite == OverwritePolicy::SkipIfManifestMatch
-                    && album.req.settings.dsd.album_auto_gain_selected()
+                    && (album.req.settings.dsd.album_auto_gain_selected()
+                        || (album.req.settings.pcm_true_peak.enabled
+                            && album.req.settings.pcm_true_peak.scope
+                                == tonepoet_pipeline::PcmTruePeakScope::Album))
                 {
                     pool.metrics().record_jobs_queued(1);
                     submissions.enqueue_album_gain_rerun(album);
@@ -3263,11 +3407,11 @@ fn apply_dsd_album_gain_barrier_resolution(
             }
         }
         Err((reason, albums)) => {
-            log::error!("submitted-batch DSD album-gain barrier refused conversion: {reason}");
+            log::error!("submitted-batch album-gain barrier refused conversion: {reason}");
             for album in albums {
                 let item_id = album.item_id.clone();
                 let status = ConversionStatus::Failed {
-                    error: format!("submitted-batch DSD album gain refused: {reason}"),
+                    error: format!("submitted-batch album gain refused: {reason}"),
                     log_path: None,
                 };
                 if terminal.insert(item_id, status.clone()).is_none() {
@@ -3494,7 +3638,7 @@ async fn run_queue_with_shared_orchestrator(
                                             state.ready_albums.push(album);
                                         } else {
                                             let status = ConversionStatus::Failed {
-                                                error: "submitted-batch DSD album-gain participant completed the measurement barrier more than once".to_string(),
+                                                error: "submitted-batch album-gain participant completed the measurement barrier more than once".to_string(),
                                                 log_path: None,
                                             };
                                             if terminal.insert(item_id, status.clone()).is_none() {
@@ -3504,7 +3648,7 @@ async fn run_queue_with_shared_orchestrator(
                                         }
                                     } else {
                                         let status = ConversionStatus::Failed {
-                                            error: "submitted-batch DSD album-gain barrier state disappeared before materialization completed".to_string(),
+                                            error: "submitted-batch album-gain barrier state disappeared before materialization completed".to_string(),
                                             log_path: None,
                                         };
                                         if terminal.insert(item_id, status.clone()).is_none() {
@@ -3810,7 +3954,7 @@ fn build_initial_work(
     job_to_item.insert(request.job_id.clone(), item_id.clone());
 
     if matches!(source_kind, Some(SourceKind::SingleFile))
-        && !request.settings.dsd.album_auto_gain_selected()
+        && !requires_measure_then_gain_materialization(&request.settings)
         && !has_embedded_chapters
     {
         return Some(build_single_file_work(
@@ -4004,7 +4148,8 @@ fn next_album_source_work(
 
         return Some(match &track.source_ref {
             TrackSourceRef::StagedFile(_)
-            | TrackSourceRef::DsdAlbumGainCarrier { .. } => {
+            | TrackSourceRef::DsdAlbumGainCarrier { .. }
+            | TrackSourceRef::PcmTruePeakCarrier { .. } => {
                 let kind = if album.source.kind == SourceKind::SingleFile {
                     WorkKind::SingleFile
                 } else {
@@ -4146,7 +4291,8 @@ fn build_realize_work(
         TrackSourceRef::DvdVideoTrack { .. } => WorkKind::MaterializeItem,
         TrackSourceRef::BluRayTrack { .. } => WorkKind::MaterializeItem,
         TrackSourceRef::StagedFile(_)
-        | TrackSourceRef::DsdAlbumGainCarrier { .. } => {
+        | TrackSourceRef::DsdAlbumGainCarrier { .. }
+        | TrackSourceRef::PcmTruePeakCarrier { .. } => {
             WorkKind::EncodeTrack { track_id: track_id.clone() }
         }
     };
@@ -4485,11 +4631,11 @@ fn run_album_postprocess_work_scoped(
         } else {
             None
         };
-        let resolved_album_gain_authority =
-            album.req.settings.dsd.runtime_album_gain_db().is_some();
+        let resolved_album_gain_authority = album.req.settings.dsd.runtime_album_gain_db().is_some()
+            || album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some();
         // The generic disk retry rematerializes the original source. A bound
-        // submitted-batch DSD gain is valid only with its retained carrier, so
-        // resolved Album work must stay on the album-aware retry below.
+        // submitted-batch gain is valid only with its retained measured carrier,
+        // so resolved Album work must never fall back to a per-item source retry.
         if let Some((mut retry_req, staging_root, output_root)) = scratch_retry_context.clone() {
             if !resolved_album_gain_authority
                 && !worker_cancel.is_cancelled()
@@ -4545,9 +4691,11 @@ fn run_album_postprocess_work_scoped(
                 if !worker_cancel.is_cancelled()
                     && pipeline_report_requests_scratch_disk_retry(&report)
                 {
-                    if retry_req.settings.dsd.runtime_album_gain_db().is_some() {
+                    if retry_req.settings.dsd.runtime_album_gain_db().is_some()
+                        || retry_req.settings.pcm_true_peak.runtime_album_gain_db().is_some()
+                    {
                         log::error!(
-                            "refusing unsafe generic scratch retry for resolved DSD album gain: job_id={}, item_id={}; album-aware retry must preserve the submitted-batch fixed gain",
+                            "refusing unsafe generic scratch retry for resolved album gain: job_id={}, item_id={}; retry must preserve the submitted-batch fixed gain and retained measured carrier",
                             retry_req.job_id,
                             item_id,
                         );
@@ -5433,7 +5581,10 @@ mod tests {
             Err(payload) => payload,
             Ok(_) => panic!("early failure refuses the cohort"),
         };
-        assert!(reason.contains("ended before every submitted DSD track"), "{reason}");
+        assert!(
+            reason.contains("ended before every submitted participant reached the album-gain barrier"),
+            "{reason}"
+        );
         assert!(ready.is_empty());
         assert!(!pending.contains_key("submission"));
     }
@@ -9440,6 +9591,28 @@ FILE "disc2.flac" WAVE
         ));
 
         run.shutdown().await;
+    }
+
+    #[test]
+    fn pcm_true_peak_disables_single_file_direct_scheduler_path() {
+        let mut settings = PipelineSettings::default();
+        assert!(
+            !requires_measure_then_gain_materialization(&settings),
+            "ordinary settings retain the single-file direct scheduler path"
+        );
+
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Track;
+        assert!(
+            requires_measure_then_gain_materialization(&settings),
+            "track-scoped PCM true-peak must pass through carrier measurement"
+        );
+
+        settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
+        assert!(
+            requires_measure_then_gain_materialization(&settings),
+            "album-scoped PCM true-peak must pass through carrier measurement and the submitted-batch barrier"
+        );
     }
 
     #[test]

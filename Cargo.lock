@@ -2822,6 +2822,9 @@ dependencies = [
 [[package]]
 name = "tonepoet-true-peak"
 version = "0.1.0"
+dependencies = [
+ "rustfft",
+]
 
 [[package]]
 name = "tonepoet-wizard"

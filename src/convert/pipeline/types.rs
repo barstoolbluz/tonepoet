@@ -1123,6 +1123,21 @@ pub enum TrackSourceRef {
         channels: u16,
         duration: Option<std::time::Duration>,
     },
+    /// Audio-only final-rate headerless little-endian Float64 PCM carrier
+    /// measured before the one PCM true-peak gain step. `source_path` remains metadata/provenance
+    /// authority. Album scope leaves `gain_db` unbound until the submitted
+    /// batch barrier has observed every participant.
+    PcmTruePeakCarrier {
+        path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        channels: u16,
+        duration: Option<std::time::Duration>,
+        gain_db: Option<tonepoet_pipeline::DbNano>,
+        point_dbtp: Option<tonepoet_pipeline::DbNano>,
+        effective_target_dbtp: tonepoet_pipeline::DbNano,
+        lossy_target_capped: bool,
+    },
     CueSegmentCarrier {
         /// Validated, sample-bounded CUE segment carrier produced by the
         /// materializer. This is an audio-only PCM WAV carrier (`pcm_s32le`

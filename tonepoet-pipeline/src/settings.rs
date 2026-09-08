@@ -8,7 +8,7 @@ use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, DsdTruePeakScanMode, GainCompensation,
     ModulatorOrder, Mp3Mode,
-    NyquistTransition, OpusContentType,
+    NyquistTransition, OpusContentType, PcmTruePeakScanMode, PcmTruePeakScope,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
@@ -61,6 +61,9 @@ pub struct PipelineSettings {
     pub soxr_resampler: SoxrResamplerSettings,
     /// DSD-specific conversion options.
     pub dsd: DsdSettings,
+    /// True-peak measurement and linear-gain policy for ordinary PCM conversions.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pcm_true_peak: PcmTruePeakGainSettings,
     /// Metadata and tag behavior.
     pub metadata: MetadataSettings,
     /// Post-encode verification behavior.
@@ -90,6 +93,7 @@ impl Default for PipelineSettings {
             sox_resampler: SoxResamplerSettings::default(),
             soxr_resampler: SoxrResamplerSettings::default(),
             dsd: DsdSettings::default(),
+            pcm_true_peak: PcmTruePeakGainSettings::default(),
             metadata: MetadataSettings::default(),
             verification: VerificationSettings::default(),
             replay_gain: ReplayGainSettings::default(),
@@ -106,6 +110,29 @@ impl PipelineSettings {
         validate_encoder_settings(self)?;
         validate_metadata(self)?;
         validate_dsd_settings(&self.dsd)?;
+        validate_pcm_true_peak_settings(&self.pcm_true_peak, &self.target_format)?;
+        // WavPack hybrid is lossy for true-peak policy, but its qualified path
+        // realizes bounded integer PCM before native encoding, so configured
+        // terminal dither is covered there. This rejection remains specific to
+        // direct lossy encoder-input paths whose dither has no terminal bound.
+        if self.pcm_true_peak.enabled
+            && self.target_format.is_lossy()
+            && self.dither_type != DitherType::None
+        {
+            return Err(PlanningError::invalid_settings(
+                "dither_type",
+                "PCM true-peak gain with a lossy target requires dither off: the governed contract ends at encoder-input PCM, and the configured lossy dither/noise-shaping path has no proved terminal-error bound",
+            ));
+        }
+        if self.dsd.album_auto_gain_selected()
+            && self.pcm_true_peak.enabled
+            && self.pcm_true_peak.scope == PcmTruePeakScope::Album
+        {
+            return Err(PlanningError::invalid_settings(
+                "pcm_true_peak.scope",
+                "PCM album true-peak gain and DSD album auto-gain are separate submitted-batch authorities and cannot be active in the same request",
+            ));
+        }
 
         if self.target_format.is_dsd() {
             if matches!(self.target_sample_rate, RateTarget::PcmHz(_)) {
@@ -1714,6 +1741,123 @@ impl Default for ReplayGainExistingTagPolicy {
     }
 }
 
+/// Default true-peak target for PCM gain.
+pub const PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP: DbNano = DbNano(-1_000_000_000);
+/// Highest requested ceiling honored for lossy encoder-input PCM.
+///
+/// Lossy decode can overshoot its encoder input, so this is deliberately a
+/// policy cap on the governed encoder-input waveform, not a decoded-codec
+/// peak guarantee.
+pub const PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP: DbNano = DbNano(-1_000_000_000);
+
+/// Return whether PCM true-peak policy must treat this target as lossy.
+///
+/// WavPack is ordinarily lossless at the format level, but its explicit
+/// hybrid mode produces a lossy base `.wv` stream and therefore uses the
+/// same encoder-input ceiling policy as the built-in lossy codecs.
+#[must_use]
+pub fn pcm_true_peak_lossy_floor_applies(
+    format: &AudioFormat,
+    wavpack_hybrid: bool,
+) -> bool {
+    format.is_lossy() || (format == &AudioFormat::WavPack && wavpack_hybrid)
+}
+
+/// True-peak measurement and one-linear-gain policy for PCM conversions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct PcmTruePeakGainSettings {
+    /// Enable the measure-then-gain step.
+    pub enabled: bool,
+    /// User-selected true-peak target in dBTP.
+    pub target_dbtp: DbNano,
+    /// Permit positive gain when material is already below the target.
+    pub allow_boost: bool,
+    /// Per-track or submitted-batch scope.
+    pub scope: PcmTruePeakScope,
+    /// User-selected PCM true-peak accuracy/speed scan.
+    pub scan_mode: PcmTruePeakScanMode,
+    /// Runtime-only submitted-batch authority. Never persisted in presets or config.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    runtime_album_gain_db: Option<DbNano>,
+}
+
+impl Default for PcmTruePeakGainSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            allow_boost: false,
+            scope: PcmTruePeakScope::Track,
+            scan_mode: PcmTruePeakScanMode::Standard,
+            runtime_album_gain_db: None,
+        }
+    }
+}
+
+impl PcmTruePeakGainSettings {
+    /// Effective ceiling after the explicit lossy encoder-input cap.
+    #[must_use]
+    pub fn effective_target(
+        self,
+        format: &AudioFormat,
+        wavpack_hybrid: bool,
+    ) -> (DbNano, bool) {
+        if pcm_true_peak_lossy_floor_applies(format, wavpack_hybrid)
+            && self.target_dbtp > PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP
+        {
+            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true)
+        } else {
+            (self.target_dbtp, false)
+        }
+    }
+
+    /// Bind the one gain derived from the complete submitted batch.
+    pub fn bind_runtime_album_gain(&mut self, gain_db: DbNano) {
+        self.runtime_album_gain_db = Some(gain_db);
+    }
+
+    /// Return the runtime-only album gain, if the submitted-batch barrier has resolved it.
+    #[must_use]
+    pub const fn runtime_album_gain_db(self) -> Option<DbNano> {
+        self.runtime_album_gain_db
+    }
+
+    /// Clear any stale runtime authority before a request is persisted/reused.
+    pub fn clear_runtime_album_gain(&mut self) {
+        self.runtime_album_gain_db = None;
+    }
+}
+
+fn validate_pcm_true_peak_settings(
+    settings: &PcmTruePeakGainSettings,
+    target_format: &AudioFormat,
+) -> Result<()> {
+    if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
+        .contains(&settings.target_dbtp)
+    {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.target_dbtp",
+            "PCM true-peak target must be between -12.000000000 and 0.000000000 dBTP",
+        ));
+    }
+    if settings.enabled && target_format.is_dsd() {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.enabled",
+            "PCM true-peak gain cannot be enabled for a DSD target",
+        ));
+    }
+    if settings.enabled && !target_format.is_lossy() && !target_format.is_pcm_lossless() {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.enabled",
+            format!(
+                "PCM true-peak hard ceiling is not defined for {target_format} output"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// ReplayGain post-processing settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2157,6 +2301,48 @@ mod pipeline_settings_serde_compatibility_tests {
     }
 
     #[test]
+    fn pcm_true_peak_settings_round_trip_without_runtime_album_authority() {
+        let mut settings = PipelineSettings::default();
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.target_dbtp = "-0.375000000".parse().unwrap();
+        settings.pcm_true_peak.allow_boost = true;
+        settings.pcm_true_peak.scope = PcmTruePeakScope::Album;
+        settings.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Reference;
+        settings
+            .pcm_true_peak
+            .bind_runtime_album_gain("-1.125000000".parse().unwrap());
+
+        let value = serde_json::to_value(&settings).expect("serialize PCM true-peak settings");
+        assert_eq!(value["pcm_true_peak"]["enabled"], true);
+        assert_eq!(value["pcm_true_peak"]["scope"], "album");
+        assert_eq!(value["pcm_true_peak"]["scan_mode"], "reference");
+        assert!(value["pcm_true_peak"].get("runtime_album_gain_db").is_none());
+
+        let decoded: PipelineSettings =
+            serde_json::from_value(value).expect("deserialize PCM true-peak settings");
+        assert!(decoded.pcm_true_peak.enabled);
+        assert_eq!(decoded.pcm_true_peak.target_dbtp, "-0.375000000".parse().unwrap());
+        assert!(decoded.pcm_true_peak.allow_boost);
+        assert_eq!(decoded.pcm_true_peak.scope, PcmTruePeakScope::Album);
+        assert_eq!(decoded.pcm_true_peak.scan_mode, PcmTruePeakScanMode::Reference);
+        assert_eq!(decoded.pcm_true_peak.runtime_album_gain_db(), None);
+    }
+
+    #[test]
+    fn pcm_true_peak_fast_scan_mode_round_trips_as_stable_snake_case() {
+        let mut settings = PipelineSettings::default();
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Fast;
+
+        let value = serde_json::to_value(&settings).expect("serialize PCM Fast scan mode");
+        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast");
+
+        let decoded: PipelineSettings =
+            serde_json::from_value(value).expect("deserialize PCM Fast scan mode");
+        assert_eq!(decoded.pcm_true_peak.scan_mode, PcmTruePeakScanMode::Fast);
+    }
+
+    #[test]
     fn changing_true_peak_scan_mode_invalidates_bound_runtime_album_gain() {
         let mut settings = DsdSettings::default();
         settings
@@ -2176,4 +2362,147 @@ mod pipeline_settings_serde_compatibility_tests {
         assert_eq!(settings.runtime_album_track_count(), None);
     }
 
+}
+
+
+#[cfg(test)]
+mod pcm_true_peak_settings_tests {
+    use super::*;
+
+    #[test]
+    fn lossless_target_is_not_capped_but_lossy_encoder_input_is() {
+        let settings = PcmTruePeakGainSettings {
+            enabled: true,
+            target_dbtp: "-0.250000000".parse().unwrap(),
+            ..PcmTruePeakGainSettings::default()
+        };
+        assert_eq!(
+            settings.effective_target(&AudioFormat::Flac, false),
+            ("-0.250000000".parse().unwrap(), false),
+        );
+        for format in [
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Opus,
+            AudioFormat::Dts,
+            AudioFormat::Ac3,
+        ] {
+            assert_eq!(
+                settings.effective_target(&format, false),
+                (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
+                "{format:?}",
+            );
+        }
+        assert_eq!(
+            settings.effective_target(&AudioFormat::WavPack, false),
+            ("-0.250000000".parse().unwrap(), false),
+        );
+        assert_eq!(
+            settings.effective_target(&AudioFormat::WavPack, true),
+            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_accepts_zero_dbtp_for_lossless_pcm() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.target_dbtp = DbNano::ZERO;
+        settings.validate().expect("0 dBTP lossless target is admitted");
+    }
+
+    #[test]
+    fn pcm_true_peak_rejects_dsd_target_when_enabled() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Dsf;
+        settings.target_sample_rate = RateTarget::Source;
+        settings.target_bit_depth = BitDepthTarget::Source;
+        settings.pcm_true_peak.enabled = true;
+        let error = settings.validate().expect_err("PCM true-peak gain must not target DSD");
+        assert!(error.to_string().contains("PCM true-peak gain cannot be enabled for a DSD target"));
+    }
+
+    #[test]
+    fn pcm_true_peak_rejects_unbounded_custom_terminal() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Custom {
+            extension: "proofless".to_string(),
+            display_name: "Proofless".to_string(),
+        };
+        settings.pcm_true_peak.enabled = true;
+        let error = settings
+            .validate()
+            .expect_err("custom terminal has no hard-ceiling contract");
+        assert!(
+            error
+                .to_string()
+                .contains("PCM true-peak hard ceiling is not defined"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_rejects_lossy_dither_without_a_terminal_error_bound() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Mp3;
+        settings.dither_type = DitherType::Tpdf;
+        settings.pcm_true_peak.enabled = true;
+        let error = settings
+            .validate()
+            .expect_err("lossy dither is outside the encoder-input ceiling proof");
+        assert!(
+            error.to_string().contains("requires dither off"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_accepts_wavpack_hybrid_and_applies_lossy_floor() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::WavPack;
+        settings.wavpack.hybrid = true;
+        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.target_dbtp = "-0.500000000".parse().unwrap();
+
+        settings
+            .validate()
+            .expect("qualified WavPack hybrid terminal should be admitted");
+        assert_eq!(
+            settings
+                .pcm_true_peak
+                .effective_target(&settings.target_format, settings.wavpack.hybrid),
+            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
+        );
+
+        settings.pcm_true_peak.target_dbtp = PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP;
+        assert_eq!(
+            settings
+                .pcm_true_peak
+                .effective_target(&settings.target_format, settings.wavpack.hybrid),
+            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, false),
+        );
+
+        settings.pcm_true_peak.target_dbtp = "-1.500000000".parse().unwrap();
+        assert_eq!(
+            settings
+                .pcm_true_peak
+                .effective_target(&settings.target_format, settings.wavpack.hybrid),
+            ("-1.500000000".parse().unwrap(), false),
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_wavpack_hybrid_can_use_the_qualified_integer_dither_terminal() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::WavPack;
+        settings.wavpack.hybrid = true;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.dither_type = DitherType::Tpdf;
+        settings.pcm_true_peak.enabled = true;
+
+        settings
+            .validate()
+            .expect("hybrid WavPack dither is bounded by its realized integer PCM terminal");
+    }
 }

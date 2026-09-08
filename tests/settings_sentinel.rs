@@ -211,6 +211,7 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             phase: Some(25),
         },
         dsd: sentinel_dsd_settings(),
+        pcm_true_peak: Default::default(),
         metadata: MetadataSettings {
             transfer_tags: false,
             preserve_artwork: false,

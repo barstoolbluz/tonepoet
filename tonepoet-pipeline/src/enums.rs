@@ -752,3 +752,29 @@ pub enum DsdTruePeakScanMode {
     /// Opt-in fastest rung with the largest declared one-sided error budget.
     Fastest,
 }
+
+/// Peak-normalization scope for ordinary PCM conversions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum PcmTruePeakScope {
+    /// Measure and normalize each converted track independently.
+    #[default]
+    Track,
+    /// Measure the complete submitted conversion batch and apply one shared gain.
+    Album,
+}
+
+/// Accuracy/speed rung for PCM pre-conversion true-peak analysis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum PcmTruePeakScanMode {
+    /// Fast fixed-16x bounded scan; the ordinary conversion default.
+    #[default]
+    Standard,
+    /// Budgeted accelerated Reference reconstruction. This is the fastest PCM
+    /// path: it keeps a certified finite-64x upper while allowing search
+    /// precision to float beneath a deterministic refinement budget.
+    Fast,
+    /// Gold-standard fixed-64x scan.
+    Reference,
+}

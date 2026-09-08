@@ -48,6 +48,11 @@ pub enum TuiButton {
     ResamplerPill(usize),
     DitherPill(usize),
     ReplayGainPill(usize),
+    PcmTruePeakPill(usize),
+    PcmTruePeakScopePill(usize),
+    PcmTruePeakBoostPill(usize),
+    PcmTruePeakScanPill(usize),
+    PcmTruePeakTargetField,
     NoiseShaperPill(usize),
     ModulatorOrderPill(usize),
     ConversionPresetPill(usize),
@@ -589,6 +594,11 @@ impl TuiButton {
             | Self::ResamplerPill(_)
             | Self::DitherPill(_)
             | Self::ReplayGainPill(_)
+            | Self::PcmTruePeakPill(_)
+            | Self::PcmTruePeakScopePill(_)
+            | Self::PcmTruePeakBoostPill(_)
+            | Self::PcmTruePeakScanPill(_)
+            | Self::PcmTruePeakTargetField
             | Self::NoiseShaperPill(_)
             | Self::ModulatorOrderPill(_)
             | Self::ConversionPresetPill(_)

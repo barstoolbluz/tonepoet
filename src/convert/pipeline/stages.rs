@@ -1166,6 +1166,54 @@ async fn realize_track_with_tool_limits_and_stats(
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
             })
         }
+        TrackSourceRef::PcmTruePeakCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            ..
+        } => {
+            if !path.exists() || !path.is_file() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "PCM true-peak carrier is missing or not a regular file: {}",
+                    path.display(),
+                )));
+            }
+            let gain_db = gain_db.ok_or_else(|| {
+                ConvertError::TrackValidation(
+                    "PCM true-peak carrier reached realization before its gain authority was bound"
+                        .to_string(),
+                )
+            })?;
+            if gain_db == tonepoet_pipeline::DbNano::ZERO {
+                return Ok(RealizedTrackInfo::without_stats(path.clone()));
+            }
+            let output = pcm_true_peak_gained_path(path, gain_db);
+            let input = path.clone();
+            let output_for_worker = output.clone();
+            let cancel_for_worker = cancel.clone();
+            let rate = *sample_rate_hz;
+            let channel_count = *channels;
+            tokio::task::spawn_blocking(move || {
+                scale_pcm_true_peak_f64le(
+                    &input,
+                    &output_for_worker,
+                    rate,
+                    channel_count,
+                    gain_db,
+                    &cancel_for_worker,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ConvertError::Realize(format!(
+                    "PCM true-peak gain worker failed for {}: {error}",
+                    path.display(),
+                ))
+            })?
+            .map_err(ConvertError::Realize)?;
+            Ok(RealizedTrackInfo::without_stats(output))
+        }
         TrackSourceRef::CueStreamSegment {
             fallback_path,
             decode_path,
@@ -1913,16 +1961,27 @@ fn expected_post_encode_depth_for_track(
             class_strict: true,
         }),
         tonepoet_pipeline::BitDepthTarget::Source => {
+            if settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+                && settings.wavpack.hybrid
+                && settings.pcm_true_peak.enabled
+            {
+                return Some(PostEncodeDepthExpectation {
+                    depth: super::plan_bridge::resolve_wavpack_hybrid_source_working_depth(track),
+                    class_strict: true,
+                });
+            }
             if !settings.target_format.is_pcm_lossless() {
                 return None;
             }
-            super::plan_bridge::resolve_source_pcm_depth(track).map(|depth| PostEncodeDepthExpectation {
-                depth,
-                // Source resolution preserves integer-versus-float class
-                // as well as width. Unknown source representation is rejected
-                // by the bridge before planning; validation never invents a
-                // target-format default and labels it as source-derived.
-                class_strict: true,
+            super::plan_bridge::resolve_source_pcm_depth(track).map(|depth| {
+                PostEncodeDepthExpectation {
+                    depth,
+                    // Source resolution preserves integer-versus-float class
+                    // as well as width. Unknown source representation is rejected
+                    // by the bridge before planning; validation never invents a
+                    // target-format default and labels it as source-derived.
+                    class_strict: true,
+                }
             })
         }
     }
@@ -13830,6 +13889,13 @@ mod replaygain_existing_tag_policy_tests {
             ReplayGainInheritedTagPolicy::Trust,
             "source-aware lossless source-rate/source-depth output remains signal-equivalent",
         );
+        req.settings.pcm_true_peak.enabled = true;
+        assert!(matches!(
+            inherited_replaygain_tag_policy(Some(&source), &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute { reason }
+                if reason.contains("PCM true-peak gain changes output level")
+        ));
+        req.settings.pcm_true_peak.enabled = false;
         assert_eq!(
             inherited_replaygain_tag_policy(None, &req.settings),
             ReplayGainInheritedTagPolicy::Recompute {
@@ -14373,6 +14439,12 @@ fn inherited_replaygain_tag_policy(
     let mut reasons = Vec::new();
     if settings.target_format.is_lossy() {
         reasons.push("lossy encoding changes the output signal".to_string());
+    }
+    if settings.pcm_true_peak.enabled {
+        // Gain is data-dependent, so source-pass ReplayGain and inherited
+        // ReplayGain tags cannot be trusted even when the resolved gain later
+        // happens to be exactly 0 dB. Measure the produced audio instead.
+        reasons.push("PCM true-peak gain changes output level".to_string());
     }
 
     let legacy_gain_configured = settings.dsd.legacy_behavior().is_some_and(|legacy| {
@@ -24275,7 +24347,8 @@ fn source_track_format_label(track: &PreparedTrack) -> String {
 fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
     let path = match source_ref {
         TrackSourceRef::StagedFile(path) => path,
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => source_path,
+        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => source_path,
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image,
@@ -25154,6 +25227,29 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             "album-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
             path_log_value(path),
             path_log_value(source_path),
+        ),
+        TrackSourceRef::PcmTruePeakCarrier {
+            path,
+            source_path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            point_dbtp,
+            effective_target_dbtp,
+            lossy_target_capped,
+            ..
+        } => format!(
+            "PCM true-peak raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; source {}; target {} dBTP; point {}; gain {}; lossy cap {})",
+            path_log_value(path),
+            path_log_value(source_path),
+            effective_target_dbtp.render(false),
+            point_dbtp
+                .map(|value| value.render(false))
+                .unwrap_or_else(|| "silence".to_string()),
+            gain_db
+                .map(|value| value.render(false))
+                .unwrap_or_else(|| "pending album authority".to_string()),
+            if *lossy_target_capped { "yes" } else { "no" },
         ),
         TrackSourceRef::CueStreamSegment {
             fallback_path,
@@ -29730,7 +29826,8 @@ fn preserve_source_tags_for_organizational_identity(source: &mut PreparedSource)
 fn track_source_identity_path(track: &PreparedTrack) -> &Path {
     match &track.source_ref {
         TrackSourceRef::StagedFile(path) => path.as_path(),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => source_path.as_path(),
+        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => source_path.as_path(),
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image.as_path(),
@@ -29790,6 +29887,7 @@ pub struct ScheduledAlbum {
     pub stages: Vec<StageRecord>,
     pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
     pub(crate) album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+    pub(crate) pcm_true_peak_measurements: Vec<PcmTruePeakPreparedMeasurement>,
     album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
@@ -29835,6 +29933,7 @@ struct DsdAlbumGainScratchRetrySeed {
     stages: Vec<StageRecord>,
     source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
     album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+    pcm_true_peak_measurements: Vec<PcmTruePeakPreparedMeasurement>,
     album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     album_gain_scope_disclosure: DsdAlbumGainScopeDisclosure,
     run_timing: ConversionRunTiming,
@@ -29899,6 +29998,7 @@ impl DsdAlbumGainScratchRetrySeed {
             stages: album.stages.clone(),
             source_replaygain: album.source_replaygain.clone(),
             album_gain_measurements: album.album_gain_measurements.clone(),
+            pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
             album_gain_timings: album.album_gain_timings.clone(),
             album_gain_scope_disclosure: disclosure,
             run_timing: album.run_timing.clone(),
@@ -30013,6 +30113,7 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
         album_gain_measurements: seed.album_gain_measurements,
+        pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
         album_gain_timings: seed.album_gain_timings,
         album_gain_scope_disclosure: Some(seed.album_gain_scope_disclosure),
         run_timing: seed.run_timing,
@@ -30087,6 +30188,7 @@ pub(crate) fn scheduled_album_for_test(
         stages,
         source_replaygain: None,
         album_gain_measurements: Vec::new(),
+        pcm_true_peak_measurements: Vec::new(),
         album_gain_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
         run_timing: ConversionRunTiming::start(),
@@ -30105,8 +30207,13 @@ pub(crate) async fn resolve_dsd_album_gain_post_barrier_rerun(
     album: ScheduledAlbum,
     reporter: &dyn PipelineReporter,
 ) -> ScheduledMaterialization {
+    let post_barrier_gain_is_bound = album.req.settings.dsd.album_auto_gain_selected()
+        || (album.req.settings.pcm_true_peak.enabled
+            && album.req.settings.pcm_true_peak.scope
+                == tonepoet_pipeline::PcmTruePeakScope::Album
+            && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some());
     if album.req.publish.overwrite != OverwritePolicy::SkipIfManifestMatch
-        || !album.req.settings.dsd.album_auto_gain_selected()
+        || !post_barrier_gain_is_bound
     {
         return ScheduledMaterialization::Ready(album);
     }
@@ -31183,7 +31290,7 @@ fn album_peak_measurement_from_true_peak(
                 .parse::<tonepoet_pipeline::DbNano>()
                 .map_err(|error| {
                     format!(
-                        "album DSD true-peak result is outside the gain measurement range: {error}"
+                        "true-peak result is outside the gain measurement range: {error}"
                     )
                 })?;
             Ok(tonepoet_pipeline::AlbumPeakMeasurement::Finite {
@@ -31192,7 +31299,7 @@ fn album_peak_measurement_from_true_peak(
             })
         }
         _ => Err(
-            "album DSD point estimate and ceiling reconstruction disagree about silence"
+            "true-peak point estimate and ceiling reconstruction disagree about silence"
                 .to_string(),
         ),
     }
@@ -31348,8 +31455,9 @@ pub(crate) fn album_gain_terminal_bound(
 
     let depth = match settings.target_bit_depth {
         BitDepthTarget::Pcm(depth) => depth,
-        // Album auto-gain participation is DSD-only, so Source has no PCM word
-        // length to preserve and resolves to the documented target default.
+        // DSD album gain has no source PCM word length to preserve. PCM
+        // true-peak callers resolve Source to an explicit depth before asking
+        // for this bound, so Source here retains the established DSD fallback.
         BitDepthTarget::Source => tonepoet_pipeline::default_pcm_depth_for_format(
             &settings.target_format,
         ),
@@ -31381,7 +31489,7 @@ pub(crate) fn album_gain_terminal_bound(
 
     if !settings.target_format.is_pcm_lossless() {
         return Err(format!(
-            "album-scoped DSD NormalizePeak hard ceiling is not defined for {} output",
+            "true-peak hard ceiling is not defined for {} output",
             settings.target_format,
         ));
     }
@@ -31457,7 +31565,7 @@ pub(crate) fn album_gain_terminal_bound(
             if integer_dither_applies {
                 if !sox_may_be_terminal && !sox_preprocess_available {
                     return Err(format!(
-                        "album-scoped DSD NormalizePeak with {:?} dither requires a proved SoX terminal or preprocess path; {} cannot provide one",
+                        "true-peak hard ceiling with {:?} dither requires a proved SoX terminal or preprocess path; {} cannot provide one",
                         settings.dither_type,
                         settings.target_format,
                     ));
@@ -32072,6 +32180,163 @@ mod album_true_peak_carrier_tests {
     }
 
     #[test]
+    fn pcm_true_peak_track_stem_distinguishes_full_track_identity() {
+        let base = TrackId {
+            source_ordinal: 7,
+            disc_number: None,
+            track_number: 1,
+        };
+        let same_source_other_track = TrackId {
+            track_number: 2,
+            ..base.clone()
+        };
+        let same_source_other_disc = TrackId {
+            disc_number: Some(1),
+            ..base.clone()
+        };
+        assert_ne!(
+            pcm_true_peak_track_stem(&base),
+            pcm_true_peak_track_stem(&same_source_other_track),
+        );
+        assert_ne!(
+            pcm_true_peak_track_stem(&base),
+            pcm_true_peak_track_stem(&same_source_other_disc),
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_rate_change_accepts_auto_and_explicit_soxr() {
+        for preferred in [
+            tonepoet_pipeline::PreferredTool::Auto,
+            tonepoet_pipeline::PreferredTool::Ffmpeg,
+        ] {
+            let mut settings = tonepoet_pipeline::PipelineSettings::default();
+            settings.preferred_tool = preferred;
+            assert!(
+                validate_pcm_true_peak_resampler_contract(&settings, 48_000, 44_100).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_true_peak_rate_change_rejects_unqualified_explicit_resamplers() {
+        for preferred in [
+            tonepoet_pipeline::PreferredTool::Sox,
+            tonepoet_pipeline::PreferredTool::Ssrc,
+            tonepoet_pipeline::PreferredTool::Custom("external-resampler".to_string()),
+        ] {
+            let mut settings = tonepoet_pipeline::PipelineSettings::default();
+            settings.preferred_tool = preferred;
+            let error = validate_pcm_true_peak_resampler_contract(&settings, 48_000, 44_100)
+                .expect_err("explicit unqualified rate-changing resampler must fail closed");
+            assert!(error.contains("Select Auto or soxr/FFmpeg"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pcm_true_peak_same_rate_does_not_reject_terminal_tool_preference() {
+        for preferred in [
+            tonepoet_pipeline::PreferredTool::Sox,
+            tonepoet_pipeline::PreferredTool::Ssrc,
+            tonepoet_pipeline::PreferredTool::Custom("terminal-only".to_string()),
+        ] {
+            let mut settings = tonepoet_pipeline::PipelineSettings::default();
+            settings.preferred_tool = preferred;
+            assert!(validate_pcm_true_peak_resampler_contract(&settings, 48_000, 48_000).is_ok());
+        }
+    }
+
+    #[test]
+    fn pcm_true_peak_rate_change_rejects_brick_wall_ssrc_topology() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.nyquist_transition = tonepoet_pipeline::NyquistTransition::BrickWall;
+        let error = validate_pcm_true_peak_resampler_contract(&settings, 96_000, 48_000)
+            .expect_err("brick-wall SSRC topology must fail closed");
+        assert!(error.contains("SSRC/brick-wall"), "{error}");
+    }
+
+    #[test]
+    fn pcm_true_peak_scanner_preserves_above_unity_float_and_channel_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("pcm-above-unity.f64le");
+        let mut samples = Vec::new();
+        for frame in 0..512 {
+            let left = 0.2 * (2.0 * PI * 0.071 * frame as f64).sin();
+            let right = if frame == 257 { 1.25 } else { 0.1 };
+            samples.extend_from_slice(&[left, right]);
+        }
+        write_f64le(&carrier, &samples);
+        let cancel = CancellationToken::new();
+        let (point, signal_upper) = finite(
+            scan_pcm_true_peak_f64le(
+                &carrier,
+                48_000,
+                2,
+                tonepoet_pipeline::PcmTruePeakScanMode::Standard,
+                &cancel,
+            )
+            .unwrap(),
+        );
+        assert!(point > tonepoet_pipeline::DbNano::ZERO, "point={point}");
+        assert!(signal_upper >= 1.25, "signal_upper={signal_upper:.17}");
+    }
+
+    #[test]
+    fn pcm_true_peak_scaler_replaces_stale_output_and_preserves_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("carrier.f64le");
+        let output = temp.path().join("carrier.gain.f64le");
+        let gain_db: tonepoet_pipeline::DbNano = "-6.000000000".parse().unwrap();
+        let gain = tonepoet_pipeline::conservative_linear_gain_lower(gain_db).unwrap();
+        let cancel = CancellationToken::new();
+
+        write_f64le(&input, &[1.25, -0.5, 0.125, -1.0]);
+        fs::write(&output, b"stale").unwrap();
+        scale_pcm_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
+        let first = fs::read(&output).unwrap();
+        assert_eq!(first.len(), 4 * 8);
+        let first_samples = first
+            .chunks_exact(8)
+            .map(|raw| f64::from_le_bytes(raw.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for (actual, source) in first_samples.iter().zip([1.25, -0.5, 0.125, -1.0]) {
+            assert!(
+            (actual - source * gain).abs()
+                <= 2.0 * f64::EPSILON * (source * gain).abs().max(1.0)
+        );
+        }
+
+        write_f64le(&input, &[0.5, -0.25]);
+        scale_pcm_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
+        let second = fs::read(&output).unwrap();
+        assert_eq!(second.len(), 2 * 8, "stale longer carrier was reused");
+        let first_sample = f64::from_le_bytes(second[0..8].try_into().unwrap());
+        assert!((first_sample - 0.5 * gain).abs() <= 2.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn pcm_true_peak_scaler_cancellation_does_not_publish_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("carrier.f64le");
+        let output = temp.path().join("carrier.gain.f64le");
+        write_f64le(&input, &[0.5; 64]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = scale_pcm_true_peak_f64le(
+            &input,
+            &output,
+            48_000,
+            1,
+            "-1.000000000".parse().unwrap(),
+            &cancel,
+        )
+        .expect_err("cancelled scaler must refuse publication");
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(!output.exists());
+        assert!(!output.with_extension("f64le.tmp").exists());
+    }
+
+    #[test]
     fn lossy_terminal_contract_stops_at_encoder_input_pcm() {
         let settings = terminal_settings(
             tonepoet_pipeline::AudioFormat::Mp3,
@@ -32088,6 +32353,882 @@ mod album_true_peak_carrier_tests {
         );
     }
 
+    #[test]
+    fn pcm_true_peak_terminal_settings_use_the_same_hybrid_source_depth_rule() {
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        req.settings.wavpack.hybrid = true;
+        req.settings.pcm_true_peak.enabled = true;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+
+        let mut source = super::pipeline_test_helpers::log_test_source();
+        let track = source.tracks.first_mut().expect("test track");
+        for (source_bits, expected) in [
+            (320, tonepoet_pipeline::PcmBitDepth::Int24),
+            (640, tonepoet_pipeline::PcmBitDepth::Int24),
+            (16, tonepoet_pipeline::PcmBitDepth::Int16),
+            (24, tonepoet_pipeline::PcmBitDepth::Int24),
+            (32, tonepoet_pipeline::PcmBitDepth::Int32),
+        ] {
+            track.bit_depth = Some(source_bits);
+            track.source_audio.bit_depth = Some(source_bits);
+            assert_eq!(
+                pcm_true_peak_terminal_settings(&req, track).target_bit_depth,
+                tonepoet_pipeline::BitDepthTarget::Pcm(expected),
+                "terminal-bound settings must use the same hybrid Source depth as planning and validation",
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_true_peak_wavpack_hybrid_charges_integer_terminal_and_uses_lossy_domain() {
+        let mut hybrid = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::None,
+        );
+        hybrid.wavpack.hybrid = true;
+        hybrid.pcm_true_peak.enabled = true;
+
+        let hybrid_bound = pcm_true_peak_terminal_bound(&hybrid, 96_000).unwrap();
+        let stored = hybrid_bound
+            .stored_sample_error_linear
+            .expect("integer encoder-input carrier must expose its stored-sample bound");
+        assert!(stored > 0.5 * 2.0_f64.powi(-23));
+        assert_eq!(
+            hybrid_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm,
+        );
+
+        let mut wav = hybrid.clone();
+        wav.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        wav.wavpack.hybrid = false;
+        let wav_bound = pcm_true_peak_terminal_bound(&wav, 96_000).unwrap();
+        assert_eq!(
+            hybrid_bound.stored_sample_error_linear,
+            wav_bound.stored_sample_error_linear,
+            "hybrid must reuse the admitted WAV integer-terminal realization bound",
+        );
+        assert_eq!(
+            hybrid_bound.post_gain_reconstructed_error_linear,
+            wav_bound.post_gain_reconstructed_error_linear,
+        );
+
+        let mut hybrid_dither = hybrid.clone();
+        hybrid_dither.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        let dither_bound = pcm_true_peak_terminal_bound(&hybrid_dither, 96_000)
+            .expect("hybrid dither must reuse the qualified integer PCM terminal bound");
+        assert_eq!(
+            dither_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm,
+        );
+        assert!(
+            dither_bound.post_gain_reconstructed_error_linear
+                >= hybrid_bound.post_gain_reconstructed_error_linear,
+            "adding bounded terminal dither must not reduce the charged error",
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_lossless_wavpack_keeps_lossless_terminal_domain() {
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Int24,
+            tonepoet_pipeline::DitherType::None,
+        );
+        settings.pcm_true_peak.enabled = true;
+
+        let bound = pcm_true_peak_terminal_bound(&settings, 96_000).unwrap();
+        assert_eq!(
+            bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+    }
+
+}
+
+
+#[derive(Debug, Clone)]
+pub(crate) struct PcmTruePeakPreparedMeasurement {
+    pub track_id: TrackId,
+    pub measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    pub terminal_bound: tonepoet_pipeline::AlbumTerminalBound,
+}
+
+#[derive(Default)]
+struct PreparedPcmTruePeakCarriers {
+    measurements: Vec<PcmTruePeakPreparedMeasurement>,
+}
+
+struct PreparedPcmTruePeakCarrier {
+    source_ref: TrackSourceRef,
+    measurement: PcmTruePeakPreparedMeasurement,
+}
+
+fn pcm_true_peak_scan_mode(
+    mode: tonepoet_pipeline::PcmTruePeakScanMode,
+) -> Option<tonepoet_true_peak::HeadroomScanMode> {
+    match mode {
+        tonepoet_pipeline::PcmTruePeakScanMode::Standard => {
+            Some(tonepoet_true_peak::HeadroomScanMode::Standard)
+        }
+        tonepoet_pipeline::PcmTruePeakScanMode::Fast => {
+            None
+        }
+        tonepoet_pipeline::PcmTruePeakScanMode::Reference => {
+            Some(tonepoet_true_peak::HeadroomScanMode::Reference)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pcm_true_peak_scan_mode_tests {
+    use super::pcm_true_peak_scan_mode;
+
+    #[test]
+    fn pcm_fast_is_the_accelerated_reference_path_not_a_legacy_headroom_rung() {
+        assert_eq!(
+            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Standard),
+            Some(tonepoet_true_peak::HeadroomScanMode::Standard),
+        );
+        assert_eq!(
+            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Fast),
+            None,
+        );
+        assert_eq!(
+            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Reference),
+            Some(tonepoet_true_peak::HeadroomScanMode::Reference),
+        );
+    }
+}
+
+fn scan_pcm_true_peak_f64le(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::PcmTruePeakScanMode,
+    cancel: &CancellationToken,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
+    use std::io::Read;
+
+    if cancel.is_cancelled() {
+        return Err("PCM true-peak scan cancelled".to_string());
+    }
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("PCM true-peak scan requires a positive sample rate and channel count".to_string());
+    }
+    let mut file = fs::File::open(carrier)
+        .map_err(|error| format!("could not open PCM true-peak carrier: {error}"))?;
+    let carrier_len = file
+        .metadata()
+        .map_err(|error| format!("could not stat PCM true-peak carrier: {error}"))?
+        .len();
+    let frame_bytes = u64::from(channels)
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| "PCM true-peak frame size overflowed".to_string())?;
+    if carrier_len == 0 || carrier_len % frame_bytes != 0 {
+        return Err(format!(
+            "PCM true-peak carrier is not whole-frame headerless f64le: {} bytes for {} channels",
+            carrier_len, channels,
+        ));
+    }
+    let mut meter = match pcm_true_peak_scan_mode(scan_mode) {
+        Some(headroom_mode) => tonepoet_true_peak::HeadroomCeilingMeter::new_with_scan_mode(
+            sample_rate_hz,
+            usize::from(channels),
+            tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+            headroom_mode,
+        ),
+        None => tonepoet_true_peak::HeadroomCeilingMeter::new_accelerated_reference(
+            sample_rate_hz,
+            usize::from(channels),
+            tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+        ),
+    }
+    .map_err(|error| format!("could not initialize PCM true-peak ceiling meter: {error}"))?;
+
+    const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
+    let frame_bytes_usize = usize::try_from(frame_bytes)
+        .map_err(|_| "PCM true-peak frame size does not fit this platform".to_string())?;
+    let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes_usize).max(1) * frame_bytes_usize;
+    let mut bytes = vec![0_u8; buffer_len];
+    let mut samples = Vec::<f64>::with_capacity(buffer_len / 8);
+    let mut remaining = carrier_len;
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err("PCM true-peak scan cancelled".to_string());
+        }
+        let count = usize::try_from(remaining.min(buffer_len as u64))
+            .map_err(|_| "PCM true-peak carrier length does not fit this platform".to_string())?;
+        file.read_exact(&mut bytes[..count])
+            .map_err(|error| format!("could not read PCM true-peak carrier: {error}"))?;
+        samples.clear();
+        for raw in bytes[..count].chunks_exact(8) {
+            let sample = f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+            if !sample.is_finite() {
+                return Err("PCM true-peak carrier contains a non-finite sample".to_string());
+            }
+            samples.push(sample);
+        }
+        meter
+            .push_interleaved(&samples)
+            .map_err(|error| format!("PCM true-peak carrier is invalid: {error}"))?;
+        remaining -= count as u64;
+    }
+    if cancel.is_cancelled() {
+        return Err("PCM true-peak scan cancelled".to_string());
+    }
+    let result = meter
+        .finalize()
+        .map_err(|error| format!("could not finalize PCM true-peak ceiling measurement: {error}"))?;
+    let point_estimate = result.point_estimate.overall;
+    if let Some(reference_scan) = result.reference_scan {
+        log::debug!(
+            "PCM accelerated Reference scan interval_width_db={:?} complete={} candidates={} refined={} budget_exhausted_tiles={}",
+            reference_scan.interval_width_db,
+            reference_scan.reference_search_complete,
+            reference_scan.candidate_intervals,
+            reference_scan.refined_intervals,
+            reference_scan.budget_exhausted_tiles,
+        );
+    }
+    let signal_upper_linear = match pcm_true_peak_scan_mode(scan_mode) {
+        Some(headroom_mode) => headroom_mode
+            .reserve_point_estimate(point_estimate)
+            .linear()
+            .max(result.reconstruction_upper.linear()),
+        None => result.reconstruction_upper.linear(),
+    };
+    let signal_upper = if signal_upper_linear == 0.0 {
+        tonepoet_true_peak::PeakLevel::Silence
+    } else {
+        let linear = next_up_nonnegative(signal_upper_linear);
+        tonepoet_true_peak::PeakLevel::Finite {
+            linear,
+            dbtp: 20.0 * linear.log10(),
+        }
+    };
+    album_peak_measurement_from_true_peak(point_estimate, signal_upper)
+}
+
+fn pcm_true_peak_terminal_settings(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+) -> tonepoet_pipeline::PipelineSettings {
+    let mut settings = req.settings.clone();
+    if settings.target_bit_depth == BitDepthTarget::Source {
+        let depth = if settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+            && settings.wavpack.hybrid
+        {
+            super::plan_bridge::resolve_wavpack_hybrid_source_working_depth(track)
+        } else {
+            let source_depth = if matches!(
+                track.source_audio.coding,
+                Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
+            ) {
+                resolved_target_pcm_depth(track, BitDepthTarget::Source)
+            } else {
+                None
+            };
+            source_depth.unwrap_or_else(|| {
+                tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format)
+            })
+        };
+        settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+    }
+    settings
+}
+
+fn pcm_true_peak_terminal_bound(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    sample_rate_hz: u32,
+) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
+    let wavpack_hybrid = settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+        && settings.wavpack.hybrid;
+    let lossy_policy = tonepoet_pipeline::pcm_true_peak_lossy_floor_applies(
+        &settings.target_format,
+        settings.wavpack.hybrid,
+    );
+    let terminal_settings = if wavpack_hybrid {
+        // Hybrid WavPack receives one already-final-rate integer WAV carrier.
+        // Reuse the existing WAV terminal-realization proof for that exact
+        // Float64 -> integer PCM step, then relabel the governed domain below
+        // as lossy encoder-input PCM. The native wavpack encode that follows
+        // performs no further PCM DSP.
+        let mut terminal_settings = settings.clone();
+        terminal_settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        terminal_settings.wavpack.hybrid = false;
+        Some(terminal_settings)
+    } else {
+        None
+    };
+    let bound_settings = terminal_settings.as_ref().unwrap_or(settings);
+    let mut bound = album_gain_terminal_bound(bound_settings, sample_rate_hz)?;
+    if lossy_policy {
+        bound.domain = tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm;
+    }
+    // PCM gain is realized by multiplying the already-measured Float64 carrier.
+    // The directed-down coefficient prevents gain overshoot; one binary64
+    // multiplication rounding remains. Near the governed <= 1 FS output this
+    // absolute 2^-51 term safely covers that operation and is reconstructed
+    // through the same frozen Headroom64 L-infinity gain used elsewhere.
+    let scaler_error = 2.0_f64.powi(-51)
+        * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER;
+    bound.post_gain_reconstructed_error_linear = next_up_nonnegative(
+        bound.post_gain_reconstructed_error_linear + scaler_error,
+    );
+    Ok(bound)
+}
+
+fn pcm_true_peak_carrier_rate_hz(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    source: &tonepoet_pipeline::SourceInfo,
+) -> Result<u32, String> {
+    let source_rate = source
+        .sample_rate_hz
+        .filter(|rate| *rate > 0)
+        .ok_or_else(|| "PCM true-peak analysis requires an authoritative source sample rate".to_string())?;
+    let requested = match settings.target_sample_rate {
+        RateTarget::Source => source_rate,
+        RateTarget::PcmHz(rate) => rate,
+        RateTarget::Dsd(_) => {
+            return Err("PCM true-peak analysis cannot target a DSD sample rate".to_string())
+        }
+    };
+    if settings.target_format.is_lossy() {
+        tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
+            &settings.target_format,
+            requested,
+        )
+        .ok_or_else(|| {
+            format!(
+                "{} has no admitted lossy encoder rate for requested {} Hz",
+                settings.target_format, requested,
+            )
+        })
+    } else {
+        Ok(requested)
+    }
+}
+
+fn validate_pcm_true_peak_resampler_contract(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+) -> Result<(), String> {
+    if source_rate_hz == target_rate_hz {
+        return Ok(());
+    }
+
+    if settings.ssrc.force || settings.nyquist_transition == NyquistTransition::BrickWall {
+        return Err(
+            "PCM true-peak gain cannot use the SSRC/brick-wall resampler for a rate-changing hard-ceiling carrier: the pre-measurement path must preserve floating-point samples above 0 dBFS. Select Auto or soxr/FFmpeg, or keep the source sample rate."
+                .to_string(),
+        );
+    }
+
+    match &settings.preferred_tool {
+        PreferredTool::Auto | PreferredTool::Ffmpeg => Ok(()),
+        PreferredTool::Sox => Err(
+            "PCM true-peak gain cannot use explicitly selected SoX for a rate-changing hard-ceiling carrier because SoX converts floating-point input through a bounded integer sample domain before effects. Select Auto or soxr/FFmpeg, or keep the source sample rate."
+                .to_string(),
+        ),
+        PreferredTool::Ssrc => Err(
+            "PCM true-peak gain cannot use explicitly selected SSRC for a rate-changing hard-ceiling carrier because that path is not qualified to preserve samples above 0 dBFS before measurement. Select Auto or soxr/FFmpeg, or keep the source sample rate."
+                .to_string(),
+        ),
+        PreferredTool::Custom(name) => Err(format!(
+            "PCM true-peak gain cannot use custom resampler '{name}' for a rate-changing hard-ceiling carrier because its above-0-dBFS behavior has no qualified bound. Select Auto or soxr/FFmpeg, or keep the source sample rate."
+        )),
+    }
+}
+
+fn pcm_true_peak_carrier_request(
+    req: &PipelineRequest,
+    sample_rate_hz: u32,
+) -> PipelineRequest {
+    let mut carrier_req = req.clone();
+    carrier_req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+    carrier_req.settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
+    carrier_req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    // The analysis carrier must preserve finite floating-point samples above
+    // full scale until the true-peak authority has measured them. In Auto,
+    // force the qualified FFmpeg/soxr floating-point path rather than allowing
+    // SoX's preferred PCM-processing score to route Float32 or resampled
+    // Float64 material through SoX's bounded integer sample domain. Explicit
+    // non-soxr rate-changing selections are rejected before this request is
+    // executed by `validate_pcm_true_peak_resampler_contract`.
+    carrier_req.settings.preferred_tool = PreferredTool::Ffmpeg;
+    carrier_req.settings.dither_type = DitherType::None;
+    carrier_req.settings.dither_explicit = false;
+    carrier_req.settings.force_encode = true;
+    carrier_req.settings.flac.verify = false;
+    carrier_req.settings.metadata.transfer_tags = false;
+    carrier_req.settings.metadata.preserve_artwork = false;
+    carrier_req.settings.metadata.store_source_audio_md5 = false;
+    carrier_req.settings.verification.verify_after_encode = false;
+    carrier_req.settings.replay_gain.mode = None;
+    carrier_req.settings.pcm_true_peak.enabled = false;
+    carrier_req.settings.pcm_true_peak.clear_runtime_album_gain();
+    carrier_req.container_extension = Some("f64le".to_string());
+    carrier_req.container_ffmpeg_flags = vec!["-f".to_string(), "f64le".to_string()];
+    carrier_req
+}
+
+fn pcm_true_peak_track_stem(track_id: &TrackId) -> String {
+    let disc = track_id
+        .disc_number
+        .map_or_else(|| "dn".to_string(), |number| format!("d{number:010}"));
+    format!(
+        "s{:010}-{disc}-t{:010}",
+        track_id.source_ordinal, track_id.track_number,
+    )
+}
+
+async fn prepare_pcm_true_peak_carrier_for_track(
+    req: &PipelineRequest,
+    track: PreparedTrack,
+    staging: &StagingDir,
+    carrier_dir: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedPcmTruePeakCarrier, String> {
+    if cancel.is_cancelled() {
+        return Err("PCM true-peak analysis cancelled".to_string());
+    }
+    let original_source_path = track_source_identity_path(&track).to_path_buf();
+    let source_ref = track.source_ref.clone();
+    let realized = realize_track_with_tool_limits_and_stats(
+        &source_ref,
+        Some(&track),
+        req,
+        staging,
+        runner,
+        cancel,
+        tool_concurrency_limits.clone(),
+        None,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not realize PCM track {} for true-peak analysis: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let source = super::plan_bridge::source_info_for_realized_track(&track, &realized.path)
+        .map_err(|error| {
+            format!(
+                "could not resolve PCM facts for true-peak analysis on track {}: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    if source.is_dsd() {
+        return Err(format!(
+            "track {} resolved to DSD and cannot participate in the PCM true-peak gain step",
+            track.id.source_ordinal,
+        ));
+    }
+    let channels = source
+        .channels
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| format!("PCM track {} has no valid channel count", track.id.source_ordinal))?;
+    let target_rate_hz = pcm_true_peak_carrier_rate_hz(&req.settings, &source)?;
+    let source_rate_hz = source
+        .sample_rate_hz
+        .filter(|rate| *rate > 0)
+        .ok_or_else(|| {
+            format!(
+                "PCM track {} has no valid source sample rate",
+                track.id.source_ordinal,
+            )
+        })?;
+    validate_pcm_true_peak_resampler_contract(
+        &req.settings,
+        source_rate_hz,
+        target_rate_hz,
+    )?;
+    let carrier_hash = stable_path_hash(&original_source_path);
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
+    let _ = fs::remove_file(&carrier_path);
+    let carrier_req = pcm_true_peak_carrier_request(req, target_rate_hz);
+    let convert_root = carrier_dir.join(format!("work-{track_stem}"));
+    let mut progress = OperationProgressTracker::new(
+        req.item_id.clone(),
+        PipelineStage::Convert,
+        None,
+    );
+    execute_planned_track_conversion(
+        &carrier_req,
+        &track,
+        &realized.path,
+        &carrier_path,
+        &convert_root,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+        &mut progress,
+        0.0,
+        1.0,
+    )
+    .await
+    .map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!(
+            "PCM track {} could not be rendered to its final-rate Float64 analysis carrier: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+
+    let scan_path = carrier_path.clone();
+    let scan_cancel = cancel.clone();
+    let scan_mode = req.settings.pcm_true_peak.scan_mode;
+    let measurement = tokio::task::spawn_blocking(move || {
+        scan_pcm_true_peak_f64le(
+            &scan_path,
+            target_rate_hz,
+            channels,
+            scan_mode,
+            &scan_cancel,
+        )
+    })
+    .await
+    .map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!("PCM true-peak worker failed for track {}: {error}", track.id.source_ordinal)
+    })?
+    .map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!("PCM true-peak measurement failed for track {}: {error}", track.id.source_ordinal)
+    })?;
+
+    let terminal_settings = pcm_true_peak_terminal_settings(req, &track);
+    let terminal_bound = pcm_true_peak_terminal_bound(&terminal_settings, target_rate_hz)?;
+    let (effective_target_dbtp, lossy_target_capped) = req.settings.pcm_true_peak.effective_target(
+        &req.settings.target_format,
+        req.settings.wavpack.hybrid,
+    );
+    let gain_db = if req.settings.pcm_true_peak.scope
+        == tonepoet_pipeline::PcmTruePeakScope::Track
+    {
+        Some(
+            tonepoet_pipeline::resolve_true_peak_gain_constraints(
+                effective_target_dbtp,
+                &[(measurement, terminal_bound)],
+                req.settings.pcm_true_peak.allow_boost,
+            )
+            .map_err(|error| {
+                format!("could not resolve PCM true-peak gain for track {}: {error}", track.id.source_ordinal)
+            })?
+            .gain_db,
+        )
+    } else {
+        None
+    };
+    let point_dbtp = match measurement {
+        tonepoet_pipeline::AlbumPeakMeasurement::Finite { point_db, .. } => Some(point_db),
+        tonepoet_pipeline::AlbumPeakMeasurement::Silence => None,
+    };
+    if lossy_target_capped {
+        log::warn!(
+            "PCM true-peak target {} dBTP capped to {} dBTP for {} encoder-input PCM; decoded lossy output is outside the hard-ceiling contract",
+            req.settings.pcm_true_peak.target_dbtp.render(false),
+            effective_target_dbtp.render(false),
+            req.settings.target_format,
+        );
+    }
+    log::info!(
+        "PCM true-peak measured item={} track={} point={:?} effective_target={} dBTP gain={:?} carrier={} rate={} channels={} scan_mode={:?}",
+        req.item_id,
+        track.id.source_ordinal,
+        point_dbtp,
+        effective_target_dbtp.render(false),
+        gain_db,
+        carrier_path.display(),
+        target_rate_hz,
+        channels,
+        scan_mode,
+    );
+    Ok(PreparedPcmTruePeakCarrier {
+        source_ref: TrackSourceRef::PcmTruePeakCarrier {
+            path: carrier_path,
+            source_path: original_source_path,
+            sample_rate_hz: target_rate_hz,
+            channels,
+            duration: source.duration,
+            gain_db,
+            point_dbtp,
+            effective_target_dbtp,
+            lossy_target_capped,
+        },
+        measurement: PcmTruePeakPreparedMeasurement {
+            track_id: track.id,
+            measurement,
+            terminal_bound,
+        },
+    })
+}
+
+async fn prepare_pcm_true_peak_carriers(
+    req: &PipelineRequest,
+    prepared: &mut PreparedSource,
+    album_plan: &AlbumPlan,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedPcmTruePeakCarriers, String> {
+    if !req.settings.pcm_true_peak.enabled {
+        return Ok(PreparedPcmTruePeakCarriers::default());
+    }
+    let selected = album_plan
+        .entries
+        .iter()
+        .map(|entry| entry.track_id.clone())
+        .collect::<BTreeSet<_>>();
+    let selected_contains_dsd = prepared.tracks.iter().any(|track| {
+        selected.contains(&track.id)
+            && (matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+                || source_track_dsd_rate(track).is_some())
+    });
+    if req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album
+        && selected_contains_dsd
+    {
+        return Err(
+            "PCM true-peak Album scope cannot partially normalize a submitted set that also contains DSD tracks; use Track scope for the PCM members or the existing DSD gain controls for a DSD-only batch"
+                .to_string(),
+        );
+    }
+
+    let carrier_dir = staging.root.join("pcm-true-peak");
+    fs::create_dir_all(&carrier_dir)
+        .map_err(|error| format!("could not create PCM true-peak staging: {error}"))?;
+    let jobs = prepared
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| {
+            selected.contains(&track.id)
+                && !matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+                && source_track_dsd_rate(track).is_none()
+        })
+        .map(|(index, track)| (index, track.clone()))
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(PreparedPcmTruePeakCarriers::default());
+    }
+
+    let analysis_cancel = cancel.child_token();
+    type PcmTruePeakFuture<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (usize, Result<PreparedPcmTruePeakCarrier, String>)>
+                + Send
+                + 'a,
+        >,
+    >;
+    let mut pending: Vec<Option<PcmTruePeakFuture<'_>>> = jobs
+        .into_iter()
+        .map(|(index, track)| {
+            let task_cancel = analysis_cancel.clone();
+            let task_tool_limits = tool_concurrency_limits.clone();
+            let task_carrier_dir = carrier_dir.as_path();
+            Some(Box::pin(async move {
+                let result = prepare_pcm_true_peak_carrier_for_track(
+                    req,
+                    track,
+                    staging,
+                    task_carrier_dir,
+                    runner,
+                    &task_cancel,
+                    tool_paths,
+                    task_tool_limits,
+                )
+                .await;
+                (index, result)
+            }) as PcmTruePeakFuture<'_>)
+        })
+        .collect();
+    let mut remaining = pending.len();
+    // Stage successful carriers separately and publish them into `prepared`
+    // only after every selected PCM track has completed. This keeps the
+    // preparation mutation atomic: a late worker failure cannot leave a
+    // partially rewritten PreparedSource that a caller might accidentally
+    // reuse or inspect on the error path.
+    let mut carriers = std::iter::repeat_with(|| None)
+        .take(prepared.tracks.len())
+        .collect::<Vec<Option<PreparedPcmTruePeakCarrier>>>();
+    let mut first_error = None;
+    while remaining > 0 {
+        let (track_index, result) = std::future::poll_fn(|cx| {
+            for slot in &mut pending {
+                let ready = slot.as_mut().and_then(|future| {
+                    match std::future::Future::poll(future.as_mut(), cx) {
+                        std::task::Poll::Ready(output) => Some(output),
+                        std::task::Poll::Pending => None,
+                    }
+                });
+                if let Some(output) = ready {
+                    *slot = None;
+                    return std::task::Poll::Ready(output);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await;
+        remaining -= 1;
+        match result {
+            Ok(carrier) if first_error.is_none() => {
+                carriers[track_index] = Some(carrier);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                    analysis_cancel.cancel();
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    let album_scope =
+        req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album;
+    let mut measurements = Vec::new();
+    for (track_index, carrier) in carriers.into_iter().enumerate() {
+        let Some(carrier) = carrier else {
+            continue;
+        };
+        prepared.tracks[track_index].source_ref = carrier.source_ref;
+        if album_scope {
+            measurements.push(carrier.measurement);
+        }
+    }
+    Ok(PreparedPcmTruePeakCarriers { measurements })
+}
+
+fn pcm_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("carrier");
+    let sign = if gain_db.0 < 0 { 'm' } else { 'p' };
+    let magnitude = gain_db.0.unsigned_abs();
+    path.with_file_name(format!("{stem}.gain-{sign}{magnitude}.f64le"))
+}
+
+fn scale_pcm_true_peak_f64le(
+    input: &Path,
+    output: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    gain_db: tonepoet_pipeline::DbNano,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("PCM true-peak gain requires a positive sample rate and channel count".to_string());
+    }
+    let mut input_file = fs::File::open(input)
+        .map_err(|error| format!("could not open PCM true-peak carrier for gain: {error}"))?;
+    let input_len = input_file
+        .metadata()
+        .map_err(|error| format!("could not stat PCM true-peak carrier for gain: {error}"))?
+        .len();
+    let frame_bytes = u64::from(channels)
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| "PCM true-peak gain frame size overflowed".to_string())?;
+    if input_len == 0 || input_len % frame_bytes != 0 {
+        return Err(format!(
+            "PCM true-peak gain input is not whole-frame headerless f64le: {} bytes for {} channels",
+            input_len, channels,
+        ));
+    }
+
+    // The measured carrier is regenerated for every materialization. Never
+    // reuse a gained file based only on path/gain: doing so could bind stale
+    // samples to a newly rendered carrier with the same source identity.
+    if output.exists() {
+        fs::remove_file(output)
+            .map_err(|error| format!("could not remove stale PCM true-peak gained carrier: {error}"))?;
+    }
+    let temp = output.with_extension("f64le.tmp");
+    let _ = fs::remove_file(&temp);
+    let gain = tonepoet_pipeline::conservative_linear_gain_lower(gain_db)?;
+    let result = (|| -> Result<(), String> {
+        let mut output_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("could not create PCM true-peak gained carrier: {error}"))?;
+        const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
+        let frame_bytes_usize = usize::try_from(frame_bytes)
+            .map_err(|_| "PCM true-peak gain frame size does not fit this platform".to_string())?;
+        let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes_usize).max(1) * frame_bytes_usize;
+        let mut bytes = vec![0_u8; buffer_len];
+        let mut written = 0_u64;
+        let mut remaining = input_len;
+        while remaining > 0 {
+            if cancel.is_cancelled() {
+                return Err("PCM true-peak gain cancelled".to_string());
+            }
+            let count = usize::try_from(remaining.min(buffer_len as u64))
+                .map_err(|_| "PCM true-peak carrier length does not fit this platform".to_string())?;
+            input_file
+                .read_exact(&mut bytes[..count])
+                .map_err(|error| format!("could not read PCM true-peak gain payload: {error}"))?;
+            for raw in bytes[..count].chunks_exact_mut(8) {
+                let sample = f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+                if !sample.is_finite() {
+                    return Err("PCM true-peak gain input contains a non-finite sample".to_string());
+                }
+                let scaled = sample * gain;
+                if !scaled.is_finite() {
+                    return Err("PCM true-peak gain produced a non-finite sample".to_string());
+                }
+                raw.copy_from_slice(&scaled.to_le_bytes());
+            }
+            output_file
+                .write_all(&bytes[..count])
+                .map_err(|error| format!("could not write PCM true-peak gain payload: {error}"))?;
+            written = written
+                .checked_add(count as u64)
+                .ok_or_else(|| "PCM true-peak gained carrier byte count overflowed".to_string())?;
+            remaining -= count as u64;
+        }
+        if written != input_len {
+            return Err(format!(
+                "PCM true-peak gained carrier length changed: expected {input_len} bytes, wrote {written}",
+            ));
+        }
+        output_file
+            .sync_all()
+            .map_err(|error| format!("could not sync PCM true-peak gained carrier: {error}"))?;
+        drop(output_file);
+        let published_len = fs::metadata(&temp)
+            .map_err(|error| format!("could not stat PCM true-peak gained carrier: {error}"))?
+            .len();
+        if published_len != input_len {
+            return Err(format!(
+                "PCM true-peak gained carrier has wrong length: expected {input_len}, got {published_len}",
+            ));
+        }
+        fs::rename(&temp, output)
+            .map_err(|error| format!("could not publish PCM true-peak gained carrier: {error}"))?;
+        sync_parent_dir(output)
+            .map_err(|error| format!("could not sync PCM true-peak gained-carrier directory: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 struct PreparedAlbumGainCarrier {
@@ -32756,7 +33897,10 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     // ordinary per-item rerun gate skip one participant before the aggregate is
     // bound; doing so could silently reuse an output normalized against a
     // different submitted set.
-    if !req.settings.dsd.album_auto_gain_selected() {
+    let submitted_album_gain_selected = req.settings.dsd.album_auto_gain_selected()
+        || (req.settings.pcm_true_peak.enabled
+            && req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album);
+    if !submitted_album_gain_selected {
         if let super::rerun::RerunDecision::Skip {
             manifest,
             manifest_path,
@@ -32836,7 +33980,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         &staging,
         runner,
         cancel,
-        tool_concurrency_limits,
+        tool_concurrency_limits.clone(),
     )
     .await
     {
@@ -32885,6 +34029,57 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         timings: album_gain_timings,
     } = prepared_album_gain_carriers;
 
+    let prepared_pcm_true_peak_carriers = match prepare_pcm_true_peak_carriers(
+        &req,
+        &mut prepared,
+        &album_plan,
+        &staging,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+    )
+    .await
+    {
+        Ok(carriers) => carriers,
+        Err(error) => {
+            let record = stage_record(
+                PipelineStage::Convert,
+                StageOutcome::Failed(format!("PCM true-peak analysis failed: {error}")),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let failed = failed_track_records(&prepared, &error);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed,
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+            };
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                Some(&prepared),
+                None,
+                &outcome,
+                staging,
+                Some(runner),
+            );
+            return ScheduledMaterialization::Finished(
+                finalize_report(
+                    &req,
+                    reporter,
+                    Some(prepared),
+                    Some(album_plan),
+                    None,
+                    published,
+                    outcome,
+                )
+                .await,
+            );
+        }
+    };
+    let pcm_true_peak_measurements = prepared_pcm_true_peak_carriers.measurements;
+
     ScheduledMaterialization::Ready(ScheduledAlbum {
         item_id,
         req,
@@ -32894,6 +34089,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         stages,
         source_replaygain: None,
         album_gain_measurements,
+        pcm_true_peak_measurements,
         album_gain_timings,
         album_gain_scope_disclosure: None,
         run_timing,
@@ -34746,14 +35942,26 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     retry_tool_paths: Option<&HashMap<String, PathBuf>>,
 ) -> PipelineReport {
-    let resolved_album_gain_scratch_authority = album.staging.is_scratch_staging()
+    let resolved_dsd_album_gain_scratch_authority = album.staging.is_scratch_staging()
         && album.req.settings.dsd.runtime_album_gain_db().is_some();
+    let resolved_pcm_album_gain_scratch_authority = album.staging.is_scratch_staging()
+        && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some();
+    let resolved_album_gain_scratch_authority = resolved_dsd_album_gain_scratch_authority
+        || resolved_pcm_album_gain_scratch_authority;
     let (mut album_gain_retry_seed, album_gain_retry_seed_error) =
-        if resolved_album_gain_scratch_authority {
+        if resolved_dsd_album_gain_scratch_authority {
             match DsdAlbumGainScratchRetrySeed::capture(&album) {
                 Ok(seed) => (seed, None),
                 Err(error) => (None, Some(error)),
             }
+        } else if resolved_pcm_album_gain_scratch_authority {
+            (
+                None,
+                Some(
+                    "PCM true-peak Album scope has a resolved submitted-batch gain; generic source retry is unsafe because it would discard the retained measured carrier"
+                        .to_string(),
+                ),
+            )
         } else {
             (None, None)
         };
@@ -34797,7 +36005,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                 if resolved_album_gain_scratch_authority {
                     if cancel.is_cancelled() {
                         log::warn!(
-                            "resolved DSD album-gain scratch retry suppressed by cancellation: job_id={}, item_id={}, original_error={}",
+                            "resolved album-gain scratch retry suppressed by cancellation: job_id={}, item_id={}, original_error={}",
                             req.job_id,
                             item_id,
                             original_error,
@@ -34819,7 +36027,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                             Ok(report) => return report,
                             Err(error) => {
                                 log::error!(
-                                    "resolved DSD album-gain scratch disk retry failed; refusing unsafe generic source retry: job_id={}, item_id={}, error={}, original_error={}",
+                                    "resolved album-gain scratch disk retry failed; refusing unsafe generic source retry: job_id={}, item_id={}, error={}, original_error={}",
                                     req.job_id,
                                     item_id,
                                     error,
@@ -34832,7 +36040,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                             .as_deref()
                             .unwrap_or("scheduler did not provide album-aware retry tool paths");
                         log::error!(
-                            "resolved DSD album-gain scratch retry unavailable; refusing unsafe generic source retry: job_id={}, item_id={}, reason={}, original_error={}",
+                            "resolved album-gain scratch retry unavailable; refusing unsafe generic source retry: job_id={}, item_id={}, reason={}, original_error={}",
                             req.job_id,
                             item_id,
                             reason,
@@ -38572,7 +39780,8 @@ fn companion_track_source_path_and_role(
 ) -> Option<(&Path, CompanionSourceRefRole)> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => {
+        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => {
             Some((source_path.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -46215,6 +47424,7 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
         TrackSourceRef::DsdAlbumGainCarrier { .. }
+        | TrackSourceRef::PcmTruePeakCarrier { .. }
         | TrackSourceRef::CueStreamSegment { .. }
         | TrackSourceRef::CueSegmentCarrier { .. }
         | TrackSourceRef::EmbeddedChapterCarrier { .. }
@@ -46229,7 +47439,8 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
 fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => Some(source_path.as_path()),
+        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => Some(source_path.as_path()),
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => Some(source_image.as_path()),
@@ -49224,6 +50435,26 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
         return StagingParentSelection::disk(disk_parent);
     }
 
+    if req.settings.pcm_true_peak.enabled
+        && req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album
+    {
+        // Album scope retains a final-rate Float64 carrier until the complete
+        // submitted set reaches the gain barrier. Before materialization, the
+        // generic scratch estimator cannot bound that decoded expansion for
+        // every supported PCM container, and retrying one member after the
+        // shared gain is bound would violate submitted-set identity. Keep this
+        // path on ordinary disk staging until a carrier-aware scratch estimate
+        // can be proved. Track scope remains eligible for the existing safe
+        // one-item disk retry.
+        log::info!(
+            "scratch bypassed for PCM true-peak Album scope: job_id={}, item_id={}, disk_staging_path={}; retained Float64 carrier size is not bounded before materialization",
+            req.job_id,
+            req.item_id,
+            disk_parent.display(),
+        );
+        return StagingParentSelection::disk(disk_parent);
+    }
+
     let scratch_parent = scratch.root().join(STAGING_PARENT_NAME);
     if let Err(err) = scratch.ensure_usable(&scratch_parent) {
         log::warn!(
@@ -49413,6 +50644,31 @@ mod scratch_staging_parent_tests {
         // The source-kind detector does not need to parse this fixture: `.iso`
         // is enough to select the SACD/multi-track family for this admission
         // policy. The returned parent must remain disk-backed.
+        let selected = select_staging_parent_for(&req);
+        assert_eq!(selected.parent, disk_staging_parent_for(&req));
+        assert!(selected.scratch_reservation.is_none());
+    }
+
+    #[test]
+    fn pcm_true_peak_album_scope_bypasses_unbounded_scratch_carrier() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("out");
+        req.settings.pcm_true_peak.enabled = true;
+        req.settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
+        req.scratch_staging = Some(ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+            temp.path().join("scratch"),
+            50,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+            10 * 1024 * 1024 * 1024,
+        ));
+
         let selected = select_staging_parent_for(&req);
         assert_eq!(selected.parent, disk_staging_parent_for(&req));
         assert!(selected.scratch_reservation.is_none());
@@ -49881,7 +51137,8 @@ fn build_manifest_for_album(
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| match &t.source_ref {
                         TrackSourceRef::StagedFile(p) => p.clone(),
-                        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. } => {
+                        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
+                        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => {
                             source_path.clone()
                         }
                         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -57087,6 +58344,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 stages: Vec::new(),
                 source_replaygain: None,
                 album_gain_measurements: Vec::new(),
+                pcm_true_peak_measurements: Vec::new(),
                 album_gain_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
                 run_timing: ConversionRunTiming::start(),
@@ -66124,6 +67382,41 @@ mod validate_encoded_output_tests {
         );
     }
 
+    #[test]
+    fn expected_post_encode_depth_uses_hybrid_source_working_depth_for_pcm_true_peak() {
+        let mut track = non_dvda_validation_test_track(Some(1_000_000), Some(48_000));
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        settings.wavpack.hybrid = true;
+        settings.pcm_true_peak.enabled = true;
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+
+        for (source_bits, expected) in [
+            (320, tonepoet_pipeline::PcmBitDepth::Int24),
+            (640, tonepoet_pipeline::PcmBitDepth::Int24),
+            (16, tonepoet_pipeline::PcmBitDepth::Int16),
+            (24, tonepoet_pipeline::PcmBitDepth::Int24),
+            (32, tonepoet_pipeline::PcmBitDepth::Int32),
+        ] {
+            track.bit_depth = Some(source_bits);
+            track.source_audio.bit_depth = Some(source_bits);
+            assert_eq!(
+                expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
+                Some(expected),
+                "post-encode validation must expect the same hybrid Source working depth selected by planning",
+            );
+        }
+
+        settings.wavpack.hybrid = false;
+        track.bit_depth = Some(320);
+        track.source_audio.bit_depth = Some(320);
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+            "ordinary lossless WavPack Source semantics must remain unchanged",
+        );
+    }
+
     #[tokio::test]
     async fn post_encode_depth_validation_returns_measured_depth_for_log() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -66222,6 +67515,55 @@ mod validate_encoded_output_tests {
         .expect("WavPack 24-bit should be measured by wvunpack, not ffprobe's s32 container representation");
 
         assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
+        assert_eq!(runner.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn wavpack_hybrid_float_source_validation_accepts_int24_working_depth() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = stub_with_probe_and_wvunpack(
+            &ffprobe_exact_json_with_depth(
+                48_000,
+                1_000_000,
+                "wavpack",
+                "s32p",
+                32,
+            ),
+            "source:            24-bit ints at 48000 Hz\nduration:          0:00:20.83\n",
+        );
+        let cancel = CancellationToken::new();
+        let mut track = non_dvda_validation_test_track(Some(1_000_000), Some(48_000));
+        track.bit_depth = Some(320);
+        track.source_audio.bit_depth = Some(320);
+        track.source_audio.coding = Some(SourceAudioCoding::Pcm);
+
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        settings.wavpack.hybrid = true;
+        settings.pcm_true_peak.enabled = true;
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        let expected_depth = expected_post_encode_depth_for_track(&track, &settings)
+            .expect("hybrid Float32 Source must resolve a strict integer validation depth");
+        assert_eq!(expected_depth.depth, tonepoet_pipeline::PcmBitDepth::Int24);
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(expected_depth),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("hybrid Float32 Source encoded from the admitted Int24 carrier must validate");
+
+        assert_eq!(
+            validation.measured_depth,
+            Some(tonepoet_pipeline::PcmBitDepth::Int24)
+        );
         assert_eq!(runner.transcript().len(), 2);
     }
 

@@ -388,6 +388,15 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         }
     };
 
+    let mut pcm_true_peak = tonepoet_pipeline::PcmTruePeakGainSettings::default();
+    pcm_true_peak.enabled = !is_dsd
+        && !format.source_is_dsd
+        && *format.pcm_true_peak_enabled.selected_value();
+    pcm_true_peak.target_dbtp = format.pcm_true_peak_target_dbtp;
+    pcm_true_peak.allow_boost = *format.pcm_true_peak_boost.selected_value();
+    pcm_true_peak.scope = *format.pcm_true_peak_scope.selected_value();
+    pcm_true_peak.scan_mode = *format.pcm_true_peak_scan_mode.selected_value();
+
     // settings-sentinel-allow: sub-struct defaults are correct here — user-facing
     // settings (format, rate, depth, dither, resampler, RG) are set from pill state;
     // codec-specific sub-structs (flac, mp3, aac, etc.) use defaults until the TUI
@@ -530,6 +539,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             phase: format.soxr_phase,
         },
         dsd,
+        pcm_true_peak,
         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
         metadata: Default::default(),
         verification: Default::default(),
