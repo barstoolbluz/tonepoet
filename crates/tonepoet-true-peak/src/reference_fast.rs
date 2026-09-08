@@ -96,6 +96,7 @@ fn reference_two_x_impulse_response(taps: usize) -> Vec<f64> {
 
 fn build_reference_tail_kernels() -> ReferenceTailKernels {
     let mut response = vec![1.0_f64];
+    let mut expected_response_len = 1_usize;
     let mut delay = 0_i32;
     for taps in [
         HEADROOM64_STAGE_3_TAPS,
@@ -103,15 +104,36 @@ fn build_reference_tail_kernels() -> ReferenceTailKernels {
         HEADROOM64_STAGE_5_TAPS,
         HEADROOM64_STAGE_6_TAPS,
     ] {
+        let stage_response = reference_two_x_impulse_response(taps);
+        // Blackman is mathematically zero at both nominal FIR endpoints. The
+        // shared filter builder drops those near-zero coefficients, and the
+        // impulse-response helper trims the resulting trailing zero. Its
+        // represented buffer is therefore taps - 1 samples long (indices
+        // 0..taps-2), not the nominal taps samples. Keep that construction
+        // invariant explicit so a future window/filter change cannot silently
+        // alter the tail kernel.
+        let expected_stage_response_len = taps - 1;
+        debug_assert_eq!(stage_response.len(), expected_stage_response_len);
+
         let mut upsampled = vec![0.0; response.len() * 2 - 1];
         for (index, value) in response.iter().copied().enumerate() {
             upsampled[index * 2] = value;
         }
-        response = convolve(&upsampled, &reference_two_x_impulse_response(taps));
+        response = convolve(&upsampled, &stage_response);
+        expected_response_len = expected_response_len * 2 + expected_stage_response_len - 2;
+        debug_assert_eq!(response.len(), expected_response_len);
         delay = (delay + ((taps - 1) / 4) as i32) * 2;
     }
     debug_assert_eq!(delay, TAIL_DELAY_SUBFRAMES);
-    debug_assert_eq!(response.len(), 289);
+    debug_assert!(response.iter().enumerate().all(|(index, coefficient)| {
+        if *coefficient == 0.0 {
+            return true;
+        }
+        let index = index as i32;
+        let phase = (index - delay).rem_euclid(TAIL_FACTOR);
+        let offset = (phase + delay - index) / TAIL_FACTOR;
+        (TAIL_OFFSET_MIN..=TAIL_OFFSET_MAX).contains(&offset)
+    }));
 
     let mut coefficients = [[0.0_f64; TAIL_OFFSET_COUNT]; 16];
     for phase in 0..16_i32 {

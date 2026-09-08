@@ -2959,16 +2959,16 @@ mod tests {
         req.settings.wavpack.hybrid = false;
         prepared_track.bit_depth = Some(320);
         prepared_track.source_audio.bit_depth = Some(320);
-        let planned_lossless_float = plan_request_for_track(
+        let error = plan_request_for_track(
             &req,
             &prepared_track,
             &carrier,
             &output,
             temp.path().join("work-lossless-float"),
         )
-        .expect("bridge resolves ordinary WavPack Source before planner validation");
-        let error = tonepoet_pipeline::plan_conversion(&planned_lossless_float)
-            .expect_err("ordinary lossless WavPack must still reject floating-point Source output");
+        .expect_err(
+            "ordinary lossless WavPack Source must reject floating-point output during bridge validation",
+        );
         let message = error.to_string();
         assert!(message.contains("WavPack"), "{message}");
         assert!(message.to_ascii_lowercase().contains("float"), "{message}");
