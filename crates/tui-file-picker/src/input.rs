@@ -2196,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn every_picker_text_surface_dispatches_mouse_copy_cut_and_internal_paste_uniformly() {
+    fn every_picker_text_surface_dispatches_mouse_copy_cut_and_host_paste_uniformly() {
         use std::sync::{Arc, Mutex};
 
         fn active_text(picker: &FilePickerState) -> &str {
@@ -2263,6 +2263,14 @@ mod tests {
                     KeyModifiers::CONTROL,
                 )),
                 FilePickerAction::None,
+            );
+            assert!(
+                picker.take_host_clipboard_paste_request(),
+                "Ctrl+P on a picker text field must request the authoritative host clipboard",
+            );
+            assert!(
+                picker.paste_host_clipboard_text("abc"),
+                "the returned host clipboard text must be applied to the focused picker field",
             );
             assert_eq!(active_text(picker), "abcdef");
         }

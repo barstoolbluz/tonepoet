@@ -11126,7 +11126,7 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn editing_phase_bracketed_track_scalar_paste_confirms_and_rejects_extra_lines() {
+    fn editing_phase_bracketed_track_scalar_paste_confirms_and_drops_extra_lines() {
         let mut state = MetadataEditorState::for_files(
             vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
             vec![editing_entry("TITLE", ItemKey::TrackTitle, &["Old A", "Old B"])],
@@ -11166,14 +11166,38 @@ mod metadata_detail_paste_tests {
         };
         assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
 
-        handle_paste(&mut app, "One\nTwo\nThree", &tx);
-        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("editor remains open after rejected paste");
+        handle_paste(&mut app, "Three\nFour\nIgnored", &tx);
+        let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
+            panic!("overflow TrackScalar paste must still ask for confirmation");
         };
-        assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
+        assert!(matches!(
+            action,
+            super::super::app::ConfirmAction::MetadataRowsClipboardPaste {
+                session_id: actual_session,
+                field_index: 0,
+                text,
+            } if *actual_session == session_id && text == "Three\nFour\nIgnored"
+        ));
+        assert!(
+            message.contains("1 surplus line will be ignored"),
+            "overflow confirmation must disclose the ignored surplus: {message}",
+        );
+
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("editor returns after overflow confirmation");
+        };
         assert_eq!(
-            app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("TITLE paste has 3 lines for 2 tracks; refusing to discard the extra lines")
+            state.active_surface().entries[0].per_file_values,
+            ["Three", "Four"],
+            "surplus clipboard lines must be dropped after the available tracks are filled",
         );
     }
 

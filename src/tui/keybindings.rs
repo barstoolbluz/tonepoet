@@ -3986,14 +3986,6 @@ fn metadata_editor_inline_host_clipboard_text(
     }
     let lines = normalized_paste_lines(text);
     let slot_count = entry.per_file_values.len();
-    if lines.len() > slot_count {
-        return Err(format!(
-            "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
-            key,
-            lines.len(),
-            slot_count
-        ));
-    }
     let encoded = lines
         .iter()
         .map(|line| {
@@ -4166,26 +4158,27 @@ pub(crate) fn handle_terminal_clipboard_text(
                             .unwrap_or_else(|| "field".to_string());
                         let slot_count = state.active_surface().entries.get(field_index)
                             .map(|entry| entry.per_file_values.len()).unwrap_or(0);
-                        if line_count > slot_count {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                            app.set_status(format!(
-                                "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
-                                key, line_count, slot_count
-                            ));
+                        let message = if line_count > slot_count {
+                            let surplus = line_count - slot_count;
+                            format!(
+                                "Paste the first {slot_count} of {line_count} clipboard lines into {key}, one line per track in order? {surplus} surplus line{} will be ignored.",
+                                if surplus == 1 { "" } else { "s" },
+                            )
                         } else {
-                            metadata_editor_open_clipboard_confirmation(
-                                app,
-                                state,
-                                ConfirmAction::MetadataRowsClipboardPaste {
-                                    session_id,
-                                    field_index,
-                                    text,
-                                },
-                                format!(
-                                    "Paste {line_count} clipboard lines into {key}, one line per track in order? Trailing tracks will be left unchanged."
-                                ),
-                            );
-                        }
+                            format!(
+                                "Paste {line_count} clipboard lines into {key}, one line per track in order? Trailing tracks will be left unchanged."
+                            )
+                        };
+                        metadata_editor_open_clipboard_confirmation(
+                            app,
+                            state,
+                            ConfirmAction::MetadataRowsClipboardPaste {
+                                session_id,
+                                field_index,
+                                text,
+                            },
+                            message,
+                        );
                     } else {
                         match metadata_editor_apply_clipboard_text_without_confirmation(
                             app,
@@ -4316,11 +4309,23 @@ pub(crate) fn handle_terminal_clipboard_text(
                         && state.phase == MetadataEditorPhase::InlineEdit
                         && state.cursor == field_index =>
                 {
-                    match metadata_editor_inline_host_clipboard_text(state, field_index, &text) {
-                        Ok(paste_text) => state.edit_input.as_mut().map(|input| input.insert_string(&paste_text)).is_some(),
-                        Err(reason) => {
-                            success_status = Some(reason);
-                            true
+                    if single_line_clipboard_text(&text).is_empty() {
+                        success_status = Some(
+                            "Clipboard paste made no changes because its first line is empty"
+                                .to_string(),
+                        );
+                        true
+                    } else {
+                        match metadata_editor_inline_host_clipboard_text(state, field_index, &text) {
+                            Ok(paste_text) => state
+                                .edit_input
+                                .as_mut()
+                                .map(|input| input.insert_string(&paste_text))
+                                .is_some(),
+                            Err(reason) => {
+                                success_status = Some(reason);
+                                true
+                            }
                         }
                     }
                 }
@@ -22102,19 +22107,10 @@ fn metadata_editor_apply_clipboard_text_without_confirmation(
             let taxonomy = crate::metadata_persistence::metadata_field_taxonomy(&key);
             let lines = normalized_paste_lines(text);
             if taxonomy.inline_class == crate::metadata_persistence::MetadataInlineEditClass::TrackScalar {
-                let slot_count = entry.per_file_values.len();
-                if lines.len() > slot_count {
-                    return Err(format!(
-                        "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
-                        key,
-                        lines.len(),
-                        slot_count
-                    ));
-                }
                 // A single trailing line terminator is text-file framing, not
-                // an extra empty track value. Validation above already uses
-                // `normalized_paste_lines`; apply the exact same normalized
-                // payload so confirmation and mutation cannot disagree.
+                // an extra empty track value. Apply the normalized payload so
+                // confirmation and mutation use the same line count; the core
+                // positional mapper intentionally drops any surplus lines.
                 let normalized_text = lines.join("\n");
                 let result = metadata_editor_apply_detail_paste_with_mode(
                     state,
@@ -73730,7 +73726,7 @@ ignored".to_string()),
     }
 
     #[test]
-    fn track_scalar_inline_host_clipboard_keeps_existing_scalar_short_list_and_overflow_rules() {
+    fn track_scalar_inline_host_clipboard_keeps_scalar_short_list_and_drops_overflow() {
         let title = entry(
             "TITLE",
             ItemKey::TrackTitle,
@@ -73785,8 +73781,29 @@ ignored".to_string()),
         );
 
         let overflow = metadata_editor_inline_host_clipboard_text(&state, 0, "1\n2\n3\n4\n")
-            .expect_err("overflow must remain rejected");
-        assert!(overflow.contains("4 lines for 3 tracks"));
+            .expect("overflow positional list");
+        assert_eq!(overflow, "1; 2; 3; 4");
+        let mut overflow_state = state.clone();
+        overflow_state.cursor = 0;
+        assert_eq!(
+            metadata_editor_begin_cursor_value_edit(&mut overflow_state, true),
+            None,
+        );
+        overflow_state.edit_input = Some(crate::tui::text_input::TextInputState::new(overflow));
+        let mut overflow_app = AppState::new_for_test(TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(
+            &mut overflow_app,
+            &mut overflow_state,
+        ));
+        assert_eq!(
+            overflow_state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"],
+            "inline TrackScalar paste must fill available tracks and ignore surplus lines",
+        );
     }
 
     #[test]
