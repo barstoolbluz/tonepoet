@@ -181,13 +181,17 @@ impl FilePickerState {
                 _ => {}
             }
         }
-        if matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
-            && key
-                .modifiers
-                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && self.host_clipboard_paste_is_available()
-        {
+        let host_text_paste_chord = match key.code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v') => {
+                key.modifiers == KeyModifiers::CONTROL
+                    || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => {
+                key.modifiers == KeyModifiers::CONTROL
+            }
+            _ => false,
+        };
+        if host_text_paste_chord && self.host_clipboard_paste_is_available() {
             self.host_clipboard_paste_requested = true;
             return FilePickerAction::None;
         }
@@ -1731,12 +1735,8 @@ impl FilePickerState {
                 FilePickerAction::None
             }
             FilePickerMenuAction::TextPaste => {
-                let refresh_search = self.context_menu_kind == FilePickerContextMenuKind::SearchEditor;
-                if let Some(input) = self.context_text_input_mut() {
-                    input.paste_clipboard();
-                }
-                if refresh_search {
-                    self.restart_search();
+                if self.context_text_input_mut().is_some() {
+                    self.host_clipboard_paste_requested = true;
                 }
                 self.close_menu();
                 FilePickerAction::None
@@ -2349,7 +2349,10 @@ mod tests {
         picker.open_context_menu(Some(FilePickerHitAction::SearchInput), 1, 1);
         assert_eq!(picker.context_menu_kind, FilePickerContextMenuKind::SearchEditor);
         assert_eq!(picker.previous_focus, FilePickerFocus::Search);
-        picker.close_menu();
+        assert!(picker.is_menu_action_enabled(FilePickerMenuAction::TextPaste));
+        picker.apply_menu_action_if_enabled(FilePickerMenuAction::TextPaste);
+        assert!(picker.take_host_clipboard_paste_request());
+        assert_eq!(picker.search.input.text, "needle");
 
         picker.focus = FilePickerFocus::SaveName;
         picker.save_name_input = crate::text_input::TextInputState::new("album".to_string());
@@ -2379,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_v_requests_host_paste_only_for_focused_text_editors() {
+    fn all_text_paste_chords_request_host_paste_only_for_focused_text_editors() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut picker = FilePickerState::new(FilePickerConfig {
             start_dir: temp.path().to_path_buf(),
@@ -2387,6 +2390,21 @@ mod tests {
         });
 
         picker.begin_address_edit();
+        for (code, modifiers) in [
+            (KeyCode::Char('v'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(code, modifiers)),
+                FilePickerAction::None
+            );
+            assert!(picker.take_host_clipboard_paste_request());
+            assert!(!picker.take_host_clipboard_paste_request());
+        }
         assert_eq!(
             picker.handle_key(KeyEvent::new(
                 KeyCode::Char('v'),
@@ -2395,7 +2413,6 @@ mod tests {
             FilePickerAction::None
         );
         assert!(picker.take_host_clipboard_paste_request());
-        assert!(!picker.take_host_clipboard_paste_request());
         assert_eq!(
             picker.handle_key(KeyEvent::new(
                 KeyCode::Char('V'),

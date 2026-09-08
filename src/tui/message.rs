@@ -129,6 +129,20 @@ pub struct FileOperationReplayResult {
 /// merely because some editor happens to be open when a worker finishes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostClipboardPasteTarget {
+    /// Replay the host clipboard through the same focus reducer as a terminal
+    /// bracketed-paste event. The interaction generation rejects late reads
+    /// after any intervening key/mouse/paste event changes user intent.
+    CurrentTerminalFocus {
+        interaction_generation: u64,
+    },
+    /// Replay one host snapshot through the ordinary key reducer for a
+    /// specific reusable text editor. This is primarily used by right-click
+    /// Paste, where the context menu temporarily owns focus while the editor
+    /// itself is parked/restored.
+    EditorText {
+        target: crate::tui::app::EditorTextTarget,
+        interaction_generation: u64,
+    },
     BrowseInlineEdit {
         target: crate::tui::app::BrowseInlineEditTarget,
     },
@@ -151,6 +165,22 @@ pub enum HostClipboardPasteTarget {
         session_id: u64,
         field_index: usize,
     },
+    /// Paste onto the selected metadata key row. Structured single-field
+    /// payloads are free-form; field sets and track-scalar line lists retain
+    /// the frozen row/session for confirmation.
+    MetadataRows {
+        session_id: u64,
+        field_index: usize,
+    },
+    /// Whole-view tag paste requested by the metadata `tags` popup.
+    MetadataTags {
+        session_id: u64,
+        view: crate::tui::app::MetadataEditorView,
+    },
+    /// Paste chapter titles from the terminal clipboard.
+    MetadataChapterTitles {
+        session_id: u64,
+    },
     FilePickerOverlay {
         session_id: u64,
     },
@@ -163,7 +193,7 @@ pub enum HostClipboardPasteTarget {
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
-    /// Completion of an explicit Ctrl+Shift+V host-clipboard read.
+    /// Completion of an explicit terminal-clipboard read.
     HostClipboardReadComplete {
         generation: u64,
         target: HostClipboardPasteTarget,

@@ -5191,11 +5191,11 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                         || topic.eq_ignore_ascii_case("tmux")
                         || topic.eq_ignore_ascii_case("byobu") =>
                 {
-                    const CLIPBOARD_HELP: &str = "Host and Tonepoet clipboards
+                    const CLIPBOARD_HELP: &str = "Terminal clipboard
 
-Copy and cut always update Tonepoet's in-app clipboard first. Tonepoet mirrors a text projection to the host clipboard on a background worker, preferring wl-copy on Wayland and xclip/xsel on X11. When no native helper is available, writes fall back to OSC 52 through /dev/tty.
+Tonepoet has one text clipboard: the terminal/host clipboard. Text and metadata copy/cut publish there directly, preferring wl-copy on Wayland and xclip/xsel on X11. When no native helper is available, writes fall back to OSC 52 through /dev/tty. Structured metadata is encoded as a versioned text envelope so multi-value and positional fields survive the host clipboard round trip without a second in-process authority.
 
-Ctrl+V and Ctrl+P paste Tonepoet's internal clipboard. Ctrl+Shift+V reads host text with wl-paste, xclip, or xsel and inserts it into the focused text editor. Host filesystem paths are not interpreted as file-operation instructions.
+Ctrl+V, Ctrl+P, and Ctrl+Shift+V all paste from that same host clipboard. When a terminal supplies a bracketed-paste payload Tonepoet consumes that payload directly; otherwise the key chord triggers an asynchronous host-clipboard read. Filesystem Cut/Copy/Paste keeps its separate operation transaction state; that is not a text clipboard.
 
 Run :clipboard to inspect the detected display/multiplexer environment, helper discovery, a reversible live write/read check when restoration is safe, and recent transport outcomes.
 
@@ -5206,7 +5206,7 @@ For OSC 52 fallback inside tmux or byobu, add these settings to the tmux/byobu p
 
 Tonepoet can apply these for you: set manage_tmux_clipboard = true under [ui] in config.toml and the next TUI start writes an idempotent, backed-up block to ~/.byobu/.tmux.conf (byobu) or ~/.tmux.conf (plain tmux). This will become a Config screen toggle once that screen is built out.
 
-Native helper failures, missing displays, denied clipboard access, and oversized payloads never block or invalidate Tonepoet's internal clipboard. OSC 52 fallback is capped at 64 KiB; larger content remains available internally.";
+Host clipboard failures are reported instead of silently claiming that an internal copy succeeded. OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for larger payloads.";
                     app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                         super::app::CuePreviewState::new_readonly_help(
                             "Clipboard help".to_string(),

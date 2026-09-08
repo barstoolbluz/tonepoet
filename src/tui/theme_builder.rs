@@ -259,6 +259,28 @@ struct DerivedListRow {
 }
 
 impl ThemeBuilderState {
+    /// True when keyboard text events currently belong to one of the
+    /// builder's `TextInputState` fields. The app-level clipboard bridge uses
+    /// this to fetch the host clipboard before replaying Ctrl+V/Ctrl+P through
+    /// the normal builder reducer.
+    pub fn text_input_owns_focus(&self) -> bool {
+        match self.overlay {
+            BuilderOverlay::Gallery => self.gallery_filter_active,
+            BuilderOverlay::ExportDialog | BuilderOverlay::ImportDialog => true,
+            BuilderOverlay::MoreMenu
+            | BuilderOverlay::Apply
+            | BuilderOverlay::DeleteConfirm => false,
+            BuilderOverlay::None => {
+                (self.swatch_naming_active && self.tab == BuilderTab::Edit)
+                    || (self.tab == BuilderTab::Edit
+                        && self.editor_focus == BuilderEditorFocus::Hex)
+                    || (self.tab == BuilderTab::Derived
+                        && self.editor_focus == BuilderEditorFocus::Hex
+                        && self.selected_derived_locked())
+            }
+        }
+    }
+
     pub fn from_active_theme(theme: theme::Theme) -> Self {
         Self::from_active_theme_with_library(theme, theme::theme_choices())
     }

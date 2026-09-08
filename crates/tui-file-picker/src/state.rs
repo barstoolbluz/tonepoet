@@ -1203,7 +1203,7 @@ pub struct FilePickerState {
     pub(crate) sort_reverse: bool,
     pub(crate) sort_changed: bool,
     pub(crate) clipboard: Option<FilesystemClipboard>,
-    /// One-shot request raised by Ctrl+Shift+V in a focused text editor.
+    /// One-shot request raised by a paste chord in a focused text editor.
     /// The embedding application owns the asynchronous host clipboard read.
     pub(crate) host_clipboard_paste_requested: bool,
     pub(crate) paste_task: Option<PickerPasteTask>,
@@ -5024,9 +5024,10 @@ impl FilePickerState {
             FilePickerMenuAction::TextCopy => self
                 .context_text_input()
                 .is_some_and(TextInputState::has_selection),
-            FilePickerMenuAction::TextPaste => self
-                .context_text_input()
-                .is_some_and(TextInputState::can_paste),
+            // Host clipboard contents are asynchronous and cannot be queried
+            // while building a context menu. Offer Paste whenever a text
+            // editor owns the menu; dispatch resolves empty/unavailable state.
+            FilePickerMenuAction::TextPaste => self.context_text_input().is_some(),
             FilePickerMenuAction::TextDelete => self.context_text_input().is_some_and(|input| {
                 input.has_selection() || input.cursor < input.text.len()
             }),

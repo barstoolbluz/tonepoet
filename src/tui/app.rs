@@ -12638,6 +12638,20 @@ pub enum ConfirmAction {
         scope: TagTransferScope,
         edit_count: usize,
     },
+    /// Apply a frozen terminal-clipboard snapshot to the selected metadata
+    /// row after the user confirms positional/multi-field overwrite semantics.
+    MetadataRowsClipboardPaste {
+        session_id: u64,
+        field_index: usize,
+        text: String,
+    },
+    /// Apply a frozen terminal-clipboard field set to the active metadata view
+    /// after confirming overwrites.
+    MetadataTagsClipboardPaste {
+        session_id: u64,
+        view: MetadataEditorView,
+        text: String,
+    },
     /// Browse-side tag transfer prepared and dry-run planned before any
     /// target mutation. Confirmation executes exactly this frozen snapshot.
     BrowseTagTransfer {
@@ -13173,6 +13187,16 @@ pub struct AppState {
     /// Last-request-wins ownership for asynchronous host-clipboard reads.
     pub host_clipboard_paste_generation: u64,
 
+    /// UI-interaction epoch captured by generic terminal-clipboard paste reads.
+    /// Any later key, mouse, or bracketed-paste event invalidates a slow read
+    /// before it can land in a newly focused field.
+    pub host_clipboard_interaction_generation: u64,
+
+    /// True only while replaying a completed terminal-clipboard read through
+    /// an existing TextInput reducer. The scoped payload is transient and the
+    /// guard prevents the replayed Ctrl+V from launching a second host read.
+    pub host_clipboard_replay_active: bool,
+
     /// Most recent terminal file-task state, retained after its live overlay is
     /// dismissed so full warnings/failures remain inspectable via `:messages`.
     pub last_file_task_progress: Option<(u64, tui_file_picker::FileTaskProgressState)>,
@@ -13256,9 +13280,10 @@ pub struct AppState {
     /// restored after the command executes or review completes.
     pub pending_metadata_editor: Option<Box<MetadataEditorState>>,
 
-    /// Structured field clipboard for cross-folder Copy/Paste in the metadata
-    /// detail overlay. App ownership is deliberate: it survives overlay close,
-    /// Browse navigation, and tab switches while retaining per-track lists.
+    /// Unit-test seam for legacy clipboard assertions. Production builds have
+    /// no structured in-process metadata clipboard; the terminal clipboard is
+    /// authoritative.
+    #[cfg(test)]
     pub metadata_field_clipboard: Option<crate::tui::tag_interchange::FieldBlock>,
 
     /// Browse-screen archive metadata extraction currently in flight. This owns
@@ -14368,6 +14393,8 @@ impl AppState {
             pending_editor_context_overlay: None,
             editor_context_target: None,
             host_clipboard_paste_generation: 0,
+            host_clipboard_interaction_generation: 0,
+            host_clipboard_replay_active: false,
             last_file_task_progress: None,
             minimized_file_task_progress: None,
             file_task_preempted_overlay: None,
@@ -14388,6 +14415,7 @@ impl AppState {
             browse_context_action_paths: None,
             pending_bulk_rename: None,
             pending_metadata_editor: None,
+            #[cfg(test)]
             metadata_field_clipboard: None,
             pending_browse_archive_metadata: None,
             pending_browse_archive_rename: None,

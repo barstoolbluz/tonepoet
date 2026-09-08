@@ -6601,14 +6601,71 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             generation,
             target,
             result,
-        } => {
-            super::keybindings::handle_host_clipboard_read_complete(
-                app,
-                generation,
+        } => match target {
+            super::message::HostClipboardPasteTarget::EditorText {
                 target,
-                result,
-            );
-        }
+                interaction_generation,
+            } => {
+                if generation != app.host_clipboard_paste_generation {
+                    return;
+                }
+                if interaction_generation != app.host_clipboard_interaction_generation {
+                    app.set_status(
+                        "Terminal clipboard result ignored because focus changed while it was being read",
+                    );
+                    return;
+                }
+                if super::keybindings::editor_text_input(app, target).is_none() {
+                    app.set_status("Terminal clipboard result ignored because the editor changed");
+                    return;
+                }
+                match result {
+                    Ok(text) if !text.is_empty() => {
+                        replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                    }
+                    Ok(_) => app.set_status("Terminal clipboard is empty"),
+                    Err(error) => {
+                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                    }
+                }
+            }
+            super::message::HostClipboardPasteTarget::CurrentTerminalFocus {
+                interaction_generation,
+            } => {
+                if generation != app.host_clipboard_paste_generation {
+                    return;
+                }
+                if interaction_generation != app.host_clipboard_interaction_generation {
+                    app.set_status(
+                        "Terminal clipboard result ignored because focus changed while it was being read",
+                    );
+                    return;
+                }
+                match result {
+                    Ok(text) if !text.is_empty() => {
+                        if !super::keybindings::current_focus_needs_generic_host_clipboard(app) {
+                            app.set_status(
+                                "Terminal clipboard result ignored because the editor changed",
+                            );
+                            return;
+                        }
+                        replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                    }
+                    Ok(_) => app.set_status("Terminal clipboard is empty"),
+                    Err(error) => {
+                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                    }
+                }
+            }
+            target => {
+                super::keybindings::handle_host_clipboard_read_complete(
+                    app,
+                    generation,
+                    target,
+                    result,
+                );
+            }
+        },
         AppMessage::HostClipboardDiagnosticComplete { report } => {
             app.active_overlay = ActiveOverlay::CuePreview(Box::new(
                 super::app::CuePreviewState::new_readonly_help(
@@ -10291,10 +10348,47 @@ fn insert_single_line_terminal_paste(input: &mut TextInputState, text: &str) {
     }
 }
 
+fn replay_single_line_terminal_text_at_current_focus(
+    app: &mut AppState,
+    text: &str,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let first_line = text.lines().next().unwrap_or("").to_string();
+    app.host_clipboard_replay_active = true;
+    tui_file_picker::with_scoped_shared_text_clipboard(first_line, || {
+        super::keybindings::handle_key(
+            app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            tx,
+        );
+    });
+    app.host_clipboard_replay_active = false;
+}
+
 /// Handle a bracketed paste event. When the BulkRename overlay is active,
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
 fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
+    // A terminal-provided paste is itself a newer user interaction. This also
+    // invalidates a raw Ctrl+Shift+V host-read request if the terminal emits a
+    // bracketed-paste event for the same physical gesture.
+    app.host_clipboard_interaction_generation = app
+        .host_clipboard_interaction_generation
+        .checked_add(1)
+        .unwrap_or(1);
+
+    // Reusable text inputs have one reducer for raw paste chords, right-click
+    // Paste, and terminal bracketed-paste delivery. Metadata TrackScalar and
+    // other structured surfaces deliberately return false from this focus
+    // predicate and keep their richer target-specific semantics below.
+    if super::keybindings::current_focus_needs_generic_host_clipboard(app) {
+        replay_single_line_terminal_text_at_current_focus(app, text, tx);
+        return;
+    }
+
     // The dedicated picker owns its focused text fields. When navigation owns
     // focus, an intercepted Ctrl+V arrives as Event::Paste and is promoted to
     // the same filesystem-paste command as Ctrl+V/Ctrl+P.
@@ -10401,65 +10495,95 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
             }
         }
         ActiveOverlay::MetadataEditor(_) => {
-            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
-            if let ActiveOverlay::MetadataEditor(mut state) = overlay {
+            // A bracketed-paste event already carries the terminal clipboard
+            // payload. Route it through the same target-specific semantics as
+            // an asynchronous host read so Ctrl+V/Ctrl+P/Ctrl+Shift+V cannot
+            // diverge on confirmations, structured fields, or TrackScalar lists.
+            let mut picker_handled = false;
+            let mut picker_empty_clipboard = false;
+            if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
                 if let Some(file_picker) = state.file_picker.as_mut() {
                     if file_picker.picker.handle_terminal_paste(text) {
-                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         return;
                     }
                     if file_picker.picker.has_filesystem_clipboard() {
                         let _ = file_picker.picker.paste_clipboard();
                     } else {
-                        app.set_status(
-                            "terminal paste found no focused picker text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
-                        );
+                        picker_empty_clipboard = true;
                     }
-                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                    return;
+                    picker_handled = true;
                 }
-                use super::app::MetadataEditorPhase;
-                if state.phase == MetadataEditorPhase::DetailEdit {
-                    if let Some(input) = state.detail_edit.as_mut() {
-                        // Detail row editors are single-line inputs. Keep terminal
-                        // paste on the focused editor; commit owns list parsing.
-                        insert_single_line_terminal_paste(input, text);
+            }
+            if picker_handled {
+                if picker_empty_clipboard {
+                    app.set_status(
+                        "terminal paste found no focused picker text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
+                    );
+                }
+                return;
+            }
+
+            let target = match &app.active_overlay {
+                ActiveOverlay::MetadataEditor(state) => {
+                    let session_id = state.active_surface().technical_details.session_id;
+                    if state.content_tab == super::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving
+                    {
+                        Some(super::message::HostClipboardPasteTarget::MetadataChapterTitles {
+                            session_id,
+                        })
+                    } else if state.content_tab != super::app::ContentTab::Metadata {
+                        None
                     } else {
-                        let field_idx = state.detail_field_idx;
-                        if field_idx < state.active_surface().entries.len() {
-                            let changed =
-                                super::keybindings::metadata_editor_apply_detail_whole_field_text(
-                                    &mut state,
-                                    field_idx,
-                                    text,
-                                );
-                            app.set_status(if changed > 0 {
-                                format!(
-                                    "Pasted clipboard lines into {changed} track{}; review in the detail view before saving",
-                                    if changed == 1 { "" } else { "s" }
-                                )
-                            } else {
-                                "Clipboard paste made no changes to this field".to_string()
-                            });
+                        match state.phase {
+                            super::app::MetadataEditorPhase::Editing => Some(
+                                super::message::HostClipboardPasteTarget::MetadataRows {
+                                    session_id,
+                                    field_index: state.cursor,
+                                },
+                            ),
+                            super::app::MetadataEditorPhase::InlineEdit => Some(
+                                super::message::HostClipboardPasteTarget::MetadataInline {
+                                    session_id,
+                                    field_index: state.cursor,
+                                },
+                            ),
+                            super::app::MetadataEditorPhase::DetailEdit => {
+                                if state.detail_edit.is_some() {
+                                    Some(super::message::HostClipboardPasteTarget::MetadataDetail {
+                                        session_id,
+                                        field_index: state.detail_field_idx,
+                                        detail_index: state.detail_cursor,
+                                    })
+                                } else {
+                                    Some(
+                                        super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                                            session_id,
+                                            field_index: state.detail_field_idx,
+                                        },
+                                    )
+                                }
+                            }
+                            // The add-key prompt owns its own text input and a
+                            // save is already in flight, so neither phase has a
+                            // metadata paste target to route to.
+                            super::app::MetadataEditorPhase::AddingKey
+                            | super::app::MetadataEditorPhase::Saving => None,
                         }
                     }
-                } else if state.phase == MetadataEditorPhase::InlineEdit {
-                    // Single-field inline edit: insert first line at cursor.
-                    if let Some(ref mut input) = state.edit_input {
-                        insert_single_line_terminal_paste(input, text);
-                    }
-                } else if state.phase == MetadataEditorPhase::Editing {
-                    if let Err(reason) =
-                        super::keybindings::metadata_editor_apply_row_or_block_paste(
-                            app,
-                            &mut state,
-                            text,
-                        )
-                    {
-                        app.set_status(reason);
-                    }
                 }
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                _ => None,
+            };
+            if let Some(target) = target {
+                super::keybindings::handle_terminal_clipboard_text(
+                    app,
+                    target,
+                    text.to_string(),
+                );
+            } else {
+                app.set_status(
+                    "terminal paste is unavailable on this metadata-editor tab",
+                );
             }
         }
         ActiveOverlay::FileTaskProgress(_) => {
@@ -11002,7 +11126,7 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn editing_phase_bracketed_paste_uses_block_then_row_classification_and_reports_errors() {
+    fn editing_phase_bracketed_track_scalar_paste_confirms_and_rejects_extra_lines() {
         let mut state = MetadataEditorState::for_files(
             vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
             vec![editing_entry("TITLE", ItemKey::TrackTitle, &["Old A", "Old B"])],
@@ -11010,38 +11134,46 @@ mod metadata_detail_paste_tests {
             MetadataTechnicalDetails::default(),
         );
         state.phase = MetadataEditorPhase::Editing;
+        let session_id = state.active_surface().technical_details.session_id;
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
         let (tx, _rx) = mpsc::channel(8);
 
-        handle_paste(&mut app, "TITLE\nShared", &tx);
-        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("editor remains open after block paste");
+        handle_paste(&mut app, "One\nTwo\n", &tx);
+        let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay else {
+            panic!("un-descended TrackScalar paste must ask for confirmation");
         };
-        assert_eq!(
-            state.active_surface().entries[0].per_file_values,
-            ["Shared", "Shared"]
-        );
-        assert_eq!(
-            app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("applied TITLE (broadcast to 2 files) — review before save")
-        );
+        assert!(matches!(
+            action,
+            super::super::app::ConfirmAction::MetadataRowsClipboardPaste {
+                session_id: actual_session,
+                field_index: 0,
+                text,
+            } if *actual_session == session_id && text == "One\nTwo\n"
+        ));
+        assert!(app.pending_metadata_editor.is_some(), "editor is parked during confirmation");
 
-        handle_paste(&mut app, "One\nTwo", &tx);
+        super::super::keybindings::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('y'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        );
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("editor remains open after row paste");
+            panic!("editor returns after confirmation");
         };
         assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
 
-        let before = state.active_surface().entries[0].per_file_values.clone();
-        handle_paste(&mut app, "TITLE\nOne\nTwo\nThree", &tx);
+        handle_paste(&mut app, "One\nTwo\nThree", &tx);
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
-            panic!("editor remains open after rejected block paste");
+            panic!("editor remains open after rejected paste");
         };
-        assert_eq!(state.active_surface().entries[0].per_file_values, before);
+        assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("tag blocks: TITLE has 3 values for 2 files")
+            Some("TITLE paste has 3 lines for 2 tracks; refusing to discard the extra lines")
         );
     }
 
@@ -18745,7 +18877,7 @@ mod tag_clipboard_completion_tests {
         assert_eq!(clipboard.entries[0].per_file_stored_value_counts, vec![2, 1]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Copied 1 field from 2 files (text clipboard)"),
+            Some("Copied 1 field from 2 files to terminal clipboard"),
         );
         assert_eq!(app.browse.tag_clipboard_copy_active_generation, None);
         assert!(app.browse.tag_clipboard_copy_cancel.is_none());

@@ -44,9 +44,6 @@ fn persist_browse_config(app: &mut AppState) {
 /// stores `Vec<MenuLevel>` and refuses to push beyond this depth.
 pub const MAX_CONTEXT_MENU_DEPTH: usize = 4;
 
-pub(crate) const TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS: &str =
-    "tonepoet's clipboard has no tag blocks; paste from the system clipboard with your terminal's paste key instead";
-
 /// One panel in the cascade. The deepest level is the focused one;
 /// ancestor levels stay visible with a muted border, their selected
 /// row marking the breadcrumb.
@@ -237,7 +234,7 @@ pub enum ContextAction {
     QueryGnudb,
     /// Look up tags from MusicBrainz (disc-TOC).
     TagsFromMb,
-    /// Read selected metadata into the session tag clipboard.
+    /// Copy selected metadata to the terminal clipboard.
     CopyTags(TagCopySelection),
     /// Deferred Custom tag-field builder; surfaced honestly this round.
     CopyTagsCustomDeferred,
@@ -251,6 +248,7 @@ pub enum ContextAction {
     /// Metadata editor footer popup: launch one of the tag lookup/apply flows.
     MetadataTagsMusicBrainz,
     MetadataTagsGnudb,
+    MetadataTagsCopyClipboard,
     MetadataTagsClipboard,
     MetadataTagsFile,
     /// Metadata editor footer popup: explicitly project the active editor
@@ -707,6 +705,7 @@ fn archive_synthetic_file_op_status(app: &mut AppState, operation: &str) {
 fn build_tagging_submenu(
     cue_import_available: bool,
     embedded_cue_availability: super::probe::EmbeddedCueAvailability,
+    include_lookup_actions: bool,
 ) -> ContextMenuEntry {
     let copy_tags = ContextMenuEntry::Submenu {
         label: "Copy tags".to_string(),
@@ -743,46 +742,49 @@ fn build_tagging_submenu(
             item("Custom...", ContextAction::CopyTagsCustomDeferred),
         ],
     };
-    let mut children = vec![
-        item("Edit metadata", ContextAction::EditMetadataFull),
-        separator(),
-        item("Get tags from MusicBrainz", ContextAction::TagsFromMb),
-    ];
-    if cue_import_available {
+    let mut children = vec![item("Edit metadata", ContextAction::EditMetadataFull)];
+    if include_lookup_actions {
+        children.push(separator());
         children.push(item(
-            "Get tags from CUE",
-            ContextAction::ImportCueFromBrowse,
+            "Get tags from MusicBrainz",
+            ContextAction::TagsFromMb,
         ));
-    }
-    let embedded_actions_enabled =
-        embedded_cue_availability == super::probe::EmbeddedCueAvailability::Present;
-    if cue_import_available
-        || embedded_cue_availability != super::probe::EmbeddedCueAvailability::Absent
-    {
-        children.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "View embedded CUE sheet".to_string(),
-            action: ContextAction::BrowseCueView,
-            shortcut: Some(":cue-view".to_string()),
-            enabled: embedded_actions_enabled,
-        }));
-        children.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Edit embedded CUE sheet".to_string(),
-            action: ContextAction::BrowseCueEdit,
-            shortcut: Some(":cuesheet-edit".to_string()),
-            enabled: embedded_actions_enabled,
-        }));
-        children.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Extract embedded CUE sheet".to_string(),
-            action: ContextAction::BrowseCueExtract,
-            shortcut: Some(":cuesheet-extract".to_string()),
-            enabled: embedded_actions_enabled,
-        }));
-        children.push(ContextMenuEntry::Item(ContextMenuItem {
-            label: "Delete embedded CUE sheet".to_string(),
-            action: ContextAction::BrowseCueDelete,
-            shortcut: Some(":cuesheet-delete".to_string()),
-            enabled: embedded_actions_enabled,
-        }));
+        if cue_import_available {
+            children.push(item(
+                "Get tags from CUE",
+                ContextAction::ImportCueFromBrowse,
+            ));
+        }
+        let embedded_actions_enabled =
+            embedded_cue_availability == super::probe::EmbeddedCueAvailability::Present;
+        if cue_import_available
+            || embedded_cue_availability != super::probe::EmbeddedCueAvailability::Absent
+        {
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "View embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueView,
+                shortcut: Some(":cue-view".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Edit embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueEdit,
+                shortcut: Some(":cuesheet-edit".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Extract embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueExtract,
+                shortcut: Some(":cuesheet-extract".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Delete embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueDelete,
+                shortcut: Some(":cuesheet-delete".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+        }
     }
     let transfer_tags = ContextMenuEntry::Submenu {
         label: "Transfer tags".to_string(),
@@ -853,10 +855,17 @@ pub(crate) fn build_metadata_tags_popup() -> Vec<ContextMenuEntry> {
             children: vec![
                 item("MusicBrainz", ContextAction::MetadataTagsMusicBrainz),
                 item("gnuDB", ContextAction::MetadataTagsGnudb),
-                item("Clipboard", ContextAction::MetadataTagsClipboard),
                 item("File", ContextAction::MetadataTagsFile),
             ],
         },
+        item(
+            "Copy tags to clipboard",
+            ContextAction::MetadataTagsCopyClipboard,
+        ),
+        item(
+            "Paste tags from clipboard",
+            ContextAction::MetadataTagsClipboard,
+        ),
         ContextMenuEntry::Submenu {
             label: "Transfer tags from".to_string(),
             children: vec![
@@ -942,8 +951,66 @@ fn build_disk_tools_submenu() -> ContextMenuEntry {
     }
 }
 
-fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
-    let mut children = vec![
+fn build_utilities_submenu(
+    app: &AppState,
+    cue_context: Option<(
+        bool,
+        super::probe::EmbeddedCueAvailability,
+        Option<std::path::PathBuf>,
+    )>,
+) -> ContextMenuEntry {
+    let mut children = Vec::new();
+
+    if let Some((cue_import_available, embedded_cue_availability, advanced_folder)) = cue_context {
+        children.push(item(
+            "Get tags from MusicBrainz",
+            ContextAction::TagsFromMb,
+        ));
+        if cue_import_available {
+            children.push(item("Get tags from CUE", ContextAction::ImportCueFromBrowse));
+        }
+        let embedded_actions_enabled =
+            embedded_cue_availability == super::probe::EmbeddedCueAvailability::Present;
+        let advanced_cue_available = advanced_folder.is_some();
+        if cue_import_available
+            || advanced_cue_available
+            || embedded_cue_availability != super::probe::EmbeddedCueAvailability::Absent
+        {
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "View embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueView,
+                shortcut: Some(":cue-view".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Edit embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueEdit,
+                shortcut: Some(":cuesheet-edit".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Extract embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueExtract,
+                shortcut: Some(":cuesheet-extract".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+            children.push(ContextMenuEntry::Item(ContextMenuItem {
+                label: "Delete embedded CUE sheet".to_string(),
+                action: ContextAction::BrowseCueDelete,
+                shortcut: Some(":cuesheet-delete".to_string()),
+                enabled: embedded_actions_enabled,
+            }));
+        }
+        if let Some(folder) = advanced_folder {
+            children.push(item(
+                "Advanced CUE Options",
+                ContextAction::InspectCueChoices(folder),
+            ));
+        }
+        children.push(separator());
+    }
+
+    children.extend([
         item("Verify integrity", ContextAction::Verify),
         separator(),
         item(
@@ -964,7 +1031,7 @@ fn build_utilities_submenu(app: &AppState) -> ContextMenuEntry {
         ),
         item("Fill CUE from MusicBrainz", ContextAction::FillCueFromMb),
         separator(),
-    ];
+    ]);
 
     if app.compare_reference.is_empty() {
         children.push(item(
@@ -1172,9 +1239,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(
                 selected_audio_cue_import_available(app, entry),
                 selected_audio_embedded_cue_availability(app, entry),
+                true,
             ));
             items.push(build_disk_tools_submenu());
-            items.push(build_utilities_submenu(app));
+            items.push(build_utilities_submenu(app, None));
             items.push(separator());
             items.push(build_file_ops_submenu(true, allow_single_item_actions, selection_all_files));
             items.push(item(
@@ -1191,6 +1259,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(
                 false,
                 super::probe::EmbeddedCueAvailability::Absent,
+                true,
             ));
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item(
@@ -1217,8 +1286,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(
                 false,
                 super::probe::EmbeddedCueAvailability::Absent,
+                true,
             ));
-            items.push(build_utilities_submenu(app));
+            items.push(build_utilities_submenu(app, None));
             items.push(separator());
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
@@ -1249,8 +1319,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_tagging_submenu(
                 false,
                 super::probe::EmbeddedCueAvailability::Absent,
+                true,
             ));
-            items.push(build_utilities_submenu(app));
+            items.push(build_utilities_submenu(app, None));
             items.push(separator());
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
@@ -1262,19 +1333,8 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
             let cue_import_availability = directory_cue_import_availability(app, entry);
-            match cue_import_availability {
-                super::probe::CueImportAvailability::Present => items.push(item(
-                    "Advanced CUE Options",
-                    ContextAction::InspectCueChoices(entry.path.clone()),
-                )),
-                super::probe::CueImportAvailability::Unknown => items.push(item_enabled(
-                    "Advanced CUE Options",
-                    ContextAction::InspectCueChoices(entry.path.clone()),
-                    false,
-                )),
-                super::probe::CueImportAvailability::Absent => {}
-            }
-            match directory_cue_repair_availability(app, entry) {
+            let cue_repair_availability = directory_cue_repair_availability(app, entry);
+            match cue_repair_availability.clone() {
                 super::browse::CueRepairAvailability::Repairable(cue_path) => {
                     items.push(item(
                         "Repair malformed CUE (create copy)",
@@ -1305,11 +1365,26 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             // cache; unresolved actions stay disabled until the cache resolves,
             // while known-absent actions are omitted.
             items.push(build_tagging_submenu(
-                cue_import_availability == super::probe::CueImportAvailability::Present,
-                directory_embedded_cue_availability(app, entry),
+                false,
+                super::probe::EmbeddedCueAvailability::Absent,
+                false,
             ));
             items.push(build_disk_tools_submenu());
-            items.push(build_utilities_submenu(app));
+            let advanced_cue_folder = match (&cue_import_availability, &cue_repair_availability) {
+                (super::probe::CueImportAvailability::Present, _)
+                | (_, super::browse::CueRepairAvailability::Repairable(_)) => {
+                    Some(entry.path.clone())
+                }
+                _ => None,
+            };
+            items.push(build_utilities_submenu(
+                app,
+                Some((
+                    cue_import_availability == super::probe::CueImportAvailability::Present,
+                    directory_embedded_cue_availability(app, entry),
+                    advanced_cue_folder,
+                )),
+            ));
             items.push(build_select_submenu(true));
             items.push(separator());
             items.push(build_file_ops_submenu(false, allow_single_item_actions, selection_all_files));
@@ -1339,6 +1414,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                     items.push(build_tagging_submenu(
                         true,
                         super::probe::EmbeddedCueAvailability::Absent,
+                        true,
                     ));
                 }
                 items.push(separator());
@@ -2298,15 +2374,21 @@ fn handle_tag_clipboard_copy_complete_with_publisher<F>(
         match result {
             Ok((entries, failure_count)) => {
                 let file_count = source_paths.len();
-                let serialized = super::tag_interchange::serialize_tag_entries(entries.iter());
+                let serialized = super::tag_interchange::serialize_clipboard_tag_entries(
+                    entries.iter(),
+                    super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+                );
                 let field_count = serialized.keys.len();
                 publish(&serialized.text);
-                app.browse.tag_clipboard = Some(super::browse::TagClipboard {
-                    source_paths,
-                    entries,
-                });
+                #[cfg(test)]
+                {
+                    app.browse.tag_clipboard = Some(super::browse::TagClipboard {
+                        source_paths: source_paths.clone(),
+                        entries: entries.clone(),
+                    });
+                }
                 let mut status = format!(
-                    "Copied {} field{} from {} file{} (text clipboard)",
+                    "Copied {} field{} from {} file{} to terminal clipboard",
                     field_count,
                     if field_count == 1 { "" } else { "s" },
                     file_count,
@@ -3087,29 +3169,46 @@ pub fn execute_context_action(
             }
         }
         ContextAction::PathTextPaste => {
-            if let Some(input) = app.browse.path_input.as_mut() {
-                input.paste_clipboard();
+            if app.browse.path_input.is_some() {
+                let interaction_generation = app.host_clipboard_interaction_generation;
+                super::keybindings::begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::EditorText {
+                        target: super::app::EditorTextTarget::BrowsePath,
+                        interaction_generation,
+                    },
+                );
             }
         }
         ContextAction::EditorPaste => {
-            super::keybindings::execute_editor_context_action(app, ContextAction::EditorPaste);
+            super::keybindings::execute_editor_context_action(
+                app,
+                ContextAction::EditorPaste,
+                tx,
+            );
         }
         ContextAction::EditorCopy => {
-            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCopy);
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCopy, tx);
         }
         ContextAction::EditorCut => {
-            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCut);
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorCut, tx);
         }
         ContextAction::EditorDelete => {
-            super::keybindings::execute_editor_context_action(app, ContextAction::EditorDelete);
+            super::keybindings::execute_editor_context_action(app, ContextAction::EditorDelete, tx);
         }
         ContextAction::EditorSelectAll => {
-            super::keybindings::execute_editor_context_action(app, ContextAction::EditorSelectAll);
+            super::keybindings::execute_editor_context_action(
+                app,
+                ContextAction::EditorSelectAll,
+                tx,
+            );
         }
         ContextAction::EditorFixCapitalization(transform) => {
             super::keybindings::execute_editor_context_action(
                 app,
                 ContextAction::EditorFixCapitalization(transform),
+                tx,
             );
         }
         ContextAction::RenameFixCapitalization(transform) => {
@@ -3392,29 +3491,47 @@ pub fn execute_context_action(
                 app.set_status("metadata editor: tag popup lost its editor session");
             }
         }
-        ContextAction::MetadataTagsClipboard => {
-            let Some(mut state) = app.pending_metadata_editor.take() else {
+        ContextAction::MetadataTagsCopyClipboard => {
+            let Some(state) = app.pending_metadata_editor.take() else {
                 app.set_status("metadata editor: tag popup lost its editor session");
                 return;
             };
-            let clipboard = tui_file_picker::read_shared_text_clipboard();
-            let result = super::tag_interchange::parse_field_blocks(&clipboard);
-            match result {
-                Ok(blocks) => match super::tag_interchange::apply_field_blocks_to_editor(
-                    &mut state,
-                    &blocks,
-                ) {
-                    Ok(report) => app.set_status(
-                        report.success_status(state.active_surface().paths.len()),
-                    ),
-                    Err(reason) => app.set_status(format!("tag blocks: {reason}")),
-                },
-                Err(error) => {
-                    log::debug!("tonepoet clipboard did not contain applicable tag blocks: {error}");
-                    app.set_status(TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS);
-                }
+            let visible = state.visible_metadata_entry_indices();
+            let serialized = super::tag_interchange::serialize_clipboard_tag_entries(
+                visible
+                    .iter()
+                    .filter_map(|index| state.active_surface().entries.get(*index)),
+                super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+            );
+            if serialized.text.is_empty() {
+                app.set_status(format!(
+                    "metadata editor: {} view contains no serializable tags",
+                    state.metadata_view.label()
+                ));
+            } else {
+                publish_text_clipboard(&serialized.text);
+                app.set_status(format!(
+                    "metadata editor: copied {} {}-view tag field{} to terminal clipboard",
+                    serialized.keys.len(),
+                    state.metadata_view.label(),
+                    if serialized.keys.len() == 1 { "" } else { "s" }
+                ));
             }
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ContextAction::MetadataTagsClipboard => {
+            let Some(state) = app.pending_metadata_editor.take() else {
+                app.set_status("metadata editor: tag popup lost its editor session");
+                return;
+            };
+            let session_id = state.active_surface().technical_details.session_id;
+            let view = state.metadata_view;
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            super::keybindings::begin_host_clipboard_paste(
+                app,
+                tx,
+                super::message::HostClipboardPasteTarget::MetadataTags { session_id, view },
+            );
         }
         ContextAction::MetadataTagsFile => {
             let Some(mut state) = app.pending_metadata_editor.take() else {
@@ -3508,13 +3625,18 @@ pub fn execute_context_action(
             }
         }
         ContextAction::MetadataRowsPaste => {
-            if let Some(mut state) = app.pending_metadata_editor.take() {
-                if let Err(reason) =
-                    super::keybindings::metadata_editor_paste_shared_clipboard(app, &mut state)
-                {
-                    app.set_status(reason);
-                }
-                app.pending_metadata_editor = Some(state);
+            if let Some(state) = app.pending_metadata_editor.take() {
+                let session_id = state.active_surface().technical_details.session_id;
+                let field_index = state.cursor;
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                super::keybindings::begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::MetadataRows {
+                        session_id,
+                        field_index,
+                    },
+                );
             } else {
                 app.set_status("metadata editor: row clipboard action lost its editor session");
             }
@@ -3821,27 +3943,20 @@ pub fn execute_context_action(
             }
         }
         ContextAction::MetadataDetailPasteField => {
-            if let Some(mut state) = app.pending_metadata_editor.take() {
-                match super::keybindings::metadata_editor_paste_detail_field(app, &mut state) {
-                    Ok(report) if report.changed_slots == 0 => app.set_status(
-                        "metadata editor: field clipboard already matches this field",
-                    ),
-                    Ok(report) => {
-                        let mut status = format!(
-                            "metadata editor: pasted this field into {} track{}; review before save",
-                            report.changed_slots,
-                            if report.changed_slots == 1 { "" } else { "s" }
-                        );
-                        if report.collapsed_stored_values {
-                            status.push_str(
-                                "; warning: one or more stored multi-value lists were reduced",
-                            );
-                        }
-                        app.set_status(status);
-                    }
-                    Err(reason) => app.set_status(reason),
-                }
+            if let Some(state) = app.pending_metadata_editor.take() {
+                let session_id = state.active_surface().technical_details.session_id;
+                let field_index = state.detail_field_idx;
                 app.active_overlay = super::app::ActiveOverlay::MetadataEditor(state);
+                super::keybindings::begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                        session_id,
+                        field_index,
+                    },
+                );
+            } else {
+                app.set_status("metadata editor: field clipboard action lost its editor session");
             }
         }
         ContextAction::MetadataDetailTransferTags { direction } => {
@@ -4154,22 +4269,19 @@ pub fn execute_context_action(
     }
 }
 
-/// Publish through Tonepoet's single text-clipboard authority. The picker
-/// crate stores the in-process value and invokes the process-wide system
-/// publisher installed by the TUI at startup.
+/// Publish through Tonepoet's single user-visible clipboard authority: the
+/// terminal/host clipboard. No in-process paste carrier is updated here.
 pub(crate) fn publish_text_clipboard(text: &str) {
-    tui_file_picker::write_shared_text_clipboard(text.to_string());
+    tui_file_picker::mirror_host_clipboard_text(text);
 }
 
-/// Mirror structured clipboard content to the host as text without replacing
-/// the internal text-editing clipboard.
+/// Publish structured clipboard content through the same host authority.
 pub(crate) fn mirror_host_clipboard_text(text: &str) {
     tui_file_picker::mirror_host_clipboard_text(text);
 }
 
-/// Host hook installed into `tui-file-picker`. Publication remains
-/// best-effort: the authoritative in-process clipboard was already updated
-/// before this hook runs.
+/// Host hook installed into `tui-file-picker`. Text-input copies call this
+/// asynchronously; failures are reported by the host-clipboard worker.
 pub(crate) fn publish_system_clipboard(text: &str) {
     super::host_clipboard::publish_system_clipboard(text);
 }
@@ -4765,16 +4877,12 @@ mod tests {
                 );
             },
         );
-        // One publication through the single authority: hook fired once with
-        // the path text, and the in-app clipboard holds the same text.
+        // One publication through the single authority: the host hook fires
+        // once with the path text; there is no second in-app paste authority.
         assert_eq!(
             published.borrow().as_slice(),
             &["/music/Album/track.flac".to_string()],
             "CopyPath must publish exactly once through the unified helper"
-        );
-        assert_eq!(
-            tui_file_picker::read_shared_text_clipboard(),
-            "/music/Album/track.flac"
         );
         assert!(app
             .status_message
@@ -4953,8 +5061,11 @@ mod tests {
     #[test]
     fn browse_context_menu_build_does_not_scan_for_cue_presence_on_reducer() {
         let source = include_str!("context_menu.rs");
+        // Slice at the test module itself: inline `#[cfg(test)]` blocks inside
+        // production functions would otherwise truncate this prefix and make
+        // the assertions below vacuous.
         let production = source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("production source prefix");
         assert!(
@@ -5026,8 +5137,11 @@ mod tests {
             execute[blocking..].contains("prepare_gnudb_virtual_disc_toc_blocking(&paths)"),
             "GNUDB direct-source preparation must execute behind spawn_blocking"
         );
+        // Slice at the test module itself: inline `#[cfg(test)]` blocks inside
+        // production functions would otherwise truncate this prefix and make
+        // the assertions below vacuous.
         let production = source
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("production source prefix");
         assert_eq!(
@@ -5649,6 +5763,7 @@ mod tests {
         let ContextMenuEntry::Submenu { label, children } = build_tagging_submenu(
             false,
             crate::tui::probe::EmbeddedCueAvailability::Absent,
+            true,
         ) else {
             panic!("tagging menu must be a submenu");
         };
@@ -5669,6 +5784,7 @@ mod tests {
         let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(
             false,
             crate::tui::probe::EmbeddedCueAvailability::Absent,
+            true,
         ) else {
             panic!("tagging menu must be a submenu");
         };
@@ -5731,14 +5847,20 @@ mod tests {
             |text| published = Some(text.to_string()),
         );
 
-        assert_eq!(
-            published.as_deref(),
-            Some("TITLE\nBehind the Lines\nDuchess"),
-            "the generation-winning completion must invoke the text-clipboard publication seam"
-        );
+        let published = published.expect("generation-winning completion publishes");
+        let payload = super::super::tag_interchange::parse_clipboard_tag_payload(&published)
+            .expect("clipboard envelope parses")
+            .expect("clipboard envelope is recognized");
+        let super::super::tag_interchange::ClipboardTagPayload::FieldSet(blocks) = payload
+        else {
+            panic!("Browse tag copy must publish a field-set envelope");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].key, "TITLE");
+        assert_eq!(blocks[0].values, vec!["Behind the Lines", "Duchess"]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Copied 1 field from 2 files (text clipboard)")
+            Some("Copied 1 field from 2 files to terminal clipboard")
         );
     }
 
@@ -5826,15 +5948,87 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tonepoet_clipboard_status_wording_is_pinned() {
+    fn metadata_tags_copy_all_view_publishes_multiline_text_field() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        fn text_entry(
+            key: &str,
+            item_key: lofty::tag::ItemKey,
+            value: &str,
+        ) -> crate::tui::probe::TagEntry {
+            let values = crate::tui::probe::MetadataFieldValues::from_scalar(value.to_string());
+            crate::tui::probe::TagEntry {
+                display_key: key.to_string(),
+                item_key,
+                value: value.to_string(),
+                original: value.to_string(),
+                is_binary: false,
+                is_mixed: false,
+                has_multiple_stored_values: false,
+                row_scope: crate::tui::probe::RowScope::File,
+                per_file_stored_value_counts: vec![values.value_count()],
+                per_file_values: vec![values.clone()],
+                per_file_originals: vec![values],
+                mb_proposed_value: None,
+                mb_proposed_per_file: None,
+            }
+        }
+
+        let mut state = MetadataEditorState::for_files(
+            vec![std::path::PathBuf::from("/tmp/editor.flac")],
+            vec![
+                text_entry("TITLE", lofty::tag::ItemKey::TrackTitle, "Duke"),
+                text_entry(
+                    "COMMENT",
+                    lofty::tag::ItemKey::Comment,
+                    "recorded live\nremastered 2024",
+                ),
+            ],
+            vec!["editor.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.metadata_view = MetadataEditorView::All;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.pending_metadata_editor = Some(Box::new(state));
+        let (tx, _rx) = mpsc::channel(4);
+        let published = Rc::new(RefCell::new(Vec::<String>::new()));
+        let captured = Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| captured.borrow_mut().push(text.to_string()),
+            || {
+                execute_context_action(
+                    &mut app,
+                    ContextAction::MetadataTagsCopyClipboard,
+                    &tx,
+                    false,
+                );
+            },
+        );
+
+        let clipboard = published.borrow();
+        assert_eq!(clipboard.len(), 1);
+        let payload = super::super::tag_interchange::parse_clipboard_tag_payload(&clipboard[0])
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        let super::super::tag_interchange::ClipboardTagPayload::FieldSet(blocks) = payload else {
+            panic!("tags copy must publish a field-set payload");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().any(|block| block.key == "TITLE"));
+        let comment = blocks
+            .iter()
+            .find(|block| block.key == "COMMENT")
+            .expect("COMMENT block");
         assert_eq!(
-            TONEPOET_CLIPBOARD_NO_TAG_BLOCKS_STATUS,
-            "tonepoet's clipboard has no tag blocks; paste from the system clipboard with your terminal's paste key instead"
+            comment.values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
         );
     }
 
     #[test]
-    fn metadata_tags_popup_exposes_exactly_twelve_leaf_routes() {
+    fn metadata_tags_popup_exposes_copy_paste_and_existing_leaf_routes() {
         fn collect<'a>(entries: &'a [ContextMenuEntry], out: &mut Vec<(&'a str, &'a ContextAction)>) {
             for entry in entries {
                 match entry {
@@ -5848,7 +6042,7 @@ mod tests {
         let popup = build_metadata_tags_popup();
         let mut leaves = Vec::new();
         collect(&popup, &mut leaves);
-        assert_eq!(leaves.len(), 12);
+        assert_eq!(leaves.len(), 13);
         assert!(leaves.iter().any(|(label, action)| {
             *label == "MusicBrainz" && matches!(action, ContextAction::MetadataTagsMusicBrainz)
         }));
@@ -5856,7 +6050,12 @@ mod tests {
             *label == "gnuDB" && matches!(action, ContextAction::MetadataTagsGnudb)
         }));
         assert!(leaves.iter().any(|(label, action)| {
-            *label == "Clipboard" && matches!(action, ContextAction::MetadataTagsClipboard)
+            *label == "Copy tags to clipboard"
+                && matches!(action, ContextAction::MetadataTagsCopyClipboard)
+        }));
+        assert!(leaves.iter().any(|(label, action)| {
+            *label == "Paste tags from clipboard"
+                && matches!(action, ContextAction::MetadataTagsClipboard)
         }));
         assert!(leaves.iter().any(|(label, action)| {
             *label == "File" && matches!(action, ContextAction::MetadataTagsFile)
@@ -5927,6 +6126,7 @@ mod tests {
         let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(
             false,
             crate::tui::probe::EmbeddedCueAvailability::Absent,
+            true,
         ) else {
             panic!("tagging menu must be a submenu");
         };
@@ -5935,8 +6135,7 @@ mod tests {
 
     #[test]
     fn metadata_tags_popup_leaf_actions_execute_their_dispatch_routes() {
-        tui_file_picker::with_scoped_shared_text_clipboard("TITLE\nDuke", || {
-            let tx = {
+        let tx = {
                 let (tx, _rx) = mpsc::channel(16);
                 tx
             };
@@ -5989,10 +6188,17 @@ mod tests {
                 false,
             );
             let ActiveOverlay::MetadataEditor(state) = &clipboard.active_overlay else {
-                panic!("Clipboard dispatch must restore the editor");
+                panic!("Clipboard dispatch must restore the editor while the host read is pending");
             };
-            assert_eq!(state.active_surface().entries[0].display_key, "TITLE");
-            assert_eq!(state.active_surface().entries[0].value, "Duke");
+            assert!(
+                state.active_surface().entries.is_empty(),
+                "starting a host clipboard read must not mutate tags before the payload arrives",
+            );
+            assert_eq!(clipboard.host_clipboard_paste_generation, 1);
+            assert!(clipboard
+                .status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("Reading host clipboard")));
 
             let mut file = AppState::new_for_test(TonepoetConfig::default());
             file.pending_metadata_editor = Some(parked_test_editor(vec![
@@ -6086,7 +6292,6 @@ mod tests {
                 ));
                 assert!(maintenance.pending_metadata_editor.is_some());
             }
-        });
     }
 
     #[test]
@@ -6107,6 +6312,7 @@ mod tests {
         let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(
             false,
             crate::tui::probe::EmbeddedCueAvailability::Absent,
+            true,
         ) else {
             panic!("tagging menu must be a submenu");
         };
@@ -6255,6 +6461,7 @@ mod tests {
         let ContextMenuEntry::Submenu { children, .. } = build_tagging_submenu(
             true,
             crate::tui::probe::EmbeddedCueAvailability::Present,
+            true,
         ) else {
             panic!("tagging menu must be a submenu");
         };
@@ -6399,26 +6606,20 @@ mod tests {
         app.browse.selected_index = 0;
         let cue_import_availability =
             super::super::keybindings::cue_import_availability_for_paths(&audio_paths);
-        let cue_repair_availability = match cue_import_availability {
-            crate::tui::probe::CueImportAvailability::Present => {
-                let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
-                    folder.to_path_buf(),
-                ]);
-                crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates)
-                    .rejected
-                    .into_iter()
-                    .find(|rejection| rejection.reason.is_cross_file_cumulative_index())
-                    .map(|rejection| {
-                        crate::tui::browse::CueRepairAvailability::Repairable(rejection.cue_path)
-                    })
-                    .unwrap_or(crate::tui::browse::CueRepairAvailability::Absent)
-            }
-            crate::tui::probe::CueImportAvailability::Unknown => {
-                crate::tui::browse::CueRepairAvailability::Unknown
-            }
-            crate::tui::probe::CueImportAvailability::Absent => {
-                crate::tui::browse::CueRepairAvailability::Absent
-            }
+        let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+            folder.to_path_buf(),
+        ]);
+        let cue_repair_availability = if candidates.is_empty() {
+            crate::tui::browse::CueRepairAvailability::Absent
+        } else {
+            crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates)
+                .rejected
+                .into_iter()
+                .find(|rejection| rejection.reason.is_cross_file_cumulative_index())
+                .map(|rejection| {
+                    crate::tui::browse::CueRepairAvailability::Repairable(rejection.cue_path)
+                })
+                .unwrap_or(crate::tui::browse::CueRepairAvailability::Absent)
         };
         let mut format_counts = std::collections::BTreeMap::new();
         format_counts.insert("FLAC".to_string(), audio_paths.len());
@@ -6503,6 +6704,19 @@ mod tests {
             Some(true)
         );
         assert!(menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"));
+        let utilities = menu.iter().find_map(|entry| match entry {
+            ContextMenuEntry::Submenu { label, children } if label == "Utilities" => Some(children),
+            _ => None,
+        }).expect("Utilities submenu");
+        let delete_pos = utilities.iter().position(|entry| menu_entry_label(entry) == Some("Delete embedded CUE sheet"))
+            .expect("Delete embedded CUE sheet in Utilities");
+        let advanced_pos = utilities.iter().position(|entry| menu_entry_label(entry) == Some("Advanced CUE Options"))
+            .expect("Advanced CUE Options in Utilities");
+        assert_eq!(advanced_pos, delete_pos + 1, "Advanced CUE Options belongs immediately after Delete embedded CUE sheet");
+        assert!(
+            !menu.iter().any(|entry| menu_entry_label(entry) == Some("Advanced CUE Options")),
+            "Advanced CUE Options must not remain at the directory-menu root",
+        );
         assert!(!menu_contains_action(&menu, |action| matches!(
             action,
             ContextAction::RepairCue { .. }
@@ -6555,6 +6769,43 @@ mod tests {
     }
 
     #[test]
+    fn directory_with_only_missing_member_cue_omits_advanced_cue_options() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("dead-cue");
+        std::fs::create_dir_all(&album).expect("album dir");
+        let audio = album.join("01.flac");
+        std::fs::write(&audio, b"audio").expect("dummy selected audio");
+        std::fs::write(
+            album.join("album.cue"),
+            concat!(
+                "FILE \"missing-side-a.wv\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("dead cue fixture");
+
+        assert_eq!(
+            super::super::keybindings::cue_import_availability_for_paths(std::slice::from_ref(&audio)),
+            crate::tui::probe::CueImportAvailability::Absent,
+            "a CUE whose member image is missing is not useful enough to gate the menu",
+        );
+        let app = app_with_selected_folder_for_cue_menu(
+            TonepoetConfig::default(),
+            &album,
+            vec![audio],
+            crate::tui::probe::EmbeddedCueAvailability::Absent,
+        );
+        let menu = build_browse_entry_menu(&app);
+        assert!(
+            !menu_labels_recursive(&menu)
+                .iter()
+                .any(|label| label == "Advanced CUE Options"),
+            "dead CUEs must not offer a chooser with no viable or repairable action",
+        );
+    }
+
+    #[test]
     fn directory_without_any_cue_disables_embedded_cue_actions_in_actual_browse_menu() {
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
@@ -6604,12 +6855,14 @@ mod tests {
         app.browse.selected_index = 0;
         let menu = build_browse_entry_menu(&app);
         assert_embedded_actions_enabled(&menu, false);
-        assert_eq!(
-            menu_action_enabled(&menu, |action| matches!(action, ContextAction::InspectCueChoices(_))),
-            Some(false),
-            "unknown cache state keeps Advanced CUE Options discoverable but disabled"
+        assert!(
+            !menu_contains_action(&menu, |action| matches!(action, ContextAction::InspectCueChoices(_))),
+            "unresolved CUE classification must not draw Advanced CUE Options and then shrink the menu later",
         );
-        assert!(menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"));
+        assert!(
+            !menu_labels_recursive(&menu).iter().any(|label| label == "Advanced CUE Options"),
+            "unknown cache state omits Advanced CUE Options until viability is known",
+        );
     }
 
     #[test]

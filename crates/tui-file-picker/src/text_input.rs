@@ -3,49 +3,37 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
-static TEXT_INPUT_CLIPBOARD: OnceLock<Mutex<String>> = OnceLock::new();
 static TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
 thread_local! {
     /// Optional thread-scoped clipboard used by tests that need an atomic
-    /// setup/dispatch/assertion sequence without contending on process-global
-    /// clipboard state. Production callers never install an override.
+    /// setup/dispatch/assertion sequence and by the embedding TUI while it
+    /// replays one already-read host snapshot. Production does not retain the
+    /// value outside that scoped dispatch.
     static SCOPED_TEXT_INPUT_CLIPBOARD: RefCell<Option<String>> = RefCell::new(None);
     static SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: RefCell<Option<Box<dyn Fn(&str)>>> = RefCell::new(None);
 }
 
-fn shared_text_input_clipboard() -> &'static Mutex<String> {
-    TEXT_INPUT_CLIPBOARD.get_or_init(|| Mutex::new(String::new()))
-}
-
-/// Replace the process-wide text clipboard shared by every picker/editor text
-/// input. Poisoning cannot make clipboard access permanently unavailable: the
-/// recovered value is replaced atomically under the same mutex.
+/// Publish text to the terminal/host clipboard. The only in-process value is
+/// the thread-scoped seam used by deterministic tests and by the embedding TUI
+/// to replay one already-read host snapshot through the ordinary text-input
+/// reducer. Production calls do not retain a second clipboard value.
 pub fn write_shared_text_clipboard(text: impl Into<String>) {
     let text = text.into();
-    let handled_scoped = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
+    SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
         let mut scoped = scoped.borrow_mut();
         if scoped.is_some() {
             *scoped = Some(text.clone());
-            true
-        } else {
-            false
         }
     });
-    if !handled_scoped {
-        let mut clipboard = shared_text_input_clipboard()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *clipboard = text.clone();
-    }
     mirror_host_clipboard_text(&text);
 }
 
-/// Publish a best-effort host clipboard projection without changing Tonepoet's
-/// internal text clipboard. Structured filesystem cut/copy uses this path so a
-/// later Ctrl+V/Ctrl+P in a text field still pastes the user's prior text copy.
+/// Publish a best-effort host clipboard projection. Structured filesystem
+/// cut/copy uses this path to expose a readable text projection externally
+/// without creating another in-process paste authority.
 pub fn mirror_host_clipboard_text(text: &str) {
     let handled_scoped_hook = SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.with(|hook| {
         let hook = hook.borrow();
@@ -72,15 +60,14 @@ pub fn set_shared_clipboard_publish_hook(hook: fn(&str)) -> bool {
     TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.set(hook).is_ok()
 }
 
-/// Read an exact snapshot of the process-wide text clipboard.
+/// Read the currently scoped host snapshot, if one is being replayed. There is
+/// deliberately no process-wide production fallback: an unscoped read is empty
+/// so callers cannot accidentally paste stale in-memory data instead of asking
+/// the host clipboard.
 pub fn read_shared_text_clipboard() -> String {
-    if let Some(value) = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| scoped.borrow().clone()) {
-        return value;
-    }
-    let clipboard = shared_text_input_clipboard()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    clipboard.clone()
+    SCOPED_TEXT_INPUT_CLIPBOARD
+        .with(|scoped| scoped.borrow().clone())
+        .unwrap_or_default()
 }
 
 /// Run a closure with a thread-scoped shared clipboard. This is intended for
@@ -175,9 +162,6 @@ pub struct TextInputState {
     /// Some and differs from `cursor`; both endpoints are kept on UTF-8
     /// boundaries.
     pub selection_anchor: Option<usize>,
-    /// Internal per-field clipboard for terminal environments where the host
-    /// clipboard is unavailable to the TUI.
-    pub clipboard: String,
     undo_history: Vec<TextInputSnapshot>,
     redo_history: Vec<TextInputSnapshot>,
     ranked_completion_cycle: Option<RankedCompletionCycle>,
@@ -251,7 +235,6 @@ impl TextInputState {
             cursor,
             select_all: false,
             selection_anchor: None,
-            clipboard: String::new(),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             ranked_completion_cycle: None,
@@ -266,7 +249,6 @@ impl TextInputState {
             cursor,
             select_all: true,
             selection_anchor: Some(0),
-            clipboard: String::new(),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             ranked_completion_cycle: None,
@@ -397,7 +379,6 @@ impl TextInputState {
             None if self.text.is_empty() => return false,
             None => self.text.clone(),
         };
-        self.clipboard = copied.clone();
         write_shared_text_clipboard(copied);
         true
     }
@@ -420,22 +401,14 @@ impl TextInputState {
         self.record_edit(before)
     }
 
-    pub fn can_paste(&self) -> bool {
-        if !self.clipboard.is_empty() {
-            return true;
-        }
-        !read_shared_text_clipboard().is_empty()
-    }
-
+    /// Paste only an explicitly scoped host snapshot. The embedding TUI owns
+    /// asynchronous host reads and scopes their completion around this reducer;
+    /// calling this directly in production cannot resurrect stale copied text.
     pub fn paste_clipboard(&mut self) -> bool {
-        let shared = read_shared_text_clipboard();
-        if !shared.is_empty() {
-            self.clipboard = shared;
-        }
-        if self.clipboard.is_empty() {
+        let clipboard = read_shared_text_clipboard();
+        if clipboard.is_empty() {
             return false;
         }
-        let clipboard = self.clipboard.clone();
         self.insert_string(&clipboard);
         true
     }
@@ -1120,8 +1093,9 @@ pub fn handle_text_input_key_with_boundaries(
         }
 
         // The embedding TUI owns asynchronous host-clipboard reads. Do not let
-        // Ctrl+Shift+V fall through to the internal clipboard path; callers use
-        // the unhandled result to launch the host read without ambiguity.
+        // A raw Ctrl+Shift+V is owned by the embedding TUI so it can request
+        // the host clipboard asynchronously. During replay the embedding layer
+        // sends plain Ctrl+V with the already-read snapshot scoped here.
         (true, false, true, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => false,
 
         // Clipboard commands.
@@ -2533,15 +2507,16 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_pastes_the_in_app_text_clipboard_like_ctrl_v() {
-        let mut input = TextInputState::new_selected("old".to_string());
-        input.clipboard = "replacement".to_string();
+    fn ctrl_p_replays_the_scoped_host_clipboard_like_ctrl_v() {
+        with_scoped_shared_text_clipboard("replacement", || {
+            let mut input = TextInputState::new_selected("old".to_string());
 
-        assert!(handle_text_input_key(
-            &mut input,
-            &key(KeyCode::Char('p'), KeyModifiers::CONTROL),
-        ));
-        assert_eq!(input.text, "replacement");
+            assert!(handle_text_input_key(
+                &mut input,
+                &key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            ));
+            assert_eq!(input.text, "replacement");
+        });
     }
 
     #[test]
@@ -2660,7 +2635,6 @@ mod tests {
             input.cursor = 3;
 
             assert!(input.copy_selection());
-            assert_eq!(input.clipboard, "whole field");
             assert_eq!(read_shared_text_clipboard(), "whole field");
             assert_eq!(input.text, "whole field");
             assert_eq!(input.cursor, 3);
@@ -2674,13 +2648,11 @@ mod tests {
         // rather than silently refusing.
         with_scoped_shared_text_clipboard("shared", || {
             let mut input = TextInputState::new("whole field".to_string());
-            input.clipboard = "local".to_string();
             input.cursor = 4;
 
             assert!(input.cut_selection());
             assert_eq!(input.text, "");
             assert_eq!(input.cursor, 0);
-            assert_eq!(input.clipboard, "whole field");
             assert_eq!(read_shared_text_clipboard(), "whole field");
             // The removal is a recorded edit: undo restores the field.
             assert!(input.undo());
@@ -2703,14 +2675,12 @@ mod tests {
     }
 
     #[test]
-    fn paste_prefers_newer_shared_text_over_stale_field_local_text() {
+    fn paste_uses_only_the_scoped_host_snapshot() {
         with_scoped_shared_text_clipboard("copied in field A", || {
             let mut input = TextInputState::new_selected("field B".to_string());
-            input.clipboard = "stale field B copy".to_string();
 
             assert!(input.paste_clipboard());
             assert_eq!(input.text, "copied in field A");
-            assert_eq!(input.clipboard, "copied in field A");
         });
     }
 

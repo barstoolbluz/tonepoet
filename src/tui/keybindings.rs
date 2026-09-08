@@ -19,19 +19,40 @@ use crate::convert::{AudioFormat, ConversionOptions, ConversionStatus};
 
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    // User interaction is an ownership boundary for a pending generic
+    // clipboard read. Capture the post-event epoch on a paste chord; any later
+    // interaction makes that completion stale rather than pasting into a new
+    // focus target.
+    if !app.host_clipboard_replay_active {
+        app.host_clipboard_interaction_generation = app
+            .host_clipboard_interaction_generation
+            .checked_add(1)
+            .unwrap_or(1);
+    }
+
     // Any keyboard activity cancels a pending browse rename (user moved on).
     app.pending_browse_rename = None;
     if app.current_screen == AppScreen::Browse {
         app.browse.tree_last_click = None;
     }
 
-    // A terminal that forwards Ctrl+Shift+V as a raw key event must not
-    // reinterpret it as the in-app text clipboard. Local clipboard text enters
-    // through crossterm's bracketed-paste Event::Paste path instead.
-    if matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::SHIFT)
+    // Text surfaces that historically delegated Ctrl+V/Ctrl+P to the reusable
+    // TextInputState need one app-level bridge to the terminal clipboard. More
+    // specialized editors below retain their stronger identity guards. Do not
+    // intercept browse/file-picker filesystem paste when no text field owns
+    // focus.
+    if !app.host_clipboard_replay_active
+        && current_focus_needs_generic_host_clipboard(app)
+        && is_host_clipboard_paste_chord(&key)
     {
+        let interaction_generation = app.host_clipboard_interaction_generation;
+        begin_host_clipboard_paste(
+            app,
+            tx,
+            super::message::HostClipboardPasteTarget::CurrentTerminalFocus {
+                interaction_generation,
+            },
+        );
         return;
     }
 
@@ -3828,14 +3849,105 @@ fn report_scoped_text_clipboard_status(
 }
 
 fn is_host_clipboard_paste_chord(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
-        && key
-            .modifiers
-            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-        && !key.modifiers.contains(KeyModifiers::ALT)
+    match key.code {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v') => {
+            key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => {
+            key.modifiers == KeyModifiers::CONTROL
+        }
+        _ => false,
+    }
 }
 
-fn begin_host_clipboard_paste(
+fn format_settings_text_input_owns_focus(
+    kind: &super::app::FormatSettingsKind,
+    focus: super::app::FormatSettingsFocus,
+) -> bool {
+    use super::app::{FormatSettingsFocus as Focus, FormatSettingsKind as Kind};
+
+    match kind {
+        Kind::Flac { .. } => focus == Focus::Compression,
+        Kind::Aac { .. } => focus == Focus::AacBitrate,
+        Kind::Opus { .. } => matches!(focus, Focus::OpusBitrate | Focus::OpusComplexity),
+        Kind::Mp3 { .. } => matches!(focus, Focus::Mp3VbrQuality | Focus::Mp3Bitrate),
+        Kind::WavPack { .. } => focus == Focus::WavPackBitrate,
+        Kind::Ssrc { .. } => matches!(
+            focus,
+            Focus::SsrcAttenuation | Focus::SsrcDitherId | Focus::SsrcPdf
+        ),
+        Kind::Sox { .. } => matches!(
+            focus,
+            Focus::SoxBandwidth
+                | Focus::SoxPhase
+                | Focus::SoxSincTaps
+                | Focus::SoxSincAttenuation
+                | Focus::SoxSincPassband
+                | Focus::SoxSincTransition
+                | Focus::SoxSincKaiserBeta
+        ),
+        Kind::Soxr { .. } => matches!(focus, Focus::SoxrCutoff | Focus::SoxrPhase),
+    }
+}
+
+pub(super) fn current_focus_needs_generic_host_clipboard(app: &AppState) -> bool {
+    if app.preset.naming_input.is_some()
+        || app.bookmarks.naming.is_some()
+        || app.bookmarks.filter_input.is_some()
+    {
+        return true;
+    }
+
+    match &app.active_overlay {
+        ActiveOverlay::CommandInput { .. } | ActiveOverlay::FileInput { .. } => true,
+        ActiveOverlay::MetadataAutoNumber(state) => state.prefix_input.is_some(),
+        ActiveOverlay::GnudbReview(state) => state.edit_input.is_some(),
+        ActiveOverlay::ThemeBuilder(state) => state.text_input_owns_focus(),
+        ActiveOverlay::CuePreview(state) => state.is_editing(),
+        ActiveOverlay::ConversionActionsWizard(state) => state.edit_input.is_some(),
+        ActiveOverlay::FormatSettings {
+            kind,
+            focus,
+            help_scroll: None,
+        } => format_settings_text_input_owns_focus(kind, *focus),
+        ActiveOverlay::BulkRename(state) => state.focus == super::app::BulkRenameFocus::Template,
+        ActiveOverlay::TemplateBuilder(state) => {
+            state.focus == super::app::TemplateBuilderFocus::TemplateInput
+        }
+        ActiveOverlay::MetadataEditor(state) => {
+            if state.phase == MetadataEditorPhase::AddingKey {
+                return state.add_key_input.is_some();
+            }
+            if state.content_tab != crate::tui::app::ContentTab::Chapters {
+                return false;
+            }
+            let authoring = &state.active_surface().chapter_authoring;
+            authoring.edit_input.is_some()
+                || authoring.generation.as_ref().is_some_and(|generation| {
+                    matches!(
+                        generation.field,
+                        crate::tui::chapter_authoring::ChapterGenerationField::Value
+                            | crate::tui::chapter_authoring::ChapterGenerationField::BaseTitle
+                    )
+                })
+        }
+        ActiveOverlay::None if app.current_screen == AppScreen::Browse => {
+            app.browse_inline_edit.is_none()
+                && ((app.browse.search.active
+                    && app.browse.search.focus == super::browse::SearchFocus::Input)
+                    || app.browse.path_input.is_some()
+                    || app.browse.filter_input.is_some())
+        }
+        ActiveOverlay::None if app.current_screen == AppScreen::Convert => {
+            app.convert.metadata.editing.is_some()
+                || app.convert.output_options.editing.is_some()
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn begin_host_clipboard_paste(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     target: super::message::HostClipboardPasteTarget,
@@ -3846,11 +3958,117 @@ fn begin_host_clipboard_paste(
         .unwrap_or(1);
     let generation = app.host_clipboard_paste_generation;
     super::host_clipboard::request_host_clipboard_paste(tx.clone(), generation, target);
-    app.set_status("Reading host clipboard…");
+    app.set_status("Reading host clipboard...");
 }
 
 fn single_line_clipboard_text(text: &str) -> &str {
     text.split(|ch| matches!(ch, '\r' | '\n')).next().unwrap_or("")
+}
+
+fn clipboard_text_has_line_framing(text: &str) -> bool {
+    text.contains('\n') || text.contains('\r')
+}
+
+fn metadata_editor_inline_host_clipboard_text(
+    state: &super::app::MetadataEditorState,
+    field_index: usize,
+    text: &str,
+) -> Result<String, String> {
+    let Some(entry) = state.active_surface().entries.get(field_index) else {
+        return Err("metadata editor: selected field is no longer available".to_string());
+    };
+    let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+    if crate::metadata_persistence::metadata_field_taxonomy(&key).inline_class
+        != crate::metadata_persistence::MetadataInlineEditClass::TrackScalar
+        || !clipboard_text_has_line_framing(text)
+    {
+        return Ok(single_line_clipboard_text(text).to_string());
+    }
+    let lines = normalized_paste_lines(text);
+    let slot_count = entry.per_file_values.len();
+    if lines.len() > slot_count {
+        return Err(format!(
+            "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
+            key,
+            lines.len(),
+            slot_count
+        ));
+    }
+    let encoded = lines
+        .iter()
+        .map(|line| {
+            metadata_editor_escape_inline_component(
+                line,
+                matches!(key.as_str(), "TRACKNUMBER" | "DISCNUMBER"),
+            )
+        })
+        .collect::<Vec<_>>();
+    if encoded.len() == 1 && slot_count > 1 {
+        // Preserve the clipboard's explicit line-list semantics even though a
+        // one-line list has no natural separator after normalization. The
+        // empty second segment selects positional mode at commit and is
+        // deliberately treated as an omitted slot rather than a clear.
+        Ok(format!("{};", encoded[0]))
+    } else {
+        Ok(encoded.join("; "))
+    }
+}
+
+fn metadata_editor_filter_blocks_for_view(
+    state: &super::app::MetadataEditorState,
+    view: super::app::MetadataEditorView,
+    blocks: Vec<super::tag_interchange::FieldBlock>,
+) -> Vec<super::tag_interchange::FieldBlock> {
+    match view {
+        super::app::MetadataEditorView::All => blocks,
+        super::app::MetadataEditorView::Canonical => blocks
+            .into_iter()
+            .filter(|block| {
+                let key = super::probe::canonical_metadata_display_key(&block.key);
+                super::probe::STANDARD_KEY_ORDER.contains(&key.as_str())
+                    || state
+                        .active_surface()
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .any(|(index, entry)| {
+                            super::probe::canonical_metadata_display_key(&entry.display_key) == key
+                                && state.metadata_entry_is_visible(index)
+                        })
+            })
+            .collect(),
+    }
+}
+
+fn metadata_editor_parse_tags_clipboard(
+    state: &super::app::MetadataEditorState,
+    view: super::app::MetadataEditorView,
+    text: &str,
+) -> Result<Vec<super::tag_interchange::FieldBlock>, String> {
+    let blocks = match super::tag_interchange::parse_clipboard_tag_payload(text)? {
+        Some(super::tag_interchange::ClipboardTagPayload::SingleField(block)) => vec![block],
+        Some(super::tag_interchange::ClipboardTagPayload::FieldSet(blocks)) => blocks,
+        None => super::tag_interchange::parse_field_blocks(text)
+            .map_err(|error| format!("clipboard tags: {error}"))?,
+    };
+    let blocks = metadata_editor_filter_blocks_for_view(state, view, blocks);
+    if blocks.is_empty() {
+        return Err(format!(
+            "clipboard contains no tags visible in the {} view",
+            view.label()
+        ));
+    }
+    Ok(blocks)
+}
+
+fn metadata_editor_open_clipboard_confirmation(
+    app: &mut AppState,
+    state: Box<super::app::MetadataEditorState>,
+    action: ConfirmAction,
+    message: String,
+) {
+    app.pending_metadata_editor = Some(state);
+    app.active_overlay = ActiveOverlay::Confirmation { message, action };
 }
 
 pub(crate) fn handle_host_clipboard_read_complete(
@@ -3866,14 +4084,213 @@ pub(crate) fn handle_host_clipboard_read_complete(
     let text = match result {
         Ok(text) if !text.is_empty() => text,
         Ok(_) => {
-            app.set_status("Host clipboard is empty");
+            app.set_status("Terminal clipboard is empty");
             return;
         }
         Err(error) => {
-            app.set_status(format!("Host clipboard unavailable: {error}"));
+            app.set_status(format!("Terminal clipboard unavailable: {error}"));
             return;
         }
     };
+
+    handle_terminal_clipboard_text(app, target, text);
+}
+
+pub(crate) fn handle_terminal_clipboard_text(
+    app: &mut AppState,
+    target: super::message::HostClipboardPasteTarget,
+    text: String,
+) {
+    // These targets may replace the active editor with a confirmation overlay,
+    // so consume editor ownership instead of borrowing the overlay in place.
+    match target.clone() {
+        super::message::HostClipboardPasteTarget::MetadataRows {
+            session_id,
+            field_index,
+        } => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+                app.active_overlay = overlay;
+                app.set_status("Terminal clipboard result ignored because the editor changed");
+                return;
+            };
+            if state.active_surface().technical_details.session_id != session_id
+                || state.content_tab != crate::tui::app::ContentTab::Metadata
+                || state.phase != MetadataEditorPhase::Editing
+                || state.cursor != field_index
+            {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status("Terminal clipboard result ignored because the editor changed");
+                return;
+            }
+
+            let parsed = super::tag_interchange::parse_clipboard_tag_payload(&text);
+            match parsed {
+                Err(reason) => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status(reason);
+                }
+                Ok(Some(super::tag_interchange::ClipboardTagPayload::FieldSet(blocks)))
+                    if metadata_editor_field_set_would_overwrite(&state, &blocks) =>
+                {
+                    metadata_editor_open_clipboard_confirmation(
+                        app,
+                        state,
+                        ConfirmAction::MetadataRowsClipboardPaste {
+                            session_id,
+                            field_index,
+                            text,
+                        },
+                        format!(
+                            "Paste {} copied metadata fields by matching field name? Existing values with the same names will be overwritten.",
+                            blocks.len()
+                        ),
+                    );
+                }
+                Ok(None) => {
+                    let is_track_scalar_list = state
+                        .active_surface()
+                        .entries
+                        .get(field_index)
+                        .map(|entry| {
+                            let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+                            crate::metadata_persistence::metadata_field_taxonomy(&key).inline_class
+                                == crate::metadata_persistence::MetadataInlineEditClass::TrackScalar
+                        })
+                        .unwrap_or(false)
+                        && clipboard_text_has_line_framing(&text);
+                    if is_track_scalar_list {
+                        let line_count = normalized_paste_lines(&text).len();
+                        let key = state.active_surface().entries.get(field_index)
+                            .map(|entry| super::probe::canonical_metadata_display_key(&entry.display_key))
+                            .unwrap_or_else(|| "field".to_string());
+                        let slot_count = state.active_surface().entries.get(field_index)
+                            .map(|entry| entry.per_file_values.len()).unwrap_or(0);
+                        if line_count > slot_count {
+                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                            app.set_status(format!(
+                                "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
+                                key, line_count, slot_count
+                            ));
+                        } else {
+                            metadata_editor_open_clipboard_confirmation(
+                                app,
+                                state,
+                                ConfirmAction::MetadataRowsClipboardPaste {
+                                    session_id,
+                                    field_index,
+                                    text,
+                                },
+                                format!(
+                                    "Paste {line_count} clipboard lines into {key}, one line per track in order? Trailing tracks will be left unchanged."
+                                ),
+                            );
+                        }
+                    } else {
+                        match metadata_editor_apply_clipboard_text_without_confirmation(
+                            app,
+                            &mut state,
+                            field_index,
+                            &text,
+                        ) {
+                            Ok(()) => {}
+                            Err(reason) => app.set_status(reason),
+                        }
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    }
+                }
+                Ok(Some(_)) => {
+                    match metadata_editor_apply_clipboard_text_without_confirmation(
+                        app,
+                        &mut state,
+                        field_index,
+                        &text,
+                    ) {
+                        Ok(()) => {}
+                        Err(reason) => app.set_status(reason),
+                    }
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                }
+            }
+            return;
+        }
+        super::message::HostClipboardPasteTarget::MetadataTags { session_id, view } => {
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+                app.active_overlay = overlay;
+                app.set_status("Terminal clipboard result ignored because the editor changed");
+                return;
+            };
+            if state.active_surface().technical_details.session_id != session_id
+                || state.metadata_view != view
+            {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status("Terminal clipboard result ignored because the editor view changed");
+                return;
+            }
+            let blocks = match metadata_editor_parse_tags_clipboard(&state, view, &text) {
+                Ok(blocks) => blocks,
+                Err(reason) => {
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    app.set_status(reason);
+                    return;
+                }
+            };
+            if metadata_editor_field_set_would_overwrite(&state, &blocks) {
+                metadata_editor_open_clipboard_confirmation(
+                    app,
+                    state,
+                    ConfirmAction::MetadataTagsClipboardPaste {
+                        session_id,
+                        view,
+                        text,
+                    },
+                    format!(
+                        "Paste {} {}-view tag fields by matching field name? Existing values will be overwritten.",
+                        blocks.len(),
+                        view.label()
+                    ),
+                );
+            } else {
+                match metadata_editor_apply_field_set(app, &mut state, &blocks) {
+                    Ok(()) => {}
+                    Err(reason) => app.set_status(reason),
+                }
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+            }
+            return;
+        }
+        super::message::HostClipboardPasteTarget::MetadataChapterTitles { session_id } => {
+            let applied = match &mut app.active_overlay {
+                ActiveOverlay::MetadataEditor(state)
+                    if state.active_surface().technical_details.session_id == session_id
+                        && state.content_tab == crate::tui::app::ContentTab::Chapters
+                        && !state.active_surface().chapter_authoring.saving =>
+                {
+                    match metadata_editor_chapter_paste_titles(state.active_surface_mut(), &text) {
+                        Ok(count) => {
+                            state.recompute_active_dirty();
+                            app.set_status(format!(
+                                "chapter authoring: pasted {count} chapter title{}",
+                                if count == 1 { "" } else { "s" }
+                            ));
+                            true
+                        }
+                        Err(reason) => {
+                            app.set_status(format!("chapter authoring: {reason}"));
+                            true
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !applied {
+                app.set_status("Terminal clipboard result ignored because the editor changed");
+            }
+            return;
+        }
+        _ => {}
+    }
 
     let mut success_status: Option<String> = None;
     let applied = match target {
@@ -3885,111 +4302,112 @@ pub(crate) fn handle_host_clipboard_read_complete(
             .is_some(),
         super::message::HostClipboardPasteTarget::OverlayTextEdit { target } => {
             match &mut app.active_overlay {
-                ActiveOverlay::TextEdit {
-                    input,
-                    target: active_target,
-                    ..
-                } if *active_target == target => {
+                ActiveOverlay::TextEdit { input, target: active_target, .. } if *active_target == target => {
                     input.insert_string(single_line_clipboard_text(&text));
                     true
                 }
                 _ => false,
             }
         }
-        super::message::HostClipboardPasteTarget::MetadataInline {
-            session_id,
-            field_index,
-        } => match &mut app.active_overlay {
-            ActiveOverlay::MetadataEditor(state)
-                if state.active_surface().technical_details.session_id == session_id
-                    && state.phase == MetadataEditorPhase::InlineEdit
-                    && state.cursor == field_index =>
-            {
-                state
-                    .edit_input
-                    .as_mut()
-                    .map(|input| input.insert_string(single_line_clipboard_text(&text)))
-                    .is_some()
-            }
-            _ => false,
-        },
-        super::message::HostClipboardPasteTarget::MetadataDetail {
-            session_id,
-            field_index,
-            detail_index,
-        } => match &mut app.active_overlay {
-            ActiveOverlay::MetadataEditor(state)
-                if state.active_surface().technical_details.session_id == session_id
-                    && state.phase == MetadataEditorPhase::DetailEdit
-                    && state.detail_field_idx == field_index
-                    && state.detail_cursor == detail_index =>
-            {
-                state
-                    .detail_edit
-                    .as_mut()
-                    .map(|input| input.insert_string(single_line_clipboard_text(&text)))
-                    .is_some()
-            }
-            _ => false,
-        },
-        super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
-            session_id,
-            field_index,
-        } => match &mut app.active_overlay {
-            ActiveOverlay::MetadataEditor(state)
-                if state.active_surface().technical_details.session_id == session_id
-                    && state.phase == MetadataEditorPhase::DetailEdit
-                    && state.detail_field_idx == field_index
-                    && state.detail_edit.is_none() =>
-            {
-                let changed =
-                    metadata_editor_apply_detail_whole_field_text(state, field_index, &text);
-                if changed > 0 {
-                    success_status = Some(format!(
-                        "Pasted clipboard lines into {changed} track{}; review in the detail view before saving",
-                        if changed == 1 { "" } else { "s" }
-                    ));
-                } else {
-                    success_status = Some(
-                        "Clipboard paste made no changes to this field".to_string(),
-                    );
-                }
-                true
-            }
-            _ => false,
-        },
-        super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id } => {
+        super::message::HostClipboardPasteTarget::MetadataInline { session_id, field_index } => {
             match &mut app.active_overlay {
-                ActiveOverlay::FilePicker(session) if session.session_id == session_id => {
-                    session.picker.paste_host_clipboard_text(&text)
+                ActiveOverlay::MetadataEditor(state)
+                    if state.active_surface().technical_details.session_id == session_id
+                        && state.phase == MetadataEditorPhase::InlineEdit
+                        && state.cursor == field_index =>
+                {
+                    match metadata_editor_inline_host_clipboard_text(state, field_index, &text) {
+                        Ok(paste_text) => state.edit_input.as_mut().map(|input| input.insert_string(&paste_text)).is_some(),
+                        Err(reason) => {
+                            success_status = Some(reason);
+                            true
+                        }
+                    }
                 }
                 _ => false,
             }
         }
-        super::message::HostClipboardPasteTarget::MetadataFilePicker {
-            editor_session_id,
-            picker_session_id,
-        } => match &mut app.active_overlay {
-            ActiveOverlay::MetadataEditor(state)
-                if state.active_surface().technical_details.session_id == editor_session_id =>
-            {
-                state
-                    .file_picker
-                    .as_mut()
-                    .filter(|session| session.session_id == picker_session_id)
-                    .map(|session| session.picker.paste_host_clipboard_text(&text))
-                    .unwrap_or(false)
+        super::message::HostClipboardPasteTarget::MetadataDetail { session_id, field_index, detail_index } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::MetadataEditor(state)
+                    if state.active_surface().technical_details.session_id == session_id
+                        && state.phase == MetadataEditorPhase::DetailEdit
+                        && state.detail_field_idx == field_index
+                        && state.detail_cursor == detail_index =>
+                {
+                    state.detail_edit.as_mut().map(|input| input.insert_string(single_line_clipboard_text(&text))).is_some()
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
+        super::message::HostClipboardPasteTarget::MetadataDetailWholeField { session_id, field_index } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::MetadataEditor(state)
+                    if state.active_surface().technical_details.session_id == session_id
+                        && state.phase == MetadataEditorPhase::DetailEdit
+                        && state.detail_field_idx == field_index
+                        && state.detail_edit.is_none() =>
+                {
+                    match super::tag_interchange::parse_clipboard_tag_payload(&text) {
+                        Ok(Some(super::tag_interchange::ClipboardTagPayload::SingleField(block))) => {
+                            match metadata_editor_paste_detail_field_block(state, &block) {
+                                Ok(report) => {
+                                    success_status = Some(if report.changed_slots == 0 {
+                                        "Clipboard already matches this field".to_string()
+                                    } else {
+                                        format!("Pasted clipboard field into {} track{}; review before save", report.changed_slots, if report.changed_slots == 1 { "" } else { "s" })
+                                    });
+                                }
+                                Err(reason) => success_status = Some(reason),
+                            }
+                        }
+                        Ok(Some(super::tag_interchange::ClipboardTagPayload::FieldSet(_))) => {
+                            success_status = Some("Clipboard contains multiple fields; select metadata rows or use Paste tags from clipboard".to_string());
+                        }
+                        Ok(None) => {
+                            let changed = metadata_editor_apply_detail_whole_field_text(state, field_index, &text);
+                            success_status = Some(if changed > 0 {
+                                format!("Pasted clipboard lines into {changed} track{}; review before save", if changed == 1 { "" } else { "s" })
+                            } else {
+                                "Clipboard paste made no changes to this field".to_string()
+                            });
+                        }
+                        Err(reason) => success_status = Some(reason),
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::FilePicker(session) if session.session_id == session_id => session.picker.paste_host_clipboard_text(&text),
+                _ => false,
+            }
+        }
+        super::message::HostClipboardPasteTarget::MetadataFilePicker { editor_session_id, picker_session_id } => {
+            match &mut app.active_overlay {
+                ActiveOverlay::MetadataEditor(state) if state.active_surface().technical_details.session_id == editor_session_id => {
+                    state.file_picker.as_mut().filter(|session| session.session_id == picker_session_id)
+                        .map(|session| session.picker.paste_host_clipboard_text(&text)).unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+        super::message::HostClipboardPasteTarget::CurrentTerminalFocus { .. }
+        | super::message::HostClipboardPasteTarget::EditorText { .. }
+        | super::message::HostClipboardPasteTarget::MetadataRows { .. }
+        | super::message::HostClipboardPasteTarget::MetadataTags { .. }
+        | super::message::HostClipboardPasteTarget::MetadataChapterTitles { .. } => unreachable!("handled above"),
     };
 
     if applied {
-        app.set_status(success_status.unwrap_or_else(|| "Pasted from host clipboard".to_string()));
+        app.set_status(success_status.unwrap_or_else(|| "Pasted from terminal clipboard".to_string()));
     } else {
-        app.set_status("Host clipboard result ignored because the editor changed");
+        app.set_status("Terminal clipboard result ignored because the editor changed");
     }
 }
+
 
 fn handle_convert_metadata_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     match (key.code, key.modifiers) {
@@ -4540,7 +4958,7 @@ fn handle_browse_inline_edit_key(
             report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
             if attempted_paste && !handled {
                 app.set_status(
-                    "text clipboard is empty; terminal clipboard paste arrives via bracketed paste",
+                    "terminal clipboard replay contained no pasteable text",
                 );
             }
         }
@@ -5606,7 +6024,7 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
-    fn convert_metadata_view_ctrl_c_copies_focused_value_to_both_planes() {
+    fn convert_metadata_view_ctrl_c_copies_focused_value_to_terminal_clipboard() {
         let (tx, _rx) = channel();
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Convert;
@@ -5634,7 +6052,6 @@ mod inline_edit_behavior_tests {
         );
 
         assert_eq!(published.borrow().as_slice(), &["Give a Little Bit".to_string()]);
-        assert_eq!(tui_file_picker::read_shared_text_clipboard(), "Give a Little Bit");
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
             Some("Copied: Give a Little Bit")
@@ -8281,7 +8698,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                     app.browse.close_search();
                 }
                 KeyCode::Tab => {
-                    app.browse.search.focus = SearchFocus::Sort;
+                    app.browse.search.focus = SearchFocus::Match;
                 }
                 KeyCode::BackTab => {
                     app.browse.search.focus = SearchFocus::Recursive;
@@ -8300,6 +8717,21 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                 _ => {}
             }
         }
+        SearchFocus::Match => match key.code {
+            KeyCode::Esc => {
+                app.browse.close_search();
+            }
+            KeyCode::Tab => {
+                app.browse.search.focus = SearchFocus::Sort;
+            }
+            KeyCode::BackTab => {
+                app.browse.search.focus = SearchFocus::Mode;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.browse.toggle_search_fuzzy();
+            }
+            _ => {}
+        },
         SearchFocus::Sort => {
             match key.code {
                 KeyCode::Esc => {
@@ -8309,7 +8741,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                     app.browse.search.focus = SearchFocus::AudioOnly;
                 }
                 KeyCode::BackTab => {
-                    app.browse.search.focus = SearchFocus::Mode;
+                    app.browse.search.focus = SearchFocus::Match;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     let tag_mode = matches!(
@@ -8423,7 +8855,7 @@ fn handle_browse_filter_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                 super::disc_browser_actions::probe_selected_disc_after_cursor_move(app, tx);
             } else if attempted_paste {
                 app.set_status(
-                    "text clipboard is empty; terminal clipboard paste arrives via bracketed paste",
+                    "terminal clipboard replay contained no pasteable text",
                 );
             }
         }
@@ -8475,7 +8907,7 @@ fn handle_browse_path_input_key(app: &mut AppState, key: KeyEvent) {
             report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
             if attempted_paste && !handled {
                 app.set_status(
-                    "text clipboard is empty; terminal clipboard paste arrives via bracketed paste",
+                    "terminal clipboard replay contained no pasteable text",
                 );
             }
         }
@@ -9772,6 +10204,19 @@ fn update_scrollable_message_offset(
 }
 
 fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+    // MetadataEditor can carry per-file artwork and other large payloads. Do
+    // not deep-clone it just to satisfy the generic overlay dispatcher. Move
+    // ownership out, let the reducer declare whether it kept or replaced the
+    // editor, and restore only when it remains the active surface.
+    if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(state) = overlay else {
+            unreachable!("metadata editor variant checked above")
+        };
+        dispatch_metadata_editor_key_owned(app, key, state, tx);
+        return;
+    }
+
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::DiscBrowser(_) => {
@@ -10890,13 +11335,6 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             }
             _ => {}
         },
-        ActiveOverlay::MetadataEditor(mut state) => {
-            handle_metadata_editor_key(app, key, &mut state, tx);
-            // If the handler didn't close or replace the overlay, put state back.
-            if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                app.active_overlay = ActiveOverlay::MetadataEditor(state);
-            }
-        }
         ActiveOverlay::Help { mut scroll, screen } => {
             // Compute content length for scroll clamping.
             let max_scroll = {
@@ -11308,6 +11746,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                     };
                 }
             }
+        }
+        ActiveOverlay::MetadataEditor(_) => {
+            unreachable!("metadata editor is handled by the owned fast path above")
         }
         ActiveOverlay::None => {}
     }
@@ -11921,7 +12362,10 @@ fn editor_owner_overlay_mut(app: &mut AppState) -> &mut ActiveOverlay {
     }
 }
 
-fn editor_text_input(app: &AppState, target: EditorTextTarget) -> Option<&super::text_input::TextInputState> {
+pub(super) fn editor_text_input(
+    app: &AppState,
+    target: EditorTextTarget,
+) -> Option<&super::text_input::TextInputState> {
     match target {
         EditorTextTarget::BrowseFileInlineEdit
         | EditorTextTarget::BrowseTreeInlineEdit => app.browse_inline_edit.as_ref().map(|edit| &edit.input),
@@ -12149,25 +12593,89 @@ fn focus_editor_target(app: &mut AppState, target: EditorTextTarget) {
 pub(crate) fn editor_context_capabilities(app: &AppState) -> (bool, bool) {
     app.editor_context_target
         .and_then(|target| editor_text_input(app, target))
-        .map(|input| (input.has_selection(), input.can_paste()))
+        // Clipboard contents live outside the process, so menu construction
+        // cannot synchronously know whether Paste will produce text. Keep the
+        // action available whenever the editor still exists and report an
+        // empty/unavailable clipboard after the asynchronous read instead.
+        .map(|input| (input.has_selection(), true))
         .unwrap_or((false, false))
+}
+
+fn editor_context_host_paste_target(
+    app: &AppState,
+    target: EditorTextTarget,
+) -> Option<super::message::HostClipboardPasteTarget> {
+    match target {
+        EditorTextTarget::BrowseFileInlineEdit | EditorTextTarget::BrowseTreeInlineEdit => app
+            .browse_inline_edit
+            .as_ref()
+            .map(|edit| super::message::HostClipboardPasteTarget::BrowseInlineEdit {
+                target: edit.target.clone(),
+            }),
+        EditorTextTarget::MetadataInline => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state)
+                if state.phase == MetadataEditorPhase::InlineEdit
+                    && state.edit_input.is_some() =>
+            {
+                Some(super::message::HostClipboardPasteTarget::MetadataInline {
+                    session_id: state.active_surface().technical_details.session_id,
+                    field_index: state.cursor,
+                })
+            }
+            _ => None,
+        },
+        EditorTextTarget::MetadataDetail => match editor_owner_overlay(app) {
+            ActiveOverlay::MetadataEditor(state)
+                if state.phase == MetadataEditorPhase::DetailEdit
+                    && state.detail_edit.is_some() =>
+            {
+                Some(super::message::HostClipboardPasteTarget::MetadataDetail {
+                    session_id: state.active_surface().technical_details.session_id,
+                    field_index: state.detail_field_idx,
+                    detail_index: state.detail_cursor,
+                })
+            }
+            _ => None,
+        },
+        EditorTextTarget::OverlayTextEdit => match editor_owner_overlay(app) {
+            ActiveOverlay::TextEdit { target, .. } => Some(
+                super::message::HostClipboardPasteTarget::OverlayTextEdit {
+                    target: target.clone(),
+                },
+            ),
+            _ => None,
+        },
+        _ if editor_text_input(app, target).is_some() => {
+            Some(super::message::HostClipboardPasteTarget::EditorText {
+                target,
+                interaction_generation: app.host_clipboard_interaction_generation,
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn execute_editor_context_action(
     app: &mut AppState,
     action: super::context_menu::ContextAction,
+    tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     let Some(target) = app.editor_context_target else {
         return false;
     };
+    if matches!(action, super::context_menu::ContextAction::EditorPaste) {
+        let Some(paste_target) = editor_context_host_paste_target(app, target) else {
+            app.set_status("editor context target is no longer active");
+            return true;
+        };
+        begin_host_clipboard_paste(app, tx, paste_target);
+        return true;
+    }
     let Some(input) = editor_text_input_mut(app, target) else {
         app.set_status("editor context target is no longer active");
         return true;
     };
     match action {
-        super::context_menu::ContextAction::EditorPaste => {
-            input.paste_clipboard();
-        }
         super::context_menu::ContextAction::EditorCopy => {
             input.copy_selection();
         }
@@ -12181,6 +12689,7 @@ pub(crate) fn execute_editor_context_action(
                 crate::convert::renaming::transform_case(value, transform)
             });
         }
+        super::context_menu::ContextAction::EditorPaste => unreachable!("handled above"),
         _ => return false,
     }
     true
@@ -19418,6 +19927,15 @@ fn handle_global_file_picker_mouse(
     let session_id = session.session_id;
     let purpose = session.purpose.clone();
     let action = session.picker.handle_mouse(mouse, Rect::default());
+    if session.picker.take_host_clipboard_paste_request() {
+        begin_host_clipboard_paste(
+            app,
+            tx,
+            super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id },
+        );
+        app.active_overlay = ActiveOverlay::FilePicker(session);
+        return;
+    }
     let ignored_directories = session.picker.take_last_selection_ignored_directories();
     if let Err(err) = send_file_picker_completion(
         app,
@@ -20536,7 +21054,7 @@ pub(crate) fn metadata_field_keys_match(source: &str, target: &str) -> bool {
 }
 
 pub(crate) fn metadata_editor_copy_detail_field(
-    app: &mut AppState,
+    _app: &mut AppState,
     state: &super::app::MetadataEditorState,
 ) -> Result<usize, String> {
     let entry = state
@@ -20551,18 +21069,14 @@ pub(crate) fn metadata_editor_copy_detail_field(
         return Err("metadata editor: selected field has no positional values".to_string());
     }
 
-    app.metadata_field_clipboard = Some(super::tag_interchange::FieldBlock {
-        key: entry.display_key.clone(),
-        values: entry.per_file_values.clone(),
-    });
-
-    // Mirror the same single-field payload into the process-wide textual
-    // clipboard so the existing tag-block interoperability remains useful.
-    // The structured AppState carrier above is authoritative for in-app paste.
-    let serialized = super::tag_interchange::serialize_tag_entries(std::iter::once(entry));
-    if !serialized.text.is_empty() {
-        tui_file_picker::write_shared_text_clipboard(serialized.text);
+    let serialized = super::tag_interchange::serialize_clipboard_tag_entries(
+        std::iter::once(entry),
+        super::tag_interchange::ClipboardTagPayloadKind::SingleField,
+    );
+    if serialized.text.is_empty() {
+        return Err("metadata editor: selected field is not representable on the clipboard".to_string());
     }
+    super::context_menu::publish_text_clipboard(&serialized.text);
     Ok(entry.per_file_values.len())
 }
 
@@ -20572,47 +21086,44 @@ pub(crate) struct MetadataFieldPasteReport {
     pub collapsed_stored_values: bool,
 }
 
-pub(crate) fn metadata_editor_paste_detail_field(
-    app: &mut AppState,
+fn metadata_editor_paste_field_block_into_row(
     state: &mut super::app::MetadataEditorState,
+    field_idx: usize,
+    block: &super::tag_interchange::FieldBlock,
 ) -> Result<MetadataFieldPasteReport, String> {
     if state.read_only {
         return Err("read-only editor (SACD ISO)".to_string());
     }
-    let field_idx = state.detail_field_idx;
     if let Some(reason) = metadata_editor_unpersistable_per_track_reason(state, field_idx) {
         return Err(reason);
     }
-    let block = app
-        .metadata_field_clipboard
-        .clone()
-        .ok_or_else(|| "metadata editor: field clipboard is empty".to_string())?;
     let target = state
         .active_surface()
         .entries
         .get(field_idx)
         .ok_or_else(|| "metadata editor: selected field is no longer available".to_string())?;
-    if !metadata_field_keys_match(&block.key, &target.display_key) {
-        return Err(format!(
-            "metadata editor: field clipboard contains {}, but the selected field is {}",
-            block.key, target.display_key
-        ));
-    }
     if target.is_binary {
-        return Err("metadata editor: binary fields cannot receive field clipboard values".to_string());
+        return Err("metadata editor: binary fields cannot receive clipboard values".to_string());
     }
 
     let slot_count = target.per_file_values.len();
+    let value_mode = super::tag_interchange::validate_block_count(block, slot_count)
+        .map_err(|error| format!("metadata editor: {error}"))?;
     let writable = (0..slot_count)
         .map(|slot| metadata_editor_entry_slot_edit_block_reason(state, field_idx, slot).is_none())
         .collect::<Vec<_>>();
     let before = target.clone();
     let mut changed = 0usize;
     if let Some(entry) = state.active_surface_mut().entries.get_mut(field_idx) {
-        for (slot, replacement) in block.values.iter().take(slot_count).enumerate() {
+        for slot in 0..slot_count {
             if !writable.get(slot).copied().unwrap_or(false) {
                 continue;
             }
+            let Some(replacement) =
+                super::tag_interchange::value_for_target(block, value_mode, slot)
+            else {
+                continue;
+            };
             let Some(current) = entry.per_file_values.get_mut(slot) else {
                 continue;
             };
@@ -20638,16 +21149,15 @@ pub(crate) fn metadata_editor_paste_detail_field(
         .get(field_idx)
         .is_some_and(|after| {
             after
-            .per_file_values
-            .iter()
-            .enumerate()
-            .take(block.values.len().min(slot_count))
-            .filter(|(slot, _)| writable.get(*slot).copied().unwrap_or(false))
-            .any(|(slot, values)| {
-                !before
-                    .stored_list_collapse_slots(std::iter::once((slot, values)))
-                    .is_empty()
-            })
+                .per_file_values
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| writable.get(*slot).copied().unwrap_or(false))
+                .any(|(slot, values)| {
+                    !before
+                        .stored_list_collapse_slots(std::iter::once((slot, values)))
+                        .is_empty()
+                })
         });
     metadata_editor_clamp_detail_value_cursor(state);
     recalc_dirty(state);
@@ -20655,6 +21165,26 @@ pub(crate) fn metadata_editor_paste_detail_field(
         changed_slots: changed,
         collapsed_stored_values,
     })
+}
+
+pub(crate) fn metadata_editor_paste_detail_field_block(
+    state: &mut super::app::MetadataEditorState,
+    block: &super::tag_interchange::FieldBlock,
+) -> Result<MetadataFieldPasteReport, String> {
+    metadata_editor_paste_field_block_into_row(state, state.detail_field_idx, block)
+}
+
+#[cfg(test)]
+fn metadata_editor_paste_detail_field(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+) -> Result<MetadataFieldPasteReport, String> {
+    let block = app
+        .metadata_field_clipboard
+        .as_ref()
+        .ok_or_else(|| "metadata editor: test clipboard is empty".to_string())?
+        .clone();
+    metadata_editor_paste_detail_field_block(state, &block)
 }
 
 fn metadata_editor_detail_field_key(
@@ -21418,9 +21948,15 @@ fn metadata_editor_selected_rows_serialization(
     if rows.is_empty() {
         return Err("metadata editor: no tag row selected".to_string());
     }
-    let serialized = super::tag_interchange::serialize_tag_entries(
+    let kind = if rows.len() == 1 {
+        super::tag_interchange::ClipboardTagPayloadKind::SingleField
+    } else {
+        super::tag_interchange::ClipboardTagPayloadKind::FieldSet
+    };
+    let serialized = super::tag_interchange::serialize_clipboard_tag_entries(
         rows.iter()
             .filter_map(|index| state.active_surface().entries.get(*index)),
+        kind,
     );
     if serialized.text.is_empty() {
         return Err("metadata editor: selected rows contain no serializable text fields".to_string());
@@ -21435,7 +21971,7 @@ pub(super) fn metadata_editor_copy_selected_rows(
     let serialized = metadata_editor_selected_rows_serialization(state)?;
     super::context_menu::publish_text_clipboard(&serialized.text);
     let mut status = format!(
-        "Copied {} field{} (text clipboard)",
+        "Copied {} field{} to terminal clipboard",
         serialized.keys.len(),
         if serialized.keys.len() == 1 { "" } else { "s" },
     );
@@ -21495,18 +22031,6 @@ pub(super) fn metadata_editor_cut_selected_rows(
     Ok(marked)
 }
 
-fn metadata_editor_known_field_block_key(
-    state: &super::app::MetadataEditorState,
-    key: &str,
-) -> bool {
-    super::probe::STANDARD_KEY_ORDER
-        .iter()
-        .any(|known| *known == key)
-        || state.active_surface().entries.iter().any(|entry| {
-            super::probe::canonical_metadata_display_key(&entry.display_key) == key
-        })
-}
-
 fn normalized_paste_lines(text: &str) -> Vec<String> {
     let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     if normalized.ends_with('\n') {
@@ -21515,9 +22039,34 @@ fn normalized_paste_lines(text: &str) -> Vec<String> {
     normalized.split('\n').map(str::to_string).collect()
 }
 
-pub(super) fn metadata_editor_apply_row_or_block_paste(
+fn metadata_editor_apply_field_set(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
+    blocks: &[super::tag_interchange::FieldBlock],
+) -> Result<(), String> {
+    let report = super::tag_interchange::apply_clipboard_field_blocks_to_editor(state, blocks)
+        .map_err(|error| format!("clipboard metadata: {error}"))?;
+    app.set_status(report.success_status(state.active_surface().paths.len()));
+    Ok(())
+}
+
+fn metadata_editor_field_set_would_overwrite(
+    state: &super::app::MetadataEditorState,
+    blocks: &[super::tag_interchange::FieldBlock],
+) -> bool {
+    blocks.iter().any(|block| {
+        let canonical = super::probe::canonical_metadata_display_key(&block.key);
+        state.active_surface().entries.iter().any(|entry| {
+            super::probe::canonical_metadata_display_key(&entry.display_key) == canonical
+                && entry.per_file_values.iter().any(|values| !values.as_str().is_empty())
+        })
+    })
+}
+
+fn metadata_editor_apply_clipboard_text_without_confirmation(
+    app: &mut AppState,
+    state: &mut super::app::MetadataEditorState,
+    field_index: usize,
     text: &str,
 ) -> Result<(), String> {
     if state.content_tab != crate::tui::app::ContentTab::Metadata
@@ -21525,72 +22074,139 @@ pub(super) fn metadata_editor_apply_row_or_block_paste(
     {
         return Err("metadata editor: row paste requires the Metadata tab in Editing mode".to_string());
     }
-    let lines = normalized_paste_lines(text);
-    let first = lines.first().map(String::as_str).unwrap_or("");
-    let field_blocks = lines.len() >= 2
-        && super::tag_interchange::is_field_block_key(first)
-        && metadata_editor_known_field_block_key(state, first);
-    if field_blocks {
-        let blocks = super::tag_interchange::parse_field_blocks(text)
-            .map_err(|error| format!("tag blocks: {error}"))?;
-        if let Some(unknown) = blocks
-            .iter()
-            .find(|block| !metadata_editor_known_field_block_key(state, &block.key))
-        {
-            return Err(format!(
-                "tag blocks: {} is not a known editor field; use Get tags from Clipboard or File to create custom fields",
-                unknown.key
-            ));
+    state.cursor = field_index;
+    match super::tag_interchange::parse_clipboard_tag_payload(text)? {
+        Some(super::tag_interchange::ClipboardTagPayload::SingleField(block)) => {
+            let report = metadata_editor_paste_field_block_into_row(state, field_index, &block)?;
+            app.set_status(if report.changed_slots == 0 {
+                "metadata editor: clipboard already matches this field".to_string()
+            } else {
+                format!(
+                    "metadata editor: pasted field values into {} track{}; review before save",
+                    report.changed_slots,
+                    if report.changed_slots == 1 { "" } else { "s" }
+                )
+            });
+            Ok(())
         }
-        let report = super::tag_interchange::apply_field_blocks_to_editor(state, &blocks)
-            .map_err(|error| format!("tag blocks: {error}"))?;
-        app.set_status(report.success_status(state.active_surface().paths.len()));
-        return Ok(());
-    }
+        Some(super::tag_interchange::ClipboardTagPayload::FieldSet(blocks)) => {
+            metadata_editor_apply_field_set(app, state, &blocks)
+        }
+        None => {
+            let entry = state
+                .active_surface()
+                .entries
+                .get(field_index)
+                .ok_or_else(|| "metadata editor: select a tag row before pasting".to_string())?;
+            let key = super::probe::canonical_metadata_display_key(&entry.display_key);
+            let taxonomy = crate::metadata_persistence::metadata_field_taxonomy(&key);
+            let lines = normalized_paste_lines(text);
+            if taxonomy.inline_class == crate::metadata_persistence::MetadataInlineEditClass::TrackScalar {
+                let slot_count = entry.per_file_values.len();
+                if lines.len() > slot_count {
+                    return Err(format!(
+                        "{} paste has {} lines for {} tracks; refusing to discard the extra lines",
+                        key,
+                        lines.len(),
+                        slot_count
+                    ));
+                }
+                // A single trailing line terminator is text-file framing, not
+                // an extra empty track value. Validation above already uses
+                // `normalized_paste_lines`; apply the exact same normalized
+                // payload so confirmation and mutation cannot disagree.
+                let normalized_text = lines.join("\n");
+                let result = metadata_editor_apply_detail_paste_with_mode(
+                    state,
+                    field_index,
+                    &normalized_text,
+                    true,
+                )?;
+                app.set_status(metadata_editor_detail_paste_status(&key, &result));
+                return Ok(());
+            }
 
-    let row = state.cursor;
-    let Some(entry) = state.active_surface().entries.get(row) else {
-        return Err("metadata editor: select a tag row before pasting".to_string());
-    };
-    let slot_count = entry.per_file_values.len();
-    let key = super::probe::canonical_metadata_display_key(&entry.display_key);
-    let album_replicated =
-        crate::metadata_persistence::metadata_field_taxonomy(&key).release_scoped;
-    let valid_count = lines.len() == slot_count || (album_replicated && lines.len() == 1);
-    if !valid_count {
-        let expectation = if album_replicated {
-            format!(
-                "1 broadcast value or {} positional value{}",
-                slot_count,
-                if slot_count == 1 { "" } else { "s" }
-            )
-        } else {
-            format!("{} positional value{}", slot_count, if slot_count == 1 { "" } else { "s" })
-        };
-        return Err(format!(
-            "{} paste has {} line{}; expected {}",
-            key,
-            lines.len(),
-            if lines.len() == 1 { "" } else { "s" },
-            expectation,
-        ));
+            let slot_count = entry.per_file_values.len();
+            let album_replicated = taxonomy.release_scoped;
+            let valid_count = lines.len() == slot_count || (album_replicated && lines.len() == 1);
+            if !valid_count {
+                let expectation = if album_replicated {
+                    format!("1 broadcast value or {slot_count} positional values")
+                } else {
+                    format!("{slot_count} positional values")
+                };
+                return Err(format!(
+                    "{} paste has {} lines; expected {}",
+                    key,
+                    lines.len(),
+                    expectation
+                ));
+            }
+            let force_positional = album_replicated && lines.len() > 1;
+            let result = metadata_editor_apply_detail_paste_with_mode(
+                state,
+                field_index,
+                text,
+                force_positional,
+            )?;
+            app.set_status(metadata_editor_detail_paste_status(&key, &result));
+            Ok(())
+        }
     }
-    let force_positional = album_replicated && lines.len() > 1;
-    let result =
-        metadata_editor_apply_detail_paste_with_mode(state, row, text, force_positional)?;
-    app.set_status(metadata_editor_detail_paste_status(&key, &result));
-    Ok(())
 }
 
-pub(super) fn metadata_editor_paste_shared_clipboard(
+#[cfg(test)]
+pub(super) fn metadata_editor_apply_row_or_block_paste(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
+    text: &str,
 ) -> Result<(), String> {
-    let text = tui_file_picker::read_shared_text_clipboard();
-    if text.is_empty() {
-        return Err("tonepoet's clipboard has no tag text".to_string());
+    metadata_editor_apply_clipboard_text_without_confirmation(app, state, state.cursor, text)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataEditorKeyOutcome {
+    KeepEditor,
+    OverlayTransition,
+}
+
+fn dispatch_metadata_editor_key_owned(
+    app: &mut AppState,
+    key: KeyEvent,
+    mut state: Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let outcome = handle_metadata_editor_key(app, key, &mut state, tx);
+    if outcome == MetadataEditorKeyOutcome::KeepEditor
+        && matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
     }
-    metadata_editor_apply_row_or_block_paste(app, state, &text)
+}
+
+fn dispatch_metadata_editor_apply_owned(
+    app: &mut AppState,
+    mut state: Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    metadata_editor_apply(app, &mut state, tx);
+    if matches!(app.active_overlay, ActiveOverlay::None) {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    }
+}
+
+fn dispatch_metadata_editor_ok_owned(
+    app: &mut AppState,
+    mut state: Box<super::app::MetadataEditorState>,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    metadata_editor_ok(app, &mut state, tx);
+    if matches!(app.active_overlay, ActiveOverlay::None)
+        && (state.phase == super::app::MetadataEditorPhase::Saving
+            || state.any_presentation_dirty())
+    {
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+    }
 }
 
 fn handle_metadata_editor_key(
@@ -21598,7 +22214,7 @@ fn handle_metadata_editor_key(
     key: KeyEvent,
     state: &mut Box<super::app::MetadataEditorState>,
     tx: &mpsc::Sender<AppMessage>,
-) {
+) -> MetadataEditorKeyOutcome {
     use super::app::MetadataEditorPhase;
 
     let total_rows = state.visible_metadata_rows().len(); // includes the "Add field" row
@@ -21607,18 +22223,43 @@ fn handle_metadata_editor_key(
         && state.active_surface().chapter_authoring.saving
     {
         let _ = metadata_editor_handle_chapter_key(app, key, state, tx);
-        return;
+        return MetadataEditorKeyOutcome::KeepEditor;
     }
 
     if metadata_editor_handle_alt_commit_action(app, state, &key, tx) {
-        return;
+        if !matches!(app.active_overlay, ActiveOverlay::None) {
+            return MetadataEditorKeyOutcome::OverlayTransition;
+        }
+        let requested_close = key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('o' | 'O'));
+        if requested_close
+            && state.phase != MetadataEditorPhase::Saving
+            && !state.any_presentation_dirty()
+        {
+            return MetadataEditorKeyOutcome::OverlayTransition;
+        }
+        return MetadataEditorKeyOutcome::KeepEditor;
     }
 
     match state.phase {
         MetadataEditorPhase::Editing => {
+            if is_host_clipboard_paste_chord(&key)
+                && state.content_tab == crate::tui::app::ContentTab::Metadata
+                && state.cursor < state.active_surface().entries.len()
+            {
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::MetadataRows {
+                        session_id: state.active_surface().technical_details.session_id,
+                        field_index: state.cursor,
+                    },
+                );
+                return MetadataEditorKeyOutcome::KeepEditor;
+            }
             if state.file_picker.is_some() {
                 handle_metadata_file_picker_key(app, key, state, tx);
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
 
             if state.presentation_selector_open {
@@ -21685,13 +22326,13 @@ fn handle_metadata_editor_key(
                     }
                     _ => {}
                 }
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
 
             if state.content_tab == crate::tui::app::ContentTab::Chapters
                 && metadata_editor_handle_chapter_key(app, key, state, tx)
             {
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
 
             match key.code {
@@ -21702,10 +22343,11 @@ fn handle_metadata_editor_key(
                         input: super::text_input::TextInputState::empty(),
                         completion: None,
                     };
-                    return;
+                    return MetadataEditorKeyOutcome::OverlayTransition;
                 }
                 KeyCode::Esc => {
                     request_metadata_editor_close(app, state, tx);
+                    return MetadataEditorKeyOutcome::OverlayTransition;
                 }
                 KeyCode::Tab
                     if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -21827,13 +22469,6 @@ fn handle_metadata_editor_key(
                         app.set_status(reason);
                     }
                 }
-                KeyCode::Char('v') | KeyCode::Char('p')
-                    if key.modifiers == KeyModifiers::CONTROL =>
-                {
-                    if let Err(reason) = metadata_editor_paste_shared_clipboard(app, state) {
-                        app.set_status(reason);
-                    }
-                }
                 KeyCode::Char('v') if key.modifiers.is_empty() => {
                     state.toggle_metadata_view();
                     ensure_cursor_visible(state);
@@ -21904,7 +22539,7 @@ fn handle_metadata_editor_key(
                         app.set_status("read-only editor (SACD ISO)");
                     } else if metadata_editor_delete_cursor_requires_embedded_cuesheet_confirmation(state) {
                         open_embedded_cuesheet_delete_confirmation(app, state.clone());
-                        return;
+                        return MetadataEditorKeyOutcome::KeepEditor;
                     } else if let Some(status) = metadata_editor_delete_cursor(state) {
                         app.set_status(status);
                     }
@@ -21915,7 +22550,7 @@ fn handle_metadata_editor_key(
         MetadataEditorPhase::InlineEdit => {
             if state.edit_input.is_none() {
                 state.phase = MetadataEditorPhase::Editing;
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
             if is_host_clipboard_paste_chord(&key) {
                 begin_host_clipboard_paste(
@@ -21926,7 +22561,7 @@ fn handle_metadata_editor_key(
                         field_index: state.cursor,
                     },
                 );
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
             match key.code {
                 KeyCode::Esc => {
@@ -21949,7 +22584,7 @@ fn handle_metadata_editor_key(
                     let maximized = state.maximized;
                     let Some(input) = state.edit_input.as_ref() else {
                         state.phase = MetadataEditorPhase::Editing;
-                        return;
+                        return MetadataEditorKeyOutcome::KeepEditor;
                     };
                     let has_nl = input.text.contains('\n') || input.text.contains('\r');
                     let display_len = super::display_width::width(&input.text);
@@ -22037,7 +22672,7 @@ fn handle_metadata_editor_key(
                 Some(i) => i,
                 None => {
                     state.phase = MetadataEditorPhase::Editing;
-                    return;
+                    return MetadataEditorKeyOutcome::KeepEditor;
                 }
             };
             match key.code {
@@ -22060,20 +22695,20 @@ fn handle_metadata_editor_key(
                             app.set_status("metadata editor: cannot add field — no writable files in this editor session");
                             state.add_key_input = None;
                             state.phase = MetadataEditorPhase::Editing;
-                            return;
+                            return MetadataEditorKeyOutcome::KeepEditor;
                         }
                         if let Some(reason) = unified_cue_album_per_track_add_key_refusal(state, &key_name) {
                             app.set_status(reason);
                             state.add_key_input = None;
                             state.phase = MetadataEditorPhase::Editing;
-                            return;
+                            return MetadataEditorKeyOutcome::KeepEditor;
                         }
                         if metadata_editor_key_affects_embedded_cuesheet(&key_name) {
                             if let Some(reason) = metadata_editor_multi_file_embedded_cuesheet_reason(state) {
                                 app.set_status(reason);
                                 state.add_key_input = None;
                                 state.phase = MetadataEditorPhase::Editing;
-                                return;
+                                return MetadataEditorKeyOutcome::KeepEditor;
                             }
                         }
                         let semantic_track_dim = state
@@ -22192,7 +22827,7 @@ fn handle_metadata_editor_key(
                             detail_index: state.detail_cursor,
                         },
                     );
-                    return;
+                    return MetadataEditorKeyOutcome::KeepEditor;
                 }
                 match key.code {
                     KeyCode::Esc => {
@@ -22227,13 +22862,24 @@ fn handle_metadata_editor_key(
                         );
                     }
                 }
-                return;
+                return MetadataEditorKeyOutcome::KeepEditor;
             }
 
             // Detail overlay navigation. `j`/`k` move across the file/track
             // axis. Enter edits the complete escaped-semicolon row for set-valued
             // fields; `h`/`l`, `a`, `x`, and `[`/`]` remain secondary
             // single-value navigation/manipulation affordances.
+            if is_host_clipboard_paste_chord(&key) {
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                        session_id: state.active_surface().technical_details.session_id,
+                        field_index: state.detail_field_idx,
+                    },
+                );
+                return MetadataEditorKeyOutcome::KeepEditor;
+            }
             let set_valued = metadata_editor_detail_is_set_valued(state, field_idx);
             match key.code {
                 KeyCode::Esc => {
@@ -22277,27 +22923,6 @@ fn handle_metadata_editor_key(
                             count,
                             if count == 1 { "" } else { "s" }
                         )),
-                        Err(reason) => app.set_status(reason),
-                    }
-                }
-                KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                    match metadata_editor_paste_detail_field(app, state) {
-                        Ok(report) if report.changed_slots == 0 => app.set_status(
-                            "metadata editor: field clipboard already matches this field",
-                        ),
-                        Ok(report) => {
-                            let mut status = format!(
-                                "metadata editor: pasted this field into {} track{}; review before save",
-                                report.changed_slots,
-                                if report.changed_slots == 1 { "" } else { "s" }
-                            );
-                            if report.collapsed_stored_values {
-                                status.push_str(
-                                    "; warning: one or more stored multi-value lists were reduced",
-                                );
-                            }
-                            app.set_status(status);
-                        }
                         Err(reason) => app.set_status(reason),
                     }
                 }
@@ -22384,9 +23009,11 @@ fn handle_metadata_editor_key(
             // still in flight.
             if key.code == KeyCode::Esc {
                 request_metadata_editor_close(app, state, tx);
+                return MetadataEditorKeyOutcome::OverlayTransition;
             }
         }
     }
+    MetadataEditorKeyOutcome::KeepEditor
 }
 
 /// Save-time CUESHEET regeneration (Phase 4).
@@ -34171,10 +34798,10 @@ fn metadata_editor_chapter_apply_generation(
 
 fn metadata_editor_chapter_paste_titles(
     surface: &mut crate::tui::app::PresentationTab,
+    text: &str,
 ) -> Result<usize, String> {
-    let text = tui_file_picker::read_shared_text_clipboard();
     if text.is_empty() {
-        return Err("shared clipboard is empty".to_string());
+        return Err("terminal clipboard is empty".to_string());
     }
     let lines = text
         .lines()
@@ -35352,13 +35979,22 @@ fn metadata_editor_handle_chapter_key(
             app.set_status("chapter authoring: title pattern; Tab moves fields, Enter applies");
         }
         KeyCode::Char('p') if key.modifiers.is_empty() => {
-            match metadata_editor_chapter_paste_titles(state.active_surface_mut()) {
-                Ok(count) => {
-                    state.recompute_active_dirty();
-                    app.set_status(format!("chapter authoring: pasted {count} chapter title{}", if count == 1 { "" } else { "s" }));
-                }
-                Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
-            }
+            begin_host_clipboard_paste(
+                app,
+                tx,
+                super::message::HostClipboardPasteTarget::MetadataChapterTitles {
+                    session_id: state.active_surface().technical_details.session_id,
+                },
+            );
+        }
+        KeyCode::Char(_) if is_host_clipboard_paste_chord(&key) => {
+            begin_host_clipboard_paste(
+                app,
+                tx,
+                super::message::HostClipboardPasteTarget::MetadataChapterTitles {
+                    session_id: state.active_surface().technical_details.session_id,
+                },
+            );
         }
         KeyCode::Char('s') if key.modifiers.is_empty() => {
             let split_on_conversion = matches!(
@@ -39240,6 +39876,7 @@ fn metadata_cue_surface_proves_image_content(surface: &MetadataCueSurface) -> bo
     false
 }
 
+#[cfg(test)]
 pub(super) fn cue_import_availability_for_paths(
     paths: &[std::path::PathBuf],
 ) -> super::probe::CueImportAvailability {
@@ -39252,24 +39889,20 @@ pub(super) fn cue_import_availability_for_paths(
         .collect::<std::collections::BTreeSet<_>>();
     let mut saw_unknown = false;
     for parent in parents {
-        let entries = match std::fs::read_dir(parent) {
-            Ok(entries) => entries,
-            Err(_) => {
-                saw_unknown = true;
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    saw_unknown = true;
-                    continue;
-                }
-            };
-            if super::cue_parser::is_user_visible_cue_path(&entry.path()) {
-                return super::probe::CueImportAvailability::Present;
-            }
+        if std::fs::read_dir(&parent).is_err() {
+            saw_unknown = true;
+            continue;
+        }
+        let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+            parent.clone(),
+        ]);
+        if candidates.is_empty() {
+            continue;
+        }
+        let inspection =
+            crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates);
+        if !inspection.viable.is_empty() {
+            return super::probe::CueImportAvailability::Present;
         }
     }
     if saw_unknown {
@@ -47329,7 +47962,7 @@ fn handle_metadata_editor_mouse_in_area(
     let mx = mouse.column;
     let my = mouse.row;
 
-    let overlay = app.active_overlay.clone();
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
     if let ActiveOverlay::MetadataEditor(mut state) = overlay {
         let layout = super::draw_overlays::metadata_editor_layout_for_area_with_maximized(
             area,
@@ -47492,18 +48125,18 @@ fn handle_metadata_editor_mouse_in_area(
                     if state.content_tab == crate::tui::app::ContentTab::Chapters
                         && !state.active_surface().chapter_authoring.saving
                     {
-                        match metadata_editor_chapter_paste_titles(state.active_surface_mut()) {
-                            Ok(count) => {
-                                state.recompute_active_dirty();
-                                app.set_status(format!(
-                                    "chapter authoring: pasted {count} chapter title{}",
-                                    if count == 1 { "" } else { "s" }
-                                ));
-                            }
-                            Err(reason) => app.set_status(format!("chapter authoring: {reason}")),
-                        }
+                        let session_id = state.active_surface().technical_details.session_id;
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                        begin_host_clipboard_paste(
+                            app,
+                            tx,
+                            super::message::HostClipboardPasteTarget::MetadataChapterTitles {
+                                session_id,
+                            },
+                        );
+                    } else {
+                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     }
-                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
                     return;
                 }
                 Some(super::button_map::TuiButton::MetadataChapterSave) => {
@@ -48055,6 +48688,19 @@ fn handle_metadata_editor_mouse_in_area(
                     return;
                 };
                 let now = std::time::Instant::now();
+                if mouse.modifiers.contains(KeyModifiers::CONTROL)
+                    && row < state.active_surface().entries.len()
+                {
+                    state.cursor = row;
+                    let selected = &mut state.active_surface_mut().selected_rows;
+                    if !selected.insert(row) {
+                        selected.remove(&row);
+                    }
+                    state.last_click = None;
+                    ensure_cursor_visible(&mut state);
+                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                    return;
+                }
                 let is_double = state
                     .last_click
                     .map(|(prev_row, prev_time)| {
@@ -48187,17 +48833,11 @@ fn handle_metadata_editor_mouse_in_area(
                                     return;
                                 }
                                 "apply" => {
-                                    metadata_editor_apply(app, &mut state, tx);
-                                    if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                    }
+                                    dispatch_metadata_editor_apply_owned(app, state, tx);
                                     return;
                                 }
                                 "ok" => {
-                                    metadata_editor_ok(app, &mut state, tx);
-                                    if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                        app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                    }
+                                    dispatch_metadata_editor_ok_owned(app, state, tx);
                                     return;
                                 }
                                 "esc" => {
@@ -48260,17 +48900,11 @@ fn handle_metadata_editor_mouse_in_area(
                         }
                         match action {
                             "apply" => {
-                                metadata_editor_apply(app, &mut state, tx);
-                                if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
+                                dispatch_metadata_editor_apply_owned(app, state, tx);
                                 return;
                             }
                             "ok" => {
-                                metadata_editor_ok(app, &mut state, tx);
-                                if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
+                                dispatch_metadata_editor_ok_owned(app, state, tx);
                                 return;
                             }
                             "esc" => {
@@ -48494,10 +49128,7 @@ fn handle_metadata_editor_mouse_in_area(
                                 return;
                             }
                         };
-                        handle_metadata_editor_key(app, fake_key, &mut state, tx);
-                        if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                        }
+                        dispatch_metadata_editor_key_owned(app, fake_key, state, tx);
                         return;
                     }
                 } else if state.phase == MetadataEditorPhase::InlineEdit
@@ -48509,18 +49140,12 @@ fn handle_metadata_editor_mouse_in_area(
                         match action {
                             "enter" => {
                                 let fake_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, tx);
-                                if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
+                                dispatch_metadata_editor_key_owned(app, fake_key, state, tx);
                                 return;
                             }
                             "esc" => {
                                 let fake_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-                                handle_metadata_editor_key(app, fake_key, &mut state, tx);
-                                if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
-                                    app.active_overlay = ActiveOverlay::MetadataEditor(state);
-                                }
+                                dispatch_metadata_editor_key_owned(app, fake_key, state, tx);
                                 return;
                             }
                             _ => {}
@@ -48547,6 +49172,8 @@ fn handle_metadata_editor_mouse_in_area(
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
             }
         }
+    } else {
+        app.active_overlay = overlay;
     }
 }
 
@@ -65709,9 +66336,8 @@ fn cue_tonepoet_metadata_clipboard_text(
     }
 
     // Multiline values cannot use the line-oriented tag-block syntax. Keep a
-    // readable, lossless fallback in the shared clipboard; for a single field
-    // the structured field clipboard installed by the decline path is the
-    // authoritative in-app recovery carrier.
+    // readable, lossless terminal-clipboard fallback. Single-field exactness
+    // is proven separately from the payload retained for test verification.
     let mut lines = Vec::new();
     for edit in edits {
         let Some(entry) = state.active_surface().entries.get(edit.entry_index) else {
@@ -65827,15 +66453,14 @@ fn decline_cue_tonepoet_metadata_consent(app: &mut AppState, action: &ConfirmAct
         return;
     };
 
-    // The in-process text clipboard commits synchronously before any revert.
-    // Host publication remains the existing best-effort asynchronous mirror,
-    // whose failures are surfaced independently. For a single affected field,
-    // the structured field clipboard below retains the exact values. Multi-field
-    // text recovery is trusted only after replaying the real importer in scratch.
+    // Recovery is committed to the terminal clipboard before any revert. Text
+    // recovery is trusted only after replaying the real importer in scratch;
+    // there is no production in-process metadata clipboard fallback.
     let structured_recovery = cue_tonepoet_metadata_structured_field_recovery(&state, edits);
     let clipboard = cue_tonepoet_metadata_clipboard_text(&state, edits);
     let in_app_recovery = structured_recovery.is_some()
         || cue_tonepoet_metadata_text_recovery_is_exact(&state, edits, &clipboard);
+    #[cfg(test)]
     if let Some(block) = structured_recovery {
         app.metadata_field_clipboard = Some(block);
     }
@@ -65955,6 +66580,10 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
         }
         Some(ConfirmAction::MetadataTransferUnsaved { .. }) => {
             app.set_status("metadata editor: tag transfer cancelled; unsaved edits retained".to_string());
+        }
+        Some(ConfirmAction::MetadataRowsClipboardPaste { .. })
+        | Some(ConfirmAction::MetadataTagsClipboardPaste { .. }) => {
+            app.set_status("metadata editor: clipboard paste cancelled; values unchanged".to_string());
         }
         Some(ConfirmAction::BrowseTagTransfer { .. }) => {
             app.set_status("Transfer tags: write cancelled; target left unchanged".to_string());
@@ -66625,6 +67254,59 @@ fn execute_confirm_action(
                 *scope,
                 tx,
             );
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ConfirmAction::MetadataRowsClipboardPaste {
+            session_id,
+            field_index,
+            text,
+        } => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("metadata editor: clipboard confirmation lost its editor session");
+                return;
+            };
+            if state.active_surface().technical_details.session_id != *session_id
+                || *field_index >= state.active_surface().entries.len()
+            {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status("metadata editor: clipboard paste cancelled because the editor changed");
+                return;
+            }
+            match metadata_editor_apply_clipboard_text_without_confirmation(
+                app,
+                &mut state,
+                *field_index,
+                text,
+            ) {
+                Ok(()) => {}
+                Err(reason) => app.set_status(reason),
+            }
+            app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        }
+        ConfirmAction::MetadataTagsClipboardPaste {
+            session_id,
+            view,
+            text,
+        } => {
+            let Some(mut state) = app.pending_metadata_editor.take() else {
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("metadata editor: clipboard confirmation lost its editor session");
+                return;
+            };
+            if state.active_surface().technical_details.session_id != *session_id
+                || state.metadata_view != *view
+            {
+                app.active_overlay = ActiveOverlay::MetadataEditor(state);
+                app.set_status("metadata editor: clipboard paste cancelled because the editor view changed");
+                return;
+            }
+            match metadata_editor_parse_tags_clipboard(&state, *view, text)
+                .and_then(|blocks| metadata_editor_apply_field_set(app, &mut state, &blocks))
+            {
+                Ok(()) => {}
+                Err(reason) => app.set_status(reason),
+            }
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
         ConfirmAction::BrowseTagTransfer { prepared } => {
@@ -67998,6 +68680,10 @@ fn handle_editor_text_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
 }
 
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    app.host_clipboard_interaction_generation = app
+        .host_clipboard_interaction_generation
+        .checked_add(1)
+        .unwrap_or(1);
     if handle_editor_text_mouse(app, mouse) {
         return;
     }
@@ -69550,6 +70236,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
                 app.browse.search.last_keystroke = Some(std::time::Instant::now());
             }
+            TuiButton::BrowseSearchMatch => {
+                clear_browse_info_focus(app);
+                app.browse.toggle_search_fuzzy();
+            }
             TuiButton::BrowseSearchSort => {
                 clear_browse_info_focus(app);
                 let tag_mode = matches!(
@@ -69879,6 +70569,17 @@ mod phase4_tests {
     };
     use crate::config::TonepoetConfig;
     use lofty::tag::ItemKey;
+
+    fn capture_terminal_clipboard(f: impl FnOnce()) -> Vec<String> {
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            f,
+        );
+        let captured = published.borrow().clone();
+        captured
+    }
 
     fn dvd_audio_presentation(
         group_nr: u8,
@@ -70252,6 +70953,19 @@ mod phase4_tests {
             ],
             entries,
             vec!["01".to_string(), "02".to_string()],
+            crate::tui::app::MetadataTechnicalDetails::default(),
+        )
+    }
+
+    fn three_file_editor(entries: Vec<TagEntry>) -> MetadataEditorState {
+        MetadataEditorState::for_files(
+            vec![
+                std::path::PathBuf::from("/tmp/01.flac"),
+                std::path::PathBuf::from("/tmp/02.flac"),
+                std::path::PathBuf::from("/tmp/03.flac"),
+            ],
+            entries,
+            vec!["01".to_string(), "02".to_string(), "03".to_string()],
             crate::tui::app::MetadataTechnicalDetails::default(),
         )
     }
@@ -72698,13 +73412,28 @@ mod phase4_tests {
         let mut source = Box::new(two_file_editor(vec![source_entry]));
         source.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
         source.detail_field_idx = 0;
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &mut source,
-            &tx,
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_metadata_editor_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &mut source,
+                    &tx,
+                );
+            },
         );
-        let copied = app.metadata_field_clipboard.as_ref().expect("field clipboard");
+        let copied = match crate::tui::tag_interchange::parse_clipboard_tag_payload(
+            published.borrow().first().expect("terminal clipboard publication"),
+        )
+        .expect("clipboard envelope")
+        .expect("structured clipboard payload")
+        {
+            crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) => block,
+            other => panic!("expected single-field payload, got {other:?}"),
+        };
         assert_eq!(copied.key, "PERFORMER");
         assert_eq!(copied.values[0].to_texts(), ["A", "B"]);
         assert_eq!(copied.values[1].to_texts(), ["C", "D"]);
@@ -72721,12 +73450,8 @@ mod phase4_tests {
         let mut target = Box::new(two_file_editor(vec![target_entry]));
         target.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
         target.detail_field_idx = 0;
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            &mut target,
-            &tx,
-        );
+        metadata_editor_paste_detail_field_block(&mut target, &copied)
+            .expect("single-field terminal payload pastes into the selected field");
 
         assert_eq!(target.active_surface().entries[0].per_file_values[0].to_texts(), ["A", "B"]);
         assert_eq!(target.active_surface().entries[0].per_file_values[1].to_texts(), ["C", "D"]);
@@ -72734,7 +73459,7 @@ mod phase4_tests {
     }
 
     #[test]
-    fn field_clipboard_is_lenient_on_count_but_exact_for_custom_field_names() {
+    fn field_clipboard_rejects_positional_count_mismatch_and_is_free_form_across_field_names() {
         assert!(metadata_field_keys_match("Album Artist", "ALBUMARTIST"));
         assert!(metadata_field_keys_match("Year", "DATE"));
 
@@ -72744,7 +73469,7 @@ mod phase4_tests {
             values: vec![
                 crate::tui::probe::MetadataFieldValues::from_scalar("One"),
                 crate::tui::probe::MetadataFieldValues::from_scalar("Overflow"),
-                crate::tui::probe::MetadataFieldValues::from_scalar("Dropped"),
+                crate::tui::probe::MetadataFieldValues::from_scalar("Must not be dropped"),
             ],
         });
         let mut custom = entry(
@@ -72757,35 +73482,34 @@ mod phase4_tests {
         let mut state = two_file_editor(vec![custom]);
         state.phase = crate::tui::app::MetadataEditorPhase::DetailEdit;
         state.detail_field_idx = 0;
-        let report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
-        assert_eq!(report.changed_slots, 2);
-        assert!(!report.collapsed_stored_values);
-        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "One");
-        assert_eq!(state.active_surface().entries[0].per_file_values[1].as_str(), "Overflow");
+        let reason = metadata_editor_paste_detail_field(&mut app, &mut state)
+            .expect_err("genuinely positional source counts must not be silently truncated");
+        assert!(reason.contains("has 3 values for 2 files"), "{reason}");
+        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "Old");
+        assert_eq!(state.active_surface().entries[0].per_file_values[1].as_str(), "Keep");
 
-        // A short source updates only the matching prefix and preserves the
-        // remaining target slot. The inverse (more source slots than target
-        // slots) is covered above by positional `.take(slot_count)` semantics.
+        // A one-value structured field is an explicit broadcast. This is how
+        // a uniform field copied from an album with a different track count
+        // remains useful without weakening positional fields.
         app.metadata_field_clipboard = Some(crate::tui::tag_interchange::FieldBlock {
             key: "CUSTOM Field".to_string(),
-            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Short")],
+            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Broadcast")],
         });
-        let short_report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
-        assert_eq!(short_report.changed_slots, 1);
-        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "Short");
-        assert_eq!(
-            state.active_surface().entries[0].per_file_values[1].as_str(),
-            "Overflow",
-            "fill-short must leave unmatched target positions intact",
-        );
+        let broadcast_report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
+        assert_eq!(broadcast_report.changed_slots, 2);
+        assert_eq!(state.active_surface().entries[0].per_file_values[0].as_str(), "Broadcast");
+        assert_eq!(state.active_surface().entries[0].per_file_values[1].as_str(), "Broadcast");
 
         app.metadata_field_clipboard = Some(crate::tui::tag_interchange::FieldBlock {
-            key: "custom field".to_string(),
-            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Wrong")],
+            key: "SOURCE DIFFERENT FIELD".to_string(),
+            values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Free-form")],
         });
-        let err = metadata_editor_paste_detail_field(&mut app, &mut state)
-            .expect_err("custom field names are exact, not case-canonicalized");
-        assert!(err.contains("clipboard contains"));
+        let free_form_report = metadata_editor_paste_detail_field(&mut app, &mut state).unwrap();
+        assert_eq!(free_form_report.changed_slots, 2);
+        assert!(state.active_surface().entries[0]
+            .per_file_values
+            .iter()
+            .all(|value| value.as_str() == "Free-form"));
     }
 
     #[test]
@@ -72821,10 +73545,9 @@ mod phase4_tests {
     }
 
     #[test]
-    fn editor_field_copy_publishes_both_clipboard_planes() {
-        // REGRESSION pin (round-6 behavior, re-affirmed by the round-8 brief 5B):
-        // editor row copies go through publish_text_clipboard, reaching the
-        // in-app clipboard AND the system-clipboard publish hook.
+    fn editor_field_copy_publishes_once_to_the_terminal_clipboard() {
+        // Metadata copy has one authority: publish one structured envelope to
+        // the terminal clipboard. No in-process paste carrier participates.
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = two_file_editor(vec![
             entry("TITLE", ItemKey::TrackTitle, &["Behind the Lines", "Duchess"], &["Behind the Lines", "Duchess"]),
@@ -72839,15 +73562,20 @@ mod phase4_tests {
         )
         .expect("copy selected rows");
         assert_eq!(copied, 1);
-        assert_eq!(
-            published.borrow().as_slice(),
-            &["ARTIST\nGenesis\nGenesis".to_string()],
-            "editor copy must publish exactly once through the unified helper"
-        );
-        assert_eq!(
-            tui_file_picker::read_shared_text_clipboard(),
-            "ARTIST\nGenesis\nGenesis"
-        );
+        assert_eq!(published.borrow().len(), 1, "editor copy must publish exactly once");
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(
+            published.borrow().first().unwrap(),
+        )
+        .expect("valid clipboard envelope")
+        .expect("structured clipboard payload");
+        match payload {
+            crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) => {
+                assert_eq!(block.key, "ARTIST");
+                assert_eq!(block.values.len(), 1);
+                assert_eq!(block.values[0].to_texts(), ["Genesis"]);
+            }
+            other => panic!("expected single-field payload, got {other:?}"),
+        }
     }
 
     #[test]
@@ -72888,6 +73616,177 @@ ignored".to_string()),
             "oldnew-name",
             "single-line editors must consume only the first host-clipboard line"
         );
+    }
+
+    fn assert_track_scalar_newline_row_paste(text: &str) {
+        let title = entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Old 1", "Old 2", "Old 3"],
+            &["Old 1", "Old 2", "Old 3"],
+        );
+        let state = three_file_editor(vec![title]);
+        let session_id = state.active_surface().technical_details.session_id;
+        let target = super::super::message::HostClipboardPasteTarget::MetadataRows {
+            session_id,
+            field_index: 0,
+        };
+
+        let mut decline_app = AppState::new_for_test(TonepoetConfig::default());
+        decline_app.host_clipboard_paste_generation = 31;
+        decline_app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state.clone()));
+        handle_host_clipboard_read_complete(
+            &mut decline_app,
+            31,
+            target.clone(),
+            Ok(text.to_string()),
+        );
+        let decline_action = match &decline_app.active_overlay {
+            ActiveOverlay::Confirmation { action, .. } => action.clone(),
+            other => panic!("newline-framed TrackScalar paste must confirm, got {other:?}"),
+        };
+        assert!(matches!(
+            decline_action,
+            ConfirmAction::MetadataRowsClipboardPaste { .. }
+        ));
+        cancel_confirm_action(&mut decline_app, Some(&decline_action));
+        let ActiveOverlay::MetadataEditor(declined) = &decline_app.active_overlay else {
+            panic!("declining must restore the metadata editor");
+        };
+        assert_eq!(
+            declined.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Old 1", "Old 2", "Old 3"],
+        );
+
+        let mut accept_app = AppState::new_for_test(TonepoetConfig::default());
+        accept_app.host_clipboard_paste_generation = 32;
+        accept_app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        handle_host_clipboard_read_complete(
+            &mut accept_app,
+            32,
+            target,
+            Ok(text.to_string()),
+        );
+        let accept_action = match &accept_app.active_overlay {
+            ActiveOverlay::Confirmation { action, .. } => action.clone(),
+            other => panic!("newline-framed TrackScalar paste must confirm, got {other:?}"),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        execute_confirm_action(&mut accept_app, &accept_action, &tx);
+        let ActiveOverlay::MetadataEditor(accepted) = &accept_app.active_overlay else {
+            panic!("accepting must restore the metadata editor");
+        };
+        assert_eq!(
+            accepted.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Replacement title", "Old 2", "Old 3"],
+        );
+    }
+
+    #[test]
+    fn one_line_lf_track_scalar_row_paste_confirms_and_changes_only_first_track() {
+        assert_track_scalar_newline_row_paste("Replacement title\n");
+    }
+
+    #[test]
+    fn one_line_crlf_track_scalar_row_paste_confirms_and_changes_only_first_track() {
+        assert_track_scalar_newline_row_paste("Replacement title\r\n");
+    }
+
+    #[test]
+    fn one_line_newline_track_scalar_inline_paste_retains_positional_semantics() {
+        for clipboard in ["Replacement title\n", "Replacement title\r\n"] {
+            let title = entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Old 1", "Old 2", "Old 3"],
+                &["Old 1", "Old 2", "Old 3"],
+            );
+            let mut state = three_file_editor(vec![title]);
+            let converted = metadata_editor_inline_host_clipboard_text(&state, 0, clipboard)
+                .expect("newline TrackScalar clipboard conversion");
+            assert_eq!(converted, "Replacement title;");
+            state.cursor = 0;
+            assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+            state.edit_input = Some(crate::tui::text_input::TextInputState::new(converted));
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+            assert_eq!(
+                state.active_surface().entries[0]
+                    .per_file_values
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Replacement title", "Old 2", "Old 3"],
+            );
+        }
+    }
+
+    #[test]
+    fn track_scalar_inline_host_clipboard_keeps_existing_scalar_short_list_and_overflow_rules() {
+        let title = entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Old 1", "Old 2", "Old 3"],
+            &["Old 1", "Old 2", "Old 3"],
+        );
+        let state = three_file_editor(vec![title]);
+
+        let scalar = metadata_editor_inline_host_clipboard_text(&state, 0, "Broadcast title")
+            .expect("plain scalar clipboard text");
+        assert_eq!(scalar, "Broadcast title");
+        let mut scalar_state = state.clone();
+        scalar_state.cursor = 0;
+        assert_eq!(
+            metadata_editor_begin_cursor_value_edit(&mut scalar_state, true),
+            None,
+        );
+        scalar_state.edit_input = Some(crate::tui::text_input::TextInputState::new(scalar));
+        let mut scalar_app = AppState::new_for_test(TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(
+            &mut scalar_app,
+            &mut scalar_state,
+        ));
+        assert_eq!(
+            scalar_state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Broadcast title", "Broadcast title", "Broadcast title"],
+        );
+
+        let short_list = metadata_editor_inline_host_clipboard_text(&state, 0, "New 1\nNew 2\n")
+            .expect("short positional list");
+        assert_eq!(short_list, "New 1; New 2");
+        let mut list_state = state.clone();
+        list_state.cursor = 0;
+        assert_eq!(
+            metadata_editor_begin_cursor_value_edit(&mut list_state, true),
+            None,
+        );
+        list_state.edit_input = Some(crate::tui::text_input::TextInputState::new(short_list));
+        let mut list_app = AppState::new_for_test(TonepoetConfig::default());
+        assert!(metadata_editor_commit_inline_edit(&mut list_app, &mut list_state));
+        assert_eq!(
+            list_state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["New 1", "New 2", "Old 3"],
+        );
+
+        let overflow = metadata_editor_inline_host_clipboard_text(&state, 0, "1\n2\n3\n4\n")
+            .expect_err("overflow must remain rejected");
+        assert!(overflow.contains("4 lines for 3 tracks"));
     }
 
     #[test]
@@ -73004,15 +73903,92 @@ ignored".to_string()),
     }
 
     #[test]
-    fn metadata_ctrl_c_serializes_only_selected_rows_as_field_blocks() {
+    fn metadata_ctrl_c_serializes_one_selected_row_as_single_field_envelope() {
         let mut state = two_file_editor(vec![
-            entry("TITLE", ItemKey::TrackTitle, &["Behind the Lines", "Duchess"], &["Behind the Lines", "Duchess"]),
-            entry("ARTIST", ItemKey::TrackArtist, &["Genesis", "Genesis"], &["Genesis", "Genesis"]),
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Behind the Lines", "Duchess"],
+                &["Behind the Lines", "Duchess"],
+            ),
+            entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Genesis", "Genesis"],
+                &["Genesis", "Genesis"],
+            ),
         ]);
         state.active_surface_mut().selected_rows.insert(1);
-        let serialized = metadata_editor_selected_rows_serialization(&state).expect("selection serializes");
+        let serialized = metadata_editor_selected_rows_serialization(&state)
+            .expect("selection serializes");
         assert_eq!(serialized.keys, vec!["ARTIST"]);
-        assert_eq!(serialized.text, "ARTIST\nGenesis\nGenesis");
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("clipboard envelope is recognized");
+        let crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) = payload
+        else {
+            panic!("one selected row must use the single-field clipboard envelope");
+        };
+        assert_eq!(block.key, "ARTIST");
+        assert_eq!(block.values, vec!["Genesis"]);
+    }
+
+    #[test]
+    fn metadata_selected_row_copy_keeps_multiline_text_in_single_and_field_set_payloads() {
+        let mut state = two_file_editor(vec![
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Duke", "Turn It On Again"],
+                &["Duke", "Turn It On Again"],
+            ),
+            entry(
+                "COMMENT",
+                ItemKey::Comment,
+                &[
+                    "recorded live\nremastered 2024",
+                    "recorded live\nremastered 2024",
+                ],
+                &[
+                    "recorded live\nremastered 2024",
+                    "recorded live\nremastered 2024",
+                ],
+            ),
+        ]);
+        state.active_surface_mut().selected_rows.insert(1);
+        let single = metadata_editor_selected_rows_serialization(&state)
+            .expect("multiline single-row selection serializes");
+        assert_eq!(single.keys, vec!["COMMENT"]);
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&single.text)
+            .expect("single-field clipboard envelope parses")
+            .expect("single-field clipboard envelope is recognized");
+        let crate::tui::tag_interchange::ClipboardTagPayload::SingleField(comment) = payload
+        else {
+            panic!("one selected multiline row must remain a single-field payload");
+        };
+        assert_eq!(
+            comment.values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
+        );
+
+        state.active_surface_mut().selected_rows.insert(0);
+        let field_set = metadata_editor_selected_rows_serialization(&state)
+            .expect("multiline field-set selection serializes");
+        assert_eq!(field_set.keys.len(), 2);
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&field_set.text)
+            .expect("field-set clipboard envelope parses")
+            .expect("field-set clipboard envelope is recognized");
+        let crate::tui::tag_interchange::ClipboardTagPayload::FieldSet(blocks) = payload else {
+            panic!("two selected rows must use a field-set payload");
+        };
+        let comment = blocks
+            .iter()
+            .find(|block| block.key == "COMMENT")
+            .expect("COMMENT survives field-set copy");
+        assert_eq!(
+            comment.values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
+        );
     }
 
     #[test]
@@ -73048,7 +74024,7 @@ ignored".to_string()),
     }
 
     #[test]
-    fn editing_row_paste_pins_duke_positional_known_block_precedence_and_album_modes() {
+    fn editing_row_plain_text_paste_is_positional_and_never_guesses_tag_blocks() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = MetadataEditorState::for_files(
             (1..=12)
@@ -73064,36 +74040,49 @@ ignored".to_string()),
             crate::tui::app::MetadataTechnicalDetails::default(),
         );
         let duke = [
-            "Behind the Lines", "Duchess", "Guide Vocal", "Man of Our Times",
-            "Misunderstanding", "Heathaze", "Turn It On Again", "Alone Tonight",
-            "Cul-de-sac", "Please Don't Ask", "Duke's Travels", "Duke's End",
+            "Behind the Lines",
+            "Duchess",
+            "Guide Vocal",
+            "Man of Our Times",
+            "Misunderstanding",
+            "Heathaze",
+            "Turn It On Again",
+            "Alone Tonight",
+            "Cul-de-sac",
+            "Please Don't Ask",
+            "Duke's Travels",
+            "Duke's End",
         ]
         .join("\n");
         metadata_editor_apply_row_or_block_paste(&mut app, &mut state, &duke)
             .expect("Duke positional paste");
-        assert_eq!(state.active_surface().entries[0].per_file_values[0], "Behind the Lines");
-        assert_eq!(state.active_surface().entries[0].per_file_values[11], "Duke's End");
-
-        let before = state.active_surface().entries[0].per_file_values.clone();
         assert_eq!(
-            metadata_editor_apply_row_or_block_paste(
-                &mut app,
-                &mut state,
-                "TRACKNUMBER\n1\n2",
-            )
-            .unwrap_err(),
-            "tag blocks: TRACKNUMBER has 2 values for 12 files"
+            state.active_surface().entries[0].per_file_values[0],
+            "Behind the Lines"
         );
-        assert_eq!(state.active_surface().entries[0].per_file_values, before);
-
         assert_eq!(
-            metadata_editor_apply_row_or_block_paste(
-                &mut app,
-                &mut state,
-                "TITLE\nShared\n\nUNKNOWN_CUSTOM\nvalue",
-            )
-            .unwrap_err(),
-            "tag blocks: UNKNOWN_CUSTOM is not a known editor field; use Get tags from Clipboard or File to create custom fields"
+            state.active_surface().entries[0].per_file_values[11],
+            "Duke's End"
+        );
+
+        // Plain clipboard text is never reinterpreted as a structured tag block.
+        // Fewer lines than tracks replace only the corresponding leading slots.
+        metadata_editor_apply_row_or_block_paste(&mut app, &mut state, "TRACKNUMBER\n1\n2")
+            .expect("key-shaped text remains positional plain text");
+        assert_eq!(
+            &state.active_surface().entries[0].per_file_values[..4],
+            &["TRACKNUMBER", "1", "2", "Man of Our Times"]
+        );
+
+        metadata_editor_apply_row_or_block_paste(
+            &mut app,
+            &mut state,
+            "TITLE\nShared\n\nUNKNOWN_CUSTOM\nvalue",
+        )
+        .expect("blank lines and key-shaped values remain positional");
+        assert_eq!(
+            &state.active_surface().entries[0].per_file_values[..6],
+            &["TITLE", "Shared", "", "UNKNOWN_CUSTOM", "value", "Heathaze"]
         );
         assert!(state
             .active_surface()
@@ -73102,7 +74091,13 @@ ignored".to_string()),
             .all(|entry| entry.display_key != "UNKNOWN_CUSTOM"));
 
         let unknown_key_shaped_values = (0..12)
-            .map(|index| if index == 0 { "UNKNOWN".to_string() } else { format!("value-{index}") })
+            .map(|index| {
+                if index == 0 {
+                    "UNKNOWN".to_string()
+                } else {
+                    format!("value-{index}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         metadata_editor_apply_row_or_block_paste(&mut app, &mut state, &unknown_key_shaped_values)
@@ -73115,12 +74110,8 @@ ignored".to_string()),
             &["Old A", "Old B"],
             &["Old A", "Old B"],
         )]);
-        metadata_editor_apply_row_or_block_paste(
-            &mut app,
-            &mut album_state,
-            "New A\nNew B",
-        )
-        .expect("album positional paste");
+        metadata_editor_apply_row_or_block_paste(&mut app, &mut album_state, "New A\nNew B")
+            .expect("album positional paste");
         assert_eq!(
             album_state.active_surface().entries[0].per_file_values,
             ["New A", "New B"]
@@ -74808,13 +75799,10 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
+        let published = capture_terminal_clipboard(|| {
             decline_cue_tonepoet_metadata_consent(&mut app, &action);
-            assert_eq!(
-                tui_file_picker::read_shared_text_clipboard(),
-                "Jimmy Page\nSecond line"
-            );
         });
+        assert_eq!(published, ["Jimmy Page\nSecond line".to_string()]);
 
         let ActiveOverlay::MetadataEditor(reverted) = &app.active_overlay else {
             panic!("decline must return to the metadata editor");
@@ -74876,12 +75864,12 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
+        let published = capture_terminal_clipboard(|| {
             decline_cue_tonepoet_metadata_consent(&mut app, &action);
-            let copied = tui_file_picker::read_shared_text_clipboard();
-            assert!(copied.contains("CUSTOM_TRACK_ID"));
-            assert!(copied.contains("CUSTOM_TRACK_NOTE"));
         });
+        let copied = published.last().expect("terminal clipboard publication");
+        assert!(copied.contains("CUSTOM_TRACK_ID"));
+        assert!(copied.contains("CUSTOM_TRACK_NOTE"));
 
         let ActiveOverlay::MetadataEditor(retained) = &app.active_overlay else {
             panic!("non-recoverable track edits must remain in the metadata editor");
@@ -74961,9 +75949,7 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
-            decline_cue_tonepoet_metadata_consent(&mut app, &action);
-        });
+        decline_cue_tonepoet_metadata_consent(&mut app, &action);
 
         let ActiveOverlay::MetadataEditor(retained) = &app.active_overlay else {
             panic!("skipped track-scoped recovery must retain the edits");
@@ -75025,9 +76011,7 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
-            decline_cue_tonepoet_metadata_consent(&mut app, &action);
-        });
+        decline_cue_tonepoet_metadata_consent(&mut app, &action);
 
         let ActiveOverlay::MetadataEditor(retained) = &app.active_overlay else {
             panic!("normalized scalar-list recovery must retain the edits");
@@ -75114,12 +76098,12 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
+        let published = capture_terminal_clipboard(|| {
             decline_cue_tonepoet_metadata_consent(&mut app, &action);
-            let copied = tui_file_picker::read_shared_text_clipboard();
-            assert!(copied.contains("PERFORMER"));
-            assert!(copied.contains("PRODUCER"));
         });
+        let copied = published.last().expect("terminal clipboard publication");
+        assert!(copied.contains("PERFORMER"));
+        assert!(copied.contains("PRODUCER"));
 
         let ActiveOverlay::MetadataEditor(retained) = &app.active_overlay else {
             panic!("nonexact row-wide recovery must retain the edits");
@@ -75179,12 +76163,12 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
+        let published = capture_terminal_clipboard(|| {
             decline_cue_tonepoet_metadata_consent(&mut app, &action);
-            let copied = tui_file_picker::read_shared_text_clipboard();
-            assert!(copied.contains("PRODUCER"));
-            assert!(copied.contains("ENGINEER"));
         });
+        let copied = published.last().expect("terminal clipboard publication");
+        assert!(copied.contains("PRODUCER"));
+        assert!(copied.contains("ENGINEER"));
 
         let ActiveOverlay::MetadataEditor(reverted) = &app.active_overlay else {
             panic!("exact multi-field file recovery must allow the decline to revert");
@@ -75233,12 +76217,12 @@ ignored".to_string()),
             edits,
             remember_choice: false,
         };
-        tui_file_picker::with_scoped_shared_text_clipboard(String::new(), || {
+        let published = capture_terminal_clipboard(|| {
             decline_cue_tonepoet_metadata_consent(&mut app, &action);
-            let copied = tui_file_picker::read_shared_text_clipboard();
-            assert!(copied.contains("PRODUCER"));
-            assert!(copied.contains("ENGINEER"));
         });
+        let copied = published.last().expect("terminal clipboard publication");
+        assert!(copied.contains("PRODUCER"));
+        assert!(copied.contains("ENGINEER"));
 
         let ActiveOverlay::MetadataEditor(retained) = &app.active_overlay else {
             panic!("unsafe decline recovery must return to the metadata editor");
@@ -101051,6 +102035,30 @@ mod metadata_editor_inline_navigation_tests {
             "pre-existing custom rows must remain hidden in Canonical view"
         );
 
+        let filtered = metadata_editor_filter_blocks_for_view(
+            &state,
+            super::super::app::MetadataEditorView::Canonical,
+            vec![
+                crate::tui::tag_interchange::FieldBlock {
+                    key: "TITLE".to_string(),
+                    values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Title")],
+                },
+                crate::tui::tag_interchange::FieldBlock {
+                    key: "SESSION_CUSTOM".to_string(),
+                    values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Session")],
+                },
+                crate::tui::tag_interchange::FieldBlock {
+                    key: "PREEXISTING_CUSTOM".to_string(),
+                    values: vec![crate::tui::probe::MetadataFieldValues::from_scalar("Legacy")],
+                },
+            ],
+        );
+        assert_eq!(
+            filtered.iter().map(|block| block.key.as_str()).collect::<Vec<_>>(),
+            vec!["TITLE", "SESSION_CUSTOM"],
+            "active-view clipboard paste must accept exactly the rows Canonical is showing",
+        );
+
         let current_entries = state.active_surface().entries.clone();
         let fresh = editor(current_entries, 1);
         let added_in_fresh = fresh
@@ -101491,12 +102499,7 @@ mod file_picker_browse_parity_regression_tests {
                         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
                         &tx,
                     );
-                    assert_eq!(
-                        tui_file_picker::read_shared_text_clipboard(),
-                        "Album Name",
-                        "Ctrl+C in the rename editor must land on the shared text clipboard",
-                    );
-                    // Collapse the selection (End), then paste: text doubles.
+                    // Collapse the selection (End), then request the host clipboard.
                     handle_key(
                         &mut app,
                         KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
@@ -101506,6 +102509,15 @@ mod file_picker_browse_parity_regression_tests {
                         &mut app,
                         KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
                         &tx,
+                    );
+                    let generation = app.host_clipboard_paste_generation;
+                    handle_host_clipboard_read_complete(
+                        &mut app,
+                        generation,
+                        super::super::message::HostClipboardPasteTarget::BrowseInlineEdit {
+                            target: BrowseInlineEditTarget::Rename { path: target.clone() },
+                        },
+                        Ok("Album Name".to_string()),
                     );
                     app.browse_inline_edit
                         .as_ref()
@@ -101551,17 +102563,25 @@ mod file_picker_browse_parity_regression_tests {
                         &tx,
                         false,
                     );
-                    assert_eq!(
-                        tui_file_picker::read_shared_text_clipboard(),
-                        expected,
-                        "Copy path must land on the shared text clipboard",
-                    );
                     app.browse.path_input = Some(
                         super::super::text_input::TextInputState::new(String::new()),
                     );
                     handle_key(
                         &mut app,
                         KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                        &tx,
+                    );
+                    let generation = app.host_clipboard_paste_generation;
+                    let interaction_generation = app.host_clipboard_interaction_generation;
+                    super::super::event_loop::handle_message(
+                        &mut app,
+                        AppMessage::HostClipboardReadComplete {
+                            generation,
+                            target: super::super::message::HostClipboardPasteTarget::CurrentTerminalFocus {
+                                interaction_generation,
+                            },
+                            result: Ok(expected.clone()),
+                        },
                         &tx,
                     );
                     app.browse
@@ -102581,22 +103601,28 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
-    fn path_ctrl_c_copies_text_without_replacing_filesystem_clipboard() {
+    fn path_ctrl_c_publishes_terminal_text_without_replacing_filesystem_clipboard() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.path_input = Some(super::super::text_input::TextInputState::new_selected(
             "/music/album".to_string(),
         ));
         let (tx, _rx) = mpsc::channel(4);
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
 
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &tx,
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+            },
         );
 
-        let input = app.browse.path_input.as_ref().expect("path input");
-        assert_eq!(input.clipboard, "/music/album");
+        assert_eq!(published.borrow().as_slice(), &["/music/album".to_string()]);
         assert!(app.browse.filesystem_clipboard.is_none());
     }
 
@@ -102652,10 +103678,6 @@ mod file_picker_browse_parity_regression_tests {
         assert_eq!(
             published.borrow().as_slice(),
             &["Even in the Quietest Moments...".to_string()]
-        );
-        assert_eq!(
-            tui_file_picker::read_shared_text_clipboard(),
-            "Even in the Quietest Moments..."
         );
         assert!(app.browse.filesystem_clipboard.is_none());
         assert_eq!(
@@ -102743,6 +103765,7 @@ mod file_picker_browse_parity_regression_tests {
         let focuses = [
             SearchFocus::Recursive,
             SearchFocus::Mode,
+            SearchFocus::Match,
             SearchFocus::Sort,
             SearchFocus::AudioOnly,
             SearchFocus::Results,
@@ -103137,7 +104160,7 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
-    fn raw_ctrl_shift_v_is_not_reinterpreted_as_in_app_text_paste() {
+    fn raw_ctrl_shift_v_requests_the_same_host_clipboard_as_other_paste_chords() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_inline_edit = Some(BrowseInlineEditState {
@@ -103161,9 +104184,15 @@ mod file_picker_browse_parity_regression_tests {
 
         assert_eq!(
             app.browse_inline_edit.as_ref().expect("inline edit").input.text,
-            "track.flac"
+            "track.flac",
+            "clipboard data must not mutate the field before the async host read completes",
         );
         assert!(app.file_transfers.pending_by_session.is_empty());
+        assert_eq!(app.host_clipboard_paste_generation, 1);
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("Reading host clipboard")));
     }
 
     #[test]

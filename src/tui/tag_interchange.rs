@@ -444,6 +444,28 @@ pub struct FieldBlockSerialization {
     pub skipped: Vec<SkippedField>,
 }
 
+/// Semantic shape carried through the host clipboard. The envelope exists to
+/// distinguish intentional structured metadata copy from ordinary user text
+/// that merely happens to begin with an upper-case tag-looking line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTagPayloadKind {
+    /// One selected field. Paste is free-form: the source key does not constrain
+    /// the destination key.
+    SingleField,
+    /// A selected set (including active-view whole-tag copy). Paste is strict:
+    /// each block maps to the destination field of the same canonical key.
+    FieldSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardTagPayload {
+    SingleField(FieldBlock),
+    FieldSet(Vec<FieldBlock>),
+}
+
+const CLIPBOARD_SINGLE_FIELD_PREFIX: &str = "@tonepoet-clipboard-v1:single-field\n";
+const CLIPBOARD_FIELD_SET_PREFIX: &str = "@tonepoet-clipboard-v1:field-set\n";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldBlockParseError {
     Empty,
@@ -554,8 +576,12 @@ fn decode_value(line: &str) -> String {
 const MULTI_VALUE_LINE_PREFIX: &str = "@tonepoet-mv1:";
 
 fn encode_field_position(values: &super::probe::MetadataFieldValues) -> String {
-    if values.value_count() <= 1 && !values.as_str().starts_with(MULTI_VALUE_LINE_PREFIX) {
-        return encode_value(values.as_str());
+    let scalar = values.as_str();
+    let needs_json = scalar.starts_with(MULTI_VALUE_LINE_PREFIX)
+        || scalar.contains('\n')
+        || scalar.contains('\r');
+    if values.value_count() <= 1 && !needs_json {
+        return encode_value(scalar);
     }
     let encoded = serde_json::to_string(&values.to_texts())
         .expect("serializing a vector of strings to JSON cannot fail");
@@ -571,8 +597,9 @@ fn decode_field_position(line: &str) -> super::probe::MetadataFieldValues {
     super::probe::MetadataFieldValues::from_scalar(decode_value(line))
 }
 
-pub fn serialize_tag_entries<'a>(
+fn serialize_tag_entries_with_policy<'a>(
     entries: impl IntoIterator<Item = &'a TagEntry>,
+    allow_multiline: bool,
 ) -> FieldBlockSerialization {
     let mut blocks = Vec::new();
     let mut keys = Vec::new();
@@ -591,10 +618,8 @@ pub fn serialize_tag_entries<'a>(
             });
             continue;
         }
-        if entry
-            .per_file_values
-            .iter()
-            .any(|values| {
+        if !allow_multiline
+            && entry.per_file_values.iter().any(|values| {
                 values
                     .values()
                     .iter()
@@ -637,6 +662,76 @@ pub fn serialize_tag_entries<'a>(
         text: blocks.join("\n\n"),
         keys,
         skipped,
+    }
+}
+
+pub fn serialize_tag_entries<'a>(
+    entries: impl IntoIterator<Item = &'a TagEntry>,
+) -> FieldBlockSerialization {
+    serialize_tag_entries_with_policy(entries, false)
+}
+
+/// Serialize metadata for the terminal clipboard while retaining the ordinary
+/// tag-block format for file interchange. The versioned first line makes the
+/// structured intent unambiguous without introducing another in-process
+/// clipboard carrier.
+pub fn serialize_clipboard_tag_entries<'a>(
+    entries: impl IntoIterator<Item = &'a TagEntry>,
+    kind: ClipboardTagPayloadKind,
+) -> FieldBlockSerialization {
+    // A row whose per-file values are identical is semantically broadcast,
+    // not tied to the source album's track count. Collapse only that exact
+    // shape in the clipboard envelope so the same field can be pasted into a
+    // different-size album without weakening genuinely positional data.
+    let normalized = entries
+        .into_iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            if let Some(first) = entry.per_file_values.first().cloned() {
+                if entry.per_file_values.iter().all(|value| value == &first) {
+                    entry.per_file_values = vec![first];
+                }
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    let mut serialized = serialize_tag_entries_with_policy(normalized.iter(), true);
+    if serialized.text.is_empty() {
+        return serialized;
+    }
+    let prefix = match kind {
+        ClipboardTagPayloadKind::SingleField => CLIPBOARD_SINGLE_FIELD_PREFIX,
+        ClipboardTagPayloadKind::FieldSet => CLIPBOARD_FIELD_SET_PREFIX,
+    };
+    serialized.text.insert_str(0, prefix);
+    serialized
+}
+
+/// Parse only Tonepoet's explicit host-clipboard envelope. `Ok(None)` means the
+/// clipboard contains ordinary text (which may still be interpreted by an
+/// explicit tag-import command).
+pub fn parse_clipboard_tag_payload(input: &str) -> Result<Option<ClipboardTagPayload>, String> {
+    let (kind, body) = if let Some(body) = input.strip_prefix(CLIPBOARD_SINGLE_FIELD_PREFIX) {
+        (ClipboardTagPayloadKind::SingleField, body)
+    } else if let Some(body) = input.strip_prefix(CLIPBOARD_FIELD_SET_PREFIX) {
+        (ClipboardTagPayloadKind::FieldSet, body)
+    } else {
+        return Ok(None);
+    };
+    let blocks = parse_field_blocks(body).map_err(|error| format!("clipboard metadata: {error}"))?;
+    match kind {
+        ClipboardTagPayloadKind::SingleField => {
+            if blocks.len() != 1 {
+                return Err(format!(
+                    "clipboard metadata: single-field envelope contains {} fields",
+                    blocks.len()
+                ));
+            }
+            Ok(Some(ClipboardTagPayload::SingleField(
+                blocks.into_iter().next().expect("length checked"),
+            )))
+        }
+        ClipboardTagPayloadKind::FieldSet => Ok(Some(ClipboardTagPayload::FieldSet(blocks))),
     }
 }
 
@@ -809,6 +904,158 @@ mod tests {
             mb_proposed_value: None,
             mb_proposed_per_file: None,
         }
+    }
+
+    #[test]
+    fn terminal_clipboard_single_field_envelope_round_trips_structured_values() {
+        let mut performer = entry("PERFORMER", &["placeholder", "placeholder"]);
+        performer.per_file_values = vec![
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Jimmy Page", "John Paul Jones"]),
+            crate::tui::probe::MetadataFieldValues::from_stored_texts(["Robert Plant"]),
+        ];
+        performer.per_file_originals = performer.per_file_values.clone();
+
+        let serialized = serialize_clipboard_tag_entries(
+            std::iter::once(&performer),
+            ClipboardTagPayloadKind::SingleField,
+        );
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        match parsed {
+            ClipboardTagPayload::SingleField(block) => {
+                assert_eq!(block.key, "PERFORMER");
+                assert_eq!(block.values, performer.per_file_values);
+            }
+            other => panic!("expected single-field payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_clipboard_single_field_round_trips_multiline_lf_text() {
+        let comment = entry("COMMENT", &["recorded live\nremastered 2024"]);
+        let serialized = serialize_clipboard_tag_entries(
+            std::iter::once(&comment),
+            ClipboardTagPayloadKind::SingleField,
+        );
+        assert!(serialized.skipped.is_empty());
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        let ClipboardTagPayload::SingleField(block) = parsed else {
+            panic!("expected single-field payload");
+        };
+        assert_eq!(block.key, "COMMENT");
+        assert_eq!(
+            block.values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_single_field_round_trips_multiline_crlf_text() {
+        let comment = entry("COMMENT", &["recorded live\r\nremastered 2024"]);
+        let serialized = serialize_clipboard_tag_entries(
+            std::iter::once(&comment),
+            ClipboardTagPayloadKind::SingleField,
+        );
+        assert!(serialized.skipped.is_empty());
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        let ClipboardTagPayload::SingleField(block) = parsed else {
+            panic!("expected single-field payload");
+        };
+        assert_eq!(
+            block.values[0].to_texts(),
+            ["recorded live\r\nremastered 2024"],
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_field_set_keeps_title_and_multiline_comment() {
+        let entries = vec![
+            entry("TITLE", &["Duke", "Turn It On Again"]),
+            entry("COMMENT", &["recorded live\nremastered 2024"]),
+        ];
+        let serialized = serialize_clipboard_tag_entries(
+            entries.iter(),
+            ClipboardTagPayloadKind::FieldSet,
+        );
+        assert_eq!(serialized.keys, vec!["TITLE", "COMMENT"]);
+        assert!(serialized.skipped.is_empty());
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        let ClipboardTagPayload::FieldSet(blocks) = parsed else {
+            panic!("expected field-set payload");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].key, "TITLE");
+        assert_eq!(blocks[1].key, "COMMENT");
+        assert_eq!(
+            blocks[1].values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_multivalue_position_can_contain_newline_member() {
+        let mut performer = entry("PERFORMER", &["placeholder"]);
+        performer.per_file_values = vec![crate::tui::probe::MetadataFieldValues::from_stored_texts([
+            "Jimmy Page\nGuitar",
+            "Robert Plant",
+        ])];
+        performer.per_file_originals = performer.per_file_values.clone();
+
+        let serialized = serialize_clipboard_tag_entries(
+            std::iter::once(&performer),
+            ClipboardTagPayloadKind::SingleField,
+        );
+        assert!(serialized.skipped.is_empty());
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        let ClipboardTagPayload::SingleField(block) = parsed else {
+            panic!("expected single-field payload");
+        };
+        assert_eq!(
+            block.values[0].to_texts(),
+            ["Jimmy Page\nGuitar", "Robert Plant"],
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_field_set_round_trips_and_plain_title_text_stays_plain() {
+        let entries = vec![
+            entry("TITLE", &["Whole Lotta Love", "Heartbreaker"]),
+            entry("ARTIST", &["Led Zeppelin", "Led Zeppelin"]),
+        ];
+        let serialized = serialize_clipboard_tag_entries(
+            entries.iter(),
+            ClipboardTagPayloadKind::FieldSet,
+        );
+        let parsed = parse_clipboard_tag_payload(&serialized.text)
+            .expect("clipboard envelope parses")
+            .expect("structured clipboard payload");
+        match parsed {
+            ClipboardTagPayload::FieldSet(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].key, "TITLE");
+                assert_eq!(blocks[0].values.len(), 2, "mixed TITLE remains positional");
+                assert_eq!(blocks[1].key, "ARTIST");
+                assert_eq!(blocks[1].values.len(), 1, "uniform ARTIST becomes broadcast so it can cross album sizes");
+                assert_eq!(blocks[1].values[0].as_str(), "Led Zeppelin");
+            }
+            other => panic!("expected field-set payload, got {other:?}"),
+        }
+
+        assert_eq!(
+            parse_clipboard_tag_payload("TITLE\nHeartbreaker\nCommunication Breakdown")
+                .expect("ordinary text is not an envelope"),
+            None,
+            "ordinary line-oriented clipboard text must never be guessed to be structured metadata",
+        );
     }
 
     #[test]
@@ -1162,6 +1409,39 @@ mod tests {
         assert!(
             !existing.metadata_entry_is_visible(existing_index),
             "updating an existing custom field must not grant session-added visibility"
+        );
+    }
+
+    #[test]
+    fn clipboard_field_set_overwrites_existing_track_scoped_rows() {
+        let mut title = entry("TITLE", &["Old One", "Old Two"]);
+        title.row_scope = RowScope::Track;
+        let mut clipboard_state = editor_with_files(2, vec![title.clone()]);
+        let mut transfer_state = editor_with_files(2, vec![title]);
+        let blocks = vec![FieldBlock {
+            key: "TITLE".to_string(),
+            values: crate::tui::probe::metadata_field_values_from_scalars(vec![
+                "New One".to_string(),
+                "New Two".to_string(),
+            ]),
+        }];
+
+        let transfer_report = apply_field_blocks_to_editor(&mut transfer_state, &blocks)
+            .expect("ordinary transfer policy remains valid");
+        assert_eq!(transfer_report.skipped_track_scoped, vec!["TITLE"]);
+        assert_eq!(transfer_state.active_surface().entries[0].value, "Old One");
+
+        let clipboard_report = apply_clipboard_field_blocks_to_editor(&mut clipboard_state, &blocks)
+            .expect("clipboard field-set paste overwrites same-name track rows");
+        assert_eq!(clipboard_report.applied.len(), 1);
+        assert!(clipboard_report.skipped_track_scoped.is_empty());
+        assert_eq!(
+            clipboard_state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["New One", "New Two"],
         );
     }
 
@@ -6011,9 +6291,42 @@ impl FieldBlockApplyReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingTrackScopedApplyPolicy {
+    Skip,
+    Overwrite,
+}
+
 pub(crate) fn apply_field_blocks_to_editor(
     state: &mut super::app::MetadataEditorState,
     blocks: &[FieldBlock],
+) -> Result<FieldBlockApplyReport, String> {
+    apply_field_blocks_to_editor_with_policy(
+        state,
+        blocks,
+        ExistingTrackScopedApplyPolicy::Skip,
+    )
+}
+
+/// Clipboard field-set application differs from transfer/import application in
+/// one deliberate respect: an existing track-scoped row is a valid same-name
+/// destination and must be overwritten rather than skipped. The rest of the
+/// block validation and atomic preflight stays identical.
+pub(crate) fn apply_clipboard_field_blocks_to_editor(
+    state: &mut super::app::MetadataEditorState,
+    blocks: &[FieldBlock],
+) -> Result<FieldBlockApplyReport, String> {
+    apply_field_blocks_to_editor_with_policy(
+        state,
+        blocks,
+        ExistingTrackScopedApplyPolicy::Overwrite,
+    )
+}
+
+fn apply_field_blocks_to_editor_with_policy(
+    state: &mut super::app::MetadataEditorState,
+    blocks: &[FieldBlock],
+    track_scoped_policy: ExistingTrackScopedApplyPolicy,
 ) -> Result<FieldBlockApplyReport, String> {
     let file_count = state.active_surface().paths.len();
     if file_count == 0 {
@@ -6048,7 +6361,7 @@ pub(crate) fn apply_field_blocks_to_editor(
 
     let mut report = FieldBlockApplyReport::default();
     for (block, mode, existing_row, track_scoped) in plans {
-        if track_scoped {
+        if track_scoped && track_scoped_policy == ExistingTrackScopedApplyPolicy::Skip {
             report.skipped_track_scoped.push(block.key.clone());
             continue;
         }

@@ -1,9 +1,9 @@
 //! Host clipboard integration with bounded workers, observable outcomes, and diagnostics.
 //!
-//! Tonepoet's in-process text clipboard remains authoritative. Host mirroring
-//! is an asynchronous projection: writes are coalesced, every external action
-//! has a two-second deadline, and failures are reported without changing the
-//! success of the internal copy/cut operation.
+//! Tonepoet's terminal/host clipboard is the user-visible clipboard authority.
+//! Writes are asynchronous and coalesced, every external action has a two-second
+//! deadline, and failures are surfaced rather than being hidden behind a stale
+//! in-process fallback.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -22,6 +22,7 @@ const NATIVE_CLIPBOARD_MAX_BYTES: usize = 1024 * 1024;
 const OSC52_TEXT_CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
 const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CLIPBOARD_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 const CLIPBOARD_HISTORY_LIMIT: usize = 32;
 
 #[derive(Default)]
@@ -236,7 +237,7 @@ fn record_attempt(
 
 /// Publication hook installed into `tui-file-picker`.
 ///
-/// The internal clipboard has already committed before this function runs.
+/// Queue one authoritative host-clipboard publication without blocking the reducer.
 /// Rapid host writes are coalesced using last-value-wins semantics.
 pub(crate) fn publish_system_clipboard(text: &str) {
     let should_start = {
@@ -265,7 +266,7 @@ pub(crate) fn publish_system_clipboard(text: &str) {
             let detail = format!("could not start host clipboard worker: {error}");
             record_attempt(ClipboardOperation::Write, "worker", Err(detail.clone()));
             send_status(format!(
-                "Copied internally; host clipboard unavailable: {detail}"
+                "Host clipboard write failed: {detail}"
             ));
         }
     }
@@ -309,16 +310,43 @@ fn host_clipboard_write_worker_with<B, E, S>(
         match write_host_clipboard_with(backend, &env, &next, ClipboardOperation::Write) {
             Ok(outcome) => {
                 if let Some(warning) = outcome.warning {
-                    report_status(format!("Copied internally; {warning}"));
+                    report_status(format!("Host clipboard write warning: {warning}"));
                 }
             }
             Err(error) => {
                 log::debug!("host clipboard write unavailable: {error}");
                 report_status(format!(
-                    "Copied internally; host clipboard unavailable: {error}; run :clipboard"
+                    "Host clipboard write failed: {error}; run :clipboard"
                 ));
             }
         }
+    }
+}
+
+/// Wait off-thread for Tonepoet clipboard publications submitted before a
+/// paste request to finish. Without this ordering point, an immediate Copy ->
+/// Paste can race the asynchronous writer and read the host's previous value.
+/// A bounded failure is safer than silently pasting stale external contents if
+/// a host helper wedges despite its own command deadline.
+fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let drained = {
+            let state = write_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            !state.worker_running && state.pending.is_none()
+        };
+        if drained {
+            return Ok(());
+        }
+        if started.elapsed() >= CLIPBOARD_WRITE_DRAIN_TIMEOUT {
+            return Err(
+                "timed out waiting for a prior Tonepoet host-clipboard write to finish"
+                    .to_string(),
+            );
+        }
+        std::thread::sleep(CLIPBOARD_POLL_INTERVAL);
     }
 }
 
@@ -334,9 +362,11 @@ pub(crate) fn request_host_clipboard_paste(
     let spawn_result = std::thread::Builder::new()
         .name("tonepoet-host-clipboard-read".to_string())
         .spawn(move || {
-            let env = ClipboardEnvironment::detect();
-            let backend = RealClipboardBackend;
-            let result = read_host_clipboard_with(&backend, &env, ClipboardOperation::Read);
+            let result = wait_for_prior_host_clipboard_writes().and_then(|()| {
+                let env = ClipboardEnvironment::detect();
+                let backend = RealClipboardBackend;
+                read_host_clipboard_with(&backend, &env, ClipboardOperation::Read)
+            });
             let _ = tx.blocking_send(AppMessage::HostClipboardReadComplete {
                 generation,
                 target,
@@ -616,6 +646,13 @@ fn native_write_candidates(
     env: &ClipboardEnvironment,
 ) -> Vec<ClipboardCommand> {
     let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    if backend.command_exists("pbcopy", env) {
+        candidates.push(ClipboardCommand {
+            program: "pbcopy",
+            args: Vec::new(),
+        });
+    }
     if env.wayland_display.is_some() && backend.command_exists("wl-copy", env) {
         candidates.push(ClipboardCommand {
             program: "wl-copy",
@@ -644,6 +681,13 @@ fn native_read_candidates(
     env: &ClipboardEnvironment,
 ) -> Vec<ClipboardCommand> {
     let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    if backend.command_exists("pbpaste", env) {
+        candidates.push(ClipboardCommand {
+            program: "pbpaste",
+            args: Vec::new(),
+        });
+    }
     if env.wayland_display.is_some() && backend.command_exists("wl-paste", env) {
         candidates.push(ClipboardCommand {
             program: "wl-paste",
@@ -668,7 +712,9 @@ fn native_read_candidates(
 }
 
 fn actionable_write_error(env: &ClipboardEnvironment, errors: &[String]) -> String {
-    let mut reason = if env.wayland_display.is_none() && env.display.is_none() {
+    let mut reason = if cfg!(target_os = "macos") {
+        "no usable pbcopy transport".to_string()
+    } else if env.wayland_display.is_none() && env.display.is_none() {
         "no WAYLAND_DISPLAY or DISPLAY; native clipboard helpers were not eligible".to_string()
     } else {
         "no usable wl-copy/xclip/xsel transport".to_string()
@@ -687,7 +733,9 @@ fn actionable_write_error(env: &ClipboardEnvironment, errors: &[String]) -> Stri
 }
 
 fn actionable_read_error(env: &ClipboardEnvironment, errors: &[String]) -> String {
-    let mut reason = if env.wayland_display.is_none() && env.display.is_none() {
+    let mut reason = if cfg!(target_os = "macos") {
+        "host clipboard read requires a usable pbpaste transport".to_string()
+    } else if env.wayland_display.is_none() && env.display.is_none() {
         "host clipboard read requires WAYLAND_DISPLAY or DISPLAY".to_string()
     } else {
         "install wl-clipboard, xclip, or xsel, or fix the detected helper".to_string()
@@ -971,6 +1019,18 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_env() -> ClipboardEnvironment {
+        ClipboardEnvironment {
+            wayland_display: None,
+            display: None,
+            tmux: None,
+            sty: None,
+            term: Some(OsString::from("xterm-256color")),
+            path: None,
+        }
+    }
+
     #[cfg(unix)]
     struct ForkingWriteBackend {
         log_path: std::path::PathBuf,
@@ -1138,6 +1198,119 @@ mod tests {
         )
         .expect("xsel read");
         assert_eq!(value, "Duke");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_without_display_variables_admits_pbcopy_and_pbpaste() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("pbcopy".to_string());
+        backend.programs.insert("pbpaste".to_string());
+        let env = macos_env();
+
+        let writes = native_write_candidates(&backend, &env);
+        let reads = native_read_candidates(&backend, &env);
+        assert_eq!(
+            writes
+                .iter()
+                .map(|candidate| candidate.program)
+                .collect::<Vec<_>>(),
+            vec!["pbcopy"],
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .map(|candidate| candidate.program)
+                .collect::<Vec<_>>(),
+            vec!["pbpaste"],
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pbpaste_success_is_returned() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("pbpaste".to_string());
+        backend
+            .read_results
+            .insert("pbpaste".to_string(), Ok("Duke".to_string()));
+
+        let value = read_host_clipboard_with(
+            &backend,
+            &macos_env(),
+            ClipboardOperation::Diagnostic,
+        )
+        .expect("pbpaste read");
+        assert_eq!(value, "Duke");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pbcopy_failure_falls_back_to_osc52() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("pbcopy".to_string());
+        backend
+            .write_results
+            .insert("pbcopy".to_string(), Err("pasteboard unavailable".to_string()));
+
+        let outcome = write_host_clipboard_with(
+            &backend,
+            &macos_env(),
+            "Duke",
+            ClipboardOperation::Diagnostic,
+        )
+        .expect("OSC52 fallback after pbcopy failure");
+        assert_eq!(outcome.transport, "OSC52");
+        assert_eq!(
+            backend
+                .writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["pbcopy".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_write_failure_diagnostic_names_pbcopy_not_linux_display_servers() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("pbcopy".to_string());
+        backend
+            .write_results
+            .insert("pbcopy".to_string(), Err("pasteboard unavailable".to_string()));
+        backend.osc_result = Err("no tty".to_string());
+
+        let error = write_host_clipboard_with(
+            &backend,
+            &macos_env(),
+            "Duke",
+            ClipboardOperation::Diagnostic,
+        )
+        .expect_err("pbcopy and OSC52 failure must be actionable");
+        assert!(error.contains("pbcopy"));
+        assert!(!error.contains("DISPLAY"));
+        assert!(!error.contains("WAYLAND_DISPLAY"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_failure_diagnostic_names_pbpaste_not_linux_display_servers() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("pbpaste".to_string());
+        backend
+            .read_results
+            .insert("pbpaste".to_string(), Err("pasteboard unavailable".to_string()));
+
+        let error = read_host_clipboard_with(
+            &backend,
+            &macos_env(),
+            ClipboardOperation::Diagnostic,
+        )
+        .expect_err("pbpaste failure must be actionable");
+        assert!(error.contains("pbpaste"));
+        assert!(!error.contains("DISPLAY"));
+        assert!(!error.contains("WAYLAND_DISPLAY"));
     }
 
     #[test]

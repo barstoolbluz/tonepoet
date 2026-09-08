@@ -334,6 +334,7 @@ pub enum TuiButton {
     BrowseFilterInput,
     BrowseSearchRecursive,
     BrowseSearchMode,
+    BrowseSearchMatch,
     BrowseSearchSort,
     BrowseSearchAudioOnly,
 
@@ -704,6 +705,7 @@ impl TuiButton {
             | Self::BrowseFilterInput
             | Self::BrowseSearchRecursive
             | Self::BrowseSearchMode
+            | Self::BrowseSearchMatch
             | Self::BrowseSearchSort
             | Self::BrowseSearchAudioOnly => Some(AppScreen::Browse),
         }

@@ -57,7 +57,8 @@ const DIR_SCAN_CANCEL_CHECK_INTERVAL: usize = 50;
 const TREE_SCAN_CANCEL_CHECK_INTERVAL: usize = 64;
 
 /// Skim fuzzy matching is intentionally permissive: any ordered subsequence can
-/// produce a score. Browse search treats very low scores as false positives so
+/// produce a score. When fuzzy matching is explicitly enabled, Browse search
+/// treats very low scores as false positives so
 /// long filenames cannot match short queries solely because the query characters
 /// appear far apart. The floor scales with the non-whitespace query length so
 /// short queries still work while longer queries need proportionally stronger
@@ -73,7 +74,7 @@ fn search_fuzzy_score_passes_threshold(score: i64, min_score: i64) -> bool {
     score >= min_score
 }
 
-fn search_exact_substring_score(haystack_lower: &str, query_lower: &str) -> Option<i64> {
+fn search_literal_substring_score(haystack_lower: &str, query_lower: &str) -> Option<i64> {
     if query_lower.is_empty() {
         return None;
     }
@@ -1678,6 +1679,7 @@ pub enum SearchFocus {
     Input,
     Recursive,
     Mode,
+    Match,
     Sort,
     AudioOnly,
     /// Focus is on the results list — normal browse keys work.
@@ -1762,6 +1764,9 @@ pub struct SearchState {
     pub audio_only: bool,
     /// What to match against.
     pub mode: SearchMode,
+    /// Whether ordered-subsequence fuzzy matching is enabled. Exact
+    /// case-insensitive substring matching is the default.
+    pub fuzzy: bool,
     /// Sort field for results.
     pub sort: SearchSort,
     /// Sort direction for results.
@@ -1801,6 +1806,7 @@ impl SearchState {
             recursive: false,
             audio_only: true,
             mode: SearchMode::Filename,
+            fuzzy: false,
             sort: SearchSort::Score,
             sort_dir: SortDir::Desc,
             active: false,
@@ -2322,8 +2328,9 @@ pub(crate) struct PendingClipboardPaste {
     pub retry_plan: Option<BrowsePasteRetryPlan>,
 }
 
-/// Session-scoped metadata clipboard payload. `entries` are positionally
-/// aligned to `source_paths` through every per-file vector they carry.
+/// Test-only legacy carrier. Production metadata copy/paste uses only the
+/// terminal clipboard envelope.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct TagClipboard {
     pub source_paths: Vec<PathBuf>,
@@ -2571,9 +2578,9 @@ pub struct BrowseState {
     /// still owns it, even if a later Copy/Cut selected identical paths.
     pub(crate) filesystem_clipboard_generation: u64,
 
-    /// Session-scoped metadata clipboard. Entries remain complete `TagEntry`
-    /// clones so future paste semantics retain row scope, mixed/cardinality
-    /// evidence, and positional alignment with `source_paths`.
+    /// Unit-test seam for legacy Copy-tags completion assertions. Production
+    /// builds intentionally have no metadata clipboard carrier here.
+    #[cfg(test)]
     pub tag_clipboard: Option<TagClipboard>,
 
     /// Monotonic guard for background tag-copy requests and completions.
@@ -3735,6 +3742,7 @@ impl BrowseState {
             multi_selected: Vec::new(),
             filesystem_clipboard: None,
             filesystem_clipboard_generation: 0,
+            #[cfg(test)]
             tag_clipboard: None,
             tag_clipboard_copy_generation: 0,
             tag_clipboard_copy_active_generation: None,
@@ -3858,6 +3866,7 @@ impl BrowseState {
         // fields omitted here are per-tab by default.
         std::mem::swap(&mut self.filesystem_clipboard, &mut other.filesystem_clipboard);
         std::mem::swap(&mut self.filesystem_clipboard_generation, &mut other.filesystem_clipboard_generation);
+        #[cfg(test)]
         std::mem::swap(&mut self.tag_clipboard, &mut other.tag_clipboard);
         std::mem::swap(&mut self.tag_clipboard_copy_generation, &mut other.tag_clipboard_copy_generation);
         std::mem::swap(&mut self.tag_clipboard_copy_active_generation, &mut other.tag_clipboard_copy_active_generation);
@@ -7544,6 +7553,18 @@ impl BrowseState {
         self.reset_filter_state();
     }
 
+    /// Switch literal/fuzzy matching and immediately invalidate any worker that
+    /// was launched under the previous matching rule.
+    pub fn toggle_search_fuzzy(&mut self) {
+        if let Some(flag) = self.search.cancel.take() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.search.searching = false;
+        self.search.generation = self.search.generation.wrapping_add(1);
+        self.search.fuzzy = !self.search.fuzzy;
+        self.search.last_keystroke = Some(std::time::Instant::now());
+    }
+
     /// Close the search panel and restore the normal directory listing.
     pub fn close_search(&mut self) {
         let return_pane = self
@@ -7791,6 +7812,7 @@ impl BrowseState {
             self.rebuild_archive_raw_entries();
         }
         let candidates = self.archive_search_candidates(recursive, mode);
+        let fuzzy = self.search.fuzzy;
         let query = query.to_string();
 
         tokio::spawn(async move {
@@ -7809,6 +7831,7 @@ impl BrowseState {
                     audio_only,
                     format_filter,
                     mode,
+                    fuzzy,
                     sort,
                     sort_dir,
                     result_cap,
@@ -8048,6 +8071,7 @@ impl BrowseState {
 
         let matcher = SkimMatcherV2::default();
         let query_lower = query.to_lowercase();
+        let fuzzy = self.search.fuzzy;
         let min_score = search_fuzzy_min_score(query);
         let bounded_filename_score_results = matches!(mode, SearchMode::Filename)
             && matches!(self.search.sort, SearchSort::Score);
@@ -8072,8 +8096,11 @@ impl BrowseState {
             // Directories always match on filename (for navigation), even in
             // tags-only mode.
             if search_filename || e.is_navigable_dir() {
-                if let Some(s) = search_exact_substring_score(&e.name_lower, &query_lower)
-                    .or_else(|| matcher.fuzzy_match(&e.name_lower, query))
+                if let Some(s) = if fuzzy {
+                    matcher.fuzzy_match(&e.name_lower, query)
+                } else {
+                    search_literal_substring_score(&e.name_lower, &query_lower)
+                }
                 {
                     best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                 }
@@ -8082,7 +8109,12 @@ impl BrowseState {
             if search_tags && matches!(&e.kind, EntryKind::AudioFile(_)) {
                 let tag_str = self.tag_search_string_for_entry(e);
                 if !tag_str.is_empty() {
-                    if let Some(s) = matcher.fuzzy_match(&tag_str, query) {
+                    if let Some(s) = if fuzzy {
+                        matcher.fuzzy_match(&tag_str, query)
+                    } else {
+                        search_literal_substring_score(&tag_str, &query_lower)
+                    }
+                    {
                         best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                     }
                 }
@@ -8285,6 +8317,7 @@ impl BrowseState {
         let query_for_worker = query.clone();
         let search_tags = matches!(mode, SearchMode::Tags | SearchMode::Both);
         let search_filename = matches!(mode, SearchMode::Filename | SearchMode::Both);
+        let fuzzy = self.search.fuzzy;
 
         tokio::spawn(async move {
             let results =
@@ -8361,8 +8394,11 @@ impl BrowseState {
                         let mut best_score: Option<i64> = None;
 
                         if search_filename || candidate.is_navigable_dir() {
-                            if let Some(s) = search_exact_substring_score(&candidate.name_lower, &query_lower)
-                                .or_else(|| matcher.fuzzy_match(&candidate.name_lower, &query_for_worker))
+                            if let Some(s) = if fuzzy {
+                                matcher.fuzzy_match(&candidate.name_lower, &query_for_worker)
+                            } else {
+                                search_literal_substring_score(&candidate.name_lower, &query_lower)
+                            }
                             {
                                 best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                             }
@@ -8419,7 +8455,12 @@ impl BrowseState {
                             };
 
                             if !tag_str.is_empty() {
-                                if let Some(s) = matcher.fuzzy_match(&tag_str, &query_for_worker) {
+                                if let Some(s) = if fuzzy {
+                                    matcher.fuzzy_match(&tag_str, &query_for_worker)
+                                } else {
+                                    search_literal_substring_score(&tag_str, &query_lower)
+                                }
+                                {
                                     best_score =
                                         Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                                 }
@@ -12190,35 +12231,34 @@ pub fn spawn_folder_classification(
                 } else {
                     embedded
                 };
-                let cue_import = super::keybindings::cue_import_availability_for_paths(
-                    &classification.audio.file_paths,
-                );
-                classification.cue_import_availability = if incomplete_member_set
-                    && cue_import == CueImportAvailability::Absent
-                {
-                    CueImportAvailability::Unknown
+                // Resolve direct-child CUE usefulness once in the existing
+                // blocking classifier. Menu construction must remain I/O-free,
+                // and mere `.cue` file presence is not evidence that the user
+                // can import, inspect, or repair it.
+                let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
+                    classify_path.clone(),
+                ]);
+                if incomplete_member_set && candidates.is_empty() {
+                    classification.cue_import_availability = CueImportAvailability::Unknown;
+                    classification.cue_repair_availability = CueRepairAvailability::Unknown;
+                } else if candidates.is_empty() {
+                    classification.cue_import_availability = CueImportAvailability::Absent;
+                    classification.cue_repair_availability = CueRepairAvailability::Absent;
                 } else {
-                    cue_import
-                };
-                classification.cue_repair_availability = if incomplete_member_set
-                    && cue_import == CueImportAvailability::Absent
-                {
-                    CueRepairAvailability::Unknown
-                } else if cue_import == CueImportAvailability::Unknown {
-                    CueRepairAvailability::Unknown
-                } else if cue_import == CueImportAvailability::Absent {
-                    CueRepairAvailability::Absent
-                } else {
-                    let candidates = crate::convert::split_cue_album::split_cue_candidate_paths(&[
-                        classify_path.clone(),
-                    ]);
-                    crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates)
+                    let inspection =
+                        crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates);
+                    classification.cue_import_availability = if inspection.viable.is_empty() {
+                        CueImportAvailability::Absent
+                    } else {
+                        CueImportAvailability::Present
+                    };
+                    classification.cue_repair_availability = inspection
                         .rejected
                         .into_iter()
                         .find(|rejection| rejection.reason.is_cross_file_cumulative_index())
                         .map(|rejection| CueRepairAvailability::Repairable(rejection.cue_path))
-                        .unwrap_or(CueRepairAvailability::Absent)
-                };
+                        .unwrap_or(CueRepairAvailability::Absent);
+                }
             }
             classification
         })
@@ -13564,6 +13604,7 @@ fn run_archive_search_worker(
     audio_only: bool,
     format_filter: FormatFilter,
     mode: SearchMode,
+    fuzzy: bool,
     sort: SearchSort,
     sort_dir: SortDir,
     result_cap: usize,
@@ -13597,8 +13638,11 @@ fn run_archive_search_worker(
 
         let mut best_score: Option<i64> = None;
         if search_filename || e.is_navigable_dir() {
-            if let Some(s) = search_exact_substring_score(&e.name_lower, &query_lower)
-                .or_else(|| matcher.fuzzy_match(&e.name_lower, &query))
+            if let Some(s) = if fuzzy {
+                matcher.fuzzy_match(&e.name_lower, &query)
+            } else {
+                search_literal_substring_score(&e.name_lower, &query_lower)
+            }
             {
                 best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
             }
@@ -13614,7 +13658,12 @@ fn run_archive_search_worker(
                 &mut extraction,
             );
             if !tags.tag_string.is_empty() {
-                if let Some(s) = matcher.fuzzy_match(&tags.tag_string, &query) {
+                if let Some(s) = if fuzzy {
+                    matcher.fuzzy_match(&tags.tag_string, &query)
+                } else {
+                    search_literal_substring_score(&tags.tag_string, &query_lower)
+                }
+                {
                     best_score = Some(best_score.map_or(s, |prev: i64| prev.max(s)));
                 }
             }
@@ -16036,6 +16085,56 @@ mod tests {
             "garbage subsequence score {garbage} should fail threshold {}",
             search_fuzzy_min_score(query)
         );
+    }
+
+    #[test]
+    fn search_defaults_to_literal_substring_for_allman_regression() {
+        let mut state = BrowseState::new();
+        let false_positives = [
+            "Alphonse Mouzon - By All Means (1981)",
+            "Alan Price - O Lucky Man-2016 (1973)",
+            "Sviatoslav Richter - Live at Carnegie Hall Schumann",
+            "Tracey Ullman (1983) - You Broke My Heart In 17 Places",
+            "Mandrill - Mandrill (1971) [FLAC]",
+            "Andrea Bocelli - Romanza (XRCD2)",
+            "VA - Kansas City-A Robert Altman Film (Japan)",
+        ];
+        state.all_dirs = false_positives
+            .iter()
+            .chain(std::iter::once(&"The Allman Brothers Band - Fillmore East"))
+            .map(|name| {
+                BrowseEntry::new(
+                    PathBuf::from("/music").join(*name),
+                    (*name).to_string(),
+                    EntryKind::Directory,
+                    0,
+                    None,
+                )
+            })
+            .collect();
+        state.all_files.clear();
+
+        assert!(!state.search.fuzzy, "literal search must be the default");
+        state.execute_search_local(
+            "allman",
+            true,
+            false,
+            FormatFilter::Off,
+            SearchMode::Filename,
+        );
+
+        let names = state
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["The Allman Brothers Band - Fillmore East"]);
+        for name in false_positives {
+            assert!(
+                search_literal_substring_score(&name.to_lowercase(), "allman").is_none(),
+                "{name} must not be admitted by literal search",
+            );
+        }
     }
 
     #[test]

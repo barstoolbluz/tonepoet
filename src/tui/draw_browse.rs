@@ -1760,6 +1760,7 @@ mod options_menu_tests {
 enum SearchControlKind {
     Recursive,
     Mode,
+    Match,
     Sort,
     Audio,
 }
@@ -1803,6 +1804,7 @@ fn search_control_button(kind: SearchControlKind) -> TuiButton {
     match kind {
         SearchControlKind::Recursive => TuiButton::BrowseSearchRecursive,
         SearchControlKind::Mode => TuiButton::BrowseSearchMode,
+        SearchControlKind::Match => TuiButton::BrowseSearchMatch,
         SearchControlKind::Sort => TuiButton::BrowseSearchSort,
         SearchControlKind::Audio => TuiButton::BrowseSearchAudioOnly,
     }
@@ -1825,6 +1827,7 @@ fn search_control_labels_for_tier(
     tier: SearchControlLabelTier,
     recursive: bool,
     mode_label: &str,
+    fuzzy: bool,
     sort_label: &str,
     sort_dir: SortDir,
     audio_only: bool,
@@ -1845,6 +1848,10 @@ fn search_control_labels_for_tier(
             ),
             (SearchControlKind::Mode, format!(" mode: {} ", mode_label)),
             (
+                SearchControlKind::Match,
+                format!(" match: {} ", if fuzzy { "fuzzy" } else { "literal" }),
+            ),
+            (
                 SearchControlKind::Sort,
                 format!(" sort: {} {} ", sort_label, sort_arrow),
             ),
@@ -1860,6 +1867,10 @@ fn search_control_labels_for_tier(
             ),
             (SearchControlKind::Mode, format!(" mode:{} ", mode_compact)),
             (
+                SearchControlKind::Match,
+                format!(" match:{} ", if fuzzy { "fuzzy" } else { "literal" }),
+            ),
+            (
                 SearchControlKind::Sort,
                 format!(" sort:{} {} ", sort_compact, sort_arrow),
             ),
@@ -1874,6 +1885,10 @@ fn search_control_labels_for_tier(
                 if recursive { " r✓ " } else { " r " }.to_string(),
             ),
             (SearchControlKind::Mode, format!(" m:{} ", mode_tiny)),
+            (
+                SearchControlKind::Match,
+                if fuzzy { " f " } else { " l " }.to_string(),
+            ),
             (SearchControlKind::Sort, format!(" s{} ", sort_arrow)),
             (
                 SearchControlKind::Audio,
@@ -1932,6 +1947,7 @@ fn search_control_row_layout(
     inner_width: usize,
     recursive: bool,
     mode_label: &str,
+    fuzzy: bool,
     sort_label: &str,
     sort_dir: SortDir,
     audio_only: bool,
@@ -1945,6 +1961,7 @@ fn search_control_row_layout(
             tier,
             recursive,
             mode_label,
+            fuzzy,
             sort_label,
             sort_dir,
             audio_only,
@@ -1961,6 +1978,7 @@ fn search_control_row_layout(
         SearchControlLabelTier::Tiny,
         recursive,
         mode_label,
+        fuzzy,
         sort_label,
         sort_dir,
         audio_only,
@@ -1986,7 +2004,7 @@ fn search_control_style(
         SearchControlKind::Recursive | SearchControlKind::Audio => {
             Style::default().fg(theme.text_dim).bg(theme.surface)
         }
-        SearchControlKind::Mode | SearchControlKind::Sort => {
+        SearchControlKind::Mode | SearchControlKind::Match | SearchControlKind::Sort => {
             Style::default().fg(theme.text_bright).bg(theme.surface)
         }
     }
@@ -2036,6 +2054,7 @@ mod search_panel_geometry_tests {
             80,
             true,
             "filename",
+            false,
             "relevance",
             SortDir::Asc,
             false,
@@ -2046,14 +2065,16 @@ mod search_panel_geometry_tests {
             vec![
                 SearchControlKind::Recursive,
                 SearchControlKind::Mode,
+                SearchControlKind::Match,
                 SearchControlKind::Sort,
                 SearchControlKind::Audio,
             ]
         );
         assert_eq!(items[0].label, " recursive ✓ ");
         assert_eq!(items[1].label, " mode: filename ");
-        assert_eq!(items[2].label, " sort: relevance ▲ ");
-        assert_eq!(items[3].label, " all files ");
+        assert_eq!(items[2].label, " match: literal ");
+        assert_eq!(items[3].label, " sort: relevance ▲ ");
+        assert_eq!(items[4].label, " all files ");
         assert_layout_inside(80, &items);
     }
 
@@ -2063,16 +2084,18 @@ mod search_panel_geometry_tests {
             30,
             true,
             "filename",
+            false,
             "relevance",
             SortDir::Desc,
             true,
         );
 
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         assert_eq!(items[0].label, " r✓ ");
         assert_eq!(items[1].label, " m:f ");
-        assert_eq!(items[2].label, " s▼ ");
-        assert_eq!(items[3].label, " a✓ ");
+        assert_eq!(items[2].label, " l ");
+        assert_eq!(items[3].label, " s▼ ");
+        assert_eq!(items[4].label, " a✓ ");
         assert_layout_inside(30, &items);
     }
 
@@ -2083,6 +2106,7 @@ mod search_panel_geometry_tests {
                 inner_width,
                 true,
                 "filename",
+                false,
                 "relevance",
                 SortDir::Asc,
                 false,
@@ -2099,6 +2123,7 @@ mod search_panel_geometry_tests {
             inner_width,
             true,
             "filename",
+            false,
             "relevance",
             SortDir::Asc,
             true,
@@ -2185,6 +2210,7 @@ fn register_browse_buttons(
             inner_w,
             browse.search.recursive,
             browse.search.mode.label(),
+            browse.search.fuzzy,
             browse.search.sort.label(),
             browse.search.sort_dir,
             browse.search.audio_only,
@@ -2501,7 +2527,7 @@ fn draw_browse_list(
         search_spans.push(Span::styled("│", theme.border(border_color)));
         lines.push(Line::from(search_spans));
 
-        // Row 2: recursive + mode + sort + audio, all visibly clickable.
+        // Row 2: recursive + mode + match + sort + audio, all visibly clickable.
         // The shared layout helper progressively compacts labels and finally
         // omits trailing controls only when the pane is too narrow to display
         // every tiny pill without colliding with the right border.
@@ -2509,6 +2535,7 @@ fn draw_browse_list(
             inner_w,
             browse.search.recursive,
             browse.search.mode.label(),
+            browse.search.fuzzy,
             browse.search.sort.label(),
             browse.search.sort_dir,
             browse.search.audio_only,
