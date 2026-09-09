@@ -1,0 +1,51 @@
+{
+  "checks": {
+    "absolute_underflow_terms_are_positive": true,
+    "hq_output_error_below_1e_6_linear": true,
+    "legacy_output_error_below_1e_6_linear": true,
+    "twiddle_reference_inside_published_upper": true
+  },
+  "construction": {
+    "algorithm": "fixed radix-2 decimation-in-time complex FFT",
+    "complex_add_min_normal_units": 6.0,
+    "complex_mul_relative_factor": 4.440892098500626e-16,
+    "complex_twiddle_mul_min_normal_units": 12.0,
+    "filter_spectrum_subnormals_canonicalized_to_zero": true,
+    "hq1024_fft_size": 8192,
+    "legacy_fft_size": 2048,
+    "max_fft_size": 8192,
+    "normalization": "exact power-of-two reciprocal",
+    "packed_pair_scale": "maximum absolute real component over both channels and full overlap-save block",
+    "twiddle_complex_error_measured_max": 7.472101018825855e-17,
+    "twiddle_complex_error_published_upper": 2.220446049250313e-16,
+    "twiddle_reference_precision_decimal_digits": 120,
+    "twiddle_table_entries": 4096,
+    "unit_roundoff": 1.1102230246251565e-16
+  },
+  "hq1024": {
+    "filter_coefficient_peak": 0.6366179518246102,
+    "filter_l1": 4.676026435151282,
+    "filter_spectrum_error": 3.010803402037693e-11,
+    "input_scaling_absolute_units": 11585.237502960395,
+    "normalization_absolute_units": 1.0,
+    "output_absolute": 1.6546685301491345e-302,
+    "output_absolute_units": 743646.5642804545,
+    "output_relative": 3.494582798049807e-07,
+    "transform_absolute_units": 147438.00000000073,
+    "transform_relative": 4.7293724492192404e-11
+  },
+  "legacy64": {
+    "filter_coefficient_peak": 0.6370870167307932,
+    "filter_l1": 4.089899431660599,
+    "filter_spectrum_error": 6.3736999291347654e-12,
+    "input_scaling_absolute_units": 2896.309375740099,
+    "normalization_absolute_units": 1.0,
+    "output_absolute": 3.617734221365666e-303,
+    "output_absolute_units": 162589.39933763808,
+    "output_relative": 1.8581198578932993e-08,
+    "transform_absolute_units": 36846.00000000015,
+    "transform_relative": 1.0004441719502235e-11
+  },
+  "schema": 1,
+  "status": "pass"
+}

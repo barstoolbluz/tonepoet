@@ -1,378 +1,66 @@
 //! Streaming true-peak measurement for decoded PCM audio.
 //!
-//! This crate deliberately has no file, process, or application-policy layer.
-//! Callers provide decoded interleaved `f64` frames and receive a level.
+//! The public ceiling surface has exactly three HQ1024V1 tiers:
+//! [`PeakTier::Reference`], [`PeakTier::Standard`], and [`PeakTier::Fast`].
+//! They differ only in how the same certified HQ1024V1 reconstruction is
+//! searched. [`ReportingPeakMeter`] is deliberately separate: it implements
+//! the established libebur128-compatible reporting profile rather than the
+//! finite HQ ceiling reconstruction.
 //!
-//! `Reporting4x` follows libebur128's public true-peak profile: the 49-tap
-//! Hann-windowed interpolator runs at 4x below 96 kHz, 2x from 96 kHz up to
-//! 192 kHz, and reports sample peak at 192 kHz and above. The separate
-//! headroom ladder provides a fast fixed-16x default plus `Headroom64x` as the
-//! opt-in gold-standard point estimate. Ordinary PCM can additionally use a
-//! budgeted accelerated-Reference ceiling scan that computes a Reference-quality
-//! 4x prefix with enclosed execution error, certifies every remaining interval,
-//! and selectively completes 64x phases. The legacy direct 16x/8x rungs remain available for
-//! the DSD policy that already names them. Every rung has
-//! its own band-qualified one-sided authority rather than pretending that a
-//! finite interpolator can prove a uniform bound at critical Nyquist. Album
-//! hard-ceiling policy uses the separately named finite reconstruction meter,
-//! whose governed 64x waveform contract is unchanged by the selected scan rung.
+//! The old Headroom point-estimator ladder is not part of the public surface.
+//! Its direct LegacyHeadroom64 implementation is retained only as an internal
+//! independent oracle for HQ/legacy regression tests.
 
 use std::error::Error;
 use std::f64::consts::PI;
 use std::fmt;
-use std::sync::Arc;
-
-use rustfft::num_complex::Complex64;
-use rustfft::{Fft, FftPlanner};
 
 mod headroom64_coefficients;
-mod reference_fast;
+mod hq1024_coefficients;
+mod qualified_prefix_coefficients;
+mod qualified_half_delay_fft;
+mod certified_scan;
+
 use headroom64_coefficients::HEADROOM64_HALF_DELAY_COEFFICIENTS;
 
 const COEFFICIENT_EPSILON: f64 = 1.0e-15;
 const REPORTING_TAPS: usize = 49;
-const HEADROOM_STANDARD16X_FFT_SIZE: usize = 2048;
-const HEADROOM_STANDARD16X_BLOCK_FRAMES: usize =
-    HEADROOM_STANDARD16X_FFT_SIZE - HEADROOM64_HALF_DELAY_TAPS + 1;
 
-// The accelerated-reference ceiling scanner deliberately reuses the same FFT
-// size and overlap-save geometry as Standard. The first implementation is a
-// fixed policy, not a runtime autotuner: release benchmarking may justify a
-// later constant change, but decoder chunking and host scheduling never do.
-const HEADROOM_REFERENCE_FAST_FFT_SIZE: usize = HEADROOM_STANDARD16X_FFT_SIZE;
-const HEADROOM_REFERENCE_FAST_BLOCK_FRAMES: usize =
-    HEADROOM_REFERENCE_FAST_FFT_SIZE - HEADROOM64_HALF_DELAY_TAPS + 1;
-const HEADROOM_REFERENCE_FAST_TILE_INPUT_FRAMES: i128 = 4096;
-const HEADROOM_REFERENCE_FAST_INPUT_HALO_FRAMES: i128 = 201;
-const HEADROOM_REFERENCE_FAST_COARSE_HALO: i128 = 9;
-const HEADROOM_REFERENCE_FAST_MAX_REFINEMENTS_PER_TILE: usize = 64;
-const HEADROOM_REFERENCE_FAST_PREFERRED_WIDTH_LINEAR: f64 = 1.001_151_955_538_169;
-const HEADROOM_REFERENCE_FAST_CUBIC_ERROR_GAIN_UPPER: f64 = 4.0 / 3.0;
-const HEADROOM_REFERENCE_FAST_TAIL_LINF_GAIN_UPPER: f64 = 1.739;
-const HEADROOM_REFERENCE_FAST_SCREEN_NUMERIC_ERROR_PER_SCALE_UPPER: f64 = 1.0e-9;
-const HEADROOM_REFERENCE_FAST_TAIL_NUMERIC_ERROR_PER_SCALE_UPPER: f64 = 1.0e-9;
+/// Reference-tier commissioning objective for the achieved finite-peak interval.
+///
+/// This is an acceptance objective, not an additive safety reserve.
+pub const REFERENCE_INTERVAL_OBJECTIVE_DB: f64 = 0.000_000_1;
 
-/// Preferred finite-reference interval width for the accelerated Reference
-/// scanner. This is a refinement target, not a fixed accuracy declaration:
-/// the deterministic work cap may leave a wider, still-certified interval.
-pub const HEADROOM_REFERENCE_FAST_PREFERRED_INTERVAL_WIDTH_DB: f64 = 0.010_000_000;
+/// Standard-tier commissioning objective for the achieved finite-peak interval.
+///
+/// This is an acceptance objective, not an additive safety reserve.
+pub const STANDARD_INTERVAL_OBJECTIVE_DB: f64 = 0.000_1;
 
-// Independently recomputed from the exact checked-in first-stage coefficients
-// plus the production Blackman stage construction. The raw maxima are about
-// 0.0121719654 / 0.0198822951 / 0.0198822951 / 0.0121719654. These widened
-// values bound the complete original-input residual between each 4x cubic cell
-// and every corresponding 64x Reference phase, with no spectral assumption.
-const HEADROOM_REFERENCE_FAST_RESIDUAL_L1_UPPER: [f64; 4] = [0.0122, 0.0199, 0.0199, 0.0122];
+/// Fast-tier end-to-end target: one second of wall time per minute of decoded
+/// programme audio.
+///
+/// The meter enforces a slightly smaller cumulative internal allowance so the
+/// caller retains bounded room for validation, I/O, dispatch and reporting. It
+/// cannot control scheduler pauses, decoder cost, or host speed, so the
+/// shipping benchmark remains the binding check for this user-visible target.
+pub const FAST_WALL_SECONDS_PER_PROGRAMME_MINUTE: u64 = 1;
 
-// The same residuals reproduce DC to ordinary floating-point precision. Keep
-// a deliberately loose nonzero enclosure rather than relying on exact zero;
-// this is what makes the centered screen cheap on constant regions while
-// remaining insensitive to last-bit libm coefficient variation.
-const HEADROOM_REFERENCE_FAST_RESIDUAL_SUM_UPPER: [f64; 4] = [1.0e-12; 4];
-
-// Headroom64x is a six-stage 2x cascade. The expensive original-band stage is
-// not another arbitrary windowed-sinc: integer samples pass through exactly,
-// while only the half-sample phase uses a 384-tap Type-II equiripple
-// fractional-delay FIR designed over 0..0.99 of original Nyquist
-// (0..0.495 * Fs). Symmetry reduces that phase to 192 coefficient products
-// per input frame/channel. Later 2x stages see an already-oversampled signal
-// and remain short Blackman-windowed interpolation filters.
+// Legacy64 remains only as an independent internal oracle/descriptor. These
+// constants are not user-selectable policy.
 const HEADROOM64_HALF_DELAY_TAPS: usize = 384;
 const HEADROOM64_STAGE_2_TAPS: usize = 49;
 const HEADROOM64_STAGE_3_TAPS: usize = 25;
 const HEADROOM64_STAGE_4_TAPS: usize = 17;
 const HEADROOM64_STAGE_5_TAPS: usize = 13;
 const HEADROOM64_STAGE_6_TAPS: usize = 9;
-
-// Center the small residual interpolation ripple of the complete 64x cascade.
-// Decoded sample peak is tracked independently and is never scaled or clamped.
 const HEADROOM64_INTERPOLATION_CALIBRATION_LINEAR: f64 = 0.999_539_589_003_087_8;
+const HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER: f64 = 4.09;
 
-// The opt-in fast paths reuse prefixes of the frozen Headroom64 cascade.
-// The 16x path is biased upward by 0.007 dB: this spends a tiny portion of
-// point-estimate symmetry to keep the complete response-plus-grid budget inside
-// the declared 0.044 dB one-sided envelope while materially reducing work. The
-// 8x path uses a larger +0.088 dB bias for the same one-sided purpose.
-const HEADROOM16_INTERPOLATION_CALIBRATION_LINEAR: f64 = 1.000_806_229_611_061_6;
-const HEADROOM8_INTERPOLATION_CALIBRATION_LINEAR: f64 = 1.010_182_870_544_833_2;
+/// Conservative induced L-infinity gain of the public HQ1024V1 reconstruction.
+pub const HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER: f64 = 4.68;
 
-/// Highest input frequency for which the `Headroom64x` authority contract is
-/// qualified, expressed as a fraction of the input sample rate.
-///
-/// Nyquist is 0.5. The deliberate 0.005 * Fs guard band is what lets a finite,
-/// bounded-state interpolator make an honest small-error claim. Point
-/// measurement is still available outside this band, but the crate refuses to
-/// turn it into a safety authority.
-pub const HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE: f64 = 0.495;
-
-/// Analytic worst-case sampling-grid under-read for a 64x grid, in dB.
-///
-/// This is `-20*log10(cos(pi/(2*64)))`. It is only the grid component, not the
-/// complete authority reserve.
-pub const HEADROOM64X_GRID_MAX_UNDERREAD_DB: f64 = 0.002_616_421_594_233;
-
-/// Qualified one-sided under-read reserve for `Headroom64x`, in dB.
-///
-/// Qualification combines analytically known aligned signals, deterministic
-/// frequency/phase and multitone searches, finite-stream variants, and an
-/// independent high-resolution reference. Three deterministic seeds across
-/// the design and adversarial gates cover 16,000 exact-peak cases; their
-/// worst observed under-read is below 0.018 dB after final calibration. A separate
-/// complete-cascade response budget (interpolation + 64x grid + numerical
-/// allowance) is below 0.021 dB. The 0.030 dB reserve retains roughly 0.009 dB
-/// of engineering margin while staying well inside the requested 0.05 dB
-/// authority ceiling. The reserve is valid only inside
-/// `HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE`.
-pub const HEADROOM64X_MAX_UNDERREAD_DB: f64 = 0.030_000_000;
-
-/// Qualified one-sided under-read reserve for the opt-in middle-speed path.
-///
-/// This path evaluates the first four stages of the frozen Headroom64 cascade
-/// on a 16x grid and applies a +0.007 dB one-sided calibration. Offline
-/// qualification covers the complete prefix response, the analytic 16x
-/// sampling-grid miss, deterministic exact-peak searches, and finite-stream
-/// edge variants. The derived response-plus-grid component budget is about
-/// 0.04125 dB, leaving explicit margin inside the operator-approved
-/// 0.042-0.044 dB envelope.
-pub const HEADROOM16X_MAX_UNDERREAD_DB: f64 = 0.044_000_000;
-
-/// Qualified one-sided under-read reserve for the opt-in fastest path.
-///
-/// The 8x prefix is calibrated +0.088 dB so its coarser sampling grid remains
-/// conservative enough for a useful one-sided authority.  Qualification
-/// combines the complete-prefix response with the 8x grid miss and retains a
-/// small margin below the operator-approved 0.082-0.084 dB envelope.
-pub const HEADROOM8X_MAX_UNDERREAD_DB: f64 = 0.084_000_000;
-
-/// Qualified one-sided under-read reserve for the default fast headroom rung.
-///
-/// The default rung evaluates the *same mathematical 16x prefix* as
-/// [`TruePeakMode::Headroom16x`], but executes the 384-tap first-stage half
-/// phase with bounded-memory overlap-save convolution. Its physical grid,
-/// filter response, and +0.007 dB calibration therefore inherit the existing
-/// 16x qualification. The extra FFT roundoff is covered explicitly below.
-pub const HEADROOM_STANDARD16X_MAX_UNDERREAD_DB: f64 = HEADROOM16X_MAX_UNDERREAD_DB;
-
-/// Analytic 16x sampling-grid contribution over the qualified source band.
-///
-/// This is `-20*log10(cos(pi*0.495/16))`.
-pub const HEADROOM_STANDARD16X_GRID_MAX_UNDERREAD_DB: f64 = 0.041_090_311_680_097_205;
-
-/// Worst qualified-band response under-read after the +0.007 dB one-sided
-/// calibration. The frozen qualification report places the minimum branch at
-/// -0.000145995023586 dB.
-pub const HEADROOM_STANDARD16X_RESPONSE_COMPONENT_DB: f64 = 0.000_145_995_023_585_799_4;
-
-/// Explicit binary64 allowance used by the standard-rung component budget.
-pub const HEADROOM_STANDARD16X_NUMERICAL_ALLOWANCE_DB: f64 = 0.000_010_000;
-
-/// Linear execution-error enclosure corresponding to the standard rung's
-/// 0.000010 dB binary64 budget, expressed per unit decoded sample peak.
-///
-/// This term is charged to the reconstruction ceiling as well as the point
-/// authority so the hard-ceiling path cannot silently consume FFT roundoff.
-const HEADROOM_STANDARD16X_EXECUTION_ERROR_PER_INPUT_PEAK_UPPER: f64 =
-    1.151_293_209_211_701_2e-6;
-
-/// The two fast headroom paths are qualified over the same source band as
-/// Headroom64x because they reuse its frozen first-stage fractional-delay FIR.
-pub const HEADROOM_FAST_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE: f64 =
-    HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE;
-
-/// Conservative induced L-infinity difference between the full uncalibrated
-/// Headroom64 reconstruction and cubic interpolation of the fast 16x prefix.
-///
-/// Four-point cubic interpolation uses neighboring 16x prefix knots. The
-/// independently recomputed maximum phase-wise absolute coefficient sum is
-/// 0.0028500955108182; 0.0030 retains explicit coefficient-generation margin.
-pub const HEADROOM16X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER: f64 = 0.003_0;
-
-/// Conservative induced L-infinity difference between the full uncalibrated
-/// Headroom64 reconstruction and cubic interpolation of the fast 8x prefix.
-///
-/// Four-point cubic interpolation uses neighboring 8x prefix knots.  The
-/// independently recomputed maximum phase-wise absolute coefficient sum is
-/// 0.0029326006842505; 0.0030 retains explicit coefficient-generation margin.
-pub const HEADROOM8X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER: f64 = 0.003_0;
-
-/// Floating-point enclosure for the fast-prefix reconstruction bridge,
-/// expressed per unit decoded sample peak.
-///
-/// This is intentionally much looser than the full-64x 1e-11 evaluation
-/// allowance: the fast stages pair symmetric taps and both fast ceiling
-/// bridges evaluate cubic Bernstein controls. At 1e-9 the allowance remains
-/// acoustically immaterial while comfortably covering binary64 rounding in
-/// those extra operations.
-const HEADROOM_FAST_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER: f64 = 1.0e-9;
-
-const HEADROOM64X_AUTHORITY_LINEAR_SCALE: f64 = 1.003_459_849_147_839_3;
-const HEADROOM16X_AUTHORITY_LINEAR_SCALE: f64 = 1.005_078_539_490_737;
-const HEADROOM8X_AUTHORITY_LINEAR_SCALE: f64 = 1.009_717_771_242_342;
-
-/// Conservative induced L-infinity gain of Tonepoet's uncalibrated
-/// Headroom64 reconstruction from original-rate sample error to the 64x
-/// reconstruction grid. Piecewise-linear interpolation between adjacent grid
-/// points cannot increase this norm.
-///
-/// The independently derived maximum absolute coefficient sum of the complete
-/// six-stage polyphase cascade is 4.089899431660599 on the qualified source
-/// coefficients. The published upper is deliberately widened to 4.09 rather
-/// than resting on a one-ULP margin: the five later Blackman stages are derived
-/// from `sin`/`cos` at meter construction, and supported platform libm results
-/// may differ at the last few bits. The extra 2.46e-5 relative margin is
-/// negligible when applied only to terminal LSB-scale errors but keeps the
-/// bound comfortably above such coefficient-generation variation.
-///
-/// This is used only to translate a deterministic terminal sample-error bound
-/// into the reconstruction domain; it is not the published Headroom64x
-/// point-estimation accuracy reserve.
-pub const HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER: f64 = 4.09;
-
-/// Conservative floating-point evaluation allowance, expressed as linear
-/// reconstruction amplitude per unit decoded sample peak. A deliberately
-/// pessimistic Higham-gamma propagation through all six stages remains below
-/// 3.4e-12 on IEEE-754 binary64; 1e-11 retains nearly 3x margin. Keeping this
-/// separate from the signal reconstruction norm makes numerical enclosure
-/// explicit without spending interval-arithmetic work in the hot loop.
-const HEADROOM64X_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER: f64 = 1.0e-11;
-
-/// Oversampling mode used for true-peak evaluation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TruePeakMode {
-    /// libebur128-compatible reporting profile, using up to four-times
-    /// interpolation depending on input sample rate.
-    Reporting4x,
-    /// Sixty-four-times high-accuracy interpolation for headroom decisions.
-    Headroom64x,
-    /// Default fixed-16x bounded headroom estimate. It is mathematically the
-    /// qualified 16x prefix, with its expensive first stage executed by
-    /// bounded-memory overlap-save convolution.
-    HeadroomStandard16x,
-    /// Opt-in 16x headroom estimate with a qualified 0.044 dB one-sided bound.
-    Headroom16x,
-    /// Opt-in 8x headroom estimate with a qualified 0.084 dB one-sided bound.
-    Headroom8x,
-}
-
-impl TruePeakMode {
-    /// Maximum interpolation factor associated with this mode.
-    ///
-    /// `Reporting4x` intentionally reduces to 2x at 96-192 kHz and to sample
-    /// peak at 192 kHz and above, matching libebur128's reporting profile.
-    #[must_use]
-    pub const fn oversample_factor(self) -> usize {
-        match self {
-            Self::Reporting4x => 4,
-            Self::Headroom64x => 64,
-            Self::HeadroomStandard16x => 16,
-            Self::Headroom16x => 16,
-            Self::Headroom8x => 8,
-        }
-    }
-
-    /// Effective interpolation factor for a concrete input sample rate.
-    #[must_use]
-    pub const fn oversample_factor_for_sample_rate(self, sample_rate_hz: u32) -> usize {
-        match self {
-            Self::Reporting4x if sample_rate_hz >= 192_000 => 1,
-            Self::Reporting4x if sample_rate_hz >= 96_000 => 2,
-            Self::Reporting4x => 4,
-            Self::Headroom64x => 64,
-            Self::HeadroomStandard16x => 16,
-            Self::Headroom16x => 16,
-            Self::Headroom8x => 8,
-        }
-    }
-
-    /// Qualified one-sided under-read reserve for headroom modes.
-    ///
-    /// `Reporting4x` answers the separate libebur128 reporting question and
-    /// therefore deliberately has no headroom authority reserve.
-    #[must_use]
-    pub const fn max_underread_db(self) -> Option<f64> {
-        match self {
-            Self::Reporting4x => None,
-            Self::Headroom64x => Some(HEADROOM64X_MAX_UNDERREAD_DB),
-            Self::HeadroomStandard16x => Some(HEADROOM_STANDARD16X_MAX_UNDERREAD_DB),
-            Self::Headroom16x => Some(HEADROOM16X_MAX_UNDERREAD_DB),
-            Self::Headroom8x => Some(HEADROOM8X_MAX_UNDERREAD_DB),
-        }
-    }
-}
-
-/// Headroom scan ladder exposed to callers that need both a point estimate and
-/// Tonepoet's finite hard-ceiling reconstruction authority.
-///
-/// Names describe the user-visible trade rather than an implementation factor;
-/// callers can show the declared dB bounds through [`Self::max_underread_db`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum HeadroomScanMode {
-    /// Fast fixed-16x scan with the same qualified point response as the legacy
-    /// direct 16x prefix, but an FFT-accelerated expensive first stage.
-    #[default]
-    Standard,
-    /// Gold-standard Headroom64x scan.
-    Reference,
-    /// Materially faster 16x-prefix scan.
-    Fast,
-    /// Fastest 8x-prefix scan.
-    Fastest,
-}
-
-impl HeadroomScanMode {
-    /// Point-estimator implementation used by this scan rung.
-    #[must_use]
-    pub const fn point_mode(self) -> TruePeakMode {
-        match self {
-            Self::Standard => TruePeakMode::HeadroomStandard16x,
-            Self::Reference => TruePeakMode::Headroom64x,
-            Self::Fast => TruePeakMode::Headroom16x,
-            Self::Fastest => TruePeakMode::Headroom8x,
-        }
-    }
-
-    /// Declared qualified one-sided point under-read reserve in dB.
-    #[must_use]
-    pub const fn max_underread_db(self) -> f64 {
-        match self {
-            Self::Standard => HEADROOM_STANDARD16X_MAX_UNDERREAD_DB,
-            Self::Reference => HEADROOM64X_MAX_UNDERREAD_DB,
-            Self::Fast => HEADROOM16X_MAX_UNDERREAD_DB,
-            Self::Fastest => HEADROOM8X_MAX_UNDERREAD_DB,
-        }
-    }
-
-    /// Apply this rung's declared under-read reserve to a point estimate.
-    ///
-    /// This is deliberately only arithmetic: it does not assert that the
-    /// decoded signal is inside the <=0.495*Fs qualification domain. Callers
-    /// that need a band-qualified authority must establish signal support and
-    /// use the corresponding `headroom*_authority` function. Hard-ceiling
-    /// policy may still apply this reserve as an aim-point margin while using
-    /// an independent reconstruction bound outside the qualified domain.
-    #[must_use]
-    pub fn reserve_point_estimate(self, point_estimate: PeakLevel) -> PeakLevel {
-        let linear_scale = match self {
-            Self::Standard | Self::Fast => HEADROOM16X_AUTHORITY_LINEAR_SCALE,
-            Self::Reference => HEADROOM64X_AUTHORITY_LINEAR_SCALE,
-            Self::Fastest => HEADROOM8X_AUTHORITY_LINEAR_SCALE,
-        };
-        match point_estimate {
-            PeakLevel::Silence => PeakLevel::Silence,
-            PeakLevel::Finite { linear, dbtp } => PeakLevel::Finite {
-                linear: linear * linear_scale,
-                dbtp: dbtp + self.max_underread_db(),
-            },
-        }
-    }
-}
-
-/// Boundary convention for samples required outside a finite input stream.
-///
-/// This setting is used by all headroom modes. `Reporting4x` deliberately ignores
-/// it and follows libebur128's finite-stream contract instead: zero-initialized
-/// interpolation state, no synthetic pre-roll, and no synthetic end flush.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Boundary convention for samples required outside a finite certified input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgePolicy {
     /// Extend the first and last decoded frame outward.
     RepeatEndpoints,
@@ -380,183 +68,44 @@ pub enum EdgePolicy {
     ZeroExtend,
 }
 
-/// Configuration for one streaming meter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TruePeakConfig {
-    /// Sample rate of the decoded input frames.
-    pub sample_rate_hz: u32,
-    /// Number of interleaved channels in each decoded frame.
-    pub channels: usize,
-    /// Oversampling mode.
-    pub mode: TruePeakMode,
-    /// Finite-stream boundary convention for headroom modes.
-    ///
-    /// `Reporting4x` has fixed libebur128-compatible finite-stream semantics
-    /// and ignores this field.
-    pub edge_policy: EdgePolicy,
-}
-
-impl TruePeakConfig {
-    /// Construct the default interoperable reporting configuration.
-    #[must_use]
-    pub const fn new(sample_rate_hz: u32, channels: usize) -> Self {
-        Self {
-            sample_rate_hz,
-            channels,
-            mode: TruePeakMode::Reporting4x,
-            edge_policy: EdgePolicy::RepeatEndpoints,
-        }
-    }
-
-    /// Select an oversampling mode.
-    #[must_use]
-    pub const fn with_mode(mut self, mode: TruePeakMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    /// Select a finite-stream boundary convention.
-    #[must_use]
-    pub const fn with_edge_policy(mut self, edge_policy: EdgePolicy) -> Self {
-        self.edge_policy = edge_policy;
-        self
-    }
-}
-
 /// A measured true-peak level.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PeakLevel {
-    /// Every decoded sample was exactly zero, so the logarithmic result is -inf.
+    /// Every represented sample was exactly zero.
     Silence,
     /// Finite true peak. `linear` is relative to digital full scale and is not
     /// clamped; values greater than 1.0 therefore produce positive dBTP.
     Finite { linear: f64, dbtp: f64 },
 }
 
-/// Error returned when a point estimate cannot be promoted to a qualified
-/// headroom safety authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadroomAuthorityError {
-    /// The caller supplied a negative, non-finite, or above-Nyquist band limit.
-    InvalidBandLimit,
-    /// The caller's declared signal bandwidth exceeds the qualified domain.
-    OutsideQualifiedBand,
+const F64_MAGNITUDE_MASK_FOR_DB: u64 = 0x7fff_ffff_ffff_ffff;
+const F64_INFINITY_BITS_FOR_DB: u64 = 0x7ff0_0000_0000_0000;
+const F64_MIN_NORMAL_BITS_FOR_DB: u64 = 0x0010_0000_0000_0000;
+
+#[inline]
+const fn f64_magnitude_bits_for_db(value: f64) -> u64 {
+    value.to_bits() & F64_MAGNITUDE_MASK_FOR_DB
 }
 
-impl fmt::Display for HeadroomAuthorityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidBandLimit => f.write_str(
-                "headroom authority band limit must be finite and within 0..=0.5 of sample rate",
-            ),
-            Self::OutsideQualifiedBand => write!(
-                f,
-                "headroom authority is qualified only through {:.6} of sample rate",
-                HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE,
-            ),
-        }
+/// Convert a positive finite binary64 magnitude to dBTP without passing a
+/// subnormal operand to libm. On x86 DAZ may otherwise reinterpret that
+/// operand as zero inside `log10`, incorrectly producing `-inf`.
+#[inline]
+fn positive_finite_linear_to_dbtp(linear: f64) -> f64 {
+    let bits = f64_magnitude_bits_for_db(linear);
+    debug_assert!(bits != 0 && bits < F64_INFINITY_BITS_FOR_DB);
+    if bits < F64_MIN_NORMAL_BITS_FOR_DB {
+        // Every positive subnormal is k * 2^-1074 for an integer
+        // 1 <= k < 2^52. `k` is exactly representable and normal.
+        let k = bits as f64;
+        20.0 * (k.log10() - 1074.0 * std::f64::consts::LOG10_2)
+    } else {
+        20.0 * linear.log10()
     }
-}
-
-impl Error for HeadroomAuthorityError {}
-
-/// Promote a `Headroom64x` point estimate into a conservative safety authority.
-///
-/// `max_frequency_fraction_of_sample_rate` is a caller-supplied property of the
-/// decoded signal path, not something the meter guesses from a finite block. A
-/// value of 0.5 is Nyquist. The function refuses authority outside the frozen
-/// qualified band instead of applying a misleading global reserve.
-pub fn headroom64x_authority(
-    point_estimate: PeakLevel,
-    max_frequency_fraction_of_sample_rate: f64,
-) -> Result<PeakLevel, HeadroomAuthorityError> {
-    headroom_authority(
-        point_estimate,
-        max_frequency_fraction_of_sample_rate,
-        HEADROOM64X_MAX_UNDERREAD_DB,
-        HEADROOM64X_AUTHORITY_LINEAR_SCALE,
-    )
-}
-
-/// Promote a default `HeadroomStandard16x` point estimate into its qualified
-/// one-sided safety authority. The standard executor has the same 16x
-/// mathematical response and published reserve as `Headroom16x`.
-pub fn headroom_standard16x_authority(
-    point_estimate: PeakLevel,
-    max_frequency_fraction_of_sample_rate: f64,
-) -> Result<PeakLevel, HeadroomAuthorityError> {
-    headroom_authority(
-        point_estimate,
-        max_frequency_fraction_of_sample_rate,
-        HEADROOM_STANDARD16X_MAX_UNDERREAD_DB,
-        HEADROOM16X_AUTHORITY_LINEAR_SCALE,
-    )
-}
-
-/// Promote a `Headroom16x` point estimate into its qualified one-sided safety
-/// authority.
-pub fn headroom16x_authority(
-    point_estimate: PeakLevel,
-    max_frequency_fraction_of_sample_rate: f64,
-) -> Result<PeakLevel, HeadroomAuthorityError> {
-    headroom_authority(
-        point_estimate,
-        max_frequency_fraction_of_sample_rate,
-        HEADROOM16X_MAX_UNDERREAD_DB,
-        HEADROOM16X_AUTHORITY_LINEAR_SCALE,
-    )
-}
-
-/// Promote a `Headroom8x` point estimate into its qualified one-sided safety
-/// authority.
-pub fn headroom8x_authority(
-    point_estimate: PeakLevel,
-    max_frequency_fraction_of_sample_rate: f64,
-) -> Result<PeakLevel, HeadroomAuthorityError> {
-    headroom_authority(
-        point_estimate,
-        max_frequency_fraction_of_sample_rate,
-        HEADROOM8X_MAX_UNDERREAD_DB,
-        HEADROOM8X_AUTHORITY_LINEAR_SCALE,
-    )
-}
-
-fn headroom_authority(
-    point_estimate: PeakLevel,
-    max_frequency_fraction_of_sample_rate: f64,
-    reserve_db: f64,
-    linear_scale: f64,
-) -> Result<PeakLevel, HeadroomAuthorityError> {
-    if !max_frequency_fraction_of_sample_rate.is_finite()
-        || !(0.0..=0.5).contains(&max_frequency_fraction_of_sample_rate)
-    {
-        return Err(HeadroomAuthorityError::InvalidBandLimit);
-    }
-    if max_frequency_fraction_of_sample_rate
-        > HEADROOM64X_QUALIFIED_MAX_FRACTION_OF_SAMPLE_RATE
-    {
-        return Err(HeadroomAuthorityError::OutsideQualifiedBand);
-    }
-    Ok(match point_estimate {
-        PeakLevel::Silence => PeakLevel::Silence,
-        PeakLevel::Finite { linear, dbtp } => PeakLevel::Finite {
-            linear: linear * linear_scale,
-            dbtp: dbtp + reserve_db,
-        },
-    })
 }
 
 impl PeakLevel {
-    /// Return the logarithmic level, using negative infinity for silence.
-    #[must_use]
-    pub fn dbtp(self) -> f64 {
-        match self {
-            Self::Silence => f64::NEG_INFINITY,
-            Self::Finite { dbtp, .. } => dbtp,
-        }
-    }
-
-    /// Return the linear peak, using zero for silence.
+    /// Linear full-scale value; exact silence maps to zero.
     #[must_use]
     pub const fn linear(self) -> f64 {
         match self {
@@ -566,18 +115,306 @@ impl PeakLevel {
     }
 }
 
-/// Final result from a meter.
+/// The finite waveform certified by every public ceiling tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CertifiedReconstruction {
+    /// Frozen high-accuracy 1024x finite reconstruction.
+    Hq1024V1,
+}
+
+/// User-facing ceiling measurement tier.
+///
+/// These names are intentionally API choices, not persistence migrations.
+/// In particular, an older Tonepoet setting named `fast` meant the retired
+/// 16x prefix estimator. Integration must not deserialize that stored value as
+/// [`PeakTier::Fast`] without an explicit migration decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PeakTier {
+    /// Exhaustive Reference9 search of HQ1024V1.
+    Reference,
+    /// Deterministic bounded-work Fast90 search of HQ1024V1.
+    #[default]
+    Standard,
+    /// Clock-bounded HQ1024V1 search targeting one second of end-to-end wall
+    /// time per minute of decoded programme audio.
+    Fast,
+}
+
+impl PeakTier {
+    /// Commissioning width objective where the tier has one.
+    ///
+    /// Fast intentionally returns `None`: its contract is to report the
+    /// tightest truthful interval obtained within its time allowance, not to
+    /// fabricate an accuracy floor.
+    #[must_use]
+    pub const fn interval_objective_db(self) -> Option<f64> {
+        match self {
+            Self::Reference => Some(REFERENCE_INTERVAL_OBJECTIVE_DB),
+            Self::Standard => Some(STANDARD_INTERVAL_OBJECTIVE_DB),
+            Self::Fast => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ReconstructionId {
+    LegacyHeadroom64,
+    Hq1024V1,
+}
+
+impl ReconstructionId {
+    #[must_use]
+    pub(crate) const fn target_factor(self) -> usize {
+        match self {
+            Self::LegacyHeadroom64 => 64,
+            Self::Hq1024V1 => 1024,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn reconstruction_linf_gain_upper(self) -> f64 {
+        match self {
+            Self::LegacyHeadroom64 => HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
+            Self::Hq1024V1 => HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SearchPolicy {
+    Reference9,
+    Fast90,
+    Fast1sPerMinute,
+}
+
+impl SearchPolicy {
+    #[must_use]
+    pub(crate) const fn public_tier(self) -> PeakTier {
+        match self {
+            Self::Reference9 => PeakTier::Reference,
+            Self::Fast90 => PeakTier::Standard,
+            Self::Fast1sPerMinute => PeakTier::Fast,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn uses_accelerated_prefix(self) -> bool {
+        !matches!(self, Self::Reference9)
+    }
+}
+
+/// Whether a certified search fully resolved its competitive regions or
+/// returned safely with unresolved bounded work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchStatus {
+    /// No unresolved region can exceed the proven lower winner.
+    Complete,
+    /// Standard exhausted its deterministic work-credit allowance.
+    WorkLimited,
+    /// Fast reached its cumulative processing-time allowance.
+    TimeLimited,
+}
+
+/// Closed nonnegative interval enclosing a finite reconstruction peak.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeakInterval {
+    pub lower_linear: f64,
+    pub upper_linear: f64,
+}
+
+impl PeakInterval {
+    pub(crate) fn new(lower_linear: f64, upper_linear: f64) -> Self {
+        assert!(lower_linear >= 0.0, "peak interval lower must be nonnegative");
+        assert!(upper_linear >= lower_linear, "peak interval upper must not be below lower");
+        Self { lower_linear, upper_linear }
+    }
+
+    #[must_use]
+    pub fn width_db(self) -> Option<f64> {
+        let upper_bits = f64_magnitude_bits_for_db(self.upper_linear);
+        let lower_bits = f64_magnitude_bits_for_db(self.lower_linear);
+        if upper_bits == 0 { return None; }
+        if lower_bits == 0 { return Some(f64::INFINITY); }
+        if upper_bits < F64_MIN_NORMAL_BITS_FOR_DB || lower_bits < F64_MIN_NORMAL_BITS_FOR_DB {
+            Some(positive_finite_linear_to_dbtp(self.upper_linear)
+                - positive_finite_linear_to_dbtp(self.lower_linear))
+        } else {
+            Some(20.0 * (self.upper_linear / self.lower_linear).log10())
+        }
+    }
+
+    #[must_use]
+    pub fn upper_level(self) -> PeakLevel {
+        if f64_magnitude_bits_for_db(self.upper_linear) == 0 {
+            PeakLevel::Silence
+        } else {
+            PeakLevel::Finite {
+                linear: self.upper_linear,
+                dbtp: positive_finite_linear_to_dbtp(self.upper_linear),
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn is_silence(self) -> bool {
+        f64_magnitude_bits_for_db(self.lower_linear) == 0
+            && f64_magnitude_bits_for_db(self.upper_linear) == 0
+    }
+}
+
+/// Work and numerical diagnostics attached to a certified search.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SearchDiagnostics {
+    pub tiles_processed: u64,
+    pub groups_rejected: u64,
+    pub groups_expanded: u64,
+    pub candidate_cells: u64,
+    pub refined_cells: u64,
+    pub phase_evaluations: u64,
+    pub authoritative_coarse_values: u64,
+    pub authoritative_coarse_groups: u64,
+    /// Accelerated (Standard/Fast) roots tested by the cheap whole-support L1 bound.
+    pub accelerated_l1_groups_tested: u64,
+    /// Accelerated roots rejected by the L1 bound.
+    pub accelerated_l1_groups_rejected: u64,
+    /// Accelerated roots that required the curvature hierarchy.
+    pub accelerated_curvature_roots: u64,
+    /// Whether the same-graph AVX qualified-prefix executor was active.
+    pub accelerated_same_graph_avx_prefix_active: bool,
+    pub strict_coarse_evaluations: u64,
+    pub dense_regions: u64,
+    pub dense_intermediate_cells: u64,
+    pub dense_complete_regions: u64,
+    pub dense_phase_evaluations: u64,
+    pub direct_rescore_evaluations: u64,
+    /// Deterministic modeled work consumed. Standard uses it as a limit;
+    /// Reference and Fast retain it as a diagnostic only.
+    pub work_credits_consumed: u64,
+    /// Tiles in which Standard exhausted deterministic credits.
+    pub work_limited_tiles: u64,
+    /// Qualified first-stage FFT blocks Fast replaced with a conservative FIR
+    /// L1 enclosure after reaching its cumulative processing-time allowance.
+    pub time_bounded_prefix_blocks_skipped: u64,
+    /// Tiles in which Fast reached the cumulative processing-time allowance.
+    pub time_limited_tiles: u64,
+    pub max_evaluation_error_linear: f64,
+    pub unresolved_upper_linear: f64,
+}
+
+/// Public HQ1024V1 certificate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeakCertificate {
+    pub reconstruction: CertifiedReconstruction,
+    pub tier: PeakTier,
+    pub reconstruction_linf_gain_upper: f64,
+    pub numerical_envelope_linear: f64,
+    pub reported_point_estimate: TruePeakResult,
+    pub finite_interval: PeakInterval,
+    pub channel_intervals: Vec<PeakInterval>,
+    pub channel_upper_linear_peaks: Vec<f64>,
+    pub status: SearchStatus,
+    pub diagnostics: SearchDiagnostics,
+}
+
+impl PeakCertificate {
+    #[must_use]
+    pub fn upper_level(&self) -> PeakLevel { self.finite_interval.upper_level() }
+    #[must_use]
+    pub fn interval_width_db(&self) -> Option<f64> { self.finite_interval.width_db() }
+    #[must_use]
+    pub const fn reconstruction_linf_gain_upper(&self) -> f64 {
+        self.reconstruction_linf_gain_upper
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InternalPeakCertificate {
+    pub reconstruction: ReconstructionId,
+    pub search_policy: SearchPolicy,
+    pub reconstruction_linf_gain_upper: f64,
+    pub numerical_envelope_linear: f64,
+    pub reported_point_estimate: TruePeakResult,
+    pub finite_interval: PeakInterval,
+    pub channel_intervals: Vec<PeakInterval>,
+    pub channel_upper_linear_peaks: Vec<f64>,
+    pub status: SearchStatus,
+    pub diagnostics: SearchDiagnostics,
+}
+
+impl InternalPeakCertificate {
+    #[cfg(test)]
+    pub(crate) fn upper_level(&self) -> PeakLevel { self.finite_interval.upper_level() }
+    #[cfg(test)]
+    pub(crate) fn interval_width_db(&self) -> Option<f64> { self.finite_interval.width_db() }
+}
+
+/// Streaming certified HQ1024V1 meter.
+///
+/// Caller chunk sizes do not define FFT blocks or search tiles. Reference and
+/// Standard are deterministic for a fixed backend. Fast is intentionally
+/// wall-clock bounded, so scheduling can change how much optional refinement
+/// fits; every returned upper remains authoritative regardless.
+#[derive(Debug, Clone)]
+pub struct CertifiedPeakMeter {
+    inner: certified_scan::CertifiedPeakMeterImpl,
+}
+
+impl CertifiedPeakMeter {
+    /// Create one of the three public HQ1024V1 tiers.
+    pub fn new(
+        sample_rate_hz: u32,
+        channels: usize,
+        edge_policy: EdgePolicy,
+        tier: PeakTier,
+    ) -> Result<Self, TruePeakError> {
+        let policy = match tier {
+            PeakTier::Reference => SearchPolicy::Reference9,
+            PeakTier::Standard => SearchPolicy::Fast90,
+            PeakTier::Fast => SearchPolicy::Fast1sPerMinute,
+        };
+        Ok(Self {
+            inner: certified_scan::CertifiedPeakMeterImpl::new(
+                sample_rate_hz,
+                channels,
+                edge_policy,
+                ReconstructionId::Hq1024V1,
+                policy,
+            )?,
+        })
+    }
+
+
+    pub fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {
+        self.inner.push_interleaved(samples)
+    }
+
+    pub fn finalize(self) -> Result<PeakCertificate, TruePeakError> {
+        let internal = self.inner.finalize()?;
+        debug_assert_eq!(internal.reconstruction, ReconstructionId::Hq1024V1);
+        Ok(PeakCertificate {
+            reconstruction: CertifiedReconstruction::Hq1024V1,
+            tier: internal.search_policy.public_tier(),
+            reconstruction_linf_gain_upper: internal.reconstruction_linf_gain_upper,
+            numerical_envelope_linear: internal.numerical_envelope_linear,
+            reported_point_estimate: internal.reported_point_estimate,
+            finite_interval: internal.finite_interval,
+            channel_intervals: internal.channel_intervals,
+            channel_upper_linear_peaks: internal.channel_upper_linear_peaks,
+            status: internal.status,
+            diagnostics: internal.diagnostics,
+        })
+    }
+}
+
+/// Final result from the standards-compatible reporting meter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TruePeakResult {
-    /// Maximum level across all channels.
     pub overall: PeakLevel,
-    /// Per-channel linear maxima, in input channel order.
     pub channel_linear_peaks: Vec<f64>,
-    /// Number of decoded input frames consumed.
     pub frames: u64,
 }
 
-/// Input/configuration errors detected by the meter.
+/// Input/configuration errors detected by a meter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TruePeakError {
     InvalidSampleRate,
@@ -585,6 +422,10 @@ pub enum TruePeakError {
     IncompleteFrame { samples: usize, channels: usize },
     NonFiniteSample { sample_index: usize },
     NumericalOverflow,
+    /// Internal Reference invariant failure: a live unresolved upper survived
+    /// an exhaustive search. Returning a partial Reference certificate would
+    /// violate the tier contract, so finalization fails closed instead.
+    ReferenceSearchIncomplete,
     EmptyInput,
     InputTooLong,
 }
@@ -602,18 +443,17 @@ impl fmt::Display for TruePeakError {
                 f,
                 "decoded sample at block index {sample_index} is not finite"
             ),
-            Self::NumericalOverflow => {
-                f.write_str("true-peak reconstruction exceeded finite binary64 range")
-            }
+            Self::NumericalOverflow => f.write_str("true-peak reconstruction exceeded finite binary64 range"),
+            Self::ReferenceSearchIncomplete => f.write_str(
+                "reference true-peak search ended with a live unresolved region",
+            ),
             Self::EmptyInput => f.write_str("true-peak measurement requires at least one frame"),
             Self::InputTooLong => f.write_str("true-peak input frame count overflowed"),
         }
     }
 }
-
 impl Error for TruePeakError {}
 
-#[derive(Debug, Clone, Copy)]
 enum Window {
     Hann,
     Blackman,
@@ -757,6 +597,72 @@ impl ReportingEngine {
     }
 }
 
+/// Dedicated standards-compatible reporting meter.
+///
+/// This answers the interoperable 4x/2x/1x reporting question used by
+/// libebur128 consumers. It is deliberately not a low-accuracy ceiling tier.
+#[derive(Debug, Clone)]
+pub struct ReportingPeakMeter {
+    sample_rate_hz: u32,
+    channels: usize,
+    engine: ReportingEngine,
+    channel_peaks: Vec<f64>,
+    next_input_index: i128,
+    frames: u64,
+}
+
+impl ReportingPeakMeter {
+    pub fn new(sample_rate_hz: u32, channels: usize) -> Result<Self, TruePeakError> {
+        if sample_rate_hz == 0 { return Err(TruePeakError::InvalidSampleRate); }
+        if channels == 0 { return Err(TruePeakError::InvalidChannelCount); }
+        Ok(Self {
+            sample_rate_hz,
+            channels,
+            engine: ReportingEngine::new(sample_rate_hz, channels),
+            channel_peaks: vec![0.0; channels],
+            next_input_index: 0,
+            frames: 0,
+        })
+    }
+
+    /// Effective interpolation factor for the libebur128-compatible profile.
+    #[must_use]
+    pub const fn oversample_factor(&self) -> usize {
+        if self.sample_rate_hz >= 192_000 { 1 }
+        else if self.sample_rate_hz >= 96_000 { 2 }
+        else { 4 }
+    }
+
+    /// Validate the whole block before mutation, then consume complete frames.
+    pub fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {
+        if samples.len() % self.channels != 0 {
+            return Err(TruePeakError::IncompleteFrame { samples: samples.len(), channels: self.channels });
+        }
+        if let Some((sample_index, _)) = samples.iter().enumerate().find(|(_, sample)| !sample.is_finite()) {
+            return Err(TruePeakError::NonFiniteSample { sample_index });
+        }
+        for frame in samples.chunks_exact(self.channels) {
+            update_channel_peaks(&mut self.channel_peaks, frame);
+            self.engine.process_frame(frame, self.next_input_index, &mut self.channel_peaks, None);
+            self.next_input_index += 1;
+            self.frames = self.frames.checked_add(1).ok_or(TruePeakError::InputTooLong)?;
+        }
+        Ok(())
+    }
+
+    pub fn finalize(self) -> Result<TruePeakResult, TruePeakError> {
+        if self.frames == 0 { return Err(TruePeakError::EmptyInput); }
+        let linear = self.channel_peaks.iter().copied().fold(0.0, max_nonnegative_by_bits);
+        let overall = if f64_magnitude_bits_for_db(linear) == 0 {
+            PeakLevel::Silence
+        } else {
+            PeakLevel::Finite { linear, dbtp: positive_finite_linear_to_dbtp(linear) }
+        };
+        Ok(TruePeakResult { overall, channel_linear_peaks: self.channel_peaks, frames: self.frames })
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct HeadroomHalfSampleStage {
     // Each channel stores two identical copies of the circular delay line.
@@ -768,6 +674,7 @@ struct HeadroomHalfSampleStage {
     channels: usize,
 }
 
+#[cfg(test)]
 impl HeadroomHalfSampleStage {
     const GROUP_DELAY_INPUTS: i128 = (HEADROOM64_HALF_DELAY_TAPS / 2) as i128;
 
@@ -821,70 +728,6 @@ impl HeadroomHalfSampleStage {
 
         (input_index - Self::GROUP_DELAY_INPUTS) * 2
     }
-
-    /// Same frozen first-stage filter with a fast-only accumulation schedule.
-    ///
-    /// Headroom64x keeps `process_frame` above, including its historical
-    /// summation order. The opt-in modes split the 192-term half-phase dot
-    /// product across four independent accumulators, shortening its serialized
-    /// floating-point dependency chain from 192 products to 48 without
-    /// changing coefficients, samples, or streaming state. The final reduction
-    /// changes only last-bit rounding and is covered by the fast qualification's
-    /// explicit numerical allowance.
-    #[inline]
-    fn process_frame_fast(
-        &mut self,
-        frame: &[f64],
-        input_index: i128,
-        output: &mut [f64],
-    ) -> i128 {
-        debug_assert_eq!(frame.len(), self.channels);
-        debug_assert_eq!(output.len(), self.channels * 2);
-        debug_assert_eq!(HEADROOM64_HALF_DELAY_COEFFICIENTS.len() % 4, 0);
-
-        for (channel, sample) in frame.iter().copied().enumerate() {
-            self.delay[channel][self.delay_index] = sample;
-            self.delay[channel][self.delay_index + HEADROOM64_HALF_DELAY_TAPS] = sample;
-        }
-
-        for channel in 0..self.channels {
-            let delay = &self.delay[channel];
-            let base = self.delay_index;
-            output[channel] = delay[base + HEADROOM64_HALF_DELAY_TAPS / 2];
-
-            let recent = &delay[base + HEADROOM64_HALF_DELAY_TAPS / 2 + 1
-                ..base + HEADROOM64_HALF_DELAY_TAPS + 1];
-            let old = &delay[base + 1..base + HEADROOM64_HALF_DELAY_TAPS / 2 + 1];
-            let mut sum0 = 0.0_f64;
-            let mut sum1 = 0.0_f64;
-            let mut sum2 = 0.0_f64;
-            let mut sum3 = 0.0_f64;
-            let mut index = 0_usize;
-            while index < HEADROOM64_HALF_DELAY_COEFFICIENTS.len() {
-                let i0 = index;
-                let i1 = index + 1;
-                let i2 = index + 2;
-                let i3 = index + 3;
-                sum0 += HEADROOM64_HALF_DELAY_COEFFICIENTS[i0]
-                    * (recent[recent.len() - 1 - i0] + old[i0]);
-                sum1 += HEADROOM64_HALF_DELAY_COEFFICIENTS[i1]
-                    * (recent[recent.len() - 1 - i1] + old[i1]);
-                sum2 += HEADROOM64_HALF_DELAY_COEFFICIENTS[i2]
-                    * (recent[recent.len() - 1 - i2] + old[i2]);
-                sum3 += HEADROOM64_HALF_DELAY_COEFFICIENTS[i3]
-                    * (recent[recent.len() - 1 - i3] + old[i3]);
-                index += 4;
-            }
-            output[self.channels + channel] = (sum0 + sum1) + (sum2 + sum3);
-        }
-
-        self.delay_index += 1;
-        if self.delay_index == HEADROOM64_HALF_DELAY_TAPS {
-            self.delay_index = 0;
-        }
-
-        (input_index - Self::GROUP_DELAY_INPUTS) * 2
-    }
 }
 
 /// Fixed 2x interpolation stage used only by Headroom64x. The checked-in
@@ -892,6 +735,7 @@ impl HeadroomHalfSampleStage {
 /// execution layout merely specializes its exact identity phase and stores a
 /// doubled circular delay so the nontrivial phase is one contiguous dot
 /// product.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct HeadroomTwoXStage {
     group_delay_inputs: i128,
@@ -903,6 +747,7 @@ struct HeadroomTwoXStage {
     channels: usize,
 }
 
+#[cfg(test)]
 impl HeadroomTwoXStage {
     fn new(taps: usize, channels: usize) -> Self {
         let delay_frames = (taps + 1) / 2;
@@ -969,90 +814,7 @@ impl HeadroomTwoXStage {
         (input_index - self.group_delay_inputs) * 2
     }
 }
-
-/// Fast-only wrapper around the unchanged Headroom64 2x stage state.
-///
-/// The mathematical Blackman half phase is symmetric. Platform libm can
-/// leave paired generated coefficients a few ULPs apart, so the opt-in paths
-/// freeze each execution pair to its arithmetic mean at construction. Keeping
-/// this data outside `HeadroomTwoXStage` means the reference Headroom64 object,
-/// allocations, coefficients, and hot loop remain exactly unchanged.
-#[derive(Debug, Clone)]
-struct FastHeadroomTwoXStage {
-    inner: HeadroomTwoXStage,
-    symmetric_half_coefficients: Vec<f64>,
-}
-
-impl FastHeadroomTwoXStage {
-    fn new(taps: usize, channels: usize) -> Self {
-        let inner = HeadroomTwoXStage::new(taps, channels);
-        debug_assert_eq!(inner.half_coefficients.len() % 2, 0);
-        let half_len = inner.half_coefficients.len() / 2;
-        let symmetric_half_coefficients = (0..half_len)
-            .map(|index| {
-                let mirror = inner.half_coefficients.len() - 1 - index;
-                0.5 * (inner.half_coefficients[index] + inner.half_coefficients[mirror])
-            })
-            .collect();
-        Self {
-            inner,
-            symmetric_half_coefficients,
-        }
-    }
-
-    #[inline]
-    fn group_delay_inputs(&self) -> i128 {
-        self.inner.group_delay_inputs
-    }
-
-    #[inline]
-    fn process_frame_symmetric(
-        &mut self,
-        frame: &[f64],
-        input_index: i128,
-        output: &mut [f64],
-    ) -> i128 {
-        let Self {
-            inner: stage,
-            symmetric_half_coefficients,
-        } = self;
-        debug_assert_eq!(frame.len(), stage.channels);
-        debug_assert_eq!(output.len(), stage.channels * 2);
-
-        for (channel, sample) in frame.iter().copied().enumerate() {
-            stage.delay[channel][stage.delay_index] = sample;
-            stage.delay[channel][stage.delay_index + stage.delay_frames] = sample;
-        }
-
-        let coefficient_len = stage.half_coefficients.len();
-        for channel in 0..stage.channels {
-            let delay = &stage.delay[channel];
-            let base = stage.delay_index;
-            output[channel] = delay[base + stage.delay_frames - stage.identity_index] + 0.0;
-
-            let mut value = 0.0;
-            for (index, coefficient) in symmetric_half_coefficients
-                .iter()
-                .copied()
-                .enumerate()
-            {
-                let mirror = coefficient_len - 1 - index;
-                let recent = delay[base + stage.delay_frames - index];
-                let old = delay[base + stage.delay_frames - mirror];
-                value += coefficient * (recent + old);
-            }
-            output[stage.channels + channel] = value;
-        }
-
-        stage.delay_index += 1;
-        if stage.delay_index == stage.delay_frames {
-            stage.delay_index = 0;
-        }
-
-        (input_index - stage.group_delay_inputs) * 2
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct HeadroomEngine {
     stage1: HeadroomHalfSampleStage,
@@ -1071,6 +833,7 @@ struct HeadroomEngine {
     pre_post_frames: i128,
 }
 
+#[cfg(test)]
 impl HeadroomEngine {
     fn new(channels: usize) -> Self {
         let stage1 = HeadroomHalfSampleStage::new(channels);
@@ -1174,1198 +937,95 @@ impl HeadroomEngine {
     }
 }
 
-/// Prefix executor for the opt-in 16x and 8x headroom modes.
-///
-/// It intentionally owns a separate execution path so the Headroom64x gold
-/// standard remains untouched. Stage one uses the frozen qualified filter with
-/// a fast-only accumulation schedule; later stages pair the mathematically
-/// symmetric Blackman half-phase taps. That reduces the 16x path to 272 FIR
-/// coefficient products per original frame/channel and the 8x path to 240,
-/// versus 576 for the reference path.
-#[derive(Debug, Clone)]
-struct FastHeadroomEngine {
-    factor: usize,
-    stage1: HeadroomHalfSampleStage,
-    stage2: FastHeadroomTwoXStage,
-    stage3: FastHeadroomTwoXStage,
-    stage4: Option<FastHeadroomTwoXStage>,
-    scratch1: Vec<f64>,
-    scratch2: Vec<f64>,
-    scratch3: Vec<f64>,
-    scratch4: Vec<f64>,
+#[cfg(test)]
+pub(crate) fn legacy_headroom64_direct_oracle_peak(
+    samples: &[f64],
     channels: usize,
-    pre_post_frames: i128,
-    calibration_linear: f64,
-}
+    edge_policy: EdgePolicy,
+) -> Result<f64, TruePeakError> {
+    if channels == 0 { return Err(TruePeakError::InvalidChannelCount); }
+    if samples.len() % channels != 0 {
+        return Err(TruePeakError::IncompleteFrame { samples: samples.len(), channels });
+    }
+    if let Some((sample_index, _)) = samples.iter().enumerate().find(|(_, sample)| !sample.is_finite()) {
+        return Err(TruePeakError::NonFiniteSample { sample_index });
+    }
+    let frames = samples.len() / channels;
+    if frames == 0 { return Err(TruePeakError::EmptyInput); }
 
-impl FastHeadroomEngine {
-    fn new(mode: TruePeakMode, channels: usize) -> Self {
-        debug_assert!(matches!(mode, TruePeakMode::Headroom16x | TruePeakMode::Headroom8x));
-        let stage1 = HeadroomHalfSampleStage::new(channels);
-        let stage2 = FastHeadroomTwoXStage::new(HEADROOM64_STAGE_2_TAPS, channels);
-        let stage3 = FastHeadroomTwoXStage::new(HEADROOM64_STAGE_3_TAPS, channels);
-        let (factor, stage4, calibration_linear) = match mode {
-            TruePeakMode::Headroom16x => (
-                16,
-                Some(FastHeadroomTwoXStage::new(HEADROOM64_STAGE_4_TAPS, channels)),
-                HEADROOM16_INTERPOLATION_CALIBRATION_LINEAR,
-            ),
-            TruePeakMode::Headroom8x => (8, None, HEADROOM8_INTERPOLATION_CALIBRATION_LINEAR),
-            _ => unreachable!("fast headroom engine requires a fast headroom mode"),
-        };
-
-        let mut delay_subframes = HeadroomHalfSampleStage::GROUP_DELAY_INPUTS * 2;
-        for group_delay in [stage2.group_delay_inputs(), stage3.group_delay_inputs()] {
-            delay_subframes = (delay_subframes + group_delay) * 2;
-        }
-        if let Some(stage) = stage4.as_ref() {
-            delay_subframes = (delay_subframes + stage.group_delay_inputs()) * 2;
-        }
-        let pre_post_frames = (delay_subframes + factor as i128 - 1) / factor as i128;
-        debug_assert_eq!(
-            (factor, delay_subframes, pre_post_frames),
-            if factor == 16 {
-                (16, 3_200, 200)
-            } else {
-                (8, 1_596, 200)
-            },
+    let mut engine = HeadroomEngine::new(channels);
+    let mut point_sink = vec![0.0; channels];
+    let mut reconstruction_peaks = vec![0.0; channels];
+    let first = samples[..channels].to_vec();
+    let pre_extension = match edge_policy {
+        EdgePolicy::RepeatEndpoints => first,
+        EdgePolicy::ZeroExtend => vec![0.0; channels],
+    };
+    for input_index in -engine.pre_post_frames..0 {
+        engine.process_frame(
+            &pre_extension,
+            input_index,
+            &mut point_sink,
+            Some(&mut reconstruction_peaks),
+            None,
         );
-
-        Self {
-            factor,
-            stage1,
-            stage2,
-            stage3,
-            stage4,
-            scratch1: vec![0.0; channels * 2],
-            scratch2: vec![0.0; channels * 2],
-            scratch3: vec![0.0; channels * 2],
-            scratch4: vec![0.0; channels * 2],
-            channels,
-            pre_post_frames,
-            calibration_linear,
-        }
     }
 
-    fn process_frame(
-        &mut self,
-        frame: &[f64],
-        input_index: i128,
-        channel_peaks: &mut [f64],
-        mut bridge: Option<&mut FastReconstructionBridge>,
-        upper_subframe: Option<i128>,
-    ) {
-        let base1 = self
-            .stage1
-            .process_frame_fast(frame, input_index, &mut self.scratch1);
-        for phase1 in 0..2 {
-            let frame1 = &self.scratch1[phase1 * self.channels..(phase1 + 1) * self.channels];
-            let base2 = self.stage2.process_frame_symmetric(
-                frame1,
-                base1 + phase1 as i128,
-                &mut self.scratch2,
-            );
-            for phase2 in 0..2 {
-                let frame2 = &self.scratch2[phase2 * self.channels..(phase2 + 1) * self.channels];
-                let base3 = self.stage3.process_frame_symmetric(
-                    frame2,
-                    base2 + phase2 as i128,
-                    &mut self.scratch3,
-                );
-                for phase3 in 0..2 {
-                    let frame3 =
-                        &self.scratch3[phase3 * self.channels..(phase3 + 1) * self.channels];
-                    let index3 = base3 + phase3 as i128;
-                    if self.factor == 8 {
-                        observe_fast_headroom_output(
-                            index3,
-                            frame3,
-                            self.calibration_linear,
-                            channel_peaks,
-                            bridge.as_deref_mut(),
-                            upper_subframe,
-                        );
-                        continue;
-                    }
-
-                    let stage4 = self.stage4.as_mut().expect("16x path has stage 4");
-                    let base4 = stage4.process_frame_symmetric(
-                        frame3,
-                        index3,
-                        &mut self.scratch4,
-                    );
-                    for phase4 in 0..2 {
-                        let output_index = base4 + phase4 as i128;
-                        let reconstructed = &self.scratch4
-                            [phase4 * self.channels..(phase4 + 1) * self.channels];
-                        observe_fast_headroom_output(
-                            output_index,
-                            reconstructed,
-                            self.calibration_linear,
-                            channel_peaks,
-                            bridge.as_deref_mut(),
-                            upper_subframe,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// FFT-accelerated executor for the qualified 16x headroom prefix.
-///
-/// Only the expensive 384-tap first-stage half phase changes execution
-/// strategy.  The integer phase, coefficients, later 2x stages, calibration,
-/// edge extension, and physical output grid are the same as `Headroom16x`.
-/// Overlap-save is bounded to one 2048-point complex work buffer plus 383
-/// history samples/channel, independent of programme length.
-#[derive(Clone)]
-struct FftHeadroom16Engine {
-    forward: Arc<dyn Fft<f64>>,
-    inverse: Arc<dyn Fft<f64>>,
-    filter_spectrum: Vec<Complex64>,
-    fft_buffer: Vec<Complex64>,
-    forward_scratch: Vec<Complex64>,
-    inverse_scratch: Vec<Complex64>,
-    history: Vec<Vec<f64>>,
-    pending: Vec<f64>,
-    pending_start_index: Option<i128>,
-    final_upper_subframe: Option<i128>,
-    half_output: Vec<f64>,
-    stage2: FastHeadroomTwoXStage,
-    stage3: FastHeadroomTwoXStage,
-    stage4: FastHeadroomTwoXStage,
-    scratch1: Vec<f64>,
-    scratch2: Vec<f64>,
-    scratch3: Vec<f64>,
-    scratch4: Vec<f64>,
-    channels: usize,
-    pre_post_frames: i128,
-}
-
-impl fmt::Debug for FftHeadroom16Engine {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FftHeadroom16Engine")
-            .field("channels", &self.channels)
-            .field("pending_frames", &(self.pending.len() / self.channels))
-            .field("pre_post_frames", &self.pre_post_frames)
-            .finish_non_exhaustive()
-    }
-}
-
-impl FftHeadroom16Engine {
-    fn new(channels: usize) -> Self {
-        debug_assert!(HEADROOM_STANDARD16X_FFT_SIZE
-            >= HEADROOM_STANDARD16X_BLOCK_FRAMES + HEADROOM64_HALF_DELAY_TAPS - 1);
-        let mut planner = FftPlanner::<f64>::new();
-        let forward = planner.plan_fft_forward(HEADROOM_STANDARD16X_FFT_SIZE);
-        let inverse = planner.plan_fft_inverse(HEADROOM_STANDARD16X_FFT_SIZE);
-
-        let mut filter_spectrum = vec![Complex64::new(0.0, 0.0); HEADROOM_STANDARD16X_FFT_SIZE];
-        for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            filter_spectrum[index].re = coefficient;
-            filter_spectrum[HEADROOM64_HALF_DELAY_TAPS - 1 - index].re = coefficient;
-        }
-        // `Fft::process()` may allocate scratch internally. Preallocate the
-        // exact planner-declared scratch once so the streaming hot path is
-        // allocation-free regardless of the selected SIMD/scalar executor.
-        let mut forward_scratch =
-            vec![Complex64::new(0.0, 0.0); forward.get_inplace_scratch_len()];
-        let inverse_scratch =
-            vec![Complex64::new(0.0, 0.0); inverse.get_inplace_scratch_len()];
-        forward.process_with_scratch(&mut filter_spectrum, &mut forward_scratch);
-
-        let stage2 = FastHeadroomTwoXStage::new(HEADROOM64_STAGE_2_TAPS, channels);
-        let stage3 = FastHeadroomTwoXStage::new(HEADROOM64_STAGE_3_TAPS, channels);
-        let stage4 = FastHeadroomTwoXStage::new(HEADROOM64_STAGE_4_TAPS, channels);
-        let mut delay_subframes = HeadroomHalfSampleStage::GROUP_DELAY_INPUTS * 2;
-        for group_delay in [
-            stage2.group_delay_inputs(),
-            stage3.group_delay_inputs(),
-            stage4.group_delay_inputs(),
-        ] {
-            delay_subframes = (delay_subframes + group_delay) * 2;
-        }
-        let pre_post_frames = (delay_subframes + 15) / 16;
-        debug_assert_eq!((delay_subframes, pre_post_frames), (3_200, 200));
-
-        Self {
-            forward,
-            inverse,
-            filter_spectrum,
-            fft_buffer: vec![Complex64::new(0.0, 0.0); HEADROOM_STANDARD16X_FFT_SIZE],
-            forward_scratch,
-            inverse_scratch,
-            history: vec![vec![0.0; HEADROOM64_HALF_DELAY_TAPS - 1]; channels],
-            pending: Vec::with_capacity(HEADROOM_STANDARD16X_BLOCK_FRAMES * channels),
-            pending_start_index: None,
-            final_upper_subframe: None,
-            half_output: vec![0.0; HEADROOM_STANDARD16X_BLOCK_FRAMES * channels],
-            stage2,
-            stage3,
-            stage4,
-            scratch1: vec![0.0; channels * 2],
-            scratch2: vec![0.0; channels * 2],
-            scratch3: vec![0.0; channels * 2],
-            scratch4: vec![0.0; channels * 2],
-            channels,
-            pre_post_frames,
-        }
+    for (index, frame) in samples.chunks_exact(channels).enumerate() {
+        engine.process_frame(
+            frame,
+            index as i128,
+            &mut point_sink,
+            Some(&mut reconstruction_peaks),
+            None,
+        );
     }
 
-    fn process_frame(
-        &mut self,
-        frame: &[f64],
-        input_index: i128,
-        channel_peaks: &mut [f64],
-        bridge: Option<&mut FastReconstructionBridge>,
-        upper_subframe: Option<i128>,
-    ) {
-        debug_assert_eq!(frame.len(), self.channels);
-        if let Some(upper) = upper_subframe {
-            self.final_upper_subframe = Some(upper);
-        }
-        let pending_frames = self.pending.len() / self.channels;
-        match self.pending_start_index {
-            None => self.pending_start_index = Some(input_index),
-            Some(start) => debug_assert_eq!(input_index, start + pending_frames as i128),
-        }
-        self.pending.extend_from_slice(frame);
-        if self.pending.len() == HEADROOM_STANDARD16X_BLOCK_FRAMES * self.channels {
-            self.process_pending(channel_peaks, bridge);
-        }
+    let last = samples[samples.len() - channels..].to_vec();
+    let post_extension = match edge_policy {
+        EdgePolicy::RepeatEndpoints => last,
+        EdgePolicy::ZeroExtend => vec![0.0; channels],
+    };
+    let upper_subframe = (frames as i128 - 1) * 64;
+    let stop = frames as i128 + engine.pre_post_frames;
+    for input_index in frames as i128..stop {
+        engine.process_frame(
+            &post_extension,
+            input_index,
+            &mut point_sink,
+            Some(&mut reconstruction_peaks),
+            Some(upper_subframe),
+        );
     }
 
-    fn flush(
-        &mut self,
-        channel_peaks: &mut [f64],
-        bridge: Option<&mut FastReconstructionBridge>,
-    ) {
-        if !self.pending.is_empty() {
-            self.process_pending(channel_peaks, bridge);
-        }
-    }
-
-    fn process_pending(
-        &mut self,
-        channel_peaks: &mut [f64],
-        mut bridge: Option<&mut FastReconstructionBridge>,
-    ) {
-        let count = self.pending.len() / self.channels;
-        if count == 0 {
-            return;
-        }
-        debug_assert!(count <= HEADROOM_STANDARD16X_BLOCK_FRAMES);
-        let start = self
-            .pending_start_index
-            .expect("non-empty FFT headroom block has a start index");
-        let overlap = HEADROOM64_HALF_DELAY_TAPS - 1;
-        let inverse_scale = 1.0 / HEADROOM_STANDARD16X_FFT_SIZE as f64;
-
-        // The FIR is real and identical for every channel, so two real
-        // channels can share one complex transform: channel A occupies the
-        // real component and channel B the imaginary component. Complex
-        // convolution by the real impulse response is linear, yielding the
-        // two independent real convolutions in the inverse transform's real
-        // and imaginary components. This halves FFT work for stereo and other
-        // even-channel material without changing the mathematical filter.
-        for channel_pair_start in (0..self.channels).step_by(2) {
-            let second_channel = (channel_pair_start + 1 < self.channels)
-                .then_some(channel_pair_start + 1);
-            self.fft_buffer.fill(Complex64::new(0.0, 0.0));
-            for history_index in 0..overlap {
-                self.fft_buffer[history_index].re =
-                    self.history[channel_pair_start][history_index];
-                if let Some(channel) = second_channel {
-                    self.fft_buffer[history_index].im = self.history[channel][history_index];
-                }
-            }
-            for frame_index in 0..count {
-                self.fft_buffer[overlap + frame_index].re =
-                    self.pending[frame_index * self.channels + channel_pair_start];
-                if let Some(channel) = second_channel {
-                    self.fft_buffer[overlap + frame_index].im =
-                        self.pending[frame_index * self.channels + channel];
-                }
-            }
-            self.forward
-                .process_with_scratch(&mut self.fft_buffer, &mut self.forward_scratch);
-            for (bin, filter) in self
-                .fft_buffer
-                .iter_mut()
-                .zip(self.filter_spectrum.iter().copied())
-            {
-                *bin *= filter;
-            }
-            self.inverse
-                .process_with_scratch(&mut self.fft_buffer, &mut self.inverse_scratch);
-            for frame_index in 0..count {
-                let output = self.fft_buffer[overlap + frame_index];
-                self.half_output[frame_index * self.channels + channel_pair_start] =
-                    output.re * inverse_scale;
-                if let Some(channel) = second_channel {
-                    self.half_output[frame_index * self.channels + channel] =
-                        output.im * inverse_scale;
-                }
-            }
-        }
-
-        for frame_index in 0..count {
-            for channel in 0..self.channels {
-                self.scratch1[channel] = if frame_index >= HEADROOM64_HALF_DELAY_TAPS / 2 {
-                    self.pending[(frame_index - HEADROOM64_HALF_DELAY_TAPS / 2) * self.channels
-                        + channel]
-                } else {
-                    let history_index = overlap + frame_index - HEADROOM64_HALF_DELAY_TAPS / 2;
-                    self.history[channel][history_index]
-                };
-                self.scratch1[self.channels + channel] =
-                    self.half_output[frame_index * self.channels + channel];
-            }
-            let base1 = (start + frame_index as i128 - HeadroomHalfSampleStage::GROUP_DELAY_INPUTS)
-                * 2;
-            self.process_later_stages(
-                base1,
-                channel_peaks,
-                bridge.as_deref_mut(),
-                self.final_upper_subframe,
-            );
-        }
-
-        for channel in 0..self.channels {
-            if count >= overlap {
-                for history_index in 0..overlap {
-                    let source_frame = count - overlap + history_index;
-                    self.history[channel][history_index] =
-                        self.pending[source_frame * self.channels + channel];
-                }
-            } else {
-                self.history[channel].copy_within(count..overlap, 0);
-                for frame_index in 0..count {
-                    self.history[channel][overlap - count + frame_index] =
-                        self.pending[frame_index * self.channels + channel];
-                }
-            }
-        }
-        self.pending.clear();
-        self.pending_start_index = None;
-    }
-
-    fn process_later_stages(
-        &mut self,
-        base1: i128,
-        channel_peaks: &mut [f64],
-        mut bridge: Option<&mut FastReconstructionBridge>,
-        upper_subframe: Option<i128>,
-    ) {
-        for phase1 in 0..2 {
-            let frame1 = &self.scratch1[phase1 * self.channels..(phase1 + 1) * self.channels];
-            let base2 = self.stage2.process_frame_symmetric(
-                frame1,
-                base1 + phase1 as i128,
-                &mut self.scratch2,
-            );
-            for phase2 in 0..2 {
-                let frame2 = &self.scratch2[phase2 * self.channels..(phase2 + 1) * self.channels];
-                let base3 = self.stage3.process_frame_symmetric(
-                    frame2,
-                    base2 + phase2 as i128,
-                    &mut self.scratch3,
-                );
-                for phase3 in 0..2 {
-                    let frame3 =
-                        &self.scratch3[phase3 * self.channels..(phase3 + 1) * self.channels];
-                    let index3 = base3 + phase3 as i128;
-                    let base4 = self.stage4.process_frame_symmetric(
-                        frame3,
-                        index3,
-                        &mut self.scratch4,
-                    );
-                    for phase4 in 0..2 {
-                        let output_index = base4 + phase4 as i128;
-                        let reconstructed = &self.scratch4
-                            [phase4 * self.channels..(phase4 + 1) * self.channels];
-                        observe_fast_headroom_output(
-                            output_index,
-                            reconstructed,
-                            HEADROOM16_INTERPOLATION_CALIBRATION_LINEAR,
-                            channel_peaks,
-                            bridge.as_deref_mut(),
-                            upper_subframe,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    Ok(reconstruction_peaks.into_iter().fold(0.0, max_nonnegative_by_bits))
 }
 
 #[inline]
-fn observe_fast_headroom_output(
-    output_index: i128,
-    reconstructed: &[f64],
-    calibration_linear: f64,
-    channel_peaks: &mut [f64],
-    bridge: Option<&mut FastReconstructionBridge>,
-    upper_subframe: Option<i128>,
-) {
-    if let Some(bridge) = bridge {
-        // Ceiling mode already tracks every uncalibrated prefix knot in the
-        // bridge. Derive the calibrated point maximum once at finalize rather
-        // than multiplying and comparing the same hot-loop output twice.
-        bridge.observe(output_index, reconstructed, upper_subframe);
-        return;
-    }
-    if output_index < 0
-        || upper_subframe
-            .map(|upper| output_index > upper)
-            .unwrap_or(false)
-    {
-        return;
-    }
-    update_channel_peaks_scaled(channel_peaks, reconstructed, calibration_linear);
-}
-
-#[derive(Debug, Clone)]
-enum MeterEngine {
-    Reporting(ReportingEngine),
-    Headroom(HeadroomEngine),
-    FastHeadroom(FastHeadroomEngine),
-    FftHeadroom16(FftHeadroom16Engine),
-}
-
-impl MeterEngine {
-    fn pre_post_frames(&self) -> i128 {
-        match self {
-            Self::Reporting(engine) => engine.pre_post_frames(),
-            Self::Headroom(engine) => engine.pre_post_frames,
-            Self::FastHeadroom(engine) => engine.pre_post_frames,
-            Self::FftHeadroom16(engine) => engine.pre_post_frames,
-        }
-    }
-
-    fn process_frame(
-        &mut self,
-        frame: &[f64],
-        input_index: i128,
-        channel_peaks: &mut [f64],
-        reconstruction_peaks: Option<&mut [f64]>,
-        fast_reconstruction_bridge: Option<&mut FastReconstructionBridge>,
-        upper_subframe: Option<i128>,
-    ) {
-        match self {
-            Self::Reporting(engine) => {
-                engine.process_frame(frame, input_index, channel_peaks, upper_subframe)
-            }
-            Self::Headroom(engine) => engine.process_frame(
-                frame,
-                input_index,
-                channel_peaks,
-                reconstruction_peaks,
-                upper_subframe,
-            ),
-            Self::FastHeadroom(engine) => engine.process_frame(
-                frame,
-                input_index,
-                channel_peaks,
-                fast_reconstruction_bridge,
-                upper_subframe,
-            ),
-            Self::FftHeadroom16(engine) => engine.process_frame(
-                frame,
-                input_index,
-                channel_peaks,
-                fast_reconstruction_bridge,
-                upper_subframe,
-            ),
-        }
-    }
-
-    fn flush(
-        &mut self,
-        channel_peaks: &mut [f64],
-        fast_reconstruction_bridge: Option<&mut FastReconstructionBridge>,
-    ) {
-        if let Self::FftHeadroom16(engine) = self {
-            engine.flush(channel_peaks, fast_reconstruction_bridge);
-        }
-    }
-}
-
-/// Bounded-state incremental true-peak meter.
-#[derive(Debug, Clone)]
-pub struct TruePeakMeter {
-    config: TruePeakConfig,
-    factor: usize,
-    engine: MeterEngine,
-    channel_peaks: Vec<f64>,
-    reconstruction_peaks: Option<Vec<f64>>,
-    fast_reconstruction_bridge: Option<FastReconstructionBridge>,
-    input_sample_peak: f64,
-    last_frame: Vec<f64>,
-    started: bool,
-    next_input_index: i128,
-    frames: u64,
-}
-
-impl TruePeakMeter {
-    /// Create a new meter with bounded memory independent of stream length.
-    pub fn new(config: TruePeakConfig) -> Result<Self, TruePeakError> {
-        if config.sample_rate_hz == 0 {
-            return Err(TruePeakError::InvalidSampleRate);
-        }
-        if config.channels == 0 {
-            return Err(TruePeakError::InvalidChannelCount);
-        }
-
-        let factor = config
-            .mode
-            .oversample_factor_for_sample_rate(config.sample_rate_hz);
-        let engine = match config.mode {
-            TruePeakMode::Reporting4x => MeterEngine::Reporting(ReportingEngine::new(
-                config.sample_rate_hz,
-                config.channels,
-            )),
-            TruePeakMode::Headroom64x => {
-                MeterEngine::Headroom(HeadroomEngine::new(config.channels))
-            }
-            TruePeakMode::HeadroomStandard16x => {
-                MeterEngine::FftHeadroom16(FftHeadroom16Engine::new(config.channels))
-            }
-            TruePeakMode::Headroom16x | TruePeakMode::Headroom8x => {
-                MeterEngine::FastHeadroom(FastHeadroomEngine::new(config.mode, config.channels))
-            }
-        };
-
-        Ok(Self {
-            config,
-            factor,
-            engine,
-            channel_peaks: vec![0.0; config.channels],
-            reconstruction_peaks: None,
-            fast_reconstruction_bridge: None,
-            input_sample_peak: 0.0,
-            last_frame: vec![0.0; config.channels],
-            started: false,
-            next_input_index: 0,
-            frames: 0,
-        })
-    }
-
-    fn new_with_headroom_reconstruction(config: TruePeakConfig) -> Result<Self, TruePeakError> {
-        debug_assert_eq!(config.mode, TruePeakMode::Headroom64x);
-        let channels = config.channels;
-        let mut meter = Self::new(config)?;
-        meter.reconstruction_peaks = Some(vec![0.0; channels]);
-        Ok(meter)
-    }
-
-    fn new_with_fast_reconstruction(config: TruePeakConfig) -> Result<Self, TruePeakError> {
-        debug_assert!(matches!(
-            config.mode,
-            TruePeakMode::HeadroomStandard16x | TruePeakMode::Headroom16x | TruePeakMode::Headroom8x
-        ));
-        let channels = config.channels;
-        let mode = config.mode;
-        let mut meter = Self::new(config)?;
-        meter.fast_reconstruction_bridge = Some(FastReconstructionBridge::new(mode, channels));
-        Ok(meter)
-    }
-
-    /// Feed complete interleaved decoded frames.
-    ///
-    /// Block boundaries have no effect on the result. The call validates the
-    /// complete block before mutating meter state, so a rejected block is not
-    /// partially consumed.
-    pub fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {
-        if samples.len() % self.config.channels != 0 {
-            return Err(TruePeakError::IncompleteFrame {
-                samples: samples.len(),
-                channels: self.config.channels,
-            });
-        }
-        if let Some((sample_index, _)) = samples
-            .iter()
-            .enumerate()
-            .find(|(_, sample)| !sample.is_finite())
-        {
-            return Err(TruePeakError::NonFiniteSample { sample_index });
-        }
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        if !self.started {
-            let first = samples[..self.config.channels].to_vec();
-            let extension = match self.config.edge_policy {
-                EdgePolicy::RepeatEndpoints => first,
-                EdgePolicy::ZeroExtend => vec![0.0; self.config.channels],
-            };
-            let pre_frames = self.engine.pre_post_frames();
-            for input_index in -pre_frames..0 {
-                self.engine.process_frame(
-                    &extension,
-                    input_index,
-                    &mut self.channel_peaks,
-                    self.reconstruction_peaks.as_deref_mut(),
-                    self.fast_reconstruction_bridge.as_mut(),
-                    None,
-                );
-            }
-            self.started = true;
-        }
-
-        for frame in samples.chunks_exact(self.config.channels) {
-            let input_index = self.next_input_index;
-            // Preserve decoded sample peak as an independent authority.  This
-            // matches libebur128's TRUE_PEAK contract and also guarantees that
-            // Headroom64x calibration can never hide an above-unity input.
-            update_channel_peaks(&mut self.channel_peaks, frame);
-            if let Some(peaks) = self.reconstruction_peaks.as_deref_mut() {
-                update_channel_peaks(peaks, frame);
-            }
-            self.input_sample_peak = frame
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .fold(self.input_sample_peak, f64::max);
-            self.engine.process_frame(
-                frame,
-                input_index,
-                &mut self.channel_peaks,
-                self.reconstruction_peaks.as_deref_mut(),
-                self.fast_reconstruction_bridge.as_mut(),
-                None,
-            );
-            self.last_frame.copy_from_slice(frame);
-            self.next_input_index += 1;
-            self.frames = self
-                .frames
-                .checked_add(1)
-                .ok_or(TruePeakError::InputTooLong)?;
-        }
-        Ok(())
-    }
-
-    /// Flush the interpolation filter according to the selected edge policy.
-    pub fn finalize(self) -> Result<TruePeakResult, TruePeakError> {
-        self.finalize_internal().map(|(result, _, _, _)| result)
-    }
-
-    fn finalize_internal(
-        mut self,
-    ) -> Result<
-        (
-            TruePeakResult,
-            Option<Vec<f64>>,
-            Option<FastReconstructionBridge>,
-            f64,
-        ),
-        TruePeakError,
-    > {
-        if self.frames == 0 {
-            return Err(TruePeakError::EmptyInput);
-        }
-
-        let upper_subframe = i128::from(self.frames - 1) * self.factor as i128;
-        let extension = match self.config.edge_policy {
-            EdgePolicy::RepeatEndpoints => self.last_frame.clone(),
-            EdgePolicy::ZeroExtend => vec![0.0; self.config.channels],
-        };
-        let stop = self.next_input_index + self.engine.pre_post_frames();
-        for input_index in self.next_input_index..stop {
-            self.engine.process_frame(
-                &extension,
-                input_index,
-                &mut self.channel_peaks,
-                self.reconstruction_peaks.as_deref_mut(),
-                self.fast_reconstruction_bridge.as_mut(),
-                Some(upper_subframe),
-            );
-        }
-        self.engine.flush(
-            &mut self.channel_peaks,
-            self.fast_reconstruction_bridge.as_mut(),
-        );
-
-        if let Some(reconstruction_peaks) = self.reconstruction_peaks.as_ref() {
-            for (point_peak, reconstruction_peak) in self
-                .channel_peaks
-                .iter_mut()
-                .zip(reconstruction_peaks.iter().copied())
-            {
-                let calibrated = reconstruction_peak * HEADROOM64_INTERPOLATION_CALIBRATION_LINEAR;
-                if calibrated > *point_peak {
-                    *point_peak = calibrated;
-                }
-            }
-        }
-        if let Some(bridge) = self.fast_reconstruction_bridge.as_ref() {
-            let calibration = match self.config.mode {
-                TruePeakMode::HeadroomStandard16x => HEADROOM16_INTERPOLATION_CALIBRATION_LINEAR,
-                TruePeakMode::Headroom16x => HEADROOM16_INTERPOLATION_CALIBRATION_LINEAR,
-                TruePeakMode::Headroom8x => HEADROOM8_INTERPOLATION_CALIBRATION_LINEAR,
-                _ => unreachable!("fast bridge requires a fast headroom mode"),
-            };
-            for (point_peak, reconstruction_peak) in self
-                .channel_peaks
-                .iter_mut()
-                .zip(bridge.point_channel_peaks().iter().copied())
-            {
-                let calibrated = reconstruction_peak * calibration;
-                if calibrated > *point_peak {
-                    *point_peak = calibrated;
-                }
-            }
-        }
-
-        let linear = self.channel_peaks.iter().copied().fold(0.0, f64::max);
-        let overall = if linear == 0.0 {
-            PeakLevel::Silence
-        } else {
-            PeakLevel::Finite {
-                linear,
-                dbtp: 20.0 * linear.log10(),
-            }
-        };
-        Ok((
-            TruePeakResult {
-                overall,
-                channel_linear_peaks: self.channel_peaks,
-                frames: self.frames,
-            },
-            self.reconstruction_peaks,
-            self.fast_reconstruction_bridge,
-            self.input_sample_peak,
-        ))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FastReconstructionBridge {
-    channel_peaks: Vec<f64>,
-    cubic_envelope_peaks: Vec<f64>,
-    window: Vec<f64>,
-    window_len: usize,
-    last_index: Option<i128>,
-    final_upper: Option<i128>,
-    highest_index: i128,
-    channels: usize,
-    bridge_error_upper: f64,
-    execution_error_per_input_peak_upper: f64,
-}
-
-impl FastReconstructionBridge {
-    fn new(mode: TruePeakMode, channels: usize) -> Self {
-        let bridge_error_upper = match mode {
-            TruePeakMode::HeadroomStandard16x | TruePeakMode::Headroom16x => {
-                HEADROOM16X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER
-            }
-            TruePeakMode::Headroom8x => HEADROOM8X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER,
-            _ => unreachable!("fast reconstruction bridge requires a fast headroom mode"),
-        };
-        let execution_error_per_input_peak_upper = match mode {
-            TruePeakMode::HeadroomStandard16x => {
-                HEADROOM_STANDARD16X_EXECUTION_ERROR_PER_INPUT_PEAK_UPPER
-            }
-            TruePeakMode::Headroom16x | TruePeakMode::Headroom8x => 0.0,
-            _ => unreachable!("fast reconstruction bridge requires a fast headroom mode"),
-        };
-        Self {
-            channel_peaks: vec![0.0; channels],
-            cubic_envelope_peaks: vec![0.0; channels],
-            window: vec![0.0; channels * 4],
-            window_len: 0,
-            last_index: None,
-            final_upper: None,
-            highest_index: i128::MIN,
-            channels,
-            bridge_error_upper,
-            execution_error_per_input_peak_upper,
-        }
-    }
-
-    fn observe(&mut self, output_index: i128, frame: &[f64], upper_subframe: Option<i128>) {
-        if let Some(upper) = upper_subframe {
-            self.final_upper = Some(upper);
-            if output_index > upper + 1 {
-                return;
-            }
-        }
-        if output_index < -1 {
-            return;
-        }
-        if let Some(previous) = self.last_index {
-            debug_assert_eq!(output_index, previous + 1);
-        }
-        self.last_index = Some(output_index);
-
-        if output_index >= 0
-            && upper_subframe
-                .map(|upper| output_index <= upper)
-                .unwrap_or(true)
-        {
-            update_channel_peaks_fail_closed(&mut self.channel_peaks, frame);
-        }
-        self.highest_index = self.highest_index.max(output_index);
-
-        if self.window_len < 4 {
-            let start = self.window_len * self.channels;
-            self.window[start..start + self.channels].copy_from_slice(frame);
-            self.window_len += 1;
-        } else {
-            self.window
-                .copy_within(self.channels..4 * self.channels, 0);
-            self.window[3 * self.channels..4 * self.channels].copy_from_slice(frame);
-        }
-        if self.window_len < 4 {
-            return;
-        }
-
-        // With window indices [k-1, k, k+1, k+2], this evaluates the interval
-        // k..k+1. A cubic polynomial expressed in Bernstein form lies inside
-        // the convex hull of its four controls, so the largest absolute
-        // control is a rigorous continuous-interval bound regardless of whether
-        // the coarse prefix grid is 16x or 8x.
-        let interval_index = output_index - 2;
-        if interval_index < 0
-            || upper_subframe
-                .map(|upper| interval_index >= upper)
-                .unwrap_or(false)
-        {
-            return;
-        }
-        for channel in 0..self.channels {
-            let ym1 = self.window[channel];
-            let y0 = self.window[self.channels + channel];
-            let y1 = self.window[2 * self.channels + channel];
-            let y2 = self.window[3 * self.channels + channel];
-
-            // The endpoint Bernstein controls b0=y0 and b3=y1 are already
-            // covered by channel_peaks. Compute only the two interior controls.
-            // Rewriting through adjacent first differences needs two floating
-            // multiplications per coarse interval/channel.
-            let d0 = y0 - ym1;
-            let d1 = y1 - y0;
-            let d2 = y2 - y1;
-            let twice_d0 = d0 + d0;
-            let twice_d1 = d1 + d1;
-            let five_d1 = twice_d1 + twice_d1 + d1;
-            let twice_d2 = d2 + d2;
-            let b1 = y0 + (twice_d0 + five_d1 - d2) * (1.0 / 18.0);
-            let b2 = y1 + (d0 - five_d1 - twice_d2) * (1.0 / 18.0);
-            let bound = b1.abs().max(b2.abs());
-            if !bound.is_finite() {
-                self.cubic_envelope_peaks[channel] = f64::INFINITY;
-            } else if bound > self.cubic_envelope_peaks[channel] {
-                self.cubic_envelope_peaks[channel] = bound;
-            }
-        }
-    }
-
-    fn point_channel_peaks(&self) -> &[f64] {
-        &self.channel_peaks
-    }
-
-    fn into_reconstruction_upper(self, input_sample_peak: f64) -> Vec<f64> {
-        let complete = self
-            .final_upper
-            .is_some_and(|upper| self.highest_index >= upper + 1);
-        let mut peaks = self
-            .channel_peaks
-            .into_iter()
-            .zip(self.cubic_envelope_peaks)
-            .map(|(coarse, cubic)| coarse.max(cubic))
-            .collect::<Vec<_>>();
-        if !complete {
-            // A future filter-delay edit that fails to supply the bridge's
-            // required terminal samples must fail closed rather than return an
-            // under-bound. Production validation rejects non-finite authority.
-            peaks.fill(f64::INFINITY);
-            return peaks;
-        }
-        if input_sample_peak == 0.0 {
-            return peaks;
-        }
-        let allowance = input_sample_peak
-            * (self.bridge_error_upper
-                + self.execution_error_per_input_peak_upper
-                + HEADROOM64X_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER
-                + HEADROOM_FAST_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER);
-        for peak in &mut peaks {
-            *peak = next_up_nonnegative((*peak).max(input_sample_peak) + allowance);
-        }
-        peaks
-    }
-}
-
-/// Result of the finite Headroom64 ceiling reconstruction.
-///
-/// The point estimate may come from any headroom scan rung, but the ceiling
-/// authority always governs the same full finite Headroom64 reconstruction.
-/// It is intentionally distinct from the band-qualified point authorities.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HeadroomCeilingResult {
-    /// Calibrated point estimate from the selected headroom scan rung.
-    pub point_estimate: TruePeakResult,
-    /// Conservative peak of Tonepoet's declared finite reconstruction model.
-    pub reconstruction_upper: PeakLevel,
-    /// Conservative per-channel reconstruction peaks in input channel order.
-    pub reconstruction_channel_linear_peaks: Vec<f64>,
-    /// Adaptive Reference-search diagnostics, present only for the accelerated
-    /// Reference scanner. Safety never depends on the preferred width being
-    /// reached: `reconstruction_upper` remains authoritative when the fixed
-    /// refinement budget leaves a wider interval.
-    pub reference_scan: Option<HeadroomReferenceScanDiagnostics>,
-}
-
-/// Certificate and work counters from the accelerated Reference scanner.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HeadroomReferenceScanDiagnostics {
-    /// Certified lower bound on the uncalibrated finite 64x reconstruction.
-    pub lower_linear: f64,
-    /// Width of the final `[lower, upper]` interval in dB. Silence has no
-    /// meaningful ratio and therefore reports `None`.
-    pub interval_width_db: Option<f64>,
-    /// True when every unresolved screen upper is already no larger than the
-    /// certified lower bound, so selective evaluation found the finite maximum
-    /// to the evaluator's explicit numerical enclosure.
-    pub reference_search_complete: bool,
-    /// Intervals whose conservative screen initially exceeded the preferred
-    /// 0.01 dB threshold and were considered for refinement.
-    pub candidate_intervals: u64,
-    /// Candidate intervals evaluated with the compact exact Reference tail.
-    pub refined_intervals: u64,
-    /// Canonical tiles where the deterministic refinement cap was reached
-    /// while at least one above-threshold candidate remained.
-    pub budget_exhausted_tiles: u64,
-}
-
-#[derive(Debug, Clone)]
-enum HeadroomCeilingEngine {
-    Existing(TruePeakMeter),
-    AcceleratedReference(reference_fast::ReferenceFastCeilingMeter),
-}
-
-/// Streaming evaluator for Tonepoet's hard-ceiling waveform contract.
-///
-/// The governed signal is the final-rate interleaved Float64 PCM stream fed to
-/// this meter. Each channel is extended outside the finite stream using the
-/// configured Headroom64 edge policy. `Reference` evaluates the full six-stage
-/// 2x FIR cascade directly. The fast scan rungs evaluate a qualified prefix and
-/// add a conservative interpolation/difference enclosure that still bounds the
-/// same uncalibrated full-64x reconstruction. Over the nominal finite interval
-/// from the first decoded
-/// frame through the last, the continuous waveform is defined as straight-line
-/// interpolation between adjacent 64x reconstruction knots. The absolute value
-/// of a linear segment reaches its maximum at an endpoint, so the real-valued
-/// continuous peak under this convention is bounded by the maximum knot plus
-/// the explicit binary64 evaluation allowance. Channels are independent and
-/// the reported ceiling peak is their maximum.
-///
-/// This deliberately does not claim to bound an arbitrary ideal DAC, an
-/// unspecified sinc reconstruction, or decoded output of a lossy codec. It is a
-/// finite, auditable reconstruction convention that requires no fabricated
-/// <=0.495*Fs spectral-support assertion.
-#[derive(Debug, Clone)]
-pub struct HeadroomCeilingMeter {
-    engine: HeadroomCeilingEngine,
-}
-
-impl HeadroomCeilingMeter {
-    /// Create a bounded-state ceiling evaluator using the default scan rung.
-    ///
-    /// The default is [`HeadroomScanMode::Standard`]. Call
-    /// [`Self::new_with_scan_mode`] with `Reference` for the full 64x path.
-    pub fn new(
-        sample_rate_hz: u32,
-        channels: usize,
-        edge_policy: EdgePolicy,
-    ) -> Result<Self, TruePeakError> {
-        Self::new_with_scan_mode(
-            sample_rate_hz,
-            channels,
-            edge_policy,
-            HeadroomScanMode::default(),
-        )
-    }
-
-    /// Create a ceiling evaluator using one rung of the headroom scan ladder.
-    ///
-    /// `Reference` evaluates the full 64x cascade. The bounded fast modes scan
-    /// a qualified prefix for their point estimate and add a conservative
-    /// interpolation/difference enclosure that still bounds the same full
-    /// finite 64x reconstruction.
-    pub fn new_with_scan_mode(
-        sample_rate_hz: u32,
-        channels: usize,
-        edge_policy: EdgePolicy,
-        scan_mode: HeadroomScanMode,
-    ) -> Result<Self, TruePeakError> {
-        if scan_mode == HeadroomScanMode::Reference {
-            let config = TruePeakConfig::new(sample_rate_hz, channels)
-                .with_mode(TruePeakMode::Headroom64x)
-                .with_edge_policy(edge_policy);
-            return Ok(Self {
-                engine: HeadroomCeilingEngine::Existing(
-                    TruePeakMeter::new_with_headroom_reconstruction(config)?,
-                ),
-            });
-        }
-        let config = TruePeakConfig::new(sample_rate_hz, channels)
-            .with_mode(scan_mode.point_mode())
-            .with_edge_policy(edge_policy);
-        Ok(Self {
-            engine: HeadroomCeilingEngine::Existing(
-                TruePeakMeter::new_with_fast_reconstruction(config)?,
-            ),
-        })
-    }
-
-    /// Create the budgeted accelerated Reference scanner used by the PCM
-    /// fastest-path option.
-    ///
-    /// Unlike the historical `Fast`/`Fastest` point-estimator rungs, this
-    /// scanner keeps the same finite uncalibrated 64x Reference reconstruction
-    /// as the hard-ceiling authority. It computes a Reference-quality 4x
-    /// prefix everywhere, screens every remaining cell conservatively, and
-    /// evaluates selected missing phases with the exact composed Reference
-    /// tail. The deterministic work cap can widen the returned certificate but
-    /// never weakens `reconstruction_upper`.
-    pub fn new_accelerated_reference(
-        sample_rate_hz: u32,
-        channels: usize,
-        edge_policy: EdgePolicy,
-    ) -> Result<Self, TruePeakError> {
-        Ok(Self {
-            engine: HeadroomCeilingEngine::AcceleratedReference(
-                reference_fast::ReferenceFastCeilingMeter::new(
-                    sample_rate_hz,
-                    channels,
-                    edge_policy,
-                )?,
-            ),
-        })
-    }
-
-    /// Feed complete interleaved final-rate Float64 frames.
-    pub fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {
-        match &mut self.engine {
-            HeadroomCeilingEngine::Existing(meter) => meter.push_interleaved(samples),
-            HeadroomCeilingEngine::AcceleratedReference(meter) => meter.push_interleaved(samples),
-        }
-    }
-
-    /// Finalize the selected-rung point estimate and the full-64x ceiling authority.
-    pub fn finalize(self) -> Result<HeadroomCeilingResult, TruePeakError> {
-        let meter = match self.engine {
-            HeadroomCeilingEngine::AcceleratedReference(meter) => {
-                let result = meter.finalize()?;
-                return Ok(HeadroomCeilingResult {
-                    point_estimate: result.point_estimate,
-                    reconstruction_upper: result.reconstruction_upper,
-                    reconstruction_channel_linear_peaks: result.reconstruction_channel_linear_peaks,
-                    reference_scan: Some(HeadroomReferenceScanDiagnostics {
-                        lower_linear: result.lower_linear,
-                        interval_width_db: result.interval_width_db,
-                        reference_search_complete: result.reference_search_complete,
-                        candidate_intervals: result.stats.candidate_intervals,
-                        refined_intervals: result.stats.refined_intervals,
-                        budget_exhausted_tiles: result.stats.budget_exhausted_tiles,
-                    }),
-                });
-            }
-            HeadroomCeilingEngine::Existing(meter) => meter,
-        };
-        let is_reference = meter.config.mode == TruePeakMode::Headroom64x;
-        let (point_estimate, reconstruction, fast_bridge, input_sample_peak) =
-            meter.finalize_internal()?;
-        let mut reconstruction_channel_linear_peaks = match (reconstruction, fast_bridge) {
-            (Some(peaks), None) => peaks,
-            (None, Some(bridge)) => bridge.into_reconstruction_upper(input_sample_peak),
-            _ => unreachable!("ceiling meter enables exactly one reconstruction authority"),
-        };
-        if reconstruction_channel_linear_peaks
-            .iter()
-            .all(|peak| peak.is_finite())
-        {
-            if is_reference {
-                let numerical_allowance = input_sample_peak
-                    * HEADROOM64X_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER;
-                if input_sample_peak > 0.0 {
-                    for peak in &mut reconstruction_channel_linear_peaks {
-                        *peak = next_up_nonnegative(*peak + numerical_allowance);
-                    }
-                }
-            }
-        }
-        let linear = reconstruction_channel_linear_peaks
-            .iter()
-            .copied()
-            .fold(0.0, f64::max);
-        let reconstruction_upper = if linear == 0.0 {
-            PeakLevel::Silence
-        } else {
-            PeakLevel::Finite {
-                linear,
-                dbtp: 20.0 * linear.log10(),
-            }
-        };
-        Ok(HeadroomCeilingResult {
-            point_estimate,
-            reconstruction_upper,
-            reconstruction_channel_linear_peaks,
-            reference_scan: None,
-        })
-    }
-}
-
-fn next_up_nonnegative(value: f64) -> f64 {
-    debug_assert!(value >= 0.0 && !value.is_nan());
-    if value == f64::INFINITY {
-        return value;
-    }
-    if value == 0.0 {
-        return f64::from_bits(1);
-    }
-    f64::from_bits(value.to_bits() + 1)
+fn max_nonnegative_by_bits(left: f64, right: f64) -> f64 {
+    let left_bits = f64_magnitude_bits_for_db(left);
+    let right_bits = f64_magnitude_bits_for_db(right);
+    f64::from_bits(left_bits.max(right_bits))
 }
 
 fn update_channel_peaks(channel_peaks: &mut [f64], frame: &[f64]) {
     for (peak, sample) in channel_peaks.iter_mut().zip(frame.iter().copied()) {
-        let magnitude = sample.abs();
-        if magnitude > *peak {
-            *peak = magnitude;
+        let magnitude_bits = f64_magnitude_bits_for_db(sample);
+        if magnitude_bits > f64_magnitude_bits_for_db(*peak) {
+            *peak = f64::from_bits(magnitude_bits);
         }
     }
 }
 
-/// Peak update for proof-carrying fast reconstruction state.
-///
-/// Ordinary meter paths preserve their historical IEEE-754 behavior. The fast
-/// ceiling bridge is newer authority code, so an arithmetic overflow/NaN must
-/// conservatively poison the bound instead of being skipped by comparisons.
-fn update_channel_peaks_fail_closed(channel_peaks: &mut [f64], frame: &[f64]) {
-    for (peak, sample) in channel_peaks.iter_mut().zip(frame.iter().copied()) {
-        let magnitude = sample.abs();
-        if !magnitude.is_finite() {
-            *peak = f64::INFINITY;
-        } else if magnitude > *peak {
-            *peak = magnitude;
-        }
-    }
-}
-
+/// Scaled variant of [`update_channel_peaks`], used by the calibrated point
+/// path. The scale is applied before the magnitude is taken, and the
+/// comparison uses the same bit-level magnitude as the unscaled helper so a
+/// subnormal product cannot be flushed to zero by a DAZ-sensitive compare.
 fn update_channel_peaks_scaled(channel_peaks: &mut [f64], frame: &[f64], scale: f64) {
     for (peak, sample) in channel_peaks.iter_mut().zip(frame.iter().copied()) {
-        let magnitude = (sample * scale).abs();
-        if magnitude > *peak {
-            *peak = magnitude;
+        let magnitude_bits = f64_magnitude_bits_for_db(sample * scale);
+        if magnitude_bits > f64_magnitude_bits_for_db(*peak) {
+            *peak = f64::from_bits(magnitude_bits);
         }
     }
 }
@@ -2423,672 +1083,42 @@ fn build_polyphase_filters(
 }
 
 #[cfg(test)]
-mod coefficient_integrity_tests {
+mod public_surface_tests {
     use super::*;
 
-    const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
-    const EXPECTED_COEFFICIENT_COUNT: usize = 192;
-    const EXPECTED_COEFFICIENT_CHECKSUM: u64 = 0xdca3_0520_f06a_0210;
-
-    fn mix_u64(mut hash: u64, value: u64) -> u64 {
-        for byte in value.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(FNV1A64_PRIME);
-        }
-        hash
+    #[test]
+    fn tier_surface_is_exactly_hq_reference_standard_fast() {
+        let tiers = [PeakTier::Reference, PeakTier::Standard, PeakTier::Fast];
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(PeakTier::Reference.interval_objective_db(), Some(REFERENCE_INTERVAL_OBJECTIVE_DB));
+        assert_eq!(PeakTier::Standard.interval_objective_db(), Some(STANDARD_INTERVAL_OBJECTIVE_DB));
+        assert_eq!(PeakTier::Fast.interval_objective_db(), None);
     }
 
     #[test]
-    fn headroom64_coefficients_match_frozen_checksum() {
-        assert_eq!(
-            HEADROOM64_HALF_DELAY_COEFFICIENTS.len(),
-            EXPECTED_COEFFICIENT_COUNT,
-        );
-
-        let mut hash = FNV1A64_OFFSET_BASIS;
-        hash = mix_u64(hash, HEADROOM64_HALF_DELAY_COEFFICIENTS.len() as u64);
-        for coefficient in HEADROOM64_HALF_DELAY_COEFFICIENTS {
-            hash = mix_u64(hash, coefficient.to_bits());
-        }
-        assert_eq!(hash, EXPECTED_COEFFICIENT_CHECKSUM);
-    }
-
-
-    #[derive(Clone)]
-    struct ReferenceHalfStage {
-        delay: Vec<Vec<f64>>,
-        delay_index: usize,
-        channels: usize,
-    }
-
-    impl ReferenceHalfStage {
-        fn new(channels: usize) -> Self {
-            Self {
-                delay: vec![vec![0.0; HEADROOM64_HALF_DELAY_TAPS]; channels],
-                delay_index: 0,
-                channels,
-            }
-        }
-
-        fn delayed(&self, channel: usize, frames_ago: usize) -> f64 {
-            let len = HEADROOM64_HALF_DELAY_TAPS;
-            let index = (self.delay_index + len - frames_ago) % len;
-            self.delay[channel][index]
-        }
-
-        fn process_frame(&mut self, frame: &[f64], input_index: i128, output: &mut [f64]) -> i128 {
-            for (channel, sample) in frame.iter().copied().enumerate() {
-                self.delay[channel][self.delay_index] = sample;
-            }
-            for channel in 0..self.channels {
-                output[channel] = self.delayed(channel, HEADROOM64_HALF_DELAY_TAPS / 2);
-                let mut half = 0.0;
-                for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-                    .iter()
-                    .copied()
-                    .enumerate()
-                {
-                    half += coefficient
-                        * (self.delayed(channel, index)
-                            + self.delayed(channel, HEADROOM64_HALF_DELAY_TAPS - 1 - index));
-                }
-                output[self.channels + channel] = half;
-            }
-            self.delay_index += 1;
-            if self.delay_index == HEADROOM64_HALF_DELAY_TAPS {
-                self.delay_index = 0;
-            }
-            (input_index - HeadroomHalfSampleStage::GROUP_DELAY_INPUTS) * 2
-        }
-    }
-
-    fn pseudo_random_frame(state: &mut u64, channels: usize) -> Vec<f64> {
-        (0..channels)
-            .map(|_| {
-                *state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                let unit = ((*state >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64));
-                unit * 2.5 - 1.25
-            })
-            .collect()
-    }
-
-    fn convolve(left: &[f64], right: &[f64]) -> Vec<f64> {
-        let mut output = vec![0.0; left.len() + right.len() - 1];
-        for (left_index, left_value) in left.iter().copied().enumerate() {
-            if left_value == 0.0 {
-                continue;
-            }
-            for (right_index, right_value) in right.iter().copied().enumerate() {
-                output[left_index + right_index] += left_value * right_value;
-            }
-        }
-        output
-    }
-
-    fn headroom_stage_impulse_response(taps: usize) -> Vec<f64> {
-        let delay_frames = (taps + 1) / 2;
-        let filters = build_polyphase_filters(taps, 2, delay_frames, Window::Blackman, true);
-        let mut response = vec![0.0; delay_frames * 2];
-        for (phase, filter) in filters.iter().enumerate() {
-            for (&index, &coefficient) in filter.indices.iter().zip(&filter.coefficients) {
-                response[index * 2 + phase] = coefficient;
-            }
-        }
-        response
-    }
-
-    fn complete_headroom_impulse_response() -> Vec<f64> {
-        let mut response = vec![0.0; HEADROOM64_HALF_DELAY_TAPS * 2];
-        response[(HEADROOM64_HALF_DELAY_TAPS / 2) * 2] = 1.0;
-        for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            response[index * 2 + 1] += coefficient;
-            response[(HEADROOM64_HALF_DELAY_TAPS - 1 - index) * 2 + 1] += coefficient;
-        }
-
-        for taps in [
-            HEADROOM64_STAGE_2_TAPS,
-            HEADROOM64_STAGE_3_TAPS,
-            HEADROOM64_STAGE_4_TAPS,
-            HEADROOM64_STAGE_5_TAPS,
-            HEADROOM64_STAGE_6_TAPS,
-        ] {
-            let mut upsampled = vec![0.0; response.len() * 2 - 1];
-            for (index, value) in response.iter().copied().enumerate() {
-                upsampled[index * 2] = value;
-            }
-            response = convolve(&upsampled, &headroom_stage_impulse_response(taps));
-        }
-        response
-    }
-
-    fn headroom_stage_impulse_response_fast(taps: usize) -> Vec<f64> {
-        let delay_frames = (taps + 1) / 2;
-        let filters = build_polyphase_filters(taps, 2, delay_frames, Window::Blackman, true);
-        let mut response = vec![0.0; delay_frames * 2];
-        for (phase, filter) in filters.iter().enumerate() {
-            if phase == 0 {
-                for (&index, &coefficient) in filter.indices.iter().zip(&filter.coefficients) {
-                    response[index * 2 + phase] = coefficient;
-                }
-                continue;
-            }
-            let half_len = filter.coefficients.len() / 2;
-            for index in 0..half_len {
-                let mirror = filter.coefficients.len() - 1 - index;
-                let average = 0.5 * (filter.coefficients[index] + filter.coefficients[mirror]);
-                response[filter.indices[index] * 2 + phase] = average;
-                response[filter.indices[mirror] * 2 + phase] = average;
-            }
-        }
-        response
+    fn reporting_profile_factor_is_rate_dependent_and_separate() {
+        assert_eq!(ReportingPeakMeter::new(48_000, 1).unwrap().oversample_factor(), 4);
+        assert_eq!(ReportingPeakMeter::new(96_000, 1).unwrap().oversample_factor(), 2);
+        assert_eq!(ReportingPeakMeter::new(192_000, 1).unwrap().oversample_factor(), 1);
     }
 
     #[test]
-    fn symmetric_two_x_runtime_matches_its_independent_impulse_response() {
-        for taps in [
-            HEADROOM64_STAGE_2_TAPS,
-            HEADROOM64_STAGE_3_TAPS,
-            HEADROOM64_STAGE_4_TAPS,
-        ] {
-            let expected = headroom_stage_impulse_response_fast(taps);
-            let delay_frames = (taps + 1) / 2;
-            let mut stage = FastHeadroomTwoXStage::new(taps, 1);
-            let mut output = [0.0_f64; 2];
-            let mut actual = Vec::with_capacity(expected.len());
-            for input_index in 0..delay_frames as i128 {
-                let sample = if input_index == 0 { 1.0 } else { 0.0 };
-                stage.process_frame_symmetric(&[sample], input_index, &mut output);
-                actual.extend_from_slice(&output);
-            }
-            assert_eq!(actual.len(), expected.len());
-            for (index, (actual, expected)) in actual
-                .iter()
-                .copied()
-                .zip(expected.iter().copied())
-                .enumerate()
-            {
-                assert!(
-                    (actual - expected).abs() <= 2.0e-15,
-                    "taps={taps} index={index}: runtime={actual:.17e} expected={expected:.17e}",
-                );
-            }
-        }
-    }
-
-    fn complete_fast_headroom_impulse_response(mode: TruePeakMode) -> (Vec<f64>, i128) {
-        let mut response = vec![0.0; HEADROOM64_HALF_DELAY_TAPS * 2];
-        response[(HEADROOM64_HALF_DELAY_TAPS / 2) * 2] = 1.0;
-        for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            response[index * 2 + 1] += coefficient;
-            response[(HEADROOM64_HALF_DELAY_TAPS - 1 - index) * 2 + 1] += coefficient;
-        }
-
-        let taps: &[usize] = match mode {
-            TruePeakMode::Headroom16x => &[
-                HEADROOM64_STAGE_2_TAPS,
-                HEADROOM64_STAGE_3_TAPS,
-                HEADROOM64_STAGE_4_TAPS,
-            ],
-            TruePeakMode::Headroom8x => &[HEADROOM64_STAGE_2_TAPS, HEADROOM64_STAGE_3_TAPS],
-            _ => unreachable!("fast impulse response requires a fast mode"),
-        };
-        let mut delay = HeadroomHalfSampleStage::GROUP_DELAY_INPUTS * 2;
-        for &stage_taps in taps {
-            let mut upsampled = vec![0.0; response.len() * 2 - 1];
-            for (index, value) in response.iter().copied().enumerate() {
-                upsampled[index * 2] = value;
-            }
-            response = convolve(&upsampled, &headroom_stage_impulse_response_fast(stage_taps));
-            let group_delay = ((stage_taps - 1) / 4) as i128;
-            delay = (delay + group_delay) * 2;
-        }
-        (response, delay)
-    }
-
-    fn complete_reference4_impulse_response() -> (Vec<f64>, i128) {
-        let mut response = vec![0.0; HEADROOM64_HALF_DELAY_TAPS * 2];
-        response[(HEADROOM64_HALF_DELAY_TAPS / 2) * 2] = 1.0;
-        for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            response[index * 2 + 1] += coefficient;
-            response[(HEADROOM64_HALF_DELAY_TAPS - 1 - index) * 2 + 1] += coefficient;
-        }
-        let mut upsampled = vec![0.0; response.len() * 2 - 1];
-        for (index, value) in response.iter().copied().enumerate() {
-            upsampled[index * 2] = value;
-        }
-        response = convolve(
-            &upsampled,
-            &headroom_stage_impulse_response(HEADROOM64_STAGE_2_TAPS),
-        );
-        let delay = (HeadroomHalfSampleStage::GROUP_DELAY_INPUTS * 2
-            + ((HEADROOM64_STAGE_2_TAPS - 1) / 4) as i128)
-            * 2;
-        (response, delay)
-    }
-
-    fn complete_reference4_symmetric_execution_impulse_response() -> (Vec<f64>, i128) {
-        let mut response = vec![0.0; HEADROOM64_HALF_DELAY_TAPS * 2];
-        response[(HEADROOM64_HALF_DELAY_TAPS / 2) * 2] = 1.0;
-        for (index, coefficient) in HEADROOM64_HALF_DELAY_COEFFICIENTS
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            response[index * 2 + 1] += coefficient;
-            response[(HEADROOM64_HALF_DELAY_TAPS - 1 - index) * 2 + 1] += coefficient;
-        }
-        let mut upsampled = vec![0.0; response.len() * 2 - 1];
-        for (index, value) in response.iter().copied().enumerate() {
-            upsampled[index * 2] = value;
-        }
-        response = convolve(
-            &upsampled,
-            &headroom_stage_impulse_response_fast(HEADROOM64_STAGE_2_TAPS),
-        );
-        let delay = (HeadroomHalfSampleStage::GROUP_DELAY_INPUTS * 2
-            + ((HEADROOM64_STAGE_2_TAPS - 1) / 4) as i128)
-            * 2;
-        (response, delay)
+    fn reporting_rejected_block_is_not_partially_consumed() {
+        let mut meter = ReportingPeakMeter::new(48_000, 2).unwrap();
+        assert!(matches!(
+            meter.push_interleaved(&[0.1, 0.2, 0.3]),
+            Err(TruePeakError::IncompleteFrame { .. })
+        ));
+        meter.push_interleaved(&[0.25, -0.5]).unwrap();
+        assert_eq!(meter.finalize().unwrap().frames, 1);
     }
 
     #[test]
-    fn accelerated_reference_symmetric_stage2_is_inside_execution_enclosure() {
-        let (mathematical, mathematical_delay) = complete_reference4_impulse_response();
-        let (runtime, runtime_delay) = complete_reference4_symmetric_execution_impulse_response();
-        assert_eq!(mathematical_delay, runtime_delay);
-
-        let length = mathematical.len().max(runtime.len());
-        let mut worst_phase_l1 = 0.0_f64;
-        for phase in 0..4 {
-            let mut phase_l1 = 0.0_f64;
-            let mut index = phase;
-            while index < length {
-                let exact = mathematical.get(index).copied().unwrap_or(0.0);
-                let paired = runtime.get(index).copied().unwrap_or(0.0);
-                phase_l1 += (exact - paired).abs();
-                index += 4;
-            }
-            worst_phase_l1 = worst_phase_l1.max(phase_l1);
+    fn logarithmic_view_keeps_nonzero_subnormal_finite() {
+        let level = PeakInterval::new(f64::from_bits(7), f64::from_bits(11)).upper_level();
+        match level {
+            PeakLevel::Finite { dbtp, .. } => assert!(dbtp.is_finite()),
+            PeakLevel::Silence => panic!("nonzero subnormal must not become silence"),
         }
-
-        // Independent qualification currently measures about 1.05e-16. Keep
-        // a deliberately loose regression ceiling while tying the change to
-        // the much larger production numerical enclosure used by the scanner.
-        assert!(
-            worst_phase_l1 < 2.0e-15,
-            "unexpected paired-stage delta: {worst_phase_l1:e}"
-        );
-        assert!(
-            worst_phase_l1 < HEADROOM_FAST_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER
-        );
-    }
-
-    fn impulse_sample(response: &[f64], delay: i128, physical_index: i128) -> f64 {
-        let index = physical_index + delay;
-        if index < 0 || index >= response.len() as i128 {
-            0.0
-        } else {
-            response[index as usize]
-        }
-    }
-
-    fn cubic_sample(
-        response: &[f64],
-        delay: i128,
-        fine_index: i128,
-        ratio: i128,
-    ) -> f64 {
-        let q = fine_index.div_euclid(ratio);
-        let t = fine_index.rem_euclid(ratio) as f64 / ratio as f64;
-        let ym1 = impulse_sample(response, delay, q - 1);
-        let y0 = impulse_sample(response, delay, q);
-        let y1 = impulse_sample(response, delay, q + 1);
-        let y2 = impulse_sample(response, delay, q + 2);
-        let wm1 = -t * (t - 1.0) * (t - 2.0) / 6.0;
-        let w0 = (t + 1.0) * (t - 1.0) * (t - 2.0) / 2.0;
-        let w1 = -(t + 1.0) * t * (t - 2.0) / 2.0;
-        let w2 = (t + 1.0) * t * (t - 1.0) / 6.0;
-        wm1 * ym1 + w0 * y0 + w1 * y1 + w2 * y2
-    }
-
-    fn bridge_phase_l1(
-        full: &[f64],
-        full_delay: i128,
-        coarse: &[f64],
-        coarse_delay: i128,
-        ratio: i128,
-    ) -> f64 {
-        let full_min = -full_delay;
-        let full_max = full.len() as i128 - 1 - full_delay;
-        let coarse_min = -coarse_delay;
-        let coarse_max = coarse.len() as i128 - 1 - coarse_delay;
-        let min_physical = full_min.min(ratio * (coarse_min - 2)) - 128;
-        let max_physical = full_max.max(ratio * (coarse_max + 2) + ratio - 1) + 128;
-
-        let mut worst = 0.0_f64;
-        for phase in 0_i128..64 {
-            let mut physical = min_physical + (phase - min_physical).rem_euclid(64);
-            let mut total = 0.0_f64;
-            while physical <= max_physical {
-                total += (impulse_sample(full, full_delay, physical)
-                    - cubic_sample(coarse, coarse_delay, physical, ratio))
-                .abs();
-                physical += 64;
-            }
-            worst = worst.max(total);
-        }
-        worst
-    }
-
-    #[test]
-    fn fast_reconstruction_bridge_constants_cover_exact_runtime_filters() {
-        let full = complete_headroom_impulse_response();
-        let full_delay = 12_816_i128;
-        let (fast16, fast16_delay) =
-            complete_fast_headroom_impulse_response(TruePeakMode::Headroom16x);
-        let (fast8, fast8_delay) =
-            complete_fast_headroom_impulse_response(TruePeakMode::Headroom8x);
-        assert_eq!(fast16_delay, 3_200);
-        assert_eq!(fast8_delay, 1_596);
-
-        let fast16_cubic_l1 = bridge_phase_l1(&full, full_delay, &fast16, fast16_delay, 4);
-        let fast8_cubic_l1 = bridge_phase_l1(&full, full_delay, &fast8, fast8_delay, 8);
-
-        assert!((fast16_cubic_l1 - 0.002_850_095_510_818_164).abs() < 5.0e-13);
-        assert!((fast8_cubic_l1 - 0.002_932_600_684_250_417_7).abs() < 5.0e-13);
-        assert!(fast16_cubic_l1 <= HEADROOM16X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER);
-        assert!(fast8_cubic_l1 <= HEADROOM8X_TO_64X_RECONSTRUCTION_LINF_ERROR_UPPER);
-    }
-
-    #[test]
-    fn accelerated_reference_4x_screen_constants_cover_mathematical_reference_filters() {
-        let full = complete_headroom_impulse_response();
-        let full_delay = 12_816_i128;
-        let (coarse4, coarse4_delay) = complete_reference4_impulse_response();
-        assert_eq!(coarse4_delay, 792);
-
-        let full_min = -full_delay;
-        let full_max = full.len() as i128 - 1 - full_delay;
-        let coarse_min = -coarse4_delay;
-        let coarse_max = coarse4.len() as i128 - 1 - coarse4_delay;
-        let min_physical = full_min.min(16 * (coarse_min - 2)) - 128;
-        let max_physical = full_max.max(16 * (coarse_max + 2) + 15) + 128;
-        let mut phase_l1 = [0.0_f64; 64];
-        let mut phase_sum = [0.0_f64; 64];
-        for phase in 0_i128..64 {
-            let mut physical = min_physical + (phase - min_physical).rem_euclid(64);
-            let mut absolute_sum = 0.0_f64;
-            let mut signed_sum = 0.0_f64;
-            while physical <= max_physical {
-                let residual = impulse_sample(&full, full_delay, physical)
-                    - cubic_sample(&coarse4, coarse4_delay, physical, 16);
-                absolute_sum += residual.abs();
-                signed_sum += residual;
-                physical += 64;
-            }
-            phase_l1[phase as usize] = absolute_sum;
-            phase_sum[phase as usize] = signed_sum.abs();
-        }
-
-        let independent = [
-            0.012_171_965_399_791_278_f64,
-            0.019_882_295_065_542_21_f64,
-            0.019_882_295_065_542_052_f64,
-            0.012_171_965_399_790_983_f64,
-        ];
-        for coarse_phase in 0..4 {
-            let range = coarse_phase * 16..(coarse_phase + 1) * 16;
-            let l1 = range
-                .clone()
-                .map(|phase| phase_l1[phase])
-                .fold(0.0, f64::max);
-            let sum = range
-                .map(|phase| phase_sum[phase])
-                .fold(0.0, f64::max);
-            assert!((l1 - independent[coarse_phase]).abs() < 2.0e-13);
-            assert!(l1 <= HEADROOM_REFERENCE_FAST_RESIDUAL_L1_UPPER[coarse_phase]);
-            assert!(sum <= HEADROOM_REFERENCE_FAST_RESIDUAL_SUM_UPPER[coarse_phase]);
-        }
-    }
-
-    #[test]
-    fn reconstruction_linf_constant_covers_complete_cascade() {
-        let response = complete_headroom_impulse_response();
-        let maximum_phase_l1 = (0..64)
-            .map(|phase| {
-                response
-                    .iter()
-                    .skip(phase)
-                    .step_by(64)
-                    .map(|value| value.abs())
-                    .sum::<f64>()
-            })
-            .fold(0.0, f64::max);
-
-        // Frozen independently by qualification/verify_ceiling_contract.py.
-        let independent_reference = 4.089_899_431_660_599_f64;
-        assert!((maximum_phase_l1 - independent_reference).abs() < 5.0e-15);
-        assert!(maximum_phase_l1 <= HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER);
-    }
-
-    #[test]
-    fn fast_reconstruction_numeric_allowance_exceeds_pessimistic_gamma_budget() {
-        let unit_roundoff = f64::EPSILON / 2.0;
-        let gamma = |operations: usize| {
-            let ku = operations as f64 * unit_roundoff;
-            ku / (1.0 - ku)
-        };
-
-        let first_stage_l1 = 2.0
-            * HEADROOM64_HALF_DELAY_COEFFICIENTS
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .sum::<f64>();
-        let stage_l1 = |taps: usize| {
-            let response = headroom_stage_impulse_response_fast(taps);
-            (0..2)
-                .map(|phase| {
-                    response
-                        .iter()
-                        .skip(phase)
-                        .step_by(2)
-                        .copied()
-                        .map(f64::abs)
-                        .sum::<f64>()
-                })
-                .fold(0.0, f64::max)
-        };
-        let stages = [
-            (first_stage_l1, 4 * 192 + 8),
-            (stage_l1(HEADROOM64_STAGE_2_TAPS), 3 * 24 + 4),
-            (stage_l1(HEADROOM64_STAGE_3_TAPS), 3 * 12 + 4),
-            (stage_l1(HEADROOM64_STAGE_4_TAPS), 3 * 8 + 4),
-        ];
-
-        let propagate = |count: usize| {
-            let mut real_magnitude_bound = 1.0_f64;
-            let mut numerical_error_bound = 0.0_f64;
-            for &(l1, operations) in &stages[..count] {
-                let local_error = gamma(operations)
-                    * l1
-                    * (real_magnitude_bound + numerical_error_bound);
-                numerical_error_bound = l1 * numerical_error_bound + local_error;
-                real_magnitude_bound *= l1;
-            }
-            (real_magnitude_bound, numerical_error_bound)
-        };
-
-        let (fast16_magnitude, fast16_error) = propagate(4);
-        let (fast8_magnitude, fast8_error) = propagate(3);
-        // Each interior cubic Bernstein control has coefficient L1 norm 4/3.
-        // Charge 32 rounding operations, twice the runtime expression's count,
-        // to keep this enclosure intentionally pessimistic.
-        let cubic_error = |magnitude: f64, error: f64| {
-            (4.0 / 3.0) * error + gamma(32) * (4.0 / 3.0) * (magnitude + error)
-        };
-        let fast16_cubic_error = cubic_error(fast16_magnitude, fast16_error);
-        let fast8_cubic_error = cubic_error(fast8_magnitude, fast8_error);
-
-        assert!(fast16_cubic_error < 4.0e-12);
-        assert!(fast8_cubic_error < 4.0e-12);
-        assert!(fast16_cubic_error < HEADROOM_FAST_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER);
-        assert!(fast8_cubic_error < HEADROOM_FAST_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER);
-    }
-
-    #[test]
-    fn reconstruction_numeric_allowance_exceeds_pessimistic_gamma_budget() {
-        let unit_roundoff = f64::EPSILON / 2.0;
-        let gamma = |operations: usize| {
-            let ku = operations as f64 * unit_roundoff;
-            ku / (1.0 - ku)
-        };
-
-        let mut real_magnitude_bound = 1.0_f64;
-        let mut numerical_error_bound = 0.0_f64;
-        let stage_specs = [
-            (4.089_899_431_660_599_f64, 4 * 192 + 8),
-            (2.182_305_364_025_995_5_f64, 3 * 24 + 4),
-            (1.738_382_235_555_464_f64, 3 * 12 + 4),
-            (1.475_916_404_745_172_f64, 3 * 8 + 4),
-            (1.288_719_089_050_186_f64, 3 * 6 + 4),
-            (1.058_953_251_382_957_2_f64, 3 * 4 + 4),
-        ];
-        for (stage_l1, operations) in stage_specs {
-            let local_error = gamma(operations)
-                * stage_l1
-                * (real_magnitude_bound + numerical_error_bound);
-            numerical_error_bound = stage_l1 * numerical_error_bound + local_error;
-            real_magnitude_bound *= stage_l1;
-        }
-
-        assert!(numerical_error_bound < 3.4e-12);
-        assert!(
-            numerical_error_bound
-                < HEADROOM64X_RECONSTRUCTION_NUMERIC_ERROR_PER_INPUT_PEAK_UPPER
-        );
-    }
-
-    #[test]
-    fn doubled_first_stage_is_bit_identical_to_modulo_reference() {
-        let channels = 3;
-        let mut optimized = HeadroomHalfSampleStage::new(channels);
-        let mut reference = ReferenceHalfStage::new(channels);
-        let mut optimized_output = vec![0.0; channels * 2];
-        let mut reference_output = vec![0.0; channels * 2];
-        let mut state = 0x72f0_4a81_d3c6_195b_u64;
-
-        for input_index in -250_i128..2_000 {
-            let frame = pseudo_random_frame(&mut state, channels);
-            let optimized_base = optimized.process_frame(&frame, input_index, &mut optimized_output);
-            let reference_base = reference.process_frame(&frame, input_index, &mut reference_output);
-            assert_eq!(optimized_base, reference_base);
-            assert_eq!(
-                optimized_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                reference_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-            );
-        }
-    }
-
-    #[test]
-    fn fast_first_stage_preserves_the_frozen_filter_with_only_rounding_reorder() {
-        let channels = 3;
-        let mut reference = HeadroomHalfSampleStage::new(channels);
-        let mut fast = HeadroomHalfSampleStage::new(channels);
-        let mut reference_output = vec![0.0; channels * 2];
-        let mut fast_output = vec![0.0; channels * 2];
-        let mut state = 0x6d2a_1e93_9f71_c4b5_u64;
-
-        for input_index in -250_i128..2_000 {
-            let frame = pseudo_random_frame(&mut state, channels);
-            let reference_base =
-                reference.process_frame(&frame, input_index, &mut reference_output);
-            let fast_base = fast.process_frame_fast(&frame, input_index, &mut fast_output);
-            assert_eq!(reference_base, fast_base);
-            for (channel_phase, (reference, fast)) in reference_output
-                .iter()
-                .copied()
-                .zip(fast_output.iter().copied())
-                .enumerate()
-            {
-                assert!(
-                    (reference - fast).abs() <= 1.0e-12,
-                    "index={input_index} channel_phase={channel_phase}: reference={reference:.17e} fast={fast:.17e}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn specialized_two_x_stages_are_bit_identical_to_generic_filters() {
-        let channels = 3;
-        for taps in [
-            HEADROOM64_STAGE_2_TAPS,
-            HEADROOM64_STAGE_3_TAPS,
-            HEADROOM64_STAGE_4_TAPS,
-            HEADROOM64_STAGE_5_TAPS,
-            HEADROOM64_STAGE_6_TAPS,
-        ] {
-            let mut optimized = HeadroomTwoXStage::new(taps, channels);
-            let mut reference = InterpolatorStage::new(taps, 2, channels, Window::Blackman, true);
-            let mut optimized_output = vec![0.0; channels * 2];
-            let mut reference_output = vec![0.0; channels * 2];
-            let mut state = 0x3109_b765_a77d_38e1_u64 ^ taps as u64;
-
-            for input_index in -80_i128..500 {
-                let frame = pseudo_random_frame(&mut state, channels);
-                let optimized_base = optimized.process_frame(&frame, input_index, &mut optimized_output);
-                let reference_base = reference.process_frame(&frame, input_index, &mut reference_output);
-                assert_eq!(optimized_base, reference_base, "taps={taps}");
-                assert_eq!(
-                    optimized_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                    reference_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                    "taps={taps}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ceiling_meter_preserves_silence_and_exposes_uncalibrated_reconstruction() {
-        let mut silent = HeadroomCeilingMeter::new_with_scan_mode(
-            48_000,
-            2,
-            EdgePolicy::RepeatEndpoints,
-            HeadroomScanMode::Reference,
-        )
-        .unwrap();
-        silent.push_interleaved(&[0.0; 128]).unwrap();
-        let silent = silent.finalize().unwrap();
-        assert_eq!(silent.point_estimate.overall, PeakLevel::Silence);
-        assert_eq!(silent.reconstruction_upper, PeakLevel::Silence);
-
-        let mut meter = HeadroomCeilingMeter::new_with_scan_mode(
-            48_000,
-            1,
-            EdgePolicy::RepeatEndpoints,
-            HeadroomScanMode::Reference,
-        )
-        .unwrap();
-        meter.push_interleaved(&[0.5; 512]).unwrap();
-        let result = meter.finalize().unwrap();
-        assert!(result.reconstruction_upper.linear() >= 0.5);
-        assert!(result.reconstruction_upper.linear() >= result.point_estimate.overall.linear());
-        assert!(result.reconstruction_upper.linear() - 0.5 < 1.0e-9);
     }
 }

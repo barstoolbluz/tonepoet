@@ -2823,7 +2823,7 @@ dependencies = [
 name = "tonepoet-true-peak"
 version = "0.1.0"
 dependencies = [
- "rustfft",
+ "num-complex",
 ]
 
 [[package]]
