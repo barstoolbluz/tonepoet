@@ -1,0 +1,144 @@
+{
+  "checks": {
+    "authority_coefficients_are_normal_and_abs_at_most_one": true,
+    "benchmark_exposes_only_three_tiers": true,
+    "binding_benchmark_uses_total_timer_without_projection": true,
+    "daz_safe_logarithmic_views": true,
+    "direct_bound_primitives_are_exactly_outward_on_edge_cases": true,
+    "fast066_policy_is_fixed_work_and_fail_closed": true,
+    "fast90_coarse_lower_and_magnitude_are_single_pass": true,
+    "fast90_curvature_summary_reuses_rolling_coarse_knots": true,
+    "fast90_l1_prefilter_is_authority_bearing": true,
+    "fast90_phase_l1_bounds_are_exactly_outward": true,
+    "fast90_prefix_executor_is_policy_scoped": true,
+    "hq_all_frozen_dyadic_node_bounds_are_exactly_outward": true,
+    "hq_delay_target_subframes": true,
+    "hq_dyadic_bound_stress": true,
+    "hq_operator_matches_design_probe": true,
+    "hq_root_a_matches_design_probe": true,
+    "hq_root_affine_defect_small": true,
+    "hq_runtime_omits_redundant_stage_tables_but_generator_retains_construction": true,
+    "hq_sampled_response_within_design_envelope": true,
+    "hq_sampled_single_tone_objective_has_margin": true,
+    "hq_tail_delay_subframes": true,
+    "hq_width_128_matches_design_probe": true,
+    "hq_width_256_matches_design_probe": true,
+    "hq_width_2_matches_design_probe": true,
+    "legacy_dense_halo_matches_declared_tail_support": true,
+    "legacy_dense_pairing_bounds_are_exactly_outward": true,
+    "legacy_dense_work_model_prefers_complete_block_for_8_cells": true,
+    "legacy_direct_oracle_is_exercised_against_hq_analytical_reference": true,
+    "legacy_dyadic_bound_stress": true,
+    "legacy_oracle_is_internal_only": true,
+    "legacy_public_norm_contains_operator": true,
+    "legacy_root_a_matches_design_probe": true,
+    "legacy_runtime_composition_bound_contains_exact_rational_discrepancy": true,
+    "legacy_runtime_composition_bound_is_usefully_tight": true,
+    "legacy_runtime_dyadic_node_bounds_are_exactly_outward": true,
+    "public_surface_is_exactly_three_hq_tiers": true,
+    "qualified_2x_prefix_is_normal_certificate_authority": true,
+    "reference9_dense_and_rescore_paths_present": true,
+    "reference9_focused_oracle_frontier_edge_regressions_present": true,
+    "reference9_release_incomplete_fails_closed": true,
+    "shipping_stress_fixtures_self_validate": true,
+    "stale_msrv_workaround_is_retired": true
+  },
+  "direct_authority": {
+    "absolute_underflow_units_per_operation": 4.0,
+    "authority_coefficient_abs_max": 1.0,
+    "authority_coefficient_abs_min_nonzero": 3.204609915655832e-09,
+    "binary64_unit_roundoff": 1.1102230246251565e-16,
+    "daz_input_units_per_operation": 2.0,
+    "ftz_result_units_per_operation": 1.0,
+    "fused_residual_underflow_units": 1.0
+  },
+  "hq1024": {
+    "delay_target_subframes": 795354,
+    "frozen_rust_sha256": "7070c2e9abc255062dd30aaa516c0827d969d238759e14a61c5d1da94a67de9d",
+    "node_a_width_128_max": 0.0216970512931053,
+    "node_a_width_256_max": 0.07666879250223929,
+    "node_a_width_2_max": 5.502940194692601e-06,
+    "operator_linf_measured_from_frozen_construction": 4.676026435151282,
+    "phase_l1_exact_binary64_sum": 1.9638475377212503,
+    "phase_l1_outward_upper": 1.9638475377212539,
+    "root_affine_b": 9.273373783036081e-16,
+    "root_curvature_a": 0.32942234266732673,
+    "sampled_response_audit": {
+      "complex_error_at_fraction_and_phase": [
+        0.494637451171875,
+        512
+      ],
+      "frequency_points": 4097,
+      "ideal_grid_component_db_at_0_495_fs": 1.0016009048813814e-05,
+      "maximum_at_fraction_and_phase": [
+        0.494637451171875,
+        512
+      ],
+      "maximum_complex_response_error": 1.876451046894881e-07,
+      "maximum_magnitude_deviation_db": 1.6298645183914847e-06,
+      "minimum_at_fraction_and_phase": [
+        0.494033203125,
+        488
+      ],
+      "minimum_magnitude_deviation_db": -1.4779443258828773e-06,
+      "phase_count": 1024,
+      "sampled_single_tone_abs_error_plus_grid_db": 1.1645873567205299e-05
+    },
+    "tail_delay_subframes": 8922,
+    "tail_nonzero_count_range": [
+      1,
+      33
+    ],
+    "tail_support": [
+      -16,
+      17
+    ]
+  },
+  "legacy64": {
+    "delay_target_subframes": 12816,
+    "dense_8_cell_pair_products": 922,
+    "dense_8_cell_required_coarse_range": [
+      -15,
+      23
+    ],
+    "dense_pair_exact_coefficient_discrepancy_max": 1.1102230246251565e-16,
+    "dense_pair_outward_coefficient_bound_max": 1.1102230246251568e-16,
+    "derived_runtime_composition_error_per_coarse_peak_upper": 1.2600045896457424e-14,
+    "exact_real_vs_rounded_tail_max_phase_l1": 4.1916359019045463e-16,
+    "operator_linf_measured_from_reconstructed_runtime_filters": 4.0898994316606,
+    "phase_l1_exact_binary64_sum": 2.1823053640259955,
+    "phase_l1_outward_upper": 2.182305364026003,
+    "root_affine_b": 8.435610509318126e-16,
+    "root_curvature_a": 0.38505435936295945,
+    "runtime_root_affine_b_upper": 2.083695388071971e-14,
+    "runtime_root_curvature_a_upper": 0.3850543593630394,
+    "sparse_8_cell_full_phase_product_plus_node_work": 8592,
+    "tail_delay_subframes": 528,
+    "tail_support": [
+      -15,
+      16
+    ]
+  },
+  "qualification_scope": {
+    "certified_fft_authoritative": true,
+    "certified_fft_implementation": "crate-owned fixed radix-2 prefix; scalar graph with same-graph AVX pair dispatch",
+    "coefficient_construction_reproduced": true,
+    "commissioning_benchmark_run_here": false,
+    "direct_authority_coefficient_domain_checked": true,
+    "direct_authority_rounding_derivation_checked": true,
+    "dyadic_coefficient_identities_checked": true,
+    "finite_tail_support_checked": true,
+    "legacy_composition_rounding_derivation_checked": true,
+    "legacy_dense_pairing_enclosure_checked": true,
+    "legacy_dense_shipping_crossover_measured": false,
+    "legacy_dense_source_work_model_recomputed": true,
+    "operator_norm_recomputed": true,
+    "runtime_fft_rounding_proof": true,
+    "rustfft_runtime_backend_is_certificate_authority": false,
+    "sampled_hq_response_checked": true,
+    "shipping_backend_verified": false,
+    "shipping_rust_tests_run_here": false
+  },
+  "schema": 1,
+  "status": "pass"
+}

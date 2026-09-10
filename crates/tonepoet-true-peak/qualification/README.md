@@ -1,61 +1,87 @@
-# Headroom64x offline filter-design tooling
+# Offline qualification and Fast066 commissioning
 
-Correctness gates for `tonepoet-true-peak` live in ordinary Rust tests. Nothing in this directory is required to build, test, install, or run the crate or Tonepoet.
+The source-round scripts independently re-derive the frozen mathematical
+artifacts used by the surviving HQ1024V1 certified surface. They are source
+evidence, not a substitute for compiling and executing the Rust tests.
 
-`design_headroom64_filter.py` is optional offline tooling for intentional redesign/audit of the checked-in 384-tap Type-II equiripple half-sample filter. `verify_ceiling_contract.py` is separate optional qualification tooling for the finite hard-ceiling reconstruction. `verify_fast_headroom_paths.py` independently rebuilds the exact 16x and 8x fast execution paths, derives their point-authority component budgets, runs deterministic exact-peak searches, and recomputes the induced-norm bridges back to the unchanged full-64x finite reconstruction. The tools use NumPy/SciPy only when invoked manually.
+Run the offline source round with:
 
-It is not invoked by Cargo, `build.rs`, Rust tests, runtime code, or `flake.nix`, and it is not a release or commissioning gate. The checked-in coefficients are protected during normal development by a std-only Rust integrity test over the coefficient count and exact `f64::to_bits()` values.
-
-For an intentional offline design audit, a developer may run:
-
-```sh
-python3 crates/tonepoet-true-peak/qualification/design_headroom64_filter.py \
-  --source crates/tonepoet-true-peak \
-  --report /tmp/headroom64-design.json
+```text
+python3 -B qualification/run_offline_qualification.py
 ```
 
-The normal regression suite remains:
+The runner:
 
-```sh
-cargo test -p tonepoet-true-peak
-cargo test --workspace
+1. regenerates HQ1024 coefficients and requires byte identity with checked-in
+   Rust/JSON artifacts;
+2. regenerates the qualified 2x prefix and requires byte identity;
+3. independently verifies the fixed-radix-2 prefix enclosure, twiddles,
+   packed-channel scaling, AVX same-graph source shape, and DAZ/FTZ-safe
+   classification;
+4. independently verifies HQ/Legacy dyadic bounds, operator norms, dense Legacy
+   oracle composition, HQ response probes, and shared Reference/Standard source
+   invariants;
+5. regenerates Fast066V2 midpoint/phase metadata, including the common outward
+   tail-L1 maximum, verifies the two 4x-child coefficient bounds, and exercises
+   the flat 256-frame envelope over deterministic exact-rational cases;
+6. checks the 64-nominee spatial/global policy under saturation and audits the
+   fixed 64/8/104 source constants;
+7. source-audits the Fast066V2 graph and the presence of the targeted Rust
+   falsification hooks; and
+8. unit-tests the commissioning driver's duration-normalized strict C stop/go
+   rule, benchmark identity validation, result parser, and A/B/C/D orchestration.
+
+The source audit in step 7 intentionally does **not** claim that Rust tests ran.
+The Rust unit/integration suite is the behavioral authority for per-tile work,
+rejected-neighborhood oracle enumeration, prefix-error-run envelope behavior,
+finishing stop conditions, tile ordering, and future-input chunk invariance.
+
+## A/B/C/D commissioning
+
+`commission_fast066_v2.py` is an external commissioning driver. It does not add
+a V1 mode or a fourth tier to the production API. It requires the exact V1
+baseline archive and verifies this SHA-256 before extraction:
+
+```text
+604060fce4a9159383e7200cd35af7325a7ddce8f854bb13782bee93ff3e61d0
 ```
 
-Those Rust tests carry the lasting correctness evidence: analytical three-tone and upper-band five-tone truths, the explicit out-of-domain R3 near-Nyquist diagnostic, deterministic upper-band and multitone families, frozen adversarial cases, the formula-derived 64x grid bound, Reporting4x values frozen from libebur128 1.2.6, streaming equivalence, finite-stream boundaries, silence, multichannel maxima, and above-full-scale behavior. They also include `tests/fixtures/real_reference_48k_stereo.f64le`, a small redistributable excerpt of genuine recorded saxophone material. Its test freezes a libebur128 1.2.6 Reporting4x result and a 256x libsoxr Headroom64x cross-check; the reference tools are not executed by Cargo. See `tests/fixtures/README.md` for provenance, licensing, exact hashes, and reference-generation details.
+Example:
 
-## Hard-ceiling reconstruction audit
-
-`verify_ceiling_contract.py` is a second optional offline audit for the album
-NormalizePeak ceiling work. It independently rebuilds the complete six-stage
-reconstruction from the checked-in coefficient values, derives the complete
-64-phase induced L-infinity norm, evaluates both finite-stream edge policies,
-and freezes analytical/real-material reconstruction values used by Rust tests.
-It also records high-precision dB-to-linear references for the directed fixed-
-point conversion tests.
-
-Run it manually with:
-
-```sh
-python3 crates/tonepoet-true-peak/qualification/verify_ceiling_contract.py \
-  --source crates/tonepoet-true-peak \
-  --report /tmp/headroom64-ceiling-contract.json
+```text
+python3 -B qualification/commission_fast066_v2.py \
+  --v1-archive /path/to/tonepoet-fast066-v1-implementation-corrected-2026-09-09.tar.gz \
+  --carrier /path/to/carrier.f64le \
+  --sample-rate 192000 \
+  --channels 2 \
+  --expected-point-dbtp <revalidated-dense-HQ-point> \
+  --rustflags '<operator release flags, including any vectorizer setting>' \
+  --output /path/to/fast066-commissioning.json
 ```
 
-Like the filter-design program, it is **not** a commissioning mechanism or a
-build/runtime gate. In particular, it makes no `<= 0.495 * Fs` claim for the
-production DSD carrier. Its report intentionally separates the exact finite
-reconstruction ceiling from comparison against the historical ideal analytical
-tone truths, so interpolation-model deviation cannot be mistaken for the tiny
-numeric enclosure used by the hard-ceiling proof.
+The driver hashes the carrier and source inputs before measured execution. It
+then runs:
 
-## Fast headroom path audit
+- **A** — unchanged V1 Fast, instrumented and nonbinding;
+- **B** — V2 survey + bounds (`fast-survey`), instrumented and nonbinding;
+- **C** — V2 B + nomination (`fast-nominate`), instrumented and nonbinding;
+- **D-instrumented** — complete V2 with stage attribution, only if C is strictly
+  below 0.66 seconds per programme minute; and
+- **D-binding** — complete V2 without `fast-stage-timing`, which is the binding
+  wall-time gate.
 
-Run the independent fast-path qualification with:
+If C is at or above 0.66 s/min, the driver records the stop decision and does not
+run D for performance purposes. The JSON manifest records one carrier digest,
+A/B/C/D labels, edge policy, V1/V2 source identities, algorithm revisions,
+`rustc -vV`, Cargo version, operator/codegen inputs, release profile settings,
+active SIMD backend, wall times, certificate/error data, V2 work counters, and
+the final speed/accuracy gate state. Carrier/source hashing and compiler metadata
+collection occur outside the benchmark executable's wall-time interval. V1 and
+V2 use separate Cargo target directories so one source tree cannot satisfy the
+other's build artifacts accidentally. V2 runs from a disposable byte-checked
+source copy, and any Cargo-generated lockfile digest is recorded separately from
+the immutable source-tree identity.
 
-```sh
-python3 crates/tonepoet-true-peak/qualification/verify_fast_headroom_paths.py \
-  --source crates/tonepoet-true-peak \
-  --report /tmp/fast-headroom-paths.json
-```
-
-The audit checks the exact checked-in first-stage coefficients, independently reconstructed symmetrized Blackman prefixes, cascade delays, operation-count model, qualified-band response extrema, analytic grid miss, required analytical tones, deterministic aligned-peak cases, and the 16x-cubic / 8x-cubic bridge norms. The point-response budget is an engineering qualification over the stated band, matching the existing Headroom64x methodology; it is not presented as a theorem for arbitrary critical-Nyquist content. The finite-reconstruction bridge constants are independently recomputed induced-L-infinity enclosures. Ordinary Rust tests separately compare the actual symmetric-stage runtime impulse response against that independent definition and freeze the strongest deterministic under-read cases found by qualification. They fail if the implementation drifts outside the published `0.044 dB` and `0.084 dB` one-sided point bounds or if either bridge exceeds its public enclosure. The checked-in `fast_headroom_paths_report.json` records the current audit result for review; runtime does not read it.
+The research probes that selected 64 nominees, eight finishers, and step 32 are
+external numerical evidence. They do not replace the crate's independent Rust
+oracle or establish production throughput.

@@ -1,0 +1,133 @@
+{
+  "algorithm_revision": "Fast066V2",
+  "candidate_policy_saturation": {
+    "global_top64_microgroups": 1,
+    "microgroups_represented": 16,
+    "observed": 4096,
+    "passed": true,
+    "selected": 64
+  },
+  "coefficient_flat_bound": {
+    "cases": [
+      {
+        "case": "zero",
+        "dense_knots": 2049,
+        "slack_hex": "0x0.0p+0"
+      },
+      {
+        "case": "constant",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.2a06ce53a392ap-52"
+      },
+      {
+        "case": "alternating",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.26687d62505dep-2"
+      },
+      {
+        "case": "saw",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.5560447e101e1p-4"
+      },
+      {
+        "case": "impulse_-16",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49e5p-4"
+      },
+      {
+        "case": "impulse_0",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49cdp-3"
+      },
+      {
+        "case": "impulse_1",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49cdp-3"
+      },
+      {
+        "case": "impulse_3",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49cdp-3"
+      },
+      {
+        "case": "impulse_4",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49cdp-3"
+      },
+      {
+        "case": "impulse_20",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.12c7ec7de49e5p-4"
+      },
+      {
+        "case": "dyadic_random",
+        "dense_knots": 2049,
+        "slack_hex": "0x1.756e409b11d4ap-3"
+      }
+    ],
+    "passed": true,
+    "total_exact_dense_knots": 22539
+  },
+  "coefficient_source_sha256": "7070c2e9abc255062dd30aaa516c0827d969d238759e14a61c5d1da94a67de9d",
+  "fixed_work_caps": {
+    "group_frames": 256,
+    "max_additional_fine_knots_per_finisher": 5,
+    "max_finishers_per_tile_channel": 8,
+    "max_new_fine_knots_per_full_tile_channel": 104,
+    "max_nominees_per_tile_channel": 64,
+    "tile_frames": 4096
+  },
+  "metadata_exact_child_checks": true,
+  "phase_l1_enclosures": {
+    "common_tail_l1_upper_hex": "0x1.f6beb654d7c8cp+0",
+    "minimum_outward_margin_hex": "0x1.0000000000000p-52",
+    "passed": true,
+    "phase_count": 512
+  },
+  "schema": "tonepoet-fast066-verification-v2",
+  "source_contract": {
+    "checks": {
+      "block_prefix_api": true,
+      "cached_common_tail_envelope": true,
+      "candidate_independent_envelope_regression": true,
+      "canonical_group": true,
+      "canonical_tile": true,
+      "certified_neighborhood_dominance": true,
+      "certified_scan_test_gain_constant_import_present": true,
+      "chunk_boundary_regression": true,
+      "commissioning_ablation_is_feature_gated": true,
+      "commissioning_stage_fields": true,
+      "commissioning_timing_is_feature_gated": true,
+      "cross_group_behavior_regression_hook": true,
+      "dense_all_knot_oracle": true,
+      "dense_fixture_regression": true,
+      "direct_fast_backend": true,
+      "edge_scratch_reused_without_frame_clone": true,
+      "external_abcd_commissioning_driver": true,
+      "fast_kernel_enclosure_regressions": true,
+      "fine_work_cap": true,
+      "finisher_cap": true,
+      "finishing_stop_regressions_hook": true,
+      "future_validation_max_regression_hook": true,
+      "integer_seconds_rate_removed": true,
+      "legacy_frame_adapter_retained": true,
+      "legacy_scaled_peak_helper_present": true,
+      "midpoint_metadata_test_matches_generated_authority": true,
+      "nanosecond_rate": true,
+      "no_clock_in_fast_backend": true,
+      "no_old_search_in_fast_backend": true,
+      "nominee_cap": true,
+      "numerical_roundoff_terms": true,
+      "per_tile_quota_regression_hook": true,
+      "prefix_error_cross_block_reduction": true,
+      "prefix_error_run_envelope_regression_hook": true,
+      "rejected_nominee_oracle_regression_hook": true,
+      "tile_ordering_regression_hook": true,
+      "two_stage_policy": true,
+      "v1_stencil_removed": true,
+      "v2_behavioral_regressions": true,
+      "versioned_revision": true
+    },
+    "passed": true
+  }
+}

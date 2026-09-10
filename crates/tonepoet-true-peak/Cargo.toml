@@ -2,9 +2,21 @@
 name = "tonepoet-true-peak"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.93"
 description = "Streaming true-peak measurement for decoded PCM audio"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+# Commissioning-only stage attribution for the Fast066 benchmark. The normal
+# Fast backend contains no timing state or clock reads when this feature is off.
+fast-stage-timing = []
+
 [dependencies]
-rustfft = "=6.4.1"
+num-complex = "=0.4.6"
+
+# Preserve the release-codegen shape used for the supplied performance baseline.
+# This is not the LLVM-21 loop-vectorizer workaround: the operator still needs
+# the documented vectorizer-disable flag for the known compiler fault.
+[profile.release]
+codegen-units = 1

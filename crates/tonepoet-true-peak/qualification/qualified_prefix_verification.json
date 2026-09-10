@@ -1,0 +1,71 @@
+{
+  "checks": {
+    "all_frozen_twiddles_inside_declared_complex_error": true,
+    "authority_zero_and_subnormal_classification_is_daz_independent": true,
+    "avx_dispatch_preserves_the_certified_arithmetic_graph": true,
+    "certified_scanner_uses_owned_prefix": true,
+    "coarse_authority_screen_present": true,
+    "complex_multiply_graph_matches_derivation": true,
+    "fast90_bit_reversal_is_precomputed_without_changing_permutation": true,
+    "filter_spectrum_uses_same_owned_transform": true,
+    "hq_absolute_bound_rederived_outward_and_tight": true,
+    "hq_prefix_error_has_1e_6_linear_margin": true,
+    "hq_relative_bound_rederived_outward_and_tight": true,
+    "hq_skipped_prefix_l1_is_outward": true,
+    "inverse_normalization_matches_derivation": true,
+    "legacy_absolute_bound_rederived_outward_and_tight": true,
+    "legacy_relative_bound_rederived_outward_and_tight": true,
+    "legacy_skipped_prefix_l1_is_outward": true,
+    "overflow_scaling_is_binary_power_only": true,
+    "overlap_save_arithmetic_matches_derivation": true,
+    "owned_fft_sizes_match_derivation": true,
+    "owned_radix2_executor_present": true,
+    "packed_scale_covers_pair_and_full_overlap_block": true,
+    "published_twiddle_error_is_outward": true,
+    "radix2_butterfly_graph_matches_derivation": true,
+    "raw_domain_normal_screen_removed": true,
+    "retired_unqualified_executor_is_absent": true,
+    "subnormal_filter_components_are_canonicalized_bitwise": true,
+    "time_bounded_prefix_skip_uses_source_derived_l1_enclosure": true
+  },
+  "hq1024": {
+    "filter_l1": 4.676026435151282,
+    "filter_spectrum_error": 3.010803402037693e-11,
+    "input_scaling_absolute_units": 11585.237502960395,
+    "output_absolute_required": 1.6546685301491345e-302,
+    "output_relative_required": 3.494582798049807e-07,
+    "published_absolute_error_upper": 1.6546685301491348e-302,
+    "published_relative_error_upper": 3.4945827980498074e-07,
+    "time_bounded_skip_l1_upper": 4.676026435151309,
+    "transform_absolute_units": 147438.00000000073,
+    "transform_relative": 4.7293724492192404e-11
+  },
+  "legacy64": {
+    "filter_l1": 4.089899431660599,
+    "filter_spectrum_error": 6.3736999291347654e-12,
+    "input_scaling_absolute_units": 2896.309375740099,
+    "output_absolute_required": 3.617734221365666e-303,
+    "output_relative_required": 1.8581198578932993e-08,
+    "published_absolute_error_upper": 3.6177342213656665e-303,
+    "published_relative_error_upper": 1.8581198578932997e-08,
+    "time_bounded_skip_l1_upper": 4.089899431660611,
+    "transform_absolute_units": 36846.00000000015,
+    "transform_relative": 1.0004441719502235e-11
+  },
+  "qualification_scope": {
+    "commissioning_benchmark_run_here": false,
+    "external_planner_or_alternate_simd_fft_is_certificate_authority": false,
+    "owned_fixed_fft_is_certificate_authority": true,
+    "same_graph_avx_executor_source_audited": true,
+    "shipping_codegen_verified_here": false,
+    "shipping_rust_tests_run_here": false,
+    "source_round_enclosure_rederived_independently": true
+  },
+  "schema": 1,
+  "status": "pass",
+  "twiddles": {
+    "declared_complex_error_upper": 2.220446049250313e-16,
+    "entries": 4096,
+    "measured_max_complex_error": 7.472101018825855e-17
+  }
+}
