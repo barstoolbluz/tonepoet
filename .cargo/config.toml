@@ -1,0 +1,32 @@
+# Workaround for an LLVM loop-vectorizer crash that aborts release builds.
+#
+# rustc 1.93.1 / LLVM 21.1 SIGSEGVs while compiling crates/tonepoet-true-peak at
+# opt-level 3, in:
+#
+#   LoopVectorizePass::processLoop
+#     -> LoopVectorizationPlanner::executePlan
+#       -> VPlan::execute
+#         -> VPIRBasicBlock::execute
+#           -> VPIRPhi::execute
+#
+# Verified 2026-09-10 on two separate machines. The crash survives opt-level 2,
+# codegen-units=1, --force-vector-width=2, --interleave-loops=false and
+# -C target-cpu=native. Disabling the loop vectorizer is the only configuration
+# that builds. The same source compiles with vectorization enabled on rustc
+# 1.80.1 / LLVM 18, so this is a toolchain regression rather than a property of
+# the code.
+#
+# Measured cost: none worth recording. Built from identical source with only the
+# vectorizer toggled, the true-peak fast tier measured 1.683 / 1.683 / 1.678
+# s/min enabled and 1.683 / 1.676 / 1.685 s/min disabled, and the two binaries
+# differed by about 4 KB.
+#
+# This applies to the whole workspace, not just the crate that crashes, because
+# cargo has no per-package rustflags. Remove it once the toolchain no longer
+# crashes, or once the offending loop is restructured.
+#
+# Note: a RUSTFLAGS environment variable overrides this table entirely. If you
+# set RUSTFLAGS for any reason, include this flag yourself or release builds
+# will crash again.
+[build]
+rustflags = ["-C", "llvm-args=--vectorize-loops=false"]
