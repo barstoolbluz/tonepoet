@@ -32017,6 +32017,141 @@ mod album_true_peak_carrier_tests {
         }
     }
 
+    fn source_fact_test_track(source_ref: TrackSourceRef, sample_rate: u32) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref,
+            metadata: TrackMetadata::default(),
+            expected_samples: Some(u64::from(sample_rate)),
+            sample_rate: Some(sample_rate),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(sample_rate),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(24),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn untyped_dvda_source(root: &Path) -> TrackSourceRef {
+        TrackSourceRef::DvdaTrack {
+            volume_source: DvdaVolumeSourceRef::Directory {
+                root: root.join("AUDIO_TS"),
+            },
+            group_nr: 1,
+            title_set_nr: Some(1),
+            title_nr: Some(1),
+            title_ordinal: Some(1),
+            group_track_ordinal: 1,
+            ats_track_nr: Some(1),
+            samg_track_nr: None,
+            samg_ordinal: None,
+            sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
+            elementary_stream_kind_hint: None,
+            first_pts: 0,
+            len_in_pts: 90_000,
+            track_type: Some(0x01),
+            index_start: None,
+            downmix_matrix: None,
+            dvda_downmix_policy: DvdaDownmixPolicy::None,
+            title_table_offset: None,
+            title_len_in_pts: None,
+            title_track_count_declared: None,
+            title_index_count_declared: None,
+            audio_format_index: None,
+            expected_sample_rate: None,
+            expected_channel_count: None,
+            expected_bit_depth: None,
+            expected_channel_assignment_code: None,
+            expected_group1_sample_rate: None,
+            expected_group2_sample_rate: None,
+            expected_group1_bit_depth: None,
+            expected_group2_bit_depth: None,
+            expected_group1_channel_count: None,
+            expected_group2_channel_count: None,
+            sector_ranges: Vec::new(),
+            aob_files: Vec::new(),
+        }
+    }
+
+    fn dvd_video_source(root: &Path, channels: Option<u8>) -> TrackSourceRef {
+        TrackSourceRef::DvdVideoTrack {
+            source: root.join("VIDEO_TS"),
+            vts_number: 1,
+            title_number: 1,
+            angle_number: 1,
+            chapter_number: 1,
+            audio_stream_index: 0,
+            audio_coding: DvdVideoAudioCoding::Lpcm,
+            cell_sectors: Vec::new(),
+            vob_files: Vec::new(),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            channels,
+        }
+    }
+
+    fn bluray_source(root: &Path, channels: Option<u8>) -> TrackSourceRef {
+        TrackSourceRef::BluRayTrack {
+            source: root.join("BDMV"),
+            playlist_number: 1,
+            title_index: 0,
+            angle_number: 1,
+            chapter_number: 1,
+            chapter_start_pts_90k: 0,
+            chapter_end_pts_90k: Some(90_000),
+            audio_pid: 0x1100,
+            audio_stream_index: 0,
+            audio_coding: crate::disc::bluray_backend::BluRayAudioCoding::Lpcm,
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            channels,
+            channel_layout: None,
+        }
+    }
+
+    fn true_peak_test_request(root: &Path, container: &Path) -> PipelineRequest {
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.job_id = "true-peak-source-fact-test".to_string();
+        req.item_id = "true-peak-source-fact-test".to_string();
+        req.container = container.to_path_buf();
+        req.output_root = root.join("out");
+        req.log.root = root.join("logs");
+        req.stages = StagePolicy {
+            metadata: StageRequirement::Disabled,
+            replaygain: StageRequirement::Disabled,
+            features: StageRequirement::Disabled,
+            generate_cue: false,
+        };
+        req.failure_policy = FailurePolicy::FailAlbumOnAnyTrackFailure;
+        req
+    }
+
+    fn write_dff_with_zero_declared_channels(path: &Path) {
+        let file = fs::File::create(path).expect("create DFF fixture");
+        let mut writer = sacd_rs::dff_writer::DffWriter::new(file, 2, 2_822_400)
+            .expect("create DFF writer");
+        writer
+            .write_frame(&vec![0x69; 4_096])
+            .expect("write DFF payload");
+        writer.finish().expect("finish DFF fixture");
+
+        let mut bytes = fs::read(path).expect("read DFF fixture");
+        let chnl_offset = bytes
+            .windows(4)
+            .position(|window| window == b"CHNL")
+            .expect("DFF fixture contains CHNL chunk");
+        let channel_count_offset = chnl_offset + 12;
+        bytes[channel_count_offset..channel_count_offset + 2]
+            .copy_from_slice(&0_u16.to_be_bytes());
+        fs::write(path, bytes).expect("patch DFF channel count");
+    }
+
     #[tokio::test]
     async fn true_peak_source_facts_fall_back_to_realized_cue_carrier_probe() {
         use crate::convert::pipeline::tool::StubToolRunner;
@@ -32072,6 +32207,270 @@ mod album_true_peak_carrier_tests {
         let transcript = runner.transcript();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].binary, ToolBinary::Ffprobe);
+    }
+
+    #[tokio::test]
+    async fn true_peak_source_facts_fall_back_for_every_remaining_untyped_variant() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let realized = temp.path().join("realized-track.wav");
+        fs::write(&realized, b"probe is supplied by the stub runner").unwrap();
+
+        let mut dvda = source_fact_test_track(untyped_dvda_source(temp.path()), 96_000);
+        dvda.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(96_000),
+            Some(24),
+            Some(SourceAudioCoding::DvdaUnknown),
+        );
+        let cases = vec![
+            (
+                "staged file",
+                source_fact_test_track(TrackSourceRef::StagedFile(realized.clone()), 96_000),
+            ),
+            (
+                "embedded chapter carrier",
+                source_fact_test_track(
+                    TrackSourceRef::EmbeddedChapterCarrier {
+                        path: realized.clone(),
+                        source_image: temp.path().join("book.m4b"),
+                        start_sample: 0,
+                        samples: 96_000,
+                        carrier: CueSegmentCarrier::PcmS32LeWav,
+                    },
+                    96_000,
+                ),
+            ),
+            (
+                "image segment",
+                source_fact_test_track(
+                    TrackSourceRef::ImageSegment {
+                        image: temp.path().join("album.wav"),
+                        start_sample: 0,
+                        samples: 96_000,
+                    },
+                    96_000,
+                ),
+            ),
+            ("DVD-Audio track", dvda),
+            (
+                "DVD-Video track without typed channels",
+                source_fact_test_track(dvd_video_source(temp.path(), None), 96_000),
+            ),
+            (
+                "Blu-ray track without typed channels",
+                source_fact_test_track(bluray_source(temp.path(), None), 96_000),
+            ),
+        ];
+
+        for (label, track) in cases {
+            let before =
+                super::super::plan_bridge::source_info_for_realized_track(&track, &realized)
+                    .unwrap_or_else(|error| panic!("{label}: planner source facts: {error}"));
+            assert_eq!(before.channels, None, "{label}");
+            assert_eq!(before.sample_rate_hz, Some(96_000), "{label}");
+
+            let runner = StubToolRunner::new();
+            runner.push_output(ffprobe_source_fact_output(96_000, 2));
+            let resolved = source_info_for_true_peak_realized_track(
+                &track,
+                &realized,
+                &runner,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: realized source facts: {error}"));
+
+            assert_eq!(resolved.channels, Some(2), "{label}");
+            assert_eq!(resolved.sample_rate_hz, Some(96_000), "{label}");
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 1, "{label}");
+            assert_eq!(transcript[0].binary, ToolBinary::Ffprobe, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn true_peak_source_facts_prefer_realized_geometry_over_disc_metadata_channels() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let realized = temp.path().join("realized-track.wav");
+        fs::write(&realized, b"probe is supplied by the stub runner").unwrap();
+        let cases = [
+            (
+                "DVD-Video",
+                source_fact_test_track(dvd_video_source(temp.path(), Some(6)), 96_000),
+            ),
+            (
+                "Blu-ray",
+                source_fact_test_track(bluray_source(temp.path(), Some(8)), 96_000),
+            ),
+        ];
+
+        for (label, track) in cases {
+            let before =
+                super::super::plan_bridge::source_info_for_realized_track(&track, &realized)
+                    .unwrap_or_else(|error| panic!("{label}: planner source facts: {error}"));
+            assert_eq!(
+                before.channels, None,
+                "{label}: the base resolver intentionally does not treat disc metadata as realized-carrier geometry",
+            );
+
+            let runner = StubToolRunner::new();
+            runner.push_output(ffprobe_source_fact_output(96_000, 2));
+            let resolved = source_info_for_true_peak_realized_track(
+                &track,
+                &realized,
+                &runner,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: realized source facts: {error}"));
+
+            assert_eq!(
+                resolved.channels,
+                Some(2),
+                "{label}: true-peak preparation must use the realized carrier rather than stale or divergent disc metadata",
+            );
+            assert_eq!(resolved.sample_rate_hz, Some(96_000), "{label}");
+            let transcript = runner.transcript();
+            assert_eq!(transcript.len(), 1, "{label}");
+            assert_eq!(transcript[0].binary, ToolBinary::Ffprobe, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pcm_true_peak_preparation_consumes_resolved_staged_file_channels() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.wav");
+        fs::write(&source, b"conversion is supplied by the stub runner").unwrap();
+        let track = source_fact_test_track(TrackSourceRef::StagedFile(source.clone()), 96_000);
+        let mut req = true_peak_test_request(temp.path(), &source);
+        req.settings.pcm_true_peak.enabled = true;
+        req.settings.target_sample_rate = RateTarget::Source;
+        let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
+        let carrier_dir = temp.path().join("pcm-true-peak");
+        fs::create_dir_all(&carrier_dir).unwrap();
+        let runner = StubToolRunner::new();
+        runner.push_output(ffprobe_source_fact_output(96_000, 2));
+
+        // `expect_err` would require the Ok type to implement Debug.
+        // PreparedPcmTruePeakCarrier does not, and deriving it would cascade
+        // into tonepoet-pipeline, so the result is destructured instead.
+        // Streaming FFmpeg normally bypasses `ToolRunner` so progress can be
+        // parsed directly. This test needs the executor's injection scope for
+        // its transcript assertion and must not spawn a real FFmpeg process.
+        let cancel = CancellationToken::new();
+        let tool_paths = HashMap::new();
+        let preparation = prepare_pcm_true_peak_carrier_for_track(
+            &req,
+            track,
+            &staging,
+            &carrier_dir,
+            &runner,
+            &cancel,
+            &tool_paths,
+            None,
+        );
+        let error = match super::super::track_executor::with_injected_track_execution_runner_for_test(
+            preparation,
+        )
+        .await
+        {
+            Ok(_) => panic!("stub conversion must stop after source-fact resolution"),
+            Err(error) => error,
+        };
+
+        assert!(
+            !error.contains("no valid channel count")
+                && !error.contains("no valid source sample rate"),
+            "production PCM preparation must consume the ffprobe-resolved geometry: {error}",
+        );
+        let transcript = runner.transcript();
+        assert_eq!(
+            transcript.first().map(|record| record.binary),
+            Some(ToolBinary::Ffprobe),
+        );
+        assert!(
+            transcript.iter().any(|record| record.binary == ToolBinary::Ffmpeg),
+            "PCM preparation must advance into carrier rendering after resolving channels: {transcript:#?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn dsd_album_gain_preparation_consumes_resolved_staged_file_channels() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.dff");
+        write_dff_with_zero_declared_channels(&source);
+        let mut track = source_fact_test_track(TrackSourceRef::StagedFile(source.clone()), 2_822_400);
+        track.expected_samples = None;
+        track.bit_depth = None;
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(2_822_400),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        );
+
+        let before = super::super::plan_bridge::source_info_for_realized_track(&track, &source)
+            .expect("DFF source facts remain inspectable despite the diagnostic");
+        assert!(before.is_dsd());
+        assert_eq!(before.channels, Some(0));
+        assert_eq!(before.sample_rate_hz, Some(2_822_400));
+
+        let mut req = true_peak_test_request(temp.path(), &source);
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        req.settings.target_bit_depth =
+            BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+        req.settings
+            .dsd
+            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
+        let carrier_dir = temp.path().join("album-gain");
+        fs::create_dir_all(&carrier_dir).unwrap();
+        let runner = StubToolRunner::new();
+        runner.push_output(ffprobe_source_fact_output(2_822_400, 2));
+
+        let error = match prepare_album_gain_carrier_for_track(
+            &req,
+            track,
+            &staging,
+            &carrier_dir,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("stub reconstruction must stop after source-fact resolution"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("empty or truncated Float64 PCM carrier"),
+            "DSD preparation must advance past channel resolution into reconstruction: {error}",
+        );
+        assert!(
+            !error.contains("no valid channel count"),
+            "DSD preparation must consume the ffprobe-resolved channel count: {error}",
+        );
+        let transcript = runner.transcript();
+        assert_eq!(
+            transcript.first().map(|record| record.binary),
+            Some(ToolBinary::Ffprobe),
+        );
+        assert!(
+            transcript.iter().any(|record| record.binary == ToolBinary::Sox),
+            "DSD preparation must invoke reconstruction after resolving channels: {transcript:#?}",
+        );
     }
 
     #[tokio::test]

@@ -638,6 +638,16 @@ tokio::task_local! {
     static TRACK_EXECUTION_USE_INJECTED_RUNNER: ();
 }
 
+/// Route streaming FFmpeg/SoX commands through the injected `ToolRunner` for
+/// the duration of a test future instead of spawning the real streaming path.
+#[cfg(test)]
+pub(crate) async fn with_injected_track_execution_runner_for_test<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TRACK_EXECUTION_USE_INJECTED_RUNNER.scope((), future).await
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReferenceMaterializationPausePoint {
