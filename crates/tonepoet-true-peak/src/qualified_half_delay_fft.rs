@@ -694,13 +694,6 @@ impl QualifiedHalfDelayFft {
         self.kind.block_frames()
     }
 
-    /// Frames required to complete the current canonical overlap-save block.
-    /// Fast uses this to interleave block production with tile retirement even
-    /// when a caller supplies a very large input chunk.
-    pub(crate) fn frames_until_block(&self) -> usize {
-        self.kind.block_frames() - self.pending.len() / self.channels
-    }
-
     pub(crate) const fn fast90_same_graph_avx_active(&self) -> bool {
         self.fast90_same_graph_avx
     }
@@ -713,6 +706,7 @@ impl QualifiedHalfDelayFft {
         self.pending.len() / self.channels + 1 == self.kind.block_frames()
     }
 
+    #[cfg(test)]
     pub(crate) fn process_frame<F>(
         &mut self,
         frame: &[f64],
@@ -756,6 +750,7 @@ impl QualifiedHalfDelayFft {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn flush<F>(&mut self, emit: F) -> bool
     where
         F: FnMut(i128, &[f64], &[f64], &[f64], &[f64]),

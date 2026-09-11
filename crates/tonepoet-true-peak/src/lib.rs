@@ -189,14 +189,6 @@ pub(crate) enum ReconstructionId {
 
 impl ReconstructionId {
     #[must_use]
-    pub(crate) const fn target_factor(self) -> usize {
-        match self {
-            Self::LegacyHeadroom64 => 64,
-            Self::Hq1024V1 => 1024,
-        }
-    }
-
-    #[must_use]
     pub(crate) const fn reconstruction_linf_gain_upper(self) -> f64 {
         match self {
             Self::LegacyHeadroom64 => HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
@@ -428,13 +420,6 @@ pub(crate) struct InternalPeakCertificate {
     pub channel_upper_linear_peaks: Vec<f64>,
     pub status: SearchStatus,
     pub diagnostics: SearchDiagnostics,
-}
-
-impl InternalPeakCertificate {
-    #[cfg(test)]
-    pub(crate) fn upper_level(&self) -> PeakLevel { self.finite_interval.upper_level() }
-    #[cfg(test)]
-    pub(crate) fn interval_width_db(&self) -> Option<f64> { self.finite_interval.width_db() }
 }
 
 /// Streaming certified HQ1024V1 meter.
@@ -702,13 +687,6 @@ impl ReportingEngine {
             scratch: vec![0.0; factor * channels],
             channels,
         }
-    }
-
-    fn pre_post_frames(&self) -> i128 {
-        // libebur128 starts with calloc-zeroed interpolation state and does
-        // not synthesize samples before or after a finite stream.  Returning
-        // zero here keeps the shared streaming shell from adding either.
-        0
     }
 
     fn process_frame(

@@ -1782,6 +1782,7 @@ struct CertifiedScanner {
 }
 
 impl CertifiedScanner {
+    #[cfg(test)]
     fn new(spec: ReconstructionSpec, policy: SearchPolicy, channels: usize) -> Self {
         Self::new_at_rate(spec, policy, channels, 192_000)
     }
@@ -1798,17 +1799,6 @@ impl CertifiedScanner {
             channels,
             sample_rate_hz,
             FAST90_CREDITS_PER_TILE_CHANNEL,
-        )
-    }
-
-    fn new_with_fast_credits(
-        spec: ReconstructionSpec,
-        policy: SearchPolicy,
-        channels: usize,
-        fast_credits_per_tile_channel: u64,
-    ) -> Self {
-        Self::new_with_fast_credits_at_rate(
-            spec, policy, channels, 192_000, fast_credits_per_tile_channel,
         )
     }
 
@@ -3673,26 +3663,6 @@ impl CertifiedPeakMeterImpl {
         }
         self.engine.flush(&mut self.scanner);
         self.scanner.finalize(self.frames, &self.input_channel_peaks)
-    }
-}
-
-#[cfg(test)]
-pub(super) mod tests_support {
-    use super::*;
-
-    pub(super) fn legacy_root_curvature_upper() -> f64 {
-        legacy_tail_metadata().node_a_upper[1]
-    }
-
-    pub(super) fn hq_root_curvature_upper() -> f64 {
-        hq_tail_metadata().node_a_upper[1]
-    }
-
-    pub(super) fn tail_identity(reconstruction: ReconstructionId) -> (usize, f64, usize) {
-        let tail = ReconstructionSpec::for_id(reconstruction).tail();
-        let identity = tail.coefficient(0, 0);
-        let count = tail.nonzero_counts[0] as usize;
-        (tail.factor, identity, count)
     }
 }
 

@@ -1860,6 +1860,46 @@ async fn probe_realized_segment_with_tool_limits(
     parse_realized_probe_json(&output.stdout_tail)
 }
 
+/// Resolve planner source facts for true-peak analysis, using the realized
+/// carrier as the fallback authority for facts that are unavailable before
+/// realization. This is deliberately local to true-peak preparation: ordinary
+/// conversion planning keeps its existing source-fact semantics, while CUE
+/// fallback carriers and other decoded source shapes can still be measured
+/// with their actual channel geometry.
+async fn source_info_for_true_peak_realized_track(
+    track: &PreparedTrack,
+    realized_input: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<tonepoet_pipeline::SourceInfo, ConvertError> {
+    let mut source = super::plan_bridge::source_info_for_realized_track(track, realized_input)?;
+    let needs_channels = !matches!(source.channels, Some(channels) if channels > 0);
+    let needs_sample_rate = !matches!(source.sample_rate_hz, Some(rate) if rate > 0);
+    if !needs_channels && !needs_sample_rate {
+        return Ok(source);
+    }
+
+    let probe = probe_realized_segment_with_tool_limits(
+        realized_input,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await?;
+
+    if needs_channels {
+        source.channels = probe
+            .channels
+            .and_then(|channels| u16::try_from(channels).ok())
+            .filter(|channels| *channels > 0);
+    }
+    if needs_sample_rate {
+        source.sample_rate_hz = Some(probe.sample_rate);
+    }
+    Ok(source)
+}
+
 fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|err| {
         ConvertError::TrackValidation(format!("ffprobe JSON parse failed: {err}"))
@@ -31939,6 +31979,155 @@ mod album_true_peak_carrier_tests {
         }
     }
 
+    fn ffprobe_source_fact_output(sample_rate: u32, channels: u32) -> ToolOutput {
+        use crate::convert::pipeline::tool::ProcessExit;
+
+        let stdout = format!(
+            r#"{{
+  "streams": [{{
+    "codec_name": "pcm_s32le",
+    "sample_fmt": "s32",
+    "sample_rate": "{sample_rate}",
+    "channels": {channels},
+    "duration_ts": {sample_rate},
+    "time_base": "1/{sample_rate}",
+    "bits_per_raw_sample": "24"
+  }}],
+  "format": {{}}
+}}"#
+        );
+        ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: stdout.clone(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+            command: CommandRecord {
+                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                environment: BTreeMap::new(),
+                description: None,
+                binary: ToolBinary::Ffprobe,
+                sanitized_args: Vec::new(),
+                cwd: None,
+                env_keys: Vec::new(),
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: stdout,
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn true_peak_source_facts_fall_back_to_realized_cue_carrier_probe() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let realized = temp.path().join("cue-track.wav");
+        fs::write(&realized, b"probe is supplied by the stub runner").unwrap();
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::CueSegmentCarrier {
+                path: realized.clone(),
+                source_image: temp.path().join("album.flac"),
+                start_sample: 0,
+                samples: 96_000,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+            },
+            metadata: TrackMetadata::default(),
+            expected_samples: Some(96_000),
+            sample_rate: Some(96_000),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(96_000),
+                Some(24),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(24),
+            warnings: Vec::new(),
+        };
+
+        let before = super::super::plan_bridge::source_info_for_realized_track(&track, &realized)
+            .expect("planner source facts");
+        assert_eq!(before.channels, None);
+        assert_eq!(before.sample_rate_hz, Some(96_000));
+
+        let runner = StubToolRunner::new();
+        runner.push_output(ffprobe_source_fact_output(96_000, 2));
+        let cancel = CancellationToken::new();
+        let resolved = source_info_for_true_peak_realized_track(
+            &track,
+            &realized,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("realized carrier must supply missing true-peak geometry");
+
+        assert_eq!(resolved.channels, Some(2));
+        assert_eq!(resolved.sample_rate_hz, Some(96_000));
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].binary, ToolBinary::Ffprobe);
+    }
+
+    #[tokio::test]
+    async fn true_peak_source_facts_do_not_probe_when_typed_geometry_is_complete() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let realized = temp.path().join("stream-track.wav");
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::CueStreamSegment {
+                fallback_path: realized.clone(),
+                source_image: temp.path().join("album.wav"),
+                decode_path: temp.path().join("album.wav"),
+                start_sample: 0,
+                samples: 48_000,
+                image_samples: 48_000,
+                carrier: CueSegmentCarrier::PcmF64LeWav,
+                channels: 6,
+            },
+            metadata: TrackMetadata::default(),
+            expected_samples: Some(48_000),
+            sample_rate: Some(48_000),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(48_000),
+                Some(640),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(640),
+            warnings: Vec::new(),
+        };
+
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let resolved = source_info_for_true_peak_realized_track(
+            &track,
+            &realized,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("typed source facts should be sufficient");
+
+        assert_eq!(resolved.channels, Some(6));
+        assert_eq!(resolved.sample_rate_hz, Some(48_000));
+        assert!(
+            runner.transcript().is_empty(),
+            "complete typed facts must stay on the zero-probe path",
+        );
+    }
+
     #[test]
     fn true_peak_mapping_preserves_the_measured_point_without_runtime_reserve() {
         let point = tonepoet_true_peak::PeakLevel::Finite {
@@ -33208,13 +33397,20 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    let source = super::plan_bridge::source_info_for_realized_track(&track, &realized.path)
-        .map_err(|error| {
-            format!(
-                "could not resolve PCM facts for true-peak analysis on track {}: {error}",
-                track.id.source_ordinal,
-            )
-        })?;
+    let source = source_info_for_true_peak_realized_track(
+        &track,
+        &realized.path,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not resolve PCM facts for true-peak analysis on track {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
     if source.is_dsd() {
         return Err(format!(
             "track {} resolved to DSD and cannot participate in the PCM true-peak gain step",
@@ -33668,13 +33864,20 @@ async fn prepare_album_gain_carrier_for_track(
         )
     })?;
     let realization_elapsed = realization_started.elapsed();
-    let source = super::plan_bridge::source_info_for_realized_track(&track, &realized.path)
-        .map_err(|error| {
-            format!(
-                "could not resolve DSD facts for album peak analysis on track {}: {error}",
-                track.id.source_ordinal,
-            )
-        })?;
+    let source = source_info_for_true_peak_realized_track(
+        &track,
+        &realized.path,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not resolve DSD facts for album peak analysis on track {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
     if !source.is_dsd() {
         return Err(format!(
             "track {} was classified as DSD at materialization but its realized analysis input is not DSD; refusing to derive a batch gain from a decoded or ambiguous carrier",

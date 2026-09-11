@@ -91,14 +91,20 @@ impl Evaluation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FastExecutionMode {
     Production,
+    #[cfg(any(feature = "fast-stage-timing", test))]
     SurveyBoundsOnly,
+    #[cfg(any(feature = "fast-stage-timing", test))]
     NominationOnly,
 }
 
 impl FastExecutionMode {
     #[inline]
     fn stops_after_flat_bounds(self) -> bool {
-        matches!(self, Self::SurveyBoundsOnly | Self::NominationOnly)
+        match self {
+            Self::Production => false,
+            #[cfg(any(feature = "fast-stage-timing", test))]
+            Self::SurveyBoundsOnly | Self::NominationOnly => true,
+        }
     }
 }
 
@@ -436,6 +442,7 @@ impl TileHalfCache {
         self.values[offset] = Some(evaluation);
     }
 
+    #[cfg(test)]
     fn get(&self, m: i128) -> Evaluation {
         self.values[self.offset(m)].expect("requested half knot was reconstructed")
     }
