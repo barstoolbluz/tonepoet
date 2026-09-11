@@ -44,6 +44,7 @@ def main() -> int:
         qualified_prefix_verification = tmp / "qualified_prefix_verification.json"
         certified_report = tmp / "certified_search_report.json"
         fast_metadata = tmp / "fast066_metadata.json"
+        raw_screen_metadata = tmp / "raw_screen_metadata.json"
         fast_verification = tmp / "fast066_verification.json"
 
         run(
@@ -108,6 +109,26 @@ def main() -> int:
             fast_metadata,
         )
         require_identical(fast_metadata, QUALIFICATION / "fast066_metadata.json")
+
+        run(
+            PYTHON,
+            "-B",
+            QUALIFICATION / "generate_raw_screen_metadata.py",
+            "--crate",
+            CRATE_ROOT,
+            "--output",
+            raw_screen_metadata,
+        )
+        require_identical(raw_screen_metadata, QUALIFICATION / "raw_screen_metadata.json")
+        run(
+            PYTHON,
+            "-B",
+            QUALIFICATION / "test_raw_screen.py",
+            "--crate",
+            CRATE_ROOT,
+            "--metadata",
+            raw_screen_metadata,
+        )
 
         run(
             PYTHON,

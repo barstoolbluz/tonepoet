@@ -1,3 +1,6 @@
 /target
 **/target
 *.log
+
+# Model-exchange bundles (transient; do not version)
+*.tar.gz

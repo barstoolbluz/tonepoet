@@ -17,6 +17,27 @@ fn signal(frames: usize, channels: usize) -> Vec<f64> {
     out
 }
 
+/// Commissioning-only stage timing (`fast-stage-timing` feature) is wall-clock
+/// and non-deterministic; it is not part of the logical certificate. Chunk-
+/// invariance / clone equality assertions must exclude it. No-op unless the
+/// feature is built.
+#[allow(unused_mut)]
+fn strip_timing(mut certificate: tonepoet_true_peak::PeakCertificate) -> tonepoet_true_peak::PeakCertificate {
+    #[cfg(feature = "fast-stage-timing")]
+    {
+        let d = &mut certificate.diagnostics;
+        d.fast_stage_prefix_block_ingest_nanos = 0;
+        d.fast_stage_midpoint_survey_nanos = 0;
+        d.fast_stage_flat_envelope_nanos = 0;
+        d.fast_stage_candidate_refinement_nanos = 0;
+        d.fast_stage_nomination_nanos = 0;
+        d.fast_stage_proposal_nanos = 0;
+        d.fast_stage_finishing_nanos = 0;
+        d.fast_stage_finalize_nanos = 0;
+    }
+    certificate
+}
+
 #[test]
 fn public_surface_has_three_hq_tiers_with_explicit_contracts() {
     assert_eq!(PeakTier::default(), PeakTier::Standard);
@@ -92,10 +113,10 @@ fn fast066_is_chunk_invariant_including_exact_tile_and_fft_boundaries() {
             meter.finalize().unwrap()
         };
 
-        let whole = run(&[FRAMES]);
-        let one = run(&[1]);
-        let thirty_seven = run(&[37]);
-        let irregular = run(&[5, 1, 5879, 3, 257, 17, 6657, 4096]);
+        let whole = strip_timing(run(&[FRAMES]));
+        let one = strip_timing(run(&[1]));
+        let thirty_seven = strip_timing(run(&[37]));
+        let irregular = strip_timing(run(&[5, 1, 5879, 3, 257, 17, 6657, 4096]));
         assert_eq!(whole, one, "{edge:?}: whole vs one-frame");
         assert_eq!(whole, thirty_seven, "{edge:?}: whole vs 37-frame");
         assert_eq!(whole, irregular, "{edge:?}: whole vs irregular");
@@ -103,13 +124,61 @@ fn fast066_is_chunk_invariant_including_exact_tile_and_fft_boundaries() {
 }
 
 #[test]
+fn fast066_partial_clone_is_independent_of_completion_chunking() {
+    const FRAMES: usize = 5003;
+    const PREFIX: usize = 911;
+    let samples = signal(FRAMES, 2);
+    let mut base = CertifiedPeakMeter::new(
+        192_000,
+        2,
+        EdgePolicy::RepeatEndpoints,
+        PeakTier::Fast,
+    )
+    .unwrap();
+    base.push_interleaved(&samples[..PREFIX * 2]).unwrap();
+
+    let mut whole_tail = base.clone();
+    whole_tail.push_interleaved(&samples[PREFIX * 2..]).unwrap();
+
+    let mut prime_tail = base;
+    for chunk in samples[PREFIX * 2..].chunks(74) {
+        // 74 interleaved samples = 37 complete stereo frames.
+        prime_tail.push_interleaved(chunk).unwrap();
+    }
+    assert_eq!(strip_timing(whole_tail.finalize().unwrap()), strip_timing(prime_tail.finalize().unwrap()));
+}
+
+#[test]
+fn fast066_short_and_tile_boundary_lengths_are_chunk_invariant() {
+    for frames in [1usize, 2, 31, 32, 33, 255, 256, 257, 4095, 4096, 4097] {
+        let mut samples = vec![0.0_f64; frames];
+        samples[0] = 0.75;
+        if frames > 1 {
+            samples[frames - 1] = -0.125;
+        }
+        let run = |chunk_frames: usize| {
+            let mut meter = CertifiedPeakMeter::new(
+                192_000,
+                1,
+                EdgePolicy::ZeroExtend,
+                PeakTier::Fast,
+            )
+            .unwrap();
+            for chunk in samples.chunks(chunk_frames) {
+                meter.push_interleaved(chunk).unwrap();
+            }
+            meter.finalize().unwrap()
+        };
+        assert_eq!(strip_timing(run(frames)), strip_timing(run(37)), "frames={frames}");
+    }
+}
+
+#[test]
 fn fast066_pruning_ignores_future_validation_peak_in_the_same_caller_push() {
-    // The first full tile becomes retireable after roughly 5880 nominal frames
-    // with the qualified prefix's 777-frame leading halo and 6657-frame block.
-    // Put the decisive sample well after that point. A whole-push validator has
-    // seen it before tile 0 runs; one-frame streaming has not. Therefore any
-    // accidental use of the whole push's validation maximum as a pruning
-    // witness changes optional-work diagnostics and fails this regression.
+    // Put the decisive sample after tile 0 has enough native right context.
+    // A whole-push validator has seen it before tile 0 runs; one-frame streaming
+    // has not. Any accidental use of that future validation maximum as an
+    // earlier tile's lower witness therefore changes deterministic work.
     const FRAMES: usize = 8193;
     const FUTURE_PEAK_FRAME: usize = 7000;
     let mut samples = Vec::with_capacity(FRAMES);
@@ -138,11 +207,11 @@ fn fast066_pruning_ignores_future_validation_peak_in_the_same_caller_push() {
         meter.finalize().unwrap()
     };
 
-    let whole = run(&[FRAMES]);
-    let one = run(&[1]);
-    let irregular = run(&[5, 37, 5777, 3, 257, 19, 911]);
-    assert!(whole.diagnostics.fast_candidates_selected > 0);
-    assert!(whole.diagnostics.fast_fine_knots_evaluated > 0);
+    let whole = strip_timing(run(&[FRAMES]));
+    let one = strip_timing(run(&[1]));
+    let irregular = strip_timing(run(&[5, 37, 5777, 3, 257, 19, 911]));
+    assert!(whole.diagnostics.groups_expanded > 0);
+    assert!(whole.diagnostics.phase_evaluations > 0);
     assert_eq!(whole, one, "whole push vs one-frame push");
     assert_eq!(whole, irregular, "whole push vs irregular pushes");
 }

@@ -1,294 +1,327 @@
-# Fast066V2 implementation report
+# Fast066V2 native-input-screen implementation report
 
-Date: 2026-09-09
-Scope: `tonepoet-true-peak` crate
-Baseline source SHA-256: `604060fce4a9159383e7200cd35af7325a7ddce8f854bb13782bee93ff3e61d0`
-Design input: `fast066-v2-handoff-bundle(2).zip`
+Date: 2026-09-10
 
-## Result
+## Disposition
 
-This source implements Fast066V2 against the exact corrected V1 baseline named
-by the handoff. Reference, Standard, the frozen HQ1024 reconstruction, the
-qualified 2x prefix, tile/group geometry, finite-stream policy, and certificate
-reduction are unchanged. Fast's optional point-estimation work is replaced with
-the bounded 64-nominee / 8-finisher policy.
+This tree applies `qualification/FAST_INPUT_SCREEN_SPECIFICATION.md` to the
+frozen `tonepoet-true-peak` source bundle. The implementation replaces Fast's
+old full-stream reconstruction/fixed-work policy with the specified certified
+native-input screen, selective first-stage reconstruction, local HQ4 survey,
+and uncapped dyadic completion policy.
 
-No production performance claim is made from this execution environment. The
-container available for this implementation did not contain a Rust toolchain and
-could not reach a Rust distribution or package endpoint, so `cargo test`,
-release codegen, and the binding Rust wall-time gate could not be executed here.
-The source-round and independent numerical checks that *were* executable are
-listed below. This distinction is deliberate.
+The implementation is complete at source level and the offline mathematical
+qualification passes. This environment does not contain `cargo`, `rustc`, or
+`rustfmt`, so the Rust suite, release build, and target-machine wall-time
+commissioning could not be executed here. Those remain mandatory handoff gates;
+this report does not treat source inspection or Python qualification as a
+substitute for them.
 
-## Implemented Fast066V2 graph
+## Inputs and identity
 
-For each channel/tile the implementation now:
-
-1. executes the existing qualified 2x prefix and complete HQ4 survey;
-2. computes the existing outward A4/B4 flat bound for every 256-frame group,
-   stores at most 16 group uppers, and still reduces every upper into the final
-   certificate;
-3. computes the noninitial left-halo quarter-cell bound with the same formula so
-   a boundary candidate's complete optional-work domain is covered;
-4. compares whole-tile and per-candidate valid uppers only against
-   `channel_lower_peaks[channel]` in canonical processing order;
-5. nominates at most 64 HQ4 local maxima using the existing deterministic
-   spatial-plus-global policy and signed parabolic score;
-6. retains each valid fit's bounded integer proposal offset and evaluates or
-   reuses exactly one `q0` proposal for each surviving nominee;
-7. ranks proposal records by actual evaluated magnitude, then coordinate, then
-   nominee coordinate, and admits at most eight finishers;
-8. rechecks the candidate's complete-neighborhood upper against the improved
-   same-channel lower witness immediately before finishing;
-9. evaluates at most `q0-32` and `q0+32`; only a center winner with a valid
-   signed concave fit advances to at most `q1-1`, `q1`, and `q1+1`;
-10. never widens the search, iterates Newton-style, calls Standard/Reference, or
-    falls back to the removed V1 33-knot stencil.
-
-The structural fine-work ceiling is therefore 104 actual newly evaluated
-non-HQ4 knots per channel/tile. Survey-knot and same-finisher reuse can only
-reduce that count.
-
-## Numerical-envelope optimization
-
-The fine-tail arithmetic graph and frozen coefficients are unchanged. The
-implementation derives an outward maximum of all frozen phase L1 bounds once in
-`FastMetadata`. While the existing group/halo bounds are built, it also retains
-maximum approximate coarse magnitude and maximum qualified-prefix error over the
-complete possible fine-work support. These feed one conservative tail-error
-envelope per channel/tile.
-
-The hot fine-knot path therefore performs the existing short-tail dot product
-without rescanning 34 samples and prefix-error runs for every point. Integer
-coarse knots and reused HQ4 survey knots keep their existing tighter error
-handling. If the tile-wide common envelope overflows for exceptional finite
-magnitudes while a local support can still be represented, the implementation
-falls back only to the previous bounded per-knot numerical calculation. This
-preserves the supported large-finite behavior without reopening V1 search work
-or weakening any outward bound.
-
-## Rust falsification suite
-
-The V2 tests now target the scheduling and bound semantics behaviorally rather
-than relying on source-token checks or aggregate multi-tile counters.
-
-Private tests in `src/fast_scan.rs` include:
-
-- `v2_full_tile_capacity_and_work_ceiling_are_per_channel_tile`: pushes enough
-  input to retire exactly one nonfinal full mono tile without finalizing the
-  second. The deterministic carrier realizes 64 selected nominees, 64 evaluated
-  proposals, eight admitted finishers, and **104 actual newly evaluated non-HQ4
-  knots** in that single channel/tile. The test asserts those realized counts
-  and the 64/8/104 constants directly.
-- `v2_rejected_nominee_bound_encloses_every_hq_knot_and_records_same_channel_witness`:
-  records rejected-nominee evidence only under `#[cfg(test)]`, independently
-  reconstructs the frozen first stage, enumerates every HQ1024 knot in the
-  rejected clipped `D_i`, and checks each magnitude against the actual `U_i`
-  and the same-channel lower witness used at rejection.
-- `v2_cross_group_neighbor_prevents_center_group_only_rejection`: makes the
-  center group individually dominated while the adjacent group lifts the full
-  neighborhood upper above the witness, then exercises the real nominee probe
-  path and proves that the nominee is not rejected.
-- `v2_common_tail_envelope_covers_multiple_prefix_error_runs_and_boundary_supports`:
-  installs adjacent qualified-prefix blocks with different half-phase error
-  envelopes, exercises supports on each side of and across the run boundary for
-  every nonzero tail phase, and compares the cached error with the prior local
-  formula.
-- focused finishing regressions for a missing endpoint, invalid signed
-  curvature, a plateau/tie, and a larger +/-32 probe. Each checks actual fine
-  evaluation counter deltas so an unbracketed or invalid case cannot silently
-  start another search.
-- `v2_loud_then_quiet_gates_a_dominated_tile_and_quiet_first_gets_optional_work`:
-  exercises both tile-order directions and checks that loud-before-quiet can
-  gate a dominated tile while a quiet-first tile still receives bounded
-  optional work.
-
-The public integration regression
-`fast066_v2_dense_fixture_exercises_dominance_pruning_with_aggregate_sanity_caps`
-retains the useful 4,098-frame two-tile fixture for public-diagnostics coverage,
-but no longer claims to prove a per-tile quota. The private exact-one-tile test
-above is the quota authority.
-
-`tests/meter.rs` also contains
-`fast066_pruning_ignores_future_validation_peak_in_the_same_caller_push`. Its
-large sample is at frame 7000 in an 8,193-frame carrier, after the first full
-tile can retire in one-frame streaming. The first tile is materially quieter.
-Whole-push, one-frame, and irregular-push certificates, including diagnostics,
-must be identical. This makes accidental use of a caller-push future sample
-maximum as the pruning witness observable.
-
-No public audit log or per-tile production telemetry was added. Rejected-nominee
-audit state is test-only.
-
-## A/B/C/D commissioning
-
-The normal public constructor still exposes exactly three tiers. The existing
-`fast-stage-timing` feature continues to provide only V2 commissioning cuts B,
-C, and D inside the crate:
-
-- B: survey + bounds (`fast-survey`);
-- C: B + nomination (`fast-nominate`);
-- D: complete Fast066V2 (`fast`).
-
-Configuration A is deliberately **not** reintroduced into production code.
-`qualification/commission_fast066_v2.py` is an external driver that accepts the
-V1 archive separately and requires its SHA-256 to be exactly:
+Frozen source archive:
 
 ```text
-604060fce4a9159383e7200cd35af7325a7ddce8f854bb13782bee93ff3e61d0
+SHA-256  c0f2fd8647c6bd1bc67474bfff6053826fd19531a92d310b6538deaf952a7d07
+file     tonepoet-true-peak-api-frozen-2026-09-10.tar(1).gz
 ```
 
-The driver:
+Design bundle:
 
-1. hashes the carrier and source inputs before timed execution;
-2. extracts and runs A from the unchanged, digest-pinned V1 source;
-3. runs B and C from a disposable byte-checked copy of the V2 source;
-4. applies the strict C stop/go rule after normalizing to programme duration;
-5. if C is at or above 0.66 s/min, records the stop and does not commission D
-   for performance purposes;
-6. otherwise runs instrumented D for attribution and then uninstrumented D as
-   the binding wall-time gate;
-7. uses separate V1 and V2 Cargo target directories and records generated
-   `Cargo.lock` digests separately from the immutable source-tree identity; and
-8. atomically writes one JSON commissioning manifest.
+```text
+SHA-256  d3fd42634f0ecf953d6aced1745ec399caa6bb09d4b8cf7f8cd2c9b193fc65e7
+file     fast-input-screen-design(1).zip
+```
 
-The manifest identifies the A/B/C/D configuration, one carrier SHA-256, sample
-rate, channel count, frame count, programme duration, edge policy, V1 archive
-and source identity, V2 source identity, algorithm revision reported by each
-benchmark, `rustc -vV`, Cargo version, operator `RUSTFLAGS` and relevant Cargo
-codegen environment, both crates' release profiles, active SIMD backend,
-individual elapsed times, normalized seconds/programme minute, complete raw
-benchmark/certificate diagnostics and work counters, optional point-error
-statistics, the C stop/go decision, and final speed/accuracy gate state.
-Metadata and hashes are collected outside each benchmark executable's measured
-wall interval.
+The embedded specification is byte-identical to the design bundle's
+`SPECIFICATION.md`:
 
-`qualification/test_commission_fast066_v2.py` tests the strict normalized C
-threshold, result parsing, and A/B/C/D manifest orchestration against one
-synthetic carrier digest without pretending to execute Rust.
+```text
+SHA-256  8a7968b585aaf99a5ea9ef8d6ebf73e02f10f4fa30dfd33b6f94f6745d6b140f
+```
 
-## Qualification executed here
+The frozen HQ1024 coefficient source remains byte-identical to baseline:
 
-### Full source-round qualification
+```text
+SHA-256  7070c2e9abc255062dd30aaa516c0827d969d238759e14a61c5d1da94a67de9d
+```
 
-Executed:
+`Cargo.toml` and the workspace `Cargo.lock` are byte-identical to baseline.
+After comments and the new private `mod raw_screen_metadata;` declaration are
+removed, `src/lib.rs` is mechanically identical to baseline. No public type,
+method, constant, feature, or dependency was added or changed. In particular:
+
+- `FAST_ALGORITHM_REVISION` remains `Fast066V2`;
+- `FAST_WALL_NANOS_PER_PROGRAMME_MINUTE` remains `660_000_000`;
+- `PeakTier::Fast.interval_objective_db()` remains `None`;
+- the public three-tier constructor surface remains unchanged.
+
+## Implemented execution policy
+
+### Native-domain rejection
+
+`src/fast_scan.rs` now retains the raw PCM needed for canonical 4096-interval
+tiles plus a 777-frame halo. Per channel it computes exact sample-magnitude
+witnesses and 32-start second-difference summary bins, then applies the frozen
+native-domain enclosure
+
+```text
+P_g <= S_g + B_raw*S_g + A_raw*D_g
+```
+
+with generated private constants:
+
+```text
+RAW_A_UPPER             = 0x3ff02862ce0a81a1
+RAW_B_UPPER             = 0x3cce9970cbf12e12
+FAST_ACCEPT_RATIO_DOWN  = 0x3ff004b7e9b5ce5c
+```
+
+The screen uses 256-interval roots followed by 32-interval children. A child
+inherits the root curvature upper and recomputes only its endpoint-sample
+maximum. Raw rejection is strict against the same-channel `L4` witness; it does
+not use tolerance slack or the finer `Lall` witness.
+
+Subnormal raw operands, non-finite second-difference arithmetic, or an unusable
+rounding envelope make the cheap screen fail open. They cannot cause a false
+raw-domain rejection under DAZ/FTZ behavior.
+
+### Selective first-stage reconstruction
+
+Surviving child supports request native half centers `m=a-8..b+7`. Overlapping
+ranges are merged before work is selected.
+
+Sparse ranges use the frozen symmetric 1536-tap first stage directly:
+
+```text
+z[2*m+1] = sum(j=0..767)
+             h[j] * (x[m+768-j] + x[m-767+j])
+```
+
+The implementation has a scalar authority graph and an explicit AVX four-output
+batch. Sparse input copies cover only each merged FIR support, not the full tile
+halo. AVX capability is dispatched once per meter.
+
+The ordinary direct numerical envelope uses the specified conservative 3072-op
+account. The scale-aware exceptional graph has its own 6144-op account.
+
+For dense channel-pair masks, the existing qualified 8192-point executor is
+reused through a crate-private finite-window adapter. It resets history before
+and after an unrelated finite window, supplies the real absolute input index,
+flushes the final partial block, and retains only outputs whose complete FIR
+support lies in the supplied `[tile_start-777,tile_end+777]` window. The FFT
+plan/executor stays lazy and is never constructed for an all-rejected tile.
+
+The private sparse/dense crossover is currently 128 unique requested half
+centers per channel pair. This is a provisional deterministic value supported
+by the included screening fixture; the design requires selecting the shipping
+value from target-processor measurements at candidate thresholds 32, 64, 128,
+256, and 512. No runtime timing/autotuning was introduced.
+
+### Local survey and mandatory completion
+
+Each active span builds only the local coarse support it needs, evaluates the
+local frozen HQ4 survey, and applies the existing A4/B4 flat enclosure. The
+implementation keeps separate same-channel lower witnesses:
+
+- `L4`: exact native samples plus physically evaluated HQ4 values, used by the
+  raw screen;
+- `Lall`: all evaluated HQ1024 values, used during local completion.
+
+A competitive flat span enters the frozen dyadic tail hierarchy. Refinement is
+a covering partition: splitting a parent removes the parent from unresolved
+coverage and replaces it with its two children. The resolver visits the higher
+upper first, breaks ties toward the lower HQ coordinate, and has no retired
+64-nominee, 8-finisher, or 104-evaluation quota.
+
+Nodes retire only when dominated or when their same-channel upper/lower ratio
+meets the private 0.01 dB criterion. Width-one nodes reduce to their endpoint
+uppers. Packed-FFT numerical uncertainty that blocks the criterion triggers one
+channel-local direct first-stage rescore of that still-competitive span; there
+is no repeated direct/FFT oscillation.
+
+The exceptional scale-aware midpoint and tail arithmetic use independent
+rounding accounts attached to their actual graphs:
+
+```text
+MIDPOINT_EXTREME_ROUNDING_OPS = 64   # actual graph: 61 operations
+TAIL_EXTREME_ROUNDING_OPS     = 128  # actual graph: 103 operations
+```
+
+These accounts are intentionally distinct from the ordinary 48- and 96-op
+envelopes.
+
+### Streaming and certificate reduction
+
+Caller pushes are validated transactionally before measurement state moves.
+Input is then committed on canonical 4096-frame boundaries so caller chunking
+does not change tile readiness or pruning order. The maximum found while
+validating an entire caller push is retained for final sample-peak accounting,
+but it is not admitted as a future oracle into the raw-screen witness.
+
+Final per-channel uppers combine surviving terminal coverage with the
+independently valid frozen HQ1024 reconstruction norm cap. `Complete` is emitted
+only when no terminal unresolved coverage remains above the lower witness;
+adequately narrow but still terminal coverage produces `WorkLimited`.
+`TimeLimited` is never emitted by this Fast implementation.
+
+Retired nominee/proposal/finisher diagnostics remain part of the frozen public
+surface and remain zero.
+
+## Tests and qualification added or revised
+
+Rust regressions were added for the implementation obligations, including:
+
+- exact native-screen constants, all-phase support geometry, strict `L4`
+  rejection, and DAZ/FTZ fail-open behavior;
+- independent complete HQ4 comparison after pruning;
+- scalar/AVX direct-FIR enclosure checks;
+- sparse/direct versus dense/FFT reconstruction over the same requested span;
+- finite-window FFT retained-edge outputs versus the direct FIR;
+- parent-replacement semantics in the dyadic resolver;
+- removal of the former 104-evaluation completion limit;
+- per-channel 0.01 dB certificate width on hostile inputs;
+- independently known 0 dBTP windowed-multitone peak tests;
+- exact-tile/FFT-boundary chunk invariance, partial clone behavior, short edge
+  chunks, invalid-push transactional behavior, and the future-caller-push
+  witness regression;
+- silence, signed zero, subnormal, asymmetric stereo, and very large finite
+  input behavior.
+
+The positional benchmark keeps its existing interface and now checks the Fast
+per-channel 0.01 dB certificate-width gate. The `fast-stage-timing`
+commissioning declarations remain frozen. Since the retired nomination stage no
+longer exists, `SurveyBoundsOnly` and `NominationOnly` intentionally stop at the
+same post-flat-bound point; commissioning labels the latter
+`survey-bounds-only-compat` rather than claiming nomination work occurred.
+
+The external commissioning driver implements the required A/B/C/D comparison
+without putting V1 back into the crate. It verifies the pinned V1 archive
+SHA-256, runs A from that extracted source, runs B/C from the candidate source,
+applies the strict C `< 0.66 s/programme-minute` stop/go rule, then runs an
+instrumented D and a separately built uninstrumented binding D only when C
+passes. Instrumented V2 and binding D use distinct Cargo target directories.
+Fresh verbose prebuilds happen outside the benchmark timing boundary and capture
+the actual crate/example `rustc` invocations so the manifest records effective
+compiler/codegen flags rather than relying only on operator notes. Per-run
+records bind the input digest, edge policy, source-tree digest, build identity,
+algorithm revision, active SIMD backend, elapsed time, certificate/error data,
+and explicit V2 work counters.
+
+## Qualification executed in this environment
+
+The final source-round command was:
 
 ```text
 python3 -B qualification/run_offline_qualification.py
 ```
 
-Result: **pass**. The runner regenerated and byte-compared all frozen HQ1024 and
-qualified-prefix artifacts and regenerated the checked-in Fast066V2 metadata and
-verification reports. The V2 source audit reports **37/37** checks true. These
-are explicitly source obligations, not evidence that the Rust tests executed.
-The runner also executes the commissioning driver's Python unit tests. All
-qualification Python modules pass `py_compile`.
+Result: **PASS**.
 
-The exact-rational Fast flat-bound qualifier evaluated 22,539 dense knots across
-zero, constant, alternating, saw, impulse, and deterministic dyadic-random
-coarse arrays. All were enclosed. Candidate saturation observed 4096 synthetic
-local maxima, retained exactly 64 nominees, and represented all 16 spatial
-microgroups.
+It regenerated and byte-compared the frozen HQ1024 coefficients, qualified
+prefix artifacts, certified-search metadata, Fast metadata, and native-screen
+metadata. The exact native-screen suite passed all four tests, including all
+1025 frozen native phases, constant/affine identities, support/bin widening,
+and outward bounds. The commissioning Python suite passed all nine tests,
+including a synthetic strict-threshold stop case and compiler-invocation
+provenance parsing.
 
-### Independent V2 handoff numerical probes
+The selective source audit passes **69/69** obligations. It explicitly covers
+the ordinary and exceptional arithmetic accounts, raw fail-open conditions,
+strict `L4` pruning, selective direct FIR, lazy finite-window FFT, local HQ4 and
+flat bounds, uncapped dyadic completion, public/configuration freeze markers,
+streaming invariance hooks, the external A/B/C/D driver/provenance requirements,
+and required behavioral Rust regressions. The audit itself is static source
+evidence; it does not claim that Rust compiled or ran.
 
-The handoff's Python probes were rerun against the frozen coefficient source in
-this crate, not merely copied from the handoff.
+All qualification Python modules pass `py_compile`.
 
-For the selected 64-nominee / 8-finisher / step-32 policy:
-
-- all 14 base channel-cases matched the enumerated dense finite HQ1024 target to
-  floating-point noise;
-- worst absolute signed point error was approximately
-  `4.821637332766436e-15 dB`;
-- the largest observed per-channel/tile fine-query count was 102, below 104;
-- all 44 additional synthetic cases likewise matched the dense target to
-  floating-point noise;
-- worst absolute signed error on that extended set was approximately
-  `3.857309866213148e-15 dB`;
-- the largest observed extended-case per-tile count was 96.
-
-The independent frozen-coefficient fixture used by the exact-one-tile Rust quota
-regression was also checked separately and reaches 64 nominees, 64 proposals,
-eight finishers, and exactly 104 fine evaluations for the first tile. The
-future-input fixture places a 1.0 sample at frame 7000 while the modeled valid
-upper for the first quiet tile is approximately 0.039, so replacing the
-same-channel canonical lower witness with a whole-push validation maximum is a
-nonvacuous behavioral change.
-
-These are independent floating-model results. They are policy/coefficient and
-fixture evidence, not Rust execution or certificate tests.
-
-### Isolated C arithmetic probe
-
-The handoff's C prefix/midpoint microbenchmark was regenerated from the current
-crate coefficients, recompiled with `cc -O3 -mavx -ffp-contract=off`, and run for
-2000 iterations on this host. The result was:
-
-```json
-{"iterations":2000,"prefix_seconds":0.326599520,"midpoint_stereo_seconds":0.085284159,"prefix_s_per_min_192k_stereo":0.282591743,"midpoint_s_per_min_192k_stereo":0.073792513,"roundtrip_max_error":1.1102230246251565e-15}
-```
-
-This confirms only that the isolated arithmetic kernels remain inexpensive on
-this host. It does not establish Rust scanner throughput and is not the release
-gate.
-
-## Required operator gates
-
-Run the complete Rust suite against this exact bundle:
+The bundled 48 kHz stereo screening fixture was rerun using the implementation
+probe and its in-tree default metadata path. The produced JSON is byte-identical
+to `qualification/fixture_48k_screening_implementation.json`. Its workload-only
+result is:
 
 ```text
-cargo test
-cargo test --release
-cargo test --features fast-stage-timing
+native intervals across channels        95,998
+root groups                                 376
+roots rejected before reconstruction        362
+children tested                              112
+children rejected                             86
+surviving children                            26
+surviving native intervals                   832
+surviving interval fraction             0.866685%
+unique requested half centers              1,120
+max half centers in one channel/tile         192
+pair tiles dense at threshold 128              1
 ```
 
-Then run the new falsification regressions explicitly so failures are easy to
-localize:
+This fixture is not a wall-time benchmark and is not the 192 kHz release
+carrier.
+
+## Validation not executable here
+
+This environment has no `cargo`, `rustc`, or `rustfmt`. Consequently, none of
+the following is claimed to have run here:
+
+- Rust compilation or formatting;
+- `cargo test --release --no-fail-fast`;
+- the release benchmark executable;
+- scalar/AVX/DAZ/FTZ Rust behavioral tests;
+- the actual two-minute 192 kHz screening pilot;
+- target-processor sparse/dense crossover tuning;
+- the binding 0.66 s/programme-minute wall-time gate.
+
+The source therefore must be compiled and tested before merge. The private
+crossover value of 128 must also be confirmed or replaced from measurements on
+the shipping target; changing that private constant after commissioning does
+not change the public API or proof structure.
+
+## Required handoff commands
+
+From `crates/tonepoet-true-peak` with the intended Rust toolchain:
+
+```sh
+python3 -B qualification/run_offline_qualification.py
+
+RUSTFLAGS='-C llvm-args=--vectorize-loops=false' \
+CARGO_TARGET_DIR=target/fast-shipping \
+cargo test --release --no-fail-fast
+
+RUSTFLAGS='-C llvm-args=--vectorize-loops=false' \
+CARGO_TARGET_DIR=target/fast-shipping \
+cargo build --release --example bench_ceiling_f64le
+```
+
+Run `qualification/screening_probe.py` on the actual 120-second, 192 kHz
+carrier, then measure the five required private crossover candidates on the
+target processor. Finally run the shipping benchmark/commissioning workflow in
+`qualification/README.md` and require both the 0.01 dB accuracy/certificate
+criteria and the 0.66 s/programme-minute wall gate.
+
+## Principal modified files
 
 ```text
-cargo test v2_full_tile_capacity_and_work_ceiling_are_per_channel_tile
-cargo test v2_rejected_nominee_bound_encloses_every_hq_knot_and_records_same_channel_witness
-cargo test v2_cross_group_neighbor_prevents_center_group_only_rejection
-cargo test v2_common_tail_envelope_covers_multiple_prefix_error_runs_and_boundary_supports
-cargo test v2_finishing_
-cargo test v2_loud_then_quiet_gates_a_dominated_tile_and_quiet_first_gets_optional_work
-cargo test fast066_pruning_ignores_future_validation_peak_in_the_same_caller_push
+src/fast_scan.rs
+src/qualified_half_delay_fft.rs
+src/raw_screen_metadata.rs
+src/lib.rs                         # private module + documentation only
+examples/bench_ceiling_f64le.rs
+tests/fast_scan.rs
+tests/meter.rs
+qualification/FAST_INPUT_SCREEN_SPECIFICATION.md
+qualification/generate_raw_screen_metadata.py
+qualification/raw_screen_metadata.json
+qualification/test_raw_screen.py
+qualification/screening_probe.py
+qualification/fixture_48k_screening_*.json
+qualification/verify_fast_scan.py
+qualification/fast066_verification.json
+qualification/run_offline_qualification.py
+qualification/commission_fast066_v2.py
+qualification/test_commission_fast066_v2.py
+qualification/README.md
+README.md
 ```
 
-For commissioning, use the external A/B/C/D driver rather than invoking the V2
-cut points manually:
-
-```text
-python3 -B qualification/commission_fast066_v2.py \
-  --v1-archive /path/to/tonepoet-fast066-v1-implementation-corrected-2026-09-09.tar.gz \
-  --carrier /path/to/carrier.f64le \
-  --sample-rate 192000 \
-  --channels 2 \
-  --expected-point-dbtp <revalidated-dense-HQ-point> \
-  --rustflags '<operator release flags, including the vectorizer setting>' \
-  --output /path/to/fast066-commissioning.json
-```
-
-Start with the operator's known-good loop-vectorizer-disabled release setting,
-then retry default optimized codegen separately. The driver applies the C
-stop/go rule itself. If C is below 0.66 s/min it records both instrumented and
-binding D; if not, throughput commissioning stops at C and the mandatory path
-should be profiled before further Fast work.
-
-After the retained 192 kHz stereo carrier, run the agreed ordinary/stress corpus
-with Reference and Standard baselines unchanged. Release requires both the
-uninstrumented full-wall `<= 0.66 s/min` result and the agreed accuracy and
-certificate criteria. Until those Rust/operator runs exist, throughput remains
-**unverified, not failed**.
-
-## Follow-up inherited regression fixes
-
-A later regression check found three defects inherited from the supplied V1
-baseline rather than introduced by Fast066V2. The stale midpoint metadata test
-literal now matches the generated metadata authority
-(`0x1.f6beb654d7c8cp+0` = `1.9638475377212528`); the certified-scan
-test module imports `HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER`; and the
-test-only Legacy64 oracle again has its calibrated
-`update_channel_peaks_scaled` helper. No Fast066V2 production algorithm or
-numerical policy changed.
+No additional architecture, runtime dependency, public tuning knob, runtime
+clock, adaptive policy, or fallback to Standard/Reference was introduced.

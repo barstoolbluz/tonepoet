@@ -1,0 +1,45 @@
+{
+  "all_native_intervals_across_channels": 95998,
+  "channels": 2,
+  "counts": {
+    "channel_tiles": 24,
+    "channel_tiles_with_survivors": 12,
+    "child_groups_tested": 112,
+    "raw_rejected_children": 86,
+    "raw_rejected_roots": 362,
+    "root_groups": 376,
+    "surviving_children": 26,
+    "surviving_native_intervals": 832,
+    "unique_requested_half_knots": 1120
+  },
+  "dense_pair_tiles_for_candidate_half_knot_thresholds": {
+    "128": 1,
+    "256": 0,
+    "32": 6,
+    "512": 0,
+    "64": 4
+  },
+  "edge_policy": "repeat",
+  "frames": 48000,
+  "input_filename": "real_reference_48k_stereo.f64le",
+  "input_sha256": "b6ba8b041ebd87543f04f92267487937128acc9905fc743323567682ef77fd20",
+  "limitations": [
+    "Not a complete peak scanner or a wall-time benchmark.",
+    "No reconstructed lower-witness updates: survivor work is a conservative pilot estimate.",
+    "Dense pair decisions count the union of requested half-knot positions.",
+    "Ordinary finite input range only; exceptional floating-point behavior belongs in Rust tests."
+  ],
+  "maximum_requested_half_knots_in_one_channel_tile": 192,
+  "pair_tiles": 12,
+  "policy": {
+    "child_intervals": 32,
+    "halo_frames": 777,
+    "root_intervals": 256,
+    "screen_threshold": "same-channel sample-only lower witness; no tolerance slack",
+    "summary_bin_starts": 32,
+    "tile_intervals": 4096
+  },
+  "programme_seconds": 1.0,
+  "sample_rate_hz": 48000,
+  "surviving_interval_fraction": 0.008666847225983874
+}

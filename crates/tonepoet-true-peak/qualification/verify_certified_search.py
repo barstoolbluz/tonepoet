@@ -1168,26 +1168,28 @@ def audit() -> dict:
         and "pub struct ReportingPeakMeter" in lib_source
     )
     fast_source = FAST_RUST.read_text()
-    fast066_policy_is_fixed_work_and_fail_closed = (
+    # Fast066V2 now uses the certified native-input rejection design.  This
+    # cross-check intentionally verifies only the frozen public contract and
+    # high-level fail-closed search obligations; qualification/verify_fast_scan.py
+    # is the detailed authority for the private selective implementation.
+    fast066_policy_is_selective_and_fail_closed = (
         'FAST_ALGORITHM_REVISION: &str = "Fast066V2"' in lib_source
         and "FAST_WALL_NANOS_PER_PROGRAMME_MINUTE: u64 = 660_000_000" in lib_source
         and "FAST_WALL_SECONDS_PER_PROGRAMME_MINUTE" not in lib_source
         and "CertifiedPeakBackend::Fast(" in lib_source
         and "fast_scan::FastPeakMeterImpl::new" in lib_source
-        and "const TILE_FRAMES: i128 = 4096;" in fast_source
-        and "const GROUP_FRAMES: i128 = 256;" in fast_source
-        and "const MAX_NOMINEES_PER_TILE_CHANNEL: usize = 64;" in fast_source
-        and "const MAX_FINISHERS_PER_TILE_CHANNEL: usize = 8;" in fast_source
-        and "const FINISH_PROBE_STEP_Q: i128 = 32;" in fast_source
-        and "const MAX_FINE_EVALUATIONS_PER_TILE_CHANNEL: u64 = 104;" in fast_source
+        and "const TILE_INTERVALS: i128 = 4096;" in fast_source
+        and "const ROOT_INTERVALS: i128 = 256;" in fast_source
+        and "const CHILD_INTERVALS: i128 = 32;" in fast_source
+        and "const RAW_HALO_FRAMES: i128 = 777;" in fast_source
+        and "raw_group_upper" in fast_source
+        and "channel_l4_lower" in fast_source
+        and "fn resolve_span" in fast_source
+        and "ResolveNode" in fast_source
+        and "MAX_NOMINEES_PER_TILE_CHANNEL" not in fast_source
+        and "MAX_FINISHERS_PER_TILE_CHANNEL" not in fast_source
+        and "MAX_FINE_EVALUATIONS_PER_TILE_CHANNEL" not in fast_source
         and "STENCIL_POINTS" not in fast_source
-        and "fn refine_candidate" not in fast_source
-        and "fn candidate_neighborhood_upper" in fast_source
-        and "fn probe_nominees" in fast_source
-        and "fn finish_proposals" in fast_source
-        and "fn fine_evaluation_context" in fast_source
-        and "fast_flat_groups" in fast_source
-        and "fast_fine_knots_evaluated" in fast_source
         and "time_bounded_prefix_blocks_skipped" not in fast_source
         and "Instant::now" not in fast_source
         and "fast066_never_reports_time_limited_or_executes_retired_fast_machinery"
@@ -1291,7 +1293,7 @@ def audit() -> dict:
         ),
         "stale_msrv_workaround_is_retired": stale_msrv_workaround_is_retired,
         "public_surface_is_exactly_three_hq_tiers": public_surface_is_exactly_three_hq_tiers,
-        "fast066_policy_is_fixed_work_and_fail_closed": fast066_policy_is_fixed_work_and_fail_closed,
+        "fast066_policy_is_selective_and_fail_closed": fast066_policy_is_selective_and_fail_closed,
         "legacy_oracle_is_internal_only": legacy_oracle_is_internal_only,
         "benchmark_exposes_only_three_tiers": benchmark_exposes_only_three_tiers,
         "hq_runtime_omits_redundant_stage_tables_but_generator_retains_construction": (

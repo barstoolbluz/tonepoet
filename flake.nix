@@ -160,6 +160,16 @@
             rust-analyzer
             llvmPackages.libclang
             clang
+            # Offline true-peak qualification scripts (crates/tonepoet-true-peak/
+            # qualification/) need numpy, scipy, and mpmath. NOTE: the coefficient
+            # *regeneration* steps (generate_hq1024.py etc.) compare byte/FNV-exact
+            # against the checked-in frozen coefficients. That check reproduces only
+            # on the exact CPU + BLAS build that minted them: scipy.signal's LAPACK
+            # design drifts ~2 ULP (<=4.6e-16) across OpenBLAS microarchitecture
+            # kernels, independent of numpy/scipy version. So run_offline_qualification.py
+            # will not pass byte-exact on arbitrary hardware. The portable validator
+            # is the Rust suite's frozen-checksum integrity test, not this regen.
+            (python3.withPackages (ps: with ps; [ numpy scipy mpmath ]))
           ]);
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
