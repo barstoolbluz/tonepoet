@@ -15761,6 +15761,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(mode) = mode {
                 if app.convert.format.dsd_gain_mode.select_value(&mode) {
+                    app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!(
                         "dsd-gain = {}",
@@ -15781,6 +15782,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(scope) = scope {
                 if app.convert.format.dsd_auto_gain_scope.select_value(&scope) {
+                    app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!(
                         "dsd-gain-scope = {}",
@@ -15806,6 +15808,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                         .format
                         .dsd_gain_mode
                         .select_value(&DsdGainMode::Fixed);
+                    app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!("dsd-gain-db = {}", parsed.render(false)));
                 }
@@ -15825,6 +15828,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     .select_value(&DsdGainMode::Auto)
                 {
                     app.convert.format.dsd_auto_gain_margin_db = parsed;
+                    app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!("dsd-auto-margin = {}", parsed.render(false)));
                 } else {
@@ -15846,6 +15850,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                         .format
                         .dsd_gain_mode
                         .select_value(&DsdGainMode::NormalizePeak);
+                    app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!(
                         "dsd-normalize-target = {}",
@@ -22909,6 +22914,7 @@ mod source_relative_set_command_tests {
             path: std::path::PathBuf::from("source.flac"),
             info: Some(SourceInfo {
                 sample_format_is_float: None,
+                compression_is_lossless: None,
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(24),

@@ -170,11 +170,10 @@ enum Commands {
         #[arg(long = "dsd-auto-gain-scope", value_name = "track|album")]
         dsd_auto_gain_scope: Option<String>,
 
-        /// Album true-peak scan: reference <=0.030 dB, fast <=0.044 dB, fastest <=0.084 dB
-        /// one-sided under-read; valid only with album-scoped automatic DSD gain.
+        /// Certified album true-peak scan tier; valid only with album-scoped automatic DSD gain.
         #[arg(
             long = "dsd-true-peak-scan",
-            value_name = "reference|fast|fastest"
+            value_name = "reference|standard|fast"
         )]
         dsd_true_peak_scan: Option<String>,
 
@@ -1148,10 +1147,10 @@ fn apply_cli_dsd_reference_settings(
 
     let requested_scan = match true_peak_scan.map(|value| value.to_ascii_lowercase()) {
         Some(value) if value == "reference" => Some(DsdTruePeakScanMode::Reference),
+        Some(value) if value == "standard" => Some(DsdTruePeakScanMode::Standard),
         Some(value) if value == "fast" => Some(DsdTruePeakScanMode::Fast),
-        Some(value) if value == "fastest" => Some(DsdTruePeakScanMode::Fastest),
         Some(value) => anyhow::bail!(
-            "invalid --dsd-true-peak-scan '{value}'; expected reference, fast, or fastest"
+            "invalid --dsd-true-peak-scan '{value}'; expected reference, standard, or fast"
         ),
         None => None,
     };
@@ -1516,9 +1515,9 @@ mod dsd_reference_cli_settings_tests {
             None,
             None,
             Some("track"),
-            Some("fastest"),
+            Some("standard"),
         )
-        .expect_err("fast scan is meaningful only for album automatic gain");
+        .expect_err("true-peak scan tier is meaningful only for album automatic gain");
 
         assert!(
             error

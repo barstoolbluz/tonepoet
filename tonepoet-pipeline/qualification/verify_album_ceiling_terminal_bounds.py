@@ -2,8 +2,11 @@
 """Offline audit of album NormalizePeak terminal-error constants.
 
 Developer qualification only. This file is not referenced by Cargo, build.rs,
-flake.nix, or runtime code. Coefficients are transcribed from the pinned SoX-ng
-14.8.0.1 source revision 324b8cf873fd7836e8848bd87f7a90d8faa6f849.
+flake.nix, or runtime code. SoX coefficients are transcribed from the pinned
+SoX-ng 14.8.0.1 source revision
+324b8cf873fd7836e8848bd87f7a90d8faa6f849. The true-peak reconstruction is
+owned and independently qualified by the fixed ``tonepoet-true-peak``
+dependency; this audit checks only its public L-infinity integration constant.
 """
 from __future__ import annotations
 
@@ -14,37 +17,8 @@ import pathlib
 import re
 
 
-OVERSAMPLE = 64
-HALF_DELAY_TAPS = 384
-LATER_TAPS = (49, 25, 17, 13, 9)
-HEADROOM_RECONSTRUCTION_LINF_UPPER = 4.09
-
-# Diagnostic upward-rounded target-LSB bounds for the *interior LTI* terminal
-# perturbation. These combine the selected SoX shaping transfer with
-# Tonepoet's uncalibrated Headroom64x reconstruction, but they deliberately are
-# NOT production authority: the product uses RepeatEndpoints, whose finite edge
-# operator can repeat a worst stored error outside the stream. Production uses
-# stored-sample support * HEADROOM_RECONSTRUCTION_LINF_UPPER until an edge-aware
-# combined proof exists.
-EXPECTED_INTERIOR_RECONSTRUCTED = {
-    "lipshitz-44100": 41.402224,
-    "f-weighted-46000": 93.070747,
-    "modified-e-weighted-46000": 23.193027,
-    "improved-e-weighted-46000": 161.644890,
-    "shibata-48000": 101.321908,
-    "shibata-44100": 129.439766,
-    "shibata-37800": 61.646534,
-    "shibata-32000": 34.863781,
-    "shibata-22050": 9.323517,
-    "shibata-16000": 11.839719,
-    "shibata-11025": 11.950629,
-    "shibata-8000": 12.723352,
-    "low-shibata-48000": 44.793089,
-    "low-shibata-44100": 53.131788,
-    "high-shibata-44100": 239.334865,
-    "gesemann-44100": 46.558393,
-    "gesemann-48000": 42.477318,
-}
+CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME = "HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER"
+CERTIFIED_RECONSTRUCTION_LINF_UPPER_EXPECTED = 4.68
 
 FIR = {
     "lipshitz-44100": [2.033, -2.165, 1.959, -1.590, .6149],
@@ -79,90 +53,40 @@ GESEMANN = {
 
 
 
-def parse_headroom_half_coefficients(path: pathlib.Path):
+
+def parse_frozen_public_reconstruction_linf(path: pathlib.Path) -> float:
+    """Read the fixed true-peak dependency's public reconstruction bound.
+
+    This qualification owns the terminal-error proof, not the true-peak
+    reconstruction proof. The standalone crate independently qualifies
+    HQ1024V1 and exposes only the conservative L-infinity upper that pipeline
+    code needs for deterministic error propagation. Keep this check at the
+    public API boundary rather than coupling the pipeline to private HQ1024
+    coefficient tables or reconstruction internals.
+    """
     text = path.read_text(encoding="utf-8")
-    body = text.split("[", 2)[-1].rsplit("]", 1)[0]
-    values = [float(token) for token in re.findall(r"[-+]?\d+\.\d+e[-+]\d+", body, re.I)]
-    if len(values) != HALF_DELAY_TAPS // 2:
-        raise RuntimeError(f"expected 192 checked-in Headroom coefficients, found {len(values)}")
-    return values + list(reversed(values))
-
-
-def generic_two_x(taps: int):
-    center = (taps - 1) / 2.0
-    h = []
-    for tap in range(taps):
-        x = (tap - center) / 2.0
-        sinc = 1.0 if x == 0.0 else math.sin(math.pi * x) / (math.pi * x)
-        phase = tap / (taps - 1)
-        window = 0.42 - 0.5 * math.cos(2.0 * math.pi * phase) + 0.08 * math.cos(4.0 * math.pi * phase)
-        h.append(sinc * window)
-    for branch in range(2):
-        total = sum(h[branch::2])
-        for tap in range(branch, taps, 2):
-            h[tap] /= total
-    return h
-
-
-def convolve(a, b):
-    out = [0.0] * (len(a) + len(b) - 1)
-    # Put the shorter vector in the inner loop. The Headroom cascade remains
-    # small enough that this stdlib-only qualification is comfortably fast.
-    if len(a) < len(b):
-        a, b = b, a
-    for i, x in enumerate(a):
-        if x == 0.0:
-            continue
-        for j, y in enumerate(b):
-            if y != 0.0:
-                out[i + j] += x * y
-    return out
-
-
-def build_headroom_impulse(half_delay):
-    stage1 = [0.0] * (2 * HALF_DELAY_TAPS + 1)
-    stage1[HALF_DELAY_TAPS] = 1.0
-    stage1[1 : 2 * HALF_DELAY_TAPS : 2] = half_delay
-    filters = [stage1] + [generic_two_x(taps) for taps in LATER_TAPS]
-    response = [1.0]
-    for h in filters:
-        up = [0.0] * (2 * len(response) - 1)
-        up[::2] = response
-        response = convolve(up, h)
-    return response
-
-
-def polyphase_l1(response):
-    values = [sum(abs(v) for v in response[phase::OVERSAMPLE]) for phase in range(OVERSAMPLE)]
-    phase = max(range(OVERSAMPLE), key=values.__getitem__)
-    return values[phase], phase
-
-
-def convolved_polyphase_l1(headroom_impulse, original_rate_transfer):
-    # Upsampling an original-rate error transfer by 64 does not mix 64x
-    # phases. Therefore each reconstructed phase is simply the convolution of
-    # one Headroom polyphase sequence with the original-rate transfer. This is
-    # equivalent to constructing the enormous sparse 64x convolution, without
-    # either memory blow-up or a dependency on NumPy/SciPy.
-    best = -1.0
-    best_phase = 0
-    for phase in range(OVERSAMPLE):
-        phase_response = headroom_impulse[phase::OVERSAMPLE]
-        value = sum(abs(v) for v in convolve(phase_response, original_rate_transfer))
-        if value > best:
-            best = value
-            best_phase = phase
-    return best, best_phase
-
-
-def reconstructed_support_lsb(headroom_impulse, transfer, omitted_transfer_l1=0.0):
-    combined_l1, phase = convolved_polyphase_l1(headroom_impulse, transfer)
-    # For a truncated stable-IIR transfer, the omitted original-rate L1 mass
-    # can contribute at most ||H||_inf times that mass after reconstruction.
-    combined_upper = combined_l1 + HEADROOM_RECONSTRUCTION_LINF_UPPER * omitted_transfer_l1
-    support = 1.5 * combined_upper
-    return support, {"combined_l1": combined_l1, "phase": phase, "omitted_transfer_l1_upper": omitted_transfer_l1}
-
+    match = re.search(
+        rf"pub\s+const\s+{re.escape(CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME)}"
+        r"\s*:\s*f64\s*=\s*([^;]+);",
+        text,
+    )
+    if match is None:
+        raise RuntimeError(
+            f"missing public {CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME} in {path}"
+        )
+    try:
+        value = float(match.group(1).replace("_", "").strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"could not parse public {CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME}"
+        ) from exc
+    if value != CERTIFIED_RECONSTRUCTION_LINF_UPPER_EXPECTED:
+        raise RuntimeError(
+            f"{CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME} drifted: "
+            f"expected {CERTIFIED_RECONSTRUCTION_LINF_UPPER_EXPECTED:.17g}, "
+            f"found {value:.17g}"
+        )
+    return value
 
 def matrix_mul(a, b):
     return [[sum(x*y for x, y in zip(row, col)) for col in zip(*b)] for row in a]
@@ -183,17 +107,14 @@ def norm_inf(a):
     return max(sum(abs(v) for v in row) for row in a)
 
 
-def gesemann_transfer_and_tail(coefs):
+def gesemann_output_l1_bound(coefs):
     a, b = coefs[:4], coefs[4:]
     errors = [0.0] * 4
     outputs = [0.0] * 4
-    transfer = []
     output_partial = 0.0
     for n in range(512):
         e = 1.0 if n == 0 else 0.0
         output = sum(a[j] * errors[j] for j in range(4)) - sum(b[j] * outputs[j] for j in range(4))
-        # Stored perturbation relative to the undithered input is e - output.
-        transfer.append(e - output)
         output_partial += abs(output)
         errors = [e] + errors[:-1]
         outputs = [output] + outputs[:-1]
@@ -220,12 +141,7 @@ def gesemann_transfer_and_tail(coefs):
     # reconstructed multiplier upward by much more than this amount.
     tail += 1e-12
     output_l1_upper = output_partial + tail
-    return transfer, tail, output_l1_upper, {"block": k, "q": q, "tail": tail}
-
-
-def gesemann_output_l1_upper(coefs):
-    _, _, output_l1_upper, proof = gesemann_transfer_and_tail(coefs)
-    return output_l1_upper, proof
+    return output_l1_upper, {"block": k, "q": q, "tail": tail}
 
 
 def main():
@@ -240,16 +156,9 @@ def main():
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
-    half_delay = parse_headroom_half_coefficients(
-        repo_root / "crates" / "tonepoet-true-peak" / "src" / "headroom64_coefficients.rs"
+    reconstruction_linf_upper = parse_frozen_public_reconstruction_linf(
+        repo_root / "crates" / "tonepoet-true-peak" / "src" / "lib.rs"
     )
-    headroom_impulse = build_headroom_impulse(half_delay)
-    headroom_linf, headroom_phase = polyphase_l1(headroom_impulse)
-    if headroom_linf > HEADROOM_RECONSTRUCTION_LINF_UPPER:
-        raise RuntimeError(
-            f"Headroom reconstruction L-inf {headroom_linf:.17g} exceeds frozen upper "
-            f"{HEADROOM_RECONSTRUCTION_LINF_UPPER:.17g}"
-        )
 
     fir_report = {}
     for name, coefs in FIR.items():
@@ -258,44 +167,21 @@ def main():
         ceiling = math.ceil(support)
         if ceiling != EXPECTED[name]:
             raise RuntimeError(f"{name}: expected {EXPECTED[name]}, derived {ceiling}")
-        transfer = [1.0] + [-value for value in coefs]
-        reconstructed, reconstructed_proof = reconstructed_support_lsb(
-            headroom_impulse, transfer
-        )
-        if reconstructed > EXPECTED_INTERIOR_RECONSTRUCTED[name]:
-            raise RuntimeError(
-                f"{name}: reconstructed support {reconstructed:.17g} exceeds frozen "
-                f"{EXPECTED_INTERIOR_RECONSTRUCTED[name]:.17g}"
-            )
         fir_report[name] = {
             "coefficient_l1": l1,
             "support_lsb": support,
             "ceiling_lsb": ceiling,
-            "interior_lti_reconstructed_support_lsb": reconstructed,
-            "interior_lti_reconstructed_ceiling_lsb": EXPECTED_INTERIOR_RECONSTRUCTED[name],
-            "interior_lti_reconstructed_proof": reconstructed_proof,
         }
 
     iir_report = {}
     for name, coefs in GESEMANN.items():
-        transfer, transfer_tail, output_l1, proof = gesemann_transfer_and_tail(coefs)
+        output_l1, proof = gesemann_output_l1_bound(coefs)
         support = 1.5 * (1.0 + output_l1)
         if support >= 22.0:
             raise RuntimeError(f"{name}: 22-LSB production bound not established: {support}")
-        reconstructed, reconstructed_proof = reconstructed_support_lsb(
-            headroom_impulse, transfer, transfer_tail
-        )
-        if reconstructed > EXPECTED_INTERIOR_RECONSTRUCTED[name]:
-            raise RuntimeError(
-                f"{name}: reconstructed support {reconstructed:.17g} exceeds frozen "
-                f"{EXPECTED_INTERIOR_RECONSTRUCTED[name]:.17g}"
-            )
         iir_report[name] = {
             "output_l1_upper": output_l1,
             "support_lsb_upper": support,
-            "interior_lti_reconstructed_support_lsb_upper": reconstructed,
-            "interior_lti_reconstructed_ceiling_lsb": EXPECTED_INTERIOR_RECONSTRUCTED[name],
-            "interior_lti_reconstructed_proof": reconstructed_proof,
             **proof,
         }
 
@@ -309,16 +195,19 @@ def main():
 
     report = {
         "pinned_sox_ng_revision": "324b8cf873fd7836e8848bd87f7a90d8faa6f849",
-        "headroom_reconstruction_linf": {
-            "derived": headroom_linf,
-            "phase": headroom_phase,
-            "frozen_upper": HEADROOM_RECONSTRUCTION_LINF_UPPER,
+        "certified_reconstruction_linf": {
+            "public_constant": CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME,
+            "fixed_dependency_value": reconstruction_linf_upper,
+            "expected_frozen_value": CERTIFIED_RECONSTRUCTION_LINF_UPPER_EXPECTED,
+            "proof_owner": "crates/tonepoet-true-peak",
         },
         "fir": fir_report,
         "gesemann": iir_report,
         "high_rate_classic_shaper_fallback_lsb": 1.5,
-        "repeat_endpoints_production_rule": "stored_sample_error_lsb * headroom_reconstruction_linf_upper",
-        "high_rate_classic_shaper_repeat_edge_safe_lsb": 1.5 * HEADROOM_RECONSTRUCTION_LINF_UPPER,
+        "repeat_endpoints_production_rule": (
+            "stored_sample_error_lsb * HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER"
+        ),
+        "high_rate_classic_shaper_repeat_edge_safe_lsb": 1.5 * reconstruction_linf_upper,
     }
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.report:

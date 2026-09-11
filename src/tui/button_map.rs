@@ -53,6 +53,7 @@ pub enum TuiButton {
     PcmTruePeakBoostPill(usize),
     PcmTruePeakScanPill(usize),
     PcmTruePeakTargetField,
+    PcmGainDbField,
     NoiseShaperPill(usize),
     ModulatorOrderPill(usize),
     ConversionPresetPill(usize),
@@ -599,6 +600,7 @@ impl TuiButton {
             | Self::PcmTruePeakBoostPill(_)
             | Self::PcmTruePeakScanPill(_)
             | Self::PcmTruePeakTargetField
+            | Self::PcmGainDbField
             | Self::NoiseShaperPill(_)
             | Self::ModulatorOrderPill(_)
             | Self::ConversionPresetPill(_)

@@ -13,6 +13,10 @@ pub struct SourceInfo {
     /// Source storage class when the decoder preserves it. `None` means the
     /// carrier does not expose a trustworthy integer/float distinction.
     pub sample_format_is_float: Option<bool>,
+    /// Compression losslessness when it can be established from the encoded
+    /// carrier itself. This is intentionally independent of decoded PCM sample
+    /// format: WavPack hybrid streams decode to PCM but are not lossless.
+    pub compression_is_lossless: Option<bool>,
     pub sample_rate: u32,
     pub channels: u32,
     pub channel_layout: String,
@@ -352,6 +356,221 @@ fn friendly_codec_name(name: &str) -> String {
     }
 }
 
+/// WavPack's block-header hybrid flag is the authoritative distinction
+/// between normal lossless streams and hybrid/lossy streams. WavPack permits
+/// wrapper/tag bytes before and between blocks, so search forward with the
+/// same 1 MiB skipped-byte bound used by the reference decoder. Stop at the
+/// first actual audio block; malformed, truncated, or indeterminate inputs
+/// remain fail-neutral rather than changing a conversion default.
+const WAVPACK_BLOCK_HEADER_LEN: usize = 32;
+const WAVPACK_HYBRID_FLAG: u32 = 1 << 3;
+const WAVPACK_MAX_PREFIX_BLOCKS: usize = 64;
+const WAVPACK_HEADER_SEARCH_LIMIT: u64 = 1024 * 1024;
+const WAVPACK_HEADER_SEARCH_CHUNK_LEN: usize = 64 * 1024;
+const WAVPACK_MIN_STREAM_VERSION: u16 = 0x402;
+const WAVPACK_MAX_STREAM_VERSION: u16 = 0x410;
+const WAVPACK_MAX_CK_SIZE_EXCLUSIVE: u32 = 1 << 20;
+const WAVPACK_MAX_PLAUSIBLE_BLOCK_SAMPLES: u32 = 0x2ffff;
+
+#[derive(Debug, Clone, Copy)]
+struct WavPackProbeHeader {
+    block_end: u64,
+    block_samples: u32,
+    flags: u32,
+}
+
+fn wavpack_compression_is_lossless(path: &Path) -> Option<bool> {
+    match read_wavpack_compression_is_lossless(path) {
+        Ok(fact) => fact,
+        Err(error) => {
+            log::debug!(
+                "WavPack compression-mode probe failed for '{}': {}",
+                path.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
+fn parse_wavpack_probe_header(
+    header: &[u8],
+    offset: u64,
+    file_len: u64,
+) -> Option<WavPackProbeHeader> {
+    if header.len() < WAVPACK_BLOCK_HEADER_LEN || &header[0..4] != b"wvpk" {
+        return None;
+    }
+
+    // Match the reference decoder's inexpensive plausibility checks before
+    // trusting fields from a candidate signature found in arbitrary wrapper
+    // bytes. ckSize excludes the 8-byte ckID/ckSize prefix.
+    let ck_size = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    if ck_size < 24 || ck_size >= WAVPACK_MAX_CK_SIZE_EXCLUSIVE || ck_size & 1 != 0 {
+        return None;
+    }
+
+    let version = u16::from_le_bytes(header[8..10].try_into().ok()?);
+    if !(WAVPACK_MIN_STREAM_VERSION..=WAVPACK_MAX_STREAM_VERSION).contains(&version) {
+        return None;
+    }
+
+    let block_samples = u32::from_le_bytes(header[20..24].try_into().ok()?);
+    if block_samples > WAVPACK_MAX_PLAUSIBLE_BLOCK_SAMPLES {
+        return None;
+    }
+
+    let block_len = u64::from(ck_size).checked_add(8)?;
+    let block_end = offset.checked_add(block_len)?;
+    if block_end > file_len {
+        return None;
+    }
+
+    let flags = u32::from_le_bytes(header[24..28].try_into().ok()?);
+    Some(WavPackProbeHeader {
+        block_end,
+        block_samples,
+        flags,
+    })
+}
+
+fn read_wavpack_probe_header_at(
+    file: &mut std::fs::File,
+    path: &Path,
+    offset: u64,
+    file_len: u64,
+) -> Result<Option<WavPackProbeHeader>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if offset
+        .checked_add(WAVPACK_BLOCK_HEADER_LEN as u64)
+        .is_none_or(|end| end > file_len)
+    {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(offset)).map_err(|error| {
+        format!(
+            "seek WavPack block header at byte {offset} in '{}': {error}",
+            path.display()
+        )
+    })?;
+    let mut header = [0u8; WAVPACK_BLOCK_HEADER_LEN];
+    file.read_exact(&mut header).map_err(|error| {
+        format!(
+            "read WavPack block header at byte {offset} in '{}': {error}",
+            path.display()
+        )
+    })?;
+
+    Ok(parse_wavpack_probe_header(&header, offset, file_len))
+}
+
+fn find_next_wavpack_probe_header(
+    file: &mut std::fs::File,
+    path: &Path,
+    search_start: u64,
+    file_len: u64,
+) -> Result<Option<WavPackProbeHeader>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Normal WavPack files start directly with an audio block, so preserve the
+    // existing 32-byte fast path without allocating the bounded search buffer.
+    if let Some(header) = read_wavpack_probe_header_at(file, path, search_start, file_len)? {
+        return Ok(Some(header));
+    }
+
+    let Some(last_candidate_offset) = file_len.checked_sub(WAVPACK_BLOCK_HEADER_LEN as u64) else {
+        return Ok(None);
+    };
+    if search_start >= last_candidate_offset {
+        return Ok(None);
+    }
+
+    // The reference WavPack parser gives up after more than 1 MiB of skipped
+    // bytes. Search candidate starts through that same inclusive bound. Read
+    // in modest chunks with enough look-ahead for headers crossing a chunk
+    // boundary, avoiding both byte-at-a-time I/O and a mandatory 1 MiB read.
+    let max_candidate_offset = search_start
+        .saturating_add(WAVPACK_HEADER_SEARCH_LIMIT)
+        .min(last_candidate_offset);
+    let mut candidate_base = search_start.saturating_add(1);
+    let mut buffer = vec![0u8; WAVPACK_HEADER_SEARCH_CHUNK_LEN + WAVPACK_BLOCK_HEADER_LEN - 1];
+
+    while candidate_base <= max_candidate_offset {
+        let candidate_count = (max_candidate_offset - candidate_base + 1)
+            .min(WAVPACK_HEADER_SEARCH_CHUNK_LEN as u64) as usize;
+        let bytes_to_read = (file_len - candidate_base)
+            .min((candidate_count + WAVPACK_BLOCK_HEADER_LEN - 1) as u64)
+            as usize;
+        if bytes_to_read < WAVPACK_BLOCK_HEADER_LEN {
+            break;
+        }
+
+        file.seek(SeekFrom::Start(candidate_base)).map_err(|error| {
+            format!(
+                "seek WavPack header search at byte {candidate_base} in '{}': {error}",
+                path.display()
+            )
+        })?;
+        file.read_exact(&mut buffer[..bytes_to_read]).map_err(|error| {
+            format!(
+                "read WavPack header search at byte {candidate_base} in '{}': {error}",
+                path.display()
+            )
+        })?;
+
+        for relative in 0..candidate_count {
+            if relative + WAVPACK_BLOCK_HEADER_LEN > bytes_to_read {
+                break;
+            }
+            if &buffer[relative..relative + 4] != b"wvpk" {
+                continue;
+            }
+
+            let offset = candidate_base + relative as u64;
+            if let Some(header) = parse_wavpack_probe_header(
+                &buffer[relative..relative + WAVPACK_BLOCK_HEADER_LEN],
+                offset,
+                file_len,
+            ) {
+                return Ok(Some(header));
+            }
+        }
+
+        candidate_base = candidate_base.saturating_add(candidate_count as u64);
+    }
+
+    Ok(None)
+}
+
+fn read_wavpack_compression_is_lossless(path: &Path) -> Result<Option<bool>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open WavPack header '{}': {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat WavPack header '{}': {error}", path.display()))?
+        .len();
+
+    let mut search_start = 0u64;
+    for _ in 0..WAVPACK_MAX_PREFIX_BLOCKS {
+        let Some(header) = find_next_wavpack_probe_header(&mut file, path, search_start, file_len)?
+        else {
+            return Ok(None);
+        };
+
+        if header.block_samples != 0 {
+            return Ok(Some(header.flags & WAVPACK_HYBRID_FLAG == 0));
+        }
+
+        // A non-audio WavPack block does not imply that the next bytes begin
+        // another block; tags/wrapper bytes are legal between blocks too.
+        search_start = header.block_end;
+    }
+
+    Ok(None)
+}
+
 /// Probe an audio file using ffmpeg-next (in-process, no subprocess)
 
 fn probe_dvda_disc(path: &Path) -> Result<SourceInfo, String> {
@@ -511,6 +730,11 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     let format_name_raw = ctx.format().name().to_string();
     let format_name = friendly_format_name(&format_name_raw);
     let codec = friendly_codec_name(&codec_name);
+    let compression_is_lossless = if codec_name.eq_ignore_ascii_case("wavpack") {
+        wavpack_compression_is_lossless(path)
+    } else {
+        None
+    };
 
     // ffmpeg-next reports DSF/DFF dsd_u8 rates in bytes/second. Normalize
     // once at the TUI probe boundary so display and DSD-to-PCM cascades use
@@ -528,6 +752,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
         codec,
         bit_depth,
         sample_format_is_float,
+        compression_is_lossless,
         sample_rate,
         channels,
         channel_layout,
@@ -652,6 +877,7 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
         codec,
         bit_depth: Some(1),
         sample_format_is_float: None,
+        compression_is_lossless: None,
         sample_rate: super::sacd::SACD_SAMPLE_RATE_HZ,
         channels,
         channel_layout,
@@ -24749,6 +24975,159 @@ mod tests {
         );
     }
 
+    fn wavpack_test_block(block_samples: u32, flags: u32) -> [u8; WAVPACK_BLOCK_HEADER_LEN] {
+        let mut header = [0u8; WAVPACK_BLOCK_HEADER_LEN];
+        header[0..4].copy_from_slice(b"wvpk");
+        header[4..8].copy_from_slice(&24u32.to_le_bytes());
+        header[8..10].copy_from_slice(&0x410u16.to_le_bytes());
+        header[20..24].copy_from_slice(&block_samples.to_le_bytes());
+        header[24..28].copy_from_slice(&flags.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn wavpack_header_probe_distinguishes_lossless_and_hybrid_audio_blocks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lossless = temp.path().join("lossless.wv");
+        let hybrid = temp.path().join("hybrid.wv");
+        std::fs::write(&lossless, wavpack_test_block(1024, 0)).expect("write lossless header");
+        std::fs::write(&hybrid, wavpack_test_block(1024, WAVPACK_HYBRID_FLAG))
+            .expect("write hybrid header");
+
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&lossless).expect("probe lossless header"),
+            Some(true),
+        );
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&hybrid).expect("probe hybrid header"),
+            Some(false),
+        );
+    }
+
+    const MINIMAL_ID3V24_TAG: &[u8] = b"ID3\x04\x00\x00\x00\x00\x00\x00";
+
+    #[test]
+    fn wavpack_header_probe_finds_audio_after_leading_tag_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        for (name, flags, expected) in [
+            ("lossless-prefixed.wv", 0, Some(true)),
+            ("hybrid-prefixed.wv", WAVPACK_HYBRID_FLAG, Some(false)),
+        ] {
+            let path = temp.path().join(name);
+            let mut bytes = MINIMAL_ID3V24_TAG.to_vec();
+            bytes.extend_from_slice(&wavpack_test_block(1024, flags));
+            std::fs::write(&path, bytes).expect("write tag-prefixed WavPack");
+
+            assert_eq!(
+                read_wavpack_compression_is_lossless(&path).expect("probe tag-prefixed header"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn wavpack_header_probe_searches_between_non_audio_and_audio_blocks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("wrapped-prefix.wv");
+        let mut bytes = MINIMAL_ID3V24_TAG.to_vec();
+        bytes.extend_from_slice(&wavpack_test_block(0, WAVPACK_HYBRID_FLAG));
+        bytes.extend_from_slice(b"external wrapper bytes between WavPack blocks");
+        bytes.extend_from_slice(&wavpack_test_block(1024, 0));
+        std::fs::write(&path, bytes).expect("write wrapped WavPack block chain");
+
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&path).expect("probe wrapped block chain"),
+            Some(true),
+            "only the first actual audio block decides compression mode",
+        );
+    }
+
+    #[test]
+    fn wavpack_header_probe_rejects_implausible_signature_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("false-candidate.wv");
+        let mut false_candidate = wavpack_test_block(1024, WAVPACK_HYBRID_FLAG);
+        false_candidate[8..10].copy_from_slice(&0x500u16.to_le_bytes());
+
+        let mut bytes = MINIMAL_ID3V24_TAG.to_vec();
+        bytes.extend_from_slice(&false_candidate);
+        bytes.extend_from_slice(b"wrapper gap");
+        bytes.extend_from_slice(&wavpack_test_block(1024, 0));
+        std::fs::write(&path, bytes).expect("write false-candidate WavPack");
+
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&path).expect("probe false candidate"),
+            Some(true),
+            "an out-of-range stream version must not supply the hybrid flag",
+        );
+    }
+
+    #[test]
+    fn wavpack_header_probe_bounds_forward_search_and_fails_neutral_when_indeterminate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let beyond_limit = temp.path().join("beyond-search-limit.wv");
+        let mut bytes = vec![b'x'; WAVPACK_HEADER_SEARCH_LIMIT as usize + 1];
+        bytes.extend_from_slice(&wavpack_test_block(1024, 0));
+        std::fs::write(&beyond_limit, bytes).expect("write over-limit WavPack prefix");
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&beyond_limit).expect("probe bounded search"),
+            None,
+            "the source probe must not turn into an unbounded file scan",
+        );
+
+        let invalid = temp.path().join("indeterminate.wv");
+        std::fs::write(&invalid, b"not a complete WavPack block").expect("write invalid header");
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&invalid).expect("probe invalid header"),
+            None,
+        );
+    }
+
+    #[test]
+    fn wavpack_header_probe_accepts_real_ffmpeg_carrier_with_leading_id3() {
+        if !command_available("ffmpeg") {
+            eprintln!("skipping real WavPack prefix regression: ffmpeg unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plain = temp.path().join("plain.wv");
+        let prefixed = temp.path().join("prefixed.wv");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=997:duration=0.1:sample_rate=44100",
+                "-c:a",
+                "wavpack",
+            ])
+            .arg(&plain)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("spawn ffmpeg for WavPack fixture");
+        assert!(status.success(), "ffmpeg failed creating WavPack fixture");
+
+        let mut bytes = MINIMAL_ID3V24_TAG.to_vec();
+        bytes.extend_from_slice(&std::fs::read(&plain).expect("read WavPack fixture"));
+        std::fs::write(&prefixed, bytes).expect("write prefixed WavPack fixture");
+
+        assert_eq!(
+            read_wavpack_compression_is_lossless(&prefixed)
+                .expect("probe real prefixed WavPack fixture"),
+            Some(true),
+        );
+
+        let source = probe_audio(&prefixed).expect("probe real prefixed WavPack through TUI path");
+        assert_eq!(source.codec, "WavPack");
+        assert_eq!(source.compression_is_lossless, Some(true));
+    }
+
     #[test]
     fn wavpack_source_display_distinguishes_integer_and_float() {
         let (_, integer_depth, integer_float) =
@@ -24760,6 +25139,7 @@ mod tests {
             codec: "WavPack".to_string(),
             bit_depth: integer_depth,
             sample_format_is_float: integer_float,
+            compression_is_lossless: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),

@@ -3644,7 +3644,8 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
-        FormatField::PcmTruePeak => format.pcm_true_peak_enabled.selected_label().to_string(),
+        FormatField::PcmTruePeak => format.pcm_gain_mode.selected_label().to_string(),
+        FormatField::PcmGainDb => format!("{} dB", format.pcm_fixed_gain_db.render(true)),
         FormatField::PcmTruePeakTarget => format!("{} dBTP", format.pcm_true_peak_target_dbtp.render(true)),
         FormatField::PcmTruePeakScope => format.pcm_true_peak_scope.selected_label().to_string(),
         FormatField::PcmTruePeakBoost => format.pcm_true_peak_boost.selected_label().to_string(),
@@ -6367,6 +6368,7 @@ mod inline_edit_behavior_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -6444,6 +6446,7 @@ mod inline_edit_behavior_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -6548,6 +6551,7 @@ mod inline_edit_behavior_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -6662,6 +6666,7 @@ mod inline_edit_behavior_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -46631,6 +46636,7 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
                 .filter(|v| *v <= 100);
         }
     }
+    app.convert.format.apply_auto_gain_defaults();
     app.preset.mark_modified();
 }
 
@@ -69689,6 +69695,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::PcmTruePeakBoostPill(_)
             | TuiButton::PcmTruePeakScanPill(_)
             | TuiButton::PcmTruePeakTargetField
+            | TuiButton::PcmGainDbField
             | TuiButton::NoiseShaperPill(_)
             | TuiButton::ModulatorOrderPill(_)
             | TuiButton::ConversionPresetPill(_)
@@ -102671,6 +102678,7 @@ mod file_picker_browse_parity_regression_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),
@@ -103670,6 +103678,7 @@ mod file_picker_browse_parity_regression_tests {
                     codec: "flac".to_string(),
                     bit_depth: Some(16),
                     sample_format_is_float: None,
+                    compression_is_lossless: None,
                     sample_rate: 44_100,
                     channels: 2,
                     channel_layout: "stereo".to_string(),

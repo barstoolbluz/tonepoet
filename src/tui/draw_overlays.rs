@@ -10156,6 +10156,7 @@ mod tests {
                 codec: codec.to_string(),
                 bit_depth,
                 sample_format_is_float,
+                compression_is_lossless: None,
                 sample_rate,
                 channels: 2,
                 channel_layout: "stereo".to_string(),

@@ -60,7 +60,7 @@ The crate root re-exports the public items from these modules.
 ## Structs and methods
 
 - `PipelineSettings`
-  - Fields: `target_format`, `target_sample_rate`, `target_bit_depth`, `resample_quality`, `nyquist_transition`, `dither_type`, `preferred_tool`, `force_encode`, `flac`, `mp3`, `aac`, `opus`, `wavpack`, `ssrc`, `dsd`, `metadata`, `verification`, `replay_gain`
+  - Fields: `target_format`, `target_sample_rate`, `target_bit_depth`, `resample_quality`, `nyquist_transition`, `dither_type`, `dither_explicit`, `preferred_tool`, `force_encode`, `flac`, `mp3`, `aac`, `opus`, `wavpack`, `ssrc`, `sox_resampler`, `soxr_resampler`, `dsd`, `pcm_true_peak`, `metadata`, `verification`, `replay_gain`
   - Methods: `validate`, `explicit_dsd_rate`
 - `FlacSettings`: `compression_level`, `verify`
 - `Mp3Settings`: `mode`, `bitrate_kbps`, `vbr_quality`
@@ -71,9 +71,12 @@ The crate root re-exports the public items from these modules.
 - `SoxResamplerSettings`: `chebyshev`, `bandwidth_pct`, `phase`, `allow_aliasing`, `sinc_taps`, `sinc_attenuation_db`, `sinc_passband_hz`, `sinc_transition_hz`, `sinc_kaiser_beta`, `sinc_phase`
 - `SoxrResamplerSettings`: `chebyshev`, `cutoff`, `phase`
 - `DsdSettings`: `pcm_to_dsd`, `from_dsd`; album-gain control via `auto_gain_scope`, `set_auto_gain_scope`, `true_peak_scan_mode`, `set_true_peak_scan_mode`; legacy-v1 origin and wire are private compatibility state
-- `DsdTruePeakScanMode`: `Reference`, `Fast`, `Fastest` (only effective for album-scoped automatic DSD gain)
+- `DsdTruePeakScanMode`: `Reference`, `Standard`, `Fast` (only effective for album-scoped automatic DSD gain; serialized with Fast066V2 schema-qualified names)
 - `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
 - `DsdSourceSettings`: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
+- `PcmTruePeakGainSettings`: `enabled`, `target_dbtp`, `allow_boost`, `scope`, `scan_mode`, `fixed_gain_db`; automatic and fixed gain are mutually exclusive
+- `PcmTruePeakScope`: `Track`, `Album`
+- `PcmTruePeakScanMode`: `Reference`, `Standard`, `Fast` (serialized with Fast066V2 schema-qualified names)
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`
 - `PcmToDsdSincSettings`: `oversample_factor`, `taps`, `passband_hz`, `transition_hz`, `kaiser_beta`, `linear_phase`, `allow_aliasing`
 - `MetadataSettings`: `transfer_tags`, `preserve_artwork`, `store_source_audio_md5` (validated against target-aware built-in tag/artwork support)

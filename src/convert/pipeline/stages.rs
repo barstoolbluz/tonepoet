@@ -1963,7 +1963,8 @@ fn expected_post_encode_depth_for_track(
         tonepoet_pipeline::BitDepthTarget::Source => {
             if settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
                 && settings.wavpack.hybrid
-                && settings.pcm_true_peak.enabled
+                && (settings.pcm_true_peak.enabled
+                    || settings.pcm_true_peak.fixed_gain_db.is_some())
             {
                 return Some(PostEncodeDepthExpectation {
                     depth: super::plan_bridge::resolve_wavpack_hybrid_source_working_depth(track),
@@ -13896,6 +13897,13 @@ mod replaygain_existing_tag_policy_tests {
                 if reason.contains("PCM true-peak gain changes output level")
         ));
         req.settings.pcm_true_peak.enabled = false;
+        req.settings.pcm_true_peak.fixed_gain_db = Some("1.250000000".parse().unwrap());
+        assert!(matches!(
+            inherited_replaygain_tag_policy(Some(&source), &req.settings),
+            ReplayGainInheritedTagPolicy::Recompute { reason }
+                if reason.contains("PCM fixed gain changes output level")
+        ));
+        req.settings.pcm_true_peak.fixed_gain_db = None;
         assert_eq!(
             inherited_replaygain_tag_policy(None, &req.settings),
             ReplayGainInheritedTagPolicy::Recompute {
@@ -14445,6 +14453,12 @@ fn inherited_replaygain_tag_policy(
         // ReplayGain tags cannot be trusted even when the resolved gain later
         // happens to be exactly 0 dB. Measure the produced audio instead.
         reasons.push("PCM true-peak gain changes output level".to_string());
+    }
+    if settings.pcm_true_peak.fixed_gain_db.is_some() {
+        // A user-supplied fixed amplitude change is just as signal-changing as
+        // automatic gain. Inherited ReplayGain describes the source signal and
+        // must not survive unchanged.
+        reasons.push("PCM fixed gain changes output level".to_string());
     }
 
     let legacy_gain_configured = settings.dsd.legacy_behavior().is_some_and(|legacy| {
@@ -23335,17 +23349,12 @@ fn append_dsd_settings(
 
         if settings.dsd.album_auto_gain_selected() {
             let scan_mode = settings.dsd.true_peak_scan_mode();
-            let bound_db = true_peak_headroom_scan_mode(scan_mode).max_underread_db();
-            let speed_label = match scan_mode {
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference => "accurate",
+            let tier_label = match scan_mode {
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference => "reference",
+                tonepoet_pipeline::DsdTruePeakScanMode::Standard => "standard",
                 tonepoet_pipeline::DsdTruePeakScanMode::Fast => "fast",
-                tonepoet_pipeline::DsdTruePeakScanMode::Fastest => "fastest",
             };
-            push_kv_line(
-                log,
-                "DSD true-peak scan",
-                format!("{bound_db:.3} dB one-sided bound ({speed_label})"),
-            );
+            push_kv_line(log, "DSD true-peak scan", tier_label);
         }
     }
 
@@ -23817,6 +23826,12 @@ fn conversion_summary(
                 }
             }
         }
+    }
+    if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db {
+        transforms.push(format!(
+            "user-supplied PCM fixed gain {} dB (unclamped; may clip)",
+            gain_db.render(true),
+        ));
     }
     if let Some((requested_hz, effective_hz)) =
         ordinary_lossy_rate_divergence(track, &req.settings)
@@ -31274,17 +31289,25 @@ fn album_peak_measurement_from_true_peak(
     point: tonepoet_true_peak::PeakLevel,
     reconstruction_upper: tonepoet_true_peak::PeakLevel,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
-    match (point, reconstruction_upper) {
-        (tonepoet_true_peak::PeakLevel::Silence, tonepoet_true_peak::PeakLevel::Silence) => {
+    match point {
+        // The certified interval may retain a positive numerical envelope even
+        // for an exactly-zero carrier. The reported point estimate includes
+        // the exact input-sample peak, so Silence is authoritative evidence
+        // that every input sample was zero; the envelope is not signal.
+        tonepoet_true_peak::PeakLevel::Silence => {
             Ok(tonepoet_pipeline::AlbumPeakMeasurement::Silence)
         }
-        (
-            tonepoet_true_peak::PeakLevel::Finite { dbtp, .. },
-            tonepoet_true_peak::PeakLevel::Finite {
+        tonepoet_true_peak::PeakLevel::Finite { dbtp, .. } => {
+            let tonepoet_true_peak::PeakLevel::Finite {
                 linear: signal_upper_linear,
                 ..
-            },
-        ) => {
+            } = reconstruction_upper
+            else {
+                return Err(
+                    "true-peak certified ceiling reported silence for a finite point estimate"
+                        .to_string(),
+                );
+            };
             let rendered = format!("{dbtp:.9}");
             let point_db = rendered
                 .parse::<tonepoet_pipeline::DbNano>()
@@ -31298,12 +31321,15 @@ fn album_peak_measurement_from_true_peak(
                 signal_upper_linear,
             })
         }
-        _ => Err(
-            "true-peak point estimate and ceiling reconstruction disagree about silence"
-                .to_string(),
-        ),
     }
 }
+
+// CertifiedPeakMeter deliberately makes its execution graph independent of
+// caller chunking. Smaller application pushes therefore only add cancellation
+// opportunities between meter calls; they do not make one Reference tile
+// cooperatively cancellable. The constant-prefix preflight below handles the
+// demonstrated Reference9 pathology before such a tile is entered.
+const TRUE_PEAK_SCAN_CANCEL_POLL_FRAMES: usize = 8 * 1024;
 
 #[cfg(test)]
 fn scan_album_gain_true_peak_carrier_with_cancel<F>(
@@ -31324,19 +31350,13 @@ where
     )
 }
 
-fn true_peak_headroom_scan_mode(
+fn dsd_true_peak_tier(
     scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
-) -> tonepoet_true_peak::HeadroomScanMode {
+) -> tonepoet_true_peak::PeakTier {
     match scan_mode {
-        tonepoet_pipeline::DsdTruePeakScanMode::Reference => {
-            tonepoet_true_peak::HeadroomScanMode::Reference
-        }
-        tonepoet_pipeline::DsdTruePeakScanMode::Fast => {
-            tonepoet_true_peak::HeadroomScanMode::Fast
-        }
-        tonepoet_pipeline::DsdTruePeakScanMode::Fastest => {
-            tonepoet_true_peak::HeadroomScanMode::Fastest
-        }
+        tonepoet_pipeline::DsdTruePeakScanMode::Reference => tonepoet_true_peak::PeakTier::Reference,
+        tonepoet_pipeline::DsdTruePeakScanMode::Standard => tonepoet_true_peak::PeakTier::Standard,
+        tonepoet_pipeline::DsdTruePeakScanMode::Fast => tonepoet_true_peak::PeakTier::Fast,
     }
 }
 
@@ -31345,11 +31365,41 @@ fn scan_album_gain_true_peak_carrier_with_cancel_and_mode<F>(
     sample_rate_hz: u32,
     channels: u16,
     scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    is_cancelled: F,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
+where
+    F: FnMut() -> bool,
+{
+    // The demonstrated Reference9 pathology is a long, exactly constant run
+    // at the start of a carrier. Compact that narrow case before feeding a full
+    // 4,096-frame constant tile to the fixed true-peak dependency. Other tiers
+    // retain their established path and do not pay the preflight I/O.
+    scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+        carrier,
+        sample_rate_hz,
+        channels,
+        scan_mode,
+        matches!(
+            scan_mode,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference
+        ),
+        is_cancelled,
+    )
+}
+
+fn scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl<F>(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    constant_preflight: bool,
     mut is_cancelled: F,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
 where
     F: FnMut() -> bool,
 {
+    use std::io::{Read, Seek, SeekFrom};
+
     if is_cancelled() {
         return Err("album DSD true-peak scan cancelled".to_string());
     }
@@ -31371,12 +31421,11 @@ where
         ));
     }
 
-    let headroom_scan_mode = true_peak_headroom_scan_mode(scan_mode);
-    let mut meter = tonepoet_true_peak::HeadroomCeilingMeter::new_with_scan_mode(
+    let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
         sample_rate_hz,
         usize::from(channels),
         tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
-        headroom_scan_mode,
+        dsd_true_peak_tier(scan_mode),
     )
     .map_err(|error| format!("could not initialize album DSD ceiling meter: {error}"))?;
 
@@ -31384,7 +31433,153 @@ where
     let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes).max(1) * frame_bytes;
     let mut bytes = vec![0_u8; buffer_len];
     let mut samples = Vec::<f64>::with_capacity(buffer_len / 8);
+    let meter_chunk_samples = TRUE_PEAK_SCAN_CANCEL_POLL_FRAMES
+        .checked_mul(usize::from(channels))
+        .ok_or_else(|| "album DSD true-peak cancellation chunk size overflowed".to_string())?;
+
     let mut remaining = len;
+    if constant_preflight {
+        let channel_count = usize::from(channels);
+        let mut first_frame = Vec::<f64>::with_capacity(channel_count);
+        let mut preflight_remaining = len;
+        let mut preflight_offset = 0_u64;
+        let mut constant_prefix_frames = 0_u64;
+        let mut first_differing_frame_offset = None::<u64>;
+
+        while preflight_remaining > 0 && first_differing_frame_offset.is_none() {
+            if is_cancelled() {
+                return Err("album DSD true-peak scan cancelled".to_string());
+            }
+            let count = usize::try_from(preflight_remaining.min(buffer_len as u64)).map_err(|_| {
+                "album DSD true-peak carrier length does not fit this platform".to_string()
+            })?;
+            file.read_exact(&mut bytes[..count])
+                .map_err(|error| format!("could not read album DSD true-peak carrier: {error}"))?;
+
+            for (frame_index_in_read, raw_frame) in bytes[..count]
+                .chunks_exact(frame_bytes)
+                .enumerate()
+            {
+                let sample_base = frame_index_in_read * channel_count;
+                if first_frame.is_empty() {
+                    for (channel, raw) in raw_frame.chunks_exact(8).enumerate() {
+                        let sample =
+                            f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+                        if !sample.is_finite() {
+                            let error = tonepoet_true_peak::TruePeakError::NonFiniteSample {
+                                sample_index: (sample_base + channel) % meter_chunk_samples,
+                            };
+                            return Err(format!(
+                                "album DSD true-peak carrier is invalid: {error}"
+                            ));
+                        }
+                        first_frame.push(sample);
+                    }
+                    constant_prefix_frames = 1;
+                    continue;
+                }
+
+                let mut frame_matches = true;
+                for (channel, raw) in raw_frame.chunks_exact(8).enumerate() {
+                    let sample =
+                        f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+                    if !sample.is_finite() {
+                        // Preserve the fixed meter's block-local validation
+                        // index on the preflighted prefix. The normal path
+                        // presents at most meter_chunk_samples per push.
+                        let error = tonepoet_true_peak::TruePeakError::NonFiniteSample {
+                            sample_index: (sample_base + channel) % meter_chunk_samples,
+                        };
+                        return Err(format!("album DSD true-peak carrier is invalid: {error}"));
+                    }
+                    if sample.to_bits() != first_frame[channel].to_bits() {
+                        frame_matches = false;
+                    }
+                }
+
+                if frame_matches {
+                    constant_prefix_frames += 1;
+                } else {
+                    first_differing_frame_offset = Some(
+                        preflight_offset
+                            + u64::try_from(frame_index_in_read * frame_bytes).map_err(|_| {
+                                "album DSD true-peak carrier offset does not fit this platform"
+                                    .to_string()
+                            })?,
+                    );
+                    break;
+                }
+            }
+
+            if first_differing_frame_offset.is_none() {
+                preflight_offset += count as u64;
+                preflight_remaining -= count as u64;
+            }
+        }
+
+        debug_assert_eq!(first_frame.len(), channel_count);
+        match first_differing_frame_offset {
+            None => {
+                if is_cancelled() {
+                    return Err("album DSD true-peak scan cancelled".to_string());
+                }
+                // Preserve one genuine in-track constant interval whenever the
+                // source has one. RepeatEndpoints supplies the same constant
+                // extension at both finite edges, while the fixed meter remains
+                // the numerical/certificate authority for fractional phases.
+                samples.clear();
+                samples.extend_from_slice(&first_frame);
+                if constant_prefix_frames >= 2 {
+                    samples.extend_from_slice(&first_frame);
+                }
+                meter
+                    .push_interleaved(&samples)
+                    .map_err(|error| format!("album DSD true-peak carrier is invalid: {error}"))?;
+                if is_cancelled() {
+                    return Err("album DSD true-peak scan cancelled".to_string());
+                }
+                let result = meter.finalize().map_err(|error| {
+                    format!("could not finalize album DSD ceiling measurement: {error}")
+                })?;
+                return album_peak_measurement_from_true_peak(
+                    result.reported_point_estimate.overall,
+                    result.upper_level(),
+                );
+            }
+            Some(first_differing_offset) if constant_prefix_frames >= 2 => {
+                if is_cancelled() {
+                    return Err("album DSD true-peak scan cancelled".to_string());
+                }
+                // Translate the first transition earlier instead of rewinding
+                // into the pathological constant prefix. Two identical frames
+                // retain one real constant interval; RepeatEndpoints supplies
+                // the omitted all-constant history before that transition.
+                samples.clear();
+                samples.extend_from_slice(&first_frame);
+                samples.extend_from_slice(&first_frame);
+                meter
+                    .push_interleaved(&samples)
+                    .map_err(|error| format!("album DSD true-peak carrier is invalid: {error}"))?;
+                if is_cancelled() {
+                    return Err("album DSD true-peak scan cancelled".to_string());
+                }
+                file.seek(SeekFrom::Start(first_differing_offset))
+                    .map_err(|error| {
+                        format!(
+                            "could not seek album DSD true-peak carrier after constant prefix: {error}"
+                        )
+                    })?;
+                remaining = len - first_differing_offset;
+            }
+            Some(_) => {
+                // A single initial frame is not a repeated run worth
+                // compacting. Preserve the ordinary Reference stream exactly.
+                file.seek(SeekFrom::Start(0)).map_err(|error| {
+                    format!("could not rewind album DSD true-peak carrier: {error}")
+                })?;
+            }
+        }
+    }
     while remaining > 0 {
         if is_cancelled() {
             return Err("album DSD true-peak scan cancelled".to_string());
@@ -31392,15 +31587,20 @@ where
         let count = usize::try_from(remaining.min(buffer_len as u64)).map_err(|_| {
             "album DSD true-peak carrier length does not fit this platform".to_string()
         })?;
-        std::io::Read::read_exact(&mut file, &mut bytes[..count])
+        file.read_exact(&mut bytes[..count])
             .map_err(|error| format!("could not read album DSD true-peak carrier: {error}"))?;
         samples.clear();
         for raw in bytes[..count].chunks_exact(8) {
             samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
         }
-        meter
-            .push_interleaved(&samples)
-            .map_err(|error| format!("album DSD true-peak carrier is invalid: {error}"))?;
+        for chunk in samples.chunks(meter_chunk_samples) {
+            if is_cancelled() {
+                return Err("album DSD true-peak scan cancelled".to_string());
+            }
+            meter
+                .push_interleaved(chunk)
+                .map_err(|error| format!("album DSD true-peak carrier is invalid: {error}"))?;
+        }
         remaining -= count as u64;
     }
     if is_cancelled() {
@@ -31411,8 +31611,8 @@ where
         .finalize()
         .map_err(|error| format!("could not finalize album DSD ceiling measurement: {error}"))?;
     album_peak_measurement_from_true_peak(
-        result.point_estimate.overall,
-        result.reconstruction_upper,
+        result.reported_point_estimate.overall,
+        result.upper_level(),
     )
 }
 
@@ -31481,7 +31681,7 @@ pub(crate) fn album_gain_terminal_bound(
             stored_sample_error_linear: None,
             post_gain_reconstructed_error_linear: next_up_nonnegative(
                 encoder_input_error
-                    * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
+                    * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
             ),
             domain: AlbumCeilingDomain::LossyEncoderInputPcm,
         });
@@ -31606,7 +31806,7 @@ pub(crate) fn album_gain_terminal_bound(
     // tighter edge-aware shaping proof.
     let post_gain_reconstructed_error_linear = next_up_nonnegative(
         stored_sample_error_linear
-            * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER,
+            * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
     );
 
     Ok(AlbumTerminalBound {
@@ -31787,7 +31987,7 @@ mod album_true_peak_carrier_tests {
     }
 
     #[test]
-    fn carrier_fast_scan_modes_keep_the_full64_ceiling_conservative() {
+    fn carrier_scan_tiers_all_return_conservative_uppers_on_the_same_material() {
         let temp = tempfile::tempdir().unwrap();
         let carrier = temp.path().join("fast-modes.f64le");
         let samples = (0..8192)
@@ -31801,32 +32001,27 @@ mod album_true_peak_carrier_tests {
                 ]
             })
             .collect::<Vec<_>>();
+        let stored_peak = samples
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
         write_f64le(&carrier, &samples);
 
-        let (_, reference_upper) = finite(
-            scan_album_gain_true_peak_carrier_with_cancel_and_mode(
-                &carrier,
-                176_400,
-                2,
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
-                || false,
-            )
-            .unwrap(),
-        );
-
         for mode in [
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::DsdTruePeakScanMode::Standard,
             tonepoet_pipeline::DsdTruePeakScanMode::Fast,
-            tonepoet_pipeline::DsdTruePeakScanMode::Fastest,
         ] {
-            let (_, fast_upper) = finite(
+            let (_, upper) = finite(
                 scan_album_gain_true_peak_carrier_with_cancel_and_mode(
                     &carrier, 176_400, 2, mode, || false,
                 )
                 .unwrap(),
             );
             assert!(
-                fast_upper >= reference_upper,
-                "{mode:?} ceiling {fast_upper:.17} fell below full-64x reference {reference_upper:.17}"
+                upper >= stored_peak,
+                "{mode:?} certified upper {upper:.17} fell below stored-sample peak {stored_peak:.17}"
             );
         }
     }
@@ -31840,6 +32035,229 @@ mod album_true_peak_carrier_tests {
             scan_album_gain_true_peak_carrier_with_cancel(&carrier, 48_000, 2, || false)
                 .unwrap(),
             tonepoet_pipeline::AlbumPeakMeasurement::Silence,
+        );
+    }
+
+    #[test]
+    fn reference_scanner_completes_pathological_full_size_constant_carrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let full = temp.path().join("reference-constant-full.f64le");
+        let representative = temp.path().join("reference-constant-representative.f64le");
+        write_f64le(&full, &vec![0.25_f64; 393_216]);
+        write_f64le(&representative, &[0.25_f64, 0.25_f64]);
+
+        let full_measurement = scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+            &full,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            || false,
+        )
+        .unwrap();
+        let representative_measurement =
+            scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+                &representative,
+                48_000,
+                1,
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                false,
+                || false,
+            )
+            .unwrap();
+
+        let _ = finite(full_measurement);
+        assert_eq!(full_measurement, representative_measurement);
+    }
+
+    #[test]
+    fn reference_scanner_compacts_pathological_constant_prefix_before_difference() {
+        let temp = tempfile::tempdir().unwrap();
+        let full = temp.path().join("reference-constant-prefix-full.f64le");
+        let compacted = temp.path().join("reference-constant-prefix-compacted.f64le");
+        let differing = -0.375_f64;
+        let mut samples = vec![0.25_f64; 393_216];
+        samples.push(differing);
+        write_f64le(&full, &samples);
+        write_f64le(&compacted, &[0.25_f64, 0.25_f64, differing]);
+
+        let full_measurement = scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+            &full,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            || false,
+        )
+        .unwrap();
+        let compacted_measurement = scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+            &compacted,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            false,
+            || false,
+        )
+        .unwrap();
+
+        let _ = finite(full_measurement);
+        assert_eq!(full_measurement, compacted_measurement);
+    }
+
+    #[test]
+    fn reference_constant_preflight_compares_complete_multichannel_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, frame) in [
+            ("stereo", vec![0.25_f64, -0.5_f64]),
+            ("four-channel", vec![0.25_f64, -0.5_f64, 0.125_f64, -0.75_f64]),
+        ] {
+            let full = temp.path().join(format!("{name}-full.f64le"));
+            let representative = temp.path().join(format!("{name}-representative.f64le"));
+            let frames = 16_384usize;
+            let samples = frame
+                .iter()
+                .copied()
+                .cycle()
+                .take(frames * frame.len())
+                .collect::<Vec<_>>();
+            write_f64le(&full, &samples);
+            let representative_samples = frame
+                .iter()
+                .copied()
+                .cycle()
+                .take(2 * frame.len())
+                .collect::<Vec<_>>();
+            write_f64le(&representative, &representative_samples);
+
+            let full_measurement = scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+                &full,
+                48_000,
+                frame.len() as u16,
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                || false,
+            )
+            .unwrap();
+            let representative_measurement =
+                scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+                    &representative,
+                    48_000,
+                    frame.len() as u16,
+                    tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                    false,
+                    || false,
+                )
+                .unwrap();
+
+            assert_eq!(full_measurement, representative_measurement, "{name}");
+        }
+    }
+
+    #[test]
+    fn reference_constant_preflight_maps_full_size_silence() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("reference-silence-full.f64le");
+        write_f64le(&carrier, &vec![0.0_f64; 393_216]);
+
+        assert_eq!(
+            scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+                &carrier,
+                48_000,
+                1,
+                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                || false,
+            )
+            .unwrap(),
+            tonepoet_pipeline::AlbumPeakMeasurement::Silence,
+        );
+    }
+
+    #[test]
+    fn reference_constant_preflight_compacts_long_prefix_without_changing_measurement() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("long-constant-prefix-then-change.f64le");
+        let compacted = temp.path().join("long-constant-prefix-compacted.f64le");
+        let frames_per_io_buffer = (1024 * 1024) / std::mem::size_of::<f64>();
+        let constant_prefix_frames = frames_per_io_buffer + 17;
+        let tail = (0..8192)
+            .map(|frame| {
+                let t = frame as f64 + 0.31;
+                0.41 * (2.0 * PI * 0.173 * t).sin() + 0.13 * (2.0 * PI * 0.417 * t).cos()
+            })
+            .collect::<Vec<_>>();
+        let mut samples = vec![0.25_f64; constant_prefix_frames];
+        samples.extend_from_slice(&tail);
+        write_f64le(&carrier, &samples);
+
+        let mut compacted_samples = vec![0.25_f64, 0.25_f64];
+        compacted_samples.extend_from_slice(&tail);
+        write_f64le(&compacted, &compacted_samples);
+
+        let with_preflight = scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+            &carrier,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            || false,
+        )
+        .unwrap();
+        let compacted_reference = scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+            &compacted,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            false,
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(with_preflight, compacted_reference);
+    }
+
+    #[test]
+    fn reference_constant_preflight_preserves_single_frame_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("single-frame.f64le");
+        write_f64le(&carrier, &[0.25_f64, -0.5_f64]);
+
+        let optimized = scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+            &carrier,
+            48_000,
+            2,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            true,
+            || false,
+        )
+        .unwrap();
+        let ordinary = scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl(
+            &carrier,
+            48_000,
+            2,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            false,
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(optimized, ordinary);
+    }
+
+    #[test]
+    fn reference_constant_preflight_preserves_nonfinite_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let carrier = temp.path().join("reference-constant-nonfinite.f64le");
+        let mut samples = vec![0.25_f64; 32];
+        samples[17] = f64::NAN;
+        write_f64le(&carrier, &samples);
+
+        let error = scan_album_gain_true_peak_carrier_with_cancel_and_mode(
+            &carrier,
+            48_000,
+            1,
+            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "album DSD true-peak carrier is invalid: decoded sample at block index 17 is not finite"
         );
     }
 
@@ -31943,7 +32361,7 @@ mod album_true_peak_carrier_tests {
     }
 
     #[test]
-    fn carrier_scanner_honors_cancellation_between_large_sequential_reads() {
+    fn carrier_scanner_honors_cancellation_during_constant_preflight() {
         let temp = tempfile::tempdir().unwrap();
         let carrier = temp.path().join("large.f64le");
         let samples = vec![0.25_f64; (1024 * 1024 / 8) * 3];
@@ -31955,12 +32373,14 @@ mod album_true_peak_carrier_tests {
             1,
             || {
                 checks += 1;
-                checks >= 3
+                // One entry check plus two complete 1 MiB preflight reads have
+                // happened before this cancellation becomes visible.
+                checks >= 4
             },
         )
         .unwrap_err();
         assert!(error.contains("cancelled"), "{error}");
-        assert!(checks >= 3);
+        assert!(checks >= 4);
     }
 
     fn terminal_settings(
@@ -32014,7 +32434,7 @@ mod album_true_peak_carrier_tests {
             assert!(stored > expected_lsb_ceiling * lsb);
             assert!(stored < (expected_lsb_ceiling + 0.01) * lsb);
             let repeat_edge_safe = stored
-                * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER;
+                * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER;
             assert!(bound.post_gain_reconstructed_error_linear >= repeat_edge_safe);
             assert!(
                 bound.post_gain_reconstructed_error_linear
@@ -32465,39 +32885,33 @@ struct PreparedPcmTruePeakCarrier {
     measurement: PcmTruePeakPreparedMeasurement,
 }
 
-fn pcm_true_peak_scan_mode(
+fn pcm_true_peak_tier(
     mode: tonepoet_pipeline::PcmTruePeakScanMode,
-) -> Option<tonepoet_true_peak::HeadroomScanMode> {
+) -> tonepoet_true_peak::PeakTier {
     match mode {
-        tonepoet_pipeline::PcmTruePeakScanMode::Standard => {
-            Some(tonepoet_true_peak::HeadroomScanMode::Standard)
-        }
-        tonepoet_pipeline::PcmTruePeakScanMode::Fast => {
-            None
-        }
-        tonepoet_pipeline::PcmTruePeakScanMode::Reference => {
-            Some(tonepoet_true_peak::HeadroomScanMode::Reference)
-        }
+        tonepoet_pipeline::PcmTruePeakScanMode::Reference => tonepoet_true_peak::PeakTier::Reference,
+        tonepoet_pipeline::PcmTruePeakScanMode::Standard => tonepoet_true_peak::PeakTier::Standard,
+        tonepoet_pipeline::PcmTruePeakScanMode::Fast => tonepoet_true_peak::PeakTier::Fast,
     }
 }
 
 #[cfg(test)]
 mod pcm_true_peak_scan_mode_tests {
-    use super::pcm_true_peak_scan_mode;
+    use super::pcm_true_peak_tier;
 
     #[test]
-    fn pcm_fast_is_the_accelerated_reference_path_not_a_legacy_headroom_rung() {
+    fn pcm_scan_modes_map_one_to_one_to_the_certified_crate_tiers() {
         assert_eq!(
-            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Standard),
-            Some(tonepoet_true_peak::HeadroomScanMode::Standard),
+            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Reference),
+            tonepoet_true_peak::PeakTier::Reference,
         );
         assert_eq!(
-            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Fast),
-            None,
+            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Standard),
+            tonepoet_true_peak::PeakTier::Standard,
         );
         assert_eq!(
-            pcm_true_peak_scan_mode(tonepoet_pipeline::PcmTruePeakScanMode::Reference),
-            Some(tonepoet_true_peak::HeadroomScanMode::Reference),
+            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Fast),
+            tonepoet_true_peak::PeakTier::Fast,
         );
     }
 }
@@ -32532,19 +32946,12 @@ fn scan_pcm_true_peak_f64le(
             carrier_len, channels,
         ));
     }
-    let mut meter = match pcm_true_peak_scan_mode(scan_mode) {
-        Some(headroom_mode) => tonepoet_true_peak::HeadroomCeilingMeter::new_with_scan_mode(
-            sample_rate_hz,
-            usize::from(channels),
-            tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
-            headroom_mode,
-        ),
-        None => tonepoet_true_peak::HeadroomCeilingMeter::new_accelerated_reference(
-            sample_rate_hz,
-            usize::from(channels),
-            tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
-        ),
-    }
+    let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
+        sample_rate_hz,
+        usize::from(channels),
+        tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+        pcm_true_peak_tier(scan_mode),
+    )
     .map_err(|error| format!("could not initialize PCM true-peak ceiling meter: {error}"))?;
 
     const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
@@ -32553,6 +32960,9 @@ fn scan_pcm_true_peak_f64le(
     let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes_usize).max(1) * frame_bytes_usize;
     let mut bytes = vec![0_u8; buffer_len];
     let mut samples = Vec::<f64>::with_capacity(buffer_len / 8);
+    let meter_chunk_samples = TRUE_PEAK_SCAN_CANCEL_POLL_FRAMES
+        .checked_mul(usize::from(channels))
+        .ok_or_else(|| "PCM true-peak cancellation chunk size overflowed".to_string())?;
     let mut remaining = carrier_len;
     while remaining > 0 {
         if cancel.is_cancelled() {
@@ -32570,9 +32980,14 @@ fn scan_pcm_true_peak_f64le(
             }
             samples.push(sample);
         }
-        meter
-            .push_interleaved(&samples)
-            .map_err(|error| format!("PCM true-peak carrier is invalid: {error}"))?;
+        for chunk in samples.chunks(meter_chunk_samples) {
+            if cancel.is_cancelled() {
+                return Err("PCM true-peak scan cancelled".to_string());
+            }
+            meter
+                .push_interleaved(chunk)
+                .map_err(|error| format!("PCM true-peak carrier is invalid: {error}"))?;
+        }
         remaining -= count as u64;
     }
     if cancel.is_cancelled() {
@@ -32581,34 +32996,10 @@ fn scan_pcm_true_peak_f64le(
     let result = meter
         .finalize()
         .map_err(|error| format!("could not finalize PCM true-peak ceiling measurement: {error}"))?;
-    let point_estimate = result.point_estimate.overall;
-    if let Some(reference_scan) = result.reference_scan {
-        log::debug!(
-            "PCM accelerated Reference scan interval_width_db={:?} complete={} candidates={} refined={} budget_exhausted_tiles={}",
-            reference_scan.interval_width_db,
-            reference_scan.reference_search_complete,
-            reference_scan.candidate_intervals,
-            reference_scan.refined_intervals,
-            reference_scan.budget_exhausted_tiles,
-        );
-    }
-    let signal_upper_linear = match pcm_true_peak_scan_mode(scan_mode) {
-        Some(headroom_mode) => headroom_mode
-            .reserve_point_estimate(point_estimate)
-            .linear()
-            .max(result.reconstruction_upper.linear()),
-        None => result.reconstruction_upper.linear(),
-    };
-    let signal_upper = if signal_upper_linear == 0.0 {
-        tonepoet_true_peak::PeakLevel::Silence
-    } else {
-        let linear = next_up_nonnegative(signal_upper_linear);
-        tonepoet_true_peak::PeakLevel::Finite {
-            linear,
-            dbtp: 20.0 * linear.log10(),
-        }
-    };
-    album_peak_measurement_from_true_peak(point_estimate, signal_upper)
+    album_peak_measurement_from_true_peak(
+        result.reported_point_estimate.overall,
+        result.upper_level(),
+    )
 }
 
 fn pcm_true_peak_terminal_settings(
@@ -32671,9 +33062,9 @@ fn pcm_true_peak_terminal_bound(
     // The directed-down coefficient prevents gain overshoot; one binary64
     // multiplication rounding remains. Near the governed <= 1 FS output this
     // absolute 2^-51 term safely covers that operation and is reconstructed
-    // through the same frozen Headroom64 L-infinity gain used elsewhere.
+    // through the same frozen HQ1024V1 reconstruction L-infinity gain used elsewhere.
     let scaler_error = 2.0_f64.powi(-51)
-        * tonepoet_true_peak::HEADROOM64X_RECONSTRUCTION_LINF_GAIN_UPPER;
+        * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER;
     bound.post_gain_reconstructed_error_linear = next_up_nonnegative(
         bound.post_gain_reconstructed_error_linear + scaler_error,
     );
@@ -53100,7 +53491,7 @@ mod conversion_log_tests {
         let album_fast_log =
             build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(album_fast_log.contains(
-            "DSD true-peak scan: 0.044 dB one-sided bound (fast)"
+            "DSD true-peak scan: fast"
         ));
         assert!(dsd_log.contains("DSD→PCM lowpass method"));
         assert!(!dsd_log.contains("DSD manual gain"));
@@ -67407,6 +67798,17 @@ mod validate_encoded_output_tests {
             );
         }
 
+        settings.pcm_true_peak.enabled = false;
+        settings.pcm_true_peak.fixed_gain_db = Some("2.500000000".parse().unwrap());
+        track.bit_depth = Some(320);
+        track.source_audio.bit_depth = Some(320);
+        assert_eq!(
+            expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
+            Some(tonepoet_pipeline::PcmBitDepth::Int24),
+            "fixed-gain hybrid Source must validate against the same integer working depth as planning",
+        );
+
+        settings.pcm_true_peak.fixed_gain_db = None;
         settings.wavpack.hybrid = false;
         track.bit_depth = Some(320);
         track.source_audio.bit_depth = Some(320);

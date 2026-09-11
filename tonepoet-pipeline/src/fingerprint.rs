@@ -152,10 +152,11 @@ pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.album_gain_db",
 ];
 
-/// Additive fingerprint fields for enabled PCM true-peak gain. Disabled
-/// settings write no extension fields, preserving the historical default
-/// fingerprint while making every byte-affecting enabled control visible.
+/// Additive fingerprint fields for PCM gain. The ordinary disabled state
+/// writes no extension fields; a user-supplied fixed gain is byte-affecting
+/// even though automatic true-peak gain is disabled.
 pub const PCM_TRUE_PEAK_FINGERPRINT_FIELD_PATHS: &[&str] = &[
+    "pcm_true_peak.fixed_gain_db",
     "pcm_true_peak.enabled",
     "pcm_true_peak.target_dbtp",
     "pcm_true_peak.allow_boost",
@@ -551,6 +552,9 @@ fn push_pcm_true_peak(
     writer: &mut FingerprintWriter,
     settings: &crate::PcmTruePeakGainSettings,
 ) {
+    if let Some(gain_db) = settings.fixed_gain_db {
+        writer.field_string("pcm_true_peak.fixed_gain_db", gain_db.render(false));
+    }
     if !settings.enabled {
         return;
     }
@@ -567,9 +571,9 @@ fn push_pcm_true_peak(
     writer.field_static(
         "pcm_true_peak.scan_mode",
         match settings.scan_mode {
-            crate::PcmTruePeakScanMode::Standard => "standard",
-            crate::PcmTruePeakScanMode::Fast => "fast",
-            crate::PcmTruePeakScanMode::Reference => "reference",
+            crate::PcmTruePeakScanMode::Reference => "fast066v2_reference",
+            crate::PcmTruePeakScanMode::Standard => "fast066v2_standard",
+            crate::PcmTruePeakScanMode::Fast => "fast066v2_fast",
         },
     );
     if let Some(gain_db) = settings.runtime_album_gain_db() {
@@ -614,15 +618,14 @@ fn push_native_dsd_v2(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         && settings.auto_gain_scope() == DsdAutoGainScope::Album
     {
         writer.field_static("dsd.auto_gain_scope", "album");
-        match settings.true_peak_scan_mode() {
-            crate::DsdTruePeakScanMode::Reference => {}
-            crate::DsdTruePeakScanMode::Fast => {
-                writer.field_static("dsd.true_peak_scan_mode", "fast");
-            }
-            crate::DsdTruePeakScanMode::Fastest => {
-                writer.field_static("dsd.true_peak_scan_mode", "fastest");
-            }
-        }
+        writer.field_static(
+            "dsd.true_peak_scan_mode",
+            match settings.true_peak_scan_mode() {
+                crate::DsdTruePeakScanMode::Reference => "fast066v2_reference",
+                crate::DsdTruePeakScanMode::Standard => "fast066v2_standard",
+                crate::DsdTruePeakScanMode::Fast => "fast066v2_fast",
+            },
+        );
         if let Some(gain) = settings.runtime_album_gain_db() {
             writer.field_string("dsd.album_gain_db", gain.render(false));
         }
@@ -835,15 +838,14 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
     // without perturbing any historical track-scoped fingerprint.
     if settings.album_auto_gain_selected() {
         writer.field_static("dsd.auto_gain_scope", "album");
-        match settings.true_peak_scan_mode() {
-            crate::DsdTruePeakScanMode::Reference => {}
-            crate::DsdTruePeakScanMode::Fast => {
-                writer.field_static("dsd.true_peak_scan_mode", "fast");
-            }
-            crate::DsdTruePeakScanMode::Fastest => {
-                writer.field_static("dsd.true_peak_scan_mode", "fastest");
-            }
-        }
+        writer.field_static(
+            "dsd.true_peak_scan_mode",
+            match settings.true_peak_scan_mode() {
+                crate::DsdTruePeakScanMode::Reference => "fast066v2_reference",
+                crate::DsdTruePeakScanMode::Standard => "fast066v2_standard",
+                crate::DsdTruePeakScanMode::Fast => "fast066v2_fast",
+            },
+        );
         // Native album-mode reconstruction is deliberately unqualified and
         // therefore still uses the legacy manifest-v1 settings fingerprint.
         // Bind only the native reconstruction selector consumed by the album

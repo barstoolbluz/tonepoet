@@ -735,22 +735,25 @@ pub enum DsdAutoGainScope {
     Album,
 }
 
-/// Accuracy/speed rung for submitted-batch DSD true-peak analysis.
+/// Accuracy/speed tier for submitted-batch DSD true-peak analysis.
 ///
 /// This remains an application-independent policy token: the pipeline crate
 /// does not import the true-peak crate or encode interpolation details. Track
 /// normalization does not use this setting; it is effective only for album
 /// scope, where Tonepoet performs an in-process retained-carrier scan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DsdTruePeakScanMode {
-    /// Gold-standard scan; compatibility and user-facing default.
+    /// Tightest certified interval tier.
     #[default]
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_reference"))]
     Reference,
-    /// Opt-in middle rung with a smaller accuracy-for-speed trade.
+    /// Ordinary certified interval tier.
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_standard"))]
+    Standard,
+    /// Fastest certified tier; interval width is content-dependent.
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_fast"))]
     Fast,
-    /// Opt-in fastest rung with the largest declared one-sided error budget.
-    Fastest,
 }
 
 /// Peak-normalization scope for ordinary PCM conversions.
@@ -764,17 +767,23 @@ pub enum PcmTruePeakScope {
     Album,
 }
 
-/// Accuracy/speed rung for PCM pre-conversion true-peak analysis.
+/// Accuracy/speed tier for PCM pre-conversion true-peak analysis.
+///
+/// The serialized names deliberately carry the Fast066V2 schema identity.
+/// Previous Tonepoet scan-mode strings used the same human words for different
+/// algorithms, so accepting those bare strings would silently reinterpret an
+/// old preset/configuration under the new certified meter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PcmTruePeakScanMode {
-    /// Fast fixed-16x bounded scan; the ordinary conversion default.
-    #[default]
-    Standard,
-    /// Budgeted accelerated Reference reconstruction. This is the fastest PCM
-    /// path: it keeps a certified finite-64x upper while allowing search
-    /// precision to float beneath a deterministic refinement budget.
-    Fast,
-    /// Gold-standard fixed-64x scan.
+    /// Tightest certified interval tier.
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_reference"))]
     Reference,
+    /// Ordinary certified interval tier.
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_standard"))]
+    Standard,
+    /// Fastest certified tier; interval width is content-dependent.
+    #[default]
+    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_fast"))]
+    Fast,
 }

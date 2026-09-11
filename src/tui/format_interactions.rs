@@ -87,6 +87,9 @@ pub fn handle_format_button(
         TuiButton::PcmTruePeakTargetField => format.select_row_index(
             FormatField::PcmTruePeakTarget, 0, source_bits, source_rate,
         ),
+        TuiButton::PcmGainDbField => format.select_row_index(
+            FormatField::PcmGainDb, 0, source_bits, source_rate,
+        ),
         TuiButton::NoiseShaperPill(index) => format.select_row_index(
             FormatField::NoiseShaper,
             index,

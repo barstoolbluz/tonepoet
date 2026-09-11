@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 26;
+const CURRENT_VERSION: u32 = 27;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -1006,6 +1006,10 @@ impl Database {
         }
         if version < 26 {
             self.run_migration_step(26, Self::migrate_v26)?;
+            version = 26;
+        }
+        if version < 27 {
+            self.run_migration_step(27, Self::migrate_v27)?;
         }
 
         Ok(())
@@ -2148,6 +2152,34 @@ impl Database {
 
         conn.execute("DELETE FROM probe_cache", [])
             .map_err(|error| format!("v26 migration invalidate legacy probe cache: {error}"))?;
+        Ok(())
+    }
+
+    /// v27: persist compression-mode losslessness separately from decoded
+    /// sample representation. Existing WavPack rows cannot distinguish normal
+    /// lossless from hybrid mode, so invalidate only those rows and let the
+    /// ordinary bounded probe repopulate the new header-derived fact.
+    fn migrate_v27(conn: &Connection) -> Result<(), String> {
+        if !Self::legacy_add_column_present(
+            conn,
+            "v27",
+            "probe_cache",
+            "compression_is_lossless",
+            "INTEGER",
+            false,
+            None,
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE probe_cache ADD COLUMN compression_is_lossless INTEGER;",
+            )
+            .map_err(|error| format!("v27 migration add probe compression losslessness: {error}"))?;
+        }
+
+        conn.execute(
+            "DELETE FROM probe_cache WHERE lower(trim(codec)) = 'wavpack'",
+            [],
+        )
+        .map_err(|error| format!("v27 migration invalidate legacy WavPack probe rows: {error}"))?;
         Ok(())
     }
 
@@ -4824,16 +4856,17 @@ impl Database {
             .execute(
                 "INSERT OR REPLACE INTO probe_cache (
                 file_path, file_mtime, file_size,
-                format_name, codec, bit_depth, sample_format_is_float, sample_rate, channels,
+                format_name, codec, bit_depth, sample_format_is_float,
+                compression_is_lossless, sample_rate, channels,
                 channel_layout, duration_secs,
                 title, artist, album, genre, year, track_number, catalog_number,
                 rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak,
                 r128_track_gain, r128_album_gain,
                 probed_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24, ?25
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                ?20, ?21, ?22, ?23, ?24, ?25, ?26
             )",
                 params![
                     file_path,
@@ -4843,6 +4876,7 @@ impl Database {
                     row.codec,
                     row.bit_depth,
                     row.sample_format_is_float,
+                    row.compression_is_lossless,
                     row.sample_rate,
                     row.channels,
                     row.channel_layout,
@@ -5953,6 +5987,7 @@ pub struct CachedProbeRow {
     pub codec: Option<String>,
     pub bit_depth: Option<u32>,
     pub sample_format_is_float: Option<bool>,
+    pub compression_is_lossless: Option<bool>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
@@ -6027,6 +6062,7 @@ fn cached_probe_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cached
         codec: row.get("codec")?,
         bit_depth: row.get("bit_depth")?,
         sample_format_is_float: row.get("sample_format_is_float")?,
+        compression_is_lossless: row.get("compression_is_lossless")?,
         sample_rate: row.get("sample_rate")?,
         channels: row.get("channels")?,
         channel_layout: row.get("channel_layout")?,
@@ -6056,6 +6092,7 @@ impl CachedProbeRow {
         use crate::tui::probe::{SourceInfo, SourceMetadata};
         let source = SourceInfo {
             sample_format_is_float: self.sample_format_is_float,
+            compression_is_lossless: self.compression_is_lossless,
             format_name: self.format_name.clone()?,
             codec: self.codec.clone().unwrap_or_default(),
             bit_depth: self.bit_depth,
@@ -6097,6 +6134,7 @@ impl CachedProbeRow {
             codec: Some(info.source.codec.clone()),
             bit_depth: info.source.bit_depth,
             sample_format_is_float: info.source.sample_format_is_float,
+            compression_is_lossless: info.source.compression_is_lossless,
             sample_rate: Some(info.source.sample_rate),
             channels: Some(info.source.channels),
             channel_layout: Some(info.source.channel_layout.clone()),
@@ -6679,7 +6717,7 @@ mod tests {
             .expect("seed v25 probe cache");
         }
 
-        let db = Database::open_path(&path).expect("migrate v25 database to v26");
+        let db = Database::open_path(&path).expect("migrate v25 database through current schema");
         let version: u32 = db
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -6711,6 +6749,95 @@ mod tests {
             sentinel, "keep",
             "v26 must invalidate only the derived probe cache",
         );
+    }
+
+    #[test]
+    fn v27_persists_compression_losslessness_and_reprobes_only_legacy_wavpack_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("v26-to-v27.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("create v26 database fixture");
+            conn.execute_batch(
+                "CREATE TABLE probe_cache (
+                    file_path       TEXT PRIMARY KEY,
+                    file_mtime      INTEGER NOT NULL,
+                    file_size       INTEGER NOT NULL,
+                    format_name     TEXT,
+                    codec           TEXT,
+                    bit_depth       INTEGER,
+                    sample_format_is_float INTEGER,
+                    sample_rate     INTEGER,
+                    channels        INTEGER,
+                    channel_layout  TEXT,
+                    duration_secs   REAL,
+                    title           TEXT,
+                    artist          TEXT,
+                    album           TEXT,
+                    genre           TEXT,
+                    year            TEXT,
+                    track_number    INTEGER,
+                    catalog_number  TEXT,
+                    rg_track_gain   TEXT,
+                    rg_track_peak   TEXT,
+                    rg_album_gain   TEXT,
+                    rg_album_peak   TEXT,
+                    r128_track_gain TEXT,
+                    r128_album_gain TEXT,
+                    probed_at       TEXT NOT NULL
+                );
+                INSERT INTO probe_cache (
+                    file_path, file_mtime, file_size, format_name, codec, bit_depth,
+                    sample_format_is_float, sample_rate, channels, channel_layout,
+                    duration_secs, probed_at
+                ) VALUES
+                    ('/music/legacy-lossless.wv', 1000, 5000000, 'WavPack', 'WavPack', 24,
+                     0, 96000, 2, 'stereo', 60.0, '2026-09-10T00:00:00Z'),
+                    ('/music/preserve.flac', 1000, 4000000, 'FLAC', 'FLAC', 24,
+                     0, 96000, 2, 'stereo', 60.0, '2026-09-10T00:00:00Z');
+                CREATE TABLE migration_sentinel(value TEXT NOT NULL);
+                INSERT INTO migration_sentinel(value) VALUES ('keep');
+                PRAGMA user_version = 26;",
+            )
+            .expect("seed v26 probe cache");
+        }
+
+        let db = Database::open_path(&path).expect("migrate v26 database to v27");
+        let version: u32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, CURRENT_VERSION);
+
+        let probe_columns = table_columns(&db.conn, "probe_cache");
+        assert!(
+            probe_columns.iter().any(|(name, declared_type)| {
+                name == "compression_is_lossless" && declared_type == "INTEGER"
+            }),
+            "v27 must persist compression losslessness independently of sample format",
+        );
+        let wavpack_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM probe_cache WHERE lower(trim(codec)) = 'wavpack'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count legacy WavPack rows");
+        assert_eq!(wavpack_rows, 0, "legacy WavPack rows require one bounded reprobe");
+        let flac_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM probe_cache WHERE file_path = '/music/preserve.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved non-WavPack rows");
+        assert_eq!(flac_rows, 1, "v27 must not invalidate unrelated probe rows");
+        let sentinel: String = db
+            .conn
+            .query_row("SELECT value FROM migration_sentinel", [], |row| row.get(0))
+            .expect("read unrelated sentinel");
+        assert_eq!(sentinel, "keep");
     }
 
     const CROSS_PROCESS_DB_PATH_ENV: &str = "TONEPOET_DB_CROSS_PROCESS_PATH";
@@ -9413,6 +9540,7 @@ mod tests {
             codec: Some("WavPack".into()),
             bit_depth: Some(32),
             sample_format_is_float: Some(true),
+            compression_is_lossless: Some(true),
             sample_rate: Some(384000),
             channels: Some(2),
             title: Some("Test Song".into()),
@@ -9429,8 +9557,10 @@ mod tests {
             .expect("probe cache hit");
         assert_eq!(cached.title, Some("Test Song".into()));
         assert_eq!(cached.sample_format_is_float, Some(true));
+        assert_eq!(cached.compression_is_lossless, Some(true));
         let cached_info = cached.to_cached_info(5000000).expect("cached info");
         assert_eq!(cached_info.source.sample_format_is_float, Some(true));
+        assert_eq!(cached_info.source.compression_is_lossless, Some(true));
         assert_eq!(cached_info.source.codec_display(), "WavPack 32-bit float");
 
         // Miss: different mtime.

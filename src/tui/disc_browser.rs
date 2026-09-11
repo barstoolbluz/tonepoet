@@ -745,6 +745,7 @@ pub fn source_info_for_presentation(
     let fmt = &presentation.format;
     SourceInfo {
         sample_format_is_float: None,
+        compression_is_lossless: None,
         format_name: match contents.format {
             DiscFormat::DvdAudio => "DVD-Audio".to_string(),
             DiscFormat::Sacd => "SACD ISO".to_string(),

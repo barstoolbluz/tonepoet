@@ -244,13 +244,13 @@ impl ToolPlugin for SoxPlugin {
             } if target_format.sox_encodable() => {
                 if *target_format == AudioFormat::WavPack
                     && context.request.settings.wavpack.hybrid
-                    && context.request.settings.pcm_true_peak.enabled
+                    && (context.request.settings.pcm_true_peak.enabled
+                        || context.request.settings.pcm_true_peak.fixed_gain_db.is_some())
                 {
-                    // The PCM true-peak hybrid contract governs the integer
-                    // WAV carrier realized immediately before this step. The
-                    // final encode must therefore be native `wavpack -b` with
-                    // no additional PCM processing; the FFmpeg plugin owns
-                    // that deliberate native-CLI delegation.
+                    // PCM gain + WavPack hybrid deliberately realizes the
+                    // final integer encoder-input WAV before this step. The
+                    // terminal encode must therefore be native `wavpack -b`;
+                    // the FFmpeg plugin owns that native-CLI delegation.
                     return ToolSupport::UNSUPPORTED;
                 }
                 let target_depth = match &step.operation {
@@ -1573,6 +1573,9 @@ fn ffmpeg_lossy_processing_filter(context: &PlanContext<'_>, encoder_rate_hz: u3
     if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
+    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db {
+        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+    }
     if context.request.source.sample_rate_hz != Some(encoder_rate_hz) {
         filters.push(format!(
             "aresample={}",
@@ -1590,6 +1593,9 @@ fn ffmpeg_audio_filter(
     let settings = &context.request.settings;
     let mut filters = Vec::new();
     if let Some(gain) = settings.dsd.runtime_album_gain_db() {
+        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+    }
+    if let Some(gain) = settings.pcm_true_peak.fixed_gain_db {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
 
@@ -1774,6 +1780,10 @@ fn add_sox_pcm_effects(
     target_depth: Option<PcmBitDepth>,
 ) {
     if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+        args.push("gain".into());
+        args.push(gain.render(false));
+    }
+    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db {
         args.push("gain".into());
         args.push(gain.render(false));
     }
@@ -2349,6 +2359,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pcm_fixed_gain_is_emitted_once_as_a_plain_amplitude_change() {
+        let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Float64);
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.pcm_true_peak.fixed_gain_db =
+            Some("3.250000000".parse().expect("fixed gain"));
+        let step = album_gain_encode_step(AudioFormat::Flac, true);
+
+        let ffmpeg = build_ffmpeg_encode_pcm(
+            &request.context(),
+            &step,
+            &AudioFormat::Flac,
+            None,
+            PcmBitDepth::Int24,
+            true,
+        )
+        .expect("FFmpeg fixed-gain command");
+        let filter = arg_value(&ffmpeg.args, "-af").expect("FFmpeg fixed-gain filter");
+        assert_eq!(
+            filter.split(',').next(),
+            Some("volume=3.250000000dB:precision=double"),
+            "fixed gain must be the plain first amplitude transform: {filter}",
+        );
+        for forbidden in ["loudnorm", "alimiter", "acompressor", "dynaudnorm", "compand"] {
+            assert!(!filter.contains(forbidden), "unexpected dynamic processing: {filter}");
+        }
+
+        let sox = build_sox_encode_pcm(
+            &request.context(),
+            &step,
+            &AudioFormat::Flac,
+            None,
+            PcmBitDepth::Int24,
+            true,
+        )
+        .expect("SoX fixed-gain command");
+        assert!(
+            sox.args.windows(2).any(|pair| pair == ["gain", "3.250000000"]),
+            "SoX must receive the exact user gain: {:?}",
+            sox.args,
+        );
     }
 
     #[test]
@@ -3119,6 +3172,22 @@ mod tests {
                 .supports(&hard_ceiling_hybrid.context(), &step(false))
                 .is_supported(),
             "PCM true-peak hybrid final encode keeps the native wavpack delegate",
+        );
+
+        let mut fixed_gain_hybrid = hybrid_request.clone();
+        fixed_gain_hybrid.settings.pcm_true_peak.fixed_gain_db =
+            Some("2.500000000".parse().expect("valid fixed gain"));
+        assert!(
+            !SoxPlugin
+                .supports(&fixed_gain_hybrid.context(), &step(false))
+                .is_supported(),
+            "PCM fixed-gain hybrid final encode must not bypass native wavpack -b via SoX",
+        );
+        assert!(
+            FfmpegPlugin
+                .supports(&fixed_gain_hybrid.context(), &step(false))
+                .is_supported(),
+            "PCM fixed-gain hybrid final encode keeps the native wavpack delegate",
         );
 
         hard_ceiling_hybrid.settings.dither_type = DitherType::Tpdf;

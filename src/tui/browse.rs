@@ -14861,6 +14861,7 @@ mod tests {
         CachedInfo {
             source: crate::tui::probe::SourceInfo {
                 sample_format_is_float: None,
+                compression_is_lossless: None,
                 format_name: "FLAC".to_string(),
                 codec: "flac".to_string(),
                 bit_depth: Some(16),
@@ -14898,6 +14899,7 @@ mod tests {
     fn cached_source_info(bit_depth: Option<u32>, sample_rate: u32) -> SourceInfo {
         SourceInfo {
             sample_format_is_float: Some(false),
+            compression_is_lossless: None,
             format_name: "FLAC".to_string(),
             codec: "flac".to_string(),
             bit_depth,
@@ -18496,6 +18498,7 @@ mod tests {
                 std::sync::Arc::new(CachedInfo {
                     source: crate::tui::probe::SourceInfo {
                         sample_format_is_float: None,
+                        compression_is_lossless: None,
                         format_name: "FLAC".to_string(),
                         codec: "flac".to_string(),
                         bit_depth: Some(16),

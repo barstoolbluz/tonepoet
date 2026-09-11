@@ -848,6 +848,7 @@ mod output_options_companion_render_tests {
             codec: "flac".to_string(),
             bit_depth: Some(24),
             sample_format_is_float: None,
+            compression_is_lossless: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),

@@ -272,6 +272,18 @@ pub enum ReplayGainChoice {
     BothIfMissing,
 }
 
+/// PCM gain policy exposed by the Convert screen.
+///
+/// Automatic true-peak gain and fixed amplitude gain are intentionally one
+/// mutually-exclusive axis. This mirrors the DSD gain-mode treatment without
+/// changing the DSD axis itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmGainMode {
+    Off,
+    Auto,
+    Fixed,
+}
+
 /// Bit depth options including float formats
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BitDepthChoice {
@@ -390,6 +402,47 @@ fn source_info_is_dsd(info: &SourceInfo) -> bool {
     info.bit_depth == Some(1)
         || tonepoet_pipeline::DsdRate::from_hz(info.sample_rate).is_some()
         || info.codec.to_ascii_lowercase().contains("dsd")
+}
+
+/// Best-effort lossless classification from probe facts. `None` is deliberate:
+/// an unfamiliar codec must not silently opt into a sample-changing default.
+fn source_info_is_lossless(info: &SourceInfo) -> Option<bool> {
+    use crate::convert::pipeline::SourceAudioCoding;
+
+    // `SourceInfo.codec` is a presentation label for ordinary file probes
+    // (for example `PCM Float`), while disc presentations can surface labels
+    // such as `LPCM` and `DTS-HD MA`. Let the pipeline classifier handle the
+    // labels that remain ffprobe-compatible, then bridge only the known
+    // presentation spellings here. Unknowns remain unknown: they must not arm
+    // a sample-changing default merely because a decoder can open them.
+    let codec = info.codec.trim().to_ascii_lowercase();
+    // WavPack's codec token alone does not distinguish lossless from
+    // hybrid/lossy streams. The probe records that distinction from the
+    // encoded block header; do not infer it from decoded PCM representation.
+    if codec == "wavpack" {
+        return info.compression_is_lossless;
+    }
+
+    let (coding, _) = crate::convert::pipeline::classify_source_audio_probe(
+        Some(info.codec.as_str()),
+        None,
+        info.bit_depth,
+    );
+    match coding {
+        SourceAudioCoding::Pcm | SourceAudioCoding::Dsd => Some(true),
+        SourceAudioCoding::Lossy => Some(false),
+        SourceAudioCoding::DvdaUnknown | SourceAudioCoding::Unknown => {
+            if source_info_is_dsd(info)
+                || matches!(codec.as_str(), "pcm" | "pcm float" | "lpcm")
+                || codec.contains("dts-hd ma")
+                || codec.contains("lossless")
+            {
+                Some(true)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn source_path_is_dsd(path: &Path) -> bool {
@@ -3743,13 +3796,15 @@ pub enum FormatField {
     ReplayGain,
     /// Enable the ordinary-PCM true-peak measure/gain step.
     PcmTruePeak,
+    /// User-supplied fixed PCM gain in dB.
+    PcmGainDb,
     /// True-peak target in dBTP.
     PcmTruePeakTarget,
     /// Per-track or submitted-batch scope.
     PcmTruePeakScope,
     /// Whether positive gain is permitted below the target.
     PcmTruePeakBoost,
-    /// Standard fast rung or 64x Reference measurement.
+    /// Certified true-peak scan tier.
     PcmTruePeakScan,
     // DSD rows
     DsdRate,
@@ -3763,7 +3818,7 @@ pub enum FormatField {
     DsdGain,
     /// Track or submitted-batch scope for automatic DSD peak normalization.
     DsdGainScope,
-    /// Accuracy/speed rung for submitted-batch DSD true-peak analysis.
+    /// Certified scan tier for submitted-batch DSD true-peak analysis.
     DsdTruePeakScan,
     /// Fixed DSD-to-PCM gain value, edited with left/right controls.
     DsdGainDb,
@@ -3974,11 +4029,12 @@ pub struct FormatState {
     pub resampler: PillState<ResamplerChoice>,
     pub dither: PillState<DitherType>,
     pub replaygain: PillState<ReplayGainChoice>,
-    pub pcm_true_peak_enabled: PillState<bool>,
+    pub pcm_gain_mode: PillState<PcmGainMode>,
     pub pcm_true_peak_scope: PillState<PcmTruePeakScope>,
     pub pcm_true_peak_boost: PillState<bool>,
     pub pcm_true_peak_scan_mode: PillState<PcmTruePeakScanMode>,
     pub pcm_true_peak_target_dbtp: DbNano,
+    pub pcm_fixed_gain_db: DbNano,
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
     pub conversion_preset: PillState<DsdConversionPreset>,
@@ -3989,7 +4045,7 @@ pub struct FormatState {
     pub dsd_gain_mode: PillState<DsdGainMode>,
     /// Scope for legacy Auto / native NormalizePeak. Track is compatibility default.
     pub dsd_auto_gain_scope: PillState<DsdAutoGainScope>,
-    /// Opt-in true-peak scan rung for album scope. Reference is the default.
+    /// Opt-in true-peak scan tier for album scope. Reference is the default.
     pub dsd_true_peak_scan_mode: PillState<DsdTruePeakScanMode>,
     /// Fixed DSD-to-PCM gain in dB used when `dsd_gain_mode` is Manual.
     pub dsd_gain_db: DbNano,
@@ -4000,6 +4056,12 @@ pub struct FormatState {
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
+    /// Probe-established source float class and width. `None` means either an
+    /// integer/non-PCM source or that the probe cannot establish float class.
+    pub source_pcm_float_bits: Option<u32>,
+    /// Probe-established lossless PCM/source class used only for the
+    /// lossless->lossy automatic safety default. `None` means unknown.
+    pub source_is_lossless: Option<bool>,
     /// Probe-established DSD source sample rate used to disable impossible
     /// profile choices without replacing planner-grade validation.
     pub source_dsd_rate_hz: Option<u32>,
@@ -4018,6 +4080,12 @@ pub struct FormatState {
     pub sample_rate_overridden: bool,
     /// True after an explicit keyboard, mouse, command, or preset depth choice.
     pub bit_depth_overridden: bool,
+    /// False while source/target facts are allowed to install the automatic
+    /// PCM gain default. Any explicit PCM gain interaction or preset sets it.
+    pub pcm_gain_overridden: bool,
+    /// DSD counterpart: automatic DSD gain defaults stop mutating the row once
+    /// the user or a preset explicitly chooses the gain policy.
+    pub dsd_gain_overridden: bool,
     /// Concrete rate most recently installed by a source-default cascade.
     /// `None` means the selected rate is user/preset policy or the Source sentinel.
     pub(crate) source_derived_sample_rate: Option<u32>,
@@ -4224,17 +4292,22 @@ impl FormatState {
             (ReplayGainChoice::Off, "off"),
         ]);
 
-        let pcm_true_peak_enabled = PillState::new(vec![(false, "off"), (true, "on")]);
+        let pcm_gain_mode = PillState::new(vec![
+            (PcmGainMode::Off, "off"),
+            (PcmGainMode::Auto, "auto"),
+            (PcmGainMode::Fixed, "fixed"),
+        ]);
         let pcm_true_peak_scope = PillState::new(vec![
             (PcmTruePeakScope::Track, "track"),
             (PcmTruePeakScope::Album, "album"),
         ]);
         let pcm_true_peak_boost = PillState::new(vec![(false, "off"), (true, "on")]);
-        let pcm_true_peak_scan_mode = PillState::new(vec![
-            (PcmTruePeakScanMode::Standard, "0.044 dB / standard"),
-            (PcmTruePeakScanMode::Fast, "adaptive / fast"),
-            (PcmTruePeakScanMode::Reference, "0.030 dB / reference"),
+        let mut pcm_true_peak_scan_mode = PillState::new(vec![
+            (PcmTruePeakScanMode::Reference, "reference"),
+            (PcmTruePeakScanMode::Standard, "standard"),
+            (PcmTruePeakScanMode::Fast, "fast"),
         ]);
+        pcm_true_peak_scan_mode.select_value(&PcmTruePeakScanMode::Fast);
 
         let noise_shaper = PillState::new(vec![
             (DsdNoiseShaper::Clans, "CLANS"),
@@ -4268,9 +4341,9 @@ impl FormatState {
             (DsdAutoGainScope::Album, "album"),
         ]);
         let dsd_true_peak_scan_mode = PillState::new(vec![
-            (DsdTruePeakScanMode::Reference, "0.030 dB / accurate"),
-            (DsdTruePeakScanMode::Fast, "0.044 dB / fast"),
-            (DsdTruePeakScanMode::Fastest, "0.084 dB / fastest"),
+            (DsdTruePeakScanMode::Reference, "reference"),
+            (DsdTruePeakScanMode::Standard, "standard"),
+            (DsdTruePeakScanMode::Fast, "fast"),
         ]);
         let mut dsd_pathway = PillState::new(vec![
             (DsdSourcePathway::Reference, "reference"),
@@ -4290,11 +4363,12 @@ impl FormatState {
             resampler,
             dither,
             replaygain,
-            pcm_true_peak_enabled,
+            pcm_gain_mode,
             pcm_true_peak_scope,
             pcm_true_peak_boost,
             pcm_true_peak_scan_mode,
             pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            pcm_fixed_gain_db: DbNano::ZERO,
             noise_shaper,
             modulator_order,
             conversion_preset,
@@ -4304,9 +4378,11 @@ impl FormatState {
             dsd_auto_gain_scope,
             dsd_true_peak_scan_mode,
             dsd_gain_db: DbNano(0),
-            dsd_normalize_target_dbfs: DbNano::DEFAULT_NORMALIZE_TARGET,
-            dsd_auto_gain_margin_db: DbNano(150_000_000),
+            dsd_normalize_target_dbfs: DbNano(-100_000_000),
+            dsd_auto_gain_margin_db: DbNano(100_000_000),
             source_is_dsd: false,
+            source_pcm_float_bits: None,
+            source_is_lossless: None,
             source_dsd_rate_hz: None,
             source_rate_identity: SourceRateIdentity::Unstaged,
             field_focus: FormatField::Format,
@@ -4315,6 +4391,8 @@ impl FormatState {
             resampler_overridden: false,
             sample_rate_overridden: false,
             bit_depth_overridden: false,
+            pcm_gain_overridden: false,
+            dsd_gain_overridden: false,
             source_derived_sample_rate: None,
             source_derived_bit_depth: None,
             pcm_rate_before_dsd: None,
@@ -4554,10 +4632,13 @@ impl FormatState {
     /// permissiveness holds only on a screen that never staged a source.
     pub fn set_pending_source_hint(&mut self, source_is_dsd_hint: bool) {
         self.source_is_dsd = source_is_dsd_hint;
+        self.source_pcm_float_bits = None;
+        self.source_is_lossless = None;
         if self.source_rate_identity != SourceRateIdentity::Unstaged {
             self.source_rate_identity = SourceRateIdentity::Lost;
         }
         self.apply_format_constraints();
+        self.apply_auto_gain_defaults();
     }
 
     /// Exact dynamic row sequence rendered by the Format pane. This is the
@@ -4584,13 +4665,17 @@ impl FormatState {
             }
             if !self.source_is_dsd {
                 rows.push(FormatPaneRow::Field(FormatField::PcmTruePeak));
-                if *self.pcm_true_peak_enabled.selected_value() {
-                    rows.extend([
+                match *self.pcm_gain_mode.selected_value() {
+                    PcmGainMode::Auto => rows.extend([
                         FormatPaneRow::Field(FormatField::PcmTruePeakTarget),
                         FormatPaneRow::Field(FormatField::PcmTruePeakScope),
                         FormatPaneRow::Field(FormatField::PcmTruePeakBoost),
                         FormatPaneRow::Field(FormatField::PcmTruePeakScan),
-                    ]);
+                    ]),
+                    PcmGainMode::Fixed => {
+                        rows.push(FormatPaneRow::Field(FormatField::PcmGainDb));
+                    }
+                    PcmGainMode::Off => {}
                 }
             }
             // ReplayGain is intentionally presented after the sample-changing
@@ -4687,6 +4772,7 @@ impl FormatState {
         self.bit_depth.select_value(&bit_depth);
         self.apply_auto_dither(source_bits);
         self.apply_format_constraints();
+        self.apply_auto_gain_defaults();
     }
 
     pub fn is_lossy_codec_selected(&self) -> bool {
@@ -4694,6 +4780,68 @@ impl FormatState {
             *self.format.selected_value(),
             AudioFormat::Mp3 | AudioFormat::Aac | AudioFormat::Opus
         )
+    }
+
+    fn auto_gain_target_is_lossy(&self) -> bool {
+        self.pcm_true_peak_lossy_floor_applies()
+    }
+
+    fn auto_gain_target_is_integer_pcm(&self) -> bool {
+        if self.is_dsd_selected() || self.auto_gain_target_is_lossy() {
+            return false;
+        }
+        match *self.bit_depth.selected_value() {
+            BitDepthChoice::Int16 | BitDepthChoice::Int24 | BitDepthChoice::Int32 => true,
+            // `Source` is an output sentinel. For ordinary PCM it preserves
+            // the authoritative source representation and therefore must not
+            // manufacture a float->integer safety trigger. A DSD source has no
+            // PCM word length to preserve, however: the planner resolves Source
+            // to the selected lossless format's documented integer default.
+            BitDepthChoice::Source => self.source_is_dsd,
+            BitDepthChoice::Float32 | BitDepthChoice::Float64 => false,
+        }
+    }
+
+    /// Install only safety-oriented defaults. User and preset choices become
+    /// sticky through the corresponding `*_gain_overridden` bit.
+    pub fn apply_auto_gain_defaults(&mut self) {
+        let lossy_target = self.auto_gain_target_is_lossy();
+
+        if !self.pcm_gain_overridden {
+            let float_to_integer = self.source_pcm_float_bits.is_some()
+                && self.auto_gain_target_is_integer_pcm();
+            let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
+            if !self.source_is_dsd && (float_to_integer || lossless_to_lossy) {
+                self.pcm_gain_mode.select_value(&PcmGainMode::Auto);
+                self.pcm_true_peak_scan_mode
+                    .select_value(&PcmTruePeakScanMode::Fast);
+            } else {
+                self.pcm_gain_mode.select_value(&PcmGainMode::Off);
+            }
+        }
+
+        if !self.dsd_gain_overridden {
+            let dsd_requires_safety_gain = self.source_is_dsd
+                && self.dsd_to_pcm_gain_available()
+                && (lossy_target || self.auto_gain_target_is_integer_pcm());
+            if dsd_requires_safety_gain {
+                let mode = if self.dsd_reference_controls_available() {
+                    DsdGainMode::NormalizePeak
+                } else {
+                    DsdGainMode::Auto
+                };
+                self.dsd_gain_mode.select_value(&mode);
+                self.dsd_true_peak_scan_mode
+                    .select_value(&DsdTruePeakScanMode::Fast);
+            } else {
+                let mode = if self.dsd_reference_controls_available() {
+                    DsdGainMode::Reference
+                } else {
+                    DsdGainMode::Disabled
+                };
+                self.dsd_gain_mode.select_value(&mode);
+            }
+        }
     }
 
     pub fn pcm_true_peak_lossy_floor_applies(&self) -> bool {
@@ -4922,8 +5070,11 @@ impl FormatState {
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
             FormatField::ReplayGain => select_enabled_index(&mut self.replaygain, index),
-            FormatField::PcmTruePeak => {
-                select_enabled_index(&mut self.pcm_true_peak_enabled, index)
+            FormatField::PcmTruePeak => select_enabled_index(&mut self.pcm_gain_mode, index),
+            FormatField::PcmGainDb => {
+                self.pcm_gain_mode.select_value(&PcmGainMode::Fixed);
+                self.pcm_fixed_gain_db = clamp_dsd_to_pcm_gain_db(self.pcm_fixed_gain_db);
+                true
             }
             FormatField::PcmTruePeakScope => {
                 select_enabled_index(&mut self.pcm_true_peak_scope, index)
@@ -4935,7 +5086,7 @@ impl FormatState {
                 select_enabled_index(&mut self.pcm_true_peak_scan_mode, index)
             }
             FormatField::PcmTruePeakTarget => {
-                self.pcm_true_peak_enabled.select_value(&true);
+                self.pcm_gain_mode.select_value(&PcmGainMode::Auto);
                 self.pcm_true_peak_target_dbtp =
                     clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
                 true
@@ -5006,6 +5157,27 @@ impl FormatState {
         if row == FormatField::Resampler {
             self.resampler_overridden = true;
         }
+        if matches!(
+            row,
+            FormatField::PcmTruePeak
+                | FormatField::PcmGainDb
+                | FormatField::PcmTruePeakTarget
+                | FormatField::PcmTruePeakScope
+                | FormatField::PcmTruePeakBoost
+                | FormatField::PcmTruePeakScan
+        ) {
+            self.pcm_gain_overridden = true;
+        }
+        if matches!(
+            row,
+            FormatField::DsdGain
+                | FormatField::DsdGainScope
+                | FormatField::DsdTruePeakScan
+                | FormatField::DsdGainDb
+                | FormatField::DsdNormalizeTarget
+        ) {
+            self.dsd_gain_overridden = true;
+        }
 
         if row == FormatField::Format && before_format != *self.format.selected_value() {
             self.selected_container_index = 0;
@@ -5039,6 +5211,7 @@ impl FormatState {
                 }
                 self.apply_auto_resampler(source_rate);
             }
+            self.apply_auto_gain_defaults();
             return;
         }
 
@@ -5057,6 +5230,7 @@ impl FormatState {
         }
 
         self.apply_format_constraints();
+        self.apply_auto_gain_defaults();
     }
 
     /// Applies the default dither rule while preserving manual user choice.
@@ -5141,6 +5315,8 @@ impl FormatState {
     /// output policy and therefore survive the same source-fact gap.
     pub fn clear_source_derived_defaults(&mut self) {
         self.source_is_dsd = false;
+        self.source_pcm_float_bits = None;
+        self.source_is_lossless = None;
         self.source_dsd_rate_hz = None;
         self.source_rate_identity = SourceRateIdentity::Lost;
 
@@ -5163,22 +5339,18 @@ impl FormatState {
         if !self.resampler_overridden {
             self.resampler.select_value(&ResamplerChoice::None);
         }
-        if *self.dsd_gain_mode.selected_value() != DsdGainMode::Fixed {
-            let default_mode = if self.dsd_reference_controls_available() {
-                DsdGainMode::Reference
-            } else {
-                DsdGainMode::Disabled
-            };
-            self.dsd_gain_mode.select_value(&default_mode);
-            self.dsd_gain_db = DbNano(0);
-        }
-
         // Constraints update option availability, but clamp_sample_rate_pill
         // deliberately retains the source sentinel even while disabled. This
         // keeps the user's policy visible until a later probe can validate it.
         self.apply_format_constraints();
         self.apply_auto_dither(None);
         self.apply_auto_resampler(None);
+        self.apply_auto_gain_defaults();
+        if !self.dsd_gain_overridden
+            && *self.dsd_gain_mode.selected_value() != DsdGainMode::Fixed
+        {
+            self.dsd_gain_db = DbNano::ZERO;
+        }
     }
 
     /// Set PCM output defaults to match a PCM source. Called when a source is
@@ -5526,11 +5698,12 @@ impl FormatState {
         clamp_pill(&mut self.resampler);
         clamp_pill(&mut self.dither);
         clamp_pill(&mut self.replaygain);
-        clamp_pill(&mut self.pcm_true_peak_enabled);
+        clamp_pill(&mut self.pcm_gain_mode);
         clamp_pill(&mut self.pcm_true_peak_scope);
         clamp_pill(&mut self.pcm_true_peak_boost);
         clamp_pill(&mut self.pcm_true_peak_scan_mode);
         self.pcm_true_peak_target_dbtp = clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
+        self.pcm_fixed_gain_db = clamp_dsd_to_pcm_gain_db(self.pcm_fixed_gain_db);
         clamp_pill(&mut self.noise_shaper);
         clamp_pill(&mut self.modulator_order);
         clamp_pill(&mut self.conversion_preset);
@@ -5560,7 +5733,11 @@ impl FormatState {
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
             FormatField::ReplayGain => FocusedPill::ReplayGain(&mut self.replaygain),
-            FormatField::PcmTruePeak => FocusedPill::PcmTruePeak(&mut self.pcm_true_peak_enabled),
+            FormatField::PcmTruePeak => FocusedPill::PcmTruePeak(&mut self.pcm_gain_mode),
+            FormatField::PcmGainDb => FocusedPill::PcmGainDb {
+                gain_db: &mut self.pcm_fixed_gain_db,
+                gain_mode: &mut self.pcm_gain_mode,
+            },
             FormatField::PcmTruePeakScope => {
                 FocusedPill::PcmTruePeakScope(&mut self.pcm_true_peak_scope)
             }
@@ -5572,7 +5749,7 @@ impl FormatState {
             }
             FormatField::PcmTruePeakTarget => FocusedPill::PcmTruePeakTarget {
                 target_dbtp: &mut self.pcm_true_peak_target_dbtp,
-                enabled: &mut self.pcm_true_peak_enabled,
+                gain_mode: &mut self.pcm_gain_mode,
             },
             FormatField::NoiseShaper => FocusedPill::NoiseShaper(&mut self.noise_shaper),
             FormatField::ModulatorOrder => FocusedPill::ModulatorOrder(&mut self.modulator_order),
@@ -5762,13 +5939,17 @@ pub enum FocusedPill<'a> {
     Resampler(&'a mut PillState<ResamplerChoice>),
     Dither(&'a mut PillState<DitherType>),
     ReplayGain(&'a mut PillState<ReplayGainChoice>),
-    PcmTruePeak(&'a mut PillState<bool>),
+    PcmTruePeak(&'a mut PillState<PcmGainMode>),
+    PcmGainDb {
+        gain_db: &'a mut DbNano,
+        gain_mode: &'a mut PillState<PcmGainMode>,
+    },
     PcmTruePeakScope(&'a mut PillState<PcmTruePeakScope>),
     PcmTruePeakBoost(&'a mut PillState<bool>),
     PcmTruePeakScan(&'a mut PillState<PcmTruePeakScanMode>),
     PcmTruePeakTarget {
         target_dbtp: &'a mut DbNano,
-        enabled: &'a mut PillState<bool>,
+        gain_mode: &'a mut PillState<PcmGainMode>,
     },
     NoiseShaper(&'a mut PillState<DsdNoiseShaper>),
     ModulatorOrder(&'a mut PillState<ModulatorOrder>),
@@ -5802,11 +5983,15 @@ impl FocusedPill<'_> {
             Self::Dither(p) => p.select_next(),
             Self::ReplayGain(p) => p.select_next(),
             Self::PcmTruePeak(p) => p.select_next(),
+            Self::PcmGainDb { gain_db, gain_mode } => {
+                (*gain_mode).select_value(&PcmGainMode::Fixed);
+                step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
+            }
             Self::PcmTruePeakScope(p) => p.select_next(),
             Self::PcmTruePeakBoost(p) => p.select_next(),
             Self::PcmTruePeakScan(p) => p.select_next(),
-            Self::PcmTruePeakTarget { target_dbtp, enabled } => {
-                (*enabled).select_value(&true);
+            Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
+                (*gain_mode).select_value(&PcmGainMode::Auto);
                 step_pcm_true_peak_target(*target_dbtp, 50_000_000);
             }
             Self::NoiseShaper(p) => p.select_next(),
@@ -5841,11 +6026,15 @@ impl FocusedPill<'_> {
             Self::Dither(p) => p.select_prev(),
             Self::ReplayGain(p) => p.select_prev(),
             Self::PcmTruePeak(p) => p.select_prev(),
+            Self::PcmGainDb { gain_db, gain_mode } => {
+                (*gain_mode).select_value(&PcmGainMode::Fixed);
+                step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
+            }
             Self::PcmTruePeakScope(p) => p.select_prev(),
             Self::PcmTruePeakBoost(p) => p.select_prev(),
             Self::PcmTruePeakScan(p) => p.select_prev(),
-            Self::PcmTruePeakTarget { target_dbtp, enabled } => {
-                (*enabled).select_value(&true);
+            Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
+                (*gain_mode).select_value(&PcmGainMode::Auto);
                 step_pcm_true_peak_target(*target_dbtp, -50_000_000);
             }
             Self::NoiseShaper(p) => p.select_prev(),
@@ -6276,6 +6465,15 @@ impl ConvertState {
             Some(info) => {
                 let source_is_dsd = source_info_is_dsd(info);
                 self.format.set_source_is_dsd(source_is_dsd);
+                self.format.source_pcm_float_bits = if !source_is_dsd
+                    && info.sample_format_is_float == Some(true)
+                    && matches!(info.bit_depth, Some(32 | 64))
+                {
+                    info.bit_depth
+                } else {
+                    None
+                };
+                self.format.source_is_lossless = source_info_is_lossless(info);
             }
             None => {
                 let hint = self
@@ -6288,6 +6486,7 @@ impl ConvertState {
             }
         }
         self.format.apply_format_constraints();
+        self.format.apply_auto_gain_defaults();
     }
 
     /// Recompute constraints from a newly probed source without selecting
@@ -6298,8 +6497,19 @@ impl ConvertState {
         &mut self,
         info: &SourceInfo,
     ) {
-        self.format.set_source_is_dsd(source_info_is_dsd(info));
+        let is_dsd = source_info_is_dsd(info);
+        self.format.set_source_is_dsd(is_dsd);
+        self.format.source_pcm_float_bits = if !is_dsd
+            && info.sample_format_is_float == Some(true)
+            && matches!(info.bit_depth, Some(32 | 64))
+        {
+            info.bit_depth
+        } else {
+            None
+        };
+        self.format.source_is_lossless = source_info_is_lossless(info);
         self.format.apply_format_constraints();
+        self.format.apply_auto_gain_defaults();
     }
 
     pub fn install_pending_archive_preview(&mut self, pending: PendingArchivePreview) {
@@ -6380,9 +6590,18 @@ impl ConvertState {
     pub fn apply_source_info_defaults(&mut self, info: &SourceInfo) {
         let source_rate = info.sample_rate;
         let source_bits = info.bit_depth;
-        let source_is_float = info.codec.contains("Float");
+        let source_is_float = info.sample_format_is_float == Some(true);
         let is_dsd_source = source_info_is_dsd(info);
         self.format.set_source_is_dsd(is_dsd_source);
+        self.format.source_pcm_float_bits = if !is_dsd_source
+            && source_is_float
+            && matches!(source_bits, Some(32 | 64))
+        {
+            source_bits
+        } else {
+            None
+        };
+        self.format.source_is_lossless = source_info_is_lossless(info);
 
         if is_dsd_source {
             if !self.format.is_dsd_selected() {
@@ -6402,6 +6621,7 @@ impl ConvertState {
         self.format.apply_format_constraints();
         self.format.apply_auto_dither(source_bits);
         self.format.apply_auto_resampler(Some(source_rate));
+        self.format.apply_auto_gain_defaults();
     }
 
     /// Apply source-aware format pane defaults after a probe completes.
@@ -7418,6 +7638,7 @@ pub struct MediaFacts {
     pub codec: String,
     pub bit_depth: Option<u32>,
     pub sample_format_is_float: Option<bool>,
+    pub compression_is_lossless: Option<bool>,
     pub sample_rate: u32,
     pub channels: u32,
     pub channel_layout: String,
@@ -7432,6 +7653,7 @@ impl From<SourceInfo> for MediaFacts {
             codec: info.codec,
             bit_depth: info.bit_depth,
             sample_format_is_float: info.sample_format_is_float,
+            compression_is_lossless: info.compression_is_lossless,
             sample_rate: info.sample_rate,
             channels: info.channels,
             channel_layout: info.channel_layout,
@@ -7448,6 +7670,7 @@ impl From<&SourceInfo> for MediaFacts {
             codec: info.codec.clone(),
             bit_depth: info.bit_depth,
             sample_format_is_float: info.sample_format_is_float,
+            compression_is_lossless: info.compression_is_lossless,
             sample_rate: info.sample_rate,
             channels: info.channels,
             channel_layout: info.channel_layout.clone(),
@@ -7464,6 +7687,7 @@ impl From<MediaFacts> for SourceInfo {
             codec: facts.codec,
             bit_depth: facts.bit_depth,
             sample_format_is_float: facts.sample_format_is_float,
+            compression_is_lossless: facts.compression_is_lossless,
             sample_rate: facts.sample_rate,
             channels: facts.channels,
             channel_layout: facts.channel_layout,
@@ -16788,6 +17012,7 @@ pub fn apply_format_settings_kind(
         }
     }
     format.apply_format_constraints();
+    format.apply_auto_gain_defaults();
     Ok(())
 }
 
@@ -17174,6 +17399,235 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
 }
 
 #[cfg(test)]
+mod pcm_gain_auto_default_tests {
+    use super::*;
+
+    fn pcm_state(format: AudioFormat, depth: BitDepthChoice) -> FormatState {
+        let mut state = FormatState::new();
+        state.format.select_value(&format);
+        state.bit_depth.select_value(&depth);
+        state.source_is_dsd = false;
+        state.source_rate_identity = SourceRateIdentity::Known;
+        state.apply_format_constraints();
+        state
+    }
+
+    #[test]
+    fn friendly_probe_labels_preserve_known_lossless_vs_lossy_source_facts() {
+        let info = |codec: &str,
+                    bit_depth: Option<u32>,
+                    float: Option<bool>,
+                    compression_is_lossless: Option<bool>| SourceInfo {
+            format_name: "test".to_string(),
+            codec: codec.to_string(),
+            bit_depth,
+            sample_format_is_float: float,
+            compression_is_lossless,
+            sample_rate: 48_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 0,
+        };
+
+        assert_eq!(
+            source_info_is_lossless(&info("PCM", Some(24), Some(false), None)),
+            Some(true),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("PCM Float", Some(32), Some(true), None)),
+            Some(true),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("LPCM", Some(24), None, None)),
+            Some(true),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("DTS-HD MA", Some(24), None, None)),
+            Some(true),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("AAC", None, None, None)),
+            Some(false),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("WavPack", Some(24), Some(false), Some(true))),
+            Some(true),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("WavPack", Some(24), Some(false), Some(false))),
+            Some(false),
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("WavPack", Some(24), Some(false), None)),
+            None,
+        );
+        assert_eq!(
+            source_info_is_lossless(&info("unknown codec", None, None, None)),
+            None,
+        );
+    }
+
+    #[test]
+    fn media_facts_round_trip_preserves_wavpack_compression_losslessness() {
+        let source = SourceInfo {
+            format_name: "WavPack".to_string(),
+            codec: "WavPack".to_string(),
+            bit_depth: Some(24),
+            sample_format_is_float: Some(false),
+            compression_is_lossless: Some(true),
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 4096,
+        };
+
+        let facts = MediaFacts::from(&source);
+        assert_eq!(facts.compression_is_lossless, Some(true));
+
+        let restored = SourceInfo::from(facts);
+        assert_eq!(restored.compression_is_lossless, Some(true));
+        assert_eq!(restored.codec, source.codec);
+    }
+
+    #[test]
+    fn wavpack_compression_fact_controls_lossless_to_lossy_auto_gain_default() {
+        let wavpack = |compression_is_lossless| SourceInfo {
+            format_name: "WavPack".to_string(),
+            codec: "WavPack".to_string(),
+            bit_depth: Some(24),
+            sample_format_is_float: Some(false),
+            compression_is_lossless,
+            sample_rate: 48_000,
+            channels: 2,
+            channel_layout: "stereo".to_string(),
+            duration_secs: 1.0,
+            file_size: 4096,
+        };
+
+        for target in [AudioFormat::Aac, AudioFormat::Mp3, AudioFormat::Opus] {
+            let mut lossless = pcm_state(target.clone(), BitDepthChoice::Source);
+            lossless.source_is_lossless = source_info_is_lossless(&wavpack(Some(true)));
+            lossless.apply_auto_gain_defaults();
+            assert_eq!(
+                lossless.pcm_gain_mode.selected_value(),
+                &PcmGainMode::Auto,
+                "lossless WavPack -> {target:?} must default to auto gain",
+            );
+            assert_eq!(
+                lossless.pcm_true_peak_scan_mode.selected_value(),
+                &PcmTruePeakScanMode::Fast,
+            );
+
+            let mut hybrid = pcm_state(target.clone(), BitDepthChoice::Source);
+            hybrid.source_is_lossless = source_info_is_lossless(&wavpack(Some(false)));
+            hybrid.apply_auto_gain_defaults();
+            assert_eq!(
+                hybrid.pcm_gain_mode.selected_value(),
+                &PcmGainMode::Off,
+                "hybrid WavPack -> {target:?} must remain off absent another trigger",
+            );
+
+            let mut unknown = pcm_state(target, BitDepthChoice::Source);
+            unknown.source_is_lossless = source_info_is_lossless(&wavpack(None));
+            unknown.apply_auto_gain_defaults();
+            assert_eq!(
+                unknown.pcm_gain_mode.selected_value(),
+                &PcmGainMode::Off,
+                "indeterminate WavPack -> lossy must remain fail-neutral",
+            );
+        }
+    }
+
+    #[test]
+    fn float_pcm_to_integer_pcm_defaults_to_fast_auto_gain() {
+        let mut state = pcm_state(AudioFormat::Wav, BitDepthChoice::Int24);
+        state.source_pcm_float_bits = Some(64);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(
+            state.pcm_true_peak_scan_mode.selected_value(),
+            &PcmTruePeakScanMode::Fast,
+        );
+        assert_eq!(
+            state.pcm_true_peak_target_dbtp,
+            tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+        );
+    }
+
+    #[test]
+    fn lossless_to_lossy_defaults_to_auto_but_lossy_to_lossy_does_not() {
+        let mut state = pcm_state(AudioFormat::Aac, BitDepthChoice::Source);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+
+        state.source_is_lossless = Some(false);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+    }
+
+    #[test]
+    fn source_depth_float_to_float_does_not_create_an_unnecessary_gain_pass() {
+        let mut state = pcm_state(AudioFormat::Wav, BitDepthChoice::Source);
+        state.source_pcm_float_bits = Some(32);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+    }
+
+    #[test]
+    fn dsd_source_depth_sentinel_resolves_to_integer_pcm_and_defaults_to_fast_auto_gain() {
+        let mut state = pcm_state(AudioFormat::Wav, BitDepthChoice::Source);
+        // Must go through the setter: it re-runs apply_format_constraints(), which
+        // is what enables the DSD gain pill options. Assigning the field directly
+        // leaves them disabled, and PillState::select_value silently no-ops on a
+        // disabled option, so the mode would stay at its default.
+        state.set_source_is_dsd(true);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+        assert_eq!(state.dsd_gain_mode.selected_value(), &DsdGainMode::Auto);
+        assert_eq!(
+            state.dsd_true_peak_scan_mode.selected_value(),
+            &DsdTruePeakScanMode::Fast,
+        );
+    }
+
+    #[test]
+    fn explicit_user_off_remains_sticky_when_target_changes() {
+        let mut state = pcm_state(AudioFormat::Aac, BitDepthChoice::Source);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+
+        state.pcm_gain_mode.select_value(&PcmGainMode::Off);
+        state.pcm_gain_overridden = true;
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+    }
+
+    #[test]
+    fn wavpack_hybrid_transition_recomputes_lossless_to_lossy_default() {
+        let mut state = pcm_state(AudioFormat::WavPack, BitDepthChoice::Int24);
+        state.source_is_lossless = Some(true);
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+
+        state.wavpack_hybrid = true;
+        state.apply_auto_gain_defaults();
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(
+            state.pcm_true_peak_scan_mode.selected_value(),
+            &PcmTruePeakScanMode::Fast,
+        );
+    }
+}
+
+#[cfg(test)]
 mod pcm_true_peak_lossy_floor_ui_tests {
     use super::*;
 
@@ -17193,10 +17647,10 @@ mod pcm_true_peak_lossy_floor_ui_tests {
             AudioFormat::Dts,
             AudioFormat::Ac3,
         ] {
-            let capped = state(format.clone(), "-0.500000000");
+            let capped = state(format.clone(), "0.000000000");
             assert!(capped.pcm_true_peak_target_is_capped(), "{format:?}");
 
-            let at_floor = state(format.clone(), "-1.000000000");
+            let at_floor = state(format.clone(), "-0.100000000");
             assert!(!at_floor.pcm_true_peak_target_is_capped());
 
             let below_floor = state(format, "-1.500000000");
@@ -17210,14 +17664,14 @@ mod pcm_true_peak_lossy_floor_ui_tests {
             AudioFormat::Alac,
             AudioFormat::WavPack,
         ] {
-            let lossless = state(format, "-0.500000000");
+            let lossless = state(format, "0.000000000");
             assert!(!lossless.pcm_true_peak_target_is_capped());
         }
 
-        let mut hybrid = state(AudioFormat::WavPack, "-0.500000000");
+        let mut hybrid = state(AudioFormat::WavPack, "0.000000000");
         hybrid.wavpack_hybrid = true;
         assert!(hybrid.pcm_true_peak_target_is_capped());
-        hybrid.pcm_true_peak_target_dbtp = "-1.000000000".parse().unwrap();
+        hybrid.pcm_true_peak_target_dbtp = "-0.100000000".parse().unwrap();
         assert!(!hybrid.pcm_true_peak_target_is_capped());
         hybrid.pcm_true_peak_target_dbtp = "-1.500000000".parse().unwrap();
         assert!(!hybrid.pcm_true_peak_target_is_capped());
@@ -17630,7 +18084,7 @@ mod app_startup_options_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
         assert_eq!(
-            version, 26,
+            version, 27,
             "quiescent startup must durably advance through the current schema"
         );
         let protocol_version: u32 = conn
@@ -17731,10 +18185,10 @@ mod dsd_gain_format_state_tests {
         assert!(rows.contains(&FormatField::DsdTruePeakScan));
         assert!(state
             .dsd_true_peak_scan_mode
-            .select_value(&DsdTruePeakScanMode::Fastest));
+            .select_value(&DsdTruePeakScanMode::Fast));
         assert_eq!(
             state.dsd_true_peak_scan_mode.selected_label(),
-            "0.084 dB / fastest"
+            "fast"
         );
 
         assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
@@ -17817,14 +18271,14 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn pre_promotion_dsd_gain_defaults_are_exact_legacy_disabled_and_point_15_margin() {
+    fn convert_dsd_gain_defaults_are_disabled_with_point_1_auto_headroom() {
         let s = FormatState::new();
         assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
         assert_eq!(
             s.dsd_normalize_target_dbfs,
-            "-0.150000000".parse().unwrap()
+            "-0.100000000".parse().unwrap()
         );
-        assert_eq!(s.dsd_auto_gain_margin_db, "0.150000000".parse().unwrap());
+        assert_eq!(s.dsd_auto_gain_margin_db, "0.100000000".parse().unwrap());
         assert_eq!(s.dsd_gain_db, DbNano::ZERO);
         assert!(!s.source_is_dsd);
     }
@@ -17887,7 +18341,7 @@ mod dsd_gain_format_state_tests {
         s.field_focus = FormatField::DsdNormalizeTarget;
         s.select_focused_next(None, None);
         assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Auto);
-        assert_eq!(s.dsd_auto_gain_margin_db, "0.200000000".parse().unwrap());
+        assert_eq!(s.dsd_auto_gain_margin_db, "0.150000000".parse().unwrap());
     }
 
     #[test]
@@ -18103,6 +18557,7 @@ mod cue_proxy_probe_tests {
             codec: "FLAC".to_string(),
             bit_depth,
             sample_format_is_float: None,
+            compression_is_lossless: None,
             sample_rate,
             channels,
             channel_layout: if channels == 2 { "stereo".to_string() } else { format!("{} ch", channels) },
@@ -18728,6 +19183,7 @@ mod source_default_reset_tests {
             codec: "FLAC".to_string(),
             bit_depth,
             sample_format_is_float: None,
+            compression_is_lossless: None,
             sample_rate,
             channels: 2,
             channel_layout: "stereo".to_string(),
@@ -20610,6 +21066,7 @@ mod metadata_presentation_tab_tests {
             codec: "FLAC".to_string(),
             bit_depth: Some(24),
             sample_format_is_float: None,
+            compression_is_lossless: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),
@@ -21103,6 +21560,7 @@ mod metadata_presentation_tab_tests {
             codec: "FLAC".to_string(),
             bit_depth: Some(24),
             sample_format_is_float: None,
+            compression_is_lossless: None,
             sample_rate: 96_000,
             channels: 2,
             channel_layout: "stereo".to_string(),

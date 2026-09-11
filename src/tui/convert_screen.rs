@@ -305,10 +305,14 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
             FormatField::PcmTruePeak => register_pill_row(
                 buttons,
-                &state.pcm_true_peak_enabled,
+                &state.pcm_gain_mode,
                 y,
                 label_col,
                 TuiButton::PcmTruePeakPill,
+            ),
+            FormatField::PcmGainDb => buttons.record_button(
+                TuiButton::PcmGainDbField,
+                ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
             FormatField::PcmTruePeakScope => register_pill_row(
                 buttons,

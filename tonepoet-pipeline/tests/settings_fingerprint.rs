@@ -281,6 +281,7 @@ fn pcm_true_peak_fingerprint_extension_covers_every_enabled_byte_affecting_contr
     assert_eq!(
         PCM_TRUE_PEAK_FINGERPRINT_FIELD_PATHS,
         &[
+            "pcm_true_peak.fixed_gain_db",
             "pcm_true_peak.enabled",
             "pcm_true_peak.target_dbtp",
             "pcm_true_peak.allow_boost",
@@ -303,8 +304,24 @@ fn pcm_true_peak_fingerprint_extension_covers_every_enabled_byte_affecting_contr
         "disabled PCM true-peak state must remain fingerprint-inert",
     );
 
+    let mut fixed = disabled.clone();
+    fixed.pcm_true_peak.fixed_gain_db = Some("3.250000000".parse().unwrap());
+    let fixed_fingerprint = settings_fingerprint(&fixed);
+    assert_ne!(
+        disabled_fingerprint,
+        fixed_fingerprint,
+        "user fixed gain changes output bytes even while automatic true-peak gain is off",
+    );
+    fixed.pcm_true_peak.fixed_gain_db = Some("3.251000000".parse().unwrap());
+    assert_ne!(
+        fixed_fingerprint,
+        settings_fingerprint(&fixed),
+        "fixed gain is fingerprinted at nanodecibel precision",
+    );
+
     let mut enabled = disabled.clone();
     enabled.pcm_true_peak.enabled = true;
+    enabled.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Standard;
     let base = settings_fingerprint(&enabled);
     assert_ne!(disabled_fingerprint, base);
 

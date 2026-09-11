@@ -10,27 +10,20 @@ A persisted target of exactly `0.000000000` remains valid. The persisted target 
 
 The signal-domain input is the retained headerless little-endian Float64 PCM carrier produced by the ordinary DSD reconstruction path at the governed terminal PCM sample rate. For lossless output this is the requested final PCM rate. For lossy hard-ceiling output it must also be a sample rate accepted directly by Tonepoet's configured FFmpeg encoder; unsupported rate/encoder pairs are rejected before the retained carrier is constructed. Channels are independent; the ceiling is the maximum absolute reconstructed amplitude over all channels.
 
-For each channel Tonepoet:
+Tonepoet scans that carrier with the fixed `tonepoet-true-peak` dependency's public `CertifiedPeakMeter`, `EdgePolicy::RepeatEndpoints`, and the selected `PeakTier`. All three public tiers (`Reference`, `Standard`, and `Fast`) certify the same HQ1024V1 reconstruction. The tier changes search work and interval tightness; it does not select a different ceiling reconstruction or a different safety allowance.
 
-1. applies the existing Headroom64x finite-stream `RepeatEndpoints` edge convention;
-2. evaluates the same six-stage 2x interpolation cascade used by Headroom64x, using the checked-in 384-tap first-stage coefficient set and the existing later Blackman stages;
-3. does **not** apply the Headroom64x point estimator's `0.9995395890030878` calibration to the ceiling reconstruction;
-4. over the nominal interval from the first stored frame through the last, defines the continuous waveform by straight-line interpolation between adjacent 64x reconstruction knots.
+The ceiling signal term is `PeakCertificate::finite_interval.upper_linear` (exposed by `PeakCertificate::upper_level()`), not the reported point estimate and not a per-tier under-read constant. The certificate contract guarantees that this upper does not under-read the declared true peak. The reported point estimate remains available separately for logs/UI.
 
-A linear segment's absolute maximum is attained at an endpoint. Therefore the real-valued peak of this declared finite waveform is the maximum 64x knot magnitude, plus the explicit binary64 evaluation enclosure. This is a deliberately finite and auditable reconstruction convention. It is not a claim about an unspecified DAC, ideal infinite sinc reconstruction, or decoded output from a lossy codec.
-
-The maximum absolute polyphase coefficient sum of the complete uncalibrated reconstruction is independently derived as `4.089899431660599`; production uses the deliberately widened upper `4.09`, leaving `0.000100568339401` absolute (`~2.46e-5` relative) margin above the independently derived value so last-bit platform variation in the later Blackman-stage `sin`/`cos` construction cannot rest the bound on a one-ULP accident. This operator norm converts deterministic sample-domain terminal error into a reconstructed-waveform bound, including `RepeatEndpoints` edges.
+The complete HQ1024V1 reconstruction has public conservative induced L-infinity gain `HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER = 4.68`. The standalone true-peak crate owns and independently qualifies that reconstruction and bound. The pipeline consumes the public constant only when deterministic stored-sample terminal error must be propagated into the same reconstructed-waveform domain; it does not duplicate or reach into the crate's private coefficient construction.
 
 ## Measurement and proof are separate
 
-`Headroom64x` remains the public high-accuracy point estimator and keeps its existing calibration and published accuracy contract. Album scanning now obtains two deliberately distinct values in one pass:
+Album scanning therefore obtains two deliberately distinct values from one `PeakCertificate`:
 
-- the unchanged calibrated Headroom64x point estimate, retained for reporting;
-- an uncalibrated finite-reconstruction upper value used only for hard-ceiling arithmetic.
+- `reported_point_estimate.overall`, retained for reporting;
+- `upper_level()`, retained as the signal authority for hard-ceiling arithmetic.
 
-The latter receives a `1e-11 * decoded_sample_peak` binary64 evaluation allowance. An independent qualification implementation derives a pessimistic floating-error budget below `3.4e-12 * decoded_sample_peak`, so the frozen allowance remains conservative.
-
-No `<= 0.495 * Fs` property is invented. The production DSD caller does not call `headroom64x_authority()` and does not consume `HEADROOM64X_MAX_UNDERREAD_DB`. The standalone band-qualified API remains available for callers that actually know their spectral support.
+No `<= 0.495 * Fs` property is invented. The production DSD caller does not invoke the retired Headroom64 authority or consume its former per-tier under-read constants. The older band-qualified authority is not used to manufacture spectral support for this path.
 
 ## Linear hard-ceiling arithmetic
 
@@ -41,7 +34,7 @@ For each participating track/output pair Tonepoet evaluates
 where:
 
 - `C` is the exact requested `DbNano` ceiling converted to a conservative linear lower bound;
-- `P_signal` is that carrier's finite reconstruction upper bound;
+- `P_signal` is that carrier's certified true-peak upper bound;
 - `E_pre` is any reconstructed realization error introduced before the fixed gain;
 - `E_post` is the deterministic reconstructed error introduced after the fixed gain;
 - `G` is the permitted linear gain.
@@ -71,7 +64,7 @@ Stored-sample and reconstructed-waveform bounds are separate:
 - Gesemann uses a separately bounded stable four-state IIR recurrence and a 22-LSB stored-sample ceiling;
 - SoX's first-within-5%-of-design-rate selection is mirrored exactly; when no named filter matches, the bound falls back to the `1.5`-LSB TPDF behavior rather than charging an inapplicable 44.1/48-kHz shaper.
 
-For the final `RepeatEndpoints` reconstructed waveform, the production bound multiplies the worst deterministic stored-sample terminal error by the complete reconstruction L-infinity upper `4.09`. A tighter interior LTI shaper/reconstruction convolution was investigated, but it is intentionally **not** used as authority because repeating the finite endpoint error outside the stream changes the boundary operator. An edge-aware proof would be required before that tightening could be promoted.
+For the final `RepeatEndpoints` reconstructed waveform, the production bound multiplies the worst deterministic stored-sample terminal error by the fixed dependency's public HQ1024V1 L-infinity upper `4.68`. This edge-safe operator bound deliberately remains separate from the SoX stored-sample proof.
 
 When a dithered integer lossless output can be written by either FFmpeg or SoX, hard-ceiling processing is routed to SoX so the implementation that realizes the samples matches the proved dither recurrence. FFmpeg album gain is explicitly requested with `precision=double`.
 
@@ -89,10 +82,10 @@ The submitted-batch barrier aggregates the completed per-track measurements, der
 
 ## Qualification and regression protection
 
-Ordinary Rust regressions cover the finite reconstruction values, analytical and real-material cross-checks, silence, edges, chunk boundaries, multichannel maxima, above-full-scale samples, zero-ceiling arithmetic, directional `DbNano` conversion, terminal domains, dither rate selection, and the mutation in which hard-ceiling arithmetic is replaced by naïve `target - point` subtraction.
+Ordinary Rust regressions cover the certified scan/certificate integration, silence, edges, chunk boundaries, multichannel maxima, above-full-scale samples, zero-ceiling arithmetic, directional `DbNano` conversion, terminal domains, dither rate selection, and the mutation in which hard-ceiling arithmetic is replaced by naive `target - point` subtraction.
 
-`crates/tonepoet-true-peak/qualification/verify_ceiling_contract.py` independently reconstructs the complete 64x filter from the checked-in coefficient values and freezes the reconstruction/operator references used by Rust tests.
+`crates/tonepoet-true-peak/qualification/verify_certified_search.py` independently reconstructs and audits HQ1024V1 from its published design, checks the frozen coefficient construction, and measures the reconstruction operator norm against the crate's conservative public bound. That proof belongs to the fixed true-peak dependency.
 
-`tonepoet-pipeline/qualification/verify_album_ceiling_terminal_bounds.py` independently derives the pinned SoX-ng FIR/IIR stored-sample support constants and rate-selection behavior. Its additional interior-LTI reconstruction numbers are diagnostic only; production deliberately keeps the `RepeatEndpoints` edge-safe norm bound described above.
+`tonepoet-pipeline/qualification/verify_album_ceiling_terminal_bounds.py` independently derives the pinned SoX-ng FIR/IIR stored-sample support constants and rate-selection behavior, then checks that the fixed dependency still exposes the expected public `HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER = 4.68` integration boundary. It intentionally does not duplicate private HQ1024 coefficients or the crate's reconstruction proof.
 
 Neither script is invoked by Cargo, `build.rs`, `flake.nix`, or runtime code. There is no commissioning stamp, executable/profile gate, source fingerprint, runtime warning/error, real-DSD commissioning corpus, or restored R7/R8/R9 authority machinery.

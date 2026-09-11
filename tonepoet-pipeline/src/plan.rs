@@ -1322,6 +1322,12 @@ fn plan_from_dsd(
     current_input: &mut InputSource,
     final_work: PathBuf,
 ) -> Result<()> {
+    if request.settings.pcm_true_peak.fixed_gain_db.is_some() {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.fixed_gain_db",
+            "PCM fixed gain is a PCM-source control; use the DSD gain-mode Fixed control for DSD-to-PCM conversion",
+        ));
+    }
     let requested_target_rate_hz = match request.settings.target_sample_rate {
         RateTarget::PcmHz(hz) => hz,
         RateTarget::Source => request
@@ -1457,11 +1463,12 @@ fn plan_from_pcm(
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
 
-    let pcm_true_peak_wavpack_hybrid = request.settings.pcm_true_peak.enabled
+    let pcm_gain_wavpack_hybrid = (request.settings.pcm_true_peak.enabled
+        || request.settings.pcm_true_peak.fixed_gain_db.is_some())
         && request.settings.target_format == AudioFormat::WavPack
         && request.settings.wavpack.hybrid;
-    if pcm_true_peak_wavpack_hybrid {
-        if processing_rate.is_some() {
+    if pcm_gain_wavpack_hybrid {
+        if request.settings.pcm_true_peak.enabled && processing_rate.is_some() {
             return Err(PlanningError::invalid_source(
                 "sample_rate_hz",
                 "PCM true-peak WavPack hybrid carrier must already be at the final sample rate; post-measurement resampling is forbidden",
@@ -1472,13 +1479,17 @@ fn plan_from_pcm(
             steps,
             PlanOperation::EncodePcm {
                 target_format: AudioFormat::Wav,
-                target_rate_hz: None,
+                // Automatic true-peak gain has already proved that no rate
+                // change remains. Fixed gain carries no ceiling proof, so it
+                // may share this single realization step with an ordinary
+                // requested resample.
+                target_rate_hz: processing_rate,
                 target_bit_depth: target_depth,
                 apply_processing: true,
             },
             current_input.clone(),
             OutputSink::Path(encoder_input.clone()),
-            "Realize final-rate integer PCM for WavPack hybrid encoder input",
+            "Realize final PCM for WavPack hybrid encoder input",
         );
         *current_input = InputSource::Path(encoder_input);
         push_encode_final(
@@ -1498,7 +1509,8 @@ fn plan_from_pcm(
     };
     let needs_processing = processing_rate.is_some()
         || depth_change
-        || request.settings.dsd.runtime_album_gain_db().is_some();
+        || request.settings.dsd.runtime_album_gain_db().is_some()
+        || request.settings.pcm_true_peak.fixed_gain_db.is_some();
     let needs_ssrc = processing_rate.is_some()
         && (request.settings.nyquist_transition == NyquistTransition::BrickWall
             || request.settings.ssrc.force);
@@ -1525,11 +1537,21 @@ fn plan_from_pcm(
         let ssrc_path = context.intermediate_path(steps.len(), "wav");
         let profile =
             mapping::ssrc_profile(request.settings.ssrc, request.settings.resample_quality);
+        // A user fixed gain is ordinary PCM processing, not a hard-ceiling
+        // authority. Keep SSRC's output floating when a gain still has to be
+        // applied so the final processing encode performs exactly one target-
+        // depth quantization after gain rather than quantizing both before and
+        // after it.
+        let ssrc_output_depth = if request.settings.pcm_true_peak.fixed_gain_db.is_some() {
+            PcmBitDepth::Float64
+        } else {
+            target_depth
+        };
         push_step(
             steps,
             PlanOperation::ResamplePcm {
                 target_rate_hz: ssrc_target_rate_hz,
-                target_bit_depth: Some(target_depth),
+                target_bit_depth: Some(ssrc_output_depth),
                 profile: Some(profile),
                 brick_wall: true,
             },
@@ -1545,7 +1567,7 @@ fn plan_from_pcm(
             final_work,
             lossy_encoder_rate,
             target_depth,
-            false,
+            request.settings.pcm_true_peak.fixed_gain_db.is_some(),
         )?;
         return Ok(());
     }
@@ -2239,6 +2261,86 @@ mod dsd_album_gain_carrier_planning_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pcm_fixed_gain_forces_one_processing_encode_without_measurement_authority() {
+        let mut request = carrier_request(96_000);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.fixed_gain_db =
+            Some("2.500000000".parse().expect("fixed gain"));
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.flac");
+
+        let topology = plan_topology(&request).expect("fixed PCM gain topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("fixed PCM gain must force executable processing");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn pcm_fixed_gain_wavpack_hybrid_fuses_resample_gain_and_integer_realization() {
+        let mut request = carrier_request(44_100);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.fixed_gain_db =
+            Some("-3.250000000".parse().expect("fixed gain"));
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = true;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.wv");
+
+        let topology = plan_topology(&request).expect("fixed-gain WavPack hybrid topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("fixed-gain WavPack hybrid must execute");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_rate_hz: Some(96_000),
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::WavPack,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+            }
+        ));
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "fixed gain has no hard-ceiling rate freeze and should realize resampling exactly once: {steps:#?}",
+        );
     }
 
     #[test]

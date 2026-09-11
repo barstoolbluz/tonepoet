@@ -133,6 +133,12 @@ impl PipelineSettings {
                 "PCM album true-peak gain and DSD album auto-gain are separate submitted-batch authorities and cannot be active in the same request",
             ));
         }
+        if self.dsd.album_auto_gain_selected() && self.pcm_true_peak.fixed_gain_db.is_some() {
+            return Err(PlanningError::invalid_settings(
+                "pcm_true_peak.fixed_gain_db",
+                "PCM fixed gain and DSD album auto-gain are separate gain authorities and cannot be active in the same request",
+            ));
+        }
 
         if self.target_format.is_dsd() {
             if matches!(self.target_sample_rate, RateTarget::PcmHz(_)) {
@@ -844,7 +850,7 @@ pub struct DsdSettings {
     pub from_dsd: DsdSourceSettings,
     /// Automatic DSD peak-normalization scope. Track is the compatibility default.
     auto_gain_scope: DsdAutoGainScope,
-    /// Accuracy/speed rung for the in-process album true-peak scan. Reference
+    /// Accuracy/speed tier for the in-process album true-peak scan. Reference
     /// is the compatibility default and remains the point-scan gold standard.
     true_peak_scan_mode: DsdTruePeakScanMode,
     /// Runtime-only fixed album gain bound after submitted-batch analysis.
@@ -1071,16 +1077,16 @@ impl DsdSettings {
         self.clear_runtime_album_gain();
     }
 
-    /// Return the selected submitted-batch true-peak scan rung.
+    /// Return the selected submitted-batch true-peak scan tier.
     #[must_use]
     pub const fn true_peak_scan_mode(&self) -> DsdTruePeakScanMode {
         self.true_peak_scan_mode
     }
 
-    /// Select the submitted-batch true-peak scan rung.
+    /// Select the submitted-batch true-peak scan tier.
     ///
     /// Any already-bound runtime album authority is invalidated because its
-    /// point provenance and signal ceiling were measured under the old rung.
+    /// point provenance and signal ceiling were measured under the old tier.
     pub fn set_true_peak_scan_mode(&mut self, mode: DsdTruePeakScanMode) {
         self.true_peak_scan_mode = if self.auto_gain_scope == DsdAutoGainScope::Album {
             mode
@@ -1369,10 +1375,12 @@ impl serde::Serialize for DsdSettings {
                 .serialize(serializer)
             }
             DsdSettingsOrigin::NativeV2 => {
-                let include_scan_mode =
-                    self.true_peak_scan_mode != DsdTruePeakScanMode::Reference;
-                let mut map =
-                    serializer.serialize_map(Some(if include_scan_mode { 5 } else { 4 }))?;
+                // Album scope always serializes the revision-tagged scan tier.
+                // Older schemas omitted their default Reference tier, so
+                // omission here would make that legacy value indistinguishable
+                // from Fast066V2 Reference during deserialization.
+                let include_scan_mode = self.auto_gain_scope == DsdAutoGainScope::Album;
+                let mut map = serializer.serialize_map(Some(if include_scan_mode { 5 } else { 4 }))?;
                 map.serialize_entry("schema_version", &2_u32)?;
                 map.serialize_entry("pcm_to_dsd", &self.pcm_to_dsd)?;
                 map.serialize_entry("from_dsd", &self.from_dsd)?;
@@ -1394,8 +1402,7 @@ impl serde::Serialize for DsdSettings {
                     return self.legacy_compat_wire().serialize(serializer);
                 }
                 let wire = self.legacy_compat_wire();
-                let include_scan_mode =
-                    self.true_peak_scan_mode != DsdTruePeakScanMode::Reference;
+                let include_scan_mode = self.auto_gain_scope == DsdAutoGainScope::Album;
                 let mut map =
                     serializer.serialize_map(Some(if include_scan_mode { 12 } else { 11 }))?;
                 map.serialize_entry("noise_shaper", &wire.noise_shaper)?;
@@ -1517,7 +1524,7 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                     }
                     let auto_gain_scope = auto_gain_scope.unwrap_or_default();
                     let true_peak_scan_mode = if auto_gain_scope == DsdAutoGainScope::Album {
-                        true_peak_scan_mode.unwrap_or_default()
+                        true_peak_scan_mode.ok_or_else(|| A::Error::missing_field("true_peak_scan_mode"))?
                     } else {
                         DsdTruePeakScanMode::Reference
                     };
@@ -1548,7 +1555,7 @@ impl<'de> serde::Deserialize<'de> for DsdSettings {
                 let mut settings = DsdSettings::from_legacy_wire(wire);
                 settings.auto_gain_scope = auto_gain_scope.unwrap_or_default();
                 settings.true_peak_scan_mode = if settings.auto_gain_scope == DsdAutoGainScope::Album {
-                    true_peak_scan_mode.unwrap_or_default()
+                    true_peak_scan_mode.ok_or_else(|| A::Error::missing_field("true_peak_scan_mode"))?
                 } else {
                     DsdTruePeakScanMode::Reference
                 };
@@ -1741,14 +1748,15 @@ impl Default for ReplayGainExistingTagPolicy {
     }
 }
 
-/// Default true-peak target for PCM gain.
-pub const PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP: DbNano = DbNano(-1_000_000_000);
+/// Default true-peak target for PCM automatic gain: 0.1 dB of user headroom
+/// below the certified upper bound.
+pub const PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP: DbNano = DbNano(-100_000_000);
 /// Highest requested ceiling honored for lossy encoder-input PCM.
 ///
 /// Lossy decode can overshoot its encoder input, so this is deliberately a
 /// policy cap on the governed encoder-input waveform, not a decoded-codec
 /// peak guarantee.
-pub const PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP: DbNano = DbNano(-1_000_000_000);
+pub const PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP: DbNano = PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP;
 
 /// Return whether PCM true-peak policy must treat this target as lossy.
 ///
@@ -1777,6 +1785,11 @@ pub struct PcmTruePeakGainSettings {
     pub scope: PcmTruePeakScope,
     /// User-selected PCM true-peak accuracy/speed scan.
     pub scan_mode: PcmTruePeakScanMode,
+    /// Optional user-supplied fixed amplitude gain. This is an alternative to
+    /// automatic true-peak gain and is applied exactly as supplied; clipping
+    /// is intentionally not prevented.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub fixed_gain_db: Option<DbNano>,
     /// Runtime-only submitted-batch authority. Never persisted in presets or config.
     #[cfg_attr(feature = "serde", serde(skip))]
     runtime_album_gain_db: Option<DbNano>,
@@ -1789,7 +1802,8 @@ impl Default for PcmTruePeakGainSettings {
             target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             allow_boost: false,
             scope: PcmTruePeakScope::Track,
-            scan_mode: PcmTruePeakScanMode::Standard,
+            scan_mode: PcmTruePeakScanMode::Fast,
+            fixed_gain_db: None,
             runtime_album_gain_db: None,
         }
     }
@@ -1833,6 +1847,26 @@ fn validate_pcm_true_peak_settings(
     settings: &PcmTruePeakGainSettings,
     target_format: &AudioFormat,
 ) -> Result<()> {
+    if settings.enabled && settings.fixed_gain_db.is_some() {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.fixed_gain_db",
+            "PCM automatic true-peak gain and user-supplied fixed gain are mutually exclusive",
+        ));
+    }
+    if let Some(gain_db) = settings.fixed_gain_db {
+        if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&gain_db) {
+            return Err(PlanningError::invalid_settings(
+                "pcm_true_peak.fixed_gain_db",
+                "PCM fixed gain must be between -24.000000000 and +24.000000000 dB",
+            ));
+        }
+        if target_format.is_dsd() {
+            return Err(PlanningError::invalid_settings(
+                "pcm_true_peak.fixed_gain_db",
+                "PCM fixed gain cannot be used for a DSD target",
+            ));
+        }
+    }
     if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
         .contains(&settings.target_dbtp)
     {
@@ -2231,7 +2265,7 @@ mod pipeline_settings_serde_compatibility_tests {
         album.set_auto_gain_scope(DsdAutoGainScope::Album);
         let value = serde_json::to_value(album).expect("serialize native album settings");
         assert_eq!(value["auto_gain_scope"], "album");
-        assert!(value.get("true_peak_scan_mode").is_none());
+        assert_eq!(value["true_peak_scan_mode"], "fast066v2_reference");
 
         let decoded: DsdSettings =
             serde_json::from_value(value).expect("deserialize native album settings");
@@ -2252,13 +2286,13 @@ mod pipeline_settings_serde_compatibility_tests {
                     .expect("legacy auto gain");
             }
             settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-            settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fastest);
+            settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Standard);
 
             let value = serde_json::to_value(settings).expect("serialize scan mode");
-            assert_eq!(value["true_peak_scan_mode"], "fastest");
+            assert_eq!(value["true_peak_scan_mode"], "fast066v2_standard");
             let decoded: DsdSettings =
                 serde_json::from_value(value).expect("deserialize scan mode");
-            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Fastest);
+            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Standard);
             assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Album);
         }
     }
@@ -2266,7 +2300,7 @@ mod pipeline_settings_serde_compatibility_tests {
     #[test]
     fn track_scope_canonicalizes_true_peak_scan_mode_to_reference() {
         let mut settings = DsdSettings::native_v2();
-        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fastest);
+        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
         assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
 
         settings.set_auto_gain_scope(DsdAutoGainScope::Album);
@@ -2281,7 +2315,7 @@ mod pipeline_settings_serde_compatibility_tests {
     }
 
     #[test]
-    fn deserialization_canonicalizes_non_album_true_peak_scan_mode_to_reference() {
+    fn deserialization_rejects_retired_scan_schema_even_when_track_scoped() {
         for mut value in [
             serde_json::to_value(DsdSettings::native_v2()).expect("serialize native settings"),
             serde_json::to_value(DsdSettings::default()).expect("serialize legacy settings"),
@@ -2293,10 +2327,9 @@ mod pipeline_settings_serde_compatibility_tests {
                     "true_peak_scan_mode".to_owned(),
                     serde_json::Value::String("fastest".to_owned()),
                 );
-            let decoded: DsdSettings =
-                serde_json::from_value(value).expect("deserialize canonicalized settings");
-            assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Track);
-            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
+            let err = serde_json::from_value::<DsdSettings>(value)
+                .expect_err("retired scan token must not be reinterpreted");
+            assert!(err.to_string().contains("fastest"), "{err}");
         }
     }
 
@@ -2315,7 +2348,7 @@ mod pipeline_settings_serde_compatibility_tests {
         let value = serde_json::to_value(&settings).expect("serialize PCM true-peak settings");
         assert_eq!(value["pcm_true_peak"]["enabled"], true);
         assert_eq!(value["pcm_true_peak"]["scope"], "album");
-        assert_eq!(value["pcm_true_peak"]["scan_mode"], "reference");
+        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast066v2_reference");
         assert!(value["pcm_true_peak"].get("runtime_album_gain_db").is_none());
 
         let decoded: PipelineSettings =
@@ -2329,17 +2362,54 @@ mod pipeline_settings_serde_compatibility_tests {
     }
 
     #[test]
-    fn pcm_true_peak_fast_scan_mode_round_trips_as_stable_snake_case() {
+    fn pcm_true_peak_fast_scan_mode_round_trips_with_schema_identity() {
         let mut settings = PipelineSettings::default();
         settings.pcm_true_peak.enabled = true;
         settings.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Fast;
 
         let value = serde_json::to_value(&settings).expect("serialize PCM Fast scan mode");
-        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast");
+        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast066v2_fast");
 
         let decoded: PipelineSettings =
             serde_json::from_value(value).expect("deserialize PCM Fast scan mode");
         assert_eq!(decoded.pcm_true_peak.scan_mode, PcmTruePeakScanMode::Fast);
+    }
+
+    #[test]
+    fn pcm_true_peak_retired_scan_tokens_are_rejected_instead_of_reinterpreted() {
+        for retired in ["reference", "standard", "fast"] {
+            let mut value = serde_json::to_value(PipelineSettings::default())
+                .expect("serialize baseline settings");
+            value["pcm_true_peak"]["scan_mode"] =
+                serde_json::Value::String(retired.to_string());
+            let err = serde_json::from_value::<PipelineSettings>(value)
+                .expect_err("retired PCM scan token must not be reinterpreted");
+            assert!(err.to_string().contains(retired), "{err}");
+        }
+    }
+
+    #[test]
+    fn dsd_album_retired_scan_tokens_and_omitted_reference_are_rejected() {
+        for retired in ["reference", "fast", "fastest"] {
+            let mut settings = DsdSettings::native_v2();
+            settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+            let mut value = serde_json::to_value(settings).expect("serialize DSD album settings");
+            value["true_peak_scan_mode"] = serde_json::Value::String(retired.to_string());
+            let err = serde_json::from_value::<DsdSettings>(value)
+                .expect_err("retired DSD scan token must not be reinterpreted");
+            assert!(err.to_string().contains(retired), "{err}");
+        }
+
+        let mut settings = DsdSettings::native_v2();
+        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
+        let mut value = serde_json::to_value(settings).expect("serialize DSD album settings");
+        value
+            .as_object_mut()
+            .expect("DSD settings object")
+            .remove("true_peak_scan_mode");
+        let err = serde_json::from_value::<DsdSettings>(value)
+            .expect_err("legacy omitted Reference scan must not silently acquire new semantics");
+        assert!(err.to_string().contains("true_peak_scan_mode"), "{err}");
     }
 
     #[test]
@@ -2373,12 +2443,12 @@ mod pcm_true_peak_settings_tests {
     fn lossless_target_is_not_capped_but_lossy_encoder_input_is() {
         let settings = PcmTruePeakGainSettings {
             enabled: true,
-            target_dbtp: "-0.250000000".parse().unwrap(),
+            target_dbtp: "0.000000000".parse().unwrap(),
             ..PcmTruePeakGainSettings::default()
         };
         assert_eq!(
             settings.effective_target(&AudioFormat::Flac, false),
-            ("-0.250000000".parse().unwrap(), false),
+            ("0.000000000".parse().unwrap(), false),
         );
         for format in [
             AudioFormat::Mp3,
@@ -2395,7 +2465,7 @@ mod pcm_true_peak_settings_tests {
         }
         assert_eq!(
             settings.effective_target(&AudioFormat::WavPack, false),
-            ("-0.250000000".parse().unwrap(), false),
+            ("0.000000000".parse().unwrap(), false),
         );
         assert_eq!(
             settings.effective_target(&AudioFormat::WavPack, true),
@@ -2463,7 +2533,7 @@ mod pcm_true_peak_settings_tests {
         settings.target_format = AudioFormat::WavPack;
         settings.wavpack.hybrid = true;
         settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.target_dbtp = "-0.500000000".parse().unwrap();
+        settings.pcm_true_peak.target_dbtp = DbNano::ZERO;
 
         settings
             .validate()
@@ -2490,6 +2560,39 @@ mod pcm_true_peak_settings_tests {
                 .effective_target(&settings.target_format, settings.wavpack.hybrid),
             ("-1.500000000".parse().unwrap(), false),
         );
+    }
+
+    #[test]
+    fn pcm_fixed_gain_round_trips_and_is_mutually_exclusive_with_auto_gain() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.pcm_true_peak.fixed_gain_db = Some("3.250000000".parse().unwrap());
+        settings.validate().expect("fixed PCM gain should be admitted");
+
+        let json = serde_json::to_value(&settings).expect("serialize fixed gain");
+        assert_eq!(json["pcm_true_peak"]["fixed_gain_db"], "3.250000000");
+        let decoded: PipelineSettings = serde_json::from_value(json).expect("deserialize fixed gain");
+        assert_eq!(
+            decoded.pcm_true_peak.fixed_gain_db,
+            Some("3.250000000".parse().unwrap()),
+        );
+
+        settings.pcm_true_peak.enabled = true;
+        let error = settings
+            .validate()
+            .expect_err("automatic and fixed PCM gain must not stack");
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+    }
+
+    #[test]
+    fn pcm_fixed_gain_rejects_values_outside_the_user_contract() {
+        for raw in ["-24.000000001", "24.000000001"] {
+            let mut settings = PipelineSettings::default();
+            settings.pcm_true_peak.fixed_gain_db = Some(raw.parse().unwrap());
+            let error = settings.validate().expect_err("fixed gain range must be enforced");
+            assert!(error.to_string().contains("-24.000000000"), "{error}");
+            assert!(error.to_string().contains("+24.000000000"), "{error}");
+        }
     }
 
     #[test]

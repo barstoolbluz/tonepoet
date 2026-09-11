@@ -135,9 +135,19 @@ pub fn draw_format_pane(
                         ));
                     }
                     FormatField::PcmTruePeak => lines.push(pill_row(
-                        border_color, w, "true peak  ", "",
-                        &render_pill_spans(&format_state.pcm_true_peak_enabled, row_focused, theme),
+                        border_color, w, "PCM gain   ", "",
+                        &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
                         row_focused, theme,
+                    )),
+                    FormatField::PcmGainDb => lines.push(dsd_db_value_row(
+                        border_color,
+                        w,
+                        "gain       ",
+                        format_state.pcm_fixed_gain_db,
+                        true,
+                        row_focused,
+                        "",
+                        theme,
                     )),
                     FormatField::PcmTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
                         border_color,
@@ -495,7 +505,14 @@ fn pcm_true_peak_db_value_row(
         Span::styled(" >", control_style),
         Span::raw("  "),
         Span::styled(
-            if lossy_capped { "lossy encoder input capped at -1.000 dBTP" } else { "left/right adjust" },
+            if lossy_capped {
+                format!(
+                    "lossy encoder input capped at {} dBTP",
+                    tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
+                )
+            } else {
+                "left/right adjust".to_string()
+            },
             theme.muted(),
         ),
     ];
