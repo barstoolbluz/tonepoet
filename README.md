@@ -59,6 +59,33 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 - **SSRC** — brick-wall sinc interpolation with 7 quality profiles (lightning through insane), ATH psychoacoustic noise shaping, min-phase filters, rate-dependent dither validation
 - Automatic dither suppression when target bit depth >= source (no pointless noise addition)
 
+**True-peak auto-gain (PCM):** measures the true peak of the converted signal and
+applies a single fixed gain so the result lands at or below the target, defaulting
+to -0.1 dBTP. Three scan tiers trade speed against how tightly the measurement is
+bounded: `reference`, `standard` and `fast`. The gain is computed from the
+certified upper bound of the measurement rather than from a per-tier error
+estimate, so the tier governs speed and interval width, never how safe the result
+is. It enables itself for float-to-integer PCM, for the equivalent DSD
+conversions, and for lossless-to-lossy transcodes, and can always be switched off.
+Boost is opt-in: with it off, quiet material is left alone and only material that
+would exceed the target is attenuated.
+
+**DSD gain, and what to select today.** The DSD gain row offers `reference`,
+`native`, `manual` and `normalize` once native settings are in use. The first
+three carry a proved ceiling: `reference` restores the 12 dB decode headroom plus
+6.020599913 dB of 2x amplitude compensation and clamps at -1.0 dBTP, `native`
+restores the 12 dB exactly and fails closed rather than clamping, and `manual`
+adds a user value to the headroom restoration. `normalize` is SoX peak
+normalization with modified, unqualified semantics and carries no ceiling.
+
+The DSD true-peak scan tiers are reachable only from `auto` or `normalize`, with
+Album scope. On native settings that means `normalize`, so selecting a DSD scan
+tier today means leaving the qualified path and its proved -1.0 dBTP ceiling.
+For DSD conversions where that guarantee matters, `reference` is the mode to
+choose; it performs its own bounded true-peak measurement and does not run the
+scan tiers. Unifying those two measurements, so that a DSD conversion can have
+both the certified measurement and the proved ceiling, is pending work.
+
 ### SACD support
 
 Native SACD ISO extraction via the built-in sacd-rs crate (byte-exact against sacd_extract). DSD-to-PCM conversion through sox with auto-gain peak normalization (`norm` effect), configurable safety margin, and rate-dependent lowpass filtering. DST frame decoding for compressed SACD layers.
