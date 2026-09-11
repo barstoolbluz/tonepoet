@@ -70,21 +70,39 @@ conversions, and for lossless-to-lossy transcodes, and can always be switched of
 Boost is opt-in: with it off, quiet material is left alone and only material that
 would exceed the target is attenuated.
 
-**DSD gain, and what to select today.** The DSD gain row offers `reference`,
-`native`, `manual` and `normalize` once native settings are in use. The first
-three carry a proved ceiling: `reference` restores the 12 dB decode headroom plus
-6.020599913 dB of 2x amplitude compensation and clamps at -1.0 dBTP, `native`
-restores the 12 dB exactly and fails closed rather than clamping, and `manual`
-adds a user value to the headroom restoration. `normalize` is SoX peak
-normalization with modified, unqualified semantics and carries no ceiling.
+**DSD gain, and what is actually selectable today.** The DSD gain row offers
+`disabled`, `auto` and `manual`. `disabled` leaves decoded PCM at SoX's natural
+reconstruction level, `auto` peak-normalizes after decoding and low-pass
+filtering, and `manual` applies a fixed dB value.
 
-The DSD true-peak scan tiers are reachable only from `auto` or `normalize`, with
-Album scope. On native settings that means `normalize`, so selecting a DSD scan
-tier today means leaving the qualified path and its proved -1.0 dBTP ceiling.
-For DSD conversions where that guarantee matters, `reference` is the mode to
-choose; it performs its own bounded true-peak measurement and does not run the
-scan tiers. Unifying those two measurements, so that a DSD conversion can have
-both the certified measurement and the proved ceiling, is pending work.
+A second family exists in the code — `reference`, `native` and `normalize` —
+and is **not reachable in the shipped default**. `reference` restores the 12 dB
+decode headroom plus 6.020599913 dB of 2x amplitude compensation and clamps at a
+proved -1.0 dBTP ceiling; `native` restores the 12 dB exactly and fails closed
+rather than clamping. Those modes are enabled only for native-v2 DSD settings,
+and the application default is the legacy wire: "Reference remains fail-closed
+until its policy is promoted. Keep the application default on the exact frozen
+legacy wire so ordinary DSD-to-PCM conversions continue to work pre-promotion."
+
+So a DSD conversion today runs the legacy path, and the true-peak scan tiers are
+reached from `auto` with Album scope. That combination is better measured than
+it might appear. The album-gain analysis applies the same -12 dB headroom before
+reconstruction that the Reference front end uses, and the crate's `reference`
+tier returns an interval of width zero, against the 0.034 dB worst-case
+under-read of the 16x measurement the Reference policy binds against. Gain
+computed from a certified upper that cannot under-read is a sound output bound.
+
+What the legacy path does not carry is the attestation. The album-gain command
+is documented as matching "the native reconstruction front end while remaining
+outside qualified Reference policy/attestation". The Reference guarantee is not
+only that output lands at or below -1.0 dBTP; it is that a pinned sox_ng build,
+a qualified decode route, a frozen policy and fail-closed refusal hold together,
+proved by a dedicated qualification suite. The legacy path reproduces the front
+end without claiming any of that, and does not fail closed when a requested gain
+cannot satisfy a ceiling.
+
+Promoting Reference, so a DSD conversion can have the certified measurement and
+the attested chain at once, is pending work.
 
 ### SACD support
 
