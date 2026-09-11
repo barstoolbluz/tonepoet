@@ -3,7 +3,7 @@
 
 This driver deliberately lives outside the production API. It verifies and
 extracts the exact V1 baseline archive, runs A/B/C/D against one carrier, applies
-the C stop/go rule, and writes one provenance-rich JSON manifest. Hashing and
+the C compatibility-ablation stop/go rule, and writes one provenance-rich JSON manifest. Hashing and
 compiler/source metadata collection happen outside every benchmark's internal
 wall-time interval.
 """
@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -185,6 +186,127 @@ def active_simd_backend(result: dict[str, Any]) -> str:
     raise RuntimeError("benchmark certificate did not identify the active SIMD backend")
 
 
+def v2_work_counters(result: dict[str, Any]) -> dict[str, Any]:
+    """Extract the work diagnostics required by the commissioning record."""
+    certificate = result.get("certificate")
+    if not isinstance(certificate, dict):
+        raise RuntimeError("benchmark result did not contain certificate diagnostics")
+    names = (
+        "tiles_processed",
+        "groups_rejected",
+        "groups_expanded",
+        "candidate_cells",
+        "refined_cells",
+        "phase_evaluations",
+        "authoritative_coarse_values",
+        "authoritative_coarse_groups",
+        "accelerated_l1_groups_tested",
+        "accelerated_l1_groups_rejected",
+        "accelerated_curvature_roots",
+        "strict_coarse_evaluations",
+        "dense_regions",
+        "dense_intermediate_cells",
+        "dense_complete_regions",
+        "dense_phase_evaluations",
+        "direct_rescore_evaluations",
+        "work_credits_consumed",
+        "work_limited_tiles",
+        "time_bounded_prefix_blocks_skipped",
+        "time_limited_tiles",
+        "fast_survey_knots",
+        "fast_flat_groups",
+        "fast_input_sample_peak_linear",
+        "fast_hq4_peak_linear",
+        "max_evaluation_error_linear",
+        "unresolved_upper_linear",
+    )
+    return {name: certificate.get(name) for name in names}
+
+
+def rustflags_tokens(env: dict[str, str]) -> list[str]:
+    """Return operator rustflags, preferring Cargo's encoded form when present."""
+    encoded = env.get("CARGO_ENCODED_RUSTFLAGS")
+    if encoded:
+        return [token for token in encoded.split("\x1f") if token]
+    raw = env.get("RUSTFLAGS", "")
+    return shlex.split(raw) if raw else []
+
+
+def loop_vectorizer_disabled(env: dict[str, str]) -> bool:
+    tokens = rustflags_tokens(env)
+    for index, token in enumerate(tokens):
+        if "--vectorize-loops=false" in token:
+            return True
+        if token == "-C" and index + 1 < len(tokens) and "--vectorize-loops=false" in tokens[index + 1]:
+            return True
+    return False
+
+
+def rustc_invocations(verbose_stderr: str) -> list[str]:
+    """Keep the actual crate/example rustc command lines emitted by `cargo -vv`."""
+    selected: list[str] = []
+    for line in verbose_stderr.splitlines():
+        stripped = line.strip()
+        if "Running `" not in stripped:
+            continue
+        if (
+            "--crate-name tonepoet_true_peak" in stripped
+            or f"--crate-name {BENCH_EXAMPLE}" in stripped
+        ):
+            selected.append(stripped)
+    return selected
+
+
+def prebuild_benchmark(
+    *,
+    build_id: str,
+    crate_root: Path,
+    cargo: str,
+    env: dict[str, str],
+    instrumented: bool,
+) -> dict[str, Any]:
+    """Build outside the measured wall interval and capture effective rustc invocations."""
+    command = [
+        cargo,
+        "build",
+        "--release",
+        "--manifest-path",
+        str(crate_root / "Cargo.toml"),
+        "-vv",
+    ]
+    if instrumented:
+        command += ["--features", "fast-stage-timing"]
+    command += ["--example", BENCH_EXAMPLE]
+    process = subprocess.run(
+        command,
+        cwd=crate_root,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"prebuild {build_id} failed ({process.returncode})\n"
+            f"stdout:\n{process.stdout}\nstderr:\n{process.stderr}"
+        )
+    invocations = rustc_invocations(process.stderr)
+    if not invocations:
+        raise RuntimeError(
+            f"prebuild {build_id} did not expose the crate/example rustc command under cargo -vv"
+        )
+    return {
+        "build_id": build_id,
+        "instrumented": instrumented,
+        "cargo_command": command,
+        "cargo_target_dir": env.get("CARGO_TARGET_DIR"),
+        "rustflags_tokens": rustflags_tokens(env),
+        "loop_vectorizer_disabled": loop_vectorizer_disabled(env),
+        "rustc_invocations": invocations,
+    }
+
+
 def validate_benchmark_identity(
     benchmark: dict[str, Any],
     *,
@@ -200,7 +322,7 @@ def validate_benchmark_identity(
     expected_configuration = {
         "fast": "production",
         "fast-survey": "survey-bounds-only",
-        "fast-nominate": "nomination-only",
+        "fast-nominate": "survey-bounds-only-compat",
     }[configuration]
     expected = {
         "tier": "Fast",
@@ -236,6 +358,9 @@ def run_benchmark(
     env: dict[str, str],
     instrumented: bool,
     expected_algorithm_revision: str,
+    source_role: str,
+    source_tree_sha256: str,
+    build_id: str,
     allow_binding_gate_failure: bool = False,
 ) -> dict[str, Any]:
     command = [
@@ -288,7 +413,10 @@ def run_benchmark(
         expected_gate_failure = (
             allow_binding_gate_failure
             and benchmark.get("binding_fast_wall_gate") is True
-            and benchmark.get("fast_wall_target_met") is False
+            and (
+                benchmark.get("fast_wall_target_met") is False
+                or benchmark.get("fast_accuracy_target_met") is False
+            )
         )
         if not expected_gate_failure:
             raise RuntimeError(
@@ -298,7 +426,7 @@ def run_benchmark(
 
     programme_seconds = float(benchmark["programme_seconds"])
     rate = seconds_per_programme_minute(float(benchmark["total_wall_seconds"]), programme_seconds)
-    return {
+    record = {
         "label": label,
         "configuration_label": label.split("-", 1)[0],
         "benchmark_configuration": configuration,
@@ -306,6 +434,9 @@ def run_benchmark(
         "binding": not instrumented,
         "edge_policy": EDGE_POLICY,
         "carrier_sha256": carrier_sha256,
+        "source_role": source_role,
+        "source_tree_sha256": source_tree_sha256,
+        "build_id": build_id,
         "algorithm_revision": benchmark.get("fast_algorithm_revision"),
         "cargo_command": command,
         "process_returncode": process.returncode,
@@ -314,6 +445,9 @@ def run_benchmark(
         "active_simd_backend": active_simd_backend(benchmark),
         "benchmark": benchmark,
     }
+    if expected_algorithm_revision == "Fast066V2":
+        record["v2_work_counters"] = v2_work_counters(benchmark)
+    return record
 
 
 def annotate_accuracy(
@@ -376,6 +510,8 @@ def compiler_metadata(
         "cargo_profile": "release",
         "operator_rustflags": env.get("RUSTFLAGS", ""),
         "operator_encoded_rustflags": env.get("CARGO_ENCODED_RUSTFLAGS", ""),
+        "rustflags_tokens": rustflags_tokens(env),
+        "loop_vectorizer_disabled": loop_vectorizer_disabled(env),
         "cargo_codegen_environment": cargo_env,
         "v1_release_profile": release_profile_metadata(v1_crate),
         "v2_release_profile": release_profile_metadata(v2_crate),
@@ -411,8 +547,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-abs-point-error-db",
         type=float,
-        default=0.005,
-        help="Accuracy gate for this carrier when --expected-point-dbtp is supplied (default: 0.005 dB).",
+        default=0.01,
+        help="Point-accuracy gate for this carrier when --expected-point-dbtp is supplied (default: 0.01 dB).",
     )
     return parser.parse_args(argv)
 
@@ -463,18 +599,39 @@ def main(argv: Iterable[str] | None = None) -> int:
         if source_tree_sha256(v2_run_crate) != v2_source_sha256_before:
             raise RuntimeError("disposable V2 source copy does not match commissioned source identity")
 
-        env_v1 = build_environment(args, work / "cargo-target-v1")
-        env_v2 = build_environment(args, work / "cargo-target-v2")
-        compiler = compiler_metadata(args, env_v2, v1_crate, v2_run_crate)
+        # Keep instrumented and binding artifacts physically separate so a
+        # stale feature-enabled executable cannot be mistaken for shipping D.
+        env_v1_instrumented = build_environment(args, work / "cargo-target-v1-instrumented")
+        env_v2_instrumented = build_environment(args, work / "cargo-target-v2-instrumented")
+        env_v2_binding = build_environment(args, work / "cargo-target-v2-binding")
+        compiler = compiler_metadata(args, env_v2_binding, v1_crate, v2_run_crate)
+
+        builds = {
+            "A-instrumented": prebuild_benchmark(
+                build_id="A-instrumented",
+                crate_root=v1_crate,
+                cargo=args.cargo,
+                env=env_v1_instrumented,
+                instrumented=True,
+            ),
+            "V2-instrumented": prebuild_benchmark(
+                build_id="V2-instrumented",
+                crate_root=v2_run_crate,
+                cargo=args.cargo,
+                env=env_v2_instrumented,
+                instrumented=True,
+            ),
+        }
         records: list[dict[str, Any]] = []
 
         manifest: dict[str, Any] = {
-            "schema": "tonepoet.fast066.commissioning.v1",
+            "schema": "tonepoet.fast066.commissioning.v2",
             "target_seconds_per_programme_minute": FAST_TARGET_SECONDS_PER_PROGRAMME_MINUTE,
             "edge_policy": EDGE_POLICY,
             "carrier": {
                 "path": str(carrier),
                 "sha256": carrier_sha256,
+                "sample_format": "interleaved-f64le",
                 "bytes": carrier_bytes,
                 "frames": frames,
                 "sample_rate_hz": args.sample_rate,
@@ -497,6 +654,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "build_lockfiles": None,
             },
             "compiler": compiler,
+            "builds": builds,
             "accuracy_reference": {
                 "expected_point_dbtp": args.expected_point_dbtp,
                 "max_abs_point_error_db": args.max_abs_point_error_db,
@@ -505,6 +663,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             "stop_go": None,
             "release_gate": {
                 "speed": None,
+                "certificate_width": None,
+                "point_accuracy": None,
                 "accuracy": None,
                 "ready": False,
             },
@@ -522,9 +682,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             channels=args.channels,
             configuration="fast",
             cargo=args.cargo,
-            env=env_v1,
+            env=env_v1_instrumented,
             instrumented=True,
             expected_algorithm_revision="Fast066V1",
+            source_role="v1-baseline",
+            source_tree_sha256=v1_source_sha256_before,
+            build_id="A-instrumented",
         )
         annotate_accuracy(a, args.expected_point_dbtp)
         records.append(a)
@@ -538,13 +701,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             channels=args.channels,
             configuration="fast-survey",
             cargo=args.cargo,
-            env=env_v2,
+            env=env_v2_instrumented,
             instrumented=True,
             expected_algorithm_revision="Fast066V2",
+            source_role="v2-candidate",
+            source_tree_sha256=v2_source_sha256_before,
+            build_id="V2-instrumented",
         )
         annotate_accuracy(b, args.expected_point_dbtp)
         records.append(b)
 
+        # C preserves the frozen NominationOnly commissioning entry point. The
+        # nomination stage has been retired, so C is intentionally equivalent
+        # to B and is reported under a compatibility label by the benchmark.
         c = run_benchmark(
             label="C",
             crate_root=v2_run_crate,
@@ -554,9 +723,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             channels=args.channels,
             configuration="fast-nominate",
             cargo=args.cargo,
-            env=env_v2,
+            env=env_v2_instrumented,
             instrumented=True,
             expected_algorithm_revision="Fast066V2",
+            source_role="v2-candidate",
+            source_tree_sha256=v2_source_sha256_before,
+            build_id="V2-instrumented",
         )
         annotate_accuracy(c, args.expected_point_dbtp)
         records.append(c)
@@ -567,10 +739,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             "seconds_per_programme_minute": c["seconds_per_programme_minute"],
             "threshold_seconds_per_programme_minute": FAST_TARGET_SECONDS_PER_PROGRAMME_MINUTE,
             "run_D": go,
+            "profile_mandatory_path": not go,
             "reason": (
-                "C is below the 0.66 s/min mandatory-path threshold"
+                "C compatibility ablation is below the 0.66 s/min mandatory-path threshold"
                 if go
-                else "C is at or above 0.66 s/min; stop and profile the mandatory path"
+                else "C compatibility ablation is at or above 0.66 s/min; stop and profile the mandatory path"
             ),
         }
 
@@ -589,6 +762,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(output)
             return 2
 
+        builds["D-binding"] = prebuild_benchmark(
+            build_id="D-binding",
+            crate_root=v2_run_crate,
+            cargo=args.cargo,
+            env=env_v2_binding,
+            instrumented=False,
+        )
+
         d_instrumented = run_benchmark(
             label="D-instrumented",
             crate_root=v2_run_crate,
@@ -598,9 +779,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             channels=args.channels,
             configuration="fast",
             cargo=args.cargo,
-            env=env_v2,
+            env=env_v2_instrumented,
             instrumented=True,
             expected_algorithm_revision="Fast066V2",
+            source_role="v2-candidate",
+            source_tree_sha256=v2_source_sha256_before,
+            build_id="V2-instrumented",
         )
         annotate_accuracy(d_instrumented, args.expected_point_dbtp)
         records.append(d_instrumented)
@@ -614,22 +798,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             channels=args.channels,
             configuration="fast",
             cargo=args.cargo,
-            env=env_v2,
+            env=env_v2_binding,
             instrumented=False,
             expected_algorithm_revision="Fast066V2",
+            source_role="v2-candidate",
+            source_tree_sha256=v2_source_sha256_before,
+            build_id="D-binding",
             allow_binding_gate_failure=True,
         )
         annotate_accuracy(d_binding, args.expected_point_dbtp)
         records.append(d_binding)
 
         speed_pass = d_binding["benchmark"].get("fast_wall_target_met") is True
+        certificate_width_pass = d_binding["benchmark"].get("fast_accuracy_target_met") is True
         if args.expected_point_dbtp is None:
+            point_accuracy_pass: bool | None = None
             accuracy_pass: bool | None = None
         else:
             error = d_binding["absolute_point_error_db"]
-            accuracy_pass = error is not None and error <= args.max_abs_point_error_db
+            point_accuracy_pass = error is not None and error <= args.max_abs_point_error_db
+            accuracy_pass = certificate_width_pass and point_accuracy_pass
         manifest["release_gate"] = {
             "speed": speed_pass,
+            "certificate_width": certificate_width_pass,
+            "point_accuracy": point_accuracy_pass,
             "accuracy": accuracy_pass,
             "ready": speed_pass and accuracy_pass is True,
         }

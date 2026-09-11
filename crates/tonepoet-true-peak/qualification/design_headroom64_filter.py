@@ -19,6 +19,8 @@ import numpy as np
 import scipy
 from scipy.signal import remez, upfirdn, freqz
 
+from portable_compare import BLAS_COEFFICIENT_ABS_TOL
+
 PI = math.pi
 HALF_TAPS = 384
 DESIGN_EDGE_NORMALIZED_NYQUIST = 0.99
@@ -239,7 +241,7 @@ def main() -> int:
     c = design_half_delay()
     checked_half = parse_checked_in_half(args.source / "src" / "headroom64_coefficients.rs")
     coefficient_max_abs_delta = float(np.max(np.abs(checked_half - c[: HALF_TAPS // 2])))
-    if coefficient_max_abs_delta > 5e-16:
+    if coefficient_max_abs_delta > BLAS_COEFFICIENT_ABS_TOL:
         raise RuntimeError(f"checked-in filter differs from frozen design: {coefficient_max_abs_delta}")
 
     filters = build_filters(c)

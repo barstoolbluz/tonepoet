@@ -4,6 +4,10 @@
 This is intentionally not a release qualifier: Cargo tests, shipping-codegen
 regressions, and commissioning benchmarks remain operator owned. The runner
 makes the source-only numerical derivations reproducible and idempotent.
+
+NumPy/SciPy filter regeneration is compared numerically rather than bit-for-bit
+because conforming BLAS/LAPACK implementations may differ in the last few
+binary64 bits. Integer/rational/source-derived artifacts remain exact.
 """
 from __future__ import annotations
 
@@ -11,6 +15,12 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+
+from portable_compare import (
+    require_hq_json_portable,
+    require_hq_rust_portable,
+    require_json_numeric_close,
+)
 
 
 def run(*args: object) -> None:
@@ -44,7 +54,12 @@ def main() -> int:
         qualified_prefix_verification = tmp / "qualified_prefix_verification.json"
         certified_report = tmp / "certified_search_report.json"
         fast_metadata = tmp / "fast066_metadata.json"
+        raw_screen_metadata = tmp / "raw_screen_metadata.json"
         fast_verification = tmp / "fast066_verification.json"
+
+        # Guard the portable comparator itself: accept last-bit drift, but reject
+        # larger coefficient changes and any change to exact-zero/sign topology.
+        run(PYTHON, "-B", QUALIFICATION / "test_portable_compare.py")
 
         run(
             PYTHON,
@@ -55,10 +70,25 @@ def main() -> int:
             "--json-output",
             generated_json,
         )
-        require_identical(generated_rust, CRATE_ROOT / "src" / "hq1024_coefficients.rs")
-        require_identical(
+        rust_deltas = require_hq_rust_portable(
+            generated_rust,
+            CRATE_ROOT / "src" / "hq1024_coefficients.rs",
+        )
+        print(
+            "portable-close: src/hq1024_coefficients.rs "
+            f"(max coefficient |delta|={max(v for k, v in rust_deltas.items() if 'MEASURED' not in k):.3e})",
+            flush=True,
+        )
+        json_deltas = require_hq_json_portable(
             generated_json,
             QUALIFICATION / "hq1024_candidate_coefficients.json",
+            generated_rust,
+            CRATE_ROOT / "src" / "hq1024_coefficients.rs",
+        )
+        print(
+            "portable-close: qualification/hq1024_candidate_coefficients.json "
+            f"(max derived |delta|={max(json_deltas.values(), default=0.0):.3e})",
+            flush=True,
         )
 
         run(
@@ -98,8 +128,19 @@ def main() -> int:
             "--output",
             certified_report,
         )
-        require_identical(certified_report, QUALIFICATION / "certified_search_report.json")
+        certified_delta = require_json_numeric_close(
+            certified_report,
+            QUALIFICATION / "certified_search_report.json",
+        )
+        print(
+            "portable-close: qualification/certified_search_report.json "
+            f"(max diagnostic |delta|={certified_delta:.3e})",
+            flush=True,
+        )
 
+        # This generator only reads the frozen HQ Rust bank. Its Fraction-based
+        # dyadic checks and scalar nextafter accumulation do not regenerate the
+        # SciPy design, so its output is still required to be exact.
         run(
             PYTHON,
             "-B",
@@ -108,6 +149,26 @@ def main() -> int:
             fast_metadata,
         )
         require_identical(fast_metadata, QUALIFICATION / "fast066_metadata.json")
+
+        run(
+            PYTHON,
+            "-B",
+            QUALIFICATION / "generate_raw_screen_metadata.py",
+            "--crate",
+            CRATE_ROOT,
+            "--output",
+            raw_screen_metadata,
+        )
+        require_identical(raw_screen_metadata, QUALIFICATION / "raw_screen_metadata.json")
+        run(
+            PYTHON,
+            "-B",
+            QUALIFICATION / "test_raw_screen.py",
+            "--crate",
+            CRATE_ROOT,
+            "--metadata",
+            raw_screen_metadata,
+        )
 
         run(
             PYTHON,

@@ -310,7 +310,10 @@ def main() -> int:
             and "fn widened_nonnegative_bound(bits: u64) -> f64" in executor
             and "if left_bits == 0 || right_bits == 0" in executor
             and "if left == 0.0 || right == 0.0" not in executor
-            and "if magnitude_bits(component_peak) == 0" in executor
+            and "if component_peak_bits == 0" in executor
+            and "let component_peak = f64::from_bits(component_peak_bits);" in executor
+            and "fn nonzero_authority_upper(bound: f64) -> f64" in executor
+            and "if magnitude_bits(bound) < F64_MIN_NORMAL_BITS" in executor
             and "if component_peak == 0.0" not in executor
             and "fn magnitude_bits(value: f64) -> u64" in scanner
             and "fn nonnegative_finite_bits(value: f64) -> Option<u64>" in scanner
@@ -325,7 +328,9 @@ def main() -> int:
             and "outward_add(half, half)" in executor
             and "fn process_frame_with_fft_permission" in executor
             and "if !execute_fft" in executor
-            and "outward_mul(first_stage_l1_upper(self.kind), component_peak)" in executor
+            and "nonzero_authority_upper(outward_mul(" in executor
+            and "first_stage_l1_upper(self.kind)" in executor
+            and "component_peak" in executor
             and "self.half_output[frame_index * self.channels + channel_pair_start] = 0.0;" in executor
             and "skipped_fft_block_is_conservative_and_does_not_break_later_fft_state" in executor
             and "skipped_fft_l1_enclosure_survives_daz_ftz_subnormal_input" in executor

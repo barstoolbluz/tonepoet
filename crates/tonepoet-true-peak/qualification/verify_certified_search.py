@@ -27,6 +27,12 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
+from portable_compare import (
+    BLAS_COEFFICIENT_ABS_TOL,
+    require_float_sequences_close,
+    rust_const_literal,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 DESIGN = ROOT.parents[1] / "docs" / "tonepoet_true_peak_reference9_fast90_design.md"
 HQ_RUST = ROOT / "src" / "hq1024_coefficients.rs"
@@ -64,6 +70,13 @@ def parse_rust_f64_array(path: Path, name: str) -> np.ndarray:
         [float(token) for token in match.group(1).replace("\n", " ").split(",") if token.strip()],
         dtype=np.float64,
     )
+
+
+def parse_rust_f64_matrix(path: Path, name: str) -> np.ndarray:
+    values = np.asarray(rust_const_literal(path, name), dtype=np.float64)
+    if values.ndim != 2:
+        raise RuntimeError(f"{name} in {path} is not a matrix")
+    return values
 
 
 def parse_rust_u64(path: Path, name: str) -> int:
@@ -876,26 +889,48 @@ def audit() -> dict:
     # phase and finite identities. This does not import the generator.
     hq_first = build_hq_first()
     frozen_hq_half = parse_rust_f64_array(HQ_RUST, "HQ1024_HALF_DELAY_COEFFICIENTS")
-    if not np.array_equal(hq_first[:768], frozen_hq_half):
-        raise RuntimeError("frozen HQ first half does not reproduce the published construction")
+    first_delta = require_float_sequences_close(
+        hq_first[:768],
+        frozen_hq_half,
+        label="HQ1024 first half regeneration",
+        abs_tol=BLAS_COEFFICIENT_ABS_TOL,
+    )
     hq_stage_coefficients = hq_stages()
     hq_stage_responses = [hq_stage_response(stage) for stage in hq_stage_coefficients]
     hq_tail, hq_tail_delay = compose_tail(hq_stage_responses)
     hq_bank = make_bank(hq_tail, hq_tail_delay, HQ_TAIL_FACTOR, HQ_OFFSET_MIN, HQ_OFFSET_MAX)
+    frozen_hq_bank = parse_rust_f64_matrix(HQ_RUST, "HQ1024_TAIL_COEFFICIENTS")
+    if frozen_hq_bank.shape != hq_bank.shape:
+        raise RuntimeError(
+            f"frozen HQ tail geometry differs: {frozen_hq_bank.shape} vs {hq_bank.shape}"
+        )
+    tail_delta = require_float_sequences_close(
+        hq_bank.flat,
+        frozen_hq_bank.flat,
+        label="HQ1024 tail regeneration",
+        abs_tol=BLAS_COEFFICIENT_ABS_TOL,
+    )
+    print(
+        "portable HQ construction match: "
+        f"first-half max |delta|={first_delta:.3e}, tail max |delta|={tail_delta:.3e}"
+    )
     hq_root_a, hq_root_b = node_bound(hq_bank, HQ_TAIL_FACTOR, HQ_OFFSET_MIN, HQ_OFFSET_MAX, 0, HQ_TAIL_FACTOR)
     hq_op, hq_delay = operator_norm(first_response(hq_first), 1536, hq_stage_responses)
     hq_response = sampled_hq_response_audit(hq_first, hq_bank)
 
+    # The FNV is authority for the frozen source bits, not for a fresh BLAS
+    # regeneration. Validate the frozen source against its own checksum, while
+    # the independent regeneration is constrained numerically above.
     frozen_tail_fnv = parse_rust_u64(HQ_RUST, "HQ1024_TAIL_FNV1A64")
-    if fnv1a64(hq_bank) != frozen_tail_fnv:
-        raise RuntimeError("frozen HQ tail checksum does not reproduce the independent construction")
+    if fnv1a64(frozen_hq_bank) != frozen_tail_fnv:
+        raise RuntimeError("frozen HQ tail checksum does not match the checked-in source")
 
     frozen_node_a = parse_rust_f64_array(HQ_RUST, "HQ1024_NODE_A_UPPER")
     frozen_node_b = parse_rust_f64_array(HQ_RUST, "HQ1024_NODE_B_UPPER")
     if frozen_node_a.size != HQ_TAIL_FACTOR or frozen_node_b.size != HQ_TAIL_FACTOR:
         raise RuntimeError("frozen HQ node metadata has the wrong geometry")
     exact_node_metadata_outward = all_nodes_exactly_outward(
-        hq_bank,
+        frozen_hq_bank,
         HQ_TAIL_FACTOR,
         HQ_OFFSET_MIN,
         HQ_OFFSET_MAX,
@@ -903,7 +938,7 @@ def audit() -> dict:
         frozen_node_b,
     )
     hq_bound_stress = deterministic_bound_stress(
-        hq_bank,
+        frozen_hq_bank,
         HQ_TAIL_FACTOR,
         HQ_OFFSET_MIN,
         HQ_OFFSET_MAX,
@@ -1168,26 +1203,28 @@ def audit() -> dict:
         and "pub struct ReportingPeakMeter" in lib_source
     )
     fast_source = FAST_RUST.read_text()
-    fast066_policy_is_fixed_work_and_fail_closed = (
+    # Fast066V2 now uses the certified native-input rejection design.  This
+    # cross-check intentionally verifies only the frozen public contract and
+    # high-level fail-closed search obligations; qualification/verify_fast_scan.py
+    # is the detailed authority for the private selective implementation.
+    fast066_policy_is_selective_and_fail_closed = (
         'FAST_ALGORITHM_REVISION: &str = "Fast066V2"' in lib_source
         and "FAST_WALL_NANOS_PER_PROGRAMME_MINUTE: u64 = 660_000_000" in lib_source
         and "FAST_WALL_SECONDS_PER_PROGRAMME_MINUTE" not in lib_source
         and "CertifiedPeakBackend::Fast(" in lib_source
         and "fast_scan::FastPeakMeterImpl::new" in lib_source
-        and "const TILE_FRAMES: i128 = 4096;" in fast_source
-        and "const GROUP_FRAMES: i128 = 256;" in fast_source
-        and "const MAX_NOMINEES_PER_TILE_CHANNEL: usize = 64;" in fast_source
-        and "const MAX_FINISHERS_PER_TILE_CHANNEL: usize = 8;" in fast_source
-        and "const FINISH_PROBE_STEP_Q: i128 = 32;" in fast_source
-        and "const MAX_FINE_EVALUATIONS_PER_TILE_CHANNEL: u64 = 104;" in fast_source
+        and "const TILE_INTERVALS: i128 = 4096;" in fast_source
+        and "const ROOT_INTERVALS: i128 = 256;" in fast_source
+        and "const CHILD_INTERVALS: i128 = 32;" in fast_source
+        and "const RAW_HALO_FRAMES: i128 = 777;" in fast_source
+        and "raw_group_upper" in fast_source
+        and "channel_l4_lower" in fast_source
+        and "fn resolve_span" in fast_source
+        and "ResolveNode" in fast_source
+        and "MAX_NOMINEES_PER_TILE_CHANNEL" not in fast_source
+        and "MAX_FINISHERS_PER_TILE_CHANNEL" not in fast_source
+        and "MAX_FINE_EVALUATIONS_PER_TILE_CHANNEL" not in fast_source
         and "STENCIL_POINTS" not in fast_source
-        and "fn refine_candidate" not in fast_source
-        and "fn candidate_neighborhood_upper" in fast_source
-        and "fn probe_nominees" in fast_source
-        and "fn finish_proposals" in fast_source
-        and "fn fine_evaluation_context" in fast_source
-        and "fast_flat_groups" in fast_source
-        and "fast_fine_knots_evaluated" in fast_source
         and "time_bounded_prefix_blocks_skipped" not in fast_source
         and "Instant::now" not in fast_source
         and "fast066_never_reports_time_limited_or_executes_retired_fast_machinery"
@@ -1291,7 +1328,7 @@ def audit() -> dict:
         ),
         "stale_msrv_workaround_is_retired": stale_msrv_workaround_is_retired,
         "public_surface_is_exactly_three_hq_tiers": public_surface_is_exactly_three_hq_tiers,
-        "fast066_policy_is_fixed_work_and_fail_closed": fast066_policy_is_fixed_work_and_fail_closed,
+        "fast066_policy_is_selective_and_fail_closed": fast066_policy_is_selective_and_fail_closed,
         "legacy_oracle_is_internal_only": legacy_oracle_is_internal_only,
         "benchmark_exposes_only_three_tiers": benchmark_exposes_only_three_tiers,
         "hq_runtime_omits_redundant_stage_tables_but_generator_retains_construction": (

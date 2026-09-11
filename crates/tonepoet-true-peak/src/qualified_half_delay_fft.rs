@@ -573,20 +573,33 @@ fn overflow_safe_scale(component_peak: f64) -> (f64, f64) {
     }
 }
 
+#[inline]
+fn nonzero_authority_upper(bound: f64) -> f64 {
+    // This helper is called only after source support has been classified as
+    // nonzero in integer space. Keep the resulting authority normal-valued so
+    // a DAZ/FTZ consumer cannot reinterpret the enclosure itself as zero.
+    if magnitude_bits(bound) < F64_MIN_NORMAL_BITS {
+        f64::MIN_POSITIVE
+    } else {
+        bound
+    }
+}
+
 fn block_error_upper(
     kind: QualifiedHalfDelayKind,
-    component_peak: f64,
+    component_peak_bits: u64,
     inverse_block_scale: f64,
 ) -> f64 {
-    if magnitude_bits(component_peak) == 0 {
+    if component_peak_bits == 0 {
         return 0.0;
     }
+    let component_peak = f64::from_bits(component_peak_bits);
     let relative = outward_mul(
         kind.relative_error_per_packed_component_peak_upper(),
         component_peak,
     );
     let absolute = outward_mul(kind.absolute_error_upper(), inverse_block_scale);
-    outward_add(relative, absolute)
+    nonzero_authority_upper(outward_add(relative, absolute))
 }
 
 /// One qualified half-delay overlap-save output block.
@@ -812,6 +825,41 @@ impl QualifiedHalfDelayFft {
         }
     }
 
+    /// Execute one self-contained finite input window with zero history before
+    /// the supplied window, preserving the qualified overlap-save arithmetic
+    /// graph. Fast uses this only when every retained output's full FIR support
+    /// lies inside the supplied window, so the synthetic zero history cannot
+    /// affect a retained value. The executor is reset before and after the
+    /// call and can therefore be reused across unrelated selective windows.
+    pub(crate) fn process_finite_window_blocks<F>(
+        &mut self,
+        samples: &[f64],
+        start_input_index: i128,
+        mut emit: F,
+    ) -> usize
+    where
+        F: FnMut(QualifiedHalfDelayBlock<'_>),
+    {
+        debug_assert_eq!(samples.len() % self.channels, 0);
+        self.reset_finite_window_state();
+        let consumed = self.process_interleaved_blocks(
+            samples,
+            start_input_index,
+            |block| emit(block),
+        );
+        let _ = self.flush_block(|block| emit(block));
+        self.reset_finite_window_state();
+        consumed
+    }
+
+    fn reset_finite_window_state(&mut self) {
+        for history in &mut self.history {
+            history.fill(0.0);
+        }
+        self.pending.clear();
+        self.pending_start_index = None;
+    }
+
     fn emit_block_frames<F>(
         block: QualifiedHalfDelayBlock<'_>,
         emit: &mut F,
@@ -897,7 +945,10 @@ impl QualifiedHalfDelayFft {
 
             let component_peak = f64::from_bits(component_peak_bits);
             if !execute_fft {
-                let half_upper = outward_mul(first_stage_l1_upper(self.kind), component_peak);
+                let half_upper = nonzero_authority_upper(outward_mul(
+                    first_stage_l1_upper(self.kind),
+                    component_peak,
+                ));
                 self.half_error_by_channel[channel_pair_start] = half_upper;
                 if let Some(channel) = second {
                     self.half_error_by_channel[channel] = half_upper;
@@ -948,7 +999,11 @@ impl QualifiedHalfDelayFft {
                 fixed_radix2_fft(&mut self.fft_buffer, true);
             }
 
-            let error = block_error_upper(self.kind, component_peak, inverse_block_scale);
+            let error = block_error_upper(
+                self.kind,
+                component_peak_bits,
+                inverse_block_scale,
+            );
             self.half_error_by_channel[channel_pair_start] = error;
             if let Some(channel) = second {
                 self.half_error_by_channel[channel] = error;
@@ -1364,6 +1419,80 @@ mod tests {
                     assert_eq!(expected.4[channel].to_bits(), actual.4[channel].to_bits());
                 }
             }
+        }
+    }
+
+    fn finite_window_direct_half(
+        samples: &[f64],
+        channels: usize,
+        window_start: i128,
+        m: i128,
+        channel: usize,
+    ) -> f64 {
+        let mut sum = 0.0_f64;
+        for tap in 0..HQ1024_FIRST_HALF_DELAY_TAPS {
+            let coefficient = if tap < HQ1024_HALF_DELAY_COEFFICIENTS.len() {
+                HQ1024_HALF_DELAY_COEFFICIENTS[tap]
+            } else {
+                HQ1024_HALF_DELAY_COEFFICIENTS[HQ1024_FIRST_HALF_DELAY_TAPS - 1 - tap]
+            };
+            let source = m + 768 - tap as i128;
+            let frame = usize::try_from(source - window_start).expect("retained FIR support in window");
+            sum += coefficient * samples[frame * channels + channel];
+        }
+        sum
+    }
+
+    #[test]
+    fn finite_window_adapter_retained_edge_outputs_match_direct_fir() {
+        // The partial case exercises the flush path. The 6657-frame case is
+        // the executor's complete useful-input capacity and guards that exact
+        // geometry independently of caller chunking.
+        for &(channels, window_start, frames, first_m, last_m) in &[
+            (1usize, -777i128, 1855usize, -8i128, 307i128),
+            (3usize, -777i128, 6657usize, -8i128, 4103i128),
+        ] {
+            let mut samples = Vec::with_capacity(frames * channels);
+            for frame in 0..frames {
+                let absolute = window_start + frame as i128;
+                for channel in 0..channels {
+                    let x = absolute as f64;
+                    let c = channel as f64 + 1.0;
+                    samples.push(
+                        0.43 * (0.013 * c * x).sin()
+                            + 0.19 * (0.031 * x).cos()
+                            + if (absolute + channel as i128).rem_euclid(11) == 0 { 0.07 } else { -0.03 },
+                    );
+                }
+            }
+
+            let mut engine = QualifiedHalfDelayFft::new_fast90(ReconstructionId::Hq1024V1, channels);
+            let mut observed = Vec::new();
+            let consumed = engine.process_finite_window_blocks(&samples, window_start, |block| {
+                let block_first_m = block.first_coarse_index.div_euclid(2);
+                for frame in 0..block.frames {
+                    let m = block_first_m + frame as i128;
+                    if m != first_m && m != last_m {
+                        continue;
+                    }
+                    for channel in 0..channels {
+                        observed.push((m, channel, block.half[frame * channels + channel], block.half_error_by_channel[channel]));
+                    }
+                }
+            });
+            assert_eq!(consumed, frames);
+            assert_eq!(observed.len(), 2 * channels);
+            for (m, channel, actual, error) in observed {
+                let direct = finite_window_direct_half(&samples, channels, window_start, m, channel);
+                assert!(
+                    (actual - direct).abs() <= error,
+                    "finite-window FFT escaped direct FIR enclosure: channels={channels} m={m} channel={channel}",
+                );
+            }
+
+            // A finite-window call must leave no history or pending state that
+            // can leak into the next unrelated selective window.
+            assert!(!engine.has_pending());
         }
     }
 

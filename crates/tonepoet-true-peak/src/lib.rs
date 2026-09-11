@@ -20,6 +20,7 @@ mod hq1024_coefficients;
 mod qualified_prefix_coefficients;
 mod qualified_half_delay_fft;
 mod certified_scan;
+mod raw_screen_metadata;
 mod fast_scan;
 #[cfg(feature = "fast-stage-timing")]
 mod fast_stage_timing;
@@ -60,11 +61,12 @@ pub const FAST_WALL_NANOS_PER_PROGRAMME_MINUTE: u64 = 660_000_000;
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FastCommissioningMode {
-    /// Qualified prefix, complete HQ4 survey, and flat certificate bounds only.
+    /// Native screening, selective HQ4 survey, and local flat bounds only.
     SurveyBoundsOnly,
-    /// Survey/bounds plus deterministic 64-entry nominee discovery and selection.
+    /// Compatibility ablation name; behavior is identical to `SurveyBoundsOnly`
+    /// because Fast066V2 no longer has a separate nomination stage.
     NominationOnly,
-    /// Complete shipping Fast066V2 proposal and finishing policy.
+    /// Complete shipping Fast066V2 certified selective search.
     Production,
 }
 
@@ -158,7 +160,7 @@ pub enum PeakTier {
     /// Deterministic bounded-work Fast90 search of HQ1024V1.
     #[default]
     Standard,
-    /// Deterministic bounded-work Fast066 search of HQ1024V1, with a release
+    /// Deterministic certified Fast066 search of HQ1024V1, with a release
     /// commissioning target of 0.66 seconds of wall time per programme minute.
     Fast,
 }
@@ -166,9 +168,9 @@ pub enum PeakTier {
 impl PeakTier {
     /// Commissioning width objective where the tier has one.
     ///
-    /// Fast intentionally returns `None`: its fixed work budget is an
-    /// execution policy, not an accuracy floor. The returned interval remains
-    /// authoritative even when optional proposal/finishing work does not find the winner.
+    /// Fast intentionally returns `None`: its 0.01 dB production acceptance
+    /// criterion is private commissioning policy, not a public tier setting.
+    /// The returned interval remains authoritative for every supported input.
     #[must_use]
     pub const fn interval_objective_db(self) -> Option<f64> {
         match self {
@@ -324,62 +326,61 @@ pub struct SearchDiagnostics {
     /// Tiles in which the retired clock-bounded Fast implementation reached
     /// its cumulative processing-time allowance. Fast066 leaves this at zero.
     pub time_limited_tiles: u64,
-    /// Complete HQ 4x survey knots reduced by Fast066.
+    /// Unique HQ4 knots physically reduced by Fast066 after native screening.
     pub fast_survey_knots: u64,
-    /// Local HQ 4x maxima observed by Fast066 before quota selection.
+    /// Retired Fast066V2 nominee-policy counter; the selective scanner leaves this zero.
     pub fast_candidates_observed: u64,
-    /// Flat 256-frame algebraic envelopes evaluated by Fast066.
+    /// Local frozen HQ4 algebraic envelopes evaluated by Fast066.
     pub fast_flat_groups: u64,
-    /// HQ4 nominees retained by Fast066V2's spatial-plus-global 64-entry selection.
+    /// Retired Fast066V2 nominee-policy counter; the selective scanner leaves this zero.
     pub fast_candidates_selected: u64,
-    /// Channel-tiles whose local-maxima population exceeded the 64-nominee quota.
+    /// Retired Fast066V2 nominee-policy counter; the selective scanner leaves this zero.
     pub fast_candidate_saturated_tiles: u64,
-    /// Surviving nominees for which Fast066V2 evaluated or reused the proposed HQ1024 knot.
+    /// Retired Fast066V2 proposal-policy counter; the selective scanner leaves this zero.
     pub fast_proposals_evaluated: u64,
-    /// Proposal-stage non-HQ4 HQ1024 knots actually evaluated by the short-tail bank.
+    /// Retired Fast066V2 proposal-policy counter; the selective scanner leaves this zero.
     pub fast_proposal_fine_knots_evaluated: u64,
-    /// Proposal records admitted to the at-most-eight finishing pass after its bound recheck.
+    /// Retired Fast066V2 finishing-policy counter; the selective scanner leaves this zero.
     pub fast_finishing_candidates: u64,
-    /// Finishing-stage non-HQ4 HQ1024 knots actually evaluated by the short-tail bank.
+    /// Retired Fast066V2 finishing-policy counter; the selective scanner leaves this zero.
     pub fast_finishing_fine_knots_evaluated: u64,
-    /// New non-HQ4 HQ1024 knots evaluated by all Fast066V2 optional work.
+    /// Retired Fast066V2 optional-work counter; mandatory dyadic work uses generic counters.
     pub fast_fine_knots_evaluated: u64,
-    /// Channel-tiles whose complete optional-work domain was dominated by the same-channel lower witness.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_bound_pruned_channel_tiles: u64,
-    /// Selected nominees skipped because their complete possible-work neighborhood was dominated.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_bound_pruned_nominees: u64,
-    /// Top-eight proposal records skipped after the lower witness improved before finishing.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_bound_pruned_finishers: u64,
-    /// Probed nominees whose HQ4 three-point fit was invalid and therefore proposed their center knot.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_invalid_proposal_fits: u64,
-    /// Finishing candidates stopped because an endpoint probe was missing or the center did not win.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_unbracketed_finishers: u64,
-    /// Center-winning finishing candidates stopped because their signed concave fit was invalid.
+    /// Retired Fast066V2 optional-policy counter; the selective scanner leaves this zero.
     pub fast_invalid_finishing_fits: u64,
     /// Exact maximum input-sample magnitude observed by Fast066.
     pub fast_input_sample_peak_linear: f64,
-    /// Complete HQ 4x survey point maximum observed by Fast066.
+    /// Complete HQ4 point maximum established by evaluated values plus dominance proofs.
     pub fast_hq4_peak_linear: f64,
-    /// Commissioning-only time spent in qualified-prefix execution plus block ingestion.
+    /// Commissioning-only time spent in selective direct/FFT first-stage execution.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_prefix_block_ingest_nanos: u64,
-    /// Commissioning-only time spent building the complete HQ 4x survey.
+    /// Commissioning-only time spent building selective local HQ4 surveys.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_midpoint_survey_nanos: u64,
-    /// Commissioning-only time spent constructing flat-group certificate envelopes.
+    /// Commissioning-only time spent in native screening and local flat envelopes.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_flat_envelope_nanos: u64,
-    /// Commissioning-only inclusive time spent in nomination, proposal, and finishing work.
-    /// This retained aggregate overlaps the three V2 stage counters below.
+    /// Commissioning-only time spent in mandatory dyadic accuracy resolution.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_candidate_refinement_nanos: u64,
-    /// Commissioning-only time spent discovering and selecting at most 64 HQ4 nominees.
+    /// Retired Fast066V2 stage counter; the selective scanner leaves this zero.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_nomination_nanos: u64,
-    /// Commissioning-only time spent screening nominees and evaluating one proposed HQ knot each.
+    /// Retired Fast066V2 stage counter; the selective scanner leaves this zero.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_proposal_nanos: u64,
-    /// Commissioning-only time spent ranking measured proposals and finishing at most eight.
+    /// Retired Fast066V2 stage counter; the selective scanner leaves this zero.
     #[cfg(feature = "fast-stage-timing")]
     pub fast_stage_finishing_nanos: u64,
     /// Commissioning-only time spent in final certificate reduction after all tile work.
@@ -439,9 +440,9 @@ impl InternalPeakCertificate {
 /// Streaming certified HQ1024V1 meter.
 ///
 /// Caller chunk sizes do not define FFT blocks or search tiles. All three tiers
-/// are deterministic for a fixed backend. Fast uses its own fixed-work Fast066
-/// execution graph; host scheduling never changes which signal locations are
-/// measured.
+/// are deterministic for a fixed backend. Fast uses its own certified selective
+/// Fast066 execution graph; host scheduling never changes which signal locations
+/// are measured.
 #[derive(Debug, Clone)]
 pub struct CertifiedPeakMeter {
     inner: CertifiedPeakBackend,

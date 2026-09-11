@@ -5,7 +5,7 @@
     "binding_benchmark_uses_total_timer_without_projection": true,
     "daz_safe_logarithmic_views": true,
     "direct_bound_primitives_are_exactly_outward_on_edge_cases": true,
-    "fast066_policy_is_fixed_work_and_fail_closed": true,
+    "fast066_policy_is_selective_and_fail_closed": true,
     "fast90_coarse_lower_and_magnitude_are_single_pass": true,
     "fast90_curvature_summary_reuses_rolling_coarse_knots": true,
     "fast90_l1_prefilter_is_authority_bearing": true,

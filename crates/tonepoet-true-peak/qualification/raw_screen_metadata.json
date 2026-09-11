@@ -1,0 +1,46 @@
+{
+  "A_raw": {
+    "denominator": "604462909807314587353088",
+    "maximizing_phase": 512,
+    "numerator": "610422825027803716233259",
+    "upper_bits": "0x3ff02862ce0a81a1",
+    "upper_decimal": 1.009859852645697,
+    "upper_hex": "0x1.02862ce0a81a1p+0"
+  },
+  "B_raw": {
+    "denominator": "1496577676626844588240573268701473812127674924007424",
+    "maximizing_phase": 941,
+    "numerator": "1271048408773046195388251475720324819",
+    "upper_bits": "0x3cce9970cbf12e12",
+    "upper_decimal": 8.493033329468595e-16,
+    "upper_hex": "0x1.e9970cbf12e12p-51"
+  },
+  "arithmetic": "exact integers over a common power-of-two denominator",
+  "coefficient_source_sha256": "7070c2e9abc255062dd30aaa516c0827d969d238759e14a61c5d1da94a67de9d",
+  "composite_denominator_exponent": 222,
+  "composite_l1": {
+    "denominator": "1208925819614629174706176",
+    "maximizing_phase": 512,
+    "numerator": "5652969090654936344428671",
+    "upper_bits": "0x4012b4404618d32d",
+    "upper_decimal": 4.676026435151283,
+    "upper_hex": "0x1.2b4404618d32dp+2"
+  },
+  "format": 1,
+  "identity": "y[n,p] = (1-t+a[p])*x[n] + (t+b[p])*x[n+1] + sum_j Q[p,j]*Delta2(x)[n+j]",
+  "native_phase_rows_checked_including_right_endpoint": 1025,
+  "notes": [
+    "Constants enclose real arithmetic on the frozen stored binary64 coefficients.",
+    "Runtime bounds must additionally enclose computed second differences and upper-bound arithmetic.",
+    "These are finite HQ1024 bounds, not ideal-sinc accuracy claims."
+  ],
+  "raw_support_inclusive": [
+    -775,
+    776
+  ],
+  "second_difference_start_offsets_inclusive": [
+    -775,
+    774
+  ],
+  "upper": "P_[a,b] <= (1+B_raw)*S_[a,b] + A_raw*D_[a-775,b+773]"
+}
