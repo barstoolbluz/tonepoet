@@ -27,6 +27,12 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
+from portable_compare import (
+    BLAS_COEFFICIENT_ABS_TOL,
+    require_float_sequences_close,
+    rust_const_literal,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 DESIGN = ROOT.parents[1] / "docs" / "tonepoet_true_peak_reference9_fast90_design.md"
 HQ_RUST = ROOT / "src" / "hq1024_coefficients.rs"
@@ -64,6 +70,13 @@ def parse_rust_f64_array(path: Path, name: str) -> np.ndarray:
         [float(token) for token in match.group(1).replace("\n", " ").split(",") if token.strip()],
         dtype=np.float64,
     )
+
+
+def parse_rust_f64_matrix(path: Path, name: str) -> np.ndarray:
+    values = np.asarray(rust_const_literal(path, name), dtype=np.float64)
+    if values.ndim != 2:
+        raise RuntimeError(f"{name} in {path} is not a matrix")
+    return values
 
 
 def parse_rust_u64(path: Path, name: str) -> int:
@@ -876,26 +889,48 @@ def audit() -> dict:
     # phase and finite identities. This does not import the generator.
     hq_first = build_hq_first()
     frozen_hq_half = parse_rust_f64_array(HQ_RUST, "HQ1024_HALF_DELAY_COEFFICIENTS")
-    if not np.array_equal(hq_first[:768], frozen_hq_half):
-        raise RuntimeError("frozen HQ first half does not reproduce the published construction")
+    first_delta = require_float_sequences_close(
+        hq_first[:768],
+        frozen_hq_half,
+        label="HQ1024 first half regeneration",
+        abs_tol=BLAS_COEFFICIENT_ABS_TOL,
+    )
     hq_stage_coefficients = hq_stages()
     hq_stage_responses = [hq_stage_response(stage) for stage in hq_stage_coefficients]
     hq_tail, hq_tail_delay = compose_tail(hq_stage_responses)
     hq_bank = make_bank(hq_tail, hq_tail_delay, HQ_TAIL_FACTOR, HQ_OFFSET_MIN, HQ_OFFSET_MAX)
+    frozen_hq_bank = parse_rust_f64_matrix(HQ_RUST, "HQ1024_TAIL_COEFFICIENTS")
+    if frozen_hq_bank.shape != hq_bank.shape:
+        raise RuntimeError(
+            f"frozen HQ tail geometry differs: {frozen_hq_bank.shape} vs {hq_bank.shape}"
+        )
+    tail_delta = require_float_sequences_close(
+        hq_bank.flat,
+        frozen_hq_bank.flat,
+        label="HQ1024 tail regeneration",
+        abs_tol=BLAS_COEFFICIENT_ABS_TOL,
+    )
+    print(
+        "portable HQ construction match: "
+        f"first-half max |delta|={first_delta:.3e}, tail max |delta|={tail_delta:.3e}"
+    )
     hq_root_a, hq_root_b = node_bound(hq_bank, HQ_TAIL_FACTOR, HQ_OFFSET_MIN, HQ_OFFSET_MAX, 0, HQ_TAIL_FACTOR)
     hq_op, hq_delay = operator_norm(first_response(hq_first), 1536, hq_stage_responses)
     hq_response = sampled_hq_response_audit(hq_first, hq_bank)
 
+    # The FNV is authority for the frozen source bits, not for a fresh BLAS
+    # regeneration. Validate the frozen source against its own checksum, while
+    # the independent regeneration is constrained numerically above.
     frozen_tail_fnv = parse_rust_u64(HQ_RUST, "HQ1024_TAIL_FNV1A64")
-    if fnv1a64(hq_bank) != frozen_tail_fnv:
-        raise RuntimeError("frozen HQ tail checksum does not reproduce the independent construction")
+    if fnv1a64(frozen_hq_bank) != frozen_tail_fnv:
+        raise RuntimeError("frozen HQ tail checksum does not match the checked-in source")
 
     frozen_node_a = parse_rust_f64_array(HQ_RUST, "HQ1024_NODE_A_UPPER")
     frozen_node_b = parse_rust_f64_array(HQ_RUST, "HQ1024_NODE_B_UPPER")
     if frozen_node_a.size != HQ_TAIL_FACTOR or frozen_node_b.size != HQ_TAIL_FACTOR:
         raise RuntimeError("frozen HQ node metadata has the wrong geometry")
     exact_node_metadata_outward = all_nodes_exactly_outward(
-        hq_bank,
+        frozen_hq_bank,
         HQ_TAIL_FACTOR,
         HQ_OFFSET_MIN,
         HQ_OFFSET_MAX,
@@ -903,7 +938,7 @@ def audit() -> dict:
         frozen_node_b,
     )
     hq_bound_stress = deterministic_bound_stress(
-        hq_bank,
+        frozen_hq_bank,
         HQ_TAIL_FACTOR,
         HQ_OFFSET_MIN,
         HQ_OFFSET_MAX,
