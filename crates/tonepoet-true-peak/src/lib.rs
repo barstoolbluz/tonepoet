@@ -15,6 +15,10 @@ use std::error::Error;
 use std::f64::consts::PI;
 use std::fmt;
 
+pub mod loudness;
+pub mod replaygain;
+pub mod compat;
+
 mod headroom64_coefficients;
 mod hq1024_coefficients;
 mod qualified_prefix_coefficients;
