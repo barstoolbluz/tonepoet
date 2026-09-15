@@ -15,11 +15,18 @@ nix develop --extra-experimental-features 'nix-command flakes'
 # Inside the dev shell:
 cargo build                  # Debug build
 cargo build --release        # Release build
-cargo test --workspace       # Run ALL workspace tests (plain `cargo test` only
-                             # tests the root package — sub-crate tests went
-                             # dark for months under it; always use --workspace)
+cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
+                             # RUN IT IN THE BACKGROUND. It outruns the 600s Bash
+                             # foreground timeout; a foreground run dies mid-suite
+                             # and reports a misleadingly CLEAN partial result.
+                             # plain `cargo test` tests only the root package;
+                             # without --no-fail-fast, --workspace stops at the
+                             # first failing binary; tonepoet-true-peak costs
+                             # ~41 min and is gated separately. See ## Testing —
+                             # a clean gate is 6858/4, NOT zero failures.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
+cargo test -p tonepoet-true-peak # True-peak + loudness core (~41 min)
 cargo check                  # Fast type check
 
 # Run the binary
@@ -33,17 +40,25 @@ cargo run -- config
 nix build --extra-experimental-features 'nix-command flakes'
 ```
 
-**Do not use system Rust** (1.82) — it cannot resolve some transitive dependencies. Always build inside `nix develop`.
+**Do not use the system Rust toolchain.** The root `Cargo.toml` declares `rust-version = "1.82"` but `crates/tonepoet-true-peak` declares `1.93`, so the effective workspace MSRV is **1.93** — above the system toolchain. Always build inside `nix develop`, which supplies the pinned toolchain.
 
 ## Workspace Structure
+
+**This tree is ABRIDGED — roughly a third of the files.** It shows 9 of 44 in
+`src/convert/pipeline/`, 22 of 73 in `src/tui/`, 11 of 22 in `src/convert/`, and omits
+`tests/`, `assets/`, `docs/`, `examples/`, `fixtures/`, `scripts/`. Whole subsystems are
+absent — `browse.rs`, `theme_builder.rs`, `musicbrainz.rs`, `scheduler.rs`,
+`track_executor.rs`, `label_resolver.rs`, `memory_budget.rs`, and the `bluray_*` / `dvda_*`
+families. **`ls` the directory; absence here does not mean absence on disk.**
 
 ```
 tonepoet/
 ├── Cargo.toml              # Workspace root + main tonepoet crate
 ├── flake.nix               # Nix dev shell + build package (includes libclang, ffmpeg)
 ├── src/
-│   ├── main.rs             # Clap CLI: tui, convert, wizard, check-tools, config
-│   ├── lib.rs              # pub mod convert; pub mod config; pub mod tui;
+│   ├── main.rs             # Clap CLI (15 subcommands; see `enum Commands`)
+│   ├── lib.rs              # 10 pub mods: concurrency config convert ctdb_rs db
+│                           #   disc dsf_tags metadata_persistence secret_store tui
 │   ├── config.rs           # TonepoetConfig (TOML at ~/.config/tonepoet/config.toml)
 │   ├── convert/
 │   │   ├── mod.rs           # Module root — re-exports, ConversionManager, ConversionConfig
@@ -51,13 +66,13 @@ tonepoet/
 │   │   ├── queue.rs         # ConversionQueue, ConversionItem, ConversionStatus
 │   │   ├── formats.rs       # AudioFormat, FileFormat, FormatDetector, ConversionOptions
 │   │   ├── pipeline/        # Staged conversion pipeline (PRs 1-9)
-│   │   │   ├── mod.rs           # Module root, #![forbid(unsafe_code)], re-exports, tests
+│   │   │   ├── mod.rs           # Module root, #![deny(unsafe_code)], re-exports, tests
 │   │   │   ├── types.rs         # PipelineRequest, PreparedSource, ArtifactSet, AlbumOutcome, etc.
 │   │   │   ├── errors.rs        # All pipeline error types (14 enums)
 │   │   │   ├── tool.rs          # ToolBinary, ToolCommand, ToolRunner trait, RealToolRunner, StubToolRunner
 │   │   │   ├── reporter.rs      # PipelineEvent, PipelineReporter, RecordingReporter
 │   │   │   ├── stages.rs        # Stage functions, orchestrator (run_pipeline_item), publish
-│   │   │   ├── materializer_7z.rs   # SevenZipMaterializer
+│   │   │   ├── materializer_archive.rs # ArchiveMaterializer (7z/zip/rar/…)
 │   │   │   ├── materializer_cue.rs  # CueImageMaterializer
 │   │   │   └── materializer_sacd.rs # SacdIsoMaterializer
 │   │   ├── wizard_integration.rs  # Wizard state → ConversionOptions bridge
@@ -89,10 +104,17 @@ tonepoet/
 │       ├── button_map.rs     # TuiButton enum + ButtonRenderMap for mouse clicks
 │       ├── event_loop.rs     # Async event loop (crossterm + mpsc messages)
 │       └── message.rs        # AppMessage enum for async communication
-├── crates/
-│   ├── tonepoet-backend/    # FFmpeg/SoX command builders, pipeline, metadata I/O
-│   ├── tonepoet-features/   # Log file writer, CUE sheet generator
-│   └── tonepoet-wizard/     # Legacy ratatui TUI wizard (draw_wizard, events, presets)
+├── tonepoet-pipeline/      # NOTE: at the repo root, NOT under crates/
+│                           # Pipeline settings, enums, planning, fingerprint
+└── crates/
+    ├── tonepoet-backend/   # FFmpeg/SoX command builders, pipeline, metadata I/O
+    ├── tonepoet-features/  # Log file writer, CUE sheet generator
+    ├── tonepoet-wizard/    # Legacy ratatui TUI wizard (draw_wizard, events, presets)
+    ├── tonepoet-true-peak/ # BS.1770 true-peak certification + loudness core
+    ├── sacd-rs/            # SACD ISO parsing
+    ├── dvda-demuxer/       # DVD-Audio demuxing
+    ├── dvdvideo/           # DVD-Video parsing
+    └── tui-file-picker/    # File/directory picker widget
 ```
 
 ## Crate Dependency Graph
@@ -102,6 +124,7 @@ tonepoet (main binary + lib)
 ├── tonepoet-backend     (workspace: FFmpeg/SoX command builders, metadata I/O)
 ├── tonepoet-features    (workspace: log file writer, CUE sheet generator; depends on tonepoet-backend)
 ├── tonepoet-pipeline    (workspace: pipeline settings, enums, planning)
+├── tonepoet-true-peak   (workspace: BS.1770 true-peak certification + loudness core)
 ├── tonepoet-wizard      (workspace: legacy ratatui TUI wizard)
 ├── sacd-rs              (workspace: SACD ISO parsing)
 ├── dvda-demuxer         (workspace: DVD-Audio demuxing)
@@ -114,14 +137,39 @@ tonepoet (main binary + lib)
 └── libbluray-sys        (FFI bindings for libbluray)
 ```
 
+## The true-peak crate (`crates/tonepoet-true-peak`)
+
+Separately gated, ~41 min, **136 passed / 0 failed**. Excluded from the routine workspace
+gate; run it explicitly whenever the crate itself changes.
+
+- **Its public API is frozen.** Additions are allowed, removals and signature changes are
+  not.
+- `PeakTier { Reference, Standard, Fast }`. Gain is always computed from
+  `PeakCertificate::finite_interval.upper_linear`, a certified upper bound guaranteed not
+  to under-read — so the tier chooses speed vs tightness, never safety.
+- As of 2026-09-14 it carries a BS.1770 loudness core (integrated LUFS + LRA) and loudgain
+  compatibility under three `pub mod`s: `loudness`, `replaygain`, `compat`. These are
+  tested against frozen libebur128 1.2.6 references but **nothing in tonepoet consumes
+  them yet**.
+- Those are the crate's first `pub mod` declarations, so an API-freeze audit can no longer
+  stop at `lib.rs` — it must descend into the modules.
+- Two constant-carrier reference tests account for ~40 of the ~41 minutes. Slow is expected
+  there, not a hang.
+
 ## Key Types & Entry Points
 
-**CLI subcommands** (src/main.rs):
+**CLI subcommands** (src/main.rs, `enum Commands` — 15 variants; the user-facing ones):
 - `tui` — launches the new TUI (default convert screen)
 - `convert <PATHS>... [--format --output --workers --replaygain --preset --bitrate --track --track-range --area --no-cue --partial --overwrite --naming --no-metadata --no-features ...]`
 - `wizard` — launches legacy TUI wizard
 - `check-tools` — probes for ffmpeg, sox, ssrc, 7z, loudgain, opustags, etc.
 - `config --show | --reset | --path`
+- `tags-mb` — MusicBrainz tagging
+- `disc-info`, `dvda-info`, `dsf-recover` — disc/format inspection and repair
+- `legacy-file-recovery-list`, `legacy-file-recovery-adopt` — recover interrupted file ops
+- Four hidden helper-subprocess variants (`__action-script-supervisor`,
+  `__execution-item-supervisor`, `__action-script-launcher`, `__file-task-worker`) —
+  double-underscore prefixed and `hide = true`; not user-facing
 
 **TUI architecture** (src/tui/):
 - `AppState` holds all TUI state: `ConvertState`, `PresetState`, queue state, overlays
@@ -148,7 +196,7 @@ tonepoet (main binary + lib)
 
 **Config location:** `~/.config/tonepoet/config.toml`
 **Preset location:** `~/.config/tonepoet/presets/` (TOML files)
-**Queue persistence:** `~/.cache/tonepoet/conversion_queue.json`
+**Queue + core persistence:** SQLite at `~/.local/share/tonepoet/tonepoet.db` (XDG_DATA_HOME, WAL mode, schema versioned via PRAGMA) — see `src/db.rs`. `~/.cache/tonepoet/conversion_queue.json` is the **legacy** path: import-only since schema v23, read once by `load_legacy_queue_for_import()` and then deleted by `remove_legacy_queue_file_after_import()` (`src/convert/mod.rs:2979-3040`). Nothing writes it. To inspect queue state, open the database.
 
 ## Audio Format Support
 
@@ -156,7 +204,9 @@ tonepoet (main binary + lib)
 
 **All output formats** (available in Advanced): above plus DSF, DFF, W64, RF64, LPCM, raw PCM, raw AAC, WebM/WEBA, MKV/MKA, AIFF
 
-**Input-only formats**: ISO, CUE (image decomposition), SHN, APE, DTS, AC3
+**Decode-only formats** (accepted as sources and CUE backing images, never output targets): APE, Musepack, Shorten, OGG, TTA (`AudioFormat::input_decodable` vs `output_encodable`, `formats.rs:133`). ISO and CUE are container/image sources handled by materializers.
+
+**Not accepted as sources at all**: DTS, AC3, SHN — these are *output* formats (`advanced_output()` = `[Dts, Ac3, Lpcm]`) and are absent from the `is_single_audio_extension` allowlist (`stages.rs:619`), so they are rejected as inputs. Adding them as sources is open backlog work.
 
 **Bit depths**: 16, 24, 32 integer, 32-bit float, 64-bit float (availability depends on format)
 
@@ -166,10 +216,14 @@ tonepoet (main binary + lib)
 
 The `FormatState::apply_format_constraints()` method recalculates available options when the format changes:
 - **Opus**: sample rate locked to 48 kHz, bit depth and dither disabled
-- **AAC**: bit depth and dither disabled, sample rate capped at 192 kHz
+- **AAC**: bit depth and dither disabled; sample rate limited to the encoder's direct-rate table, which tops out at **96 kHz** (`AAC_DIRECT_SAMPLE_RATES_HZ`, `tonepoet-pipeline/src/mapping.rs:609`) — 176.4/192 kHz clamp down to 96 kHz
 - **MP3**: bit depth and dither disabled, sample rate capped at 48 kHz
-- **FLAC/AIFF/ALAC**: float bit depths (32f, 64f) disabled
-- **WAV/WavPack**: all options available including float
+- **FLAC/ALAC**: float bit depths (32f, 64f) disabled, and sample rate capped at 384 kHz. ALAC additionally disables Int32
+- **WavPack**: float bit depths **disabled** — the conversion carrier integerizes float sources
+- **WAV/AIFF/LPCM**: full range, including float32 and float64
+- **APE/Musepack/Shorten/TTA**: float disabled (lossless but not encodable; same shape as FLAC)
+
+All of the above are match arms in `FormatState::apply_format_constraints()` (`src/tui/app.rs:5610-5635`) — read them there rather than trusting this summary.
 
 ## Coding Conventions
 
@@ -188,13 +242,31 @@ The `FormatState::apply_format_constraints()` method recalculates available opti
 ## Testing
 
 ```bash
-cargo test --workspace              # All workspace tests (NOT plain `cargo test`,
-                                    # which silently skips every sub-crate)
+# THE GATE. Run it exactly like this, IN THE BACKGROUND: it runs well past the Bash
+# foreground timeout of 600s, and a foreground run dies mid-suite reporting a
+# misleadingly clean partial result. (~10 min of test execution plus build time.)
+cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
+
+# --no-fail-fast: without it, --workspace STOPS at the first failing test binary and
+#   every later target silently never runs.
+# --exclude tonepoet-true-peak: that crate costs ~41 min on its own. Gate it separately
+#   at crate-delivery time:  cargo test -p tonepoet-true-peak --no-fail-fast
+
 cargo test -p tonepoet-backend     # ffmpeg builders, integration, channels
 cargo test -p tonepoet-features    # log writer, CUE generator
+cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 ```
 
-Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~4,600 tests across all targets (verify with `cargo test --workspace`). When checking results, NEVER truncate failure output — assert every `test result:` line shows 0 failed.
+Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~6,860 tests across 57 targets, plus 136 in `tonepoet-true-peak`.
+NEVER truncate failure output.
+
+**A clean gate on `main` is 6858 passed / 4 FAILED, not zero failures.** Three are the
+deferred hard-ceiling tests awaiting a decision on which quantity governs the output
+ceiling; the fourth is a recurrent contention flake
+(`cue_matrix_validates_real_outputs_when_external_tools_are_available`, "persistent lease
+descriptor exceeds 1048576 bytes") that passes in isolation. The correct check is that the
+failure set equals exactly those four — a fifth failure, or a different one, is real.
+`cargo test -p tonepoet-true-peak` is separate and IS at 136/0.
 
 ## External Tool Dependencies
 
@@ -228,21 +300,18 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
 
 
 - `assets/reference/hexload_labels_reference.rs` — 370+ label/pressing/mastering-engineer/pressing-plant mappings vendored from hexload-tui. `include_str!`'d by `label_resolver.rs` as the data source for the `DictionaryLabelResolver` implementation. Includes audiophile labels, country-specific labels (UK Harvest vs Japan Harvest), mastering engineers (RL, Sterling, KG, BG, Wally, etc.), and pressing plants (RTI, QRP, Pallas, Monarch, TML, etc.).
-- `assets/reference/canonical_artists_reference.txt` — 2,273 canonical artist names for case normalization. One name per line. `include_str!`'d by `label_resolver.rs`; used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
+- `assets/reference/canonical_artists_reference.txt` — 2,437 canonical artist names for case normalization. One name per line. `include_str!`'d by `label_resolver.rs`; used by `ArtistCanonicalizer` for case-insensitive exact matching (match → canonical casing, no match → pass through unchanged).
 - `assets/reference/cds-with-preemphasis-shf.csv` — authoritative pre-emphasis CD list. `include_str!`'d by `src/tui/preemphasis/catalog.rs`.
 - `assets/dsd_reference/` — 6 DSD guidance/brief docs `include_bytes!`'d by `track_executor.rs` (`validate_embedded_qualification_report`): `tonepoet_dsd_to_pcm_guidance_evidence_based_v9.md`, `sox_ng_dsd_decimation_test_report_v5.md`, and 4 `brief_dsd_reference_p0_*` files.
-- `docs/label_resolver_implementation_brief.md` — Implementation brief for the `DictionaryLabelResolver` (replaces the `StubLabelResolver`).
-- `docs/naming_template_expansion_brief.md` — Implementation brief for the naming template system (folder + filename templates, custom variables).
 - `docs/hexload_log_writer_reference.rs` — Vendored log writer from hexload-tui predecessor project. Reference for conversion log structure and field coverage. **NOT created by a reasoning model** — use as inspiration for WHAT to include, not HOW to implement. Tonepoet's pipeline has richer data structures.
-- `docs/conversion_log_enrichment_brief.md` — Implementation brief for enriching `build_conversion_log()` with comprehensive per-track details.
 
 ## Important Notes
 
-- **stages.rs is the largest file** (~2MB / ~52K lines) — it contains the full pipeline stage functions, publish logic, template rendering, and conversion log assembly. keybindings.rs (~41K lines) and app.rs (~16K lines) are the TUI giants; processor.rs (~6K lines) orchestrates the shared scheduler and queue processing.
+- **The giant files** (measured 2026-09-14; they grow steadily, so re-measure rather than trusting these): `src/tui/keybindings.rs` ~108K lines, `src/convert/pipeline/stages.rs` ~72K lines / 2.8 MB, `src/tui/app.rs` ~22K lines, `src/convert/processor.rs` ~9.7K lines. stages.rs holds the pipeline stage functions, publish logic, template rendering, and conversion log assembly. **Search these; never read one whole.**
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
-- The `items_mut()` method on `ConversionQueue` is private; use `add_item()` or `add_item_direct()` from outside the module
+- `ConversionQueue::items_mut()` is `pub(crate)` (`queue.rs:863`), not private — it is reachable from anywhere in the `tonepoet` crate and is used that way (`wizard_integration.rs`). Prefer `add_item()` / `add_item_direct()` unless you specifically need raw deque access
 - `probe_audio()` uses unsafe FFI to access `bits_per_raw_sample` from codec parameters (standard ffmpeg-next pattern)
 - The theme builder uses a `BuilderTab` + `BuilderOverlay` model (Edit/Preview/Derived tabs + floating gallery/menu overlays)
 - Pipeline staging can optionally use tmpfs via `scratch_directory` config, with a memory budget system (`memory_budget.rs`) that gates admission and falls back to disk
