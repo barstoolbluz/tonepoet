@@ -2404,3 +2404,134 @@ away.
 Two full gate re-runs on 2026-09-07, at roughly 10-12 minutes each. Together with #20 and #31
 this is the third distinct flake costing re-runs; the three are unrelated in mechanism but
 identical in effect on the workflow.
+
+---
+
+## 33. APE source "converted" to FLAC produced byte-identical Monkey's Audio carrying a `.flac` extension; embedded cover art destroyed; malformed-APEv2 sources unreadable by the editor
+
+**Status:** open, filed 2026-09-14 from a field report. Not reproduced under test. **Deliberately
+deferred**: replicate this *after* the planner/pipeline redesign lands and is integrated, then hand
+the replication to the model. Filing now so the artifacts and measurements are not lost.
+
+### Field artifacts — do not delete
+
+Source (Monkey's Audio, 8 tracks, 24/96 stereo), on an sshfs mount:
+
+```
+/home/daedalus/torrents/Genesis 1973_Selling England By The Pound (24bit96kHz USA Rhino 200g 2009 by Aksman)/
+    A1 Dancing With The Moonlit Knight.ape        164,650,385
+    A2 I Know What I Like (In Your Wardrobe).ape   86,615,815
+    A3 Firth Of Fifth.ape                         197,222,868
+    A4 More Fool Me (Vocals Phil).ape              62,054,692
+    B1 The Battle Of Epping Forest.ape            252,053,005
+    B2 After The Ordeal.ape                        83,219,670
+    B3 The Cinema Show.ape                        235,657,193
+    B4 Aisle Of Plenty.ape                         31,016,385
+```
+
+Conversion output as produced by tonepoet:
+
+```
+/home/daedalus/temp/Genesis - Selling England by the Pound (1973) [FLAC] {Classic FC 6060 Quiex SV-P Reissue LP  24-96} [aksman]/
+    01 - Track 01.flac  …  08 - Track 08.flac
+```
+
+The mount is `fuse.sshfs` at `/home/daedalus/torrents` and tested writable and renameable, so
+none of the below is a permissions problem.
+
+### Defect A — the conversion never encoded, but the output was published as `.flac`
+
+Every output file begins with `MAC ` (`4d 41 43 20`), not `fLaC`. `ffprobe` reports
+`codec_name=ape`, `format_long_name=Monkey's Audio`, 96 kHz / 24-bit / 2ch.
+
+For track 8, the output is the source with only the trailing APEv2 tag replaced:
+
+```
+sha256 over the first 30,967,828 bytes (audio payload)
+  source B4 Aisle Of Plenty.ape : 52292553307f2a3b2b0b…
+  output 08 - Track 08.flac     : 52292553307f2a3b2b0b…   identical
+APEv2 tag size   source 48,525 bytes  ->  output 1,434 bytes
+```
+
+All eight pairs show the same near-constant delta (47,057–47,091 bytes), so this is the whole
+album, not one file. The audio is intact; what is wrong is that a Monkey's Audio stream was
+published under a FLAC name with no decode and no encode, and **no error was surfaced**.
+
+This is the important one. A conversion that silently emits the source codec under the target
+extension produces wrong files that nothing downstream can detect by name.
+
+### Defect B — embedded cover art destroyed on write
+
+```
+source 'Cover Art (front)'  47,931 image bytes, valid JPEG (SOI ffd8 … EOI ffd9)
+output 'Cover Art (front)'     765 image bytes, no SOI, not a valid image
+```
+
+The mechanism was **not** established. It is not a clean truncation (only the first 16 bytes
+survive from source offset 4) and not a plain lossy UTF-8 round trip (that would yield 27,626
+bytes, not 765). Both were tested and eliminated. Whoever picks this up should not assume
+either.
+
+### Defect C — the editor cannot read the source `.ape` files at all
+
+Reported symptom, on the output files:
+
+```
+metadata: failed to inspect explicitly selected file '…/01 - Track 01.flac': failed to read '…'
+```
+
+raised from `explicit_embedded_metadata_surface_for_path` (`src/tui/keybindings.rs:24106`) via
+`probe::read_all_tags_merged_with_metadata`. The `.ape` sources also refuse to open in the
+editor.
+
+The sources' APEv2 tag is malformed by the original tagger:
+
+```
+footer flags = 0xaa99dbad     spec defines only bits 29-31; the rest are reserved-zero
+reserved8    = 004ce60b00000000   spec requires all zeros
+'Cover Art (front)'  47,941 bytes of JPEG declared type=utf8, invalid UTF-8 at byte 0
+```
+
+Eleven items parse with zero leftover bytes, so the tag is structurally intact — only the flags
+and the item type are wrong. A strict reader that validates the declared UTF-8 type will reject
+the whole tag.
+
+**The inconsistency is the finding**: the editor refuses these files as unreadable, while the
+conversion path read the same malformed tag leniently enough to rewrite it — and destroyed the
+artwork doing so. Same input, two behaviours, neither correct. Whatever policy is chosen
+(reject, or repair-on-read and warn) should be the same policy in both paths.
+
+### Defect D — filenames ignored a present, correct `Title`
+
+Outputs are named `01 - Track 01.flac` … `08 - Track 08.flac`, but the tags tonepoet itself
+wrote carry the real titles (`Title = 'Aisle Of Plenty'`, `Artist = 'Genesis'`, `Year = '1973'`).
+
+The tags also carry `Track = 'B4'` — vinyl-style side numbering. That is plausibly the same
+root cause as the known open vinyl `TRACKNUMBER` defect, in which case this is not a new
+problem; it is recorded here only because it appeared on the same album and the connection is
+inference, not established fact.
+
+### Dispatch is extension-based, which is the common thread
+
+`FormatDetector::detect` (`src/convert/formats.rs:956`) routes on file extension, as does
+`is_monkeys_audio_path` (`src/tui/probe.rs:12489`, `extension.eq_ignore_ascii_case("ape")`).
+The native FLAC reader then validates magic at `src/tui/probe.rs:1990-1993` and fails. So a
+misnamed file is guaranteed a confusing error, and the reader already holds the information
+needed for a good one — it has read the magic and knows it found `MAC `.
+
+APE is input-only by design (`src/convert/formats.rs:133`: accepted as a source and CUE backing
+image, never an output target), which is correct and not in question here.
+
+### Replication plan (after the planner/pipeline redesign is integrated)
+
+1. Convert the source album above to FLAC through the redesigned pipeline.
+2. Check the output magic bytes, not the extension. If they are `MAC `, Defect A survives.
+3. Compare the output's embedded cover art against the 47,931-byte source JPEG for Defect B.
+4. Open both the source `.ape` and the output in the metadata editor for Defect C.
+
+### Not established
+
+- Whether Defect A is specific to APE sources or to any input-only source format.
+- Whether the conversion was a deliberate passthrough triggered by settings, or a fallback
+  after a failed decode. No conversion log was found in the output directory.
+- The mechanism of the artwork corruption in Defect B.
