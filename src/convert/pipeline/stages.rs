@@ -2048,11 +2048,22 @@ async fn source_info_for_true_peak_realized_track(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<tonepoet_pipeline::SourceInfo, ConvertError> {
     let mut source = super::plan_bridge::source_info_for_realized_track(track, realized_input)?;
+    if source.duration.is_none() {
+        if let (Some(SourceFrameExtent::Exact(frames)), Some(sample_rate)) =
+            (source.frame_extent, source.sample_rate_hz)
+        {
+            source.duration = conservative_duration_from_exact_frames(frames, sample_rate);
+        }
+    }
     let needs_channels = !matches!(source.channels, Some(channels) if channels > 0);
     let needs_sample_rate = !matches!(source.sample_rate_hz, Some(rate) if rate > 0);
     let needs_pcm_frame_extent = source.representation_kind()
         == tonepoet_pipeline::SourceRepresentationKind::Pcm
         && source.frame_extent.is_none();
+    let fill_duration_from_probe = source.duration.is_none();
+    // Do not add a duration-only ffprobe to the true-peak fast path. Duration
+    // recovery is opportunistic when geometry already requires probing; exact
+    // source/frame facts above remain the zero-probe authority when available.
     if !needs_channels && !needs_sample_rate && !needs_pcm_frame_extent {
         return Ok(source);
     }
@@ -2079,7 +2090,68 @@ async fn source_info_for_true_peak_realized_track(
             source.frame_extent = Some(SourceFrameExtent::Exact(samples));
         }
     }
+    if fill_duration_from_probe && probe.exact {
+        if let Some(samples) = probe.samples {
+            source.duration = conservative_duration_from_exact_frames(samples, probe.sample_rate);
+        }
+    }
     Ok(source)
+}
+
+/// Convert an exact frame count into a duration without understating it.
+///
+/// `Duration` has nanosecond resolution, while many audio rates do not divide
+/// one second into an integral number of nanoseconds. Capacity and workload
+/// bounds must therefore round the fractional nanosecond upward, never down.
+fn conservative_duration_from_exact_frames(frames: u64, sample_rate: u32) -> Option<Duration> {
+    if sample_rate == 0 {
+        return None;
+    }
+
+    let rate = u64::from(sample_rate);
+    let whole_seconds = frames / rate;
+    let remainder_frames = frames % rate;
+    if remainder_frames == 0 {
+        return Some(Duration::from_secs(whole_seconds));
+    }
+
+    let nanos_numerator = u128::from(remainder_frames) * 1_000_000_000_u128;
+    let nanos = nanos_numerator.div_ceil(u128::from(rate));
+    debug_assert!((1..=1_000_000_000).contains(&nanos));
+    if nanos == 1_000_000_000 {
+        return whole_seconds
+            .checked_add(1)
+            .map(Duration::from_secs);
+    }
+
+    Some(Duration::new(whole_seconds, u32::try_from(nanos).ok()?))
+}
+
+#[cfg(test)]
+mod exact_frame_duration_tests {
+    use super::conservative_duration_from_exact_frames;
+    use std::time::Duration;
+
+    #[test]
+    fn exact_frame_duration_never_understates_fractional_nanoseconds() {
+        assert_eq!(
+            conservative_duration_from_exact_frames(0, 48_000),
+            Some(Duration::ZERO),
+        );
+        assert_eq!(
+            conservative_duration_from_exact_frames(48_000, 48_000),
+            Some(Duration::from_secs(1)),
+        );
+        assert_eq!(
+            conservative_duration_from_exact_frames(1, 3),
+            Some(Duration::new(0, 333_333_334)),
+        );
+        assert_eq!(
+            conservative_duration_from_exact_frames(1, 44_100),
+            Some(Duration::new(0, 22_676)),
+        );
+        assert_eq!(conservative_duration_from_exact_frames(1, 0), None);
+    }
 }
 
 fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> {
@@ -32087,12 +32159,24 @@ mod album_true_peak_carrier_tests {
     use super::*;
     use std::f64::consts::PI;
 
-    fn write_f64le(path: &Path, samples: &[f64]) {
+    fn f64le_bytes(samples: &[f64]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(samples.len() * 8);
         for sample in samples {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
-        fs::write(path, bytes).expect("write f64le carrier");
+        bytes
+    }
+
+    fn write_f64le(path: &Path, samples: &[f64]) {
+        fs::write(path, f64le_bytes(samples)).expect("write f64le carrier");
+    }
+
+    fn write_bound_f64le(carrier_dir: &Path, prefix: &str, samples: &[f64]) -> PathBuf {
+        let bytes = f64le_bytes(samples);
+        let digest = tonepoet_pipeline::Sha256Digest::of_bytes(&bytes);
+        let path = certified_carrier_bound_path(carrier_dir, prefix, digest);
+        fs::write(&path, bytes).expect("write content-bound f64le carrier");
+        path
     }
 
     fn finite(
@@ -32346,6 +32430,7 @@ mod album_true_peak_carrier_tests {
 
         assert_eq!(resolved.channels, Some(2));
         assert_eq!(resolved.sample_rate_hz, Some(96_000));
+        assert_eq!(resolved.duration, Some(Duration::from_secs(1)));
         assert_eq!(
             resolved.frame_extent,
             Some(SourceFrameExtent::Exact(96_000)),
@@ -32723,6 +32808,7 @@ mod album_true_peak_carrier_tests {
 
         assert_eq!(resolved.channels, Some(6));
         assert_eq!(resolved.sample_rate_hz, Some(48_000));
+        assert_eq!(resolved.duration, Some(Duration::from_secs(1)));
         assert!(
             runner.transcript().is_empty(),
             "complete typed facts must stay on the zero-probe path",
@@ -33349,12 +33435,12 @@ mod album_true_peak_carrier_tests {
             depth,
             dither,
         );
-        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-        settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-        settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
-        settings
-            .dsd
-            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
+        settings.dsd = tonepoet_pipeline::DsdSettings::default();
+        settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: tonepoet_pipeline::DbNano::ZERO,
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        });
         settings
     }
 
@@ -33641,13 +33727,16 @@ mod album_true_peak_carrier_tests {
     #[test]
     fn pcm_true_peak_scaler_replaces_stale_output_and_preserves_shape() {
         let temp = tempfile::tempdir().unwrap();
-        let input = temp.path().join("carrier.f64le");
+        let input = write_bound_f64le(
+            temp.path(),
+            "carrier-first",
+            &[1.25, -0.5, 0.125, -1.0],
+        );
         let output = temp.path().join("carrier.gain.f64le");
         let gain_db: tonepoet_pipeline::DbNano = "-6.000000000".parse().unwrap();
         let gain = tonepoet_pipeline::conservative_linear_gain_lower(gain_db).unwrap();
         let cancel = CancellationToken::new();
 
-        write_f64le(&input, &[1.25, -0.5, 0.125, -1.0]);
         fs::write(&output, b"stale").unwrap();
         scale_certified_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
         let first = fs::read(&output).unwrap();
@@ -33663,8 +33752,16 @@ mod album_true_peak_carrier_tests {
         );
         }
 
-        write_f64le(&input, &[0.5, -0.25]);
-        scale_certified_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
+        let second_input = write_bound_f64le(temp.path(), "carrier-second", &[0.5, -0.25]);
+        scale_certified_true_peak_f64le(
+            &second_input,
+            &output,
+            48_000,
+            2,
+            gain_db,
+            &cancel,
+        )
+        .unwrap();
         let second = fs::read(&output).unwrap();
         assert_eq!(second.len(), 2 * 8, "stale longer carrier was reused");
         let first_sample = f64::from_le_bytes(second[0..8].try_into().unwrap());
@@ -33674,9 +33771,8 @@ mod album_true_peak_carrier_tests {
     #[test]
     fn pcm_true_peak_scaler_cancellation_does_not_publish_partial_output() {
         let temp = tempfile::tempdir().unwrap();
-        let input = temp.path().join("carrier.f64le");
+        let input = write_bound_f64le(temp.path(), "carrier-cancel", &[0.5; 64]);
         let output = temp.path().join("carrier.gain.f64le");
-        write_f64le(&input, &[0.5; 64]);
         let cancel = CancellationToken::new();
         cancel.cancel();
         let error = scale_certified_true_peak_f64le(

@@ -152,6 +152,60 @@ pub(crate) fn certified_terminal_candidate_binding(
     certified_terminal_candidate_for_track(track).map(|candidate| candidate.cloned())
 }
 
+fn validate_certified_carrier_album_gain_authority(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+) -> Result<(), ConvertError> {
+    let (runtime_gain, carrier_gain, album_scope, domain) = match &track.source_ref {
+        TrackSourceRef::DsdTruePeakCarrier { gain_db, .. } => (
+            request.settings.dsd.runtime_album_gain_db(),
+            *gain_db,
+            request.settings.dsd.true_peak_scope()
+                == Some(tonepoet_pipeline::TruePeakScope::Album),
+            "DSD",
+        ),
+        TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } => (
+            request.settings.pcm_true_peak.runtime_album_gain_db(),
+            *gain_db,
+            request.settings.pcm_true_peak.scope()
+                == Some(tonepoet_pipeline::TruePeakScope::Album),
+            "PCM",
+        ),
+        _ => return Ok(()),
+    };
+
+    if album_scope && runtime_gain.is_none() {
+        return Err(ConvertError::Backend(format!(
+            "certified {domain} Album carrier reached terminal planning without submitted-batch runtime gain authority",
+        )));
+    }
+    if !album_scope && runtime_gain.is_some() {
+        return Err(ConvertError::Backend(format!(
+            "certified {domain} carrier carries submitted-batch runtime gain authority outside Album true-peak scope",
+        )));
+    }
+
+    if let Some(runtime_gain) = runtime_gain {
+        match carrier_gain {
+            Some(carrier_gain) if carrier_gain == runtime_gain => {}
+            Some(carrier_gain) => {
+                return Err(ConvertError::Backend(format!(
+                    "certified {domain} album carrier gain {} dB disagrees with submitted-batch runtime authority {} dB",
+                    carrier_gain.render(false),
+                    runtime_gain.render(false),
+                )));
+            }
+            None => {
+                return Err(ConvertError::Backend(format!(
+                    "certified {domain} album carrier reached terminal planning before submitted-batch gain {} dB was bound to the carrier",
+                    runtime_gain.render(false),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn plan_request_for_track(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -195,6 +249,7 @@ fn plan_request_for_track_impl(
     intermediate_dir: PathBuf,
     source_override: Option<SourceInfo>,
 ) -> Result<PlanRequest, ConvertError> {
+    validate_certified_carrier_album_gain_authority(request, track)?;
     let mut source = match source_override {
         Some(source) => source,
         None => source_info_for_realized_track(track, realized_input)?,
@@ -345,8 +400,18 @@ fn plan_request_for_track_impl(
             );
             if dsd_derived {
                 let source_domain_policy = request.settings.dsd.gain_policy();
+                let runtime_album_gain = settings.dsd.runtime_album_gain_db();
                 settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
                 settings.pcm_true_peak.set_policy(source_domain_policy);
+                if let Some(gain_db) = runtime_album_gain {
+                    // The retained carrier is PCM, so the final typed plan must
+                    // carry its already-resolved Album authority on the PCM
+                    // policy surface.  The scalar itself is realized by the
+                    // carrier materializer/scalar pump before the terminal
+                    // command; this marker exists so the typed plan does not
+                    // invent a second per-track Album observation/decision.
+                    settings.pcm_true_peak.bind_runtime_album_gain(gain_db);
+                }
             }
             if registered_effect_terminal.is_none()
                 && !request.settings.target_format.is_dsd()
@@ -381,7 +446,10 @@ fn plan_request_for_track_impl(
         // source must never apply that gain to its ordinary PCM members.
         settings.dsd.set_runtime_album_gain_db(None);
     }
-    if !matches!(&track.source_ref, TrackSourceRef::PcmTruePeakCarrier { .. })
+    if !matches!(
+        &track.source_ref,
+        TrackSourceRef::DsdTruePeakCarrier { .. } | TrackSourceRef::PcmTruePeakCarrier { .. }
+    )
         && settings.pcm_true_peak.runtime_album_gain_db().is_some()
     {
         settings.pcm_true_peak.clear_runtime_album_gain();
@@ -3979,8 +4047,10 @@ mod tests {
                 .with_target("-0.150000000".parse().expect("target"))
                 .with_scope(tonepoet_pipeline::TruePeakScope::Album),
         );
+        let resolved_gain: tonepoet_pipeline::DbNano =
+            "2.840000000".parse().expect("fixed album gain");
         req.settings.dsd.bind_runtime_album_gain(
-            "2.840000000".parse().expect("fixed album gain"),
+            resolved_gain,
             Some("-3.000000000".parse().expect("album peak")),
             2,
         );
@@ -3990,7 +4060,7 @@ mod tests {
             sample_rate_hz: 176_400,
             channels: 2,
             duration: None,
-            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            gain_db: Some(resolved_gain),
             point_dbtp: None,
             effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             lossy_target_capped: false,
@@ -4023,9 +4093,37 @@ mod tests {
                 .dsd
                 .runtime_album_gain_db()
                 .map(|gain| gain.render(false)),
-            Some("2.840000000".to_string()),
-            "carrier planning must retain submitted-batch fixed-gain authority",
+            None,
+            "the realized PCM carrier must not retain DSD-side gain authority",
         );
+        assert_eq!(
+            planned
+                .settings
+                .pcm_true_peak
+                .runtime_album_gain_db()
+                .map(|gain| gain.render(false)),
+            Some("2.840000000".to_string()),
+            "carrier planning must transfer submitted-batch authority to the PCM continuation",
+        );
+        let typed = match tonepoet_pipeline::plan_typed(&planned)
+            .expect("typed carrier plan stays within planner resource limits")
+        {
+            tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("resolved album carrier must produce a ready typed plan: {other:?}"),
+        };
+        assert!(typed.nodes.iter().any(|node| matches!(
+            node,
+            tonepoet_pipeline::TypedPlanNode::ApplyGain {
+                policy: tonepoet_pipeline::SampleGainPolicy::FixedGain { gain_db },
+                decision: None,
+                ..
+            } if *gain_db == resolved_gain
+        )), "the typed continuation must carry the coordinator-resolved scalar without creating a second decision");
+        assert!(typed.nodes.iter().all(|node| !matches!(
+            node,
+            tonepoet_pipeline::TypedPlanNode::Observe(observation)
+                if matches!(observation.kind, tonepoet_pipeline::ObservationKind::CertifiedTruePeak { .. })
+        )), "the final carrier continuation must not re-observe true peak after the submitted-batch barrier");
         let commands = planned_command_args(&planned);
         let obligations = planner_metadata_obligations_for_track(&req, &prepared_track, &planned);
         assert!(planned.settings.force_encode);
@@ -4058,8 +4156,8 @@ mod tests {
         assert!(
             commands
                 .iter()
-                .any(|args| has_adjacent_args(args, "gain", "2.840000000")),
-            "carrier encode must apply the resolved fixed album gain: {commands:?}",
+                .all(|args| !has_adjacent_args(args, "gain", "2.840000000")),
+            "the final encoder must not apply the carrier scalar a second time: {commands:?}",
         );
         assert!(
             !commands

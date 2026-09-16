@@ -13881,6 +13881,7 @@ mod tests {
     fn reference_metadata_attestation_follows_real_stage_policy_not_common_plan_marker() {
         let temp = tempfile::tempdir().expect("Reference metadata-stage ownership tempdir");
         let source = temp.path().join("source.dsf");
+        write_reference_dsf_fixture(&source);
         let staged_output = temp.path().join("reference-output.w64");
         let convert_root = temp.path().join("convert");
         let work_dir = convert_root.join(".track-0001.work");

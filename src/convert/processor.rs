@@ -5698,6 +5698,17 @@ mod tests {
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
 
+    fn write_bound_stereo_f64le_carrier(dir: &Path, prefix: &str) -> PathBuf {
+        // One stereo Float64 frame is sufficient for retry-fixture validation.
+        // Production requires both frame alignment and a filename-bound digest
+        // of the exact retained bytes before a measured carrier may be reused.
+        let bytes = [0_u8; 16];
+        let digest = tonepoet_pipeline::Sha256Digest::of_bytes(&bytes);
+        let path = dir.join(format!("{prefix}-sha256-{}.f64le", digest.to_hex()));
+        std::fs::write(&path, bytes).expect("content-bound retained carrier");
+        path
+    }
+
     struct CapturingTestLogger;
 
     static TEST_LOGGER: CapturingTestLogger = CapturingTestLogger;
@@ -5926,13 +5937,11 @@ mod tests {
         request.item_id = id.to_string();
         request.job_id = format!("job-{id}");
         request.container = root.join(format!("{id}.dsf"));
-        request.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-        request.settings.dsd.from_dsd.gain_mode =
-            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-        request
-            .settings
-            .dsd
-            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
+        request.settings.dsd = tonepoet_pipeline::DsdSettings::default();
+        request.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         let mut item = conversion_item_with_pipeline_request(id, request);
         item.submission_id = Some(submission_id.to_string());
         item.submission_size = Some(submission_size);
@@ -6276,8 +6285,8 @@ mod tests {
             signal_upper_linear: 0.78,
         };
         let dsd_measurement = tonepoet_pipeline::AlbumPeakMeasurement::Finite {
-            point_db: "-1.000000000".parse().expect("point"),
-            signal_upper_linear: 0.82,
+            point_db: "-0.600000000".parse().expect("point"),
+            signal_upper_linear: 0.94,
         };
         let pcm_bound = shared_album_test_bound(0.0);
         let dsd_bound = shared_album_test_bound(0.05);
@@ -6313,7 +6322,7 @@ mod tests {
         assert_eq!(albums[1].req.settings.dsd.runtime_album_track_count(), Some(1));
         assert_eq!(
             albums[1].req.settings.dsd.runtime_album_loudest_peak_dbfs(),
-            Some("-1.000000000".parse().expect("point")),
+            Some("-0.600000000".parse().expect("point")),
         );
     }
 
@@ -6756,8 +6765,8 @@ mod tests {
             .expect("pipeline request")
             .settings
             .dsd
-            .from_dsd
-            .profile = tonepoet_pipeline::DsdReconstructionSelection::Wideband;
+            .general_from_dsd
+            .reconstruction = tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected;
 
         let preflight = preflight_dsd_album_gain_submissions(&[first, second]);
         let failure = preflight
@@ -6875,6 +6884,8 @@ mod tests {
         use crate::convert::pipeline::tool::write_executable_test_script;
 
         let log_path = root.join("fake-tools.log");
+        let merged_fixture = root.join("fake-merged-fixture.wav");
+        write_processor_test_pcm_wav(&merged_fixture, 88_200);
         let ffprobe = write_executable_test_script(
             "ffprobe",
             &format!(
@@ -6941,6 +6952,12 @@ if [ "$out" = "-" ] || [ "$out" = "pipe:1" ]; then
 fi
 if [ -z "$out" ]; then exit 0; fi
 mkdir -p "$(dirname "$out")"
+case "$out" in
+  *merged.wav)
+    cp '{}' "$out"
+    exit 0
+    ;;
+esac
 if [ "$input" = "pipe:0" ] || [ "$input" = "-" ]; then
   cat > "$out"
 elif [ -n "$input" ] && [ -f "$input" ]; then
@@ -6949,7 +6966,8 @@ else
   printf 'fake-audio\n' > "$out"
 fi
 "#,
-                log_path.display()
+                log_path.display(),
+                merged_fixture.display(),
             ),
         );
         (
@@ -7700,8 +7718,10 @@ FILE "track.flac" WAVE
                 .with_target("-0.150000000".parse().expect("target"))
                 .with_scope(tonepoet_pipeline::TruePeakScope::Album),
         );
+        let resolved_gain_db: tonepoet_pipeline::DbNano =
+            "2.840000000".parse().expect("gain");
         req.settings.dsd.bind_runtime_album_gain(
-            "2.840000000".parse().expect("gain"),
+            resolved_gain_db,
             Some("-3.000000000".parse().expect("peak")),
             2,
         );
@@ -7711,8 +7731,8 @@ FILE "track.flac" WAVE
         let converted_root = staging_root.join("converted");
         std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
         std::fs::create_dir_all(&converted_root).expect("converted dir");
-        let carrier_path = carrier_dir.join("track-0000-a.f64le");
-        std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
+        let carrier_path =
+            write_bound_stereo_f64le_carrier(&carrier_dir, "track-0000-a");
         let staging = StagingDir::new_with_scratch_reservation(
             staging_root.clone(),
             req.job_id.clone(),
@@ -7735,7 +7755,7 @@ FILE "track.flac" WAVE
                     sample_rate_hz: 176_400,
                     channels: 2,
                     duration: None,
-                                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    gain_db: Some(resolved_gain_db),
                     point_dbtp: None,
                     effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
                     lossy_target_capped: false,
@@ -7823,7 +7843,7 @@ FILE "track.flac" WAVE
                     sample_rate_hz: 176_400,
                     channels: 2,
                     duration: None,
-                                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    gain_db: Some(resolved_gain_db),
                     point_dbtp: None,
                     effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
                     lossy_target_capped: false,
@@ -8015,8 +8035,10 @@ FILE "track.flac" WAVE
                 .with_target("-0.150000000".parse().expect("target"))
                 .with_scope(tonepoet_pipeline::TruePeakScope::Album),
         );
+        let resolved_gain_db: tonepoet_pipeline::DbNano =
+            "2.840000000".parse().expect("gain");
         req.settings.dsd.bind_runtime_album_gain(
-            "2.840000000".parse().expect("gain"),
+            resolved_gain_db,
             Some("-3.000000000".parse().expect("peak")),
             2,
         );
@@ -8026,9 +8048,9 @@ FILE "track.flac" WAVE
         let converted_root = staging_root.join("converted");
         std::fs::create_dir_all(&carrier_dir).expect("carrier dir");
         std::fs::create_dir_all(&converted_root).expect("converted dir");
-        let carrier_path = carrier_dir.join("track-0000-a.f64le");
+        let carrier_path =
+            write_bound_stereo_f64le_carrier(&carrier_dir, "track-0000-a");
         let staged_path = converted_root.join("01.flac");
-        std::fs::write(&carrier_path, b"retained float64 carrier").expect("carrier");
         std::fs::write(&staged_path, b"encoded output").expect("encoded output");
         let staging = StagingDir::new_with_scratch_reservation(
             staging_root.clone(),
@@ -8051,7 +8073,7 @@ FILE "track.flac" WAVE
                     sample_rate_hz: 176_400,
                     channels: 2,
                     duration: None,
-                                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    gain_db: Some(resolved_gain_db),
                     point_dbtp: None,
                     effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
                     lossy_target_capped: false,
@@ -8133,7 +8155,7 @@ FILE "track.flac" WAVE
                     sample_rate_hz: 176_400,
                     channels: 2,
                     duration: None,
-                                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    gain_db: Some(resolved_gain_db),
                     point_dbtp: None,
                     effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
                     lossy_target_capped: false,

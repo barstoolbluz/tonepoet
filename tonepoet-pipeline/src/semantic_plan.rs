@@ -539,7 +539,8 @@ impl ReplayGainProjectionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ReplayGainGroupBinding {
-    /// No album reduction is requested.
+    /// Complete request-local group. For an ordinary one-file conversion this
+    /// also represents singleton Album/Both ReplayGain semantics.
     Track { scope: PlanScopeId },
     /// Bind album fields to one exact coordinator-owned submitted participant batch.
     SubmittedBatch {
@@ -1628,17 +1629,23 @@ fn replay_gain_binding(
     request: &PlanRequest,
     mode: ReplayGainMode,
 ) -> Result<ReplayGainGroupBinding, PlanRefusal> {
-    if mode == ReplayGainMode::Track {
-        return Ok(ReplayGainGroupBinding::Track {
-            scope: track_scope_id(request),
-        });
-    }
     match &request.plan_scope {
+        PlanScope::Track { .. } => {
+            // A non-submitted conversion is a complete one-item group. Album
+            // and Both therefore have well-defined singleton semantics: the
+            // album aggregate is the same complete observation as the track.
+            // Do not manufacture a submitted-batch identity merely to express
+            // that fact; the Track binding deliberately has no cross-item
+            // participant barrier.
+            Ok(ReplayGainGroupBinding::Track {
+                scope: track_scope_id(request),
+            })
+        }
         PlanScope::SubmittedBatch {
             scope_id,
             participant_id,
             expected_participants,
-        } => {
+        } if mode != ReplayGainMode::Track => {
             let Some(expected_participants) = (*expected_participants).filter(|value| *value > 0) else {
                 return Err(PlanRefusal {
                     code: "replaygain_album_scope_requires_participant_count".to_owned(),
@@ -1650,11 +1657,24 @@ fn replay_gain_binding(
                 participant: participant_id.clone(),
                 expected_participants: Some(expected_participants),
             })
-        },
-        PlanScope::Track { .. } => Err(PlanRefusal {
-            code: "replaygain_album_scope_requires_submission".to_owned(),
-            reason: "Album/Both ReplayGain requires the existing submitted-batch identity and participant contract".to_owned(),
+        }
+        PlanScope::SubmittedBatch { .. } => Ok(ReplayGainGroupBinding::Track {
+            scope: track_scope_id(request),
         }),
+    }
+}
+
+fn resolved_runtime_album_gain(request: &PlanRequest) -> Result<Option<DbNano>, PlanRefusal> {
+    let dsd = request.settings.dsd.runtime_album_gain_db();
+    let pcm = request.settings.pcm_true_peak.runtime_album_gain_db();
+    match (dsd, pcm) {
+        (Some(left), Some(right)) if left != right => Err(PlanRefusal {
+            code: "conflicting_runtime_album_gain".to_owned(),
+            reason: "DSD and PCM runtime album-gain authorities disagree on the resolved scalar"
+                .to_owned(),
+        }),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -2749,155 +2769,206 @@ fn plan_typed_with_effects_and_policy(
     }
 
     if let Some((target_dbtp, scope, scan, allow_boost)) = true_peak_policy(intent.gain_policy) {
-        let binding = if scope == TruePeakScope::Album {
-            match album_gain_binding(request) {
-                Ok(binding) => binding,
+        let runtime_album_gain = if scope == TruePeakScope::Album {
+            match resolved_runtime_album_gain(request) {
+                Ok(value) => value,
                 Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
             }
         } else {
-            GainDecisionBinding::Track {
-                scope: track_scope_id(request),
-            }
+            None
         };
-        let observation_scope = match &binding {
-            GainDecisionBinding::Track { scope }
-            | GainDecisionBinding::SubmittedBatch { scope, .. } => scope.clone(),
-        };
-        let input_state = states
-            .iter()
-            .find(|state| state.id == working_signal)
-            .cloned()
-            .expect("working signal must have a typed state");
-        // Phase 3 owns the complete certified reader for ordinary PCM and
-        // general DSD-to-PCM in both Track and Album scope. The reader remains
-        // part of the typed contract; execution must consume this authority
-        // rather than reconstructing a scan policy from settings.
-        let reader_connected = true;
-        let read_contract = match certified_true_peak_read_contract(
-            &input_state,
-            scan,
-            reader_connected,
-        ) {
-            Ok(contract) => contract,
-            Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
-        };
-        selected_true_peak_read_contract = Some(read_contract.clone());
-        let observation = ObservationId(next_observation);
-        next_observation += 1;
-        nodes.push(TypedPlanNode::Observe(Observation {
-            id: observation,
-            scope: observation_scope.clone(),
-            participant: request.plan_scope.participant_id().clone(),
-            subject: working_signal,
-            artifact_subject: None,
-            kind: ObservationKind::CertifiedTruePeak { scan },
-            complete_reader_required: true,
-            read_contract,
-        }));
-        let gained = SignalId(next_signal);
-        next_signal += 1;
-        let dependency = ScopedObservationId {
-            scope: observation_scope.clone(),
-            participant: request.plan_scope.participant_id().clone(),
-            observation,
-            purpose: ObservationClass::CertifiedTruePeak,
-        };
-        let album_participant = match &binding {
-            GainDecisionBinding::SubmittedBatch {
-                scope,
-                participant,
-                expected_participants,
-            } => Some(AlbumGainParticipantInput {
-                scope: scope.clone(),
-                participant: participant.clone(),
-                expected_participants: *expected_participants,
-                observation: dependency.clone(),
-                terminal_subject: gained,
-                terminal_proof: None,
-            }),
-            GainDecisionBinding::Track { .. } => None,
-        };
-        let decision = DecisionId(next_decision);
-        next_decision += 1;
-        nodes.push(TypedPlanNode::Decide(Decision {
-            id: decision,
-            kind: DecisionKind::TruePeakGain {
-                scope,
-                target_dbtp,
-                allow_boost,
-                binding: binding.clone(),
-                album_participant,
-            },
-            observations: vec![dependency],
-        }));
-        states.push(AudioState {
-            id: gained,
-            coding: SignalCoding::Pcm,
-            sample_rate_hz: input_state.sample_rate_hz,
-            channels: input_state.channels,
-            channel_layout: input_state.channel_layout,
-            frame_extent: input_state.frame_extent,
-            programme: input_state.programme,
-            // The controlling scalar is realized on the retained Binary64
-            // carrier. Preserve source provenance separately, but make the
-            // post-gain signal representation truthful for terminal selection.
-            precision: StoragePrecision::Pcm(PcmBitDepth::Float64),
-            storage_contract: input_state.storage_contract,
-            processing_domain: Fact::Known(ProcessingDomain::Binary64),
-            value_domain: ValueDomain::FiniteFloating,
-            level_basis: input_state.level_basis,
-            // The ceiling is a requested execution result, not a discharged
-            // planning-time fact. The observation/decision plus terminal and
-            // publication obligations carry the planned guarantee until the
-            // executor proves it.
-            claims: BTreeSet::new(),
-            obligations: {
-                let mut obligations = BTreeSet::from([
-                    RuntimeObligation::CompleteReader(working_signal),
+
+        if let Some(gain_db) = runtime_album_gain {
+            // Album observation and reduction already completed at the
+            // submitted-batch barrier. This downstream carrier must apply the
+            // bound scalar exactly once; re-observing it as an independent
+            // track would both discard album authority and permit a different
+            // decision. Keep the original true-peak intent for terminal proof
+            // selection, but represent the realized action as a fixed scalar.
+            let gained = SignalId(next_signal);
+            next_signal += 1;
+            let input_state = states
+                .iter()
+                .find(|state| state.id == working_signal)
+                .cloned()
+                .expect("working signal must have a typed state");
+            states.push(AudioState {
+                id: gained,
+                coding: SignalCoding::Pcm,
+                sample_rate_hz: input_state.sample_rate_hz,
+                channels: input_state.channels,
+                channel_layout: input_state.channel_layout,
+                frame_extent: input_state.frame_extent,
+                programme: input_state.programme,
+                precision: StoragePrecision::Pcm(PcmBitDepth::Float64),
+                storage_contract: input_state.storage_contract,
+                processing_domain: Fact::Known(ProcessingDomain::Binary64),
+                value_domain: ValueDomain::FiniteFloating,
+                level_basis: input_state.level_basis,
+                claims: BTreeSet::new(),
+                obligations: BTreeSet::from([
                     RuntimeObligation::TerminalErrorBound(gained),
                     RuntimeObligation::PublicationBarrier,
-                ]);
-                if let GainDecisionBinding::SubmittedBatch {
+                ]),
+            });
+            nodes.push(TypedPlanNode::ApplyGain {
+                input: working_signal,
+                output: gained,
+                policy: SampleGainPolicy::FixedGain { gain_db },
+                decision: None,
+            });
+            working_signal = gained;
+        } else {
+            let binding = if scope == TruePeakScope::Album {
+                match album_gain_binding(request) {
+                    Ok(binding) => binding,
+                    Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
+                }
+            } else {
+                GainDecisionBinding::Track {
+                    scope: track_scope_id(request),
+                }
+            };
+            let observation_scope = match &binding {
+                GainDecisionBinding::Track { scope }
+                | GainDecisionBinding::SubmittedBatch { scope, .. } => scope.clone(),
+            };
+            let input_state = states
+                .iter()
+                .find(|state| state.id == working_signal)
+                .cloned()
+                .expect("working signal must have a typed state");
+            // Phase 3 owns the complete certified reader for ordinary PCM and
+            // general DSD-to-PCM in both Track and Album scope. The reader remains
+            // part of the typed contract; execution must consume this authority
+            // rather than reconstructing a scan policy from settings.
+            let reader_connected = true;
+            let read_contract = match certified_true_peak_read_contract(
+                &input_state,
+                scan,
+                reader_connected,
+            ) {
+                Ok(contract) => contract,
+                Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
+            };
+            selected_true_peak_read_contract = Some(read_contract.clone());
+            let observation = ObservationId(next_observation);
+            next_observation += 1;
+            nodes.push(TypedPlanNode::Observe(Observation {
+                id: observation,
+                scope: observation_scope.clone(),
+                participant: request.plan_scope.participant_id().clone(),
+                subject: working_signal,
+                artifact_subject: None,
+                kind: ObservationKind::CertifiedTruePeak { scan },
+                complete_reader_required: true,
+                read_contract,
+            }));
+            let gained = SignalId(next_signal);
+            next_signal += 1;
+            let dependency = ScopedObservationId {
+                scope: observation_scope.clone(),
+                participant: request.plan_scope.participant_id().clone(),
+                observation,
+                purpose: ObservationClass::CertifiedTruePeak,
+            };
+            let album_participant = match &binding {
+                GainDecisionBinding::SubmittedBatch {
                     scope,
                     participant,
                     expected_participants,
-                } = &binding
-                {
-                    obligations.insert(RuntimeObligation::AlbumParticipantBarrier {
-                        scope: scope.clone(),
-                        participant: participant.clone(),
-                        expected_participants: *expected_participants,
-                    });
-                }
-                obligations
-            },
-        });
-        nodes.push(TypedPlanNode::ApplyGain {
-            input: working_signal,
-            output: gained,
-            policy: intent.gain_policy,
-            decision: Some(decision),
-        });
-        working_signal = gained;
+                } => Some(AlbumGainParticipantInput {
+                    scope: scope.clone(),
+                    participant: participant.clone(),
+                    expected_participants: *expected_participants,
+                    observation: dependency.clone(),
+                    terminal_subject: gained,
+                    terminal_proof: None,
+                }),
+                GainDecisionBinding::Track { .. } => None,
+            };
+            let decision = DecisionId(next_decision);
+            next_decision += 1;
+            nodes.push(TypedPlanNode::Decide(Decision {
+                id: decision,
+                kind: DecisionKind::TruePeakGain {
+                    scope,
+                    target_dbtp,
+                    allow_boost,
+                    binding: binding.clone(),
+                    album_participant,
+                },
+                observations: vec![dependency],
+            }));
+            states.push(AudioState {
+                id: gained,
+                coding: SignalCoding::Pcm,
+                sample_rate_hz: input_state.sample_rate_hz,
+                channels: input_state.channels,
+                channel_layout: input_state.channel_layout,
+                frame_extent: input_state.frame_extent,
+                programme: input_state.programme,
+                // The controlling scalar is realized on the retained Binary64
+                // carrier. Preserve source provenance separately, but make the
+                // post-gain signal representation truthful for terminal selection.
+                precision: StoragePrecision::Pcm(PcmBitDepth::Float64),
+                storage_contract: input_state.storage_contract,
+                processing_domain: Fact::Known(ProcessingDomain::Binary64),
+                value_domain: ValueDomain::FiniteFloating,
+                level_basis: input_state.level_basis,
+                // The ceiling is a requested execution result, not a discharged
+                // planning-time fact. The observation/decision plus terminal and
+                // publication obligations carry the planned guarantee until the
+                // executor proves it.
+                claims: BTreeSet::new(),
+                obligations: {
+                    let mut obligations = BTreeSet::from([
+                        RuntimeObligation::CompleteReader(working_signal),
+                        RuntimeObligation::TerminalErrorBound(gained),
+                        RuntimeObligation::PublicationBarrier,
+                    ]);
+                    if let GainDecisionBinding::SubmittedBatch {
+                        scope,
+                        participant,
+                        expected_participants,
+                    } = &binding
+                    {
+                        obligations.insert(RuntimeObligation::AlbumParticipantBarrier {
+                            scope: scope.clone(),
+                            participant: participant.clone(),
+                            expected_participants: *expected_participants,
+                        });
+                    }
+                    obligations
+                },
+            });
+            nodes.push(TypedPlanNode::ApplyGain {
+                input: working_signal,
+                output: gained,
+                policy: intent.gain_policy,
+                decision: Some(decision),
+            });
+            working_signal = gained;
 
-        if !intent.reference_delivery
-            && intent.gain_policy.is_true_peak()
-            && !request.settings.target_format.is_dsd()
-        {
-            let mandatory_dsd_track = request.source.is_dsd()
-                && scope == TruePeakScope::Track
-                && capability == ExecutionCapability::ExecutableNow;
-            if mandatory_dsd_track
-                || capability == ExecutionCapability::RequiresPhase3DsdTrackTruePeak
+            if !intent.reference_delivery
+                && intent.gain_policy.is_true_peak()
+                && !request.settings.target_format.is_dsd()
             {
-                // Phase 3 gives the formerly missing general-DSD Track route a
-                // connected execution owner. Preserve the Phase-2
-                // `RequiresPhase3CommonRealizer` marker for other admitted
-                // physical-plan divergences (for example a soft SoX preference
-                // whose hard-ceiling resampler candidate is FFmpeg/soxr): the
-                // Phase-3 application consumes that selected plan directly,
-                // while the legacy command-plan lowerer must still refuse it.
-                capability = ExecutionCapability::ExecutableByPhase3CommonRealizer;
+                let mandatory_dsd_track = request.source.is_dsd()
+                    && scope == TruePeakScope::Track
+                    && capability == ExecutionCapability::ExecutableNow;
+                if mandatory_dsd_track
+                    || capability == ExecutionCapability::RequiresPhase3DsdTrackTruePeak
+                {
+                    // Phase 3 gives the formerly missing general-DSD Track route a
+                    // connected execution owner. Preserve the Phase-2
+                    // `RequiresPhase3CommonRealizer` marker for other admitted
+                    // physical-plan divergences (for example a soft SoX preference
+                    // whose hard-ceiling resampler candidate is FFmpeg/soxr): the
+                    // Phase-3 application consumes that selected plan directly,
+                    // while the legacy command-plan lowerer must still refuse it.
+                    capability = ExecutionCapability::ExecutableByPhase3CommonRealizer;
+                }
             }
         }
     } else if matches!(intent.gain_policy, SampleGainPolicy::FixedGain { .. }) {
@@ -3142,7 +3213,7 @@ fn plan_typed_with_effects_and_policy(
                 if let Some(obligation) = selected_reader_obligation.as_ref() {
                     candidate.contract.runtime_obligations.insert(obligation.clone());
                 }
-                if intent.gain_policy.is_true_peak() {
+                if selected_true_peak_read_contract.is_some() {
                     candidate
                         .contract
                         .runtime_obligations
@@ -3162,7 +3233,7 @@ fn plan_typed_with_effects_and_policy(
             if let Some(obligation) = selected_reader_obligation {
                 requirements.required_runtime_obligations.insert(obligation);
             }
-            if intent.gain_policy.is_true_peak() {
+            if selected_true_peak_read_contract.is_some() {
                 requirements
                     .required_runtime_obligations
                     .insert("certified_true_peak_observation".to_owned());
@@ -5248,9 +5319,10 @@ fn source_value_domain(request: &PlanRequest) -> ValueDomain {
         Some(SampleKind::Dsd) => ValueDomain::OneBit,
         Some(SampleKind::SignedInteger | SampleKind::UnsignedInteger) => request
             .source
-            .bit_depth
+            .authoritative_pcm_depth()
+            .or(request.source.bit_depth)
             .map(ValueDomain::IntegerLattice)
-            .unwrap_or_else(|| ValueDomain::Pending("source.bit_depth".to_owned())),
+            .unwrap_or_else(|| ValueDomain::Pending("source.authoritative_pcm_depth".to_owned())),
         Some(SampleKind::Float) => ValueDomain::FiniteFloating,
         None if request.source.codec.is_lossy() => ValueDomain::Encoded,
         None => ValueDomain::Pending("source.value_domain".to_owned()),
@@ -5864,6 +5936,26 @@ mod tests {
                 _ => None,
             })
             .expect("plan must select a PCM terminal")
+    }
+
+    #[test]
+    fn decoded_integer_carrier_keeps_physical_width_but_uses_authoritative_value_lattice() {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.source.bit_depth = Some(PcmBitDepth::Int32);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.source.sample_kind = Some(SampleKind::SignedInteger);
+
+        let state = source_audio_state(&request, SignalId(0));
+        assert_eq!(state.precision, StoragePrecision::Pcm(PcmBitDepth::Int32));
+        assert_eq!(
+            state.processing_domain,
+            Fact::Known(ProcessingDomain::PcmInteger(PcmBitDepth::Int32)),
+        );
+        assert_eq!(
+            state.value_domain,
+            ValueDomain::IntegerLattice(PcmBitDepth::Int16),
+            "carrier padding must not manufacture a semantic precision reduction",
+        );
     }
 
     #[test]
@@ -7166,6 +7258,45 @@ mod tests {
     }
 
     #[test]
+    fn resolved_album_gain_continuation_does_not_reopen_the_submission_barrier() {
+        let resolved_gain: DbNano = "-0.375000000".parse().expect("resolved album gain");
+        let mut request = pcm_request(SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-0.500000000".parse().expect("target"),
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
+        });
+        request
+            .settings
+            .pcm_true_peak
+            .bind_runtime_album_gain(resolved_gain);
+        request.plan_scope = PlanScope::track("resolved-album-carrier");
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("a coordinator-resolved Album continuation must be Ready without a second submitted-batch barrier")
+        };
+        assert!(plan.nodes.iter().all(|node| !matches!(
+            node,
+            TypedPlanNode::Observe(observation)
+                if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
+        )));
+        assert!(plan.nodes.iter().all(|node| !matches!(
+            node,
+            TypedPlanNode::Decide(Decision {
+                kind: DecisionKind::TruePeakGain { .. },
+                ..
+            })
+        )));
+        assert!(plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::ApplyGain {
+                policy: SampleGainPolicy::FixedGain { gain_db },
+                decision: None,
+                ..
+            } if *gain_db == resolved_gain
+        )));
+    }
+
+    #[test]
     fn one_track_album_keeps_group_binding_with_track_equivalent_policy_and_terminal_proof() {
         let policy = SampleGainPolicy::TruePeakGuard {
             target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
@@ -7324,6 +7455,79 @@ mod tests {
                 ..
             } if scope.0 == "submission:rg-album" && participant.0 == "track-3"
         ));
+    }
+
+    #[test]
+    fn standalone_album_replaygain_is_a_complete_singleton_group() {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.settings.replay_gain.mode = Some(ReplayGainMode::Both);
+        request.plan_scope = PlanScope::track("singleton-rg");
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("standalone Album/Both ReplayGain must have singleton-group semantics")
+        };
+        let decision = plan.nodes.iter().find_map(|node| match node {
+            TypedPlanNode::Decide(decision)
+                if matches!(decision.kind, DecisionKind::ReplayGainProjection { .. }) => {
+                    Some(decision)
+                }
+            _ => None,
+        }).expect("ReplayGain decision");
+        assert!(matches!(
+            &decision.kind,
+            DecisionKind::ReplayGainProjection {
+                policy: ReplayGainProjectionPolicy {
+                    mode: ReplayGainMode::Both,
+                    ..
+                },
+                group: ReplayGainGroupBinding::Track { scope },
+            } if scope.0 == "track:singleton-rg"
+        ));
+    }
+
+    #[test]
+    fn standalone_dsd_track_true_peak_with_album_replaygain_remains_ready() {
+        let mut request = dsd_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        });
+        request.plan_scope = PlanScope::track("standalone-dsd-track");
+        request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        request.settings.replay_gain.mode = Some(ReplayGainMode::Both);
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!(
+                "track true-peak and singleton Album/Both ReplayGain must coexist without submitted-batch authority"
+            )
+        };
+
+        assert!(plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::Decide(Decision {
+                kind: DecisionKind::TruePeakGain {
+                    scope: TruePeakScope::Track,
+                    binding: GainDecisionBinding::Track { .. },
+                    album_participant: None,
+                    ..
+                },
+                ..
+            })
+        )));
+        assert!(plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::Decide(Decision {
+                kind: DecisionKind::ReplayGainProjection {
+                    policy: ReplayGainProjectionPolicy {
+                        mode: ReplayGainMode::Both,
+                        ..
+                    },
+                    group: ReplayGainGroupBinding::Track { scope },
+                },
+                ..
+            }) if scope.0 == "track:standalone-dsd-track"
+        )));
     }
 
     #[test]
