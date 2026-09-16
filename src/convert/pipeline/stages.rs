@@ -63598,7 +63598,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(log.contains("A.dsf [source ordinal 0, disc none, track 1]"));
         assert!(log.contains("B.dsf [source ordinal 0, disc none, track 1]"));
         assert!(
-            log.contains("submitted-batch DSD album gain +0.340000000 dB"),
+            log.contains("submitted-batch DSD true-peak album gain +0.340000000 dB"),
             "terminal log must retain the bound album gain; actual log:\n{log}"
         );
         assert!(log.contains("2 measured DSD track(s)"));
