@@ -1,81 +1,85 @@
-# SSRC dither / noise-shaping decision table
+# SSRC dither and terminal semantics
 
-> Revised interpretation:
->
-> * `--bits` selects the destination bit depth / sample format.
-> * `--dither` selects SSRC’s dither or noise-shaping preset ID.
-> * `--pdf` selects the dither probability distribution: rectangular (`0`) or triangular (`1`).
-> * For final 16-bit music delivery, start with dither plus noise shaping.
-> * Use unshaped TPDF as a reference/baseline, not as the main production recommendation.
-> * Apply dither / noise shaping only at the final integer quantization stage.
+This document describes the behavior implemented by the current Tonepoet planner and SSRC command lowering. It is not a recommendation table for hypothetical SSRC modes.
 
-## Practical defaults
+## SSRC controls
 
-| Goal                                                        |                           Destination | Suggested SSRC settings                                                                     | Role                              | Notes                                                                                                                                           |
-| ----------------------------------------------------------- | ------------------------------------: | ------------------------------------------------------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Final 16-bit music delivery, conservative shaped start      |          16-bit PCM at 44.1 or 48 kHz | `--bits 16 --dither 0 --pdf 1`                                                              | Primary starting point            | ATH Curve A, Intensity 0 plus triangular dither. Use this as the first shaped-dither candidate for CD-style or 48 kHz 16-bit music output. |
-| Final 16-bit music delivery, slightly stronger shaping      |          16-bit PCM at 44.1 or 48 kHz | `--bits 16 --dither 1 --pdf 1` or `--bits 16 --dither 2 --pdf 1`                            | Audition after ID 0               | Use when ID 0 sounds too exposed in fades, tails, or quiet material. Compare by ear and by spectrum.                                            |
-| Final 16-bit music delivery, alternate shaper family        |          16-bit PCM at 44.1 or 48 kHz | `--bits 16 --dither 10 --pdf 1` through `--bits 16 --dither 16 --pdf 1`                     | Comparison / alternate ATH family | Curve B exists only at 44.1/48 kHz in the listed output. Treat it as an alternate family to audition, not a blind default.                      |
-| Final 16-bit music delivery, aggressive shaping             |          16-bit PCM at 44.1 or 48 kHz | `--bits 16 --dither 3 --pdf 1` through `--bits 16 --dither 6 --pdf 1`, or Curve B `13`–`16` | Special-case / test               | Strong shaping may reduce perceived midband noise while increasing high-frequency shaped noise. Use intentionally.                              |
-| Final 16-bit high-sample-rate delivery                      |    16-bit PCM at 88.2, 96, or 192 kHz | `--bits 16 --dither 0 --pdf 1`; compare `--dither 1` or `--dither 2`                        | Shaped start                      | Only ATH Curve A IDs `0`–`2` are listed at these rates.                                                                                         |
-| Final 16-bit low-rate delivery                              | 16-bit PCM at 8, 11.025, or 22.05 kHz | `--bits 16 --dither 0 --pdf 1`; compare `--dither 1 --pdf 1`                                | Low-rate shaped start             | Low rates leave less frequency space for psychoacoustic relocation. Compare against unshaped output and listen for tonal or hiss artifacts.     |
-| Final 16-bit low-rate special test                          | 16-bit PCM at 8, 11.025, or 22.05 kHz | `--bits 16 --dither 9 --pdf 1`                                                              | Special-purpose low-rate preset   | SSRC labels ID 9 as ATH Curve A, Saturated. Do not use as the first-choice low-rate setting without listening tests.                            |
-| Measurement / unshaped baseline                              |                            16-bit PCM | `--bits 16 --dither 99 --pdf 1`                                                             | Unshaped TPDF-style reference     | Useful for comparison, measurement, and verifying what the shaper contributes. Not the preferred final 16-bit music recommendation.             |
-| Simple triangular comparison                                |                            16-bit PCM | `--bits 16 --dither 98`                                                                     | SSRC simple triangular mode       | SSRC labels ID 98 as Simple triangular. Do not assume it is bit-identical to `--dither 99 --pdf 1` without testing.                             |
-| Final 24-bit integer delivery                               |                            24-bit PCM | `--bits 24 --dither 98` or `--bits 24 --dither 99 --pdf 1`                                  | Conservative 24-bit start         | At 24-bit, unshaped/simple dither is usually the practical choice. Noise shaping is optional and usually less valuable than at 16-bit.          |
-| Final 24-bit integer delivery with intentional shaped noise |       24-bit PCM, usually 44.1/48 kHz | `--bits 24 --dither 0 --pdf 1`                                                              | Optional / test                   | Valid if you deliberately want shaped dither at 24-bit, but not the default recommendation. Compare against simple/unshaped output.             |
-| Float output for later processing                           |            32-bit or 64-bit float WAV | `--bits -32` or `--bits -64`                                                                | No dither                         | Do not dither floating-point output. Save dither/noise shaping for the final integer export.                                                    |
+Tonepoet exposes these SSRC settings:
 
-## Source-to-destination decision matrix
+- `force`: require SSRC to own an actual PCM sample-rate conversion. If source and target PCM rates are equal, explicit SSRC is refused; SSRC is not inserted merely to perform dither.
+- `insane_mode`: force the `Insane` profile.
+- `profile`: one of `Insane`, `High`, `Long`, `Standard`, `Short`, `Fast`, or `Lightning`. `insane_mode` overrides `profile`; otherwise the planner derives a profile from the global resample quality when `profile` is unset.
+- `attenuation_db`: optional SSRC `--att` value.
+- `min_phase`: emit `--minPhase` when enabled.
+- `dither_id`: optional native SSRC `--dither` override.
+- `pdf_type`: optional native SSRC `--pdf` override. The typed surface supports only `Rectangular` (`0`) and `Triangular` (`1`).
 
-| Source / processing state                                                             |                Destination | Destination sample rate | Recommended path                                   | SSRC settings to start with                                | Compare against                                                                | Notes                                                                                                                       |
-| ------------------------------------------------------------------------------------- | -------------------------: | ----------------------: | -------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| 24-bit, 32-bit float, or 64-bit float source; final CD-style output                   |                 16-bit PCM |                   44100 | Dither + light ATH noise shaping                   | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, `--dither 99 --pdf 1`              | This is the main final-delivery case where shaped dither earns its place.                                                   |
-| 24-bit, 32-bit float, or 64-bit float source; final 48 kHz music/video output         |                 16-bit PCM |                   48000 | Dither + light ATH noise shaping                   | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, `--dither 99 --pdf 1`              | Same production logic as 44.1 kHz, using the 48 kHz shaper set.                                                             |
-| High-resolution source; quiet acoustic, classical, jazz, ambient, fades, reverb tails |                 16-bit PCM |          44100 or 48000 | Start shaped; audition intensity                   | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, Curve B IDs `10`–`12`              | Quiet material may expose quantization artifacts and dither/noise-shaper character more clearly.                            |
-| High-resolution source; dense/loud rock, pop, electronic, metal                       |                 16-bit PCM |          44100 or 48000 | Start shaped but avoid assuming stronger is better | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 99 --pdf 1`                                    | Dense material often masks low-level noise; aggressive shaping may add high-frequency noise without much audible benefit.   |
-| High-resolution source; final high-rate 16-bit PCM                                    |                 16-bit PCM | 88200, 96000, or 192000 | Start with available ATH Curve A shaping           | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, `--dither 99 --pdf 1`              | SSRC lists only ATH Curve A IDs `0`–`2` at these rates.                                                                     |
-| Speech, spoken word, telephony-style material                                         |                 16-bit PCM |   8000, 11025, or 22050 | Compare shaped and unshaped                        | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 99 --pdf 1`, special test `--dither 9 --pdf 1` | Speech can make noise texture obvious. Low-rate shapers deserve listening tests.                                            |
-| Source is already 16-bit, but SRC, gain, fades, mixing, EQ, or other DSP is applied   |                 16-bit PCM |       Match destination | Re-dither at final integer output                  | Use the relevant 16-bit destination row above              | Unshaped baseline: `--dither 99 --pdf 1`                                       | Once processing happens in float or high precision, the final 16-bit write requantizes the signal. Dither that final write. |
-| Source is already 16-bit and no DSP/SRC is needed                                     |                 16-bit PCM |          Same as source | Do not process                                     | Keep original file                                         | N/A                                                                            | Avoid rewriting if you want bit-identical preservation.                                                                     |
-| Lossy source decoded to PCM, then exported to final 16-bit WAV                        |                 16-bit PCM |       Match destination | Treat as final integer quantization                | Use the relevant 16-bit destination row above              | `--dither 99 --pdf 1`                                                          | The lossy source history does not replace the final dither/noise-shaping decision.                                          |
-| High-resolution or float source; final 24-bit archive / production handoff            |                 24-bit PCM |         Any listed rate | Simple or unshaped dither                          | `--bits 24 --dither 98` or `--bits 24 --dither 99 --pdf 1` | Optional `--dither 0 --pdf 1`                                                  | 24-bit has much lower quantization noise than 16-bit. Shaping usually adds less practical value.                            |
-| High-resolution or float source; final float handoff                                  | 32-bit or 64-bit float WAV |      Any supported rate | No dither                                          | `--bits -32` or `--bits -64`                               | N/A                                                                            | Keep float output undithered for later processing.                                                                          |
+There are no Tonepoet SSRC `Two-pass`, `Normalize`, or `Prevent Clipping` settings.
 
-## Destination-rate availability table
+## Dither belongs to the final integer terminal
 
-| Destination sample rate | ATH Curve A IDs         | ATH Curve B IDs           | Legacy / special IDs                      | Simple / unshaped IDs                  | Practical interpretation                                                     |
-| ----------------------: | ----------------------- | ------------------------- | ----------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------- |
-|                   44100 | `0`–`6` = Intensity 0–6 | `10`–`16` = Intensity 0–6 | `90` Old Low, `91` Old Mid, `92` Old High | `98` Simple triangular, `99` No shaper | Fullest 44.1 kHz choice set. Use ATH A `0` as the conservative shaped start. |
-|                   48000 | `0`–`6` = Intensity 0–6 | `10`–`16` = Intensity 0–6 | `90` Old Low, `91` Old Mid                | `98` Simple triangular, `99` No shaper | Full 48 kHz ATH A/B choice set, with fewer legacy presets than 44.1 kHz.     |
-|                   88200 | `0`–`2` = Intensity 0–2 | Not listed                | Not listed                                | `98` Simple triangular, `99` No shaper | Limited high-rate ATH A set.                                                 |
-|                   96000 | `0`–`2` = Intensity 0–2 | Not listed                | Not listed                                | `98` Simple triangular, `99` No shaper | Limited high-rate ATH A set.                                                 |
-|                  192000 | `0`–`2` = Intensity 0–2 | Not listed                | Not listed                                | `98` Simple triangular, `99` No shaper | Limited high-rate ATH A set.                                                 |
-|                    8000 | `0`–`1` = Intensity 0–1 | Not listed                | `9` Saturated                             | `98` Simple triangular, `99` No shaper | Low-rate set. Use ID 9 only as a special test.                               |
-|                   11025 | `0`–`1` = Intensity 0–1 | Not listed                | `9` Saturated                             | `98` Simple triangular, `99` No shaper | Low-rate set. Use ID 9 only as a special test.                               |
-|                   22050 | `0`–`1` = Intensity 0–1 | Not listed                | `9` Saturated                             | `98` Simple triangular, `99` No shaper | Low-rate set. Use ID 9 only as a special test.                               |
+Tonepoet does not decide dither by comparing source and target nominal bit depths. Dither is a property of the final integer quantization stage.
 
-## Meaning of key SSRC dither IDs
+Consequences:
 
-| SSRC setting               | Meaning                                                                | Recommended role                                                                         |
-| -------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `--dither 0 --pdf 1`       | ATH Curve A, Intensity 0, with triangular dither distribution          | Conservative shaped-dither starting point for final 16-bit music                         |
-| `--dither 1 --pdf 1`       | ATH Curve A, Intensity 1, with triangular dither distribution          | Slightly stronger shaped 16-bit option                                                   |
-| `--dither 2 --pdf 1`       | ATH Curve A, Intensity 2, with triangular dither distribution          | Stronger shaped 16-bit option; also the strongest listed ATH A option at 88.2/96/192 kHz |
-| `--dither 3`–`6 --pdf 1`   | ATH Curve A, stronger intensities, with triangular dither distribution | Aggressive 44.1/48 kHz shaping; audition carefully                                       |
-| `--dither 10`–`16 --pdf 1` | ATH Curve B family, with triangular dither distribution                | Alternate 44.1/48 kHz shaper family                                                      |
-| `--dither 9 --pdf 1`       | ATH Curve A, Saturated                                                 | Special low-rate preset for 8/11.025/22.05 kHz                                           |
-| `--dither 90`, `91`, `92`  | ATH Curve A legacy presets                                             | Compatibility or repeatability with older SSRC-style output                              |
-| `--dither 98`              | Simple triangular                                                      | Simple dither comparison path, especially useful for 24-bit or tests                     |
-| `--dither 99 --pdf 1`      | No noise shaper; with --pdf 1, use triangular dither distribution.                    | Unshaped TPDF-style baseline for testing, measurement, or deliberately unshaped output   |
+- Float32 and Float64 SSRC outputs do not emit `--dither` or `--pdf`.
+- Same-depth integer resampling may still dither when the user explicitly requests dither, because the resampler still performs a new integer quantization.
+- Global `None` means no SSRC dither: with no native override, Tonepoet emits neither `--dither` nor `--pdf`.
+- SSRC-native overrides apply only when SSRC owns the integer terminal. If later processing requires a Float64 split terminal, an active native override cannot be silently moved and the planner refuses that cell.
 
-## Revised rule of thumb
+## Global dither mapping
 
-| Destination                        | Start here                                                 | Then compare                                                                                               |
-| ---------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Final 16-bit music at 44.1 kHz     | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, Curve B `10`–`12`, and unshaped baseline `--dither 99 --pdf 1` |
-| Final 16-bit music at 48 kHz       | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, Curve B `10`–`12`, and unshaped baseline `--dither 99 --pdf 1` |
-| Final 16-bit at 88.2/96/192 kHz    | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 2 --pdf 1`, and `--dither 99 --pdf 1`                                      |
-| Final 16-bit at 8/11.025/22.05 kHz | `--bits 16 --dither 0 --pdf 1`                             | `--dither 1 --pdf 1`, `--dither 99 --pdf 1`, and special test `--dither 9 --pdf 1`                         |
-| Final 24-bit integer PCM           | `--bits 24 --dither 98` or `--bits 24 --dither 99 --pdf 1` | Optional shaped test: `--dither 0 --pdf 1`                                                                 |
-| Float output for later processing  | `--bits -32` or `--bits -64`                               | No dither, no noise shaping                                                                                |
+The planner records whether a global dither family maps exactly to SSRC or is an approximation.
+
+Exact mappings:
+
+- `None`: inactive; no `--dither` or `--pdf`.
+- `Tpdf`: `--dither 99 --pdf 1`.
+
+Documented approximations:
+
+- `SlopedTpdf`: SSRC has no sloped TPDF; use `--dither 99 --pdf 1`.
+- `LowShibata`: ATH Curve A intensity 0 with triangular PDF.
+- `Shibata`: ATH Curve A intensity 2 with triangular PDF.
+- `HighShibata`: ATH Curve A intensity 6 with triangular PDF, clamped to the strongest Curve A intensity available at the destination rate.
+- `Lipshitz`, `FWeighted`, `ModifiedEWeighted`, `ImprovedEWeighted`, and `Gesemann`: ATH Curve A intensity 0 with triangular PDF.
+
+For ATH Curve A mappings, the maximum admitted intensity is 6 at 44.1/48 kHz, 2 at 88.2/96/192 kHz, and 1 at 8/11.025/22.05 kHz. IDs 98 and 99 are accepted independently of those ATH tables. Other explicit native IDs are validated against the destination rate and fail closed when unavailable.
+
+Native `dither_id` and/or `pdf_type` settings override the derived global pair. The resolved plan records the native pair and its origin instead of pretending a native override is the original global family.
+
+## Int32 gate
+
+SSRC native Int32 dither ownership is not commissioned for the retained pinned cell.
+
+- An explicit global Int32 dither request may use the admitted Float64 split-terminal route and perform the qualified later terminal quantization.
+- An explicit SSRC-native Int32 dither/PDF override is refused because it cannot be reassigned to another terminal.
+- A directly selected SSRC Int32 terminal never emits uncommissioned native dither.
+
+## Terminal fusion versus Float64 split
+
+When SSRC can own the final integer terminal, the planner may fuse resampling, integer quantization, and the resolved SSRC dither/PDF pair into that operation.
+
+When later gain/effects or another admitted terminal must follow the resampler, SSRC instead emits a nonterminal Float64 carrier. Ordinary Float64 SSRC output is `PcmFloating`; Float64 storage width or double-computation profiles do not by themselves establish `Binary64` preservation authority.
+
+## Binary64 preservation authority
+
+The stronger `TonepoetBinary64OverloadPreservingResampleV1` contract is separate from ordinary SSRC capability.
+
+Production registry state is currently:
+
+- `Standard`, `Short`, `Fast`, and `Lightning`: `Refuted` for the strong Binary64 contract because the audited source uses the single-precision pipeline for those profiles.
+- `High`, `Long`, and `Insane`: `PendingEvidence` under Outcome C because no exact executable evidence cell has been commissioned.
+
+`High`, `Long`, and `Insane` use double computation, but double computation alone is not a Binary64 preservation claim.
+
+A future `Established` strong cell must also have an independently admitted protected Float64 ingress. The retained ordinary-PCM ingress is bounded classic RIFF/WAV `pcm_f64le`; only authoritative exact or bounded frame extents may prove that the carrier fits the protected RIFF cell. A duration estimate is not capacity proof. DSD-produced or ordinary pre-effect-produced Float64 boundaries do not inherit this ingress authority.
+
+The latent protected SSRC execution route writes Float64 Wave64, validates its exact structure/geometry, and copies the PCM payload byte-for-byte into the retained raw carrier before certified observation. This route exists so a future exact evidence cell can be commissioned without another planner redesign; it does not mean any SSRC strong cell is commissioned today.
+
+## Protected-route exclusions
+
+- Qualified Reference delivery is sealed. Explicit SSRC does not override Reference routing or qualification.
+- Certified PCM true-peak hard-ceiling operation requires an admitted overload-preserving path. With the current Outcome-C registry, Auto/FFmpeg uses the established FFmpeg/soxr protected resampler rather than treating Pending SSRC evidence as established.
+- An ordinary `BeforePcmResample` registered effect is not admitted into that certified hard-ceiling path because current registered effects do not carry a protected Binary64/overload-preservation contract for their output boundary.
+- Strong SSRC likewise cannot treat an ordinary pre-effect carrier as protected ingress, and SSRC evidence does not qualify a later sample-changing effect.

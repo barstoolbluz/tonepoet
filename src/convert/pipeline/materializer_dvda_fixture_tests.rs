@@ -96,9 +96,12 @@ fn request_for_fixture(
         .map(DvdaGroupSelection::Group)
         .unwrap_or(DvdaGroupSelection::Default);
     PipelineRequest {
+        registered_effects: Vec::new(),
         job_id: "dvda-phase2-fixture-test".to_string(),
         actions: crate::convert::pipeline::ActionPipeline::default(),
         item_id: normalized_fixture_name(fixture),
+        submission_id: None,
+        submission_size: None,
         container: fixture.to_path_buf(),
         source: SourceOptions {
             archive_password: None,

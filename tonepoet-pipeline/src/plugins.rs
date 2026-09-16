@@ -5,8 +5,8 @@
 
 use crate::enums::{
     AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdToPcmGainMode, GainCompensation,
-    Mp3Mode, PcmBitDepth, ReplayGainMode, SoxSincPhase,
+    GainCompensation,
+    Mp3Mode, PcmBitDepth, SoxSincPhase, SsrcPdfType,
 };
 use crate::error::{PlanningError, Result};
 use crate::mapping;
@@ -15,6 +15,270 @@ use crate::plan::{
     PlannedCommand,
 };
 use crate::tools::{MetadataDisposition, ToolIdentifier, ToolPlugin, ToolSupport};
+
+/// Whether SSRC terminal dither is active for the selected immediate output.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SsrcDitherAvailability {
+    /// Floating/nonterminal output, or an integer terminal with no requested dither.
+    Inactive,
+    /// SSRC owns the resolved native dither/PDF pair.
+    Active,
+    /// A derived global family has no native SSRC mapping for this terminal cell.
+    /// The semantic planner may split to a later terminal when no explicit native
+    /// override requires SSRC ownership.
+    UnavailableForSsrcTerminal { reason: String },
+}
+
+/// Provenance of the effective SSRC dither selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SsrcDitherOrigin {
+    /// No SSRC dither is active.
+    None,
+    /// The global dither maps exactly to the emitted native pair.
+    GlobalExact,
+    /// The global named family is represented by the documented SSRC approximation.
+    GlobalApproximation,
+    /// One or both SSRC-native fields were explicitly overridden.
+    NativeOverride,
+}
+
+/// Effective SSRC terminal dither/PDF pair after rate/output-role resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ResolvedSsrcDither {
+    pub requested_global: DitherType,
+    pub dither_id: Option<u8>,
+    pub pdf_type: Option<SsrcPdfType>,
+    pub origin: SsrcDitherOrigin,
+    pub availability: SsrcDitherAvailability,
+}
+
+impl ResolvedSsrcDither {
+    fn inactive(requested_global: DitherType) -> Self {
+        Self {
+            requested_global,
+            dither_id: None,
+            pdf_type: None,
+            origin: SsrcDitherOrigin::None,
+            availability: SsrcDitherAvailability::Inactive,
+        }
+    }
+}
+
+/// Resolve the exact SSRC dither/PDF pair used by command lowering.
+///
+/// Dither belongs to the final integer write, not to a comparison between the
+/// source and destination nominal widths. Float/nonterminal SSRC output never
+/// emits dither. A derived global family that is unavailable at the selected
+/// rate is returned as a split-capable terminal miss; an active explicit native
+/// override remains fail-closed.
+pub(crate) fn resolve_ssrc_dither_for_rate(
+    settings: &crate::settings::PipelineSettings,
+    _source_depth: Option<PcmBitDepth>,
+    effective_target_depth: Option<PcmBitDepth>,
+    target_rate_hz: u32,
+) -> Result<ResolvedSsrcDither> {
+    let requested_global = settings.dither_type;
+    let Some(target_depth) = effective_target_depth else {
+        return Ok(ResolvedSsrcDither::inactive(requested_global));
+    };
+    if target_depth.is_float() {
+        return Ok(ResolvedSsrcDither::inactive(requested_global));
+    }
+
+    let explicit_id = settings.ssrc.dither_id;
+    let explicit_pdf = settings.ssrc.pdf_type;
+    let native_override_active = explicit_id.is_some() || explicit_pdf.is_some();
+
+    // Int32 native dither ownership remains behind the retained exact-cell
+    // characterization gate. The semantic planner splits an explicit global
+    // Int32 request to Float64 + the admitted later terminal; an explicit
+    // SSRC-native override is refused before lowering because it cannot be
+    // reassigned. A directly constructed Int32 SSRC step therefore never
+    // emits uncommissioned native dither.
+    if target_depth == PcmBitDepth::Int32 {
+        if native_override_active || (settings.dither_explicit && requested_global != DitherType::None) {
+            return Ok(ResolvedSsrcDither {
+                requested_global,
+                dither_id: None,
+                pdf_type: None,
+                origin: if native_override_active {
+                    SsrcDitherOrigin::NativeOverride
+                } else {
+                    SsrcDitherOrigin::GlobalExact
+                },
+                availability: SsrcDitherAvailability::UnavailableForSsrcTerminal {
+                    reason: "SSRC Int32 dither ownership is not commissioned for the retained pinned cell".to_owned(),
+                },
+            });
+        }
+        return Ok(ResolvedSsrcDither::inactive(requested_global));
+    }
+
+    if !native_override_active && requested_global == DitherType::None {
+        return Ok(ResolvedSsrcDither::inactive(requested_global));
+    }
+
+    if native_override_active {
+        let (dither_id, pdf_type) = match (explicit_id, explicit_pdf) {
+            (Some(id), Some(pdf)) => (id, Some(pdf)),
+            (Some(id), None) => {
+                let pdf = if requested_global == DitherType::None {
+                    None
+                } else {
+                    mapping::ssrc_dither_selection(requested_global).pdf_type
+                };
+                (id, pdf)
+            }
+            (None, Some(pdf)) if requested_global == DitherType::None => (99, Some(pdf)),
+            (None, Some(pdf)) => {
+                let mapped = mapping::ssrc_dither_selection_for_rate(
+                    requested_global,
+                    target_rate_hz,
+                )?;
+                (mapped.dither_id, Some(pdf))
+            }
+            (None, None) => unreachable!("native override branch requires one override"),
+        };
+        mapping::validate_ssrc_dither_id_for_rate(dither_id, target_rate_hz)?;
+        return Ok(ResolvedSsrcDither {
+            requested_global,
+            dither_id: Some(dither_id),
+            pdf_type,
+            origin: SsrcDitherOrigin::NativeOverride,
+            availability: SsrcDitherAvailability::Active,
+        });
+    }
+
+    match mapping::ssrc_dither_selection_for_rate(requested_global, target_rate_hz) {
+        Ok(mapped) => Ok(ResolvedSsrcDither {
+            requested_global,
+            dither_id: Some(mapped.dither_id),
+            pdf_type: mapped.pdf_type,
+            origin: if mapping::ssrc_dither_selection_is_approximation(requested_global) {
+                SsrcDitherOrigin::GlobalApproximation
+            } else {
+                SsrcDitherOrigin::GlobalExact
+            },
+            availability: SsrcDitherAvailability::Active,
+        }),
+        Err(error) => Ok(ResolvedSsrcDither {
+            requested_global,
+            dither_id: None,
+            pdf_type: None,
+            origin: if mapping::ssrc_dither_selection_is_approximation(requested_global) {
+                SsrcDitherOrigin::GlobalApproximation
+            } else {
+                SsrcDitherOrigin::GlobalExact
+            },
+            availability: SsrcDitherAvailability::UnavailableForSsrcTerminal {
+                reason: error.to_string(),
+            },
+        }),
+    }
+}
+
+fn parse_rendered_f32(rendered: &str) -> f32 {
+    rendered
+        .parse::<f32>()
+        .expect("parameter renderer must emit a parseable f32")
+}
+
+/// Render the SSRC attenuation exactly as the command lowerer passes it.
+#[must_use]
+pub(crate) fn render_ssrc_attenuation_db(value: f32) -> String {
+    format!("{value:.1}")
+}
+
+/// Effective SSRC attenuation after argv precision is applied.
+#[must_use]
+pub(crate) fn canonicalize_ssrc_attenuation_db(value: f32) -> f32 {
+    parse_rendered_f32(&render_ssrc_attenuation_db(value))
+}
+
+/// Render the FFmpeg/SoXR cutoff exactly as the `aresample` option does.
+#[must_use]
+pub(crate) fn render_soxr_cutoff(value: f32) -> String {
+    format!("{value:.3}")
+}
+
+/// Effective SoXR cutoff after argv precision is applied.
+#[must_use]
+pub(crate) fn canonicalize_soxr_cutoff(value: f32) -> f32 {
+    parse_rendered_f32(&render_soxr_cutoff(value))
+}
+
+/// Render a SoX sinc passband frequency at the whole-Hz precision used by the
+/// retained command path. The caller owns the leading low-pass `-` marker.
+#[must_use]
+pub(crate) fn render_sox_sinc_passband_hz(value: f32) -> String {
+    format!("{value:.0}")
+}
+
+/// Effective SoX sinc passband after whole-Hz argv precision is applied.
+#[must_use]
+pub(crate) fn canonicalize_sox_sinc_passband_hz(value: f32) -> f32 {
+    parse_rendered_f32(&render_sox_sinc_passband_hz(value))
+}
+
+/// Render SoX scalar controls at the retained three-decimal precision.
+#[must_use]
+pub(crate) fn render_sox_scalar(value: f32) -> String {
+    let mut rendered = format!("{value:.3}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    rendered
+}
+
+/// Effective SoX scalar after three-decimal argv precision is applied.
+#[must_use]
+pub(crate) fn canonicalize_sox_scalar(value: f32) -> f32 {
+    parse_rendered_f32(&render_sox_scalar(value))
+}
+
+/// Render SoX gain compensation in signed dB at the retained two-decimal precision.
+#[must_use]
+pub(crate) fn render_sox_gain_db(value: f32) -> String {
+    format!("{value:+.2}")
+}
+
+/// Effective SoX dB gain after argv precision is applied.
+#[must_use]
+pub(crate) fn canonicalize_sox_gain_db(value: f32) -> f32 {
+    parse_rendered_f32(&render_sox_gain_db(value))
+}
+
+/// Exact FFmpeg/SoXR rate options after quality and transition defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResolvedSoxrRateOptions {
+    pub precision: u8,
+    pub cutoff: f32,
+    pub chebyshev: bool,
+    pub phase: Option<u8>,
+}
+
+/// Resolve the SoXR options shared by the typed plan and FFmpeg lowering.
+#[must_use]
+pub(crate) fn resolve_soxr_rate_options(
+    settings: &crate::settings::PipelineSettings,
+) -> ResolvedSoxrRateOptions {
+    let requested_cutoff = settings
+        .soxr_resampler
+        .cutoff
+        .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
+    ResolvedSoxrRateOptions {
+        precision: mapping::soxr_precision(settings.resample_quality),
+        cutoff: canonicalize_soxr_cutoff(requested_cutoff),
+        chebyshev: settings.soxr_resampler.chebyshev,
+        phase: settings.soxr_resampler.phase,
+    }
+}
 
 /// FFmpeg plugin.
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,10 +291,6 @@ pub struct SoxPlugin;
 /// SSRC plugin.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SsrcPlugin;
-
-/// loudgain ReplayGain plugin.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LoudgainPlugin;
 
 /// metaflac FLAC metadata plugin.
 #[derive(Debug, Default, Clone, Copy)]
@@ -87,7 +347,7 @@ impl ToolPlugin for FfmpegPlugin {
                     .dsd
                     .runtime_album_gain_db()
                     .is_some()
-                    || context.request.settings.pcm_true_peak.enabled)
+                    || context.request.settings.pcm_true_peak.is_true_peak())
                     && *apply_processing
                     && target_format.is_pcm_lossless()
                     && target_format.sox_encodable()
@@ -239,13 +499,14 @@ impl ToolPlugin for SoxPlugin {
         match &step.operation {
             PlanOperation::EncodePcm {
                 target_format,
+                target_bit_depth,
                 apply_processing,
                 ..
             } if target_format.sox_encodable() => {
                 if *target_format == AudioFormat::WavPack
                     && context.request.settings.wavpack.hybrid
-                    && (context.request.settings.pcm_true_peak.enabled
-                        || context.request.settings.pcm_true_peak.fixed_gain_db.is_some())
+                    && (context.request.settings.pcm_true_peak.is_true_peak()
+                        || context.request.settings.pcm_true_peak.fixed_gain_db().is_some())
                 {
                     // PCM gain + WavPack hybrid deliberately realizes the
                     // final integer encoder-input WAV before this step. The
@@ -253,10 +514,15 @@ impl ToolPlugin for SoxPlugin {
                     // the FFmpeg plugin owns that native-CLI delegation.
                     return ToolSupport::UNSUPPORTED;
                 }
-                let target_depth = match &step.operation {
-                    PlanOperation::EncodePcm { target_bit_depth, .. } => *target_bit_depth,
-                    _ => unreachable!("guarded by EncodePcm pattern"),
-                };
+                let target_depth = *target_bit_depth;
+                // Ordinary SoX Int32 output cannot realize the explicit
+                // FFmpeg Int32 dither semantics selected by the typed planner.
+                if explicit_int32_dither_requested(
+                    &context.request.settings,
+                    Some(target_depth),
+                ) {
+                    return ToolSupport::UNSUPPORTED;
+                }
                 let silently_substituted = matches!(
                     ((*target_format).clone(), target_depth),
                     (AudioFormat::Flac, PcmBitDepth::Int32)
@@ -391,62 +657,47 @@ impl ToolPlugin for SsrcPlugin {
                 "--profile".into(),
                 profile.as_arg().into(),
             ];
-            let needs_dither = match effective_target_depth(context, *target_bit_depth) {
-                Some(depth) => pcm_conversion_reduces_depth(
-                    context.request.source.authoritative_pcm_depth(),
-                    depth,
-                ),
-                None => true,
-            };
-            // SSRC treats `--dither` and `--pdf` as parameters of the terminal
-            // integer dither/quantization stage, not as two independently
-            // ordered shell pipeline stages. Keep the effective pair together
-            // here, validate it against the destination sample rate, and omit
-            // both flags when dither is not needed (float output, same/higher
-            // bit depth, or Int32 target).
-            let pdf_type = if needs_dither {
-                let mapped_dither = mapping::ssrc_dither_selection_for_rate(
-                    context.request.settings.dither_type,
-                    *target_rate_hz,
-                )?;
-                let dither_id = context
-                    .request
-                    .settings
-                    .ssrc
-                    .dither_id
-                    .unwrap_or(mapped_dither.dither_id);
-                mapping::validate_ssrc_dither_id_for_rate(dither_id, *target_rate_hz)?;
+            // SSRC treats `--dither` and `--pdf` as parameters of one terminal
+            // integer dither/quantization stage. Resolve the pair through the
+            // same pure helper consumed by the common semantic planner.
+            let resolved_dither = resolve_ssrc_dither_for_rate(
+                &context.request.settings,
+                context.request.source.authoritative_pcm_depth(),
+                effective_target_depth(context, *target_bit_depth),
+                *target_rate_hz,
+            )?;
+            if let SsrcDitherAvailability::UnavailableForSsrcTerminal { reason } =
+                &resolved_dither.availability
+            {
+                return Err(PlanningError::plugin_rejected(
+                    self.id(),
+                    format!(
+                        "selected SSRC terminal dither mapping is unavailable for destination rate {} Hz: {}",
+                        target_rate_hz, reason
+                    ),
+                ));
+            }
+            if let Some(dither_id) = resolved_dither.dither_id {
                 args.push("--dither".into());
                 args.push(dither_id.to_string());
-                context
-                    .request
-                    .settings
-                    .ssrc
-                    .pdf_type
-                    .or(mapped_dither.pdf_type)
-            } else {
-                None
-            };
+            }
             if let Some(depth) = *target_bit_depth {
                 args.push("--bits".into());
                 args.push(ssrc_bits_arg(depth));
             }
             if let Some(att) = context.request.settings.ssrc.attenuation_db {
                 args.push("--att".into());
-                args.push(format!("{:.1}", att));
+                args.push(render_ssrc_attenuation_db(att));
             }
             if context.request.settings.ssrc.min_phase {
                 args.push("--minPhase".into());
             }
-            if needs_dither {
-                if let Some(pdf) = pdf_type {
-                    use crate::enums::SsrcPdfType;
-                    args.push("--pdf".into());
-                    args.push(match pdf {
-                        SsrcPdfType::Rectangular => "0".into(),
-                        SsrcPdfType::Triangular => "1".into(),
-                    });
-                }
+            if let Some(pdf) = resolved_dither.pdf_type {
+                args.push("--pdf".into());
+                args.push(match pdf {
+                    SsrcPdfType::Rectangular => "0".into(),
+                    SsrcPdfType::Triangular => "1".into(),
+                });
             }
             args.push(input);
             args.push(output);
@@ -467,62 +718,11 @@ impl ToolPlugin for SsrcPlugin {
     }
 }
 
-fn ssrc_bits_arg(depth: PcmBitDepth) -> String {
+pub(crate) fn ssrc_bits_arg(depth: PcmBitDepth) -> String {
     match depth {
         PcmBitDepth::Float32 => "-32".into(),
         PcmBitDepth::Float64 => "-64".into(),
         _ => depth.bits().to_string(),
-    }
-}
-
-impl ToolPlugin for LoudgainPlugin {
-    fn id(&self) -> ToolIdentifier {
-        ToolIdentifier::Loudgain
-    }
-
-    fn supports(&self, _context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport {
-        match &step.operation {
-            PlanOperation::ReplayGain { target_format, .. }
-                if loudgain_supports_format(target_format) =>
-            {
-                ToolSupport::CANONICAL
-            }
-            _ => ToolSupport::UNSUPPORTED,
-        }
-    }
-
-    fn build_command(&self, context: &PlanContext<'_>, step: &PlanStep) -> Result<PlannedCommand> {
-        if let PlanOperation::ReplayGain { mode, .. } = &step.operation {
-            let path = required_input_path(step)?;
-            let mut args = Vec::new();
-            match *mode {
-                ReplayGainMode::Album => args.push("-a".into()),
-                ReplayGainMode::Track => args.push("-t".into()),
-                ReplayGainMode::Both => {
-                    args.push("-a".into());
-                    args.push("-t".into());
-                }
-            }
-            if context.request.settings.replay_gain.prevent_clipping {
-                args.push("-k".into());
-            }
-            args.push("-s".into());
-            args.push("e".into());
-            args.push(path);
-            Ok(PlannedCommand::new(
-                ToolIdentifier::Loudgain,
-                args,
-                step.input.clone(),
-                step.output.clone(),
-                context.request.source.duration,
-                step.description.clone(),
-            ))
-        } else {
-            Err(PlanningError::plugin_rejected(
-                self.id(),
-                format!("unsupported operation {}", step.operation.label()),
-            ))
-        }
     }
 }
 
@@ -1018,18 +1218,6 @@ fn format_supports_artwork(format: &AudioFormat) -> bool {
     format.supports_planner_embedded_artwork_transfer()
 }
 
-fn loudgain_supports_format(format: &AudioFormat) -> bool {
-    matches!(
-        format,
-        AudioFormat::Flac
-            | AudioFormat::Mp3
-            | AudioFormat::Aac
-            | AudioFormat::Opus
-            | AudioFormat::Alac
-            | AudioFormat::WavPack
-    )
-}
-
 fn build_ffmpeg_metadata_transfer(
     context: &PlanContext<'_>,
     step: &PlanStep,
@@ -1334,7 +1522,7 @@ fn build_sox_dsd_rate_change(
     let input = required_input_path(step)?;
     let output = required_output_path(step)?;
     let mut args = vec!["-S".into(), input, output];
-    add_sox_dsd_rate_change_effects(context, &mut args, target_rate, lowpass);
+    add_sox_dsd_rate_change_effects(context, &mut args, target_rate, lowpass)?;
     Ok(PlannedCommand::new(
         ToolIdentifier::Sox,
         args,
@@ -1545,24 +1733,17 @@ fn ffmpeg_soxr_resample_options(
     context: &PlanContext<'_>,
     target_rate_hz: Option<u32>,
 ) -> Vec<String> {
-    let settings = &context.request.settings;
+    let resolved = resolve_soxr_rate_options(&context.request.settings);
     let mut opts = vec!["resampler=soxr".to_string()];
     if let Some(rate) = target_rate_hz {
         opts.push(format!("out_sample_rate={rate}"));
     }
-    opts.push(format!(
-        "precision={}",
-        mapping::soxr_precision(settings.resample_quality)
-    ));
-    let cutoff = settings
-        .soxr_resampler
-        .cutoff
-        .unwrap_or_else(|| mapping::ffmpeg_cutoff(settings.nyquist_transition));
-    opts.push(format!("cutoff={cutoff:.3}"));
-    if settings.soxr_resampler.chebyshev {
+    opts.push(format!("precision={}", resolved.precision));
+    opts.push(format!("cutoff={}", render_soxr_cutoff(resolved.cutoff)));
+    if resolved.chebyshev {
         opts.push("cheby=1".to_string());
     }
-    if let Some(phase) = settings.soxr_resampler.phase {
+    if let Some(phase) = resolved.phase {
         opts.push(format!("phase_shift={phase}"));
     }
     opts
@@ -1573,7 +1754,7 @@ fn ffmpeg_lossy_processing_filter(context: &PlanContext<'_>, encoder_rate_hz: u3
     if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
-    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db {
+    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db() {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
     if context.request.source.sample_rate_hz != Some(encoder_rate_hz) {
@@ -1595,16 +1776,32 @@ fn ffmpeg_audio_filter(
     if let Some(gain) = settings.dsd.runtime_album_gain_db() {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
-    if let Some(gain) = settings.pcm_true_peak.fixed_gain_db {
+    if let Some(gain) = settings.pcm_true_peak.fixed_gain_db() {
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
 
+    let processing_produces_fractional_pcm = target_rate_hz.is_some()
+        || settings.dsd.runtime_album_gain_db().is_some()
+        || settings.pcm_true_peak.fixed_gain_db().is_some();
     let ffmpeg_needs_dither = match target_depth {
-        Some(depth) => pcm_conversion_reduces_depth(context.request.source.authoritative_pcm_depth(), depth),
+        Some(depth) => {
+            target_depth_needs_dither(depth)
+                && (processing_produces_fractional_pcm
+                    || pcm_conversion_reduces_depth(
+                        context.request.source.authoritative_pcm_depth(),
+                        depth,
+                    ))
+        }
         None => match context.request.settings.target_bit_depth {
             BitDepthTarget::Source => false,
-            BitDepthTarget::Pcm(depth) => pcm_conversion_reduces_depth(
-                context.request.source.authoritative_pcm_depth(), depth),
+            BitDepthTarget::Pcm(depth) => {
+                target_depth_needs_dither(depth)
+                    && (processing_produces_fractional_pcm
+                        || pcm_conversion_reduces_depth(
+                            context.request.source.authoritative_pcm_depth(),
+                            depth,
+                        ))
+            }
         },
     };
     let aresample_needed = target_rate_hz.is_some()
@@ -1699,8 +1896,8 @@ fn build_wavpack_hybrid_encode(
 ) -> Result<PlannedCommand> {
     if context.request.settings.dsd.runtime_album_gain_db().is_some() {
         return Err(PlanningError::invalid_settings(
-            "dsd.auto_gain_scope",
-            "album-scoped DSD auto-gain is not available with WavPack hybrid output because the native hybrid encoder cannot apply the submitted-batch fixed-gain authority",
+            "dsd.general_from_dsd.gain.scope",
+            "album-scoped DSD true-peak gain is not available with WavPack hybrid output because the native hybrid encoder cannot apply the submitted-batch fixed-gain authority",
         ));
     }
     let input = required_input_path(step)?;
@@ -1783,7 +1980,7 @@ fn add_sox_pcm_effects(
         args.push("gain".into());
         args.push(gain.render(false));
     }
-    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db {
+    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db() {
         args.push("gain".into());
         args.push(gain.render(false));
     }
@@ -1800,7 +1997,7 @@ fn add_sox_pcm_effects(
         if sinc_active {
             args.push("sinc".into());
             if let Some(pb) = sox_rs.sinc_passband_hz {
-                args.push(format!("-{:.0}", pb)); // negative = lowpass
+                args.push(format!("-{}", render_sox_sinc_passband_hz(pb))); // negative = lowpass
             }
             if let Some(taps) = sox_rs.sinc_taps {
                 args.push("-n".into());
@@ -1855,11 +2052,24 @@ fn add_sox_pcm_effects(
     // for Int32 until runtime tool identity and a successful behavior probe can
     // be bound to planning. The separately qualified DSD Reference path does
     // not use this ordinary builder.
+    // This helper is called only for an active SoX processing stage. A rate
+    // change or gain can make the terminal input fractional even when source
+    // storage width equals target width; an otherwise unprocessed same-depth
+    // integer path must retain the established no-dither behavior. The typed
+    // terminal realization remains authoritative, and the plan/lowering
+    // boundary checks this command against that resolved fact.
+    let processing_produces_fractional_pcm = target_rate_hz.is_some()
+        || context.request.settings.dsd.runtime_album_gain_db().is_some()
+        || context.request.settings.pcm_true_peak.fixed_gain_db().is_some();
     let depth_allows_dither = match effective_depth {
-        Some(depth) => pcm_conversion_reduces_depth(
-            context.request.source.authoritative_pcm_depth(),
-            depth,
-        ),
+        Some(depth) => {
+            target_depth_needs_dither(depth)
+                && (processing_produces_fractional_pcm
+                    || pcm_conversion_reduces_depth(
+                        context.request.source.authoritative_pcm_depth(),
+                        depth,
+                    ))
+        }
         None => true,
     };
     let should_dither =
@@ -1888,18 +2098,18 @@ fn add_sox_pcm_to_dsd_effects(
             args.push("upsample".into());
             args.push(sinc.oversample_factor.to_string());
             args.push("sinc".into());
-            args.push(format!("-{:.0}", sinc.passband_hz));
+            args.push(format!("-{}", render_sox_sinc_passband_hz(sinc.passband_hz)));
             args.push("-n".into());
             args.push(sinc.taps.to_string());
             args.push("-t".into());
-            args.push(format_float(sinc.transition_hz));
+            args.push(render_sox_scalar(sinc.transition_hz));
             if sinc.linear_phase {
                 args.push("-L".into());
             } else {
                 args.push("-M".into());
             }
             args.push("-b".into());
-            args.push(format_float(sinc.kaiser_beta));
+            args.push(render_sox_scalar(sinc.kaiser_beta));
             if sinc.allow_aliasing {
                 args.push("-a".into());
             }
@@ -1910,11 +2120,11 @@ fn add_sox_pcm_to_dsd_effects(
                 }
                 GainCompensation::Linear(value) => {
                     args.push("vol".into());
-                    args.push(format_float(value));
+                    args.push(render_sox_scalar(value));
                 }
                 GainCompensation::Decibels(value) => {
                     args.push("gain".into());
-                    args.push(format!("{value:+.2}"));
+                    args.push(render_sox_gain_db(value));
                 }
                 GainCompensation::Disabled => {}
             }
@@ -1935,20 +2145,26 @@ fn add_sox_dsd_to_pcm_effects(
 ) -> Result<()> {
     match lowpass {
         DsdLowpassMethod::Sinc => {
-            let sinc = context.request.settings.dsd.pcm_to_dsd.sinc;
+            let sinc = context.request.settings.dsd.general_from_dsd.sinc;
+            if sinc.allow_aliasing {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.general_from_dsd.sinc.allow_aliasing",
+                    "general DSD-to-PCM sinc alias permission is not supported by the retained SoX lowerer",
+                ));
+            }
             args.push("sinc".into());
-            args.push(format!("-{:.0}", sinc.passband_hz));
+            args.push(format!("-{}", render_sox_sinc_passband_hz(sinc.passband_hz)));
             args.push("-n".into());
             args.push(sinc.taps.to_string());
             args.push("-t".into());
-            args.push(format_float(sinc.transition_hz));
+            args.push(render_sox_scalar(sinc.transition_hz));
             if sinc.linear_phase {
                 args.push("-L".into());
             } else {
                 args.push("-M".into());
             }
             args.push("-b".into());
-            args.push(format_float(sinc.kaiser_beta));
+            args.push(render_sox_scalar(sinc.kaiser_beta));
             args.push("rate".into());
             args.push("-I".into());
             args.push(target_rate_hz.to_string());
@@ -2017,7 +2233,7 @@ fn effective_target_depth(
     })
 }
 
-fn explicit_int32_dither_requested(
+pub(crate) fn explicit_int32_dither_requested(
     settings: &crate::settings::PipelineSettings,
     target_depth: Option<PcmBitDepth>,
 ) -> bool {
@@ -2026,15 +2242,21 @@ fn explicit_int32_dither_requested(
         && target_depth == Some(PcmBitDepth::Int32)
 }
 
-/// True when the target depth is low enough to benefit from dither.
-/// Int32, Float32, Float64 never need dither.
-fn target_depth_needs_dither(depth: PcmBitDepth) -> bool {
+/// True for the ordinary automatic low-bit-depth dither policy.
+///
+/// This is deliberately not a universal backend capability predicate: Int32 is
+/// excluded from automatic dither, while FFmpeg can still realize an explicit
+/// Int32 dither request. Physical terminal behavior must come from the selected
+/// terminal realization, not from this helper alone.
+pub(crate) fn target_depth_needs_dither(depth: PcmBitDepth) -> bool {
     matches!(depth, PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24)
 }
 
-/// True when a PCM→PCM conversion reduces bit depth (needs dither).
-/// Returns true conservatively when source depth is unknown.
-fn pcm_conversion_reduces_depth(
+/// True when a PCM→PCM conversion reduces precision into a target covered by
+/// the ordinary automatic low-bit-depth dither policy. This does not describe
+/// backend-specific explicit Int32 behavior. Returns true conservatively when
+/// source depth is unknown.
+pub(crate) fn pcm_conversion_reduces_depth(
     source_depth: Option<PcmBitDepth>,
     target_depth: PcmBitDepth,
 ) -> bool {
@@ -2051,31 +2273,31 @@ fn add_sox_dsd_to_pcm_gain(
     dsd: &crate::settings::DsdSettings,
     args: &mut Vec<String>,
 ) -> Result<()> {
-    match dsd.legacy_dsd_to_pcm_gain_mode() {
-        DsdToPcmGainMode::Auto => {
-            args.push("norm".into());
-            args.push(format!("-{:.2}", dsd.legacy_dsd_to_pcm_auto_gain_margin_db()));
-        }
-        DsdToPcmGainMode::Manual => {
-            let gain_db = dsd.legacy_dsd_to_pcm_gain_db().ok_or_else(|| {
-                PlanningError::invalid_settings(
-                    "dsd.dsd_to_pcm_gain_db",
-                    "Manual DSD-to-PCM gain requires a finite dB value",
-                )
-            })?;
+    use crate::settings::SampleGainPolicy;
+
+    match dsd.gain_policy() {
+        SampleGainPolicy::Off => Ok(()),
+        SampleGainPolicy::FixedGain { gain_db } => {
             args.push("gain".into());
-            args.push(format!("{gain_db:+.2}"));
+            args.push(gain_db.render(false));
+            Ok(())
         }
-        DsdToPcmGainMode::Disabled => {
-            // Backward compatibility: older callers only had this optional
-            // field. Keep honoring it without making auto gain the default.
-            if let Some(gain_db) = dsd.legacy_dsd_to_pcm_gain_db() {
+        SampleGainPolicy::TruePeakGuard { .. } | SampleGainPolicy::TruePeakNormalize { .. } => {
+            if let Some(gain_db) = dsd.runtime_album_gain_db() {
+                // The submitted-batch coordinator resolved this scalar with the
+                // shared terminal-aware solver.  Applying it is not a second
+                // policy decision and never invokes SoX sample-peak `norm`.
                 args.push("gain".into());
-                args.push(format!("{gain_db:+.2}"));
+                args.push(gain_db.render(false));
+                Ok(())
+            } else {
+                Err(PlanningError::capability_unavailable(
+                    "dsd_certified_true_peak_gain",
+                    "certified DSD Guard/Normalize requires the typed observation/decision route; Phase 2 must not lower it to SoX norm",
+                ))
             }
         }
     }
-    Ok(())
 }
 
 fn add_sox_dsd_rate_change_effects(
@@ -2083,23 +2305,29 @@ fn add_sox_dsd_rate_change_effects(
     args: &mut Vec<String>,
     target_rate: crate::enums::DsdRate,
     lowpass: DsdLowpassMethod,
-) {
+) -> Result<()> {
     match lowpass {
         DsdLowpassMethod::Sinc => {
-            let sinc = context.request.settings.dsd.pcm_to_dsd.sinc;
+            let sinc = context.request.settings.dsd.general_from_dsd.sinc;
+            if sinc.allow_aliasing {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.general_from_dsd.sinc.allow_aliasing",
+                    "general DSD-to-PCM sinc alias permission is not supported by the retained SoX lowerer",
+                ));
+            }
             args.push("sinc".into());
-            args.push(format!("-{:.0}", sinc.passband_hz));
+            args.push(format!("-{}", render_sox_sinc_passband_hz(sinc.passband_hz)));
             args.push("-n".into());
             args.push(sinc.taps.to_string());
             args.push("-t".into());
-            args.push(format_float(sinc.transition_hz));
+            args.push(render_sox_scalar(sinc.transition_hz));
             if sinc.linear_phase {
                 args.push("-L".into());
             } else {
                 args.push("-M".into());
             }
             args.push("-b".into());
-            args.push(format_float(sinc.kaiser_beta));
+            args.push(render_sox_scalar(sinc.kaiser_beta));
         }
         DsdLowpassMethod::Auto | DsdLowpassMethod::SoxUltra => {}
     }
@@ -2110,6 +2338,7 @@ fn add_sox_dsd_rate_change_effects(
     );
     args.push(target_rate.hz().to_string());
     add_sox_sdm_args(context, args);
+    Ok(())
 }
 
 fn add_sox_sdm_args(context: &PlanContext<'_>, args: &mut Vec<String>) {
@@ -2148,34 +2377,12 @@ fn path_to_string(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn format_float(value: f32) -> String {
-    let mut rendered = format!("{value:.3}");
-    while rendered.contains('.') && rendered.ends_with('0') {
-        rendered.pop();
-    }
-    if rendered.ends_with('.') {
-        rendered.pop();
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn legacy_dsd(
-        gain_mode: DsdToPcmGainMode,
-        margin_db: f32,
-        gain_db: Option<f32>,
-    ) -> DsdSettings {
-        let mut wire = crate::settings::LegacyDsdSettingsWireV1::default();
-        wire.dsd_to_pcm_gain_mode = gain_mode;
-        wire.dsd_to_pcm_auto_gain_margin_db = margin_db;
-        wire.dsd_to_pcm_gain_db = gain_db;
-        DsdSettings::from_legacy_wire(wire)
-    }
-    use crate::plan::{InputSource, MetadataPlanEffect, OutputSink, PlanOperation, PlanRequest, PlanStep};
-    use crate::settings::{DsdSettings, PipelineSettings};
+    use crate::plan::{InputSource, MetadataPlanEffect, OutputSink, PlanAction, PlanOperation, PlanRequest, PlanStep};
+    use crate::settings::{DsdSettings, PipelineSettings, SampleGainPolicy, PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP};
     use crate::enums::SsrcPdfType;
     use crate::source::SourceInfo;
     use std::path::{Path, PathBuf};
@@ -2197,6 +2404,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -2208,6 +2416,7 @@ mod tests {
             output_path: PathBuf::from("output.wav"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -2272,9 +2481,11 @@ mod tests {
                 }),
                 channels: Some(2),
                 duration: None,
+                frame_extent: None,
                 audio_md5: None,
             },
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -2286,16 +2497,16 @@ mod tests {
         settings.target_format = target_format.clone();
         settings.target_sample_rate = crate::enums::RateTarget::PcmHz(96_000);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        settings
-            .dsd
-            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
-        settings
-            .dsd
-            .set_runtime_album_gain_db(Some("2.125000000".parse().unwrap()));
+        settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Album,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
+        settings.dsd.bind_runtime_album_gain(
+            "2.125000000".parse().unwrap(),
+            None,
+            2,
+        );
         let mut request = pcm_request_with(settings, PcmBitDepth::Float64);
         request.source.source_representation = crate::source::SourceRepresentationKind::Dsd;
         request.source.true_source_depth = None;
@@ -2362,11 +2573,61 @@ mod tests {
     }
 
     #[test]
+    fn fixed_gain_same_depth_low_bit_terminal_uses_post_gain_dither_truth() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.dither_type = DitherType::Tpdf;
+        settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "1.000000000".parse().expect("fixed gain"),
+        });
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
+        request.output_path = PathBuf::from("output.flac");
+
+        let typed = match crate::semantic_plan::plan_typed(&request)
+            .expect("typed fixed-gain terminal plan")
+        {
+            crate::semantic_plan::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("fixed-gain terminal should be Ready: {other:?}"),
+        };
+        let realization = typed.nodes.iter().find_map(|node| match node {
+            crate::semantic_plan::TypedPlanNode::Operation {
+                operation: PlanOperation::EncodePcm { .. },
+                candidates,
+                selected_candidate,
+                ..
+            } => candidates.get(*selected_candidate).and_then(|candidate| {
+                candidate.contract.terminal_realization.as_ref()
+            }),
+            _ => None,
+        }).expect("selected fixed-gain terminal realization");
+        let crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) = realization else {
+            panic!("expected PCM fixed-gain terminal realization")
+        };
+        assert_eq!(
+            realization.input_value_domain,
+            crate::semantic_plan::ValueDomain::FiniteFloating,
+        );
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+
+        let lowered = crate::plan_conversion(&request)
+            .expect("production fixed-gain command lowering must agree with typed terminal");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("fixed gain conversion must execute")
+        };
+        let terminal = commands.iter().find(|command| command.tool == ToolIdentifier::Sox)
+            .expect("SoX fixed-gain terminal command");
+        assert!(terminal.args.iter().any(|arg| arg == "gain"), "{:?}", terminal.args);
+        assert!(terminal.args.iter().any(|arg| arg == "dither"), "{:?}", terminal.args);
+    }
+
+    #[test]
     fn pcm_fixed_gain_is_emitted_once_as_a_plain_amplitude_change() {
         let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Float64);
         request.settings.target_format = AudioFormat::Flac;
-        request.settings.pcm_true_peak.fixed_gain_db =
-            Some("3.250000000".parse().expect("fixed gain"));
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "3.250000000".parse().expect("fixed gain"),
+        });
         let step = album_gain_encode_step(AudioFormat::Flac, true);
 
         let ffmpeg = build_ffmpeg_encode_pcm(
@@ -2608,7 +2869,11 @@ mod tests {
     fn pcm_true_peak_lossless_dither_routes_processing_encode_to_sox() {
         let mut request = album_gain_pcm_request(AudioFormat::Flac);
         request.settings.dsd = crate::settings::DsdSettings::default();
-        request.settings.pcm_true_peak.enabled = true;
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
         request.source.source_representation = crate::source::SourceRepresentationKind::Pcm;
         request.settings.dither_type = DitherType::Shibata;
         request.settings.dither_explicit = true;
@@ -2710,6 +2975,211 @@ mod tests {
 
         assert!(filter.contains("dither_method=triangular"), "{filter}");
         assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+    }
+
+    #[test]
+    fn explicit_int32_terminal_contract_matches_production_ffmpeg_lowering() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Float32);
+        request.output_path = PathBuf::from("output.flac");
+
+        let typed = match crate::semantic_plan::plan_typed(&request)
+            .expect("typed terminal plan")
+        {
+            crate::semantic_plan::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("ordinary explicit Int32 terminal should be Ready: {other:?}"),
+        };
+        let realization = typed.nodes.iter().find_map(|node| match node {
+            crate::semantic_plan::TypedPlanNode::Operation {
+                operation: PlanOperation::EncodePcm { .. },
+                candidates,
+                selected_candidate,
+                ..
+            } => candidates.get(*selected_candidate).and_then(|candidate| {
+                candidate.contract.terminal_realization.as_ref()
+            }),
+            _ => None,
+        }).expect("selected terminal realization");
+        let crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) = realization else {
+            panic!("expected PCM terminal realization")
+        };
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+
+        let lowered = crate::plan_conversion(&request).expect("production command lowering");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("depth-changing ordinary conversion must execute")
+        };
+        let dither_methods = commands
+            .iter()
+            .flat_map(|command| command.args.iter())
+            .filter(|arg| arg.contains("dither_method="))
+            .collect::<Vec<_>>();
+        assert_eq!(dither_methods.len(), 1, "{dither_methods:?}");
+        assert!(dither_methods[0].contains("dither_method=triangular"));
+    }
+
+    #[test]
+    fn same_depth_explicit_int32_terminal_executes_ffmpeg_dither() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+        request.output_path = PathBuf::from("output.flac");
+
+        let lowered = crate::plan_conversion(&request)
+            .expect("same-depth explicit Int32 FFmpeg dither must lower");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("same-depth explicit Int32 dither must execute")
+        };
+        let dither_commands = commands
+            .iter()
+            .filter(|command| {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("dither_method=triangular"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dither_commands.len(), 1, "{commands:#?}");
+        assert_eq!(dither_commands[0].tool, ToolIdentifier::Ffmpeg);
+        let dither_method_count = commands
+            .iter()
+            .flat_map(|command| command.args.iter())
+            .map(|arg| arg.matches("dither_method=").count())
+            .sum::<usize>();
+        assert_eq!(dither_method_count, 1, "{commands:#?}");
+
+        let mut control = request.clone();
+        control.settings.dither_explicit = false;
+        let lowered = crate::plan_conversion(&control)
+            .expect("same-depth non-explicit Int32 control must lower");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("format-changing control must execute")
+        };
+        assert!(
+            !commands
+                .iter()
+                .flat_map(|command| command.args.iter())
+                .any(|arg| arg.contains("dither_method=")),
+            "non-explicit Int32 control must remain undithered: {commands:#?}",
+        );
+    }
+
+    #[test]
+    fn auto_backend_realizes_explicit_int32_dither_with_ffmpeg_for_wav() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Wav;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        settings.metadata.preserve_artwork = false;
+        let request = pcm_request_with(settings, PcmBitDepth::Float64);
+
+        let typed = match crate::semantic_plan::plan_typed(&request)
+            .expect("typed explicit Int32 WAV plan")
+        {
+            crate::semantic_plan::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("ordinary explicit Int32 WAV terminal should be Ready: {other:?}"),
+        };
+        let realization = typed
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::semantic_plan::TypedPlanNode::Operation {
+                    operation: PlanOperation::EncodePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => candidates
+                    .get(*selected_candidate)
+                    .and_then(|candidate| candidate.contract.terminal_realization.as_ref()),
+                _ => None,
+            })
+            .expect("selected terminal realization");
+        let crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) = realization else {
+            panic!("expected PCM terminal realization")
+        };
+        assert_eq!(realization.selected_tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+
+        let lowered = crate::plan_conversion(&request)
+            .expect("Auto must realize the selected FFmpeg Int32 terminal");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("Float64 to WAV Int32 must execute")
+        };
+        let terminal = commands
+            .iter()
+            .find(|command| {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("dither_method=triangular"))
+            })
+            .expect("physical FFmpeg dither terminal");
+        assert_eq!(terminal.tool, ToolIdentifier::Ffmpeg, "{commands:#?}");
+        assert!(
+            commands.iter().all(|command| command.tool != ToolIdentifier::Sox),
+            "SoX must not replace the selected explicit Int32 FFmpeg terminal: {commands:#?}",
+        );
+
+        let mut control = request.clone();
+        control.settings.dither_explicit = false;
+        let lowered = crate::plan_conversion(&control)
+            .expect("non-explicit Int32 WAV control must lower");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("Float64 to WAV Int32 control must execute")
+        };
+        assert!(
+            commands.iter().all(|command| {
+                !command.args.iter().any(|arg| {
+                    arg == "dither" || arg.contains("dither_method=")
+                })
+            }),
+            "non-explicit Int32 control must not gain dither: {commands:#?}",
+        );
+    }
+
+    #[test]
+    fn same_format_source_depth_explicit_int32_dither_blocks_passthrough() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Wav;
+        settings.target_bit_depth = BitDepthTarget::Source;
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        settings.metadata.preserve_artwork = false;
+        let request = pcm_request_with(settings, PcmBitDepth::Int32);
+
+        let lowered = crate::plan_conversion(&request)
+            .expect("same-format explicit Int32 dither must lower");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("explicit Int32 dither must block passthrough")
+        };
+        let terminal = commands
+            .iter()
+            .find(|command| {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("dither_method=triangular"))
+            })
+            .expect("explicit same-format FFmpeg dither terminal");
+        assert_eq!(terminal.tool, ToolIdentifier::Ffmpeg, "{commands:#?}");
+
+        let mut control = request.clone();
+        control.settings.dither_explicit = false;
+        control.settings.metadata.preserve_artwork = true;
+        let lowered = crate::plan_conversion(&control)
+            .expect("same-format non-explicit Int32 control must plan");
+        assert!(
+            matches!(&lowered.action, PlanAction::PassthroughCopy { .. }),
+            "non-explicit same-format Int32 control should retain passthrough eligibility: {lowered:#?}",
+        );
     }
 
     #[test]
@@ -2864,26 +3334,125 @@ mod tests {
     }
 
     #[test]
-    fn explicit_int32_dither_is_not_emitted_by_ssrc() {
+    fn explicit_int32_dither_direct_ssrc_terminal_remains_uncommissioned() {
         let mut settings = PipelineSettings::default();
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
         settings.dither_type = DitherType::Tpdf;
         settings.dither_explicit = true;
 
-        let command = ssrc_resample_command_with(
+        let error = ssrc_resample_command_with(
             settings.clone(),
             44_100,
             Some(PcmBitDepth::Int32),
         )
-        .expect("SSRC Int32 command");
+        .expect_err("direct SSRC Int32 dither ownership is not commissioned");
+        assert!(format!("{error:?}").contains("dither mapping is unavailable"));
 
-        assert_no_arg(&command.args, "--dither");
-        assert_no_arg(&command.args, "--pdf");
+        let error = ssrc_resample_command_with(settings, 44_100, None)
+            .expect_err("settings-carried Int32 dither must remain uncommissioned");
+        assert!(format!("{error:?}").contains("dither mapping is unavailable"));
+    }
 
-        let depth_carried_elsewhere = ssrc_resample_command_with(settings, 44_100, None)
-            .expect("SSRC Int32 command with settings-carried depth");
-        assert_no_arg(&depth_carried_elsewhere.args, "--dither");
-        assert_no_arg(&depth_carried_elsewhere.args, "--pdf");
+    #[test]
+    fn ssrc_rate_change_keeps_explicit_int32_dither_on_final_ffmpeg_terminal() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_sample_rate = crate::enums::RateTarget::PcmHz(44_100);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.nyquist_transition = crate::enums::NyquistTransition::BrickWall;
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+        request.output_path = PathBuf::from("output.flac");
+
+        let typed = match crate::semantic_plan::plan_typed(&request)
+            .expect("typed SSRC explicit Int32 plan")
+        {
+            crate::semantic_plan::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("ordinary SSRC explicit Int32 route should be Ready: {other:?}"),
+        };
+        let realization = typed
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::semantic_plan::TypedPlanNode::Operation {
+                    operation: PlanOperation::EncodePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => candidates
+                    .get(*selected_candidate)
+                    .and_then(|candidate| candidate.contract.terminal_realization.as_ref()),
+                _ => None,
+            })
+            .expect("selected terminal realization");
+        let crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) = realization else {
+            panic!("expected PCM terminal realization")
+        };
+        assert_eq!(realization.selected_tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(
+            realization.input_precision,
+            crate::semantic_plan::StoragePrecision::Pcm(PcmBitDepth::Float64)
+        );
+        assert_eq!(
+            realization.input_value_domain,
+            crate::semantic_plan::ValueDomain::FiniteFloating
+        );
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+
+        let lowered = crate::plan_conversion(&request)
+            .expect("SSRC route must preserve the selected final FFmpeg Int32 dither");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("rate-changing SSRC route must execute")
+        };
+
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC resample command");
+        assert_arg(&ssrc.args, "--bits", "-64");
+        assert_no_arg(&ssrc.args, "--dither");
+        assert_no_arg(&ssrc.args, "--pdf");
+
+        let dither_commands = commands
+            .iter()
+            .filter(|command| {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("dither_method=triangular"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dither_commands.len(), 1, "{commands:#?}");
+        assert_eq!(dither_commands[0].tool, ToolIdentifier::Ffmpeg);
+        let dither_method_count = commands
+            .iter()
+            .flat_map(|command| command.args.iter())
+            .map(|arg| arg.matches("dither_method=").count())
+            .sum::<usize>();
+        assert_eq!(dither_method_count, 1, "{commands:#?}");
+
+        let mut control = request.clone();
+        control.settings.dither_explicit = false;
+        let lowered = crate::plan_conversion(&control)
+            .expect("SSRC non-explicit Int32 control must lower");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("rate-changing SSRC control must execute")
+        };
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC resample command");
+        assert_arg(&ssrc.args, "--bits", "-64");
+        assert_no_arg(&ssrc.args, "--dither");
+        assert_no_arg(&ssrc.args, "--pdf");
+        assert!(
+            !commands
+                .iter()
+                .flat_map(|command| command.args.iter())
+                .any(|arg| arg.contains("dither_method=")),
+            "non-explicit Int32 control must leave final FFmpeg packaging undithered: {commands:#?}",
+        );
     }
 
     #[test]
@@ -2899,14 +3468,53 @@ mod tests {
     }
 
     #[test]
-    fn ssrc_command_emits_global_none_as_no_shaper_without_pdf_override() {
+    fn ssrc_command_emits_global_none_as_no_dither_or_pdf() {
         let mut settings = PipelineSettings::default();
         settings.dither_type = DitherType::None;
 
         let command = ssrc_resample_command_with(settings, 44_100, Some(PcmBitDepth::Int16)).unwrap();
 
-        assert_arg(&command.args, "--dither", "99");
+        assert_no_arg(&command.args, "--dither");
         assert_no_arg(&command.args, "--pdf");
+    }
+
+    #[test]
+    fn same_depth_int16_tpdf_is_still_owned_by_the_ssrc_integer_terminal() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Tpdf;
+
+        let resolved = resolve_ssrc_dither_for_rate(
+            &settings,
+            Some(PcmBitDepth::Int16),
+            Some(PcmBitDepth::Int16),
+            44_100,
+        )
+        .expect("same-depth terminal dither resolution");
+
+        assert_eq!(resolved.dither_id, Some(99));
+        assert_eq!(resolved.pdf_type, Some(SsrcPdfType::Triangular));
+        assert_eq!(resolved.origin, SsrcDitherOrigin::GlobalExact);
+        assert_eq!(resolved.availability, SsrcDitherAvailability::Active);
+    }
+
+    #[test]
+    fn pdf_only_native_override_with_global_none_defaults_to_id99_with_explicit_pdf() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::None;
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Rectangular);
+
+        let resolved = resolve_ssrc_dither_for_rate(
+            &settings,
+            Some(PcmBitDepth::Int24),
+            Some(PcmBitDepth::Int16),
+            44_100,
+        )
+        .expect("PDF-only native override");
+
+        assert_eq!(resolved.dither_id, Some(99));
+        assert_eq!(resolved.pdf_type, Some(SsrcPdfType::Rectangular));
+        assert_eq!(resolved.origin, SsrcDitherOrigin::NativeOverride);
+        assert_eq!(resolved.availability, SsrcDitherAvailability::Active);
     }
 
     #[test]
@@ -3068,6 +3676,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let mut settings = PipelineSettings::default();
@@ -3082,6 +3691,7 @@ mod tests {
             output_path: PathBuf::from("track.wv"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3140,6 +3750,7 @@ mod tests {
         hybrid_settings.target_bit_depth =
             crate::enums::BitDepthTarget::Pcm(PcmBitDepth::Int24);
         hybrid_settings.wavpack.hybrid = true;
+        hybrid_settings.metadata.preserve_artwork = false;
         let hybrid_request = PlanRequest {
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
@@ -3149,6 +3760,7 @@ mod tests {
             output_path: PathBuf::from("track.wv"),
             source: request.source.clone(),
             settings: hybrid_settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3158,9 +3770,24 @@ mod tests {
                 .is_supported(),
             "hybrid WavPack Int24 keeps the ffmpeg plugin (wavpack CLI delegate)"
         );
+        let hybrid_plan = crate::plan_conversion(&hybrid_request)
+            .expect("ordinary WavPack hybrid plan must preserve the native delegate");
+        let PlanAction::Execute { commands, .. } = hybrid_plan.action else {
+            panic!("ordinary WavPack hybrid conversion must execute")
+        };
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.tool == ToolIdentifier::Custom("wavpack".to_owned())),
+            "selected terminal realization must admit the existing native wavpack delegate",
+        );
 
         let mut hard_ceiling_hybrid = hybrid_request.clone();
-        hard_ceiling_hybrid.settings.pcm_true_peak.enabled = true;
+        hard_ceiling_hybrid.settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
         assert!(
             !SoxPlugin
                 .supports(&hard_ceiling_hybrid.context(), &step(false))
@@ -3175,8 +3802,9 @@ mod tests {
         );
 
         let mut fixed_gain_hybrid = hybrid_request.clone();
-        fixed_gain_hybrid.settings.pcm_true_peak.fixed_gain_db =
-            Some("2.500000000".parse().expect("valid fixed gain"));
+        fixed_gain_hybrid.settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "2.500000000".parse().expect("valid fixed gain"),
+        });
         assert!(
             !SoxPlugin
                 .supports(&fixed_gain_hybrid.context(), &step(false))
@@ -3255,6 +3883,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let mut settings = PipelineSettings::default();
@@ -3268,6 +3897,7 @@ mod tests {
             output_path: PathBuf::from("track.aac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3305,6 +3935,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let mut settings = PipelineSettings::default();
@@ -3317,6 +3948,7 @@ mod tests {
             output_path: PathBuf::from("track.m4b"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3356,6 +3988,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
 
@@ -3370,6 +4003,7 @@ mod tests {
             output_path: PathBuf::from("track.m4a"),
             source: source.clone(),
             settings: aac_settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3398,6 +4032,7 @@ mod tests {
             output_path: PathBuf::from("track.m4a"),
             source,
             settings: alac_settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3435,6 +4070,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -3446,6 +4082,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3540,6 +4177,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -3551,6 +4189,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3603,6 +4242,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -3614,6 +4254,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3665,6 +4306,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: Some("0123456789abcdef0123456789abcdef".into()),
         };
         let request = PlanRequest {
@@ -3676,6 +4318,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3702,44 +4345,42 @@ mod tests {
     }
 
     #[test]
-    fn dsd_to_pcm_manual_gain_without_value_fails_loudly() {
-        let dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, None);
+    fn dsd_fixed_gain_emits_plain_gain_and_off_emits_nothing() {
+        let mut dsd = DsdSettings::default();
+        dsd.set_gain_policy(SampleGainPolicy::FixedGain {
+            gain_db: "2.250000000".parse().unwrap(),
+        });
         let mut args = Vec::new();
+        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
+        assert_eq!(args, vec!["gain", "2.250000000"]);
 
-        let result = add_sox_dsd_to_pcm_gain(&dsd, &mut args);
-
-        assert!(result.is_err());
+        dsd.set_gain_policy(SampleGainPolicy::Off);
+        args.clear();
+        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
         assert!(args.is_empty());
     }
 
     #[test]
-    fn dsd_to_pcm_manual_gain_with_value_emits_gain() {
-        let dsd = legacy_dsd(DsdToPcmGainMode::Manual, 0.15, Some(2.25));
-        let mut args = Vec::new();
-
-        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
-
-        assert_eq!(args, vec!["gain", "+2.25"]);
-    }
-
-    #[test]
-    fn dsd_to_pcm_auto_gain_emits_norm_margin() {
-        let dsd = legacy_dsd(DsdToPcmGainMode::Auto, 0.50, None);
-        let mut args = Vec::new();
-
-        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
-
-        assert_eq!(args, vec!["norm", "-0.50"]);
-    }
-
-    #[test]
-    fn dsd_to_pcm_disabled_gain_preserves_legacy_fixed_db() {
-        let dsd = legacy_dsd(DsdToPcmGainMode::Disabled, 0.15, Some(-1.5));
-        let mut args = Vec::new();
-
-        add_sox_dsd_to_pcm_gain(&dsd, &mut args).unwrap();
-
-        assert_eq!(args, vec!["gain", "-1.50"]);
+    fn dsd_certified_gain_never_falls_back_to_sox_norm() {
+        for policy in [
+            SampleGainPolicy::TruePeakGuard {
+                target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                scope: crate::enums::TruePeakScope::Track,
+                scan: crate::enums::TruePeakScanTier::Fast,
+            },
+            SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                scope: crate::enums::TruePeakScope::Track,
+                scan: crate::enums::TruePeakScanTier::Reference,
+            },
+        ] {
+            let mut dsd = DsdSettings::default();
+            dsd.set_gain_policy(policy);
+            let mut args = Vec::new();
+            let error = add_sox_dsd_to_pcm_gain(&dsd, &mut args).expect_err("unresolved certified policy must refuse");
+            assert!(matches!(error, PlanningError::CapabilityUnavailable { .. }));
+            assert!(!args.iter().any(|arg| arg == "norm"));
+        }
     }
 
     fn dsd_sinc_guard_command(source_hz: u32, target_rate_hz: u32) -> PlannedCommand {
@@ -3758,6 +4399,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -3769,6 +4411,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3809,6 +4452,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let request = PlanRequest {
@@ -3819,6 +4463,7 @@ mod tests {
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         };
@@ -3926,85 +4571,50 @@ mod tests {
     }
 
     #[test]
-    fn dsd_to_pcm_auto_gain_golden_sox_command_chain() {
+    fn dsd_to_pcm_directional_sinc_uses_from_dsd_settings() {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
-        settings.dither_type = DitherType::Shibata;
-        settings.dsd = crate::settings::DsdSettings::from_legacy_wire(
-            crate::settings::LegacyDsdSettingsWireV1 {
-                dsd_to_pcm_gain_mode: DsdToPcmGainMode::Auto,
-                dsd_to_pcm_auto_gain_margin_db: 0.15,
-                dsd_to_pcm_gain_db: None,
-                ..Default::default()
-            },
-        );
-
+        settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
+        settings.dsd.general_from_dsd.sinc.taps = 4096;
+        settings.dsd.general_from_dsd.sinc.passband_hz = 24_000.0;
+        settings.dsd.pcm_to_dsd.sinc.taps = 8192;
         let source = SourceInfo {
             dsd_source_kind: None,
-
             format: AudioFormat::Dsf,
             codec: crate::enums::AudioCodec::Dsd,
             sample_rate_hz: Some(2_822_400),
             bit_depth: None,
             true_source_depth: None,
-            source_representation: Default::default(),
+            source_representation: crate::source::SourceRepresentationKind::Dsd,
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
-
         let request = PlanRequest {
-            resolved_output_target: None,
-            reference_programme_scope: Default::default(),
-            planned_riff_non_audio_upper_bound_bytes: None,
-
-            input_path: PathBuf::from("input.dsf"),
+            input_path: PathBuf::from("source.dsf"),
             output_path: PathBuf::from("output.flac"),
             source,
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
         };
-        let context = request.context();
-        let step = PlanStep::new(
-            0,
-            PlanOperation::DsdToPcm {
-                target_format: AudioFormat::Flac,
-                target_rate_hz: 88_200,
-                target_bit_depth: PcmBitDepth::Int16,
-                lowpass: DsdLowpassMethod::SoxUltra,
-            },
-            InputSource::Path(PathBuf::from("input.dsf")),
-            OutputSink::Path(PathBuf::from("output.flac")),
-            "Create PCM output",
-        );
-
-        let command = SoxPlugin.build_command(&context, &step).unwrap();
-
-        assert_eq!(command.tool, ToolIdentifier::Sox);
-        assert_eq!(
-            command.args,
-            vec![
-                "-S",
-                "input.dsf",
-                "-b",
-                "16",
-                "-C",
-                "8",
-                "output.flac",
-                "rate",
-                "-u",
-                "88200",
-                "sinc",
-                "-a",
-                "180",
-                "-25000",
-                "norm",
-                "-0.15",
-                "dither",
-                "-s",
-            ]
-        );
+        let mut args = Vec::new();
+        add_sox_dsd_to_pcm_effects(
+            &request.context(),
+            &mut args,
+            88_200,
+            PcmBitDepth::Int24,
+            DsdLowpassMethod::Sinc,
+        )
+        .unwrap();
+        assert!(args.iter().any(|arg| arg == "4096"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "8192"), "{args:?}");
     }
+
 }

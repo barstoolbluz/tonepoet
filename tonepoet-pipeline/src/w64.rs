@@ -5,7 +5,7 @@
 //! metadata, and alignment padding; audio payload bytes are never buffered.
 
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 const W64_RIFF_GUID: [u8; 16] = *b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\0\0";
 const W64_WAVE_GUID: [u8; 16] = *b"wave\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
@@ -103,6 +103,14 @@ pub struct W64ExactStructure {
     pub sample_frames: u64,
     /// Total validated zero alignment padding bytes.
     pub alignment_padding_bytes: u64,
+}
+
+impl W64ExactStructure {
+    /// Byte offset of the first sample byte in the validated Wave64 data chunk.
+    #[must_use]
+    pub const fn data_payload_offset(self) -> u64 {
+        self.data_chunk_offset + CHUNK_HEADER_BYTES
+    }
 }
 
 /// Exact Wave64 validation failure.
@@ -604,6 +612,29 @@ pub fn validate_exact_w64_pcm<R: Read + Seek>(
     validate_exact_w64_pcm_inner(reader, expected.into(), Some(expected.sample_frames))
 }
 
+/// Validate an exact PCM Wave64 carrier and copy only its declared audio payload.
+///
+/// This is the production payload bridge used by the protected SSRC path and by
+/// qualification. The copy occurs only after the complete Wave64 structure and
+/// PCM representation have been validated by [`inspect_exact_w64_pcm`].
+pub fn copy_exact_w64_pcm_payload<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    expected: W64PcmFormatExpectation,
+) -> Result<W64ExactStructure, W64ValidationError> {
+    let structure = inspect_exact_w64_pcm(reader, expected)?;
+    reader.seek(SeekFrom::Start(structure.data_payload_offset()))?;
+    let mut payload = (&mut *reader).take(structure.declared_data_bytes);
+    let copied = std::io::copy(&mut payload, writer)?;
+    if copied != structure.declared_data_bytes {
+        return Err(W64ValidationError::invalid(format!(
+            "validated Wave64 payload copy was short: expected {} bytes, copied {}",
+            structure.declared_data_bytes, copied,
+        )));
+    }
+    Ok(structure)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,4 +867,69 @@ mod tests {
         let error = validate_exact_w64_pcm(&mut Cursor::new(bytes), expected).unwrap_err();
         assert!(error.to_string().contains("physical file"));
     }
+
+    #[test]
+    fn exact_payload_bridge_copies_only_validated_bytes_and_rejects_geometry_drift() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 96_000,
+            channels: 2,
+            bits_per_sample: 64,
+            sample_frames: 4,
+            encoding: W64SampleEncoding::FloatingPoint,
+        };
+        let bytes = fixture(expected, true);
+        let expected_payload_bytes = usize::try_from(
+            expected.sample_frames * u64::from(expected.channels) * 8,
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        let parsed = copy_exact_w64_pcm_payload(
+            &mut Cursor::new(bytes.clone()),
+            &mut raw,
+            W64PcmFormatExpectation::from(expected),
+        )
+        .expect("valid Float64 Wave64 must bridge exactly");
+        assert_eq!(parsed.declared_data_bytes as usize, expected_payload_bytes);
+        assert_eq!(raw, vec![0_u8; expected_payload_bytes]);
+
+        for wrong in [
+            W64PcmFormatExpectation {
+                sample_rate_hz: 44_100,
+                ..expected.into()
+            },
+            W64PcmFormatExpectation {
+                channels: 1,
+                ..expected.into()
+            },
+            W64PcmFormatExpectation {
+                bits_per_sample: 32,
+                ..expected.into()
+            },
+            W64PcmFormatExpectation {
+                encoding: W64SampleEncoding::SignedInteger,
+                ..expected.into()
+            },
+        ] {
+            let mut sink = Vec::new();
+            assert!(copy_exact_w64_pcm_payload(
+                &mut Cursor::new(bytes.clone()),
+                &mut sink,
+                wrong,
+            )
+            .is_err());
+            assert!(sink.is_empty());
+        }
+
+        let mut corrupt_extent = bytes;
+        corrupt_extent[16..24].copy_from_slice(&0_u64.to_le_bytes());
+        let mut sink = Vec::new();
+        assert!(copy_exact_w64_pcm_payload(
+            &mut Cursor::new(corrupt_extent),
+            &mut sink,
+            expected.into(),
+        )
+        .is_err());
+        assert!(sink.is_empty());
+    }
+
 }

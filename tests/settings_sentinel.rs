@@ -1,6 +1,15 @@
 #![allow(clippy::float_cmp)]
 
+//! Phase-2 settings sentinels.
+//!
+//! The Phase-1 suite used the retired dual-origin DSD wire model as part
+//! of its field inventory. Phase 2 deliberately removes that schema. These
+//! tests retain the same propagation/inventory role against the single strict
+//! directional representation instead of keeping a compatibility shadow type.
+
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+
 use tonepoet::convert::pipeline::{build_pipeline_request, PipelineRequest};
 use tonepoet::convert::simple_wizard::{
     DitherType as WizardDitherType, NyquistTransition as WizardNyquistTransition,
@@ -12,154 +21,35 @@ use tonepoet::convert::{
     WavPackMode as QueueWavPackMode,
 };
 use tonepoet_pipeline::{
-    AacProfile, AacSettings, AudioFormat, BitDepthTarget, DitherType,
-    DsdFilterPreset, DsdLowpassMethod, DsdNoiseShaper, DsdSettings, DsdToPcmGainMode, FlacSettings,
-    LegacyDsdBehavior,
-    GainCompensation, MetadataSettings, ModulatorOrder, Mp3Mode, Mp3Settings,
-    NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth, PipelineSettings,
-    PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings, ResampleQuality,
-    SETTINGS_FINGERPRINT_FIELD_PATHS, SincFilterSettings,
-    SoxResamplerSettings, SoxSincPhase, SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings,
-    TrellisSettings,
-    VerificationSettings, WavPackMode,
-    WavPackSettings,
+    AacProfile, AacSettings, AudioFormat, BitDepthTarget, DbNano, DitherType,
+    DsdFilterPreset, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdLowpassMethod,
+    DsdNoiseShaper, DsdReconstructionSelection, DsdReferencePolicyVersion, DsdSettings,
+    DsdSourceGainMode, DsdSourcePathway, GainCompensation, MetadataSettings, ModulatorOrder,
+    Mp3Mode, Mp3Settings, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth,
+    PipelineSettings, PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings,
+    ResampleQuality, SampleGainPolicy, SoxResamplerSettings, SoxSincPhase,
+    SoxrResamplerSettings, SsrcPdfType, SsrcProfile, SsrcSettings, TrellisSettings,
+    TruePeakScanTier, TruePeakScope, VerificationSettings, WavPackMode, WavPackSettings,
+    SETTINGS_FINGERPRINT_FIELD_PATHS, SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT,
+    SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS,
 };
 
-/// Raw one-object sentinel with every `PipelineSettings` field set away from
-/// `PipelineSettings::default()`.
-///
-/// This fixture intentionally fails `PipelineSettings::validate()`: current
-/// invariants make a globally valid one-object all-non-default sentinel
-/// impossible because `metadata.store_source_audio_md5 = true` requires both
-/// `metadata.transfer_tags = true` and a FLAC target, while
-/// `metadata.transfer_tags` defaults to `true` and `target_format` defaults to
-/// `Flac`. The full-chain tests below therefore use the valid sentinel pair.
-///
-/// Sentinel values:
-/// - target_format: Custom { extension: "sent", display_name: "Sentinel Audio" }
-/// - target_sample_rate: PcmHz(96_000)
-/// - target_bit_depth: Pcm(Float32)
-/// - resample_quality: High
-/// - nyquist_transition: BrickWall
-/// - dither_type: Gesemann
-/// - dither_explicit: true
-/// - preferred_tool: Custom("sentinel-tool")
-/// - force_encode: true
-/// - flac.compression_level: 5
-/// - flac.verify: true
-/// - flac.write_md5: false
-/// - mp3.mode: Abr
-/// - mp3.bitrate_kbps: 257
-/// - mp3.vbr_quality: 7
-/// - aac.profile: HeAacV2
-/// - aac.bitrate_kbps: 384
-
-/// - opus.content_type: Speech
-/// - opus.bitrate_kbps: 111
-/// - opus.complexity: 7
-/// - wavpack.mode: VeryHigh
-/// - wavpack.hybrid: true
-/// - wavpack.hybrid_bitrate_kbps: 256
-/// - wavpack.correction_file: false
-/// - ssrc.force: true
-
-/// - ssrc.insane_mode: true
-/// - sox_resampler.chebyshev: true
-/// - sox_resampler.bandwidth_pct: Some(97.0)
-/// - sox_resampler.phase: Some(25)
-/// - sox_resampler.allow_aliasing: true
-/// - sox_resampler.sinc_taps: Some(262144)
-/// - sox_resampler.sinc_attenuation_db: Some(120)
-/// - sox_resampler.sinc_passband_hz: Some(22050.0)
-/// - sox_resampler.sinc_transition_hz: Some(500.0)
-/// - sox_resampler.sinc_kaiser_beta: Some(16.0)
-/// - sox_resampler.sinc_phase: Some(Minimum)
-/// - soxr_resampler.chebyshev: true
-/// - soxr_resampler.cutoff: Some(0.97)
-/// - soxr_resampler.phase: Some(25)
-/// - ssrc.profile: Some(Long)
-/// - ssrc.attenuation_db: Some(3.0)
-/// - ssrc.min_phase: true
-/// - ssrc.dither_id: Some(2)
-/// - ssrc.pdf_type: Some(Triangular)
-/// - dsd.dsd_to_pcm_gain_mode: Manual
-/// - dsd.dsd_to_pcm_auto_gain_margin_db: 0.50
-/// - dsd.noise_shaper: Crfb
-/// - dsd.modulator_order: Order7
-/// - dsd.trellis.lookahead: 17
-/// - dsd.trellis.nodes: 9
-/// - dsd.trellis.latency: Some(321)
-/// - dsd.pcm_to_dsd_filter: Sinc
-/// - dsd.dsd_to_pcm_lowpass: Sinc
-/// - dsd.dsd_to_pcm_gain_db: Some(-3.25)
-/// - dsd.sinc.oversample_factor: 16
-/// - dsd.sinc.taps: 131_072
-/// - dsd.sinc.passband_hz: 30_000.0
-/// - dsd.sinc.transition_hz: 750.0
-/// - dsd.sinc.kaiser_beta: 12.5
-/// - dsd.sinc.linear_phase: false
-/// - dsd.sinc.allow_aliasing: true
-/// - dsd.gain_compensation: Decibels(1.5)
-/// - metadata.transfer_tags: false
-/// - metadata.preserve_artwork: false
-/// - metadata.store_source_audio_md5: true
-/// - verification.verify_after_encode: true
-/// - verification.prefer_native_flac_verify: false
-/// - replay_gain.mode: Some(Both)
-/// - replay_gain.prevent_clipping: false
-/// - replay_gain.existing_tags: SkipIfComplete
-fn legacy_dsd_behavior(settings: &DsdSettings) -> LegacyDsdBehavior {
-    settings.legacy_behavior().unwrap_or(LegacyDsdBehavior {
-        lowpass: DsdLowpassMethod::Auto,
-        gain_mode: DsdToPcmGainMode::Disabled,
-        auto_gain_margin_db: 0.15,
-        gain_db: None,
-    })
+fn db(value: &str) -> DbNano {
+    value.parse().expect("valid dB fixture")
 }
 
-fn sentinel_dsd_settings() -> DsdSettings {
-    serde_json::from_value(serde_json::json!({
-        "noise_shaper": DsdNoiseShaper::Crfb,
-        "modulator_order": ModulatorOrder::Order7,
-        "trellis": TrellisSettings {
-            lookahead: 17,
-            nodes: 9,
-            latency: Some(321),
-        },
-        "pcm_to_dsd_filter": DsdFilterPreset::Sinc,
-        "dsd_to_pcm_lowpass": DsdLowpassMethod::Sinc,
-        "dsd_to_pcm_gain_mode": DsdToPcmGainMode::Manual,
-        "dsd_to_pcm_auto_gain_margin_db": 0.50,
-        "dsd_to_pcm_gain_db": -3.25,
-        "sinc": SincFilterSettings {
-            oversample_factor: 16,
-            taps: 131_072,
-            passband_hz: 30_000.0,
-            transition_hz: 750.0,
-            kaiser_beta: 12.5,
-            linear_phase: false,
-            allow_aliasing: true,
-        },
-        "gain_compensation": GainCompensation::Decibels(1.5),
-    }))
-    .expect("valid complete legacy DSD sentinel")
-}
-
-fn raw_all_non_default_sentinel() -> PipelineSettings {
-    PipelineSettings {
-        target_format: AudioFormat::Custom {
-            extension: "sent".to_string(),
-            display_name: "Sentinel Audio".to_string(),
-        },
+fn rich_common_settings() -> PipelineSettings {
+    let mut settings = PipelineSettings {
+        target_format: AudioFormat::Flac,
         target_sample_rate: RateTarget::PcmHz(96_000),
-        target_bit_depth: BitDepthTarget::Pcm(PcmBitDepth::Float32),
+        target_bit_depth: BitDepthTarget::Pcm(PcmBitDepth::Int24),
         resample_quality: ResampleQuality::High,
         nyquist_transition: NyquistTransition::BrickWall,
         dither_type: DitherType::Gesemann,
         dither_explicit: true,
         preferred_tool: PreferredTool::Custom("sentinel-tool".to_string()),
         force_encode: true,
-        flac: FlacSettings {
+        flac: tonepoet_pipeline::FlacSettings {
             compression_level: 5,
             verify: true,
             write_md5: false,
@@ -198,9 +88,9 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             bandwidth_pct: Some(97.0),
             phase: Some(25),
             allow_aliasing: true,
-            sinc_taps: Some(262144),
+            sinc_taps: Some(262_144),
             sinc_attenuation_db: Some(120),
-            sinc_passband_hz: Some(22050.0),
+            sinc_passband_hz: Some(22_050.0),
             sinc_transition_hz: Some(500.0),
             sinc_kaiser_beta: Some(16.0),
             sinc_phase: Some(SoxSincPhase::Minimum),
@@ -210,10 +100,10 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             cutoff: Some(0.97),
             phase: Some(25),
         },
-        dsd: sentinel_dsd_settings(),
+        dsd: DsdSettings::default(),
         pcm_true_peak: Default::default(),
         metadata: MetadataSettings {
-            transfer_tags: false,
+            transfer_tags: true,
             preserve_artwork: false,
             store_source_audio_md5: true,
         },
@@ -226,46 +116,108 @@ fn raw_all_non_default_sentinel() -> PipelineSettings {
             prevent_clipping: false,
             existing_tags: tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete,
         },
-    }
-}
+    };
 
-/// Valid FLAC sentinel for fields whose non-default values require FLAC output.
-fn flac_md5_sentinel() -> PipelineSettings {
-    let mut settings = raw_all_non_default_sentinel();
-    settings.target_format = AudioFormat::Flac;
-    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-    settings.metadata.transfer_tags = true;
+    settings.dsd.pcm_to_dsd.noise_shaper = DsdNoiseShaper::Crfb;
+    settings.dsd.pcm_to_dsd.modulator_order = ModulatorOrder::Order7;
+    settings.dsd.pcm_to_dsd.trellis = Some(TrellisSettings {
+        lookahead: 17,
+        nodes: 9,
+        latency: Some(321),
+    });
+    settings.dsd.pcm_to_dsd.filter = DsdFilterPreset::Sinc;
+    settings.dsd.pcm_to_dsd.sinc.oversample_factor = 16;
+    settings.dsd.pcm_to_dsd.sinc.taps = 131_072;
+    settings.dsd.pcm_to_dsd.sinc.passband_hz = 30_000.0;
+    settings.dsd.pcm_to_dsd.sinc.transition_hz = 750.0;
+    settings.dsd.pcm_to_dsd.sinc.kaiser_beta = 12.5;
+    settings.dsd.pcm_to_dsd.sinc.linear_phase = false;
+    settings.dsd.pcm_to_dsd.sinc.allow_aliasing = true;
+    settings.dsd.pcm_to_dsd.gain_compensation = GainCompensation::Decibels(1.5);
+
+    // While General is selected, qualified-Reference controls are dormant but
+    // still raw settings identity. Use them to prove the strict single schema
+    // propagates every stored field without making them execution claims.
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
+    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
+    settings.dsd.from_dsd.normalize_peak_target_dbfs = db("-1.000000000");
+
+    settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
+    settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
+    settings.dsd.general_from_dsd.sinc.taps = 131_072;
+    settings.dsd.general_from_dsd.sinc.passband_hz = 30_000.0;
+    settings.dsd.general_from_dsd.sinc.transition_hz = 750.0;
+    settings.dsd.general_from_dsd.sinc.kaiser_beta = 12.5;
+    settings.dsd.general_from_dsd.sinc.linear_phase = false;
+    settings.dsd.general_from_dsd.sinc.allow_aliasing = true;
+    settings.dsd.general_from_dsd.export_level = DsdGeneralExportLevel::NativeWithOffset {
+        offset_db: db("0.500000000"),
+    };
+    settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-0.750000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Standard,
+    });
+    settings
+        .dsd
+        .set_runtime_album_gain_db(Some(db("-2.000000000")));
+
+    settings.pcm_true_peak.policy = SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-0.500000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Standard,
+    };
+    settings
+        .pcm_true_peak
+        .set_runtime_album_gain_db(Some(db("-1.500000000")));
     settings
 }
 
-/// Valid WAV sentinel for Float32 and the field values that conflict with
-/// FLAC-only MD5 and native FLAC verification rules.
-fn custom_format_sentinel() -> PipelineSettings {
-    let mut settings = raw_all_non_default_sentinel();
-    // Keep this sentinel genuinely custom: replacing it with WAV makes the
-    // target-format coverage self-satisfying and leaves Custom unexercised.
+fn flac_sentinel() -> PipelineSettings {
+    let settings = rich_common_settings();
+    settings.validate().expect("valid FLAC Phase-2 sentinel");
+    settings
+}
+
+fn custom_fixed_sentinel() -> PipelineSettings {
+    let mut settings = rich_common_settings();
     settings.target_format = AudioFormat::Custom {
         extension: "sent".to_string(),
         display_name: "Sentinel Audio".to_string(),
     };
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
     settings.flac.verify = false;
+    settings.metadata.transfer_tags = false;
     settings.metadata.store_source_audio_md5 = false;
+    settings.dsd.set_gain_policy(SampleGainPolicy::FixedGain {
+        gain_db: db("1.250000000"),
+    });
+    settings.pcm_true_peak.policy = SampleGainPolicy::FixedGain {
+        gain_db: db("2.250000000"),
+    };
+    settings.pcm_true_peak.set_runtime_album_gain_db(None);
+    settings.validate().expect("valid custom fixed-gain sentinel");
     settings
 }
 
-fn valid_sentinels() -> [PipelineSettings; 2] {
-    [flac_md5_sentinel(), custom_format_sentinel()]
+fn reference_sentinel() -> PipelineSettings {
+    let mut settings = rich_common_settings();
+    settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
+    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
+    // Explicit Reference delivery is mutually exclusive with the General DSD
+    // sample-domain gain policy. The General sentinels above cover those fields.
+    settings.dsd.set_gain_policy(SampleGainPolicy::Off);
+    settings.validate().expect("valid Reference-pathway sentinel");
+    settings
 }
 
-fn item_with_settings(settings: PipelineSettings) -> ConversionItem {
-    let mut options = ConversionOptions::default();
-    options.output_format = queue_format_for_settings(&settings);
-    options.pipeline_settings = Some(settings);
-    ConversionItem::new(
-        PathBuf::from("/tmp/tonepoet-settings-sentinel/input.flac"),
-        FileFormat::Audio(QueueAudioFormat::Flac),
-        options,
-    )
+fn valid_sentinels() -> [PipelineSettings; 3] {
+    [flac_sentinel(), custom_fixed_sentinel(), reference_sentinel()]
 }
 
 fn queue_format_for_settings(settings: &PipelineSettings) -> QueueAudioFormat {
@@ -286,547 +238,140 @@ fn queue_format_for_settings(settings: &PipelineSettings) -> QueueAudioFormat {
     }
 }
 
-fn assert_settings_eq(actual: &PipelineSettings, expected: &PipelineSettings) {
-    assert_eq!(&actual.target_format, &expected.target_format, "target_format");
-    assert_eq!(&actual.target_sample_rate, &expected.target_sample_rate, "target_sample_rate");
-    assert_eq!(&actual.target_bit_depth, &expected.target_bit_depth, "target_bit_depth");
-    assert_eq!(&actual.resample_quality, &expected.resample_quality, "resample_quality");
-    assert_eq!(&actual.nyquist_transition, &expected.nyquist_transition, "nyquist_transition");
-    assert_eq!(&actual.dither_type, &expected.dither_type, "dither_type");
-    assert_eq!(&actual.dither_explicit, &expected.dither_explicit, "dither_explicit");
-    assert_eq!(&actual.preferred_tool, &expected.preferred_tool, "preferred_tool");
-    assert_eq!(&actual.force_encode, &expected.force_encode, "force_encode");
-    assert_eq!(&actual.flac.compression_level, &expected.flac.compression_level, "flac.compression_level");
-    assert_eq!(&actual.flac.verify, &expected.flac.verify, "flac.verify");
-    assert_eq!(&actual.flac.write_md5, &expected.flac.write_md5, "flac.write_md5");
-    assert_eq!(&actual.mp3.mode, &expected.mp3.mode, "mp3.mode");
-    assert_eq!(&actual.mp3.bitrate_kbps, &expected.mp3.bitrate_kbps, "mp3.bitrate_kbps");
-    assert_eq!(&actual.mp3.vbr_quality, &expected.mp3.vbr_quality, "mp3.vbr_quality");
-    assert_eq!(&actual.aac.profile, &expected.aac.profile, "aac.profile");
-    assert_eq!(&actual.aac.bitrate_kbps, &expected.aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_eq!(&actual.opus.content_type, &expected.opus.content_type, "opus.content_type");
-    assert_eq!(&actual.opus.bitrate_kbps, &expected.opus.bitrate_kbps, "opus.bitrate_kbps");
-    assert_eq!(&actual.opus.complexity, &expected.opus.complexity, "opus.complexity");
-    assert_eq!(&actual.wavpack.mode, &expected.wavpack.mode, "wavpack.mode");
-    assert_eq!(&actual.wavpack.hybrid, &expected.wavpack.hybrid, "wavpack.hybrid");
-    assert_eq!(&actual.wavpack.hybrid_bitrate_kbps, &expected.wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
-    assert_eq!(&actual.wavpack.correction_file, &expected.wavpack.correction_file, "wavpack.correction_file");
-    assert_eq!(&actual.ssrc.force, &expected.ssrc.force, "ssrc.force");
-
-    assert_eq!(&actual.ssrc.insane_mode, &expected.ssrc.insane_mode, "ssrc.insane_mode");
-    assert_eq!(&actual.sox_resampler.chebyshev, &expected.sox_resampler.chebyshev, "sox_resampler.chebyshev");
-    assert_eq!(&actual.sox_resampler.bandwidth_pct, &expected.sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
-    assert_eq!(&actual.sox_resampler.phase, &expected.sox_resampler.phase, "sox_resampler.phase");
-    assert_eq!(&actual.sox_resampler.allow_aliasing, &expected.sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
-    assert_eq!(&actual.sox_resampler.sinc_taps, &expected.sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
-    assert_eq!(&actual.sox_resampler.sinc_attenuation_db, &expected.sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
-    assert_eq!(&actual.sox_resampler.sinc_passband_hz, &expected.sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
-    assert_eq!(&actual.sox_resampler.sinc_transition_hz, &expected.sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
-    assert_eq!(&actual.sox_resampler.sinc_kaiser_beta, &expected.sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
-    assert_eq!(&actual.sox_resampler.sinc_phase, &expected.sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
-    assert_eq!(&actual.soxr_resampler.chebyshev, &expected.soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
-    assert_eq!(&actual.soxr_resampler.cutoff, &expected.soxr_resampler.cutoff, "soxr_resampler.cutoff");
-    assert_eq!(&actual.soxr_resampler.phase, &expected.soxr_resampler.phase, "soxr_resampler.phase");
-    assert_eq!(&actual.ssrc.profile, &expected.ssrc.profile, "ssrc.profile");
-    assert_eq!(&actual.ssrc.attenuation_db, &expected.ssrc.attenuation_db, "ssrc.attenuation_db");
-    assert_eq!(&actual.ssrc.min_phase, &expected.ssrc.min_phase, "ssrc.min_phase");
-    assert_eq!(&actual.ssrc.dither_id, &expected.ssrc.dither_id, "ssrc.dither_id");
-    assert_eq!(&actual.ssrc.pdf_type, &expected.ssrc.pdf_type, "ssrc.pdf_type");
-    assert_eq!(&actual.dsd.pcm_to_dsd.noise_shaper, &expected.dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
-    assert_eq!(&actual.dsd.pcm_to_dsd.modulator_order, &expected.dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
-    assert_eq!(&actual.dsd.pcm_to_dsd.trellis, &expected.dsd.pcm_to_dsd.trellis, "dsd.trellis");
-    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), &expected.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), "dsd.trellis.lookahead");
-    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), &expected.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), "dsd.trellis.nodes");
-    assert_eq!(&actual.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), &expected.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), "dsd.trellis.latency");
-    assert_eq!(&actual.dsd.pcm_to_dsd.filter, &expected.dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
-    assert_eq!(legacy_dsd_behavior(&actual.dsd), legacy_dsd_behavior(&expected.dsd), "legacy DSD behavior");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.oversample_factor, &expected.dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.taps, &expected.dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.passband_hz, &expected.dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.transition_hz, &expected.dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.kaiser_beta, &expected.dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.linear_phase, &expected.dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_eq!(&actual.dsd.pcm_to_dsd.sinc.allow_aliasing, &expected.dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_eq!(&actual.dsd.pcm_to_dsd.gain_compensation, &expected.dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
-    assert_eq!(&actual.metadata.transfer_tags, &expected.metadata.transfer_tags, "metadata.transfer_tags");
-    assert_eq!(&actual.metadata.preserve_artwork, &expected.metadata.preserve_artwork, "metadata.preserve_artwork");
-    assert_eq!(&actual.metadata.store_source_audio_md5, &expected.metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
-    assert_eq!(&actual.verification.verify_after_encode, &expected.verification.verify_after_encode, "verification.verify_after_encode");
-    assert_eq!(&actual.verification.prefer_native_flac_verify, &expected.verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
-    assert_eq!(&actual.replay_gain.mode, &expected.replay_gain.mode, "replay_gain.mode");
-    assert_eq!(&actual.replay_gain.prevent_clipping, &expected.replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
-    assert_eq!(&actual.replay_gain.existing_tags, &expected.replay_gain.existing_tags, "replay_gain.existing_tags");
-}
-
-macro_rules! assert_covered_by_non_default {
-    ($default:expr, $a:expr, $b:expr, $head:ident $(.$tail:ident)*, $label:literal) => {
-        assert!(
-            &$a.$head$(.$tail)* != &$default.$head$(.$tail)*
-                || &$b.$head$(.$tail)* != &$default.$head$(.$tail)*,
-            "sentinel pair leaves field at default in both cases: {}",
-            $label
-        );
-    };
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SentinelFieldInventoryRow {
-    path: &'static str,
-    raw_drift_covered: bool,
-    valid_propagation_covered: bool,
-    fingerprint_covered: bool,
-    conflict_tests: &'static [&'static str],
-}
-
-const CONFLICT_MD5_REQUIRES_FLAC_OUTPUT: &str = "md5_requires_flac_output";
-const CONFLICT_MD5_REQUIRES_METADATA_TRANSFER_TAGS: &str = "md5_requires_metadata_transfer_tags";
-const CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT: &str = "flac_verify_requires_flac_output";
-
-const SENTINEL_FIELD_INVENTORY: &[SentinelFieldInventoryRow] = &[
-    SentinelFieldInventoryRow { path: "target_format", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[CONFLICT_MD5_REQUIRES_FLAC_OUTPUT, CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT] },
-    SentinelFieldInventoryRow { path: "target_sample_rate", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "target_bit_depth", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "resample_quality", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "nyquist_transition", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dither_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dither_explicit", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "preferred_tool", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "force_encode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "flac.compression_level", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "flac.verify", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT] },
-    SentinelFieldInventoryRow { path: "flac.write_md5", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "mp3.mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "mp3.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "mp3.vbr_quality", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "aac.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "aac.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "opus.content_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "opus.bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "opus.complexity", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "wavpack.mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "wavpack.hybrid", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "wavpack.hybrid_bitrate_kbps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "wavpack.correction_file", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.force", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-
-    SentinelFieldInventoryRow { path: "ssrc.insane_mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.chebyshev", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.bandwidth_pct", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.allow_aliasing", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_taps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_attenuation_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_passband_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_transition_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_kaiser_beta", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "sox_resampler.sinc_phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "soxr_resampler.chebyshev", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "soxr_resampler.cutoff", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "soxr_resampler.phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.profile", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.attenuation_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.min_phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.dither_id", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "ssrc.pdf_type", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.noise_shaper", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.modulator_order", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.trellis", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.trellis.lookahead", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.trellis.nodes", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.trellis.latency", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.pcm_to_dsd_filter", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_lowpass", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_gain_mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_auto_gain_margin_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.dsd_to_pcm_gain_db", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.oversample_factor", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.taps", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.passband_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.transition_hz", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.kaiser_beta", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.linear_phase", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.sinc.allow_aliasing", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "dsd.gain_compensation", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "metadata.transfer_tags", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[CONFLICT_MD5_REQUIRES_METADATA_TRANSFER_TAGS] },
-    SentinelFieldInventoryRow { path: "metadata.preserve_artwork", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "metadata.store_source_audio_md5", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[CONFLICT_MD5_REQUIRES_FLAC_OUTPUT, CONFLICT_MD5_REQUIRES_METADATA_TRANSFER_TAGS] },
-    SentinelFieldInventoryRow { path: "verification.verify_after_encode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "verification.prefer_native_flac_verify", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "replay_gain.mode", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "replay_gain.prevent_clipping", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-    SentinelFieldInventoryRow { path: "replay_gain.existing_tags", raw_drift_covered: true, valid_propagation_covered: true, fingerprint_covered: true, conflict_tests: &[] },
-];
-
-fn field_differs_from_default(
-    path: &str,
-    settings: &PipelineSettings,
-    default: &PipelineSettings,
-) -> bool {
-    match path {
-        "target_format" => settings.target_format != default.target_format,
-        "target_sample_rate" => settings.target_sample_rate != default.target_sample_rate,
-        "target_bit_depth" => settings.target_bit_depth != default.target_bit_depth,
-        "resample_quality" => settings.resample_quality != default.resample_quality,
-        "nyquist_transition" => settings.nyquist_transition != default.nyquist_transition,
-        "dither_type" => settings.dither_type != default.dither_type,
-        "dither_explicit" => settings.dither_explicit != default.dither_explicit,
-        "preferred_tool" => settings.preferred_tool != default.preferred_tool,
-        "force_encode" => settings.force_encode != default.force_encode,
-        "flac.compression_level" => settings.flac.compression_level != default.flac.compression_level,
-        "flac.verify" => settings.flac.verify != default.flac.verify,
-        "flac.write_md5" => settings.flac.write_md5 != default.flac.write_md5,
-        "mp3.mode" => settings.mp3.mode != default.mp3.mode,
-        "mp3.bitrate_kbps" => settings.mp3.bitrate_kbps != default.mp3.bitrate_kbps,
-        "mp3.vbr_quality" => settings.mp3.vbr_quality != default.mp3.vbr_quality,
-        "aac.profile" => settings.aac.profile != default.aac.profile,
-        "aac.bitrate_kbps" => settings.aac.bitrate_kbps != default.aac.bitrate_kbps,
-        "opus.content_type" => settings.opus.content_type != default.opus.content_type,
-        "opus.bitrate_kbps" => settings.opus.bitrate_kbps != default.opus.bitrate_kbps,
-        "opus.complexity" => settings.opus.complexity != default.opus.complexity,
-        "wavpack.mode" => settings.wavpack.mode != default.wavpack.mode,
-        "wavpack.hybrid" => settings.wavpack.hybrid != default.wavpack.hybrid,
-        "wavpack.hybrid_bitrate_kbps" => settings.wavpack.hybrid_bitrate_kbps != default.wavpack.hybrid_bitrate_kbps,
-        "wavpack.correction_file" => settings.wavpack.correction_file != default.wavpack.correction_file,
-        "ssrc.force" => settings.ssrc.force != default.ssrc.force,
-
-        "ssrc.insane_mode" => settings.ssrc.insane_mode != default.ssrc.insane_mode,
-        "sox_resampler.chebyshev" => settings.sox_resampler.chebyshev != default.sox_resampler.chebyshev,
-        "sox_resampler.bandwidth_pct" => settings.sox_resampler.bandwidth_pct != default.sox_resampler.bandwidth_pct,
-        "sox_resampler.phase" => settings.sox_resampler.phase != default.sox_resampler.phase,
-        "sox_resampler.allow_aliasing" => settings.sox_resampler.allow_aliasing != default.sox_resampler.allow_aliasing,
-        "sox_resampler.sinc_taps" => settings.sox_resampler.sinc_taps != default.sox_resampler.sinc_taps,
-        "sox_resampler.sinc_attenuation_db" => settings.sox_resampler.sinc_attenuation_db != default.sox_resampler.sinc_attenuation_db,
-        "sox_resampler.sinc_passband_hz" => settings.sox_resampler.sinc_passband_hz != default.sox_resampler.sinc_passband_hz,
-        "sox_resampler.sinc_transition_hz" => settings.sox_resampler.sinc_transition_hz != default.sox_resampler.sinc_transition_hz,
-        "sox_resampler.sinc_kaiser_beta" => settings.sox_resampler.sinc_kaiser_beta != default.sox_resampler.sinc_kaiser_beta,
-        "sox_resampler.sinc_phase" => settings.sox_resampler.sinc_phase != default.sox_resampler.sinc_phase,
-        "soxr_resampler.chebyshev" => settings.soxr_resampler.chebyshev != default.soxr_resampler.chebyshev,
-        "soxr_resampler.cutoff" => settings.soxr_resampler.cutoff != default.soxr_resampler.cutoff,
-        "soxr_resampler.phase" => settings.soxr_resampler.phase != default.soxr_resampler.phase,
-        "ssrc.profile" => settings.ssrc.profile != default.ssrc.profile,
-        "ssrc.attenuation_db" => settings.ssrc.attenuation_db != default.ssrc.attenuation_db,
-        "ssrc.min_phase" => settings.ssrc.min_phase != default.ssrc.min_phase,
-        "ssrc.dither_id" => settings.ssrc.dither_id != default.ssrc.dither_id,
-        "ssrc.pdf_type" => settings.ssrc.pdf_type != default.ssrc.pdf_type,
-        "dsd.noise_shaper" => settings.dsd.pcm_to_dsd.noise_shaper != default.dsd.pcm_to_dsd.noise_shaper,
-        "dsd.modulator_order" => settings.dsd.pcm_to_dsd.modulator_order != default.dsd.pcm_to_dsd.modulator_order,
-        "dsd.trellis" => settings.dsd.pcm_to_dsd.trellis != default.dsd.pcm_to_dsd.trellis,
-        "dsd.trellis.lookahead" => settings.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead) != default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead),
-        "dsd.trellis.nodes" => settings.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes) != default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes),
-        "dsd.trellis.latency" => settings.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency) != default.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency),
-        "dsd.pcm_to_dsd_filter" => settings.dsd.pcm_to_dsd.filter != default.dsd.pcm_to_dsd.filter,
-        "dsd.dsd_to_pcm_lowpass" => legacy_dsd_behavior(&settings.dsd).lowpass != legacy_dsd_behavior(&default.dsd).lowpass,
-        "dsd.dsd_to_pcm_gain_mode" => legacy_dsd_behavior(&settings.dsd).gain_mode != legacy_dsd_behavior(&default.dsd).gain_mode,
-        "dsd.dsd_to_pcm_auto_gain_margin_db" => (legacy_dsd_behavior(&settings.dsd).auto_gain_margin_db - legacy_dsd_behavior(&default.dsd).auto_gain_margin_db).abs() > f32::EPSILON,
-        "dsd.dsd_to_pcm_gain_db" => legacy_dsd_behavior(&settings.dsd).gain_db != legacy_dsd_behavior(&default.dsd).gain_db,
-        "dsd.sinc.oversample_factor" => settings.dsd.pcm_to_dsd.sinc.oversample_factor != default.dsd.pcm_to_dsd.sinc.oversample_factor,
-        "dsd.sinc.taps" => settings.dsd.pcm_to_dsd.sinc.taps != default.dsd.pcm_to_dsd.sinc.taps,
-        "dsd.sinc.passband_hz" => settings.dsd.pcm_to_dsd.sinc.passband_hz != default.dsd.pcm_to_dsd.sinc.passband_hz,
-        "dsd.sinc.transition_hz" => settings.dsd.pcm_to_dsd.sinc.transition_hz != default.dsd.pcm_to_dsd.sinc.transition_hz,
-        "dsd.sinc.kaiser_beta" => settings.dsd.pcm_to_dsd.sinc.kaiser_beta != default.dsd.pcm_to_dsd.sinc.kaiser_beta,
-        "dsd.sinc.linear_phase" => settings.dsd.pcm_to_dsd.sinc.linear_phase != default.dsd.pcm_to_dsd.sinc.linear_phase,
-        "dsd.sinc.allow_aliasing" => settings.dsd.pcm_to_dsd.sinc.allow_aliasing != default.dsd.pcm_to_dsd.sinc.allow_aliasing,
-        "dsd.gain_compensation" => settings.dsd.pcm_to_dsd.gain_compensation != default.dsd.pcm_to_dsd.gain_compensation,
-        "metadata.transfer_tags" => settings.metadata.transfer_tags != default.metadata.transfer_tags,
-        "metadata.preserve_artwork" => settings.metadata.preserve_artwork != default.metadata.preserve_artwork,
-        "metadata.store_source_audio_md5" => settings.metadata.store_source_audio_md5 != default.metadata.store_source_audio_md5,
-        "verification.verify_after_encode" => settings.verification.verify_after_encode != default.verification.verify_after_encode,
-        "verification.prefer_native_flac_verify" => settings.verification.prefer_native_flac_verify != default.verification.prefer_native_flac_verify,
-        "replay_gain.mode" => settings.replay_gain.mode != default.replay_gain.mode,
-        "replay_gain.prevent_clipping" => settings.replay_gain.prevent_clipping != default.replay_gain.prevent_clipping,
-        "replay_gain.existing_tags" => settings.replay_gain.existing_tags != default.replay_gain.existing_tags,
-        other => panic!("unknown PipelineSettings field path in sentinel inventory: {}", other),
-    }
-}
-
-fn known_conflict_test(name: &str) -> bool {
-    matches!(
-        name,
-        CONFLICT_MD5_REQUIRES_FLAC_OUTPUT
-            | CONFLICT_MD5_REQUIRES_METADATA_TRANSFER_TAGS
-            | CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT
+fn item_with_settings(settings: PipelineSettings) -> ConversionItem {
+    let mut options = ConversionOptions::default();
+    options.output_format = queue_format_for_settings(&settings);
+    options.pipeline_settings = Some(settings);
+    ConversionItem::new(
+        PathBuf::from("/tmp/tonepoet-settings-sentinel/input.flac"),
+        FileFormat::Audio(QueueAudioFormat::Flac),
+        options,
     )
 }
 
-#[test]
-fn sentinel_suite_inventory_matches_fingerprint_field_list() {
-    let mut inventory: Vec<&str> = SENTINEL_FIELD_INVENTORY.iter().map(|row| row.path).collect();
-    let mut fingerprint = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
-    inventory.sort_unstable();
-    fingerprint.sort_unstable();
-
-    let mut deduped = inventory.clone();
-    deduped.dedup();
-    assert_eq!(deduped.len(), inventory.len(), "duplicate sentinel inventory path");
-    assert_eq!(inventory, fingerprint, "sentinel inventory drifted from fingerprint field list");
-    assert_eq!(SENTINEL_FIELD_INVENTORY.len(), tonepoet_pipeline::SETTINGS_FINGERPRINT_FIELD_COUNT);
+fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(value, |current, component| current.get(component))
 }
 
-#[test]
-fn sentinel_suite_inventory_classification_is_mechanically_checked() {
-    let default = PipelineSettings::default();
-    let raw = raw_all_non_default_sentinel();
-    let valid = valid_sentinels();
-
-    for row in SENTINEL_FIELD_INVENTORY {
-        assert!(row.fingerprint_covered, "{} is not marked fingerprint-covered", row.path);
-        assert_eq!(
-            field_differs_from_default(row.path, &raw, &default),
-            row.raw_drift_covered,
-            "raw drift classification mismatch for {}",
-            row.path
-        );
-
-        let valid_covered = valid
-            .iter()
-            .any(|settings| field_differs_from_default(row.path, settings, &default));
-        assert_eq!(
-            valid_covered,
-            row.valid_propagation_covered,
-            "valid propagation classification mismatch for {}",
-            row.path
-        );
-
-        for conflict_test in row.conflict_tests {
-            assert!(known_conflict_test(conflict_test), "unknown conflict test {} for {}", conflict_test, row.path);
+fn canonical_field_value(settings: &PipelineSettings, path: &str) -> serde_json::Value {
+    match path {
+        "dsd.general_from_dsd.export_offset_db" => {
+            if let DsdGeneralExportLevel::NativeWithOffset { offset_db } =
+                settings.dsd.general_from_dsd.export_level
+            {
+                serde_json::to_value(offset_db).expect("serialize export offset")
+            } else {
+                serde_json::Value::Null
+            }
         }
-        if !row.valid_propagation_covered {
-            assert!(
-                !row.conflict_tests.is_empty(),
-                "{} lacks valid propagation coverage without a named conflict test",
-                row.path
-            );
+        "dsd.general_from_dsd.runtime_album_gain_db" => serde_json::to_value(
+            settings.dsd.runtime_album_gain_db(),
+        )
+        .expect("serialize DSD runtime gain"),
+        "pcm_true_peak.runtime_album_gain_db" => serde_json::to_value(
+            settings.pcm_true_peak.runtime_album_gain_db(),
+        )
+        .expect("serialize PCM runtime gain"),
+        _ => {
+            let value = serde_json::to_value(settings).expect("serialize settings sentinel");
+            json_path(&value, path).cloned().unwrap_or(serde_json::Value::Null)
         }
     }
 }
 
 #[test]
-fn raw_single_sentinel_sets_every_field_away_from_default() {
+fn canonical_fingerprint_inventory_has_no_duplicates_or_retired_gain_paths() {
+    let paths: BTreeSet<_> = SETTINGS_FINGERPRINT_FIELD_PATHS.iter().copied().collect();
+    assert_eq!(paths.len(), SETTINGS_FINGERPRINT_FIELD_PATHS.len());
+
+    for required in [
+        "dsd.from_dsd.pathway",
+        "dsd.general_from_dsd.reconstruction",
+        "dsd.general_from_dsd.export_level",
+        "dsd.general_from_dsd.gain.mode",
+        "dsd.general_from_dsd.gain.target_dbtp",
+        "dsd.general_from_dsd.gain.scope",
+        "dsd.general_from_dsd.gain.scan",
+        "pcm_true_peak.policy.mode",
+        "pcm_true_peak.policy.target_dbtp",
+        "pcm_true_peak.policy.scope",
+        "pcm_true_peak.policy.scan",
+    ] {
+        assert!(paths.contains(required), "missing current identity path {required}");
+    }
+
+    for retired in [
+        "dsd.schema_origin",
+        "dsd.dsd_to_pcm_gain_mode",
+        "dsd.dsd_to_pcm_auto_gain_margin_db",
+        "dsd.dsd_to_pcm_gain_db",
+        "pcm_true_peak.enabled",
+        "pcm_true_peak.allow_boost",
+    ] {
+        assert!(!paths.contains(retired), "retired settings path still participates: {retired}");
+    }
+}
+
+#[test]
+fn current_sentinel_set_exercises_every_fingerprint_field_away_from_default() {
     let default = PipelineSettings::default();
-    let raw = raw_all_non_default_sentinel();
-
-    assert_covered_by_non_default!(default, raw, raw, target_format, "target_format");
-    assert_covered_by_non_default!(default, raw, raw, target_sample_rate, "target_sample_rate");
-    assert_covered_by_non_default!(default, raw, raw, target_bit_depth, "target_bit_depth");
-    assert_covered_by_non_default!(default, raw, raw, resample_quality, "resample_quality");
-    assert_covered_by_non_default!(default, raw, raw, nyquist_transition, "nyquist_transition");
-    assert_covered_by_non_default!(default, raw, raw, dither_type, "dither_type");
-    assert_covered_by_non_default!(default, raw, raw, dither_explicit, "dither_explicit");
-    assert_covered_by_non_default!(default, raw, raw, preferred_tool, "preferred_tool");
-    assert_covered_by_non_default!(default, raw, raw, force_encode, "force_encode");
-    assert_covered_by_non_default!(default, raw, raw, flac.compression_level, "flac.compression_level");
-    assert_covered_by_non_default!(default, raw, raw, flac.verify, "flac.verify");
-    assert_covered_by_non_default!(default, raw, raw, flac.write_md5, "flac.write_md5");
-    assert_covered_by_non_default!(default, raw, raw, mp3.mode, "mp3.mode");
-    assert_covered_by_non_default!(default, raw, raw, mp3.bitrate_kbps, "mp3.bitrate_kbps");
-    assert_covered_by_non_default!(default, raw, raw, mp3.vbr_quality, "mp3.vbr_quality");
-    assert_covered_by_non_default!(default, raw, raw, aac.profile, "aac.profile");
-    assert_covered_by_non_default!(default, raw, raw, aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_covered_by_non_default!(default, raw, raw, opus.content_type, "opus.content_type");
-    assert_covered_by_non_default!(default, raw, raw, opus.bitrate_kbps, "opus.bitrate_kbps");
-    assert_covered_by_non_default!(default, raw, raw, opus.complexity, "opus.complexity");
-    assert_covered_by_non_default!(default, raw, raw, wavpack.mode, "wavpack.mode");
-    assert_covered_by_non_default!(default, raw, raw, wavpack.hybrid, "wavpack.hybrid");
-    assert_covered_by_non_default!(default, raw, raw, wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
-    assert_covered_by_non_default!(default, raw, raw, wavpack.correction_file, "wavpack.correction_file");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.force, "ssrc.force");
-
-    assert_covered_by_non_default!(default, raw, raw, ssrc.insane_mode, "ssrc.insane_mode");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.chebyshev, "sox_resampler.chebyshev");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.phase, "sox_resampler.phase");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
-    assert_covered_by_non_default!(default, raw, raw, sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
-    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
-    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.cutoff, "soxr_resampler.cutoff");
-    assert_covered_by_non_default!(default, raw, raw, soxr_resampler.phase, "soxr_resampler.phase");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.profile, "ssrc.profile");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.attenuation_db, "ssrc.attenuation_db");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.min_phase, "ssrc.min_phase");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.dither_id, "ssrc.dither_id");
-    assert_covered_by_non_default!(default, raw, raw, ssrc.pdf_type, "ssrc.pdf_type");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.trellis, "dsd.trellis");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
-    let default_legacy = legacy_dsd_behavior(&default.dsd);
-    let raw_legacy = legacy_dsd_behavior(&raw.dsd);
-    assert_ne!(raw_legacy.lowpass, default_legacy.lowpass, "dsd.dsd_to_pcm_lowpass");
-    assert_ne!(raw_legacy.gain_mode, default_legacy.gain_mode, "dsd.dsd_to_pcm_gain_mode");
-    assert_ne!(raw_legacy.auto_gain_margin_db, default_legacy.auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
-    assert_ne!(raw_legacy.gain_db, default_legacy.gain_db, "dsd.dsd_to_pcm_gain_db");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_covered_by_non_default!(default, raw, raw, dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
-    assert_covered_by_non_default!(default, raw, raw, metadata.transfer_tags, "metadata.transfer_tags");
-    assert_covered_by_non_default!(default, raw, raw, metadata.preserve_artwork, "metadata.preserve_artwork");
-    assert_covered_by_non_default!(default, raw, raw, metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
-    assert_covered_by_non_default!(default, raw, raw, verification.verify_after_encode, "verification.verify_after_encode");
-    assert_covered_by_non_default!(default, raw, raw, verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
-    assert_covered_by_non_default!(default, raw, raw, replay_gain.mode, "replay_gain.mode");
-    assert_covered_by_non_default!(default, raw, raw, replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
-    assert_covered_by_non_default!(default, raw, raw, replay_gain.existing_tags, "replay_gain.existing_tags");
-
-    assert!(raw.validate().is_err());
+    let sentinels = valid_sentinels();
+    for path in SETTINGS_FINGERPRINT_FIELD_PATHS {
+        let default_value = canonical_field_value(&default, path);
+        assert!(
+            sentinels
+                .iter()
+                .any(|settings| canonical_field_value(settings, path) != default_value),
+            "sentinel set leaves canonical settings field at default: {path} ({default_value})"
+        );
+    }
 }
 
 #[test]
-fn amended_contract_valid_sentinel_set_covers_every_pipeline_settings_field() {
-    let default = PipelineSettings::default();
-    let flac = flac_md5_sentinel();
-    let custom = custom_format_sentinel();
-
-    flac.validate().unwrap();
-    custom.validate().unwrap();
-
-    assert_covered_by_non_default!(default, flac, custom, target_format, "target_format");
-    assert_covered_by_non_default!(default, flac, custom, target_sample_rate, "target_sample_rate");
-    assert_covered_by_non_default!(default, flac, custom, target_bit_depth, "target_bit_depth");
-    assert_covered_by_non_default!(default, flac, custom, resample_quality, "resample_quality");
-    assert_covered_by_non_default!(default, flac, custom, nyquist_transition, "nyquist_transition");
-    assert_covered_by_non_default!(default, flac, custom, dither_type, "dither_type");
-    assert_covered_by_non_default!(default, flac, custom, dither_explicit, "dither_explicit");
-    assert_covered_by_non_default!(default, flac, custom, preferred_tool, "preferred_tool");
-    assert_covered_by_non_default!(default, flac, custom, force_encode, "force_encode");
-    assert_covered_by_non_default!(default, flac, custom, flac.compression_level, "flac.compression_level");
-    assert_covered_by_non_default!(default, flac, custom, flac.verify, "flac.verify");
-    assert_covered_by_non_default!(default, flac, custom, flac.write_md5, "flac.write_md5");
-    assert_covered_by_non_default!(default, flac, custom, mp3.mode, "mp3.mode");
-    assert_covered_by_non_default!(default, flac, custom, mp3.bitrate_kbps, "mp3.bitrate_kbps");
-    assert_covered_by_non_default!(default, flac, custom, mp3.vbr_quality, "mp3.vbr_quality");
-    assert_covered_by_non_default!(default, flac, custom, aac.profile, "aac.profile");
-    assert_covered_by_non_default!(default, flac, custom, aac.bitrate_kbps, "aac.bitrate_kbps");
-    assert_covered_by_non_default!(default, flac, custom, opus.content_type, "opus.content_type");
-    assert_covered_by_non_default!(default, flac, custom, opus.bitrate_kbps, "opus.bitrate_kbps");
-    assert_covered_by_non_default!(default, flac, custom, opus.complexity, "opus.complexity");
-    assert_covered_by_non_default!(default, flac, custom, wavpack.mode, "wavpack.mode");
-    assert_covered_by_non_default!(default, flac, custom, wavpack.hybrid, "wavpack.hybrid");
-    assert_covered_by_non_default!(default, flac, custom, wavpack.hybrid_bitrate_kbps, "wavpack.hybrid_bitrate_kbps");
-    assert_covered_by_non_default!(default, flac, custom, wavpack.correction_file, "wavpack.correction_file");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.force, "ssrc.force");
-
-    assert_covered_by_non_default!(default, flac, custom, ssrc.insane_mode, "ssrc.insane_mode");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.chebyshev, "sox_resampler.chebyshev");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.bandwidth_pct, "sox_resampler.bandwidth_pct");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.phase, "sox_resampler.phase");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.allow_aliasing, "sox_resampler.allow_aliasing");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_taps, "sox_resampler.sinc_taps");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_attenuation_db, "sox_resampler.sinc_attenuation_db");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_passband_hz, "sox_resampler.sinc_passband_hz");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_transition_hz, "sox_resampler.sinc_transition_hz");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_kaiser_beta, "sox_resampler.sinc_kaiser_beta");
-    assert_covered_by_non_default!(default, flac, custom, sox_resampler.sinc_phase, "sox_resampler.sinc_phase");
-    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.chebyshev, "soxr_resampler.chebyshev");
-    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.cutoff, "soxr_resampler.cutoff");
-    assert_covered_by_non_default!(default, flac, custom, soxr_resampler.phase, "soxr_resampler.phase");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.profile, "ssrc.profile");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.attenuation_db, "ssrc.attenuation_db");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.min_phase, "ssrc.min_phase");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.dither_id, "ssrc.dither_id");
-    assert_covered_by_non_default!(default, flac, custom, ssrc.pdf_type, "ssrc.pdf_type");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.noise_shaper, "dsd.noise_shaper");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.modulator_order, "dsd.modulator_order");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.trellis, "dsd.trellis");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.filter, "dsd.pcm_to_dsd_filter");
-    let default_legacy = legacy_dsd_behavior(&default.dsd);
-    let flac_legacy = legacy_dsd_behavior(&flac.dsd);
-    let custom_legacy = legacy_dsd_behavior(&custom.dsd);
-    assert!(flac_legacy.lowpass != default_legacy.lowpass || custom_legacy.lowpass != default_legacy.lowpass, "dsd.dsd_to_pcm_lowpass");
-    assert!(flac_legacy.gain_mode != default_legacy.gain_mode || custom_legacy.gain_mode != default_legacy.gain_mode, "dsd.dsd_to_pcm_gain_mode");
-    assert!(flac_legacy.auto_gain_margin_db != default_legacy.auto_gain_margin_db || custom_legacy.auto_gain_margin_db != default_legacy.auto_gain_margin_db, "dsd.dsd_to_pcm_auto_gain_margin_db");
-    assert!(flac_legacy.gain_db != default_legacy.gain_db || custom_legacy.gain_db != default_legacy.gain_db, "dsd.dsd_to_pcm_gain_db");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.oversample_factor, "dsd.sinc.oversample_factor");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.taps, "dsd.sinc.taps");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.passband_hz, "dsd.sinc.passband_hz");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.transition_hz, "dsd.sinc.transition_hz");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.kaiser_beta, "dsd.sinc.kaiser_beta");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.linear_phase, "dsd.sinc.linear_phase");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.sinc.allow_aliasing, "dsd.sinc.allow_aliasing");
-    assert_covered_by_non_default!(default, flac, custom, dsd.pcm_to_dsd.gain_compensation, "dsd.gain_compensation");
-    assert_covered_by_non_default!(default, flac, custom, metadata.transfer_tags, "metadata.transfer_tags");
-    assert_covered_by_non_default!(default, flac, custom, metadata.preserve_artwork, "metadata.preserve_artwork");
-    assert_covered_by_non_default!(default, flac, custom, metadata.store_source_audio_md5, "metadata.store_source_audio_md5");
-    assert_covered_by_non_default!(default, flac, custom, verification.verify_after_encode, "verification.verify_after_encode");
-    assert_covered_by_non_default!(default, flac, custom, verification.prefer_native_flac_verify, "verification.prefer_native_flac_verify");
-    assert_covered_by_non_default!(default, flac, custom, replay_gain.mode, "replay_gain.mode");
-    assert_covered_by_non_default!(default, flac, custom, replay_gain.prevent_clipping, "replay_gain.prevent_clipping");
-    assert_covered_by_non_default!(default, flac, custom, replay_gain.existing_tags, "replay_gain.existing_tags");
-}
-
-#[test]
-fn single_valid_all_non_default_sentinel_conflict_is_executably_documented() {
-    let mut md5_requires_flac_output = custom_format_sentinel();
-    md5_requires_flac_output.metadata.transfer_tags = true;
-    md5_requires_flac_output.metadata.store_source_audio_md5 = true;
-    assert!(
-        md5_requires_flac_output.validate().is_err(),
-        "{} conflict was not enforced",
-        CONFLICT_MD5_REQUIRES_FLAC_OUTPUT
-    );
-
-    let mut md5_requires_metadata_transfer_tags = flac_md5_sentinel();
-    md5_requires_metadata_transfer_tags.metadata.transfer_tags = false;
-    assert!(
-        md5_requires_metadata_transfer_tags.validate().is_err(),
-        "{} conflict was not enforced",
-        CONFLICT_MD5_REQUIRES_METADATA_TRANSFER_TAGS
-    );
-
-    let mut flac_verify_requires_flac_output = custom_format_sentinel();
-    flac_verify_requires_flac_output.flac.verify = true;
-    assert!(
-        flac_verify_requires_flac_output.validate().is_err(),
-        "{} conflict was not enforced",
-        CONFLICT_FLAC_VERIFY_REQUIRES_FLAC_OUTPUT
-    );
-}
-
-#[test]
-fn conversion_options_to_conversion_item_preserves_settings_field_by_field() {
+fn conversion_options_to_conversion_item_preserves_complete_settings() {
     for expected in valid_sentinels() {
         let item = item_with_settings(expected.clone());
         let actual = item.pipeline_settings.as_ref().expect("item settings missing");
-        assert_settings_eq(actual, &expected);
+        assert_eq!(actual, &expected);
     }
 }
 
 #[test]
-fn conversion_item_to_pipeline_request_preserves_settings_field_by_field() {
+fn conversion_item_to_pipeline_request_preserves_complete_settings() {
     for expected in valid_sentinels() {
         let item = item_with_settings(expected.clone());
-        let request = build_pipeline_request(&item).unwrap();
-        assert_settings_eq(&request.settings, &expected);
+        let request = build_pipeline_request(&item).expect("pipeline request");
+        assert_eq!(request.settings, expected);
     }
 }
 
 #[test]
-fn prebuilt_pipeline_request_preserves_settings_field_by_field() {
+fn prebuilt_pipeline_request_preserves_complete_settings() {
     for expected in valid_sentinels() {
         let mut item = item_with_settings(expected.clone());
-        let mut request = build_pipeline_request(&item).unwrap();
+        let mut request = build_pipeline_request(&item).expect("pipeline request");
         request.settings = expected.clone();
         item.pipeline_request = Some(request);
-
-        let actual = build_pipeline_request(&item).unwrap();
-        assert_settings_eq(&actual.settings, &expected);
+        let actual = build_pipeline_request(&item).expect("prebuilt pipeline request");
+        assert_eq!(actual.settings, expected);
     }
 }
 
-// The PipelineRequest -> PlanRequest edge is tested in the production module
-// that owns the real per-track `convert_tracks(...)` path. The installer adds
-// a `#[cfg(test)]` capture around that path's actual `PlanRequest` literal and
-// appends a field-by-field runtime test there. `tests/settings_static_audit.rs`
-// remains as a separate syntactic guard.
+#[test]
+fn incompatible_metadata_and_flac_sentinel_combinations_still_fail_closed() {
+    let mut md5_requires_flac = custom_fixed_sentinel();
+    md5_requires_flac.metadata.transfer_tags = true;
+    md5_requires_flac.metadata.store_source_audio_md5 = true;
+    assert!(md5_requires_flac.validate().is_err());
+
+    let mut md5_requires_transfer = flac_sentinel();
+    md5_requires_transfer.metadata.transfer_tags = false;
+    assert!(md5_requires_transfer.validate().is_err());
+
+    let mut flac_verify_requires_flac = custom_fixed_sentinel();
+    flac_verify_requires_flac.flac.verify = true;
+    assert!(flac_verify_requires_flac.validate().is_err());
+}
 
 #[test]
 fn normal_request_builder_rejects_legacy_only_items() {
@@ -838,107 +383,63 @@ fn normal_request_builder_rejects_legacy_only_items() {
     assert!(build_pipeline_request(&item).is_err());
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum LegacyProjectionStatus {
-    Translated,
-    Derived,
-    Defaulted,
-    Unrepresentable,
+#[test]
+fn general_dsd_policy_carries_reconstruction_export_scope_and_tier_independently() {
+    let mut settings = DsdSettings::default();
+    settings.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
+    settings.general_from_dsd.export_level = DsdGeneralExportLevel::NativeWithOffset {
+        offset_db: db("0.500000000"),
+    };
+    settings.set_gain_policy(SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-0.250000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Standard,
+    });
+
+    assert_eq!(settings.true_peak_scope(), Some(TruePeakScope::Album));
+    assert_eq!(settings.true_peak_scan_tier(), Some(TruePeakScanTier::Standard));
+    assert!(matches!(
+        settings.gain_policy(),
+        SampleGainPolicy::TruePeakNormalize { .. }
+    ));
+    assert_eq!(
+        settings.general_from_dsd.export_level,
+        DsdGeneralExportLevel::NativeWithOffset {
+            offset_db: db("0.500000000")
+        }
+    );
 }
-
-const LEGACY_FIELD_INVENTORY: &[(&str, LegacyProjectionStatus)] = &[
-    ("target_format", LegacyProjectionStatus::Translated),
-    ("target_sample_rate", LegacyProjectionStatus::Translated),
-    ("target_bit_depth", LegacyProjectionStatus::Translated),
-    ("resample_quality", LegacyProjectionStatus::Translated),
-    ("nyquist_transition", LegacyProjectionStatus::Translated),
-    ("dither_type", LegacyProjectionStatus::Translated),
-    ("dither_explicit", LegacyProjectionStatus::Defaulted),
-    ("preferred_tool", LegacyProjectionStatus::Translated),
-    ("force_encode", LegacyProjectionStatus::Translated),
-    ("flac.compression_level", LegacyProjectionStatus::Translated),
-    ("flac.verify", LegacyProjectionStatus::Derived),
-    ("flac.write_md5", LegacyProjectionStatus::Defaulted),
-    ("mp3.mode", LegacyProjectionStatus::Translated),
-    ("mp3.bitrate_kbps", LegacyProjectionStatus::Translated),
-    ("mp3.vbr_quality", LegacyProjectionStatus::Translated),
-    ("aac.profile", LegacyProjectionStatus::Translated),
-    ("aac.bitrate_kbps", LegacyProjectionStatus::Translated),
-    ("opus.content_type", LegacyProjectionStatus::Defaulted),
-    ("opus.bitrate_kbps", LegacyProjectionStatus::Translated),
-    ("opus.complexity", LegacyProjectionStatus::Translated),
-    ("wavpack.mode", LegacyProjectionStatus::Translated),
-    ("wavpack.hybrid", LegacyProjectionStatus::Translated),
-    ("wavpack.hybrid_bitrate_kbps", LegacyProjectionStatus::Defaulted),
-    ("wavpack.correction_file", LegacyProjectionStatus::Translated),
-    ("ssrc.force", LegacyProjectionStatus::Derived),
-
-    ("ssrc.insane_mode", LegacyProjectionStatus::Translated),
-    ("sox_resampler.chebyshev", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.bandwidth_pct", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.phase", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.allow_aliasing", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_taps", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_attenuation_db", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_passband_hz", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_transition_hz", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_kaiser_beta", LegacyProjectionStatus::Defaulted),
-    ("sox_resampler.sinc_phase", LegacyProjectionStatus::Defaulted),
-    ("soxr_resampler.chebyshev", LegacyProjectionStatus::Defaulted),
-    ("soxr_resampler.cutoff", LegacyProjectionStatus::Defaulted),
-    ("soxr_resampler.phase", LegacyProjectionStatus::Defaulted),
-    ("ssrc.profile", LegacyProjectionStatus::Derived),
-    ("ssrc.attenuation_db", LegacyProjectionStatus::Unrepresentable),
-    ("ssrc.min_phase", LegacyProjectionStatus::Unrepresentable),
-    ("ssrc.dither_id", LegacyProjectionStatus::Unrepresentable),
-    ("ssrc.pdf_type", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.noise_shaper", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.modulator_order", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.trellis", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.trellis.lookahead", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.trellis.nodes", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.trellis.latency", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.pcm_to_dsd_filter", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.dsd_to_pcm_lowpass", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.dsd_to_pcm_gain_mode", LegacyProjectionStatus::Derived),
-    ("dsd.dsd_to_pcm_auto_gain_margin_db", LegacyProjectionStatus::Derived),
-    ("dsd.dsd_to_pcm_gain_db", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.oversample_factor", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.taps", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.passband_hz", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.transition_hz", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.kaiser_beta", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.linear_phase", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.sinc.allow_aliasing", LegacyProjectionStatus::Unrepresentable),
-    ("dsd.gain_compensation", LegacyProjectionStatus::Unrepresentable),
-    ("metadata.transfer_tags", LegacyProjectionStatus::Translated),
-    ("metadata.preserve_artwork", LegacyProjectionStatus::Translated),
-    ("metadata.store_source_audio_md5", LegacyProjectionStatus::Derived),
-    ("verification.verify_after_encode", LegacyProjectionStatus::Derived),
-    ("verification.prefer_native_flac_verify", LegacyProjectionStatus::Defaulted),
-    ("replay_gain.mode", LegacyProjectionStatus::Translated),
-    ("replay_gain.prevent_clipping", LegacyProjectionStatus::Defaulted),
-    ("replay_gain.existing_tags", LegacyProjectionStatus::Defaulted),
-];
 
 #[test]
-fn legacy_projection_inventory_lists_every_pipeline_settings_field() {
-    let mut inventory: Vec<&str> = LEGACY_FIELD_INVENTORY.iter().map(|(path, _)| *path).collect();
-    let mut fingerprint = SETTINGS_FINGERPRINT_FIELD_PATHS.to_vec();
-    inventory.sort_unstable();
-    fingerprint.sort_unstable();
-    assert_eq!(inventory, fingerprint);
+fn strict_dsd_settings_have_one_representation_for_general_and_reference_intent() {
+    let general = DsdSettings::default();
+    assert_eq!(general.from_dsd.pathway, DsdSourcePathway::General);
+    assert_eq!(general.gain_policy(), SampleGainPolicy::Off);
+
+    let reference = DsdSettings::reference();
+    assert_eq!(reference.from_dsd.pathway, DsdSourcePathway::Reference);
+    assert_eq!(reference.gain_policy(), SampleGainPolicy::Off);
+
+    assert_eq!(general.pcm_to_dsd, reference.pcm_to_dsd);
+    assert_eq!(general.general_from_dsd, reference.general_from_dsd);
 }
 
-fn legacy_item(options: ConversionOptions) -> ConversionItem {
-    ConversionItem::new(
-        PathBuf::from("/tmp/tonepoet-settings-sentinel/legacy.flac"),
-        FileFormat::Audio(QueueAudioFormat::Flac),
-        options,
-    )
+#[test]
+fn directional_dsd_snapshot_inventory_is_complete_and_strict() {
+    let mut paths = SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS.to_vec();
+    let original_len = paths.len();
+    paths.sort_unstable();
+    paths.dedup();
+    assert_eq!(paths.len(), original_len, "duplicate directional DSD snapshot path");
+    assert_eq!(paths.len(), SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT);
+    assert!(paths.contains(&"dsd.from_dsd.pathway"));
+    assert!(paths.contains(&"dsd.from_dsd.reference_policy"));
+    assert!(paths.contains(&"dsd.general_from_dsd.gain.mode"));
+    assert!(!paths.contains(&"dsd.schema"));
 }
 
-fn rich_legacy_flac_options() -> ConversionOptions {
+#[test]
+fn deprecated_projection_retains_unrelated_legacy_behavior_but_cannot_invent_new_gain_policy() {
     let mut options = ConversionOptions::default();
     options.output_format = QueueAudioFormat::Flac;
     options.quality = QualitySettings::Flac {
@@ -955,176 +456,134 @@ fn rich_legacy_flac_options() -> ConversionOptions {
     options.reencode_flac = true;
     options.preferred_backend = Some(tonepoet_backend::Backend::Sox);
     options.ssrc_insane_mode = Some(true);
-    options
-}
 
-#[allow(deprecated)]
-fn legacy_projection(item: &ConversionItem) -> PipelineRequest {
-    tonepoet::convert::pipeline::build_pipeline_request_from_legacy_options(item).unwrap()
-}
-
-fn legacy_options_for_quality(
-    output_format: QueueAudioFormat,
-    quality: QualitySettings,
-) -> ConversionOptions {
-    let mut options = rich_legacy_flac_options();
-    options.output_format = output_format;
-    options.quality = quality;
-    options
-}
-
-macro_rules! assert_legacy_value {
-    ($covered:ident, $status:expr, $path:literal, $actual:expr, $expected:expr) => {{
-        $covered.push(($path, $status));
-        assert_eq!(&$actual, &$expected, "legacy projection mismatch for {}", $path);
-    }};
-}
-
-macro_rules! assert_legacy_unrepresentable {
-    ($covered:ident, $path:literal, $actual:expr, $default:expr, $sentinel:expr) => {{
-        $covered.push(($path, LegacyProjectionStatus::Unrepresentable));
-        assert_eq!(&$actual, &$default, "legacy projection unexpectedly translated {}", $path);
-        assert_ne!(&$actual, &$sentinel, "sentinel did not exercise unrepresentable {}", $path);
-    }};
-}
-
-fn assert_legacy_coverage(covered: &[(&'static str, LegacyProjectionStatus)]) {
-    let mut actual = covered.to_vec();
-    let mut expected = LEGACY_FIELD_INVENTORY.to_vec();
-    actual.sort_unstable();
-    expected.sort_unstable();
-    assert_eq!(actual, expected, "legacy behavior assertions drifted from inventory");
-}
-
-#[test]
-fn explicit_legacy_projection_has_behavioral_assertion_for_every_field() {
-    let flac = legacy_projection(&legacy_item(rich_legacy_flac_options())).settings;
-    let mp3 = legacy_projection(&legacy_item(legacy_options_for_quality(
-        QueueAudioFormat::Mp3,
-        QualitySettings::Mp3 {
-            bitrate_mode: Mp3BitrateMode::Cbr { bitrate: 192 },
-            quality: 0,
-        },
-    )))
-    .settings;
-    let aac = legacy_projection(&legacy_item(legacy_options_for_quality(
-        QueueAudioFormat::Aac,
-        QualitySettings::Aac {
-            bitrate: 96,
-            profile: QueueAacProfile::HeV2,
-        },
-    )))
-    .settings;
-    let opus = legacy_projection(&legacy_item(legacy_options_for_quality(
-        QueueAudioFormat::Opus,
-        QualitySettings::Opus {
-            bitrate: 160,
-            complexity: 5,
-        },
-    )))
-    .settings;
-    let wavpack = legacy_projection(&legacy_item(legacy_options_for_quality(
-        QueueAudioFormat::WavPack,
-        QualitySettings::WavPack {
-            compression_mode: QueueWavPackMode::VeryHigh,
-            hybrid_mode: true,
-            correction_file: false,
-        },
-    )))
-    .settings;
-
-    let default = PipelineSettings::default();
-    let sentinel = flac_md5_sentinel();
-    let mut covered = Vec::new();
-
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_format", flac.target_format, AudioFormat::Flac);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_sample_rate", flac.target_sample_rate, RateTarget::PcmHz(96_000));
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "target_bit_depth", flac.target_bit_depth, BitDepthTarget::Pcm(PcmBitDepth::Int24));
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "resample_quality", flac.resample_quality, ResampleQuality::High);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "nyquist_transition", flac.nyquist_transition, NyquistTransition::BrickWall);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "dither_type", flac.dither_type, DitherType::Gesemann);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "dither_explicit", flac.dither_explicit, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "preferred_tool", flac.preferred_tool, PreferredTool::Sox);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "force_encode", flac.force_encode, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "flac.compression_level", flac.flac.compression_level, 8);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "flac.verify", flac.flac.verify, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "flac.write_md5", flac.flac.write_md5, default.flac.write_md5);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.mode", mp3.mp3.mode, Mp3Mode::Cbr);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.bitrate_kbps", mp3.mp3.bitrate_kbps, 192);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "mp3.vbr_quality", mp3.mp3.vbr_quality, Mp3Settings::default().vbr_quality);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "aac.profile", aac.aac.profile, AacProfile::HeAacV2);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "aac.bitrate_kbps", aac.aac.bitrate_kbps, 96);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "opus.content_type", opus.opus.content_type, OpusContentType::Auto);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.bitrate_kbps", opus.opus.bitrate_kbps, 160);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "opus.complexity", opus.opus.complexity, 5);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.mode", wavpack.wavpack.mode, WavPackMode::VeryHigh);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.hybrid", wavpack.wavpack.hybrid, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "wavpack.hybrid_bitrate_kbps", wavpack.wavpack.hybrid_bitrate_kbps, default.wavpack.hybrid_bitrate_kbps);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "wavpack.correction_file", wavpack.wavpack.correction_file, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.force", flac.ssrc.force, true);
-
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "ssrc.insane_mode", flac.ssrc.insane_mode, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.chebyshev", flac.sox_resampler.chebyshev, default.sox_resampler.chebyshev);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.bandwidth_pct", flac.sox_resampler.bandwidth_pct, default.sox_resampler.bandwidth_pct);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.phase", flac.sox_resampler.phase, default.sox_resampler.phase);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.allow_aliasing", flac.sox_resampler.allow_aliasing, default.sox_resampler.allow_aliasing);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_taps", flac.sox_resampler.sinc_taps, default.sox_resampler.sinc_taps);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_attenuation_db", flac.sox_resampler.sinc_attenuation_db, default.sox_resampler.sinc_attenuation_db);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_passband_hz", flac.sox_resampler.sinc_passband_hz, default.sox_resampler.sinc_passband_hz);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_transition_hz", flac.sox_resampler.sinc_transition_hz, default.sox_resampler.sinc_transition_hz);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_kaiser_beta", flac.sox_resampler.sinc_kaiser_beta, default.sox_resampler.sinc_kaiser_beta);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "sox_resampler.sinc_phase", flac.sox_resampler.sinc_phase, default.sox_resampler.sinc_phase);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.chebyshev", flac.soxr_resampler.chebyshev, default.soxr_resampler.chebyshev);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.cutoff", flac.soxr_resampler.cutoff, default.soxr_resampler.cutoff);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "soxr_resampler.phase", flac.soxr_resampler.phase, default.soxr_resampler.phase);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "ssrc.profile", flac.ssrc.profile, Some(SsrcProfile::Insane));
-    assert_legacy_unrepresentable!(covered, "ssrc.attenuation_db", flac.ssrc.attenuation_db, default.ssrc.attenuation_db, sentinel.ssrc.attenuation_db);
-    assert_legacy_unrepresentable!(covered, "ssrc.min_phase", flac.ssrc.min_phase, default.ssrc.min_phase, sentinel.ssrc.min_phase);
-    assert_legacy_unrepresentable!(covered, "ssrc.dither_id", flac.ssrc.dither_id, default.ssrc.dither_id, sentinel.ssrc.dither_id);
-    assert_legacy_unrepresentable!(covered, "ssrc.pdf_type", flac.ssrc.pdf_type, default.ssrc.pdf_type, sentinel.ssrc.pdf_type);
-    assert_legacy_unrepresentable!(covered, "dsd.noise_shaper", flac.dsd.pcm_to_dsd.noise_shaper, default.dsd.pcm_to_dsd.noise_shaper, sentinel.dsd.pcm_to_dsd.noise_shaper);
-    assert_legacy_unrepresentable!(covered, "dsd.modulator_order", flac.dsd.pcm_to_dsd.modulator_order, default.dsd.pcm_to_dsd.modulator_order, sentinel.dsd.pcm_to_dsd.modulator_order);
-    assert_legacy_unrepresentable!(covered, "dsd.trellis", flac.dsd.pcm_to_dsd.trellis, default.dsd.pcm_to_dsd.trellis, sentinel.dsd.pcm_to_dsd.trellis);
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.lookahead", flac.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead), sentinel.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.lookahead));
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.nodes", flac.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), default.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes), sentinel.dsd.pcm_to_dsd.trellis.map(|trellis| trellis.nodes));
-    assert_legacy_unrepresentable!(covered, "dsd.trellis.latency", flac.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), default.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency), sentinel.dsd.pcm_to_dsd.trellis.and_then(|trellis| trellis.latency));
-    assert_legacy_unrepresentable!(covered, "dsd.pcm_to_dsd_filter", flac.dsd.pcm_to_dsd.filter, default.dsd.pcm_to_dsd.filter, sentinel.dsd.pcm_to_dsd.filter);
-    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_lowpass", legacy_dsd_behavior(&flac.dsd).lowpass, legacy_dsd_behavior(&default.dsd).lowpass, legacy_dsd_behavior(&sentinel.dsd).lowpass);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_gain_mode", legacy_dsd_behavior(&flac.dsd).gain_mode, DsdToPcmGainMode::Disabled);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "dsd.dsd_to_pcm_auto_gain_margin_db", legacy_dsd_behavior(&flac.dsd).auto_gain_margin_db, 0.15_f32);
-    assert_legacy_unrepresentable!(covered, "dsd.dsd_to_pcm_gain_db", legacy_dsd_behavior(&flac.dsd).gain_db, legacy_dsd_behavior(&default.dsd).gain_db, legacy_dsd_behavior(&sentinel.dsd).gain_db);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.oversample_factor", flac.dsd.pcm_to_dsd.sinc.oversample_factor, default.dsd.pcm_to_dsd.sinc.oversample_factor, sentinel.dsd.pcm_to_dsd.sinc.oversample_factor);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.taps", flac.dsd.pcm_to_dsd.sinc.taps, default.dsd.pcm_to_dsd.sinc.taps, sentinel.dsd.pcm_to_dsd.sinc.taps);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.passband_hz", flac.dsd.pcm_to_dsd.sinc.passband_hz, default.dsd.pcm_to_dsd.sinc.passband_hz, sentinel.dsd.pcm_to_dsd.sinc.passband_hz);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.transition_hz", flac.dsd.pcm_to_dsd.sinc.transition_hz, default.dsd.pcm_to_dsd.sinc.transition_hz, sentinel.dsd.pcm_to_dsd.sinc.transition_hz);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.kaiser_beta", flac.dsd.pcm_to_dsd.sinc.kaiser_beta, default.dsd.pcm_to_dsd.sinc.kaiser_beta, sentinel.dsd.pcm_to_dsd.sinc.kaiser_beta);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.linear_phase", flac.dsd.pcm_to_dsd.sinc.linear_phase, default.dsd.pcm_to_dsd.sinc.linear_phase, sentinel.dsd.pcm_to_dsd.sinc.linear_phase);
-    assert_legacy_unrepresentable!(covered, "dsd.sinc.allow_aliasing", flac.dsd.pcm_to_dsd.sinc.allow_aliasing, default.dsd.pcm_to_dsd.sinc.allow_aliasing, sentinel.dsd.pcm_to_dsd.sinc.allow_aliasing);
-    assert_legacy_unrepresentable!(covered, "dsd.gain_compensation", flac.dsd.pcm_to_dsd.gain_compensation, default.dsd.pcm_to_dsd.gain_compensation, sentinel.dsd.pcm_to_dsd.gain_compensation);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "metadata.transfer_tags", flac.metadata.transfer_tags, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "metadata.preserve_artwork", flac.metadata.preserve_artwork, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "metadata.store_source_audio_md5", flac.metadata.store_source_audio_md5, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Derived, "verification.verify_after_encode", flac.verification.verify_after_encode, false);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "verification.prefer_native_flac_verify", flac.verification.prefer_native_flac_verify, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Translated, "replay_gain.mode", flac.replay_gain.mode, Some(ReplayGainMode::Both));
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "replay_gain.prevent_clipping", flac.replay_gain.prevent_clipping, true);
-    assert_legacy_value!(covered, LegacyProjectionStatus::Defaulted, "replay_gain.existing_tags", flac.replay_gain.existing_tags, tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan);
-
-    assert_legacy_coverage(&covered);
-}
-
-#[test]
-fn native_v2_dsd_settings_use_a_separate_complete_snapshot_inventory() {
-    let mut paths = tonepoet_pipeline::SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS.to_vec();
-    paths.sort_unstable();
-    let original_len = paths.len();
-    paths.dedup();
-    assert_eq!(paths.len(), original_len, "duplicate native-v2 DSD snapshot path");
-    assert_eq!(
-        paths.len(),
-        tonepoet_pipeline::SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT
+    let item = ConversionItem::new(
+        PathBuf::from("/tmp/tonepoet-settings-sentinel/legacy-projection.flac"),
+        FileFormat::Audio(QueueAudioFormat::Flac),
+        options,
     );
-    assert!(paths.contains(&"dsd.schema"));
-    assert!(paths.contains(&"dsd.from_dsd.reference_policy"));
-    assert!(paths.contains(&"dsd.from_dsd.normalize_peak_target_dbfs"));
+    #[allow(deprecated)]
+    let projected = tonepoet::convert::pipeline::build_pipeline_request_from_legacy_options(&item)
+        .expect("explicit legacy projection")
+        .settings;
+
+    assert_eq!(projected.target_format, AudioFormat::Flac);
+    assert_eq!(projected.target_sample_rate, RateTarget::PcmHz(96_000));
+    assert_eq!(projected.target_bit_depth, BitDepthTarget::Pcm(PcmBitDepth::Int24));
+    assert_eq!(projected.resample_quality, ResampleQuality::High);
+    assert_eq!(projected.nyquist_transition, NyquistTransition::BrickWall);
+    assert_eq!(projected.dither_type, DitherType::Gesemann);
+    assert_eq!(projected.preferred_tool, PreferredTool::Sox);
+    assert!(projected.force_encode);
+    assert_eq!(projected.flac.compression_level, 8);
+    assert_eq!(projected.replay_gain.mode, Some(ReplayGainMode::Both));
+    assert_eq!(projected.ssrc.profile, Some(SsrcProfile::Insane));
+
+    // The deprecated queue projection cannot express the new mutually exclusive
+    // sample-domain gain schema. It must leave those policies Off rather than
+    // infer Guard/Normalize from historical booleans or defaults.
+    assert_eq!(projected.dsd.gain_policy(), SampleGainPolicy::Off);
+    assert_eq!(projected.pcm_true_peak.policy, SampleGainPolicy::Off);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn strict_settings_round_trip_preserves_typed_gain_and_rejects_unknown_fields() {
+    let settings = flac_sentinel();
+    let bytes = serde_json::to_vec(&settings).expect("serialize strict settings");
+    let restored: PipelineSettings =
+        serde_json::from_slice(&bytes).expect("round trip strict settings");
+
+    // Runtime album authority is deliberately not persisted.
+    let mut expected = settings;
+    expected.dsd.clear_runtime_album_gain();
+    expected.pcm_true_peak.clear_runtime_album_gain();
+    assert_eq!(restored, expected);
+
+    let mut value = serde_json::to_value(&expected).expect("serialize strict settings value");
+    value
+        .get_mut("dsd")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("DSD object")
+        .insert("schema_origin".to_string(), serde_json::json!("legacy_v1"));
+    assert!(serde_json::from_value::<PipelineSettings>(value).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn obsolete_ambiguous_gain_forms_are_rejected_not_migrated() {
+    let current = serde_json::to_value(PipelineSettings::default()).expect("serialize defaults");
+
+    for (key, value) in [
+        ("dsd_to_pcm_gain_mode", serde_json::json!("auto")),
+        ("dsd_to_pcm_auto_gain_margin_db", serde_json::json!(0.15)),
+        ("dsd_to_pcm_gain_db", serde_json::json!(3.0)),
+    ] {
+        let mut candidate = current.clone();
+        candidate
+            .get_mut("dsd")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("DSD object")
+            .insert(key.to_string(), value);
+        assert!(
+            serde_json::from_value::<PipelineSettings>(candidate).is_err(),
+            "obsolete DSD field {key} must be rejected"
+        );
+    }
+
+    let mut candidate = current;
+    candidate
+        .get_mut("pcm_true_peak")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("PCM gain object")
+        .insert("allow_boost".to_string(), serde_json::json!(true));
+    assert!(serde_json::from_value::<PipelineSettings>(candidate).is_err());
+}
+
+// Keep representative old quality adapters in this integration test so their
+// imports remain compiled alongside the settings bridge. They are independent
+// of the removed DSD schema.
+#[test]
+fn deprecated_quality_projection_still_handles_non_dsd_codec_variants() {
+    let cases = [
+        (
+            QueueAudioFormat::Mp3,
+            QualitySettings::Mp3 {
+                bitrate_mode: Mp3BitrateMode::Cbr { bitrate: 192 },
+                quality: 0,
+            },
+        ),
+        (
+            QueueAudioFormat::Aac,
+            QualitySettings::Aac {
+                bitrate: 96,
+                profile: QueueAacProfile::HeV2,
+            },
+        ),
+        (
+            QueueAudioFormat::WavPack,
+            QualitySettings::WavPack {
+                compression_mode: QueueWavPackMode::VeryHigh,
+                hybrid_mode: true,
+                correction_file: false,
+            },
+        ),
+    ];
+
+    for (format, quality) in cases {
+        let mut options = ConversionOptions::default();
+        options.output_format = format;
+        options.quality = quality;
+        let item = ConversionItem::new(
+            PathBuf::from("/tmp/tonepoet-settings-sentinel/legacy-codec.flac"),
+            FileFormat::Audio(QueueAudioFormat::Flac),
+            options,
+        );
+        #[allow(deprecated)]
+        let request: PipelineRequest =
+            tonepoet::convert::pipeline::build_pipeline_request_from_legacy_options(&item)
+                .expect("legacy codec projection");
+        assert_eq!(request.settings.dsd.gain_policy(), SampleGainPolicy::Off);
+        assert_eq!(request.settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+    }
 }

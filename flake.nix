@@ -59,15 +59,6 @@
           '';
         });
 
-        # loudgain — pin ffmpeg 6 (loudgain's scan.c is incompatible with ffmpeg 7)
-        loudgain = pkgs.loudgain.overrideAttrs (old: {
-          buildInputs = map (dep:
-            if pkgs.lib.getName dep == "ffmpeg" then pkgs.ffmpeg_6 else dep
-          ) old.buildInputs;
-          hardeningDisable = [ "all" ];
-          NIX_CFLAGS_COMPILE = "-Wno-error -Wno-deprecated-declarations";
-        });
-
         # Policy-owned Reference tools. Keep these bindings singular so the
         # wrapper, build inputs, dev shell, and runtime PATH cannot drift.
         referenceSox = sox_ng.packages.${system}.default;
@@ -79,7 +70,6 @@
           referenceSox
           ssrc.packages.${system}.default
           referenceFfmpeg
-          loudgain
         ] ++ [
           opus-tools-fixed
         ] ++ (with pkgs; [

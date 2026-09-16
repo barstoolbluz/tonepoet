@@ -11,12 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use async_trait::async_trait;
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{
@@ -72,23 +73,34 @@ use super::memory_budget::{
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
     cleanup_cue_stream_direct_track_plan, execute_planned_track_conversion,
+    execute_planned_track_conversion_with_scalar_pump,
     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
+    retained_pcm_scalar_stream_plan_admitted,
     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
     preflight_reference_rerun_authority, reference_bound_metadata_executable,
-    reference_metadata_toolchains_match, run_tool_command_with_concurrency,
+    reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
+    run_tool_command_with_concurrency,
     verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
     CueStreamDirectTrackPlan, ReferenceToolchainEvidence,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
-use super::plan_bridge::{metadata_obligations_for_request, orchestrator_metadata_stage_required};
+use super::plan_bridge::{
+    certified_true_peak_execution_contract, certified_true_peak_execution_contract_with_effects,
+    metadata_obligations_for_request, orchestrator_metadata_stage_required,
+    plan_request_for_track, plan_request_for_track_with_resolved_source,
+    registered_effect_execution_contract,
+    CertifiedTruePeakExecutionContract,
+};
 use super::planned_adapter::{planned_command_to_tool_command, DEFAULT_PLANNED_COMMAND_TIMEOUT};
 use super::progress::{
     heartbeat, OperationProgressTracker,
 };
 use super::reporter::{PipelineEvent, PipelineReporter};
 use super::tool::{
-    BoundToolExecutable, CommandRecord, EnvVar, RealToolRunner, ToolBinary, ToolCommand,
-    ToolOutput, ToolPipelineError, ToolPipelineOutput, ToolRunner, ToolSegmentedPipelineError,
+    resolve_command_launch_path, scale_certified_f64le_chunk_in_place, BoundToolExecutable,
+    CommandRecord, EnvVar,
+    RealToolRunner, RetainedPcmScalarPump, ToolBinary, ToolCommand, ToolOutput,
+    ToolPipelineError, ToolPipelineOutput, ToolRunner, ToolSegmentedPipelineError,
     ToolStreamMirror, ToolStreamSegment,
 };
 use super::types::*;
@@ -97,9 +109,9 @@ use crate::convert::ConversionStatus;
 use crate::metadata_persistence::native_ape_canonical_key;
 use tonepoet_pipeline::{
     AacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType,
-    DsdLowpassMethod, DsdRate, DsdToPcmGainMode, Mp3Mode, NyquistTransition,
-    OpusContentType, PcmBitDepth, PreferredTool, RateTarget, ResampleQuality,
-    SoxSincPhase, SsrcPdfType, SsrcProfile, WavPackMode,
+    DsdLowpassMethod, DsdRate, Mp3Mode, NyquistTransition,
+    OpusContentType, PcmBitDepth, PreferredTool, RateTarget, ResampleQuality, SampleGainPolicy,
+    SourceFrameExtent, SoxSincPhase, SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::tui::sacd::{
     parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
@@ -329,6 +341,16 @@ pub(crate) fn set_dsd_album_gain_scratch_retry_hook_for_test(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.push((id, hook));
     DsdAlbumGainScratchRetryHookGuard { id }
+}
+
+fn artifact_audio_paths(artifacts: &ArtifactSet) -> Vec<&Path> {
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks
+            .iter()
+            .map(|track| track.staged_path.as_path())
+            .collect(),
+        AudioArtifacts::Merged(merged) => vec![merged.staged_path.as_path()],
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +1148,7 @@ pub async fn realize_track_with_tool_limits(
         runner,
         cancel,
         tool_concurrency_limits,
+        false,
         progress_tracker,
     )
     .await
@@ -1140,6 +1163,7 @@ async fn realize_track_with_tool_limits_and_stats(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    admit_scalar_pump: bool,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<RealizedTrackInfo, ConvertError> {
     if cancel.is_cancelled() {
@@ -1147,8 +1171,7 @@ async fn realize_track_with_tool_limits_and_stats(
     }
 
     match src {
-        TrackSourceRef::StagedFile(path)
-        | TrackSourceRef::DsdAlbumGainCarrier { path, .. } => {
+        TrackSourceRef::StagedFile(path) => {
             if !path.exists() {
                 return Err(ConvertError::TrackValidation(format!(
                     "staged track does not exist: {}",
@@ -1164,9 +1187,17 @@ async fn realize_track_with_tool_limits_and_stats(
             Ok(RealizedTrackInfo {
                 path: path.clone(),
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
+                scalar_pump: None,
             })
         }
-        TrackSourceRef::PcmTruePeakCarrier {
+        TrackSourceRef::DsdTruePeakCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            ..
+        }
+        | TrackSourceRef::PcmTruePeakCarrier {
             path,
             sample_rate_hz,
             channels,
@@ -1175,27 +1206,64 @@ async fn realize_track_with_tool_limits_and_stats(
         } => {
             if !path.exists() || !path.is_file() {
                 return Err(ConvertError::TrackValidation(format!(
-                    "PCM true-peak carrier is missing or not a regular file: {}",
+                    "certified true-peak carrier is missing or not a regular file: {}",
                     path.display(),
                 )));
             }
             let gain_db = gain_db.ok_or_else(|| {
                 ConvertError::TrackValidation(
-                    "PCM true-peak carrier reached realization before its gain authority was bound"
+                    "certified true-peak carrier reached realization before its gain authority was bound"
                         .to_string(),
                 )
             })?;
             if gain_db == tonepoet_pipeline::DbNano::ZERO {
                 return Ok(RealizedTrackInfo::without_stats(path.clone()));
             }
-            let output = pcm_true_peak_gained_path(path, gain_db);
+            let expected_bytes = fs::metadata(path)
+                .map_err(ConvertError::Io)?
+                .len();
+            let frame_bytes = u64::from(*channels)
+                .checked_mul(std::mem::size_of::<f64>() as u64)
+                .ok_or_else(|| {
+                    ConvertError::TrackValidation(
+                        "certified true-peak carrier frame size overflowed".to_string(),
+                    )
+                })?;
+            if *sample_rate_hz == 0
+                || *channels == 0
+                || expected_bytes == 0
+                || expected_bytes % frame_bytes != 0
+            {
+                return Err(ConvertError::TrackValidation(format!(
+                    "certified true-peak carrier {} does not satisfy its retained f64le geometry (rate={}, channels={}, bytes={})",
+                    path.display(), sample_rate_hz, channels, expected_bytes,
+                )));
+            }
+            let expected_sha256 = certified_carrier_digest_from_path(path)
+                .map_err(ConvertError::TrackValidation)?;
+            if admit_scalar_pump && runner.supports_pcm_scalar_pump() {
+                return Ok(RealizedTrackInfo {
+                    path: path.clone(),
+                    dsd_dst_stats: None,
+                    scalar_pump: Some(RetainedPcmScalarPump {
+                        input_path: path.clone(),
+                        sample_rate_hz: *sample_rate_hz,
+                        channels: *channels,
+                        gain_db,
+                        expected_bytes,
+                        expected_sha256,
+                    }),
+                });
+            }
+
+            let output = certified_true_peak_gained_path(path, gain_db);
             let input = path.clone();
             let output_for_worker = output.clone();
             let cancel_for_worker = cancel.clone();
             let rate = *sample_rate_hz;
             let channel_count = *channels;
             tokio::task::spawn_blocking(move || {
-                scale_pcm_true_peak_f64le(
+                scale_certified_true_peak_f64le(
                     &input,
                     &output_for_worker,
                     rate,
@@ -1213,6 +1281,55 @@ async fn realize_track_with_tool_limits_and_stats(
             })?
             .map_err(ConvertError::Realize)?;
             Ok(RealizedTrackInfo::without_stats(output))
+        }
+        TrackSourceRef::RegisteredEffectCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            representation,
+            ..
+        } => {
+            let metadata = fs::metadata(path).map_err(ConvertError::Io)?;
+            if !metadata.is_file() || *sample_rate_hz == 0 || *channels == 0 || metadata.len() == 0 {
+                return Err(ConvertError::TrackValidation(format!(
+                    "registered-effect carrier {} has invalid retained geometry (rate={}, channels={}, bytes={})",
+                    path.display(), sample_rate_hz, channels, metadata.len(),
+                )));
+            }
+            match representation {
+                RegisteredEffectCarrierRepresentation::RawFloat64 => {
+                    let frame_bytes = u64::from(*channels)
+                        .checked_mul(std::mem::size_of::<f64>() as u64)
+                        .ok_or_else(|| {
+                            ConvertError::TrackValidation(
+                                "registered-effect carrier frame size overflowed".to_string(),
+                            )
+                        })?;
+                    if metadata.len() % frame_bytes != 0 {
+                        return Err(ConvertError::TrackValidation(format!(
+                            "registered-effect carrier {} does not satisfy its retained f64le geometry (rate={}, channels={}, bytes={})",
+                            path.display(), sample_rate_hz, channels, metadata.len(),
+                        )));
+                    }
+                }
+                RegisteredEffectCarrierRepresentation::Float64Wav
+                | RegisteredEffectCarrierRepresentation::TerminalPcmWav { .. } => {
+                    use std::io::Read as _;
+                    let mut file = fs::File::open(path).map_err(ConvertError::Io)?;
+                    let mut header = [0_u8; 12];
+                    file.read_exact(&mut header).map_err(ConvertError::Io)?;
+                    let riff_family = &header[0..4] == b"RIFF"
+                        || &header[0..4] == b"RF64"
+                        || &header[0..4] == b"BW64";
+                    if !riff_family || &header[8..12] != b"WAVE" {
+                        return Err(ConvertError::TrackValidation(format!(
+                            "registered-effect WAV carrier {} has no RIFF/RF64/BW64 WAVE header",
+                            path.display(),
+                        )));
+                    }
+                }
+            }
+            Ok(RealizedTrackInfo::without_stats(path.clone()))
         }
         TrackSourceRef::CueStreamSegment {
             fallback_path,
@@ -1722,6 +1839,62 @@ fn stable_path_hash(path: &Path) -> u64 {
     hash
 }
 
+const CERTIFIED_CARRIER_DIGEST_MARKER: &str = "-sha256-";
+
+fn certified_carrier_bound_path(
+    carrier_dir: &Path,
+    prefix: &str,
+    digest: tonepoet_pipeline::Sha256Digest,
+) -> PathBuf {
+    carrier_dir.join(format!(
+        "{prefix}{CERTIFIED_CARRIER_DIGEST_MARKER}{}.f64le",
+        digest.to_hex(),
+    ))
+}
+
+fn certified_carrier_digest_from_path(
+    path: &Path,
+) -> Result<tonepoet_pipeline::Sha256Digest, String> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("certified carrier has a non-UTF8 filename: {}", path.display()))?;
+    let (_, digest) = stem.rsplit_once(CERTIFIED_CARRIER_DIGEST_MARKER).ok_or_else(|| {
+        format!(
+            "certified carrier path does not contain its measured content binding: {}",
+            path.display(),
+        )
+    })?;
+    tonepoet_pipeline::Sha256Digest::from_hex(digest).map_err(|error| {
+        format!(
+            "certified carrier path contains an invalid measured content binding {}: {error}",
+            path.display(),
+        )
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<tonepoet_pipeline::Sha256Digest, String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("could not open retained certified carrier {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not hash retained certified carrier {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(tonepoet_pipeline::Sha256Digest(out))
+}
+
 async fn decode_wavpack_image(
     input: &Path,
     out_path: &Path,
@@ -1865,7 +2038,8 @@ async fn probe_realized_segment_with_tool_limits(
 /// realization. This is deliberately local to true-peak preparation: ordinary
 /// conversion planning keeps its existing source-fact semantics, while CUE
 /// fallback carriers and other decoded source shapes can still be measured
-/// with their actual channel geometry.
+/// with their actual channel geometry and, for PCM, exact frame extent when
+/// ffprobe exposes sample-exact stream timing.
 async fn source_info_for_true_peak_realized_track(
     track: &PreparedTrack,
     realized_input: &Path,
@@ -1876,7 +2050,10 @@ async fn source_info_for_true_peak_realized_track(
     let mut source = super::plan_bridge::source_info_for_realized_track(track, realized_input)?;
     let needs_channels = !matches!(source.channels, Some(channels) if channels > 0);
     let needs_sample_rate = !matches!(source.sample_rate_hz, Some(rate) if rate > 0);
-    if !needs_channels && !needs_sample_rate {
+    let needs_pcm_frame_extent = source.representation_kind()
+        == tonepoet_pipeline::SourceRepresentationKind::Pcm
+        && source.frame_extent.is_none();
+    if !needs_channels && !needs_sample_rate && !needs_pcm_frame_extent {
         return Ok(source);
     }
 
@@ -1896,6 +2073,11 @@ async fn source_info_for_true_peak_realized_track(
     }
     if needs_sample_rate {
         source.sample_rate_hz = Some(probe.sample_rate);
+    }
+    if needs_pcm_frame_extent && probe.exact {
+        if let Some(samples) = probe.samples {
+            source.frame_extent = Some(SourceFrameExtent::Exact(samples));
+        }
     }
     Ok(source)
 }
@@ -2003,8 +2185,8 @@ fn expected_post_encode_depth_for_track(
         tonepoet_pipeline::BitDepthTarget::Source => {
             if settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
                 && settings.wavpack.hybrid
-                && (settings.pcm_true_peak.enabled
-                    || settings.pcm_true_peak.fixed_gain_db.is_some())
+                && (settings.pcm_true_peak.is_true_peak()
+                    || settings.pcm_true_peak.fixed_gain_db().is_some())
             {
                 return Some(PostEncodeDepthExpectation {
                     depth: super::plan_bridge::resolve_wavpack_hybrid_source_working_depth(track),
@@ -2682,6 +2864,7 @@ where
         return Ok(RealizedTrackInfo {
             path: out_path,
             dsd_dst_stats: stats,
+            scalar_pump: None,
         });
     }
 
@@ -2749,6 +2932,7 @@ where
             Ok(RealizedTrackInfo {
                 path: out_path,
                 dsd_dst_stats,
+                scalar_pump: None,
             })
         }
         Err(first_err) if out_path.exists() => {
@@ -2770,6 +2954,7 @@ where
             Ok(RealizedTrackInfo {
                 path: out_path,
                 dsd_dst_stats,
+                scalar_pump: None,
             })
         }
         Err(err) => {
@@ -3468,6 +3653,7 @@ pub struct ScheduledRealizedTrack {
     pub final_path: PathBuf,
     pub realized_path: PathBuf,
     pub realized_dsd_dst_stats: Option<DsdDstPipelineStats>,
+    pub(crate) scalar_pump: Option<RetainedPcmScalarPump>,
     pub req: PipelineRequest,
     pub staging_root: PathBuf,
     pub staging_job: String,
@@ -3479,6 +3665,7 @@ pub struct ScheduledRealizedTrack {
 struct RealizedTrackInfo {
     path: PathBuf,
     dsd_dst_stats: Option<DsdDstPipelineStats>,
+    scalar_pump: Option<RetainedPcmScalarPump>,
 }
 
 impl RealizedTrackInfo {
@@ -3486,8 +3673,63 @@ impl RealizedTrackInfo {
         Self {
             path,
             dsd_dst_stats: None,
+            scalar_pump: None,
         }
     }
+}
+
+async fn select_scalar_transport_or_materialized_baseline(
+    mut realized: RealizedTrackInfo,
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    staged_output: &Path,
+    convert_root: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<RealizedTrackInfo, ConvertError> {
+    let Some(pump) = realized.scalar_pump.clone() else {
+        return Ok(realized);
+    };
+    if runner.supports_pcm_scalar_pump()
+        && retained_pcm_scalar_stream_plan_admitted(
+            request,
+            track,
+            &realized.path,
+            staged_output,
+            convert_root,
+        )?
+    {
+        return Ok(realized);
+    }
+
+    // This is a preflight baseline choice, not a retry after a failed stream.
+    // No terminal process has started.  Materialize exactly the same scalar
+    // graph and let the established path-backed executor proceed normally.
+    let output = certified_true_peak_gained_path(&pump.input_path, pump.gain_db);
+    let input = pump.input_path.clone();
+    let output_for_worker = output.clone();
+    let cancel_for_worker = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        scale_certified_true_peak_f64le(
+            &input,
+            &output_for_worker,
+            pump.sample_rate_hz,
+            pump.channels,
+            pump.gain_db,
+            &cancel_for_worker,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ConvertError::Realize(format!(
+            "PCM true-peak gain baseline worker failed for {}: {error}",
+            realized.path.display(),
+        ))
+    })?
+    .map_err(ConvertError::Realize)?;
+    realized.path = output;
+    realized.scalar_pump = None;
+    Ok(realized)
 }
 
 /// Build a deterministic failed track output for scheduler boundary failures.
@@ -3885,6 +4127,36 @@ async fn convert_one_track_work(
 ) -> Result<ScheduledTrackOutput, String> {
     let staging = StagingDir::borrowed(staging_root, staging_job);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let track = match prepare_track_scoped_certified_true_peak_carrier(
+        &req,
+        track.clone(),
+        &final_path,
+        &staging,
+        runner,
+        &cancel,
+        &tool_paths,
+        tool_concurrency_limits.clone(),
+    )
+    .await
+    {
+        Ok(track) => track,
+        Err(err) => {
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                Vec::new(),
+                err,
+            );
+            return Ok(ScheduledTrackOutput {
+                index: track_index,
+                record,
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+    };
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, reporter);
     let realized = match Box::pin(realize_track_with_tool_limits_and_stats(
         &track.source_ref,
@@ -3894,6 +4166,7 @@ async fn convert_one_track_work(
         runner,
         &cancel,
         tool_concurrency_limits.clone(),
+        true,
         Some(&mut progress_tracker),
     ))
     .await
@@ -3904,8 +4177,40 @@ async fn convert_one_track_work(
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
     };
-    let realized_input = realized.path;
-    let realized_dsd_dst_stats = realized.dsd_dst_stats;
+    let realized = match select_scalar_transport_or_materialized_baseline(
+        realized,
+        &req,
+        &track,
+        &staged_path,
+        &convert_root,
+        runner,
+        &cancel,
+    )
+    .await
+    {
+        Ok(realized) => realized,
+        Err(err) => {
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                Vec::new(),
+                err.to_string(),
+            );
+            return Ok(ScheduledTrackOutput {
+                index: track_index,
+                record,
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+    };
+    let RealizedTrackInfo {
+        path: realized_input,
+        dsd_dst_stats: realized_dsd_dst_stats,
+        scalar_pump,
+    } = realized;
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -3921,10 +4226,11 @@ async fn convert_one_track_work(
     }
 
     let bytes_in = file_len(&realized_input);
-    let executed = Box::pin(execute_planned_track_conversion(
+    let executed = Box::pin(execute_planned_track_conversion_with_scalar_pump(
         &req,
         &track,
         &realized_input,
+        scalar_pump,
         &staged_path,
         &convert_root,
         runner,
@@ -4931,6 +5237,16 @@ async fn apply_metadata_to_track_artifact(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), MetadataError> {
+    let _baseline_scope = super::baseline::scoped_event(
+        "metadata_artifact",
+        serde_json::json!({
+            "path": artifact.staged_path.display().to_string(),
+            "extension": artifact.staged_path.extension().and_then(|value| value.to_str()),
+            "reference_bound": artifact.reference_evidence.is_some(),
+            "has_track_metadata": metadata.is_some(),
+            "has_artwork": artwork.is_some(),
+        }),
+    );
     if let Some(reference) = artifact.reference_evidence.as_ref() {
         let bound_runner = ReferenceBoundMetadataRunner {
             inner: runner,
@@ -5200,7 +5516,7 @@ pub async fn apply_metadata_with_tool_limits(
                     .find(|t| t.id == artifact.track_id);
                 if let Some(PreparedTrack {
                     source_ref:
-                        TrackSourceRef::DsdAlbumGainCarrier {
+                        TrackSourceRef::DsdTruePeakCarrier {
                             source_path,
                             duration,
                             ..
@@ -6456,7 +6772,7 @@ fn m4a_freeform_tag_pairs_for_file(
 /// in-process metadata writer may follow it; that path uses the editor's
 /// format-aware preservation logic. Later unrelated tag editors are permitted
 /// only when their preservation behavior is pinned (the real-tools
-/// ReplayGain test covers loudgain/taglib). Convergence holds because the next
+/// ReplayGain test covers the native writer/tag reader). Convergence holds because the next
 /// metadata run's rewrite (`-map_metadata -1`) wipes all prior freeform atoms
 /// before this re-adds the current set.
 ///
@@ -11238,9 +11554,12 @@ FILE "album.flac" WAVE
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int16);
 
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("matrix-{}", case.name),
             item_id: format!("matrix-{}", case.name),
+            submission_id: None,
+            submission_size: None,
             container: image.to_path_buf(),
             source: SourceOptions {
                 archive_password: None,
@@ -12707,19 +13026,11 @@ FILE "album.flac" WAVE
                 let mut album_req = req.clone();
                 album_req.settings.metadata.transfer_tags = false;
                 album_req.settings.metadata.preserve_artwork = false;
-                album_req
-                    .settings
-                    .dsd
-                    .set_legacy_dsd_to_pcm_gain(
-                        tonepoet_pipeline::DsdToPcmGainMode::Auto,
-                        0.15,
-                        None,
-                    )
-                    .expect("album-scope DFF sidecar gain settings");
-                album_req
-                    .settings
-                    .dsd
-                    .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+                album_req.settings.dsd.set_gain_policy(
+                    tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                        .with_target("-0.150000000".parse().expect("target"))
+                        .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+                );
                 album_req.settings.dsd.bind_runtime_album_gain(
                     "0.000000000".parse().expect("fixed album gain"),
                     Some("-1.000000000".parse().expect("album peak")),
@@ -12730,7 +13041,7 @@ FILE "album.flac" WAVE
                 let raw_carrier = case_root.join("sidecar.album-gain.f64le");
                 std::fs::write(&raw_carrier, b"metadata-branch-only raw carrier")
                     .expect("album-scope DFF raw carrier fixture");
-                album_source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+                album_source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
                     path: raw_carrier,
                     source_path: carrier.clone(),
                     sample_rate_hz: album_source.tracks[0]
@@ -12738,6 +13049,11 @@ FILE "album.flac" WAVE
                         .unwrap_or(176_400),
                     channels: 2,
                     duration: None,
+                                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    point_dbtp: None,
+                    effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    lossy_target_capped: false,
+                    terminal_candidate: None,
                 };
 
                 let mut album_artifact = track_artifacts[0].clone();
@@ -13387,16 +13703,13 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
     }
 
     #[tokio::test]
-    async fn m4a_freeform_tags_survive_pipeline_loudgain_when_tools_are_available() {
+    async fn m4a_freeform_tags_survive_native_replaygain_when_tools_are_available() {
         let strict = cue_matrix_strict_mode();
         let case = matrix_cases()
             .into_iter()
             .find(|case| case.format == tonepoet_pipeline::AudioFormat::Alac)
             .expect("ALAC matrix case");
         let mut unavailable = case_unavailability_reasons(&case);
-        if !executable_on_path("loudgain") {
-            unavailable.push("missing loudgain executable".to_string());
-        }
         if !unavailable.is_empty() {
             let message = format!(
                 "m4a freeform/ReplayGain preservation requires {}",
@@ -13411,11 +13724,11 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
 
         let temp = tempfile::tempdir().expect("temp dir");
         let source_path = create_single_flac_with_custom_tags(temp.path());
-        let case_root = temp.path().join("m4a-freeform-loudgain");
+        let case_root = temp.path().join("m4a-freeform-native-replaygain");
         std::fs::create_dir_all(case_root.join("out")).expect("case output root");
         std::fs::create_dir_all(case_root.join("logs")).expect("case log root");
         let mut req = request_for_case(&case_root, &source_path, &case);
-        req.job_id = "m4a-freeform-loudgain".to_string();
+        req.job_id = "m4a-freeform-native-replaygain".to_string();
         req.item_id = req.job_id.clone();
         req.settings.metadata.preserve_artwork = false;
         req.stages.replaygain = StageRequirement::Enabled;
@@ -13460,7 +13773,7 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
             None,
         )
         .await
-        .expect("loudgain scan");
+        .expect("native ReplayGain scan");
         assert!(matches!(replaygain.outcome, StageOutcome::Ok));
 
         let after = ffprobe_json(&output_path);
@@ -13474,7 +13787,7 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
         ] {
             assert!(
                 tags.get(key).is_some_and(|value| !value.trim().is_empty()),
-                "loudgain should write {key}; tags were {tags:?}"
+                "native ReplayGain should write {key}; tags were {tags:?}"
             );
         }
     }
@@ -13492,970 +13805,55 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
     }
 }
 
-fn replaygain_value_present(tag: &lofty::tag::Tag, key: lofty::tag::ItemKey) -> bool {
-    tag.get_string(&key)
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-}
-
-fn replaygain_tag_set_complete(
-    tag: &lofty::tag::Tag,
-    mode: tonepoet_pipeline::ReplayGainMode,
-) -> bool {
-    use lofty::tag::ItemKey;
-    let track_complete = replaygain_value_present(tag, ItemKey::ReplayGainTrackGain)
-        && replaygain_value_present(tag, ItemKey::ReplayGainTrackPeak);
-    let album_complete = replaygain_value_present(tag, ItemKey::ReplayGainAlbumGain)
-        && replaygain_value_present(tag, ItemKey::ReplayGainAlbumPeak);
-    match mode {
-        tonepoet_pipeline::ReplayGainMode::Track => track_complete,
-        tonepoet_pipeline::ReplayGainMode::Album => album_complete,
-        tonepoet_pipeline::ReplayGainMode::Both => track_complete && album_complete,
-    }
-}
-
-#[cfg(test)]
-mod replaygain_existing_tag_policy_tests {
-    use super::*;
-    use super::chunk_2_1_3_postprocessing_gate_and_phase_tests::{request, stage_policy};
-    use crate::convert::pipeline::tool::{ProcessExit, StubToolRunner, ToolOutput};
-    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
-    use tonepoet_pipeline::{
-        AudioFormat, ReplayGainExistingTagPolicy, ReplayGainMode,
-    };
-
-    fn legacy_dsd_settings(
-        gain_mode: tonepoet_pipeline::DsdToPcmGainMode,
-        gain_db: Option<f32>,
-    ) -> tonepoet_pipeline::DsdSettings {
-        let native = tonepoet_pipeline::DsdSettings::native_v2();
-        serde_json::from_value(serde_json::json!({
-            "noise_shaper": native.pcm_to_dsd.noise_shaper,
-            "modulator_order": native.pcm_to_dsd.modulator_order,
-            "trellis": native.pcm_to_dsd.trellis,
-            "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
-            "dsd_to_pcm_lowpass": tonepoet_pipeline::DsdLowpassMethod::Auto,
-            "dsd_to_pcm_gain_mode": gain_mode,
-            "dsd_to_pcm_auto_gain_margin_db": 0.15,
-            "dsd_to_pcm_gain_db": gain_db,
-            "sinc": native.pcm_to_dsd.sinc,
-            "gain_compensation": native.pcm_to_dsd.gain_compensation,
-        }))
-        .expect("exact legacy DSD settings fixture")
-    }
-
-    fn tag_with(values: &[(ItemKey, &str)]) -> Tag {
-        let mut tag = Tag::new(TagType::VorbisComments);
-        for (key, value) in values {
-            tag.insert_unchecked(TagItem::new(
-                key.clone(),
-                ItemValue::Text((*value).to_string()),
-            ));
-        }
-        tag
-    }
-
-    fn flac_block(block_type: u8, last: bool, data: &[u8]) -> Vec<u8> {
-        assert!(data.len() <= 0x00ff_ffff);
-        let mut out = Vec::with_capacity(4 + data.len());
-        out.push((if last { 0x80 } else { 0 }) | block_type);
-        let len = data.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes()[1..]);
-        out.extend_from_slice(data);
-        out
-    }
-
-    fn vorbis_block_body(comments: &[(&str, &str)]) -> Vec<u8> {
-        let vendor = "tonepoet-replaygain-test";
-        let mut out = Vec::new();
-        out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-        out.extend_from_slice(vendor.as_bytes());
-        out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
-        for (name, value) in comments {
-            let comment = format!("{name}={value}");
-            out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
-            out.extend_from_slice(comment.as_bytes());
-        }
-        out
-    }
-
-    fn write_synthetic_flac(path: &Path, comments: &[(&str, &str)]) {
-        let mut streaminfo = [0u8; 34];
-        streaminfo[0..2].copy_from_slice(&4096u16.to_be_bytes());
-        streaminfo[2..4].copy_from_slice(&4096u16.to_be_bytes());
-        let packed_audio_facts = (44_100u64 << 44)
-            | (1u64 << 41) // two channels: channels minus one
-            | (15u64 << 36) // 16-bit PCM: bits per sample minus one
-            | 4096u64;
-        streaminfo[10..18].copy_from_slice(&packed_audio_facts.to_be_bytes());
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"fLaC");
-        bytes.extend_from_slice(&flac_block(0, false, &streaminfo));
-        bytes.extend_from_slice(&flac_block(4, false, &vorbis_block_body(comments)));
-        // Terminal PADDING block: real-world FLAC shape, and lofty's
-        // missing-padding splice path panics on a padding-less synthetic
-        // file when a WRITE (stale-album-tag removal) rewrites it.
-        bytes.extend_from_slice(&flac_block(1, true, &[0u8; 256]));
-        std::fs::write(path, bytes).expect("write synthetic ReplayGain FLAC");
-    }
-
-    fn track_artifact(path: PathBuf, ordinal: u32) -> TrackArtifact {
-        TrackArtifact {
-                    reference_evidence: None,
-            track_id: TrackId {
-                source_ordinal: ordinal,
-                disc_number: None,
-                track_number: ordinal,
-            },
-            staged_path: path.clone(),
-            final_path: path.with_extension("published.flac"),
-            samples: Some(44_100),
-            metadata_satisfaction: PlannedMetadataSatisfaction::default(),
-            metadata_required: PlannedMetadataSatisfaction::default(),
-            planned_command_hash: None,
-        }
-    }
-
-    fn artifacts(paths: &[PathBuf]) -> ArtifactSet {
-        ArtifactSet {
-            audio: AudioArtifacts::Tracks(
-                paths
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(index, path)| track_artifact(path, index as u32 + 1))
-                    .collect(),
-            ),
-            sidecars: Vec::new(),
-        }
-    }
-
-    fn replaygain_request(
-        root: &Path,
-        mode: ReplayGainMode,
-        existing_tags: ReplayGainExistingTagPolicy,
-    ) -> PipelineRequest {
-        let mut req = request(
-            root,
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            stage_policy(false, true, false),
-            OverwritePolicy::FailIfExists,
-        );
-        req.settings.replay_gain.mode = Some(mode);
-        req.settings.replay_gain.existing_tags = existing_tags;
-        req
-    }
-
-    fn successful_loudgain_output() -> ToolOutput {
-        ToolOutput {
-            exit: ProcessExit::Code(0),
-            stdout_tail: String::new(),
-            stderr_tail: String::new(),
-            elapsed: Duration::from_millis(1),
-            command: CommandRecord {
-                environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-                environment: std::collections::BTreeMap::new(),
-
-                description: None,
-                binary: ToolBinary::Loudgain,
-                sanitized_args: Vec::new(),
-                cwd: None,
-                env_keys: Vec::new(),
-                exit: Some(ProcessExit::Code(0)),
-                stdout_tail: String::new(),
-                stderr_tail: String::new(),
-                elapsed: Duration::from_millis(1),
-            },
-        }
-    }
-
-    const COMPLETE_BOTH: &[(&str, &str)] = &[
-        ("REPLAYGAIN_TRACK_GAIN", "-7.25 dB"),
-        ("REPLAYGAIN_TRACK_PEAK", "0.9231"),
-        ("REPLAYGAIN_ALBUM_GAIN", "-6.80 dB"),
-        ("REPLAYGAIN_ALBUM_PEAK", "0.9772"),
-    ];
-
-    #[test]
-    fn completeness_is_mode_specific_and_requires_gain_and_peak_values() {
-        let track = tag_with(&[
-            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
-            (ItemKey::ReplayGainTrackPeak, "0.9231"),
-        ]);
-        assert!(replaygain_tag_set_complete(&track, ReplayGainMode::Track));
-        assert!(!replaygain_tag_set_complete(&track, ReplayGainMode::Album));
-        assert!(!replaygain_tag_set_complete(&track, ReplayGainMode::Both));
-
-        let album = tag_with(&[
-            (ItemKey::ReplayGainAlbumGain, "-6.80 dB"),
-            (ItemKey::ReplayGainAlbumPeak, "0.9772"),
-        ]);
-        assert!(!replaygain_tag_set_complete(&album, ReplayGainMode::Track));
-        assert!(replaygain_tag_set_complete(&album, ReplayGainMode::Album));
-        assert!(!replaygain_tag_set_complete(&album, ReplayGainMode::Both));
-
-        let both = tag_with(&[
-            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
-            (ItemKey::ReplayGainTrackPeak, "0.9231"),
-            (ItemKey::ReplayGainAlbumGain, "-6.80 dB"),
-            (ItemKey::ReplayGainAlbumPeak, "0.9772"),
-        ]);
-        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Track));
-        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Album));
-        assert!(replaygain_tag_set_complete(&both, ReplayGainMode::Both));
-    }
-
-    #[test]
-    fn blank_or_partial_tag_sets_never_count_as_complete() {
-        let blank_track_peak = tag_with(&[
-            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
-            (ItemKey::ReplayGainTrackPeak, "   "),
-        ]);
-        assert!(!replaygain_tag_set_complete(
-            &blank_track_peak,
-            ReplayGainMode::Track
-        ));
-
-        let partial_album = tag_with(&[(ItemKey::ReplayGainAlbumGain, "-6.80 dB")]);
-        assert!(!replaygain_tag_set_complete(
-            &partial_album,
-            ReplayGainMode::Album
-        ));
-    }
-
-    #[tokio::test]
-    async fn skip_if_complete_skips_subprocess_only_when_every_output_is_complete() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        let two = temp.path().join("02.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        write_synthetic_flac(&two, COMPLETE_BOTH);
-        let artifacts = artifacts(&[one, two]);
-        assert_eq!(
-            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
-                .expect("inspect complete outputs"),
-            true
-        );
-
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let source = super::pipeline_test_helpers::log_test_source();
-        let runner = StubToolRunner::new();
-        let record = apply_replaygain_with_source_and_tool_limits(
-            &artifacts,
-            Some(&source),
-            &req,
-            &runner,
-            &CancellationToken::new(),
-            None,
-        )
-        .await
-        .expect("complete tags should skip when source facts prove signal equivalence");
-
-        assert!(matches!(
-            record.outcome,
-            StageOutcome::SkippedWithReason(ref reason)
-                if reason.contains("complete Both ReplayGain tag set")
-        ));
-        assert_eq!(runner.transcript().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn track_mode_skip_if_complete_strips_inherited_album_tags_without_scanning() {
-        use lofty::file::TaggedFileExt;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        let artifacts = artifacts(std::slice::from_ref(&one));
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Track,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let source = super::pipeline_test_helpers::log_test_source();
-        let runner = StubToolRunner::new();
-
-        let record = apply_replaygain_with_source_and_tool_limits(
-            &artifacts,
-            Some(&source),
-            &req,
-            &runner,
-            &CancellationToken::new(),
-            None,
-        )
-        .await
-        .expect("complete track tags should skip loudgain and remove stale album tags");
-
-        assert!(matches!(
-            record.outcome,
-            StageOutcome::SkippedWithReason(ref reason)
-                if reason.contains("complete Track ReplayGain tag set")
-        ));
-        assert!(runner.transcript().is_empty());
-        let tagged = lofty::read_from_path(&one).expect("read cleaned ReplayGain tags");
-        let tag = tagged
-            .primary_tag()
-            .or_else(|| tagged.first_tag())
-            .expect("primary tag");
-        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackGain));
-        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackPeak));
-        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumGain));
-        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumPeak));
-    }
-
-    #[tokio::test]
-    async fn unsupported_target_skips_before_tag_inspection_or_loudgain() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let unreadable = temp.path().join("corrupt.dsf");
-        std::fs::write(&unreadable, b"not a DSF file").expect("write corrupt fixture");
-        let artifacts = artifacts(&[unreadable]);
-        let mut req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Dsf;
-        let runner = StubToolRunner::new();
-
-        let record = apply_replaygain(
-            &artifacts,
-            &req,
-            &runner,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("unsupported ReplayGain target should degrade without reading tags");
-
-        assert_eq!(
-            record.outcome,
-            StageOutcome::SkippedWithReason(
-                "DSF output is not supported by loudgain".to_string()
-            )
-        );
-        assert!(runner.transcript().is_empty());
-        assert_eq!(
-            replaygain_format_support(&req),
-            ReplayGainFormatSupport::Unsupported {
-                reason: "DSF output is not supported by loudgain".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn replaygain_format_gate_covers_non_taglib_output_containers() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::Rescan,
-        );
-        req.settings.target_format = AudioFormat::Wav;
-
-        for (extension, flags, expected) in [
-            (Some("w64"), Vec::<String>::new(), "W64 output is not supported by loudgain"),
-            (Some("mka"), Vec::<String>::new(), "MKA output is not supported by loudgain"),
-            (Some("pcm"), Vec::<String>::new(), "raw PCM output is not supported by loudgain"),
-            (Some("wav"), vec!["-rf64".to_string(), "auto".to_string()], "RF64 output is not supported by loudgain"),
-        ] {
-            req.container_extension = extension.map(str::to_string);
-            req.container_ffmpeg_flags = flags;
-            assert_eq!(
-                replaygain_format_support(&req),
-                ReplayGainFormatSupport::Unsupported {
-                    reason: expected.to_string(),
-                }
-            );
-        }
-
-        req.container_extension = None;
-        req.container_ffmpeg_flags.clear();
-        assert_eq!(replaygain_format_support(&req), ReplayGainFormatSupport::Supported);
-    }
-
-    #[tokio::test]
-    async fn skip_if_complete_ignores_inherited_tags_after_lossy_encode() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        let artifacts = artifacts(&[one]);
-        let mut req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Mp3;
-        let source = super::pipeline_test_helpers::log_test_source();
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-
-        let record = apply_replaygain_with_source_and_tool_limits(
-            &artifacts,
-            Some(&source),
-            &req,
-            &runner,
-            &CancellationToken::new(),
-            None,
-        )
-        .await
-        .expect("lossy output must rescan inherited tags");
-
-        assert!(matches!(record.outcome, StageOutcome::Ok));
-        assert_eq!(runner.transcript().len(), 1);
-        assert_eq!(runner.transcript()[0].binary, ToolBinary::Loudgain);
-    }
-
-    #[test]
-    fn inherited_replaygain_policy_trusts_only_signal_equivalent_output() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd = legacy_dsd_settings(
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            None,
-        );
-        let source = super::pipeline_test_helpers::log_test_source();
-
-        assert_eq!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Trust,
-            "source-aware lossless source-rate/source-depth output remains signal-equivalent",
-        );
-        req.settings.pcm_true_peak.enabled = true;
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("PCM true-peak gain changes output level")
-        ));
-        req.settings.pcm_true_peak.enabled = false;
-        req.settings.pcm_true_peak.fixed_gain_db = Some("1.250000000".parse().unwrap());
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("PCM fixed gain changes output level")
-        ));
-        req.settings.pcm_true_peak.fixed_gain_db = None;
-        assert_eq!(
-            inherited_replaygain_tag_policy(None, &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute {
-                reason: "source sample-rate facts are unavailable for source-relative planning; bit-depth reduction, floating-point to integer conversion, or unresolved source-relative depth prevents proving peak-quantization equivalence".to_string(),
-            },
-            "source-less wrappers must fail closed for source-relative rate and depth",
-        );
-
-        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
-        assert_eq!(
-            inherited_replaygain_tag_policy(None, &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute {
-                reason: "source sample-rate facts are unavailable for explicit target-rate comparison; bit-depth reduction, floating-point to integer conversion, or unresolved source-relative depth prevents proving peak-quantization equivalence".to_string(),
-            },
-        );
-
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd = legacy_dsd_settings(
-            tonepoet_pipeline::DsdToPcmGainMode::Auto,
-            None,
-        );
-        assert_eq!(
-            inherited_replaygain_tag_policy(None, &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute {
-                reason: "source coding facts are unavailable while DSD-to-PCM gain is configured; source sample-rate facts are unavailable for source-relative planning; bit-depth reduction, floating-point to integer conversion, or unresolved source-relative depth prevents proving peak-quantization equivalence".to_string(),
-            },
-        );
-    }
-
-    #[tokio::test]
-    async fn source_less_public_wrapper_rescans_complete_inherited_tags() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        let artifacts = artifacts(&[one]);
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-
-        let record = apply_replaygain(
-            &artifacts,
-            &req,
-            &runner,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("source-less public wrapper must rescan rather than trust inherited tags");
-
-        assert!(matches!(record.outcome, StageOutcome::Ok));
-        let transcript = runner.transcript();
-        assert_eq!(transcript.len(), 1);
-        assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
-    }
-
-    #[tokio::test]
-    async fn one_incomplete_output_runs_exactly_one_loudgain_command() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        let two = temp.path().join("02.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        write_synthetic_flac(
-            &two,
-            &[
-                ("REPLAYGAIN_TRACK_GAIN", "-7.25 dB"),
-                ("REPLAYGAIN_TRACK_PEAK", "0.9231"),
-                ("REPLAYGAIN_ALBUM_GAIN", "-6.80 dB"),
-            ],
-        );
-        let artifacts = artifacts(&[one, two]);
-        assert_eq!(
-            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
-                .expect("inspect partial outputs"),
-            false
-        );
-
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let source = super::pipeline_test_helpers::log_test_source();
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-        let record = apply_replaygain_with_source_and_tool_limits(
-            &artifacts,
-            Some(&source),
-            &req,
-            &runner,
-            &CancellationToken::new(),
-            None,
-        )
-        .await
-        .expect("partial tags must rescan");
-
-        assert!(matches!(record.outcome, StageOutcome::Ok));
-        let transcript = runner.transcript();
-        assert_eq!(transcript.len(), 1);
-        assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
-    }
-
-    #[tokio::test]
-    async fn unreadable_output_fails_closed_to_one_rescan() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let unreadable = temp.path().join("corrupt.flac");
-        std::fs::write(&unreadable, b"not a tagged audio file").expect("corrupt fixture");
-        let artifacts = artifacts(&[unreadable]);
-        assert!(
-            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both).is_err()
-        );
-
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let source = super::pipeline_test_helpers::log_test_source();
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-        let record = apply_replaygain_with_source_and_tool_limits(
-            &artifacts,
-            Some(&source),
-            &req,
-            &runner,
-            &CancellationToken::new(),
-            None,
-        )
-        .await
-        .expect("inspection uncertainty must rescan");
-
-        assert!(matches!(record.outcome, StageOutcome::Ok));
-        assert_eq!(runner.transcript().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn empty_artifact_set_is_not_complete_and_never_invokes_loudgain() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifacts = artifacts(&[]);
-        assert_eq!(
-            all_artifacts_have_complete_replaygain(&artifacts, ReplayGainMode::Both)
-                .expect("empty inspection"),
-            false
-        );
-
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        let runner = StubToolRunner::new();
-        let record = apply_replaygain(
-            &artifacts,
-            &req,
-            &runner,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("empty artifacts skip stage");
-
-        assert_eq!(
-            record.outcome,
-            StageOutcome::SkippedWithReason("no successful output audio".to_string())
-        );
-        assert_eq!(runner.transcript().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn rescan_policy_invokes_loudgain_even_when_tags_are_complete() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        let artifacts = artifacts(&[one]);
-
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::Rescan,
-        );
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-        let record = apply_replaygain(
-            &artifacts,
-            &req,
-            &runner,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("explicit rescan must run");
-
-        assert!(matches!(record.outcome, StageOutcome::Ok));
-        assert_eq!(runner.transcript().len(), 1);
-    }
-
-
-    #[test]
-    fn inherited_replaygain_policy_recomputes_for_depth_reduction_float_to_int_and_unknown_rate() {
-        let mut source = super::pipeline_test_helpers::log_test_source();
-        let mut req = replaygain_request(
-            Path::new("/tmp"),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.dsd = legacy_dsd_settings(
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            None,
-        );
-
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("bit-depth reduction")
-        ));
-
-        for track in &mut source.tracks {
-            track.bit_depth = Some(320);
-            track.source_audio = SourceAudioDescriptor::from_scalar(
-                track.sample_rate,
-                Some(320),
-                Some(SourceAudioCoding::Pcm),
-            );
-        }
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("floating-point to integer")
-        ));
-
-        for track in &mut source.tracks {
-            track.sample_rate = None;
-            track.source_audio = SourceAudioDescriptor::from_scalar(
-                None,
-                Some(24),
-                Some(SourceAudioCoding::Pcm),
-            );
-            track.bit_depth = Some(24);
-        }
-        req.settings.target_bit_depth = BitDepthTarget::Source;
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("source-relative planning")
-        ));
-    }
-
-    #[test]
-    fn unknown_source_or_target_depth_never_proves_replaygain_equivalence() {
-        assert!(!replaygain_depth_change_requires_recompute(
-            Some(PcmBitDepth::Int24),
-            Some(PcmBitDepth::Int24),
-        ));
-        assert!(replaygain_depth_change_requires_recompute(
-            Some(PcmBitDepth::Int24),
-            Some(PcmBitDepth::Int16),
-        ));
-        assert!(replaygain_depth_change_requires_recompute(
-            None,
-            Some(PcmBitDepth::Int24),
-        ));
-        assert!(replaygain_depth_change_requires_recompute(
-            Some(PcmBitDepth::Int24),
-            None,
-        ));
-        assert!(replaygain_depth_change_requires_recompute(None, None));
-    }
-
-    #[test]
-    fn source_depth_target_recomputes_when_format_default_replaces_unknown_source_depth() {
-        let mut source = super::pipeline_test_helpers::log_test_source();
-        for track in &mut source.tracks {
-            track.bit_depth = None;
-            track.source_audio = SourceAudioDescriptor::from_scalar(
-                track.sample_rate,
-                None,
-                Some(SourceAudioCoding::Lossy),
-            );
-        }
-        let mut req = replaygain_request(
-            Path::new("/tmp"),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Source;
-        req.settings.dsd = legacy_dsd_settings(
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            None,
-        );
-
-        assert!(matches!(
-            inherited_replaygain_tag_policy(Some(&source), &req.settings),
-            ReplayGainInheritedTagPolicy::Recompute { reason }
-                if reason.contains("unresolved source-relative depth")
-        ));
-    }
-
-    #[tokio::test]
-    async fn clipping_prevention_flag_controls_loudgain_k_argument() {
-        for (prevent_clipping, expected) in [(true, true), (false, false)] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let one = temp.path().join("01.flac");
-            write_synthetic_flac(&one, &[]);
-            let artifacts = artifacts(&[one]);
-            let mut req = replaygain_request(
-                temp.path(),
-                ReplayGainMode::Both,
-                ReplayGainExistingTagPolicy::Rescan,
-            );
-            req.settings.replay_gain.prevent_clipping = prevent_clipping;
-            let runner = StubToolRunner::new();
-            runner.push_output(successful_loudgain_output());
-
-            apply_replaygain(&artifacts, &req, &runner, &CancellationToken::new())
-                .await
-                .expect("ReplayGain command");
-
-            let transcript = runner.transcript();
-            assert_eq!(transcript.len(), 1);
-            assert_eq!(transcript[0].sanitized_args.iter().any(|arg| arg == "-k"), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn track_only_replaygain_removes_stale_album_tags_after_scan() {
-        use lofty::file::TaggedFileExt;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let one = temp.path().join("01.flac");
-        write_synthetic_flac(&one, COMPLETE_BOTH);
-        let artifacts = artifacts(std::slice::from_ref(&one));
-        let req = replaygain_request(
-            temp.path(),
-            ReplayGainMode::Track,
-            ReplayGainExistingTagPolicy::Rescan,
-        );
-        let runner = StubToolRunner::new();
-        runner.push_output(successful_loudgain_output());
-
-        apply_replaygain(&artifacts, &req, &runner, &CancellationToken::new())
-            .await
-            .expect("track-only ReplayGain");
-
-        let tagged = lofty::read_from_path(&one).expect("read updated ReplayGain tags");
-        let tag = tagged.primary_tag().or_else(|| tagged.first_tag()).expect("primary tag");
-        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackGain));
-        assert!(replaygain_value_present(tag, ItemKey::ReplayGainTrackPeak));
-        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumGain));
-        assert!(!replaygain_value_present(tag, ItemKey::ReplayGainAlbumPeak));
-    }
-
-    #[test]
-    fn conversion_log_records_replaygain_policy_reason_and_clipping_setting() {
-        let source = super::pipeline_test_helpers::log_test_source();
-        let mut req = replaygain_request(
-            Path::new("/tmp"),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Flac;
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        req.settings.replay_gain.prevent_clipping = false;
-        let mut log = String::new();
-
-        append_conversion_settings_section(
-            &mut log,
-            &source,
-            &req,
-            &[],
-            Some(&StageOutcome::Ok),
-            false,
-            true,
-            true,
-        );
-
-        assert!(log.contains("ReplayGain policy: recomputed:"));
-        assert!(log.contains("bit-depth reduction"));
-        // yes_no() capitalizes ("Yes"/"No") — the log's house style.
-        assert!(log.contains("ReplayGain clipping prevention: No"));
-    }
-
-    #[test]
-    fn conversion_log_identifies_unsupported_replaygain_target() {
-        let source = super::pipeline_test_helpers::log_test_source();
-        let mut req = replaygain_request(
-            Path::new("/tmp"),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::Rescan,
-        );
-        req.settings.target_format = AudioFormat::Wav;
-        req.container_extension = Some("w64".to_string());
-        let record = super::pipeline_test_helpers::ok_record();
-        let mut log = String::new();
-
-        append_conversion_settings_section(
-            &mut log,
-            &source,
-            &req,
-            &[&record],
-            Some(&StageOutcome::SkippedWithReason(
-                "W64 output is not supported by loudgain".to_string(),
-            )),
-            false,
-            false,
-            false,
-        );
-
-        assert!(log.contains(
-            "ReplayGain policy: skipped: W64 output is not supported by loudgain; no ReplayGain tags were written"
-        ));
-    }
-
-    #[test]
-    fn conversion_log_distinguishes_trusted_disabled_and_no_output_replaygain() {
-        let _coordination = crate::concurrency::scoped_test_coordination_root();
-        let source = super::pipeline_test_helpers::log_test_source();
-        let mut req = replaygain_request(
-            Path::new("/tmp"),
-            ReplayGainMode::Both,
-            ReplayGainExistingTagPolicy::SkipIfComplete,
-        );
-        req.settings.target_format = AudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Source;
-        req.settings.dsd = legacy_dsd_settings(
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            None,
-        );
-        let record = super::pipeline_test_helpers::ok_record();
-
-        let mut trusted = String::new();
-        append_conversion_settings_section(
-            &mut trusted,
-            &source,
-            &req,
-            &[&record],
-            Some(&StageOutcome::SkippedWithReason(
-                "output audio is signal-equivalent and every output already has the complete Both ReplayGain tag set"
-                    .to_string(),
-            )),
-            false,
-            false,
-            false,
-        );
-        assert!(trusted.contains("ReplayGain policy: skipped: output audio is signal-equivalent"));
-        assert!(!trusted.contains("skipped: no successful output audio"));
-
-        let mut no_outputs = String::new();
-        append_conversion_settings_section(
-            &mut no_outputs,
-            &source,
-            &req,
-            &[],
-            Some(&StageOutcome::SkippedWithReason(
-                "no successful output audio".to_string(),
-            )),
-            false,
-            false,
-            false,
-        );
-        assert!(no_outputs.contains("ReplayGain policy: skipped: no successful output audio"));
-
-        req.stages.replaygain = StageRequirement::Disabled;
-        let mut disabled = String::new();
-        append_conversion_settings_section(
-            &mut disabled,
-            &source,
-            &req,
-            &[&record],
-            Some(&StageOutcome::NotRequested),
-            false,
-            false,
-            false,
-        );
-        assert!(disabled.contains("ReplayGain policy: disabled by pipeline settings"));
-        assert!(!disabled.contains("trusted inherited tags"));
-    }
-}
-
-fn artifact_audio_paths(artifacts: &ArtifactSet) -> Vec<&Path> {
-    match &artifacts.audio {
-        AudioArtifacts::Tracks(tracks) => tracks.iter().map(|track| track.staged_path.as_path()).collect(),
-        AudioArtifacts::Merged(merged) => vec![merged.staged_path.as_path()],
-    }
-}
-
 fn all_artifacts_have_complete_replaygain(
     artifacts: &ArtifactSet,
     mode: tonepoet_pipeline::ReplayGainMode,
 ) -> Result<bool, String> {
-    use lofty::file::TaggedFileExt;
     let paths = artifact_audio_paths(artifacts);
     if paths.is_empty() {
         return Ok(false);
     }
+    // Serialized album-looking strings do not prove that they describe the
+    // current requested manifest. Only a retained in-process current-group
+    // observation may satisfy Album/Both without a fresh reduction.
+    if !matches!(mode, tonepoet_pipeline::ReplayGainMode::Track) {
+        return Ok(false);
+    }
     for path in paths {
-        let tagged = lofty::read_from_path(path)
-            .map_err(|err| format!("could not inspect ReplayGain tags on '{}': {err}", path.display()))?;
-        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-            return Ok(false);
-        };
-        if !replaygain_tag_set_complete(tag, mode) {
+        let complete = crate::convert::replaygain::replaygain_metadata_fields_complete(path, mode)
+            .map_err(|error| error.to_string())?;
+        if !complete {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn replaygain_member_id(track_id: &TrackId) -> String {
+    format!(
+        "source:{}:disc:{}:track:{}",
+        track_id.source_ordinal,
+        track_id.disc_number.map_or_else(|| "-".to_string(), |value| value.to_string()),
+        track_id.track_number,
+    )
+}
+
+fn artifact_replaygain_member_ids(artifacts: &ArtifactSet) -> Vec<String> {
+    match &artifacts.audio {
+        AudioArtifacts::Tracks(tracks) => tracks
+            .iter()
+            .map(|track| replaygain_member_id(&track.track_id))
+            .collect(),
+        AudioArtifacts::Merged(merged) => vec![format!(
+            "merged:{}",
+            merged
+                .source_tracks
+                .iter()
+                .map(replaygain_member_id)
+                .collect::<Vec<_>>()
+                .join("+")
+        )],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14464,60 +13862,141 @@ enum ReplayGainInheritedTagPolicy {
     Recompute { reason: String },
 }
 
+fn replaygain_pcm_representation_preserves_samples(
+    source_depth: PcmBitDepth,
+    target_depth: PcmBitDepth,
+) -> bool {
+    use PcmBitDepth::{Float32, Float64, Int16, Int24, Int32, Int8};
+
+    if source_depth == target_depth {
+        return true;
+    }
+
+    match (source_depth, target_depth) {
+        // Integer widening preserves every representable source PCM value.
+        (Int8, Int16 | Int24 | Int32) | (Int16, Int24 | Int32) | (Int24, Int32) => true,
+        // IEEE-754 binary32 has enough significand bits for normalized signed
+        // 8/16/24-bit PCM exactly, but not for every Int32 value.
+        (Int8 | Int16 | Int24, Float32) => true,
+        // IEEE-754 binary64 can represent every supported integer PCM value,
+        // and Float32 widens exactly to Float64.
+        (Int8 | Int16 | Int24 | Int32 | Float32, Float64) => true,
+        // Integer narrowing, float-to-integer conversion, and Float64 ->
+        // Float32 can all change decoded samples.
+        _ => false,
+    }
+}
+
 fn replaygain_depth_change_requires_recompute(
     source_depth: Option<PcmBitDepth>,
     target_depth: Option<PcmBitDepth>,
 ) -> bool {
     match (source_depth, target_depth) {
         (Some(source_depth), Some(target_depth)) => {
-            (source_depth.is_float() && !target_depth.is_float())
-                || target_depth.bits() < source_depth.bits()
+            !replaygain_pcm_representation_preserves_samples(source_depth, target_depth)
         }
         // Unknown on either side is not evidence of signal equivalence.
         // In particular, Source can resolve through a format default when
-        // the original width is unavailable.
+        // the original representation is unavailable.
         _ => true,
+    }
+}
+
+fn replaygain_output_is_lossy_or_hybrid(settings: &tonepoet_pipeline::PipelineSettings) -> bool {
+    // Keep this runtime applicability predicate aligned with Phase 2
+    // OutputProductIdentity::is_lossy_or_hybrid(). WavPack's enum-level
+    // is_lossy() is false because losslessness depends on the hybrid setting.
+    settings.target_format.is_lossy()
+        || (settings.target_format == PlannerAudioFormat::WavPack && settings.wavpack.hybrid)
+}
+
+#[cfg(test)]
+mod replaygain_inherited_policy_tests {
+    use super::*;
+
+    #[test]
+    fn wavpack_hybrid_is_signal_changing_for_inherited_replaygain() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = PlannerAudioFormat::WavPack;
+        settings.wavpack.hybrid = false;
+        assert!(!replaygain_output_is_lossy_or_hybrid(&settings));
+
+        settings.wavpack.hybrid = true;
+        assert!(replaygain_output_is_lossy_or_hybrid(&settings));
+    }
+
+    #[test]
+    fn replaygain_pcm_representation_equivalence_is_not_nominal_bit_equality() {
+        assert!(replaygain_pcm_representation_preserves_samples(
+            PcmBitDepth::Int24,
+            PcmBitDepth::Float32,
+        ));
+        assert!(replaygain_pcm_representation_preserves_samples(
+            PcmBitDepth::Float32,
+            PcmBitDepth::Float64,
+        ));
+        assert!(!replaygain_pcm_representation_preserves_samples(
+            PcmBitDepth::Int32,
+            PcmBitDepth::Float32,
+        ));
+        assert!(!replaygain_pcm_representation_preserves_samples(
+            PcmBitDepth::Float64,
+            PcmBitDepth::Float32,
+        ));
+        assert!(!replaygain_depth_change_requires_recompute(
+            Some(PcmBitDepth::Int16),
+            Some(PcmBitDepth::Int24),
+        ));
+        assert!(replaygain_depth_change_requires_recompute(
+            Some(PcmBitDepth::Int32),
+            Some(PcmBitDepth::Float32),
+        ));
+        assert!(replaygain_depth_change_requires_recompute(None, Some(PcmBitDepth::Int24)));
     }
 }
 
 fn inherited_replaygain_tag_policy(
     source: Option<&PreparedSource>,
-    settings: &tonepoet_pipeline::PipelineSettings,
+    req: &PipelineRequest,
 ) -> ReplayGainInheritedTagPolicy {
+    let settings = &req.settings;
     let mut reasons = Vec::new();
-    if settings.target_format.is_lossy() {
-        reasons.push("lossy encoding changes the output signal".to_string());
+    if req.merge {
+        reasons.push("merge changes the ReplayGain programme/manifest subject".to_string());
     }
-    if settings.pcm_true_peak.enabled {
+    if !req.registered_effects.is_empty() {
+        reasons.push("registered sample-domain processing changes the output signal".to_string());
+    }
+    if replaygain_output_is_lossy_or_hybrid(settings) {
+        reasons.push("lossy or hybrid encoding changes the output signal".to_string());
+    }
+    if settings.pcm_true_peak.is_true_peak() {
         // Gain is data-dependent, so source-pass ReplayGain and inherited
         // ReplayGain tags cannot be trusted even when the resolved gain later
         // happens to be exactly 0 dB. Measure the produced audio instead.
         reasons.push("PCM true-peak gain changes output level".to_string());
     }
-    if settings.pcm_true_peak.fixed_gain_db.is_some() {
+    if settings.pcm_true_peak.fixed_gain_db().is_some() {
         // A user-supplied fixed amplitude change is just as signal-changing as
         // automatic gain. Inherited ReplayGain describes the source signal and
         // must not survive unchanged.
         reasons.push("PCM fixed gain changes output level".to_string());
     }
 
-    let legacy_gain_configured = settings.dsd.legacy_behavior().is_some_and(|legacy| {
-        legacy.gain_mode != tonepoet_pipeline::DsdToPcmGainMode::Disabled
-            || legacy.gain_db.is_some()
-    });
+    let general_dsd_gain_configured = settings.dsd.gain_policy().is_active();
     if !settings.target_format.is_dsd() {
         match source {
             Some(source) if source_is_dsd(source) => {
-                // Native-v2 Reference always applies an explicit terminal level
+                // Qualified Reference always applies an explicit terminal level
                 // policy; legacy applies one only when its frozen controls say so.
                 if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, true)
-                    || legacy_gain_configured
+                    || general_dsd_gain_configured
                 {
                     reasons.push("DSD-to-PCM gain changes output level".to_string());
                 }
             }
             Some(_) => {}
-            None if legacy_gain_configured => reasons.push(
+            None if general_dsd_gain_configured => reasons.push(
                 "source coding facts are unavailable while DSD-to-PCM gain is configured"
                     .to_string(),
             ),
@@ -14573,7 +14052,7 @@ fn inherited_replaygain_tag_policy(
         });
         if depth_changed {
             reasons.push(
-                "bit-depth reduction, floating-point to integer conversion, or unresolved source-relative depth prevents proving peak-quantization equivalence"
+                "PCM representation conversion is not proven sample-preserving, or source/target representation is unresolved"
                     .to_string(),
             );
         }
@@ -14604,55 +14083,12 @@ pub(super) fn normalized_container_extension(req: &PipelineRequest) -> String {
         .to_ascii_lowercase()
 }
 
-fn replaygain_format_support(req: &PipelineRequest) -> ReplayGainFormatSupport {
-    let extension = normalized_container_extension(req);
-    let rf64 = req
-        .container_ffmpeg_flags
-        .iter()
-        .any(|flag| flag.eq_ignore_ascii_case("-rf64"));
-
-    let label = if rf64 {
-        Some("RF64".to_string())
-    } else {
-        let format_label = match &req.settings.target_format {
-            PlannerAudioFormat::Dsf => Some("DSF".to_string()),
-            PlannerAudioFormat::Dff => Some("DFF".to_string()),
-            PlannerAudioFormat::Dts => Some("DTS".to_string()),
-            PlannerAudioFormat::Ac3 => Some("AC-3".to_string()),
-            _ => None,
-        };
-        let extension_label = match extension.as_str() {
-            "dsf" => Some("DSF".to_string()),
-            "dff" => Some("DFF".to_string()),
-            "w64" => Some("W64".to_string()),
-            "rf64" => Some("RF64".to_string()),
-            "pcm" | "raw" | "s8" | "u8" | "s16le" | "s16be" | "s24le"
-            | "s24be" | "s32le" | "s32be" | "f32le" | "f32be" | "f64le"
-            | "f64be" => Some("raw PCM".to_string()),
-            "mka" => Some("MKA".to_string()),
-            "mkv" => Some("MKV".to_string()),
-            "webm" | "weba" => Some("WebM".to_string()),
-            "dts" => Some("DTS".to_string()),
-            "ac3" => Some("AC-3".to_string()),
-            _ => None,
-        };
-        format_label.or(extension_label).or_else(|| {
-            matches!(&req.settings.target_format, PlannerAudioFormat::Custom { .. }).then(|| {
-                if extension.is_empty() {
-                    "custom output".to_string()
-                } else {
-                    format!("custom .{extension} container")
-                }
-            })
-        })
-    };
-
-    match label {
-        Some(label) => ReplayGainFormatSupport::Unsupported {
-            reason: format!("{label} output is not supported by loudgain"),
-        },
-        None => ReplayGainFormatSupport::Supported,
-    }
+fn replaygain_format_support(_req: &PipelineRequest) -> ReplayGainFormatSupport {
+    // Reader and writer admission are independent runtime capabilities in the
+    // native path. Do not infer either from a target extension or format enum.
+    // The output artifact is probed by the native reader and the authoritative
+    // metadata backend immediately before work.
+    ReplayGainFormatSupport::Supported
 }
 
 fn replaygain_request_policy_log_label(req: &PipelineRequest) -> String {
@@ -14696,7 +14132,7 @@ fn replaygain_policy_log_label(
             Some(StageOutcome::Failed(error)) => format!(
                 "failed unexpectedly for unsupported target ({reason}): {error}"
             ),
-            Some(StageOutcome::Ok) => format!(
+            Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => format!(
                 "completed unexpectedly for unsupported target ({reason})"
             ),
             None => format!("outcome unavailable: {reason}"),
@@ -14710,10 +14146,22 @@ fn replaygain_policy_log_label(
             reason: "explicit rescan policy".to_string(),
         }
     } else {
-        inherited_replaygain_tag_policy(Some(source), &req.settings)
+        inherited_replaygain_tag_policy(Some(source), req)
     };
 
     match stage_outcome {
+        Some(StageOutcome::OkWithDetail(detail)) => {
+            let base = match planned_policy {
+                ReplayGainInheritedTagPolicy::Recompute { reason } => {
+                    format!("recomputed: {reason}")
+                }
+                ReplayGainInheritedTagPolicy::Trust => {
+                    "recomputed: inherited requested tag set was absent, incomplete, or unreadable on signal-equivalent output"
+                        .to_string()
+                }
+            };
+            format!("{base}; {}", escape_log_value(detail))
+        }
         Some(StageOutcome::Ok) => match planned_policy {
             ReplayGainInheritedTagPolicy::Recompute { reason } => {
                 format!("recomputed: {reason}")
@@ -14775,6 +14223,7 @@ fn apply_cue_source_replaygain_if_eligible(
         .into_iter()
         .map(Path::to_path_buf)
         .collect();
+    let member_ids = artifact_replaygain_member_ids(artifacts);
     if paths.len() != source.tracks.len() || paths.len() != scan.tracks.len() {
         return None;
     }
@@ -14784,44 +14233,60 @@ fn apply_cue_source_replaygain_if_eligible(
         .mode
         .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
 
-    if req.settings.replay_gain.existing_tags
-        == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
+    // Serialized Album/Both fields can never establish current-group identity.
+    // The retained source-pass scan *does* carry that identity, so apply it.
+    // Track may still skip a complete inherited pair on proven equivalent PCM.
+    if mode == tonepoet_pipeline::ReplayGainMode::Track
+        && req.settings.replay_gain.existing_tags
+            == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
     {
         match all_artifacts_have_complete_replaygain(artifacts, mode) {
             Ok(true) => {
-                return Some(Ok(StageRecord {
-                    stage: PipelineStage::ReplayGain,
-                    outcome: StageOutcome::SkippedWithReason(format!(
-                        "output audio is signal-equivalent and every output already has the complete {mode:?} ReplayGain tag set"
-                    )),
-                    dsd_dst_stats: None,
-                }));
+                return Some(
+                    crate::convert::replaygain::normalize_track_skip_metadata(&paths)
+                        .map_err(ReplayGainError::Io)
+                        .map(|()| StageRecord {
+                            stage: PipelineStage::ReplayGain,
+                            outcome: StageOutcome::SkippedWithReason(
+                                "output audio is signal-equivalent and every output already has the complete Track ReplayGain pair"
+                                    .to_string(),
+                            ),
+                            dsd_dst_stats: None,
+                        }),
+                );
             }
             Ok(false) => {}
             Err(error) => log::warn!(
-                "{error}; applying already-computed source-pass ReplayGain instead of trusting output tags"
+                "{error}; applying already-computed native source-pass ReplayGain instead of trusting output tags"
             ),
         }
     }
 
     Some(
-        crate::convert::replaygain::apply_source_scan(&paths, mode, scan)
-            .map_err(ReplayGainError::Io)
-            .map(|()| StageRecord {
-                stage: PipelineStage::ReplayGain,
-                outcome: StageOutcome::Ok,
-                dsd_dst_stats: None,
-            }),
+        crate::convert::replaygain::apply_source_scan(
+            &paths,
+            &member_ids,
+            mode,
+            req.settings.replay_gain.prevent_clipping,
+            scan,
+        )
+        .map_err(ReplayGainError::Io)
+        .map(|report| StageRecord {
+            stage: PipelineStage::ReplayGain,
+            outcome: if report.has_unavailable_requested_gain() {
+                StageOutcome::OkWithDetail(report.status_summary())
+            } else {
+                StageOutcome::Ok
+            },
+            dsd_dst_stats: None,
+        }),
     )
 }
 
-/// Apply ReplayGain tags via loudgain.
-///
-/// This source-less compatibility entry point cannot prove inherited tags
-/// signal-equivalent when sample-rate or bit-depth equivalence depends on
-/// unavailable source facts, so `SkipIfComplete` conservatively rescans.
-/// Production orchestrators should prefer
-/// [`apply_replaygain_with_source_and_tool_limits`] with source facts.
+/// Apply production ReplayGain through the native common observation/projection
+/// path. `runner` and tool limits remain in the compatibility signature because
+/// the surrounding Phase 3 stage API also serves other post-processing owners;
+/// ReplayGain itself starts no external process.
 pub async fn apply_replaygain(
     artifacts: &ArtifactSet,
     req: &PipelineRequest,
@@ -14831,8 +14296,6 @@ pub async fn apply_replaygain(
     apply_replaygain_with_tool_limits(artifacts, req, runner, cancel, None).await
 }
 
-/// Source-less compatibility entry point with shared tool limits. As with
-/// [`apply_replaygain`], missing source facts force conservative recomputation.
 pub async fn apply_replaygain_with_tool_limits(
     artifacts: &ArtifactSet,
     req: &PipelineRequest,
@@ -14855,9 +14318,9 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     artifacts: &ArtifactSet,
     source: Option<&PreparedSource>,
     req: &PipelineRequest,
-    runner: &dyn ToolRunner,
+    _runner: &dyn ToolRunner,
     cancel: &CancellationToken,
-    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    _tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> Result<StageRecord, ReplayGainError> {
     #[cfg(test)]
     if let Some(error) = injected_post_materialization_stage_error_for_test(
@@ -14865,18 +14328,7 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
         req,
         first_artifact_staged_path(artifacts),
     ) {
-        return Err(ReplayGainError::Tool(ToolRunnerError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            error,
-        ))));
-    }
-
-    if req.stages.replaygain == StageRequirement::Disabled {
-        return Ok(StageRecord {
-            stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::NotRequested,
-            dsd_dst_stats: None,
-        });
+        return Err(ReplayGainError::Io(io::Error::new(io::ErrorKind::Other, error)));
     }
 
     let paths: Vec<PathBuf> = artifact_audio_paths(artifacts)
@@ -14886,102 +14338,128 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     if paths.is_empty() {
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::SkippedWithReason(
-                "no successful output audio".to_string(),
-            ),
+            outcome: StageOutcome::SkippedWithReason("no successful output audio".to_string()),
             dsd_dst_stats: None,
         });
     }
 
-    if let ReplayGainFormatSupport::Unsupported { reason } = replaygain_format_support(req) {
-        log::warn!(
-            "skipping ReplayGain for job {}: {}; no ReplayGain tags will be written",
-            req.job_id,
-            reason
-        );
+    let inherited_policy = inherited_replaygain_tag_policy(source, req);
+
+    // Applicability is independent of whether a replacement scan was requested.
+    // This operation only mutates metadata; it never starts a meter.
+    if req.stages.replaygain == StageRequirement::Disabled {
+        if matches!(inherited_policy, ReplayGainInheritedTagPolicy::Recompute { .. }) {
+            let cleanup_paths = paths.clone();
+            let cleanup = tokio::task::spawn_blocking(move || {
+                crate::convert::replaygain::remove_inherited_measurement_fields(&cleanup_paths)
+            })
+            .await
+            .map_err(|error| {
+                ReplayGainError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("ReplayGain metadata cleanup worker failed: {error}"),
+                ))
+            })?;
+            cleanup.map_err(ReplayGainError::Io)?;
+        }
         return Ok(StageRecord {
             stage: PipelineStage::ReplayGain,
-            outcome: StageOutcome::SkippedWithReason(reason),
+            outcome: StageOutcome::NotRequested,
             dsd_dst_stats: None,
         });
     }
 
-    let mode = req.settings.replay_gain.mode.unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
+    if cancel.is_cancelled() {
+        return Err(ReplayGainError::Io(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "ReplayGain cancelled before native observation",
+        )));
+    }
+
+    // Writer admission is based on the actual artifacts/backends, not an
+    // extension enum. A readable-but-unwritable artifact may still be used by
+    // scan-only callers, but this conversion stage requires serialization.
+    if let Err(error) = crate::convert::replaygain::all_writers_supported(&paths) {
+        if error.kind() == io::ErrorKind::Unsupported {
+            return Ok(StageRecord {
+                stage: PipelineStage::ReplayGain,
+                outcome: StageOutcome::SkippedWithReason(error.to_string()),
+                dsd_dst_stats: None,
+            });
+        }
+        return Err(ReplayGainError::Io(error));
+    }
+
+    let mode = req
+        .settings
+        .replay_gain
+        .mode
+        .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
     if req.settings.replay_gain.existing_tags
         == tonepoet_pipeline::ReplayGainExistingTagPolicy::SkipIfComplete
+        && matches!(inherited_policy, ReplayGainInheritedTagPolicy::Trust)
+        && mode == tonepoet_pipeline::ReplayGainMode::Track
     {
-        match inherited_replaygain_tag_policy(source, &req.settings) {
-            ReplayGainInheritedTagPolicy::Trust => {
-                match all_artifacts_have_complete_replaygain(artifacts, mode) {
-                    Ok(true) => {
-                        if mode == tonepoet_pipeline::ReplayGainMode::Track {
-                            crate::convert::replaygain::remove_stale_album_tags(&paths)
-                                .map_err(ReplayGainError::Io)?;
-                        }
-                        log::info!(
-                            "skipping ReplayGain scan for job {}: output audio is signal-equivalent and every output already has the complete {:?} tag set",
-                            req.job_id,
-                            mode
-                        );
-                        return Ok(StageRecord {
-                            stage: PipelineStage::ReplayGain,
-                            outcome: StageOutcome::SkippedWithReason(format!(
-                                "output audio is signal-equivalent and every output already has the complete {mode:?} ReplayGain tag set"
-                            )),
-                            dsd_dst_stats: None,
-                        });
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        // Inspection uncertainty must never be mistaken for complete tags.
-                        // Rescanning is the safe behavior and the degradation is visible.
-                        log::warn!("{err}; ReplayGain scan will run");
-                    }
-                }
+        match all_artifacts_have_complete_replaygain(artifacts, mode) {
+            Ok(true) => {
+                crate::convert::replaygain::normalize_track_skip_metadata(&paths)
+                    .map_err(ReplayGainError::Io)?;
+                return Ok(StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: StageOutcome::SkippedWithReason(
+                        "output audio is signal-equivalent and every output already has the complete Track ReplayGain pair"
+                            .to_string(),
+                    ),
+                    dsd_dst_stats: None,
+                });
             }
-            ReplayGainInheritedTagPolicy::Recompute { reason } => {
-                log::info!(
-                    "ignoring inherited ReplayGain tags for job {} and rescanning output audio: {}",
-                    req.job_id,
-                    reason
-                );
-            }
+            Ok(false) => {}
+            Err(error) => log::warn!("{error}; native ReplayGain scan will run"),
         }
     }
 
-    let grouping = if matches!(
-        mode,
-        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
-    ) {
-        crate::convert::replaygain::LoudgainGrouping::Album
-    } else {
-        crate::convert::replaygain::LoudgainGrouping::Track
-    };
-    let args = crate::convert::replaygain::loudgain_args(
-        grouping,
-        req.settings.replay_gain.prevent_clipping,
-        &paths,
-    );
+    let member_ids = artifact_replaygain_member_ids(artifacts);
+    let prevent_clipping = req.settings.replay_gain.prevent_clipping;
+    let native_paths = paths.clone();
+    let native_members = member_ids.clone();
+    // No production ReplayGain consumer requests LRA. This union is derived
+    // before the meter is constructed, so normal ReplayGain pays only the
+    // integrated-only NativeEbu2023 cost.
+    let native = tokio::task::spawn_blocking(move || {
+        crate::convert::replaygain::measure_and_write_paths(
+            &native_paths,
+            &native_members,
+            mode,
+            prevent_clipping,
+            false,
+        )
+    })
+    .await
+    .map_err(|error| {
+        ReplayGainError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("native ReplayGain worker failed: {error}"),
+        ))
+    })?;
 
-    let cmd = ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-        binary: ToolBinary::Loudgain,
-        args,
-        secret_args: vec![],
-        cwd: None,
-        env: vec![],
-        timeout: Duration::from_secs(600),
-    };
-    run_tool_command_with_concurrency(cmd, runner, cancel, tool_concurrency_limits.as_ref())
-        .await
-        .map_err(ReplayGainError::Tool)?;
-    if mode == tonepoet_pipeline::ReplayGainMode::Track {
-        crate::convert::replaygain::remove_stale_album_tags(&paths)
-            .map_err(ReplayGainError::Io)?;
+    // Finalization and metadata mutation are synchronous. Cancellation never
+    // pretends they stopped early: ownership settles when the blocking task
+    // returns, then the result is withheld from publication.
+    if cancel.is_cancelled() {
+        return Err(ReplayGainError::Io(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "ReplayGain cancelled while native finalization/mutation was active; result not publishable",
+        )));
     }
+    let report = native.map_err(ReplayGainError::Io)?;
+
     Ok(StageRecord {
         stage: PipelineStage::ReplayGain,
-        outcome: StageOutcome::Ok,
+        outcome: if report.has_unavailable_requested_gain() {
+            StageOutcome::OkWithDetail(report.status_summary())
+        } else {
+            StageOutcome::Ok
+        },
         dsd_dst_stats: None,
     })
 }
@@ -15039,7 +14517,7 @@ async fn run_features_with_album_gain_scope_and_timing(
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> Result<(ArtifactSet, StageRecord), FeatureError> {
     #[cfg(test)]
@@ -15070,7 +14548,7 @@ async fn run_features_with_album_gain_scope_and_timing(
         staging,
         Some(runner),
         album_gain_scope_disclosure,
-        album_gain_timings,
+        dsd_true_peak_timings,
         run_timing,
     )?;
 
@@ -15114,7 +14592,7 @@ fn stage_conversion_log_sidecars_with_timing(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> io::Result<ArtifactSet> {
     let album_dir = conversion_log_album_dir(source, req, &artifacts);
@@ -15140,7 +14618,7 @@ fn stage_conversion_log_sidecars_with_timing(
             staging,
             runner,
             album_gain_scope_disclosure,
-            album_gain_timings,
+            dsd_true_peak_timings,
             run_timing,
         )? {
             artifacts.sidecars.push(SidecarArtifact {
@@ -15171,7 +14649,7 @@ fn stage_conversion_log_sidecars_with_timing(
             log_generated_at,
             runner,
             album_gain_scope_disclosure,
-            album_gain_timings,
+            dsd_true_peak_timings,
             run_timing,
         );
         fs::write(&log_staged, &log_content)?;
@@ -15820,7 +15298,7 @@ fn build_conversion_log_at_with_runner_and_timing(
     generated_at: chrono::DateTime<chrono::Utc>,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> String {
     let tracks = collect_outcome_tracks(outcome);
@@ -15898,7 +15376,7 @@ fn build_conversion_log_at_with_runner_and_timing(
             req,
             metadata_stage_result,
             album_gain_scope_disclosure,
-            album_gain_timings,
+            dsd_true_peak_timings,
         );
         track_sections.push(section);
     }
@@ -16513,7 +15991,7 @@ fn stage_conversion_log_fragments(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> io::Result<Vec<(PathBuf, String)>> {
     let track_records = conversion_log_fragment_track_records(outcome);
@@ -16573,7 +16051,7 @@ fn stage_conversion_log_fragments(
             req,
             metadata_stage_result,
             album_gain_scope_disclosure,
-            album_gain_timings,
+            dsd_true_peak_timings,
         );
 
         let fragment = ConversionLogFragment {
@@ -21422,6 +20900,19 @@ fn merge_stage_outcome(existing: &StageOutcome, next: &StageOutcome) -> StageOut
         (StageOutcome::Failed(reason), _) | (_, StageOutcome::Failed(reason)) => {
             StageOutcome::Failed(reason.clone())
         }
+        (StageOutcome::OkWithDetail(left), StageOutcome::OkWithDetail(right)) => {
+            if left == right {
+                StageOutcome::OkWithDetail(left.clone())
+            } else {
+                StageOutcome::OkWithDetail(format!("{left}; {right}"))
+            }
+        }
+        (StageOutcome::OkWithDetail(detail), StageOutcome::Ok)
+        | (StageOutcome::Ok, StageOutcome::OkWithDetail(detail)) => {
+            StageOutcome::OkWithDetail(detail.clone())
+        }
+        (StageOutcome::OkWithDetail(detail), _)
+        | (_, StageOutcome::OkWithDetail(detail)) => StageOutcome::OkWithDetail(detail.clone()),
         (StageOutcome::Ok, _) | (_, StageOutcome::Ok) => StageOutcome::Ok,
         (StageOutcome::SkippedWithReason(left), StageOutcome::SkippedWithReason(right)) => {
             if left == right {
@@ -22189,7 +21680,7 @@ fn append_track_log(
     req: &PipelineRequest,
     metadata_stage_result: Option<&StageOutcome>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    album_gain_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
 ) {
     log.push_str(&escape_log_value(&track_display_label(record, prepared)));
     log.push('\n');
@@ -22213,7 +21704,7 @@ fn append_track_log(
         );
     }
 
-    if let Some(timing) = album_gain_timings
+    if let Some(timing) = dsd_true_peak_timings
         .and_then(|timings| timings.get(&record.track_id))
         .copied()
     {
@@ -22339,7 +21830,6 @@ fn conversion_log_tool_name(binary: ToolBinary) -> Option<&'static str> {
         ToolBinary::Ffprobe => Some("ffprobe"),
         ToolBinary::Sox => Some("sox"),
         ToolBinary::Ssrc => Some("ssrc"),
-        ToolBinary::Loudgain => Some("loudgain"),
         ToolBinary::Metaflac => Some("metaflac"),
         ToolBinary::Flac => Some("flac"),
         ToolBinary::Opustags => Some("opustags"),
@@ -23320,40 +22810,13 @@ fn append_dsd_settings(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) {
     if source_is_dsd(source) && !settings.target_format.is_dsd() {
-        if let Some(legacy) = settings.dsd.legacy_behavior() {
-            push_kv_line(log, "DSD path", "legacy-v1 compatibility");
-            push_kv_line(log, "DSD gain mode", dsd_gain_mode_label(legacy.gain_mode));
-            if legacy.gain_mode == tonepoet_pipeline::DsdToPcmGainMode::Auto {
-                push_kv_line(
-                    log,
-                    "DSD auto gain margin",
-                    format!("{} dB", decimal_label(legacy.auto_gain_margin_db)),
-                );
-            }
-            if legacy.gain_mode == tonepoet_pipeline::DsdToPcmGainMode::Manual {
-                if let Some(gain) = legacy.gain_db {
-                    push_kv_line(log, "DSD manual gain", format!("{} dB", decimal_label(gain)));
-                }
-            }
-            push_kv_line(
-                log,
-                "DSD→PCM lowpass method",
-                dsd_lowpass_method_label(legacy.lowpass),
-            );
-        } else {
-            let native = settings.dsd.from_dsd;
-            push_kv_line(
-                log,
-                "DSD path",
-                match native.pathway {
-                    tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
-                    tonepoet_pipeline::DsdSourcePathway::Manual => "manual (not available)",
-                },
-            );
+        if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, true) {
+            let reference = settings.dsd.from_dsd;
+            push_kv_line(log, "DSD path", "reference");
             push_kv_line(
                 log,
                 "DSD profile",
-                match native.profile {
+                match reference.profile {
                     tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
                     tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
                 },
@@ -23361,47 +22824,93 @@ fn append_dsd_settings(
             push_kv_line(
                 log,
                 "DSD gain mode",
-                match native.gain_mode {
-                    tonepoet_pipeline::DsdSourceGainMode::Reference => "reference",
-                    tonepoet_pipeline::DsdSourceGainMode::NativeLevel => "native",
-                    tonepoet_pipeline::DsdSourceGainMode::Fixed => "fixed",
-                    tonepoet_pipeline::DsdSourceGainMode::NormalizePeak => "normalize",
+                match reference.gain_mode {
+                    tonepoet_pipeline::DsdSourceGainMode::Reference => "reference compensated",
+                    tonepoet_pipeline::DsdSourceGainMode::NativeLevel => "native level exact",
+                    tonepoet_pipeline::DsdSourceGainMode::Fixed => "reference fixed",
+                    tonepoet_pipeline::DsdSourceGainMode::NormalizePeak => "sample-peak normalize",
                 },
             );
-            if native.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Fixed {
-                if let Some(gain) = native.fixed_gain_db {
+            if reference.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Fixed {
+                if let Some(gain) = reference.fixed_gain_db {
                     push_kv_line(log, "DSD fixed gain", format!("{} dB", gain));
                 }
             }
-            if native.gain_mode == tonepoet_pipeline::DsdSourceGainMode::NormalizePeak {
+            if reference.gain_mode == tonepoet_pipeline::DsdSourceGainMode::NormalizePeak {
                 push_kv_line(
                     log,
-                    "DSD normalize target",
-                    format!("{} dBFS", native.normalize_peak_target_dbfs),
+                    "DSD sample-peak normalize target",
+                    format!("{} dBFS", reference.normalize_peak_target_dbfs),
                 );
             }
             push_kv_line(
                 log,
                 "DSD Reference policy",
-                tonepoet_pipeline::DSD_REFERENCE_POLICY_V1_KEY,
+                reference.reference_policy.key(),
             );
-        }
-
-        if settings.dsd.album_auto_gain_selected() {
-            let scan_mode = settings.dsd.true_peak_scan_mode();
-            let tier_label = match scan_mode {
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference => "reference",
-                tonepoet_pipeline::DsdTruePeakScanMode::Standard => "standard",
-                tonepoet_pipeline::DsdTruePeakScanMode::Fast => "fast",
-            };
-            push_kv_line(log, "DSD true-peak scan", tier_label);
+        } else {
+            push_kv_line(log, "DSD path", "general");
+            push_kv_line(
+                log,
+                "DSD reconstruction",
+                match settings.dsd.general_from_dsd.reconstruction {
+                    tonepoet_pipeline::DsdGeneralReconstruction::General => "general native-level",
+                    tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected => "reference protected R64",
+                },
+            );
+            push_kv_line(
+                log,
+                "DSD export level",
+                match settings.dsd.general_from_dsd.export_level {
+                    tonepoet_pipeline::DsdGeneralExportLevel::Native => "native".to_string(),
+                    tonepoet_pipeline::DsdGeneralExportLevel::NominalCompensated => "nominal compensated".to_string(),
+                    tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64 => "protected R64".to_string(),
+                    tonepoet_pipeline::DsdGeneralExportLevel::NativeWithOffset { offset_db } => {
+                        format!("native {:+} dB", offset_db)
+                    }
+                },
+            );
+            push_kv_line(
+                log,
+                "DSD gain mode",
+                match settings.dsd.gain_policy() {
+                    tonepoet_pipeline::SampleGainPolicy::Off => "off",
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakGuard { .. } => "true-peak guard",
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. } => "true-peak normalize",
+                    tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => "fixed gain",
+                },
+            );
+            if let Some(gain) = settings.dsd.gain_policy().fixed_gain_db() {
+                push_kv_line(log, "DSD fixed gain", format!("{} dB", gain));
+            }
+            if let Some(target) = settings.dsd.gain_policy().target_dbtp() {
+                push_kv_line(log, "DSD true-peak target", format!("{} dBTP", target));
+            }
+            if let Some(scope) = settings.dsd.true_peak_scope() {
+                push_kv_line(log, "DSD true-peak scope", match scope {
+                    tonepoet_pipeline::TruePeakScope::Track => "track",
+                    tonepoet_pipeline::TruePeakScope::Album => "album",
+                });
+            }
+            if let Some(scan) = settings.dsd.true_peak_scan_tier() {
+                push_kv_line(log, "DSD true-peak scan", match scan {
+                    tonepoet_pipeline::TruePeakScanTier::Reference => "reference",
+                    tonepoet_pipeline::TruePeakScanTier::Standard => "standard",
+                    tonepoet_pipeline::TruePeakScanTier::Fast => "fast",
+                });
+            }
+            push_kv_line(
+                log,
+                "DSD->PCM lowpass method",
+                dsd_lowpass_method_label(settings.dsd.general_from_dsd.lowpass),
+            );
         }
     }
 
     if settings.target_format.is_dsd() {
         push_kv_line(
             log,
-            "PCM→DSD filter preset",
+            "PCM->DSD filter preset",
             format!("{:?}", settings.dsd.pcm_to_dsd.filter),
         );
     }
@@ -23525,7 +23034,7 @@ fn metadata_satisfaction_label(
                     .to_string()
             }
             StageRequirement::Enabled => match metadata_stage_result {
-                Some(StageOutcome::Ok) => {
+                Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => {
                     "metadata stage applied non-native m4a tags via AtomicParsley after artwork"
                         .to_string()
                 }
@@ -23554,7 +23063,7 @@ fn metadata_satisfaction_label(
     let album_gain_carrier_source_metadata = prepared.zip(source).is_some_and(|(track, source)| {
         matches!(
             &track.source_ref,
-            TrackSourceRef::DsdAlbumGainCarrier { .. }
+            TrackSourceRef::DsdTruePeakCarrier { .. }
         ) && dsd_album_gain_source_container_is_metadata_authority(source)
             && (required.source_tags_transferred || required.artwork_transferred)
     });
@@ -23572,7 +23081,7 @@ fn metadata_satisfaction_label(
                 "{requested} were not transferred from the original DSD source because the metadata stage is disabled"
             ),
             StageRequirement::Enabled => match metadata_stage_result {
-                Some(StageOutcome::Ok) => format!(
+                Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => format!(
                     "metadata stage transferred {requested} from the original DSD source after album-gain encoding"
                 ),
                 Some(StageOutcome::NotRequested) => format!(
@@ -23652,7 +23161,7 @@ fn metadata_remaining_requirement_parts(
     let status = match metadata_stage {
         StageRequirement::Disabled => "metadata stage disabled".to_string(),
         StageRequirement::Enabled => match metadata_stage_result {
-            Some(StageOutcome::Ok) => {
+            Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => {
                 "metadata stage completed; per-track writes not recorded".to_string()
             }
             Some(StageOutcome::NotRequested) => "metadata stage not requested".to_string(),
@@ -23829,13 +23338,13 @@ fn conversion_summary(
     let mut transforms = Vec::new();
     if matches!(
         &track.source_ref,
-        TrackSourceRef::DsdAlbumGainCarrier { .. }
+        TrackSourceRef::DsdTruePeakCarrier { .. }
     ) {
         if let Some(gain_db) = req.settings.dsd.runtime_album_gain_db() {
             let target = req
                 .settings
                 .dsd
-                .album_auto_gain_target_dbfs()
+                .album_true_peak_target_dbtp()
                 .map(|value| value.render(false))
                 .unwrap_or_else(|| "unknown".to_string());
             let scope = match (
@@ -23852,7 +23361,7 @@ fn conversion_summary(
                 _ => "submitted DSD batch".to_string(),
             };
             transforms.push(format!(
-                "submitted-batch DSD album gain {} dB ({scope}; true-peak target {} dBTP)",
+                "submitted-batch DSD true-peak album gain {} dB ({scope}; target {} dBTP)",
                 gain_db.render(true),
                 target,
             ));
@@ -23867,7 +23376,7 @@ fn conversion_summary(
             }
         }
     }
-    if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db {
+    if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db() {
         transforms.push(format!(
             "user-supplied PCM fixed gain {} dB (unclamped; may clip)",
             gain_db.render(true),
@@ -24126,9 +23635,9 @@ fn track_requires_dsd_hard_ceiling_rate_exactness(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
     let dsd_gain_participant = source_track_dsd_rate(track).is_some()
-        || matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. });
+        || matches!(&track.source_ref, TrackSourceRef::DsdTruePeakCarrier { .. });
     dsd_gain_participant
-        && (settings.dsd.album_auto_gain_selected()
+        && (settings.dsd.gain_policy().is_true_peak()
             || settings.dsd.runtime_album_gain_db().is_some())
 }
 
@@ -24189,7 +23698,7 @@ fn album_gain_terminal_headroom_reserve_db(
     settings: &tonepoet_pipeline::PipelineSettings,
     sample_rate_hz: u32,
 ) -> Result<Option<f64>, String> {
-    let Some(target) = settings.dsd.album_auto_gain_target_dbfs() else {
+    let Some(target) = settings.dsd.album_true_peak_target_dbtp() else {
         return Ok(None);
     };
     let terminal = album_gain_terminal_bound(settings, sample_rate_hz)?;
@@ -24262,8 +23771,8 @@ fn preconversion_disclosure_messages(
         };
         let target = settings
             .dsd
-            .album_auto_gain_target_dbfs()
-            .expect("reserve exists only while album auto gain is selected");
+            .album_true_peak_target_dbtp()
+            .expect("reserve exists only while album-scoped certified true-peak gain is selected");
         messages.insert(format!(
             "Hard-ceiling headroom: {depth} output reserves {reserve_db:.6} dB below the requested {} dBTP ceiling for {terminal_reason} error.",
             target.render(false),
@@ -24320,6 +23829,12 @@ fn source_track_dsd_rate(track: &PreparedTrack) -> Option<DsdRate> {
     } else {
         None
     }
+}
+
+fn prepared_track_uses_dsd_source(track: &PreparedTrack) -> bool {
+    matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+        || source_track_dsd_rate(track).is_some()
+        || matches!(&track.source_ref, TrackSourceRef::DsdTruePeakCarrier { .. })
 }
 
 fn source_audio_description(track: &PreparedTrack) -> String {
@@ -24402,8 +23917,9 @@ fn source_track_format_label(track: &PreparedTrack) -> String {
 fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
     let path = match source_ref {
         TrackSourceRef::StagedFile(path) => path,
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
-        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => source_path,
+        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => source_path,
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image,
@@ -24715,13 +24231,6 @@ fn sox_sinc_phase_label(value: SoxSincPhase) -> &'static str {
     }
 }
 
-fn dsd_gain_mode_label(value: DsdToPcmGainMode) -> &'static str {
-    match value {
-        DsdToPcmGainMode::Disabled => "disabled",
-        DsdToPcmGainMode::Auto => "auto",
-        DsdToPcmGainMode::Manual => "manual",
-    }
-}
 
 fn dsd_lowpass_method_label(value: DsdLowpassMethod) -> &'static str {
     match value {
@@ -24809,7 +24318,7 @@ fn cue_artwork_metadata_stage_outcome(req: &PipelineRequest, outcome: &AlbumOutc
     }
 
     match metadata_stage_outcome(outcome) {
-        Some(StageOutcome::Ok) => {
+        Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => {
             "metadata stage completed post-encode artwork embedding".to_string()
         }
         Some(StageOutcome::NotRequested) => {
@@ -25241,6 +24750,9 @@ fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
 fn stage_outcome_label(outcome: &StageOutcome) -> String {
     match outcome {
         StageOutcome::Ok => "Ok".to_string(),
+        StageOutcome::OkWithDetail(detail) => {
+            format!("Ok ({})", escape_log_value(detail))
+        }
         StageOutcome::NotRequested => "Not requested".to_string(),
         StageOutcome::Skipped => "Skipped".to_string(),
         StageOutcome::SkippedWithReason(reason) => {
@@ -25272,7 +24784,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
 fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
     match source_ref {
         TrackSourceRef::StagedFile(path) => format!("staged file {}", path_log_value(path)),
-        TrackSourceRef::DsdAlbumGainCarrier {
+        TrackSourceRef::DsdTruePeakCarrier {
             path,
             source_path,
             sample_rate_hz,
@@ -25305,6 +24817,19 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
                 .map(|value| value.render(false))
                 .unwrap_or_else(|| "pending album authority".to_string()),
             if *lossy_target_capped { "yes" } else { "no" },
+        ),
+        TrackSourceRef::RegisteredEffectCarrier {
+            path,
+            source_path,
+            sample_rate_hz,
+            channels,
+            source_was_dsd,
+            ..
+        } => format!(
+            "registered-effect raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; source {}; source domain {})",
+            path_log_value(path),
+            path_log_value(source_path),
+            if *source_was_dsd { "DSD" } else { "PCM" },
         ),
         TrackSourceRef::CueStreamSegment {
             fallback_path,
@@ -29102,9 +28627,10 @@ async fn decide_rerun_after_reference_preflight(
     ) || req.settings.dsd.from_dsd.pathway
         != tonepoet_pipeline::DsdSourcePathway::Reference
     {
-        return super::rerun::decide_rerun(
+        return super::rerun::decide_rerun_with_effects(
             &album_plan.album_dir,
             &req.settings,
+            &req.registered_effects,
             req.publish.overwrite,
         );
     }
@@ -29154,7 +28680,7 @@ async fn decide_rerun_after_reference_preflight(
         ),
         Ok(None) => super::rerun::RerunDecision::Redo {
             reason: super::rerun::RerunReason::NativePreflightFailed(
-                "native-v2 settings did not produce Reference preflight authority".to_string(),
+                "the Reference request did not produce qualified preflight authority".to_string(),
             ),
             warning: Some(
                 "native Reference rerun authority was unavailable; conversion will be replanned"
@@ -29229,7 +28755,12 @@ async fn prepare_batch_pre_actions_before_materialization(
     if let super::rerun::RerunDecision::Skip {
         manifest,
         manifest_path,
-    } = super::rerun::decide_rerun(&album_dir, &req.settings, req.publish.overwrite)
+    } = super::rerun::decide_rerun_with_effects(
+        &album_dir,
+        &req.settings,
+        &req.registered_effects,
+        req.publish.overwrite,
+    )
     {
         return PreMaterializationActionOutcome::Finished(
             finalize_pre_materialization_manifest_skip(
@@ -29881,8 +29412,9 @@ fn preserve_source_tags_for_organizational_identity(source: &mut PreparedSource)
 fn track_source_identity_path(track: &PreparedTrack) -> &Path {
     match &track.source_ref {
         TrackSourceRef::StagedFile(path) => path.as_path(),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
-        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => source_path.as_path(),
+        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => source_path.as_path(),
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image.as_path(),
@@ -29941,9 +29473,9 @@ pub struct ScheduledAlbum {
     pub plan: AlbumPlan,
     pub stages: Vec<StageRecord>,
     pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
-    pub(crate) album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
-    pub(crate) pcm_true_peak_measurements: Vec<PcmTruePeakPreparedMeasurement>,
-    album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
+    pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
     pub(crate) pre_actions_completed_before_album_gain_rerun: bool,
@@ -29974,12 +29506,11 @@ impl ScheduledAlbum {
 }
 
 
-/// Snapshot of the resolved submitted-batch album-gain authority needed to
-/// retry one scratch-backed single-file participant on disk without falling
-/// back to the ordinary source-from-scratch pipeline. The retry reuses this
-/// item's already-measured retained PCM carrier and must never recompute the
-/// shared gain from this item's peak alone.
-struct DsdAlbumGainScratchRetrySeed {
+/// Snapshot of one scratch-backed certified true-peak attempt that may be
+/// replayed on disk without repeating source decode/reconstruction or the
+/// certified observation.  The authority is the retained *measured* carrier
+/// plus its already-bound scalar, never a gained output.
+struct CertifiedTruePeakScratchRetrySeed {
     req: PipelineRequest,
     item_id: String,
     source: PreparedSource,
@@ -29987,53 +29518,111 @@ struct DsdAlbumGainScratchRetrySeed {
     plan: AlbumPlan,
     stages: Vec<StageRecord>,
     source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
-    album_gain_measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
-    pcm_true_peak_measurements: Vec<PcmTruePeakPreparedMeasurement>,
-    album_gain_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
-    album_gain_scope_disclosure: DsdAlbumGainScopeDisclosure,
+    dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
+    album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
     pre_actions_completed_before_album_gain_rerun: bool,
     action_output: Option<PipelineOutputCapability>,
+    dsd_runtime_album_gain_db: Option<tonepoet_pipeline::DbNano>,
+    pcm_runtime_album_gain_db: Option<tonepoet_pipeline::DbNano>,
 }
 
-impl DsdAlbumGainScratchRetrySeed {
-    fn capture(album: &ScheduledAlbum) -> Result<Option<Self>, String> {
-        if !album.staging.is_scratch_staging()
-            || album.req.settings.dsd.runtime_album_gain_db().is_none()
-        {
+fn bound_certified_true_peak_carrier(source_ref: &TrackSourceRef) -> bool {
+    matches!(
+        source_ref,
+        TrackSourceRef::DsdTruePeakCarrier {
+            gain_db: Some(_),
+            ..
+        } | TrackSourceRef::PcmTruePeakCarrier {
+            gain_db: Some(_),
+            ..
+        }
+    )
+}
+
+impl CertifiedTruePeakScratchRetrySeed {
+    fn capture(
+        album: &ScheduledAlbum,
+        track_outputs: &[ScheduledTrackOutput],
+    ) -> Result<Option<Self>, String> {
+        if !album.staging.is_scratch_staging() {
             return Ok(None);
         }
-        if !album.req.settings.dsd.album_auto_gain_selected() {
-            return Err(
-                "runtime DSD album gain reached scratch retry outside album auto-gain mode"
-                    .to_string(),
-            );
+
+        // Track-scoped preparation happens inside the worker, so ScheduledAlbum
+        // still contains the original source.  Merge only bound carrier refs
+        // reported by workers back into a private retry snapshot.  Album-scoped
+        // preparation already places its bound carriers in album.source.
+        let mut source = album.source.clone();
+        let output_refs = track_outputs
+            .iter()
+            .map(|output| (output.record.track_id.clone(), output.record.source_ref.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for track in &mut source.tracks {
+            if let Some(source_ref) = output_refs.get(&track.id) {
+                if bound_certified_true_peak_carrier(source_ref) {
+                    track.source_ref = source_ref.clone();
+                }
+            }
         }
-        let disclosure = album.album_gain_scope_disclosure.clone().ok_or_else(|| {
-            "resolved DSD album gain reached scratch retry without submitted-batch scope disclosure"
-                .to_string()
-        })?;
-        if !album
-            .source
+
+        let retained_count = source
             .tracks
             .iter()
-            .any(|track| matches!(&track.source_ref, TrackSourceRef::DsdAlbumGainCarrier { .. }))
+            .filter(|track| bound_certified_true_peak_carrier(&track.source_ref))
+            .count();
+        let has_album_authority = album.req.settings.dsd.runtime_album_gain_db().is_some()
+            || album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some();
+        if retained_count == 0 {
+            if has_album_authority {
+                return Err(
+                    "resolved certified Album gain reached scratch retry without a retained measured carrier"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
+
+        // Keep the existing retry boundary deliberately narrow.  CUE/disc/archive
+        // ownership has additional shared-source lifetimes; those retain their
+        // established baseline instead of acquiring a new recovery scheduler.
+        if source.kind != SourceKind::SingleFile {
+            if has_album_authority {
+                return Err(format!(
+                    "resolved certified Album-gain scratch retry is limited to independently submitted single-file items; got {:?}",
+                    source.kind,
+                ));
+            }
+            return Ok(None);
+        }
+
+        if album.req.settings.dsd.runtime_album_gain_db().is_some()
+            && !album.req.settings.dsd.album_true_peak_gain_selected()
         {
             return Err(
-                "resolved DSD album gain reached scratch retry without a retained album-gain carrier"
+                "runtime DSD album gain reached scratch retry outside album-scoped true-peak gain mode"
                     .to_string(),
             );
         }
-        // Scratch admission deliberately bypasses multi-track album-gain
-        // sources because their retained-carrier bound is unknown before
-        // materialization. If that invariant ever changes, fail closed here
-        // rather than silently retrying an ISO/CUE/archive as one track.
-        if album.source.kind != SourceKind::SingleFile {
-            return Err(format!(
-                "resolved DSD album-gain scratch retry is limited to independently submitted single-file items; got {:?}",
-                album.source.kind,
-            ));
+        if album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some()
+            && !album.req.settings.pcm_true_peak.album_true_peak_gain_selected()
+        {
+            return Err(
+                "runtime PCM album gain reached scratch retry outside album-scoped true-peak gain mode"
+                    .to_string(),
+            );
         }
+        if album.req.settings.dsd.runtime_album_gain_db().is_some()
+            && album.album_gain_scope_disclosure.is_none()
+        {
+            return Err(
+                "resolved DSD Album gain reached scratch retry without submitted-batch scope disclosure"
+                    .to_string(),
+            );
+        }
+
         let action_output = album
             .action_output
             .as_ref()
@@ -30041,66 +29630,107 @@ impl DsdAlbumGainScratchRetrySeed {
             .transpose()
             .map_err(|error| {
                 format!(
-                    "could not retain pre-action output authority for DSD album-gain disk retry: {error}"
+                    "could not retain pre-action output authority for certified true-peak disk retry: {error}"
                 )
             })?;
         Ok(Some(Self {
             req: album.req.clone(),
             item_id: album.item_id.clone(),
-            source: album.source.clone(),
+            source,
             scratch_staging_root: album.staging.root.clone(),
             plan: album.plan.clone(),
             stages: album.stages.clone(),
             source_replaygain: album.source_replaygain.clone(),
-            album_gain_measurements: album.album_gain_measurements.clone(),
+            dsd_true_peak_measurements: album.dsd_true_peak_measurements.clone(),
             pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
-            album_gain_timings: album.album_gain_timings.clone(),
-            album_gain_scope_disclosure: disclosure,
+            dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
+            album_gain_scope_disclosure: album.album_gain_scope_disclosure.clone(),
             run_timing: album.run_timing.clone(),
             pre_actions_completed_before_album_gain_rerun: album
                 .pre_actions_completed_before_album_gain_rerun,
             action_output,
+            dsd_runtime_album_gain_db: album.req.settings.dsd.runtime_album_gain_db(),
+            pcm_runtime_album_gain_db: album.req.settings.pcm_true_peak.runtime_album_gain_db(),
         }))
     }
 }
 
-fn validate_retained_dsd_album_gain_carriers_for_disk_retry(
+fn validate_retained_certified_true_peak_carriers_for_disk_retry(
     source: &PreparedSource,
     scratch_staging_root: &Path,
 ) -> Result<usize, String> {
     let mut carriers = 0usize;
     for track in &source.tracks {
-        let TrackSourceRef::DsdAlbumGainCarrier { path, .. } = &track.source_ref else {
-            continue;
+        let (path, channels, gain_db) = match &track.source_ref {
+            TrackSourceRef::DsdTruePeakCarrier {
+                path,
+                channels,
+                gain_db,
+                ..
+            }
+            | TrackSourceRef::PcmTruePeakCarrier {
+                path,
+                channels,
+                gain_db,
+                ..
+            } => (path, *channels, *gain_db),
+            _ => continue,
         };
+        if gain_db.is_none() {
+            return Err(format!(
+                "retained certified carrier reached retry before its scalar was bound: {}",
+                path.display(),
+            ));
+        }
         if !path.starts_with(scratch_staging_root) {
             return Err(format!(
-                "retained DSD album-gain carrier escaped its scratch staging root: {}",
+                "retained certified carrier escaped its scratch staging root: {}",
                 path.display(),
             ));
         }
         let metadata = fs::metadata(path).map_err(|error| {
             format!(
-                "could not stat retained DSD album-gain carrier for disk retry {}: {error}",
+                "could not stat retained certified carrier for disk retry {}: {error}",
                 path.display(),
             )
         })?;
-        if !metadata.is_file() || metadata.len() == 0 {
+        let frame_bytes = u64::from(channels)
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .ok_or_else(|| "retained certified carrier frame size overflowed".to_string())?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || frame_bytes == 0
+            || metadata.len() % frame_bytes != 0
+        {
             return Err(format!(
-                "retained DSD album-gain carrier for disk retry is missing, non-regular, or empty: {}",
+                "retained certified carrier for disk retry is missing, non-regular, empty, or frame-misaligned: {}",
+                path.display(),
+            ));
+        }
+
+        // PERF03: path identity alone is insufficient.  The digest was bound by
+        // the same traversal that completed the certified observation, encoded
+        // into the private carrier name, and is recomputed only on this
+        // exceptional retry path.  Any mutation at the same path invalidates
+        // the measurement/scalar binding before terminal work starts.
+        let expected_digest = certified_carrier_digest_from_path(path)?;
+        let actual_digest = sha256_file(path)?;
+        if actual_digest != expected_digest {
+            return Err(format!(
+                "retained certified carrier changed after measurement; refusing stale retry binding: {}",
                 path.display(),
             ));
         }
         carriers = carriers.saturating_add(1);
     }
     if carriers == 0 {
-        return Err("album-gain disk retry had no retained DSD carrier to reuse".to_string());
+        return Err("certified true-peak disk retry had no retained measured carrier to reuse".to_string());
     }
     Ok(carriers)
 }
 
-async fn retry_resolved_dsd_album_gain_once_on_disk(
-    seed: DsdAlbumGainScratchRetrySeed,
+async fn retry_resolved_certified_true_peak_once_on_disk(
+    seed: CertifiedTruePeakScratchRetrySeed,
     runner: &dyn ToolRunner,
     reporter: &dyn PipelineReporter,
     cancel: &CancellationToken,
@@ -30109,18 +29739,15 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
     original_error: &str,
 ) -> Result<PipelineReport, String> {
     if cancel.is_cancelled() {
-        return Err("cancelled before resolved DSD album-gain disk retry".to_string());
+        return Err("cancelled before certified true-peak disk retry".to_string());
     }
-    let fixed_gain = seed.req.settings.dsd.runtime_album_gain_db().ok_or_else(|| {
-        "resolved DSD album-gain disk retry lost its fixed gain authority".to_string()
-    })?;
     let req = request_without_scratch_staging(&seed.req);
-    let retained_carriers = validate_retained_dsd_album_gain_carriers_for_disk_retry(
+    let retained_carriers = validate_retained_certified_true_peak_carriers_for_disk_retry(
         &seed.source,
         &seed.scratch_staging_root,
     )?;
     let attempt = prepare_disk_materialization_attempt(&req).map_err(|error| {
-        format!("could not prepare disk staging for DSD album-gain retry: {error}")
+        format!("could not prepare disk staging for certified true-peak retry: {error}")
     })?;
     let MaterializationAttempt {
         staging,
@@ -30128,34 +29755,38 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
         used_scratch,
     } = attempt;
     debug_assert!(!used_scratch, "explicit disk retry must not allocate scratch staging");
-    if req.settings.dsd.runtime_album_gain_db() != Some(fixed_gain) {
+    if req.settings.dsd.runtime_album_gain_db() != seed.dsd_runtime_album_gain_db
+        || req.settings.pcm_true_peak.runtime_album_gain_db() != seed.pcm_runtime_album_gain_db
+    {
         return Err(
-            "DSD album-gain disk retry changed the submitted-batch fixed gain authority"
+            "certified true-peak disk retry changed the submitted-batch gain authority"
                 .to_string(),
         );
     }
     #[cfg(test)]
-    if let Some(report) = injected_dsd_album_gain_scratch_retry_report_for_test(
-        &req,
-        &seed.source,
-        &seed.album_gain_scope_disclosure,
-        original_error,
-    ) {
-        return Ok(report);
+    if let Some(disclosure) = seed.album_gain_scope_disclosure.as_ref() {
+        if let Some(report) = injected_dsd_album_gain_scratch_retry_report_for_test(
+            &req,
+            &seed.source,
+            disclosure,
+            original_error,
+        ) {
+            return Ok(report);
+        }
     }
 
-    // Reuse the already-measured Float64 carrier in place while staging retry
-    // outputs on disk. The outer finisher still owns the scratch StagingDir
-    // during this awaited retry, so the carrier cannot be cleaned up until the
-    // retry has fully completed. This avoids both a second DSD reconstruction
-    // and a multi-gigabyte carrier copy on the exceptional recovery path.
+    // The original scratch StagingDir remains owned by the outer finisher for
+    // this entire awaited retry, so measured carriers cannot be cleaned up or
+    // overwritten while the disk attempt reads them.  Each attempt starts from
+    // those pre-gain bytes and applies the already-bound scalar exactly once.
     log::warn!(
-        "scratch retrying resolved DSD album-gain item on disk from retained carrier without recomputing batch authority: job_id={}, item_id={}, disk_staging_path={}, retained_carriers={}, fixed_gain_db={}, original_error={}",
+        "scratch retrying certified true-peak item on disk from retained measured carrier: job_id={}, item_id={}, disk_staging_path={}, retained_carriers={}, dsd_album_gain={:?}, pcm_album_gain={:?}, original_error={}",
         req.job_id,
         req.item_id,
         staging.root.display(),
         retained_carriers,
-        fixed_gain.render(false),
+        seed.dsd_runtime_album_gain_db,
+        seed.pcm_runtime_album_gain_db,
         original_error,
     );
 
@@ -30167,10 +29798,10 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
         plan: seed.plan,
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
-        album_gain_measurements: seed.album_gain_measurements,
+        dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
-        album_gain_timings: seed.album_gain_timings,
-        album_gain_scope_disclosure: Some(seed.album_gain_scope_disclosure),
+        dsd_true_peak_timings: seed.dsd_true_peak_timings,
+        album_gain_scope_disclosure: seed.album_gain_scope_disclosure,
         run_timing: seed.run_timing,
         pre_actions_completed_before_album_gain_rerun: seed
             .pre_actions_completed_before_album_gain_rerun,
@@ -30205,7 +29836,7 @@ async fn retry_resolved_dsd_album_gain_once_on_disk(
                 &track,
                 None,
                 Some(final_path),
-                format!("DSD album-gain disk retry encode worker failed: {error}"),
+                format!("certified true-peak disk retry encode worker failed: {error}"),
             )
         });
         outputs.push(output);
@@ -30242,9 +29873,9 @@ pub(crate) fn scheduled_album_for_test(
         plan,
         stages,
         source_replaygain: None,
-        album_gain_measurements: Vec::new(),
+        dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
-        album_gain_timings: BTreeMap::new(),
+        dsd_true_peak_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
         run_timing: ConversionRunTiming::start(),
         pre_actions_completed_before_album_gain_rerun: false,
@@ -30262,10 +29893,8 @@ pub(crate) async fn resolve_dsd_album_gain_post_barrier_rerun(
     album: ScheduledAlbum,
     reporter: &dyn PipelineReporter,
 ) -> ScheduledMaterialization {
-    let post_barrier_gain_is_bound = album.req.settings.dsd.album_auto_gain_selected()
-        || (album.req.settings.pcm_true_peak.enabled
-            && album.req.settings.pcm_true_peak.scope
-                == tonepoet_pipeline::PcmTruePeakScope::Album
+    let post_barrier_gain_is_bound = album.req.settings.dsd.album_true_peak_gain_selected()
+        || (album.req.settings.pcm_true_peak.album_true_peak_gain_selected()
             && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some());
     if album.req.publish.overwrite != OverwritePolicy::SkipIfManifestMatch
         || !post_barrier_gain_is_bound
@@ -30273,9 +29902,10 @@ pub(crate) async fn resolve_dsd_album_gain_post_barrier_rerun(
         return ScheduledMaterialization::Ready(album);
     }
 
-    let decision = super::rerun::decide_rerun(
+    let decision = super::rerun::decide_rerun_with_effects(
         &album.plan.album_dir,
         &album.req.settings,
+        &album.req.registered_effects,
         album.req.publish.overwrite,
     );
     let super::rerun::RerunDecision::Skip {
@@ -30391,6 +30021,7 @@ fn post_action_outcome_with_terminal_authority(
                     StageOutcome::Failed(format!("{message}; {authority_error}"))
                 }
                 StageOutcome::Ok
+                | StageOutcome::OkWithDetail(_)
                 | StageOutcome::NotRequested
                 | StageOutcome::Skipped
                 | StageOutcome::SkippedWithReason(_) => StageOutcome::Failed(authority_error),
@@ -31364,12 +30995,46 @@ fn album_peak_measurement_from_true_peak(
     }
 }
 
+fn require_complete_file_reader_eof(
+    file: &mut fs::File,
+    path: &Path,
+    expected_len: u64,
+    label: &str,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut trailing = [0_u8; 1];
+    let trailing_len = file
+        .read(&mut trailing)
+        .map_err(|error| format!("could not confirm EOF for {label}: {error}"))?;
+    if trailing_len != 0 {
+        return Err(format!(
+            "{label} contains unexpected trailing payload beyond the declared {expected_len} bytes",
+        ));
+    }
+    let final_len = fs::metadata(path)
+        .map_err(|error| format!("could not restat {label} after the complete read: {error}"))?
+        .len();
+    if final_len != expected_len {
+        return Err(format!(
+            "{label} changed extent during the complete read: expected {expected_len} bytes, found {final_len}",
+        ));
+    }
+    Ok(())
+}
+
 // CertifiedPeakMeter deliberately makes its execution graph independent of
 // caller chunking. Smaller application pushes therefore only add cancellation
 // opportunities between meter calls; they do not make one Reference tile
 // cooperatively cancellable. The constant-prefix preflight below handles the
 // demonstrated Reference9 pathology before such a tile is entered.
 const TRUE_PEAK_SCAN_CANCEL_POLL_FRAMES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct CertifiedCarrierScan {
+    measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    content_sha256: tonepoet_pipeline::Sha256Digest,
+}
 
 #[cfg(test)]
 fn scan_album_gain_true_peak_carrier_with_cancel<F>(
@@ -31385,18 +31050,18 @@ where
         carrier,
         sample_rate_hz,
         channels,
-        tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+        tonepoet_pipeline::TruePeakScanTier::Reference,
         is_cancelled,
     )
 }
 
 fn dsd_true_peak_tier(
-    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
 ) -> tonepoet_true_peak::PeakTier {
     match scan_mode {
-        tonepoet_pipeline::DsdTruePeakScanMode::Reference => tonepoet_true_peak::PeakTier::Reference,
-        tonepoet_pipeline::DsdTruePeakScanMode::Standard => tonepoet_true_peak::PeakTier::Standard,
-        tonepoet_pipeline::DsdTruePeakScanMode::Fast => tonepoet_true_peak::PeakTier::Fast,
+        tonepoet_pipeline::TruePeakScanTier::Reference => tonepoet_true_peak::PeakTier::Reference,
+        tonepoet_pipeline::TruePeakScanTier::Standard => tonepoet_true_peak::PeakTier::Standard,
+        tonepoet_pipeline::TruePeakScanTier::Fast => tonepoet_true_peak::PeakTier::Fast,
     }
 }
 
@@ -31404,9 +31069,29 @@ fn scan_album_gain_true_peak_carrier_with_cancel_and_mode<F>(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
-    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     is_cancelled: F,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
+where
+    F: FnMut() -> bool,
+{
+    scan_album_gain_true_peak_carrier_identity_with_cancel_and_mode(
+        carrier,
+        sample_rate_hz,
+        channels,
+        scan_mode,
+        is_cancelled,
+    )
+    .map(|scan| scan.measurement)
+}
+
+fn scan_album_gain_true_peak_carrier_identity_with_cancel_and_mode<F>(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
+    is_cancelled: F,
+) -> Result<CertifiedCarrierScan, String>
 where
     F: FnMut() -> bool,
 {
@@ -31421,7 +31106,7 @@ where
         scan_mode,
         matches!(
             scan_mode,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference
+            tonepoet_pipeline::TruePeakScanTier::Reference
         ),
         is_cancelled,
     )
@@ -31431,10 +31116,10 @@ fn scan_album_gain_true_peak_carrier_with_cancel_and_mode_impl<F>(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
-    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     constant_preflight: bool,
     mut is_cancelled: F,
-) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String>
+) -> Result<CertifiedCarrierScan, String>
 where
     F: FnMut() -> bool,
 {
@@ -31460,6 +31145,17 @@ where
             "album DSD true-peak carrier is empty or truncated ({len} bytes is not aligned to {frame_bytes}-byte frames)",
         ));
     }
+    let mut baseline_scan = super::baseline::certified_scan_started(
+        "dsd_album_gain_carrier",
+        carrier,
+        len,
+    );
+    // Bind retry authority to the exact bytes certified by this reader.  The
+    // hasher advances only across the first traversal of each byte, even when
+    // the Reference constant-prefix optimization rewinds into already-read
+    // data.  This therefore adds no carrier traversal to the normal path.
+    let mut content_hasher = Sha256::new();
+    let mut hashed_until = 0_u64;
 
     let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
         sample_rate_hz,
@@ -31495,6 +31191,10 @@ where
             })?;
             file.read_exact(&mut bytes[..count])
                 .map_err(|error| format!("could not read album DSD true-peak carrier: {error}"))?;
+            content_hasher.update(&bytes[..count]);
+            hashed_until = hashed_until
+                .checked_add(count as u64)
+                .ok_or_else(|| "album DSD true-peak digest extent overflowed".to_string())?;
 
             for (frame_index_in_read, raw_frame) in bytes[..count]
                 .chunks_exact(frame_bytes)
@@ -31578,13 +31278,34 @@ where
                 if is_cancelled() {
                     return Err("album DSD true-peak scan cancelled".to_string());
                 }
+                require_complete_file_reader_eof(
+                    &mut file,
+                    carrier,
+                    len,
+                    "DSD certified true-peak carrier",
+                )?;
                 let result = meter.finalize().map_err(|error| {
                     format!("could not finalize album DSD ceiling measurement: {error}")
                 })?;
-                return album_peak_measurement_from_true_peak(
+                if hashed_until != len {
+                    return Err(format!(
+                        "DSD certified true-peak digest covered {hashed_until} of {len} bytes",
+                    ));
+                }
+                let measurement = album_peak_measurement_from_true_peak(
                     result.reported_point_estimate.overall,
                     result.upper_level(),
-                );
+                )?;
+                let digest = content_hasher.finalize();
+                let mut digest_bytes = [0_u8; 32];
+                digest_bytes.copy_from_slice(&digest);
+                if let Some(scan) = baseline_scan.as_mut() {
+                    scan.mark_complete();
+                }
+                return Ok(CertifiedCarrierScan {
+                    measurement,
+                    content_sha256: tonepoet_pipeline::Sha256Digest(digest_bytes),
+                });
             }
             Some(first_differing_offset) if constant_prefix_frames >= 2 => {
                 if is_cancelled() {
@@ -31627,8 +31348,19 @@ where
         let count = usize::try_from(remaining.min(buffer_len as u64)).map_err(|_| {
             "album DSD true-peak carrier length does not fit this platform".to_string()
         })?;
+        let read_start = len - remaining;
         file.read_exact(&mut bytes[..count])
             .map_err(|error| format!("could not read album DSD true-peak carrier: {error}"))?;
+        let read_end = read_start
+            .checked_add(count as u64)
+            .ok_or_else(|| "album DSD true-peak read extent overflowed".to_string())?;
+        if read_end > hashed_until {
+            let hash_start = hashed_until.max(read_start);
+            let offset = usize::try_from(hash_start - read_start)
+                .map_err(|_| "album DSD true-peak digest offset does not fit this platform".to_string())?;
+            content_hasher.update(&bytes[offset..count]);
+            hashed_until = read_end;
+        }
         samples.clear();
         for raw in bytes[..count].chunks_exact(8) {
             samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
@@ -31646,13 +31378,315 @@ where
     if is_cancelled() {
         return Err("album DSD true-peak scan cancelled".to_string());
     }
+    require_complete_file_reader_eof(
+        &mut file,
+        carrier,
+        len,
+        "DSD certified true-peak carrier",
+    )?;
 
     let result = meter
         .finalize()
         .map_err(|error| format!("could not finalize album DSD ceiling measurement: {error}"))?;
-    album_peak_measurement_from_true_peak(
+    if hashed_until != len {
+        return Err(format!(
+            "DSD certified true-peak digest covered {hashed_until} of {len} bytes",
+        ));
+    }
+    let measurement = album_peak_measurement_from_true_peak(
         result.reported_point_estimate.overall,
         result.upper_level(),
+    )?;
+    let digest = content_hasher.finalize();
+    let mut digest_bytes = [0_u8; 32];
+    digest_bytes.copy_from_slice(&digest);
+    if let Some(scan) = baseline_scan.as_mut() {
+        scan.mark_complete();
+    }
+    Ok(CertifiedCarrierScan {
+        measurement,
+        content_sha256: tonepoet_pipeline::Sha256Digest(digest_bytes),
+    })
+}
+
+
+/// Full-input certified Reference observation over one independently validated
+/// Wave64 sample payload. Unlike the general-DSD Reference scan-tier adapter,
+/// this qualified-delivery reader never applies the constant-prefix shortcut:
+/// every declared terminal/programme sample is decoded and pushed to the
+/// certified HQ1024V1 meter.
+pub(super) fn scan_reference_w64_certified_peak(
+    carrier: &Path,
+    structure: tonepoet_pipeline::W64ExactStructure,
+    expected: tonepoet_pipeline::W64PcmExpectation,
+    id: tonepoet_pipeline::MeasurementId,
+    purpose: tonepoet_pipeline::TruePeakPurpose,
+    subject: tonepoet_pipeline::ReferenceObservationSubject,
+    cancel: &CancellationToken,
+) -> Result<tonepoet_pipeline::ReferenceCertifiedPeakObservation, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if structure.sample_frames == 0
+        || structure.sample_frames != expected.sample_frames
+        || expected.sample_rate_hz == 0
+        || expected.channels == 0
+    {
+        return Err("Reference certified Wave64 reader received inconsistent programme geometry".to_string());
+    }
+    let bytes_per_sample = match (expected.encoding, expected.bits_per_sample) {
+        (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => 3_usize,
+        (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => 4_usize,
+        (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 64) => 8_usize,
+        _ => {
+            return Err(format!(
+                "Reference certified Wave64 reader does not admit {:?}/{}-bit samples",
+                expected.encoding, expected.bits_per_sample,
+            ));
+        }
+    };
+    let frame_bytes = bytes_per_sample
+        .checked_mul(usize::from(expected.channels))
+        .ok_or_else(|| "Reference certified Wave64 frame size overflowed".to_string())?;
+    let expected_payload = structure
+        .sample_frames
+        .checked_mul(frame_bytes as u64)
+        .ok_or_else(|| "Reference certified Wave64 payload size overflowed".to_string())?;
+    if structure.declared_data_bytes != expected_payload {
+        return Err(format!(
+            "Reference certified Wave64 payload extent mismatch: structure={}, expected={expected_payload}",
+            structure.declared_data_bytes,
+        ));
+    }
+    if cancel.is_cancelled() {
+        return Err("Reference certified peak observation cancelled".to_string());
+    }
+
+    let mut file = fs::File::open(carrier)
+        .map_err(|error| format!("could not open Reference certified Wave64 carrier: {error}"))?;
+    let initial_len = file
+        .metadata()
+        .map_err(|error| format!("could not stat Reference certified Wave64 carrier: {error}"))?
+        .len();
+    if initial_len != structure.physical_file_bytes {
+        return Err(format!(
+            "Reference certified Wave64 carrier extent changed before observation: structure={}, file={initial_len}",
+            structure.physical_file_bytes,
+        ));
+    }
+    let mut baseline_scan = super::baseline::certified_scan_started(
+        "reference_w64",
+        carrier,
+        structure.declared_data_bytes,
+    );
+    file.seek(SeekFrom::Start(structure.data_payload_offset()))
+        .map_err(|error| format!("could not seek Reference certified Wave64 payload: {error}"))?;
+
+    let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
+        expected.sample_rate_hz,
+        usize::from(expected.channels),
+        tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+        tonepoet_true_peak::PeakTier::Reference,
+    )
+    .map_err(|error| format!("could not initialize Reference certified peak meter: {error}"))?;
+
+    const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
+    let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes).max(1) * frame_bytes;
+    let mut bytes = vec![0_u8; buffer_len];
+    let mut samples = Vec::<f64>::with_capacity(buffer_len / bytes_per_sample);
+    let meter_chunk_samples = TRUE_PEAK_SCAN_CANCEL_POLL_FRAMES
+        .checked_mul(usize::from(expected.channels))
+        .ok_or_else(|| "Reference certified peak cancellation chunk overflowed".to_string())?;
+    let mut remaining = structure.declared_data_bytes;
+    let mut programme_hasher = Sha256::new();
+
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err("Reference certified peak observation cancelled".to_string());
+        }
+        let count = usize::try_from(remaining.min(buffer_len as u64))
+            .map_err(|_| "Reference certified Wave64 payload does not fit this platform".to_string())?;
+        file.read_exact(&mut bytes[..count])
+            .map_err(|error| format!("could not completely read Reference certified Wave64 payload: {error}"))?;
+        programme_hasher.update(&bytes[..count]);
+        samples.clear();
+        match (expected.encoding, expected.bits_per_sample) {
+            (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => {
+                for raw in bytes[..count].chunks_exact(3) {
+                    let packed = i32::from(raw[0]) | (i32::from(raw[1]) << 8) | (i32::from(raw[2]) << 16);
+                    let signed = if packed & 0x0080_0000 != 0 {
+                        packed | !0x00ff_ffff
+                    } else {
+                        packed
+                    };
+                    samples.push(f64::from(signed) / 8_388_608.0);
+                }
+            }
+            (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => {
+                for raw in bytes[..count].chunks_exact(4) {
+                    samples.push(f64::from(f32::from_le_bytes(raw.try_into().expect("4-byte Float32 sample"))));
+                }
+            }
+            (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 64) => {
+                for raw in bytes[..count].chunks_exact(8) {
+                    samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
+                }
+            }
+            _ => unreachable!("sample representation was admitted above"),
+        }
+        if samples.len() % usize::from(expected.channels) != 0 {
+            return Err("Reference certified Wave64 reader produced an incomplete sample frame".to_string());
+        }
+        for chunk in samples.chunks(meter_chunk_samples) {
+            if cancel.is_cancelled() {
+                return Err("Reference certified peak observation cancelled".to_string());
+            }
+            meter
+                .push_interleaved(chunk)
+                .map_err(|error| format!("Reference certified Wave64 payload is invalid: {error}"))?;
+        }
+        remaining -= count as u64;
+    }
+    if cancel.is_cancelled() {
+        return Err("Reference certified peak observation cancelled".to_string());
+    }
+    let final_len = file
+        .metadata()
+        .map_err(|error| format!("could not restat Reference certified Wave64 carrier: {error}"))?
+        .len();
+    if final_len != structure.physical_file_bytes {
+        return Err(format!(
+            "Reference certified Wave64 carrier changed extent during observation: structure={}, file={final_len}",
+            structure.physical_file_bytes,
+        ));
+    }
+
+    let certificate = meter
+        .finalize()
+        .map_err(|error| format!("could not finalize Reference certified peak observation: {error}"))?;
+    if certificate.reconstruction != tonepoet_true_peak::CertifiedReconstruction::Hq1024V1
+        || certificate.tier != tonepoet_true_peak::PeakTier::Reference
+        || certificate.reported_point_estimate.frames != structure.sample_frames
+    {
+        return Err("Reference certified peak meter returned the wrong reconstruction/tier/extent".to_string());
+    }
+    let status = match certificate.status {
+        tonepoet_true_peak::SearchStatus::Complete => {
+            tonepoet_pipeline::ReferenceCertifiedSearchStatus::Complete
+        }
+        tonepoet_true_peak::SearchStatus::WorkLimited => {
+            tonepoet_pipeline::ReferenceCertifiedSearchStatus::WorkLimited
+        }
+        tonepoet_true_peak::SearchStatus::TimeLimited => {
+            return Err("Reference certified peak meter returned retired time-limited authority".to_string());
+        }
+    };
+    let programme_sha256 = tonepoet_pipeline::Sha256Digest(programme_hasher.finalize().into());
+    let result = if certificate.finite_interval.is_silence() {
+        if !matches!(certificate.reported_point_estimate.overall, tonepoet_true_peak::PeakLevel::Silence) {
+            return Err("Reference certified peak interval reported silence with a finite point estimate".to_string());
+        }
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence
+    } else {
+        let point = certificate.reported_point_estimate.overall.linear();
+        let lower = certificate.finite_interval.lower_linear;
+        let upper = certificate.finite_interval.upper_linear;
+        if !point.is_finite() || point < 0.0 || !lower.is_finite() || lower < 0.0
+            || !upper.is_finite() || upper <= 0.0 || lower > upper
+        {
+            return Err("Reference certified peak meter returned an invalid finite interval".to_string());
+        }
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits: point.to_bits(),
+            lower_linear_bits: lower.to_bits(),
+            upper_linear_bits: upper.to_bits(),
+            status,
+        }
+    };
+
+    // Content-bound canonical evidence digest. This is deliberately independent
+    // of Debug/serde formatting and includes every value used for ceiling authority.
+    let mut evidence_hasher = Sha256::new();
+    evidence_hasher.update(b"tonepoet-reference-certified-peak-observation/v1\0");
+    evidence_hasher.update(programme_sha256.0);
+    evidence_hasher.update(expected.sample_rate_hz.to_be_bytes());
+    evidence_hasher.update(expected.channels.to_be_bytes());
+    evidence_hasher.update(structure.sample_frames.to_be_bytes());
+    evidence_hasher.update([match subject {
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64 => 0,
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm => 1,
+    }]);
+    evidence_hasher.update([match purpose {
+        tonepoet_pipeline::TruePeakPurpose::GainAuthority => 0,
+        tonepoet_pipeline::TruePeakPurpose::PostFinalAcceptance => 1,
+    }]);
+    match result {
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence => {
+            evidence_hasher.update([0]);
+        }
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits,
+            lower_linear_bits,
+            upper_linear_bits,
+            status,
+        } => {
+            evidence_hasher.update([1]);
+            evidence_hasher.update(point_linear_bits.to_be_bytes());
+            evidence_hasher.update(lower_linear_bits.to_be_bytes());
+            evidence_hasher.update(upper_linear_bits.to_be_bytes());
+            evidence_hasher.update([match status {
+                tonepoet_pipeline::ReferenceCertifiedSearchStatus::Complete => 0,
+                tonepoet_pipeline::ReferenceCertifiedSearchStatus::WorkLimited => 1,
+            }]);
+        }
+    }
+    let certificate_sha256 = tonepoet_pipeline::Sha256Digest(evidence_hasher.finalize().into());
+    let reader_authority = match subject {
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64 => {
+            tonepoet_pipeline::qualification_schema::REFERENCE_R64_READER_ID
+        }
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm => {
+            tonepoet_pipeline::qualification_schema::REFERENCE_QPCM_READER_ID
+        }
+    };
+    let observation = tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+        id,
+        scope: tonepoet_pipeline::MeasurementScope::Plan,
+        purpose,
+        subject,
+        observer_identity: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+        reconstruction: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+        edge_policy: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+        scan_tier: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+        authority_endpoint: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+        reader_authority: reader_authority.to_string(),
+        sample_rate_hz: expected.sample_rate_hz,
+        channels: expected.channels,
+        sample_frames: structure.sample_frames,
+        programme_sha256,
+        complete_reader: true,
+        result,
+        certificate_sha256,
+    };
+    observation.validate_active_contract()?;
+    if let Some(scan) = baseline_scan.as_mut() {
+        scan.mark_complete();
+    }
+    Ok(observation)
+}
+
+fn scan_album_gain_true_peak_carrier_identity(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
+    cancel: &CancellationToken,
+) -> Result<CertifiedCarrierScan, String> {
+    scan_album_gain_true_peak_carrier_identity_with_cancel_and_mode(
+        carrier,
+        sample_rate_hz,
+        channels,
+        scan_mode,
+        || cancel.is_cancelled(),
     )
 }
 
@@ -31660,7 +31694,7 @@ fn scan_album_gain_true_peak_carrier(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
-    scan_mode: tonepoet_pipeline::DsdTruePeakScanMode,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     cancel: &CancellationToken,
 ) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
     scan_album_gain_true_peak_carrier_with_cancel_and_mode(
@@ -31688,9 +31722,70 @@ pub(crate) fn album_gain_terminal_bound(
     settings: &tonepoet_pipeline::PipelineSettings,
     sample_rate_hz: u32,
 ) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
+    use tonepoet_pipeline::{BitDepthTarget, DitherType, PcmBitDepth};
+
+    let depth = match settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) => depth,
+        BitDepthTarget::Source => tonepoet_pipeline::default_pcm_depth_for_format(
+            &settings.target_format,
+        ),
+    };
+    if depth == PcmBitDepth::Int32
+        && settings.dither_explicit
+        && settings.dither_type != DitherType::None
+    {
+        // Explicit Int32 dither is backend-dependent. This legacy/display
+        // helper has no canonical selected-terminal realization, so it must
+        // not rediscover a backend and accidentally borrow either the
+        // undithered half-LSB proof or the qualified FFmpeg triangular proof.
+        return Err(
+            "explicit Int32 dither terminal bound requires the canonical selected terminal realization"
+                .to_owned(),
+        );
+    }
+    let effective_dither = (matches!(
+        depth,
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
+    ) && settings.dither_type != DitherType::None)
+        .then_some(settings.dither_type);
+    album_gain_terminal_bound_with_effective_dither(
+        settings,
+        sample_rate_hz,
+        effective_dither,
+        None,
+    )
+}
+
+/// Deterministic stored-sample error bound for the qualified FFmpeg
+/// Float64 -> triangular dither -> signed Int32 terminal.
+///
+/// The qualified FFmpeg n7.1.3/libswresample implementation generates plain
+/// triangular dither as the difference of two unsigned-LCG fractions. Each
+/// fraction is in [0, 1], so the dither support is bounded by one signed Int32 normalized
+/// LSB after the implementation's 2^-31 scale. The
+/// dither is added to the Float64 input in binary64, which contributes at most
+/// one binary64 ULP near the admitted <= 1 FS terminal range. DBL -> S32 then
+/// uses `llrint` followed by Int32 saturation; independent of the active
+/// standard IEEE rounding direction, the integer conversion contributes less
+/// than one Int32 LSB. The power-of-two scale into the integer lattice is
+/// exact. The non-clipping ingress proof keeps the admitted terminal away from
+/// any saturation error larger than this envelope.
+///
+/// This is one combined dither-plus-quantization physical error. Callers must
+/// use it *instead of* the ordinary undithered half-LSB terminal term.
+fn ffmpeg_int32_triangular_stored_error_component_sum() -> f64 {
+    let int32_lsb = 2.0_f64.powi(-31);
+    int32_lsb + int32_lsb + 2.0_f64.powi(-52)
+}
+
+fn album_gain_terminal_bound_with_effective_dither(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    sample_rate_hz: u32,
+    effective_dither: Option<tonepoet_pipeline::DitherType>,
+    selected_realization: Option<&tonepoet_pipeline::SelectedTerminalRealization>,
+) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
     use tonepoet_pipeline::{
-        AlbumCeilingDomain, AlbumTerminalBound, AudioFormat, BitDepthTarget, DitherType,
-        PcmBitDepth,
+        AlbumCeilingDomain, AlbumTerminalBound, AudioFormat, BitDepthTarget, PcmBitDepth,
     };
 
     let depth = match settings.target_bit_depth {
@@ -31774,20 +31869,30 @@ pub(crate) fn album_gain_terminal_bound(
     let sox_gain_realization_error =
         next_up_nonnegative(2.0_f64.powi(-32) + 2.0_f64.powi(-51));
 
-    let ffmpeg_output_error = match depth {
-        // Conservative absolute binary floating-point rounding bounds near
-        // full scale. The actual half-ULP bounds are tighter below 1.0.
-        PcmBitDepth::Float32 => 2.0_f64.powi(-24),
-        PcmBitDepth::Float64 => 2.0_f64.powi(-52),
-        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24 | PcmBitDepth::Int32 => {
-            0.5 * 2.0_f64.powi(-((depth.bits() - 1) as i32))
+    let ffmpeg_output_error = match selected_realization {
+        Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization))
+            if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) =>
+        {
+            ffmpeg_int32_triangular_stored_error_component_sum()
         }
+        _ => match depth {
+            // Conservative absolute binary floating-point rounding bounds near
+            // full scale. The actual half-ULP bounds are tighter below 1.0.
+            PcmBitDepth::Float32 => 2.0_f64.powi(-24),
+            PcmBitDepth::Float64 => 2.0_f64.powi(-52),
+            PcmBitDepth::Int8
+            | PcmBitDepth::Int16
+            | PcmBitDepth::Int24
+            | PcmBitDepth::Int32 => {
+                0.5 * 2.0_f64.powi(-((depth.bits() - 1) as i32))
+            }
+        },
     };
 
     let integer_dither_applies = matches!(
         depth,
         PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
-    ) && settings.dither_type != DitherType::None;
+    ) && effective_dither.is_some();
 
     let sox_output_error = match depth {
         PcmBitDepth::Float32 => {
@@ -31806,11 +31911,14 @@ pub(crate) fn album_gain_terminal_bound(
                 if !sox_may_be_terminal && !sox_preprocess_available {
                     return Err(format!(
                         "true-peak hard ceiling with {:?} dither requires a proved SoX terminal or preprocess path; {} cannot provide one",
-                        settings.dither_type,
+                        effective_dither.expect("integer dither branch requires effective dither"),
                         settings.target_format,
                     ));
                 }
-                let multiplier = sox_dither_error_lsb_upper(settings.dither_type, sample_rate_hz);
+                let multiplier = sox_dither_error_lsb_upper(
+                    effective_dither.expect("integer dither branch requires effective dither"),
+                    sample_rate_hz,
+                );
                 next_up_nonnegative(sox_gain_realization_error + multiplier * lsb)
             } else if depth == PcmBitDepth::Int32 {
                 // The gain effect already outputs an Int32 `sox_sample_t`;
@@ -31823,17 +31931,46 @@ pub(crate) fn album_gain_terminal_bound(
         }
     };
 
-    let stored_sample_error_linear = next_up_nonnegative(if sox_may_be_terminal {
-        // Auto or an explicit preference may select either direct writer in
-        // non-dither cells, so cover both. Dithered hard-ceiling cells are
-        // routed to SoX, for which this max remains conservative.
-        ffmpeg_output_error.max(sox_output_error)
-    } else if sox_preprocess_available && integer_dither_applies {
-        // The planner's SoX-to-WAV preprocessing leg owns the only lossy
-        // sample realization; the following lossless encode preserves it.
-        sox_output_error
-    } else {
-        ffmpeg_output_error
+    let stored_sample_error_linear = next_up_nonnegative(match selected_realization {
+        Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) => {
+            use tonepoet_pipeline::PcmTerminalRealizationKind;
+            match realization.kind {
+                PcmTerminalRealizationKind::FfmpegDirect => ffmpeg_output_error,
+                PcmTerminalRealizationKind::SoxDirect
+                | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
+                | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => sox_output_error,
+                PcmTerminalRealizationKind::SsrcDirectWav
+                | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
+                    return Err(
+                        "SSRC terminal realization has no retained certified hard-ceiling terminal-error authority"
+                            .to_owned(),
+                    )
+                }
+                PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
+                    return Err(
+                        "native WavPack hybrid packaging has no lossless stored-PCM terminal bound"
+                            .to_owned(),
+                    )
+                }
+            }
+        }
+        Some(tonepoet_pipeline::SelectedTerminalRealization::LossyFfmpegEncoderInput { .. }) => {
+            return Err(
+                "lossy FFmpeg encoder-input realization reached a lossless terminal-bound branch"
+                    .to_owned(),
+            )
+        }
+        None if sox_may_be_terminal => {
+            // Legacy album-gain callers do not carry a canonical terminal
+            // realization. Retain their established conservative backend max.
+            ffmpeg_output_error.max(sox_output_error)
+        }
+        None if sox_preprocess_available && integer_dither_applies => {
+            // The planner's SoX-to-WAV preprocessing leg owns the only lossy
+            // sample realization; the following lossless encode preserves it.
+            sox_output_error
+        }
+        None => ffmpeg_output_error,
     });
 
     // RepeatEndpoints applies to the entire final finite stream, including the
@@ -32188,6 +32325,11 @@ mod album_true_peak_carrier_tests {
             .expect("planner source facts");
         assert_eq!(before.channels, None);
         assert_eq!(before.sample_rate_hz, Some(96_000));
+        assert_eq!(
+            before.frame_extent,
+            Some(SourceFrameExtent::Exact(96_000)),
+            "sample-bounded CUE carriers should already expose their authoritative extent",
+        );
 
         let runner = StubToolRunner::new();
         runner.push_output(ffprobe_source_fact_output(96_000, 2));
@@ -32204,6 +32346,62 @@ mod album_true_peak_carrier_tests {
 
         assert_eq!(resolved.channels, Some(2));
         assert_eq!(resolved.sample_rate_hz, Some(96_000));
+        assert_eq!(
+            resolved.frame_extent,
+            Some(SourceFrameExtent::Exact(96_000)),
+        );
+        let transcript = runner.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].binary, ToolBinary::Ffprobe);
+    }
+
+    #[tokio::test]
+    async fn true_peak_source_facts_capture_exact_staged_file_extent_for_planning() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+
+        let temp = tempfile::tempdir().unwrap();
+        let realized = temp.path().join("ordinary.wav");
+        fs::write(&realized, b"probe is supplied by the stub runner").unwrap();
+        let track = source_fact_test_track(TrackSourceRef::StagedFile(realized.clone()), 96_000);
+
+        let before = super::super::plan_bridge::source_info_for_realized_track(&track, &realized)
+            .expect("base planner source facts");
+        assert_eq!(before.frame_extent, None);
+
+        let runner = StubToolRunner::new();
+        runner.push_output(ffprobe_source_fact_output(96_000, 2));
+        let resolved = source_info_for_true_peak_realized_track(
+            &track,
+            &realized,
+            &runner,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("exact realized PCM timing should become a source planning fact");
+
+        assert_eq!(resolved.channels, Some(2));
+        assert_eq!(resolved.sample_rate_hz, Some(96_000));
+        assert_eq!(
+            resolved.frame_extent,
+            Some(SourceFrameExtent::Exact(96_000)),
+        );
+
+        let req = true_peak_test_request(temp.path(), &realized);
+        let planned = plan_request_for_track_with_resolved_source(
+            &req,
+            &track,
+            &realized,
+            &temp.path().join("planned.flac"),
+            temp.path().join("plan-work"),
+            resolved,
+        )
+        .expect("resolved PCM source facts should survive the production planning bridge");
+        assert_eq!(
+            planned.source.frame_extent,
+            Some(SourceFrameExtent::Exact(96_000)),
+        );
+
         let transcript = runner.transcript();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].binary, ToolBinary::Ffprobe);
@@ -32350,11 +32548,12 @@ mod album_true_peak_carrier_tests {
         fs::write(&source, b"conversion is supplied by the stub runner").unwrap();
         let track = source_fact_test_track(TrackSourceRef::StagedFile(source.clone()), 96_000);
         let mut req = true_peak_test_request(temp.path(), &source);
-        req.settings.pcm_true_peak.enabled = true;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
         req.settings.target_sample_rate = RateTarget::Source;
         let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
         let carrier_dir = temp.path().join("pcm-true-peak");
         fs::create_dir_all(&carrier_dir).unwrap();
+        let planned_output = temp.path().join("out.flac");
         let runner = StubToolRunner::new();
         runner.push_output(ffprobe_source_fact_output(96_000, 2));
 
@@ -32369,6 +32568,7 @@ mod album_true_peak_carrier_tests {
         let preparation = prepare_pcm_true_peak_carrier_for_track(
             &req,
             track,
+            &planned_output,
             &staging,
             &carrier_dir,
             &runner,
@@ -32428,20 +32628,22 @@ mod album_true_peak_carrier_tests {
         req.settings.target_sample_rate = RateTarget::PcmHz(176_400);
         req.settings.target_bit_depth =
             BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         req.settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
         req.settings
             .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
         let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
         let carrier_dir = temp.path().join("album-gain");
         fs::create_dir_all(&carrier_dir).unwrap();
+        let planned_output = temp.path().join("out.flac");
         let runner = StubToolRunner::new();
         runner.push_output(ffprobe_source_fact_output(2_822_400, 2));
 
-        let error = match prepare_album_gain_carrier_for_track(
+        let error = match prepare_dsd_true_peak_carrier_for_track(
             &req,
             track,
+            &planned_output,
             &staging,
             &carrier_dir,
             &runner,
@@ -32597,9 +32799,9 @@ mod album_true_peak_carrier_tests {
         write_f64le(&carrier, &samples);
 
         for mode in [
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
-            tonepoet_pipeline::DsdTruePeakScanMode::Standard,
-            tonepoet_pipeline::DsdTruePeakScanMode::Fast,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Standard,
+            tonepoet_pipeline::TruePeakScanTier::Fast,
         ] {
             let (_, upper) = finite(
                 scan_album_gain_true_peak_carrier_with_cancel_and_mode(
@@ -32638,7 +32840,7 @@ mod album_true_peak_carrier_tests {
             &full,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             || false,
         )
         .unwrap();
@@ -32647,11 +32849,12 @@ mod album_true_peak_carrier_tests {
                 &representative,
                 48_000,
                 1,
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                tonepoet_pipeline::TruePeakScanTier::Reference,
                 false,
                 || false,
             )
-            .unwrap();
+            .unwrap()
+            .measurement;
 
         let _ = finite(full_measurement);
         assert_eq!(full_measurement, representative_measurement);
@@ -32672,7 +32875,7 @@ mod album_true_peak_carrier_tests {
             &full,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             || false,
         )
         .unwrap();
@@ -32680,11 +32883,12 @@ mod album_true_peak_carrier_tests {
             &compacted,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             false,
             || false,
         )
-        .unwrap();
+        .unwrap()
+        .measurement;
 
         let _ = finite(full_measurement);
         assert_eq!(full_measurement, compacted_measurement);
@@ -32719,7 +32923,7 @@ mod album_true_peak_carrier_tests {
                 &full,
                 48_000,
                 frame.len() as u16,
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                tonepoet_pipeline::TruePeakScanTier::Reference,
                 || false,
             )
             .unwrap();
@@ -32728,11 +32932,12 @@ mod album_true_peak_carrier_tests {
                     &representative,
                     48_000,
                     frame.len() as u16,
-                    tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                    tonepoet_pipeline::TruePeakScanTier::Reference,
                     false,
                     || false,
                 )
-                .unwrap();
+                .unwrap()
+                .measurement;
 
             assert_eq!(full_measurement, representative_measurement, "{name}");
         }
@@ -32749,7 +32954,7 @@ mod album_true_peak_carrier_tests {
                 &carrier,
                 48_000,
                 1,
-                tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+                tonepoet_pipeline::TruePeakScanTier::Reference,
                 || false,
             )
             .unwrap(),
@@ -32782,7 +32987,7 @@ mod album_true_peak_carrier_tests {
             &carrier,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             || false,
         )
         .unwrap();
@@ -32790,11 +32995,12 @@ mod album_true_peak_carrier_tests {
             &compacted,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             false,
             || false,
         )
-        .unwrap();
+        .unwrap()
+        .measurement;
 
         assert_eq!(with_preflight, compacted_reference);
     }
@@ -32809,7 +33015,7 @@ mod album_true_peak_carrier_tests {
             &carrier,
             48_000,
             2,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             true,
             || false,
         )
@@ -32818,13 +33024,13 @@ mod album_true_peak_carrier_tests {
             &carrier,
             48_000,
             2,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             false,
             || false,
         )
         .unwrap();
 
-        assert_eq!(optimized, ordinary);
+        assert_eq!(optimized.measurement, ordinary.measurement);
     }
 
     #[test]
@@ -32839,7 +33045,7 @@ mod album_true_peak_carrier_tests {
             &carrier,
             48_000,
             1,
-            tonepoet_pipeline::DsdTruePeakScanMode::Reference,
+            tonepoet_pipeline::TruePeakScanTier::Reference,
             || false,
         )
         .unwrap_err();
@@ -32983,6 +33189,48 @@ mod album_true_peak_carrier_tests {
         settings
     }
 
+    fn test_pcm_terminal_realization(
+        settings: &tonepoet_pipeline::PipelineSettings,
+        kind: tonepoet_pipeline::PcmTerminalRealizationKind,
+        effective_dither: Option<tonepoet_pipeline::DitherType>,
+    ) -> tonepoet_pipeline::SelectedTerminalRealization {
+        let tonepoet_pipeline::BitDepthTarget::Pcm(target_bit_depth) = settings.target_bit_depth else {
+            panic!("test terminal realization requires explicit PCM depth")
+        };
+        let selected_tool = match kind {
+            tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect => {
+                tonepoet_pipeline::ToolIdentifier::Sox
+            }
+            _ => tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+        };
+        let dither_owner = match (kind, effective_dither) {
+            (_, None) => tonepoet_pipeline::PcmTerminalDitherOwner::None,
+            (tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage, Some(_))
+            | (tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid, Some(_)) => {
+                tonepoet_pipeline::PcmTerminalDitherOwner::SoxPreterminal
+            }
+            (_, Some(_)) => tonepoet_pipeline::PcmTerminalDitherOwner::SelectedTerminal,
+        };
+        tonepoet_pipeline::SelectedTerminalRealization::Pcm(
+            tonepoet_pipeline::SelectedPcmTerminalRealization {
+                kind,
+                selected_tool,
+                input_precision: tonepoet_pipeline::StoragePrecision::Pcm(
+                    tonepoet_pipeline::PcmBitDepth::Float64,
+                ),
+                input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
+                target_format: settings.target_format.clone(),
+                target_rate_hz: None,
+                target_bit_depth,
+                wavpack_hybrid: settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+                    && settings.wavpack.hybrid,
+                effective_dither,
+                ssrc_dither: None,
+                dither_owner,
+            },
+        )
+    }
+
     #[test]
     fn terminal_bound_separates_stored_sample_and_reconstructed_error() {
         let settings = terminal_settings(
@@ -33101,12 +33349,12 @@ mod album_true_peak_carrier_tests {
             depth,
             dither,
         );
-        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
         settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
         settings
             .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
         settings
     }
 
@@ -33212,33 +33460,107 @@ mod album_true_peak_carrier_tests {
         );
     }
 
-    #[test]
-    fn pcm_true_peak_rate_change_accepts_auto_and_explicit_soxr() {
-        for preferred in [
-            tonepoet_pipeline::PreferredTool::Auto,
-            tonepoet_pipeline::PreferredTool::Ffmpeg,
-        ] {
-            let mut settings = tonepoet_pipeline::PipelineSettings::default();
-            settings.preferred_tool = preferred;
-            assert!(
-                validate_pcm_true_peak_resampler_contract(&settings, 48_000, 44_100).is_ok()
-            );
+    fn selected_resampler_binding(
+        tool: tonepoet_pipeline::ToolIdentifier,
+    ) -> SelectedPhysicalCandidateBinding {
+        SelectedPhysicalCandidateBinding {
+            identity: format!("registered:resample_pcm:{tool}"),
+            tool,
+            terminal_realization: None,
+            strong_ssrc_resampler: None,
+        }
+    }
+
+    fn selected_resampler(
+        tool: tonepoet_pipeline::ToolIdentifier,
+        input_rate_hz: u32,
+        output_rate_hz: u32,
+    ) -> crate::convert::pipeline::plan_bridge::SelectedPcmResamplerExecutionContract {
+        crate::convert::pipeline::plan_bridge::SelectedPcmResamplerExecutionContract {
+            input: tonepoet_pipeline::SignalId(0),
+            output: tonepoet_pipeline::SignalId(1),
+            input_rate_hz,
+            output_rate_hz,
+            channels: 2,
+            operation: tonepoet_pipeline::PlanOperation::ResamplePcm {
+                target_rate_hz: output_rate_hz,
+                target_bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Float64),
+                profile: None,
+                brick_wall: false,
+            },
+            selected: selected_resampler_binding(tool),
+            resolved_parameters: tonepoet_pipeline::ResolvedOperationParameters::None,
         }
     }
 
     #[test]
-    fn pcm_true_peak_rate_change_rejects_unqualified_explicit_resamplers() {
+    fn pcm_true_peak_rate_change_uses_typed_selected_resampler_over_soft_preference() {
+        let selected = selected_resampler(
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            96_000,
+            44_100,
+        );
         for preferred in [
+            tonepoet_pipeline::PreferredTool::Auto,
+            tonepoet_pipeline::PreferredTool::Ffmpeg,
             tonepoet_pipeline::PreferredTool::Sox,
             tonepoet_pipeline::PreferredTool::Ssrc,
             tonepoet_pipeline::PreferredTool::Custom("external-resampler".to_string()),
         ] {
             let mut settings = tonepoet_pipeline::PipelineSettings::default();
             settings.preferred_tool = preferred;
-            let error = validate_pcm_true_peak_resampler_contract(&settings, 48_000, 44_100)
-                .expect_err("explicit unqualified rate-changing resampler must fail closed");
-            assert!(error.contains("Select Auto or soxr/FFmpeg"), "{error}");
+            assert!(validate_pcm_true_peak_resampler_contract(
+                &settings,
+                96_000,
+                44_100,
+                Some(&selected),
+            )
+            .is_ok());
         }
+    }
+
+    #[test]
+    fn pcm_true_peak_rate_change_lowering_uses_typed_ffmpeg_soxr_candidate() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let realized = temp.path().join("source.wav");
+        fs::write(&realized, b"source placeholder").expect("source placeholder");
+        let track = source_fact_test_track(TrackSourceRef::StagedFile(realized.clone()), 96_000);
+        let mut request = true_peak_test_request(temp.path(), &realized);
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Sox;
+        let carrier_request = pcm_true_peak_carrier_request(&request, 44_100);
+        let selected = selected_resampler_binding(tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        validate_pcm_true_peak_carrier_lowering(
+            &carrier_request,
+            &track,
+            &realized,
+            &temp.path().join("carrier.f64le"),
+            &temp.path().join("work"),
+            96_000,
+            44_100,
+            Some(&selected),
+        )
+        .expect("typed-selected FFmpeg/soxr carrier must lower successfully");
+    }
+
+    #[test]
+    fn pcm_true_peak_rate_change_rejects_typed_unqualified_resampler() {
+        let settings = tonepoet_pipeline::PipelineSettings::default();
+        let selected = selected_resampler(
+            tonepoet_pipeline::ToolIdentifier::Sox,
+            96_000,
+            44_100,
+        );
+        let error = validate_pcm_true_peak_resampler_contract(
+            &settings,
+            96_000,
+            44_100,
+            Some(&selected),
+        )
+        .expect_err("typed unqualified rate-changing resampler must fail closed");
+        assert!(
+            error.contains("without an admitted Binary64 preservation authority"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -33250,17 +33572,44 @@ mod album_true_peak_carrier_tests {
         ] {
             let mut settings = tonepoet_pipeline::PipelineSettings::default();
             settings.preferred_tool = preferred;
-            assert!(validate_pcm_true_peak_resampler_contract(&settings, 48_000, 48_000).is_ok());
+            assert!(validate_pcm_true_peak_resampler_contract(
+                &settings,
+                48_000,
+                48_000,
+                None,
+            )
+            .is_ok());
         }
     }
 
     #[test]
-    fn pcm_true_peak_rate_change_rejects_brick_wall_ssrc_topology() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        settings.nyquist_transition = tonepoet_pipeline::NyquistTransition::BrickWall;
-        let error = validate_pcm_true_peak_resampler_contract(&settings, 96_000, 48_000)
-            .expect_err("brick-wall SSRC topology must fail closed");
-        assert!(error.contains("SSRC/brick-wall"), "{error}");
+    fn pcm_true_peak_rate_change_rejects_explicit_ssrc_authority_drift_but_not_brick_wall() {
+        let selected = selected_resampler(
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            96_000,
+            48_000,
+        );
+
+        let mut forced_ssrc = tonepoet_pipeline::PipelineSettings::default();
+        forced_ssrc.ssrc.force = true;
+        let error = validate_pcm_true_peak_resampler_contract(
+            &forced_ssrc,
+            96_000,
+            48_000,
+            Some(&selected),
+        )
+        .expect_err("explicit SSRC authority drift must fail closed");
+        assert!(error.contains("explicit SSRC authority"), "{error}");
+
+        let mut brick_wall = tonepoet_pipeline::PipelineSettings::default();
+        brick_wall.nyquist_transition = tonepoet_pipeline::NyquistTransition::BrickWall;
+        validate_pcm_true_peak_resampler_contract(
+            &brick_wall,
+            96_000,
+            48_000,
+            Some(&selected),
+        )
+        .expect("BrickWall is a capability request, not explicit SSRC authority");
     }
 
     #[test]
@@ -33280,7 +33629,7 @@ mod album_true_peak_carrier_tests {
                 &carrier,
                 48_000,
                 2,
-                tonepoet_pipeline::PcmTruePeakScanMode::Standard,
+                tonepoet_pipeline::TruePeakScanTier::Standard,
                 &cancel,
             )
             .unwrap(),
@@ -33300,7 +33649,7 @@ mod album_true_peak_carrier_tests {
 
         write_f64le(&input, &[1.25, -0.5, 0.125, -1.0]);
         fs::write(&output, b"stale").unwrap();
-        scale_pcm_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
+        scale_certified_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
         let first = fs::read(&output).unwrap();
         assert_eq!(first.len(), 4 * 8);
         let first_samples = first
@@ -33315,7 +33664,7 @@ mod album_true_peak_carrier_tests {
         }
 
         write_f64le(&input, &[0.5, -0.25]);
-        scale_pcm_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
+        scale_certified_true_peak_f64le(&input, &output, 48_000, 2, gain_db, &cancel).unwrap();
         let second = fs::read(&output).unwrap();
         assert_eq!(second.len(), 2 * 8, "stale longer carrier was reused");
         let first_sample = f64::from_le_bytes(second[0..8].try_into().unwrap());
@@ -33330,7 +33679,7 @@ mod album_true_peak_carrier_tests {
         write_f64le(&input, &[0.5; 64]);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let error = scale_pcm_true_peak_f64le(
+        let error = scale_certified_true_peak_f64le(
             &input,
             &output,
             48_000,
@@ -33366,7 +33715,7 @@ mod album_true_peak_carrier_tests {
         let mut req = super::pipeline_test_helpers::log_test_request();
         req.settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
         req.settings.wavpack.hybrid = true;
-        req.settings.pcm_true_peak.enabled = true;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
         req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
 
         let mut source = super::pipeline_test_helpers::log_test_source();
@@ -33396,9 +33745,15 @@ mod album_true_peak_carrier_tests {
             tonepoet_pipeline::DitherType::None,
         );
         hybrid.wavpack.hybrid = true;
-        hybrid.pcm_true_peak.enabled = true;
+        hybrid.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
-        let hybrid_bound = pcm_true_peak_terminal_bound(&hybrid, 96_000).unwrap();
+        let hybrid_realization = test_pcm_terminal_realization(
+            &hybrid,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid,
+            None,
+        );
+        let hybrid_bound =
+            pcm_true_peak_terminal_bound(&hybrid, 96_000, &hybrid_realization).unwrap();
         let stored = hybrid_bound
             .stored_sample_error_linear
             .expect("integer encoder-input carrier must expose its stored-sample bound");
@@ -33411,7 +33766,12 @@ mod album_true_peak_carrier_tests {
         let mut wav = hybrid.clone();
         wav.target_format = tonepoet_pipeline::AudioFormat::Wav;
         wav.wavpack.hybrid = false;
-        let wav_bound = pcm_true_peak_terminal_bound(&wav, 96_000).unwrap();
+        let wav_realization = test_pcm_terminal_realization(
+            &wav,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect,
+            None,
+        );
+        let wav_bound = pcm_true_peak_terminal_bound(&wav, 96_000, &wav_realization).unwrap();
         assert_eq!(
             hybrid_bound.stored_sample_error_linear,
             wav_bound.stored_sample_error_linear,
@@ -33424,8 +33784,17 @@ mod album_true_peak_carrier_tests {
 
         let mut hybrid_dither = hybrid.clone();
         hybrid_dither.dither_type = tonepoet_pipeline::DitherType::Tpdf;
-        let dither_bound = pcm_true_peak_terminal_bound(&hybrid_dither, 96_000)
-            .expect("hybrid dither must reuse the qualified integer PCM terminal bound");
+        let hybrid_dither_realization = test_pcm_terminal_realization(
+            &hybrid_dither,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid,
+            Some(tonepoet_pipeline::DitherType::Tpdf),
+        );
+        let dither_bound = pcm_true_peak_terminal_bound(
+            &hybrid_dither,
+            96_000,
+            &hybrid_dither_realization,
+        )
+        .expect("hybrid dither must reuse the qualified integer PCM terminal bound");
         assert_eq!(
             dither_bound.domain,
             tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm,
@@ -33444,42 +33813,415 @@ mod album_true_peak_carrier_tests {
             tonepoet_pipeline::PcmBitDepth::Int24,
             tonepoet_pipeline::DitherType::None,
         );
-        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
-        let bound = pcm_true_peak_terminal_bound(&settings, 96_000).unwrap();
+        let realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect,
+            None,
+        );
+        let bound = pcm_true_peak_terminal_bound(&settings, 96_000, &realization).unwrap();
         assert_eq!(
             bound.domain,
             tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
         );
     }
 
+    #[test]
+    fn runtime_terminal_proof_binding_rejects_same_family_different_realization() {
+        let settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int32,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        let selected_realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            Some(tonepoet_pipeline::DitherType::Tpdf),
+        );
+        let undithered_realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            None,
+        );
+        let selected = SelectedPhysicalCandidateBinding {
+            identity: "registered:encode_pcm:ffmpeg".to_owned(),
+            tool: tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            terminal_realization: Some(selected_realization.clone()),
+            strong_ssrc_resampler: None,
+        };
+        let proof = tonepoet_pipeline::TerminalProofContract {
+            authority: tonepoet_pipeline::terminal_proof_authority(
+                tonepoet_pipeline::TerminalProofAuthorityFamily::PcmTruePeakV2,
+                &undithered_realization,
+            ),
+            accepted_value_domains: std::collections::BTreeSet::from([
+                tonepoet_pipeline::ValueDomain::FiniteFloating,
+            ]),
+            requires_non_clipping_ingress: true,
+        };
+        let error = validate_certified_terminal_proof_binding(
+            &proof,
+            &selected,
+            tonepoet_pipeline::TerminalProofAuthorityFamily::PcmTruePeakV2,
+        )
+        .expect_err("a matching proof family must not authorize a different terminal realization");
+        assert!(error.contains("does not bind the selected terminal realization"), "{error}");
+    }
+
+    #[test]
+    fn runtime_bound_follows_ffmpeg_int32_triangular_arch_commissioning() {
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int32,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        settings.dither_explicit = true;
+        let realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            Some(tonepoet_pipeline::DitherType::Tpdf),
+        );
+        let tonepoet_pipeline::SelectedTerminalRealization::Pcm(pcm) = &realization else {
+            unreachable!()
+        };
+        assert!(tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(pcm));
+        let qualified = tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(pcm);
+        assert_eq!(
+            qualified,
+            tonepoet_pipeline::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch()
+        );
+        let result = pcm_true_peak_terminal_bound(&settings, 48_000, &realization);
+        if qualified {
+            let bound = result.expect("commissioned FFmpeg Int32 triangular dither must expose its bound");
+            assert_eq!(
+                bound.stored_error_linear,
+                ffmpeg_int32_triangular_stored_error_component_sum()
+            );
+        } else {
+            let error = result.expect_err("uncommissioned FFmpeg Int32 triangular dither must fail closed");
+            assert!(error.contains("no qualified deterministic FFmpeg-direct"), "{error}");
+        }
+    }
+
+    #[test]
+    fn legacy_terminal_bound_refuses_explicit_int32_dither_without_selected_realization() {
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int32,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        settings.dither_explicit = true;
+        let error = album_gain_terminal_bound(&settings, 48_000)
+            .expect_err("backend-aware Int32 dither authority requires the selected realization");
+        assert!(
+            error.contains("canonical selected terminal realization"),
+            "{error}",
+        );
+    }
+
+    #[test]
+    fn ffmpeg_int32_triangular_bound_is_the_source_derived_combined_error() {
+        let lsb = 2.0_f64.powi(-31);
+        let bound = next_up_nonnegative(ffmpeg_int32_triangular_stored_error_component_sum());
+        let derived = next_up_nonnegative(lsb + lsb + 2.0_f64.powi(-52));
+        assert_eq!(bound, derived);
+        let bound_lsb = bound / lsb;
+        assert!(bound_lsb > 2.0);
+        assert!(bound_lsb < 2.000001);
+
+        // Check every sign combination of the independently bounded physical
+        // contributions. This reduced state space represents the extrema of
+        // plain triangular support, DBL addition rounding, and S32 rounding.
+        for dither in [-lsb, lsb] {
+            for add_rounding in [-2.0_f64.powi(-52), 2.0_f64.powi(-52)] {
+                for integer_rounding in [-lsb, lsb] {
+                    let error = (dither + add_rounding + integer_rounding).abs();
+                    assert!(error <= bound, "extremal error {error:e} exceeded {bound:e}");
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum IntegerRounding {
+            Down,
+            Up,
+            TowardZero,
+            Nearest,
+        }
+        let quantize = |sample: f64, mode: IntegerRounding| {
+            let scaled = sample * 2.0_f64.powi(31);
+            let rounded = match mode {
+                IntegerRounding::Down => scaled.floor(),
+                IntegerRounding::Up => scaled.ceil(),
+                IntegerRounding::TowardZero => scaled.trunc(),
+                IntegerRounding::Nearest => scaled.round(),
+            };
+            rounded
+                .max(i32::MIN as f64)
+                .min(i32::MAX as f64)
+                * lsb
+        };
+        let next_down = |value: f64| {
+            assert!(value != 0.0 && value.is_finite());
+            if value > 0.0 {
+                f64::from_bits(value.to_bits() - 1)
+            } else {
+                f64::from_bits(value.to_bits() + 1)
+            }
+        };
+        let next_up = |value: f64| {
+            assert!(value != 0.0 && value.is_finite());
+            if value > 0.0 {
+                f64::from_bits(value.to_bits() + 1)
+            } else {
+                f64::from_bits(value.to_bits() - 1)
+            }
+        };
+        let half_lsb = 0.5 * lsb;
+        let boundary_inputs = [
+            -1.0,
+            -1.0 + 0.25 * lsb,
+            -1.5 * lsb,
+            next_down(-half_lsb),
+            -half_lsb,
+            next_up(-half_lsb),
+            0.0,
+            next_down(half_lsb),
+            half_lsb,
+            next_up(half_lsb),
+            1.5 * lsb,
+            1.0 - lsb,
+            1.0 - 0.25 * lsb,
+            1.0,
+        ];
+        for input in boundary_inputs {
+            assert!(input.is_finite());
+            for dither in [-lsb, 0.0, lsb] {
+                for add_rounding in [-2.0_f64.powi(-52), 0.0, 2.0_f64.powi(-52)] {
+                    let dithered = input + dither + add_rounding;
+                    for mode in [
+                        IntegerRounding::Down,
+                        IntegerRounding::Up,
+                        IntegerRounding::TowardZero,
+                        IntegerRounding::Nearest,
+                    ] {
+                        let realized = quantize(dithered, mode);
+                        let error = (realized - input).abs();
+                        assert!(
+                            error <= bound,
+                            "boundary input={input:e} dither={dither:e} add={add_rounding:e} error={error:e} bound={bound:e}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ffmpeg_int32_triangular_hard_ceiling_headroom_excludes_s32_saturation() {
+        let lsb = 2.0_f64.powi(-31);
+        let stored = next_up_nonnegative(ffmpeg_int32_triangular_stored_error_component_sum());
+        let reconstruction_gain = tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER;
+        let terminal_reconstructed = next_up_nonnegative(stored * reconstruction_gain);
+        let scalar_error = 2.0_f64.powi(-51);
+        let post_gain = next_up_nonnegative(
+            terminal_reconstructed + scalar_error * reconstruction_gain,
+        );
+
+        // The certified interval includes the exact Float64 carrier sample
+        // maximum P. For any admitted C <= 1, the existing solver establishes
+        // G*P + Epost <= C. Add back the separately charged scalar rounding,
+        // then the worst terminal dither/addition excursion, and prove that the
+        // value reaching llrint cannot enter S32 saturation under any standard
+        // rounding direction.
+        let max_scaled_sample = 1.0 - post_gain + scalar_error;
+        let max_pre_llrint = max_scaled_sample + lsb + 2.0_f64.powi(-52);
+        assert!(max_pre_llrint <= 1.0 - lsb);
+        assert!(-max_pre_llrint >= -1.0);
+    }
+
+    #[test]
+    fn runtime_bound_refuses_unqualified_ffmpeg_int32_dither_variants() {
+        for dither in [
+            tonepoet_pipeline::DitherType::SlopedTpdf,
+            tonepoet_pipeline::DitherType::Shibata,
+        ] {
+            let mut settings = terminal_settings(
+                tonepoet_pipeline::AudioFormat::Flac,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                dither,
+            );
+            settings.dither_explicit = true;
+            let realization = test_pcm_terminal_realization(
+                &settings,
+                tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+                Some(dither),
+            );
+            let error = pcm_true_peak_terminal_bound(&settings, 48_000, &realization)
+                .expect_err("unqualified FFmpeg Int32 dither mode must fail closed");
+            assert!(error.contains("no qualified deterministic FFmpeg-direct"), "{error}");
+        }
+
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int32,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        settings.dither_explicit = true;
+        let mut realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            Some(tonepoet_pipeline::DitherType::Tpdf),
+        );
+        let tonepoet_pipeline::SelectedTerminalRealization::Pcm(pcm) = &mut realization else {
+            unreachable!()
+        };
+        pcm.input_precision = tonepoet_pipeline::StoragePrecision::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Float32,
+        );
+        let error = pcm_true_peak_terminal_bound(&settings, 48_000, &realization)
+            .expect_err("qualified dither authority must not cross the Float64 carrier boundary");
+        assert!(error.contains("no qualified deterministic FFmpeg-direct"), "{error}");
+    }
+
+    #[test]
+    fn ffmpeg_int32_triangular_terminal_term_changes_track_and_album_ceiling_gain() {
+        let mut settings = terminal_settings(
+            tonepoet_pipeline::AudioFormat::Flac,
+            tonepoet_pipeline::PcmBitDepth::Int32,
+            tonepoet_pipeline::DitherType::Tpdf,
+        );
+        settings.dither_explicit = true;
+        let realization = test_pcm_terminal_realization(
+            &settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            Some(tonepoet_pipeline::DitherType::Tpdf),
+        );
+        let tonepoet_pipeline::SelectedTerminalRealization::Pcm(pcm) = &realization else {
+            unreachable!()
+        };
+        assert!(tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(pcm));
+        assert!(!tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(pcm));
+
+        // Candidate-only arithmetic check: this does not pass through the
+        // production bound owner while commissioning remains closed. It proves
+        // the retained term would affect the existing Track/Album inequality
+        // as intended after exact-closure commissioning, without granting the
+        // route a current certified authority.
+        let stored = next_up_nonnegative(ffmpeg_int32_triangular_stored_error_component_sum());
+        let reconstruction_gain = tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER;
+        let terminal_reconstructed = next_up_nonnegative(stored * reconstruction_gain);
+        let scalar_error = 2.0_f64.powi(-51) * reconstruction_gain;
+        let dithered = tonepoet_pipeline::AlbumTerminalBound {
+            pre_gain_reconstructed_error_linear: 0.0,
+            stored_sample_error_linear: Some(stored),
+            post_gain_reconstructed_error_linear: next_up_nonnegative(
+                terminal_reconstructed + scalar_error,
+            ),
+            domain: tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        };
+
+        let mut undithered_settings = settings.clone();
+        undithered_settings.dither_type = tonepoet_pipeline::DitherType::None;
+        undithered_settings.dither_explicit = false;
+        let undithered_realization = test_pcm_terminal_realization(
+            &undithered_settings,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            None,
+        );
+        let undithered = pcm_true_peak_terminal_bound(
+            &undithered_settings,
+            48_000,
+            &undithered_realization,
+        )
+        .unwrap();
+        assert!(
+            dithered.post_gain_reconstructed_error_linear
+                > undithered.post_gain_reconstructed_error_linear
+        );
+
+        let measurement = tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+            point_db: "-0.050000000".parse().unwrap(),
+            signal_upper_linear: 0.995,
+        };
+        let target: tonepoet_pipeline::DbNano = "-0.100000000".parse().unwrap();
+        let normalize = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+            target,
+            &[(measurement, dithered)],
+            true,
+        )
+        .unwrap();
+        let guard = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+            target,
+            &[(measurement, dithered)],
+            false,
+        )
+        .unwrap();
+        let control = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+            target,
+            &[(measurement, undithered)],
+            true,
+        )
+        .unwrap();
+        assert!(normalize.maximum_linear_gain < control.maximum_linear_gain);
+        assert_eq!(guard.maximum_linear_gain, normalize.maximum_linear_gain);
+        assert!(guard.maximum_linear_gain < 1.0, "boundary case must attenuate so Guard is terminal-bound-sensitive");
+
+        let ceiling = 10.0_f64.powf((target.0 as f64 / 1_000_000_000.0) / 20.0);
+        for authority in [guard, normalize] {
+            let lhs = authority.maximum_linear_gain
+                * (0.995 + dithered.pre_gain_reconstructed_error_linear)
+                + dithered.post_gain_reconstructed_error_linear;
+            assert!(lhs <= ceiling, "candidate terminal inequality exceeded ceiling");
+        }
+
+        let album = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+            target,
+            &[
+                (measurement, dithered),
+                (
+                    tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+                        point_db: "-1.000000000".parse().unwrap(),
+                        signal_upper_linear: 0.80,
+                    },
+                    dithered,
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(album.maximum_linear_gain, normalize.maximum_linear_gain);
+    }
+
 }
 
 
 #[derive(Debug, Clone)]
-pub(crate) struct PcmTruePeakPreparedMeasurement {
+pub(crate) struct CertifiedTruePeakPreparedMeasurement {
     pub track_id: TrackId,
     pub measurement: tonepoet_pipeline::AlbumPeakMeasurement,
     pub terminal_bound: tonepoet_pipeline::AlbumTerminalBound,
+    pub execution: CertifiedTruePeakExecutionContract,
 }
 
 #[derive(Default)]
 struct PreparedPcmTruePeakCarriers {
-    measurements: Vec<PcmTruePeakPreparedMeasurement>,
+    measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
 }
 
 struct PreparedPcmTruePeakCarrier {
     source_ref: TrackSourceRef,
-    measurement: PcmTruePeakPreparedMeasurement,
+    measurement: CertifiedTruePeakPreparedMeasurement,
 }
 
 fn pcm_true_peak_tier(
-    mode: tonepoet_pipeline::PcmTruePeakScanMode,
+    mode: tonepoet_pipeline::TruePeakScanTier,
 ) -> tonepoet_true_peak::PeakTier {
     match mode {
-        tonepoet_pipeline::PcmTruePeakScanMode::Reference => tonepoet_true_peak::PeakTier::Reference,
-        tonepoet_pipeline::PcmTruePeakScanMode::Standard => tonepoet_true_peak::PeakTier::Standard,
-        tonepoet_pipeline::PcmTruePeakScanMode::Fast => tonepoet_true_peak::PeakTier::Fast,
+        tonepoet_pipeline::TruePeakScanTier::Reference => tonepoet_true_peak::PeakTier::Reference,
+        tonepoet_pipeline::TruePeakScanTier::Standard => tonepoet_true_peak::PeakTier::Standard,
+        tonepoet_pipeline::TruePeakScanTier::Fast => tonepoet_true_peak::PeakTier::Fast,
     }
 }
 
@@ -33490,27 +34232,27 @@ mod pcm_true_peak_scan_mode_tests {
     #[test]
     fn pcm_scan_modes_map_one_to_one_to_the_certified_crate_tiers() {
         assert_eq!(
-            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Reference),
+            pcm_true_peak_tier(tonepoet_pipeline::TruePeakScanTier::Reference),
             tonepoet_true_peak::PeakTier::Reference,
         );
         assert_eq!(
-            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Standard),
+            pcm_true_peak_tier(tonepoet_pipeline::TruePeakScanTier::Standard),
             tonepoet_true_peak::PeakTier::Standard,
         );
         assert_eq!(
-            pcm_true_peak_tier(tonepoet_pipeline::PcmTruePeakScanMode::Fast),
+            pcm_true_peak_tier(tonepoet_pipeline::TruePeakScanTier::Fast),
             tonepoet_true_peak::PeakTier::Fast,
         );
     }
 }
 
-fn scan_pcm_true_peak_f64le(
+fn scan_pcm_true_peak_f64le_identity(
     carrier: &Path,
     sample_rate_hz: u32,
     channels: u16,
-    scan_mode: tonepoet_pipeline::PcmTruePeakScanMode,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     cancel: &CancellationToken,
-) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
+) -> Result<CertifiedCarrierScan, String> {
     use std::io::Read;
 
     if cancel.is_cancelled() {
@@ -33534,6 +34276,12 @@ fn scan_pcm_true_peak_f64le(
             carrier_len, channels,
         ));
     }
+    let mut baseline_scan = super::baseline::certified_scan_started(
+        "pcm_f64le",
+        carrier,
+        carrier_len,
+    );
+    let mut content_hasher = Sha256::new();
     let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
         sample_rate_hz,
         usize::from(channels),
@@ -33560,6 +34308,7 @@ fn scan_pcm_true_peak_f64le(
             .map_err(|_| "PCM true-peak carrier length does not fit this platform".to_string())?;
         file.read_exact(&mut bytes[..count])
             .map_err(|error| format!("could not read PCM true-peak carrier: {error}"))?;
+        content_hasher.update(&bytes[..count]);
         samples.clear();
         for raw in bytes[..count].chunks_exact(8) {
             let sample = f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
@@ -33581,13 +34330,46 @@ fn scan_pcm_true_peak_f64le(
     if cancel.is_cancelled() {
         return Err("PCM true-peak scan cancelled".to_string());
     }
+    require_complete_file_reader_eof(
+        &mut file,
+        carrier,
+        carrier_len,
+        "PCM certified true-peak carrier",
+    )?;
     let result = meter
         .finalize()
         .map_err(|error| format!("could not finalize PCM true-peak ceiling measurement: {error}"))?;
-    album_peak_measurement_from_true_peak(
+    let measurement = album_peak_measurement_from_true_peak(
         result.reported_point_estimate.overall,
         result.upper_level(),
+    )?;
+    let digest = content_hasher.finalize();
+    let mut digest_bytes = [0_u8; 32];
+    digest_bytes.copy_from_slice(&digest);
+    if let Some(scan) = baseline_scan.as_mut() {
+        scan.mark_complete();
+    }
+    Ok(CertifiedCarrierScan {
+        measurement,
+        content_sha256: tonepoet_pipeline::Sha256Digest(digest_bytes),
+    })
+}
+
+fn scan_pcm_true_peak_f64le(
+    carrier: &Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
+    cancel: &CancellationToken,
+) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
+    scan_pcm_true_peak_f64le_identity(
+        carrier,
+        sample_rate_hz,
+        channels,
+        scan_mode,
+        cancel,
     )
+    .map(|scan| scan.measurement)
 }
 
 fn pcm_true_peak_terminal_settings(
@@ -33618,10 +34400,190 @@ fn pcm_true_peak_terminal_settings(
     settings
 }
 
+fn validate_certified_terminal_proof_binding(
+    proof: &tonepoet_pipeline::TerminalProofContract,
+    selected: &SelectedPhysicalCandidateBinding,
+    family: tonepoet_pipeline::TerminalProofAuthorityFamily,
+) -> Result<tonepoet_pipeline::SelectedTerminalRealization, String> {
+    let realization = selected.terminal_realization.clone().ok_or_else(|| {
+        format!(
+            "selected terminal candidate {} ({}) has no structured terminal realization",
+            selected.identity, selected.tool,
+        )
+    })?;
+    match &realization {
+        tonepoet_pipeline::SelectedTerminalRealization::Pcm(pcm) => {
+            if pcm.selected_tool != selected.tool {
+                return Err(format!(
+                    "selected terminal candidate {} tool {} disagrees with its PCM realization tool {}",
+                    selected.identity, selected.tool, pcm.selected_tool,
+                ));
+            }
+            if pcm.input_precision
+                != tonepoet_pipeline::StoragePrecision::Pcm(
+                    tonepoet_pipeline::PcmBitDepth::Float64,
+                )
+            {
+                return Err(format!(
+                    "terminal proof {} requires the selected post-gain Binary64 carrier, but realization input precision is {:?}",
+                    proof.authority, pcm.input_precision,
+                ));
+            }
+            if !proof.accepted_value_domains.contains(&pcm.input_value_domain) {
+                return Err(format!(
+                    "terminal proof {} does not cover selected terminal input domain {:?}",
+                    proof.authority, pcm.input_value_domain,
+                ));
+            }
+        }
+        tonepoet_pipeline::SelectedTerminalRealization::LossyFfmpegEncoderInput { .. } => {
+            if selected.tool != tonepoet_pipeline::ToolIdentifier::Ffmpeg {
+                return Err(format!(
+                    "selected lossy terminal realization requires FFmpeg but candidate {} uses {}",
+                    selected.identity, selected.tool,
+                ));
+            }
+        }
+    }
+    let expected = tonepoet_pipeline::terminal_proof_authority(family, &realization);
+    if proof.authority != expected {
+        return Err(format!(
+            "terminal proof authority {} does not bind the selected terminal realization; expected {}",
+            proof.authority, expected,
+        ));
+    }
+    Ok(realization)
+}
+
+fn validate_terminal_bound_realization_settings(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    sample_rate_hz: u32,
+    realization: &tonepoet_pipeline::SelectedTerminalRealization,
+) -> Result<(), String> {
+    use tonepoet_pipeline::{
+        BitDepthTarget, PcmTerminalDitherOwner, PcmTerminalRealizationKind, SelectedTerminalRealization,
+        ToolIdentifier,
+    };
+
+    match realization {
+        SelectedTerminalRealization::Pcm(realization) => {
+            if settings.target_format != realization.target_format {
+                return Err(format!(
+                    "runtime target format {} disagrees with selected terminal realization {}",
+                    settings.target_format, realization.target_format,
+                ));
+            }
+            let BitDepthTarget::Pcm(depth) = settings.target_bit_depth else {
+                return Err(
+                    "runtime terminal bound requires Source bit depth to be resolved before selected-realization validation"
+                        .to_owned(),
+                );
+            };
+            if depth != realization.target_bit_depth {
+                return Err(format!(
+                    "runtime target depth {:?} disagrees with selected terminal realization {:?}",
+                    depth, realization.target_bit_depth,
+                ));
+            }
+            let wavpack_hybrid = settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+                && settings.wavpack.hybrid;
+            if wavpack_hybrid != realization.wavpack_hybrid {
+                return Err(
+                    "runtime WavPack hybrid disposition disagrees with selected terminal realization"
+                        .to_owned(),
+                );
+            }
+            if let Some(rate) = realization.target_rate_hz {
+                if rate != sample_rate_hz {
+                    return Err(format!(
+                        "runtime terminal rate {} Hz disagrees with selected terminal realization {} Hz",
+                        sample_rate_hz, rate,
+                    ));
+                }
+            }
+            if let Some(dither) = realization.effective_dither {
+                if settings.dither_type != dither {
+                    return Err(format!(
+                        "runtime dither {:?} disagrees with selected terminal realization {:?}",
+                        settings.dither_type, dither,
+                    ));
+                }
+            }
+            match (realization.kind.clone(), realization.effective_dither, realization.dither_owner) {
+                (PcmTerminalRealizationKind::SsrcDirectWav, _, _)
+                | (PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage, _, _) => {
+                    return Err(
+                        "SSRC terminal realization reached the retained certified hard-ceiling terminal-bound validator"
+                            .to_owned(),
+                    )
+                }
+                (PcmTerminalRealizationKind::FfmpegDirect, Some(_), PcmTerminalDitherOwner::SelectedTerminal)
+                    if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) => {}
+                (PcmTerminalRealizationKind::FfmpegDirect, Some(dither), _) => {
+                    return Err(format!(
+                        "no qualified deterministic FFmpeg-direct {:?} dither terminal bound exists for the selected {:?} realization",
+                        dither, realization,
+                    ));
+                }
+                (PcmTerminalRealizationKind::SoxDirect, Some(_), PcmTerminalDitherOwner::SelectedTerminal)
+                | (PcmTerminalRealizationKind::SoxDirect, None, PcmTerminalDitherOwner::None)
+                | (PcmTerminalRealizationKind::FfmpegDirect, None, PcmTerminalDitherOwner::None)
+                | (PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage, Some(_), PcmTerminalDitherOwner::SoxPreterminal)
+                | (PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid, Some(_), PcmTerminalDitherOwner::SoxPreterminal)
+                | (PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid, None, PcmTerminalDitherOwner::None) => {}
+                _ => {
+                    return Err(
+                        "selected terminal realization has an inconsistent physical dither owner"
+                            .to_owned(),
+                    )
+                }
+            }
+            if matches!(realization.kind, PcmTerminalRealizationKind::SoxDirect)
+                && realization.selected_tool != ToolIdentifier::Sox
+            {
+                return Err("SoX-direct terminal realization is not bound to SoX".to_owned());
+            }
+            if !matches!(
+                realization.kind,
+                PcmTerminalRealizationKind::SoxDirect
+                    | PcmTerminalRealizationKind::SsrcDirectWav
+                    | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+            )
+                && realization.selected_tool != ToolIdentifier::Ffmpeg
+            {
+                return Err("FFmpeg-owned/compound terminal realization is not bound to FFmpeg".to_owned());
+            }
+        }
+        SelectedTerminalRealization::LossyFfmpegEncoderInput {
+            target_format,
+            target_rate_hz,
+            ..
+        } => {
+            if &settings.target_format != target_format || !target_format.is_lossy() {
+                return Err(
+                    "runtime lossy target disagrees with selected FFmpeg encoder-input realization"
+                        .to_owned(),
+                );
+            }
+            if let Some(rate) = target_rate_hz {
+                if *rate != sample_rate_hz {
+                    return Err(format!(
+                        "runtime lossy encoder-input rate {} Hz disagrees with selected realization {} Hz",
+                        sample_rate_hz, rate,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pcm_true_peak_terminal_bound(
     settings: &tonepoet_pipeline::PipelineSettings,
     sample_rate_hz: u32,
+    realization: &tonepoet_pipeline::SelectedTerminalRealization,
 ) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
+    validate_terminal_bound_realization_settings(settings, sample_rate_hz, realization)?;
     let wavpack_hybrid = settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
         && settings.wavpack.hybrid;
     let lossy_policy = tonepoet_pipeline::pcm_true_peak_lossy_floor_applies(
@@ -33642,7 +34604,18 @@ fn pcm_true_peak_terminal_bound(
         None
     };
     let bound_settings = terminal_settings.as_ref().unwrap_or(settings);
-    let mut bound = album_gain_terminal_bound(bound_settings, sample_rate_hz)?;
+    let effective_dither = match realization {
+        tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization) => {
+            realization.effective_dither
+        }
+        tonepoet_pipeline::SelectedTerminalRealization::LossyFfmpegEncoderInput { .. } => None,
+    };
+    let mut bound = album_gain_terminal_bound_with_effective_dither(
+        bound_settings,
+        sample_rate_hz,
+        effective_dither,
+        Some(realization),
+    )?;
     if lossy_policy {
         bound.domain = tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm;
     }
@@ -33694,32 +34667,158 @@ fn validate_pcm_true_peak_resampler_contract(
     settings: &tonepoet_pipeline::PipelineSettings,
     source_rate_hz: u32,
     target_rate_hz: u32,
+    selected_resampler: Option<&super::plan_bridge::SelectedPcmResamplerExecutionContract>,
 ) -> Result<(), String> {
     if source_rate_hz == target_rate_hz {
+        if selected_resampler.is_some() {
+            return Err(
+                "typed certified plan retained a pre-observation resampler although source and observation rates are identical"
+                    .to_string(),
+            );
+        }
         return Ok(());
     }
 
-    if settings.ssrc.force || settings.nyquist_transition == NyquistTransition::BrickWall {
+    let execution = selected_resampler.ok_or_else(|| {
+        "typed certified plan has a rate change but no selected pre-observation resampler candidate"
+            .to_string()
+    })?;
+    if execution.input_rate_hz != source_rate_hz || execution.output_rate_hz != target_rate_hz {
+        return Err(format!(
+            "typed certified resampler geometry disagrees with the realized rate change: contract {} -> {} Hz, runtime {} -> {} Hz",
+            execution.input_rate_hz, execution.output_rate_hz, source_rate_hz, target_rate_hz,
+        ));
+    }
+    let selected = &execution.selected;
+    match &selected.tool {
+        tonepoet_pipeline::ToolIdentifier::Ffmpeg => {
+            if settings.ssrc.force {
+                return Err(format!(
+                    "typed certified plan selected FFmpeg/soxr resampler {} after explicit SSRC authority was requested",
+                    selected.identity,
+                ));
+            }
+            if selected.strong_ssrc_resampler.is_some() {
+                return Err(
+                    "FFmpeg/soxr pre-observation resampler unexpectedly carries an SSRC strong-preservation binding"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        tonepoet_pipeline::ToolIdentifier::Ssrc => {
+            let strong = selected.strong_ssrc_resampler.as_ref().ok_or_else(|| {
+                format!(
+                    "typed certified plan selected SSRC pre-observation resampler {} without commissioned Binary64 preservation authority",
+                    selected.identity,
+                )
+            })?;
+            if strong.binary64_preservation.contract_id
+                != tonepoet_pipeline::TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1
+                || strong.binary64_preservation.runtime_architecture != std::env::consts::ARCH
+                || strong.binary64_preservation.evidence_scope.architecture != std::env::consts::ARCH
+                || strong.resolved_resampler.source_rate_hz != source_rate_hz
+                || strong.binary64_preservation.evidence_scope.source_rate_hz != source_rate_hz
+                || strong.resolved_resampler.target_rate_hz != target_rate_hz
+                || strong.binary64_preservation.evidence_scope.target_rate_hz != target_rate_hz
+                || strong.resolved_resampler.output_depth != PcmBitDepth::Float64
+                || !strong.resolved_resampler.dither_none
+                || strong.binary64_preservation.protected_output_container != "w64"
+                || strong.binary64_preservation.evidence_scope.output_container != "w64"
+                || strong.binary64_preservation.evidence_scope.output_sample_format != "pcm_f64le"
+            {
+                return Err(format!(
+                    "typed certified SSRC resampler {} does not match its commissioned Binary64 physical scope",
+                    selected.identity,
+                ));
+            }
+            Ok(())
+        }
+        ref tool => Err(format!(
+            "typed certified plan selected pre-observation resampler {} ({tool}) without an admitted Binary64 preservation authority",
+            selected.identity,
+        )),
+    }
+}
+
+fn validate_pcm_true_peak_carrier_lowering(
+    carrier_req: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    carrier_path: &Path,
+    convert_root: &Path,
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+    selected_resampler: Option<&SelectedPhysicalCandidateBinding>,
+) -> Result<(), String> {
+    let Some(selected) = selected_resampler else {
+        return Ok(());
+    };
+    if source_rate_hz == target_rate_hz {
         return Err(
-            "PCM true-peak gain cannot use the SSRC/brick-wall resampler for a rate-changing hard-ceiling carrier: the pre-measurement path must preserve floating-point samples above 0 dBFS. Select Auto or soxr/FFmpeg, or keep the source sample rate."
+            "typed certified plan retained a pre-observation resampler for a same-rate carrier"
                 .to_string(),
         );
     }
 
-    match &settings.preferred_tool {
-        PreferredTool::Auto | PreferredTool::Ffmpeg => Ok(()),
-        PreferredTool::Sox => Err(
-            "PCM true-peak gain cannot use explicitly selected SoX for a rate-changing hard-ceiling carrier because SoX converts floating-point input through a bounded integer sample domain before effects. Select Auto or soxr/FFmpeg, or keep the source sample rate."
-                .to_string(),
-        ),
-        PreferredTool::Ssrc => Err(
-            "PCM true-peak gain cannot use explicitly selected SSRC for a rate-changing hard-ceiling carrier because that path is not qualified to preserve samples above 0 dBFS before measurement. Select Auto or soxr/FFmpeg, or keep the source sample rate."
-                .to_string(),
-        ),
-        PreferredTool::Custom(name) => Err(format!(
-            "PCM true-peak gain cannot use custom resampler '{name}' for a rate-changing hard-ceiling carrier because its above-0-dBFS behavior has no qualified bound. Select Auto or soxr/FFmpeg, or keep the source sample rate."
-        )),
+    let request = plan_request_for_track(
+        carrier_req,
+        track,
+        realized_input,
+        carrier_path,
+        convert_root.to_path_buf(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not lower the typed-selected certified carrier candidate {} ({}): {error}",
+            selected.identity, selected.tool,
+        )
+    })?;
+    let plan = tonepoet_pipeline::plan_conversion(&request).map_err(|error| {
+        format!(
+            "typed-selected certified carrier candidate {} ({}) could not be lowered: {error}",
+            selected.identity, selected.tool,
+        )
+    })?;
+    let tonepoet_pipeline::PlanAction::Execute { commands, .. } = &plan.action else {
+        return Err(format!(
+            "typed-selected certified carrier candidate {} ({}) lowered to passthrough",
+            selected.identity, selected.tool,
+        ));
+    };
+    let selected_command = commands
+        .iter()
+        .find(|command| command.tool == selected.tool)
+        .ok_or_else(|| {
+            let emitted = commands
+                .iter()
+                .map(|command| command.tool.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "typed-selected certified carrier candidate {} ({}) does not match lowered command chain [{}]",
+                selected.identity, selected.tool, emitted,
+            )
+        })?;
+
+    // The only currently admitted hard-ceiling rate-changing candidate is the
+    // FFmpeg/soxr Float64 carrier. Verify the concrete lowering retained the
+    // soxr resampler rather than accepting FFmpeg by name while realizing a
+    // different physical conversion.
+    if selected.tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg {
+        let has_soxr_rate_change = selected_command.args.iter().any(|arg| {
+            arg.contains("aresample=resampler=soxr")
+                && arg.contains(&format!("out_sample_rate={target_rate_hz}"))
+        });
+        if !has_soxr_rate_change {
+            return Err(format!(
+                "typed-selected certified carrier candidate {} (FFmpeg/soxr) lowered without the required soxr {} Hz rate change",
+                selected.identity, target_rate_hz,
+            ));
+        }
     }
+
+    Ok(())
 }
 
 fn pcm_true_peak_carrier_request(
@@ -33730,13 +34829,12 @@ fn pcm_true_peak_carrier_request(
     carrier_req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
     carrier_req.settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
     carrier_req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    // The analysis carrier must preserve finite floating-point samples above
-    // full scale until the true-peak authority has measured them. In Auto,
-    // force the qualified FFmpeg/soxr floating-point path rather than allowing
-    // SoX's preferred PCM-processing score to route Float32 or resampled
-    // Float64 material through SoX's bounded integer sample domain. Explicit
-    // non-soxr rate-changing selections are rejected before this request is
-    // executed by `validate_pcm_true_peak_resampler_contract`.
+    // The typed planner has already selected FFmpeg/soxr when a certified
+    // rate-changing carrier needs above-0-dBFS preservation. Bind that admitted
+    // realization here rather than reinterpreting the user's original soft
+    // preference. `validate_pcm_true_peak_resampler_contract` independently
+    // checks the typed selection and rejects explicit-SSRC authority drift;
+    // BrickWall itself remains only a capability request.
     carrier_req.settings.preferred_tool = PreferredTool::Ffmpeg;
     carrier_req.settings.dither_type = DitherType::None;
     carrier_req.settings.dither_explicit = false;
@@ -33747,11 +34845,838 @@ fn pcm_true_peak_carrier_request(
     carrier_req.settings.metadata.store_source_audio_md5 = false;
     carrier_req.settings.verification.verify_after_encode = false;
     carrier_req.settings.replay_gain.mode = None;
-    carrier_req.settings.pcm_true_peak.enabled = false;
+    carrier_req.settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
     carrier_req.settings.pcm_true_peak.clear_runtime_album_gain();
     carrier_req.container_extension = Some("f64le".to_string());
     carrier_req.container_ffmpeg_flags = vec!["-f".to_string(), "f64le".to_string()];
     carrier_req
+}
+
+fn protected_ssrc_bound_executable(
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<BoundToolExecutable, String> {
+    if strong.binary64_preservation.runtime_architecture != std::env::consts::ARCH
+        || strong.binary64_preservation.evidence_scope.architecture != std::env::consts::ARCH
+    {
+        return Err(format!(
+            "commissioned SSRC evidence targets architecture {}, runtime is {}",
+            strong.binary64_preservation.runtime_architecture,
+            std::env::consts::ARCH,
+        ));
+    }
+    let expected = tonepoet_pipeline::Sha256Digest::from_hex(
+        &strong.binary64_preservation.expected_executable_sha256,
+    )
+    .map_err(|error| format!("commissioned SSRC executable digest is invalid: {error}"))?;
+    let configured = tool_paths
+        .get(ToolBinary::Ssrc.canonical_name())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(ToolBinary::Ssrc.canonical_name()));
+    let launch_path = resolve_command_launch_path(
+        configured,
+        tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+    )
+    .map_err(|error| format!("could not resolve commissioned SSRC executable: {error}"))?;
+    let canonical_path = fs::canonicalize(&launch_path).map_err(|error| {
+        format!(
+            "could not canonicalize commissioned SSRC executable {}: {error}",
+            launch_path.display(),
+        )
+    })?;
+    let actual = sha256_file(&canonical_path)?;
+    if actual != expected {
+        return Err(format!(
+            "commissioned SSRC executable digest drift at {}: expected {}, got {}",
+            canonical_path.display(), expected, actual,
+        ));
+    }
+    Ok(BoundToolExecutable {
+        canonical_path,
+        executable_sha256: expected,
+    })
+}
+
+fn protected_ssrc_command(
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    input: &Path,
+    output: &Path,
+) -> Result<ToolCommand, String> {
+    let preservation = &strong.binary64_preservation;
+    let scope = &preservation.evidence_scope;
+    let resolved = &strong.resolved_resampler;
+    if preservation.contract_id
+        != tonepoet_pipeline::TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1
+        || preservation.protected_output_container != "w64"
+        || scope.output_container != "w64"
+        || scope.output_sample_format != "pcm_f64le"
+        || scope.input_container != strong.protected_ingress.input_container
+        || scope.input_sample_format != strong.protected_ingress.input_sample_format
+        || resolved.source_rate_hz != scope.source_rate_hz
+        || resolved.target_rate_hz != scope.target_rate_hz
+        || resolved.profile != scope.profile
+        || resolved.attenuation_db != scope.attenuation_db
+        || resolved.min_phase != scope.min_phase
+        || resolved.output_depth != PcmBitDepth::Float64
+        || !resolved.dither_none
+    {
+        return Err("selected protected SSRC binding is internally inconsistent".to_string());
+    }
+    let mut args = vec![
+        "--rate".to_owned(),
+        resolved.target_rate_hz.to_string(),
+        "--profile".to_owned(),
+        resolved.profile.as_arg().to_owned(),
+        "--bits".to_owned(),
+        "-64".to_owned(),
+    ];
+    if let Some(attenuation_db) = &resolved.attenuation_db {
+        args.push("--att".to_owned());
+        args.push(attenuation_db.clone());
+    }
+    if resolved.min_phase {
+        args.push("--minPhase".to_owned());
+    }
+    args.extend([
+        "--dstContainer".to_owned(),
+        "w64".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ]);
+    Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+        binary: ToolBinary::Ssrc,
+        args,
+        secret_args: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    })
+}
+
+fn validate_protected_ssrc_riff_ingress(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!("could not open protected SSRC RIFF ingress {}: {error}", path.display())
+    })?;
+    let physical_len = file
+        .metadata()
+        .map_err(|error| format!("could not stat protected SSRC RIFF ingress: {error}"))?
+        .len();
+    if physical_len < 12 || physical_len > u64::from(u32::MAX) + 8 {
+        return Err(format!(
+            "protected SSRC RIFF ingress size {physical_len} is outside the bounded RIFF cell",
+        ));
+    }
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("could not read protected SSRC RIFF ingress header: {error}"))?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err("protected SSRC ingress authority requires an exact RIFF/WAVE root".to_string());
+    }
+    let declared = u64::from(u32::from_le_bytes(header[4..8].try_into().expect("four-byte RIFF size")))
+        .checked_add(8)
+        .ok_or_else(|| "protected SSRC RIFF size overflowed".to_string())?;
+    if declared != physical_len {
+        return Err(format!(
+            "protected SSRC RIFF ingress declares {declared} bytes but contains {physical_len}",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_protected_ssrc_ingress_probe(
+    probe: &RealizedProbe,
+    source_rate_hz: u32,
+    channels: u16,
+) -> Result<(), String> {
+    let bits = probe.bits_per_raw_sample.or(probe.bits_per_sample);
+    if probe.sample_rate != source_rate_hz
+        || probe.channels != Some(u32::from(channels))
+        || probe.codec_name.as_deref() != Some("pcm_f64le")
+        || probe.sample_fmt.as_deref() != Some("dbl")
+        || bits != Some(64)
+    {
+        return Err(format!(
+            "protected SSRC ingress is not exact source-rate/channel pcm_f64le WAV: rate={} channels={:?} codec={:?} sample_fmt={:?} bits={:?}",
+            probe.sample_rate, probe.channels, probe.codec_name, probe.sample_fmt, bits,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_protected_ssrc_selected_scope(
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+) -> Result<(), String> {
+    let scope = &strong.binary64_preservation.evidence_scope;
+    if strong.resolved_resampler.source_rate_hz != source_rate_hz
+        || scope.source_rate_hz != source_rate_hz
+    {
+        return Err(format!(
+            "commissioned protected SSRC source-rate scope is {} Hz, runtime source is {} Hz",
+            scope.source_rate_hz, source_rate_hz,
+        ));
+    }
+    if strong.resolved_resampler.target_rate_hz != target_rate_hz
+        || scope.target_rate_hz != target_rate_hz
+    {
+        return Err(format!(
+            "commissioned protected SSRC target-rate scope is {} Hz, runtime target is {} Hz",
+            scope.target_rate_hz, target_rate_hz,
+        ));
+    }
+    Ok(())
+}
+
+fn bridge_validated_ssrc_w64_payload(
+    w64_path: &Path,
+    raw_path: &Path,
+    target_rate_hz: u32,
+    channels: u16,
+) -> Result<(), String> {
+    let mut input = fs::File::open(w64_path)
+        .map_err(|error| format!("could not open SSRC Wave64 output {}: {error}", w64_path.display()))?;
+    let mut output = fs::File::create(raw_path)
+        .map_err(|error| format!("could not create retained SSRC Float64 carrier {}: {error}", raw_path.display()))?;
+    if let Err(error) = tonepoet_pipeline::copy_exact_w64_pcm_payload(
+        &mut input,
+        &mut output,
+        tonepoet_pipeline::W64PcmFormatExpectation {
+            sample_rate_hz: target_rate_hz,
+            channels,
+            bits_per_sample: 64,
+            encoding: tonepoet_pipeline::W64SampleEncoding::FloatingPoint,
+        },
+    ) {
+        let _ = fs::remove_file(raw_path);
+        return Err(format!("SSRC Wave64 output failed exact validation/payload bridge: {error}"));
+    }
+    output
+        .sync_all()
+        .map_err(|error| format!("could not sync retained SSRC Float64 carrier: {error}"))?;
+    Ok(())
+}
+
+
+async fn execute_bound_protected_ssrc_once(
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    input: &Path,
+    output: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(), String> {
+    let executable = protected_ssrc_bound_executable(strong, tool_paths)?;
+    let command = protected_ssrc_command(strong, input, output)?;
+    run_bound_tool_command_with_concurrency(
+        command,
+        &executable,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    .map_err(|error| format!("commissioned protected SSRC execution failed: {error}"))?;
+    Ok(())
+}
+
+
+async fn realize_protected_ssrc_true_peak_carrier(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    carrier_path: &Path,
+    carrier_dir: &Path,
+    track_stem: &str,
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+    channels: u16,
+    selected: &SelectedPhysicalCandidateBinding,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<(), String> {
+    let strong = selected.strong_ssrc_resampler.as_ref().ok_or_else(|| {
+        format!(
+            "selected SSRC resampler {} lacks its commissioned protected execution binding",
+            selected.identity,
+        )
+    })?;
+    if strong.protected_ingress.authority_id
+        != tonepoet_pipeline::PROTECTED_PCM_F64LE_RIFF_INGRESS_V1
+        || strong.protected_ingress.input_container != "wav"
+        || strong.protected_ingress.input_sample_format != "pcm_f64le"
+        || strong.protected_ingress.max_physical_bytes
+            != tonepoet_pipeline::PROTECTED_PCM_F64LE_RIFF_MAX_PHYSICAL_BYTES_V1
+        || strong.protected_ingress.muxer_structure_upper_bound_bytes
+            != tonepoet_pipeline::PROTECTED_PCM_F64LE_RIFF_MUXER_STRUCTURE_UPPER_BOUND_BYTES_V1
+    {
+        return Err(format!(
+            "selected SSRC resampler {} uses an unsupported protected ingress authority {}",
+            selected.identity, strong.protected_ingress.authority_id,
+        ));
+    }
+    validate_protected_ssrc_selected_scope(strong, source_rate_hz, target_rate_hz)
+        .map_err(|error| format!("selected SSRC resampler {}: {error}", selected.identity))?;
+
+    let ingress_path = carrier_dir.join(format!("track-{track_stem}-ssrc-ingress.wav"));
+    let w64_path = carrier_dir.join(format!("track-{track_stem}-ssrc-output.w64"));
+    let _ = fs::remove_file(&ingress_path);
+    let _ = fs::remove_file(&w64_path);
+    let _ = fs::remove_file(carrier_path);
+
+    let ingress_req = pcm_registered_effect_base_request(req, source_rate_hz);
+    let ingress_root = carrier_dir.join(format!("work-{track_stem}-ssrc-ingress"));
+    let mut progress = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, None);
+    execute_planned_track_conversion(
+        &ingress_req,
+        track,
+        realized_input,
+        &ingress_path,
+        &ingress_root,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.clone(),
+        &mut progress,
+        0.0,
+        0.45,
+    )
+    .await
+    .map_err(|error| format!("could not materialize protected SSRC Float64 ingress: {error}"))?;
+
+    validate_protected_ssrc_riff_ingress(&ingress_path)?;
+    let probe = probe_realized_segment_with_tool_limits(
+        &ingress_path,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("could not inspect protected SSRC Float64 ingress: {error}"))?;
+    validate_protected_ssrc_ingress_probe(&probe, source_rate_hz, channels)?;
+
+    execute_bound_protected_ssrc_once(
+        strong,
+        &ingress_path,
+        &w64_path,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await?;
+
+    bridge_validated_ssrc_w64_payload(&w64_path, carrier_path, target_rate_hz, channels)?;
+    let _ = fs::remove_file(&ingress_path);
+    let _ = fs::remove_file(&w64_path);
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod protected_ssrc_runtime_tests {
+    use super::*;
+    use crate::convert::pipeline::tool::{StubToolRunner, ToolRunner};
+
+    struct BoundRecordingRunner {
+        inner: StubToolRunner,
+        bound_executables: Mutex<Vec<BoundToolExecutable>>,
+    }
+
+    impl BoundRecordingRunner {
+        fn new() -> Self {
+            Self {
+                inner: StubToolRunner::new(),
+                bound_executables: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for BoundRecordingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            self.inner.run(cmd, cancel).await
+        }
+
+        async fn run_bound(
+            &self,
+            cmd: ToolCommand,
+            executable: &BoundToolExecutable,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            self.bound_executables
+                .lock()
+                .unwrap()
+                .push(executable.clone());
+            self.inner.run(cmd, cancel).await
+        }
+    }
+
+    fn strong_binding(
+        executable_sha256: String,
+    ) -> tonepoet_pipeline::SelectedStrongSsrcResamplerBinding {
+        let scope = tonepoet_pipeline::Binary64ResampleEvidenceScope {
+            profile: SsrcProfile::High,
+            source_rate_hz: 96_000,
+            target_rate_hz: 44_100,
+            attenuation_db: Some("0.0".to_owned()),
+            min_phase: false,
+            architecture: std::env::consts::ARCH.to_owned(),
+            input_container: "wav".to_owned(),
+            input_sample_format: "pcm_f64le".to_owned(),
+            output_container: "w64".to_owned(),
+            output_sample_format: "pcm_f64le".to_owned(),
+        };
+        tonepoet_pipeline::SelectedStrongSsrcResamplerBinding {
+            binary64_preservation:
+                tonepoet_pipeline::SelectedBinary64ResamplePreservationBinding {
+                    contract_id:
+                        tonepoet_pipeline::TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1
+                            .to_owned(),
+                    authority_id:
+                        tonepoet_pipeline::TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1
+                            .to_owned(),
+                    evidence_id: "test:ssrc-runtime".to_owned(),
+                    qualification_report_sha256: "test-report".to_owned(),
+                    expected_executable_sha256: executable_sha256,
+                    runtime_architecture: std::env::consts::ARCH.to_owned(),
+                    source_revision: tonepoet_pipeline::PINNED_SSRC_SOURCE_REV.to_owned(),
+                    build_identity: "test-build".to_owned(),
+                    evidence_scope: scope,
+                    protected_output_container: "w64".to_owned(),
+                },
+            protected_ingress:
+                tonepoet_pipeline::ProtectedFloat64IngressAuthority::retained_pcm_riff_wav(),
+            resolved_resampler: tonepoet_pipeline::SelectedStrongSsrcResamplerParameters {
+                source_rate_hz: 96_000,
+                target_rate_hz: 44_100,
+                profile: SsrcProfile::High,
+                attenuation_db: Some("0.0".to_owned()),
+                min_phase: false,
+                output_depth: PcmBitDepth::Float64,
+                dither_none: true,
+            },
+        }
+    }
+
+    fn push_w64_chunk(file: &mut Vec<u8>, guid: [u8; 16], payload: &[u8]) {
+        file.extend_from_slice(&guid);
+        file.extend_from_slice(&(24_u64 + payload.len() as u64).to_le_bytes());
+        file.extend_from_slice(payload);
+        while file.len() % 8 != 0 {
+            file.push(0);
+        }
+    }
+
+    fn float64_w64_fixture(rate: u32, channels: u16, frames: u64) -> (Vec<u8>, Vec<u8>) {
+        const RIFF: [u8; 16] = *b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\0\0";
+        const WAVE: [u8; 16] = *b"wave\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const FMT: [u8; 16] = *b"fmt \xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const FACT: [u8; 16] = *b"fact\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const DATA: [u8; 16] = *b"data\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+
+        let block_align = channels * 8;
+        let byte_rate = rate * u32::from(block_align);
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&3_u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&64_u16.to_le_bytes());
+
+        let payload_len = usize::try_from(frames * u64::from(block_align)).unwrap();
+        let payload = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut file = Vec::from(RIFF);
+        file.extend_from_slice(&0_u64.to_le_bytes());
+        file.extend_from_slice(&WAVE);
+        push_w64_chunk(&mut file, FMT, &fmt);
+        push_w64_chunk(&mut file, FACT, &frames.to_le_bytes());
+        push_w64_chunk(&mut file, DATA, &payload);
+        let file_len = file.len() as u64;
+        file[16..24].copy_from_slice(&file_len.to_le_bytes());
+        (file, payload)
+    }
+
+    #[tokio::test]
+    async fn protected_ssrc_binding_freezes_command_digest_architecture_and_executes_ssrc_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = temp.path().join("ssrc-qualified");
+        fs::write(&executable, b"qualified-ssrc-fixture").expect("write executable fixture");
+        let digest = sha256_file(&executable).expect("fixture digest").to_hex();
+        let strong = strong_binding(digest);
+        let input = temp.path().join("in.wav");
+        let output = temp.path().join("out.w64");
+        let mut tool_paths = HashMap::new();
+        tool_paths.insert(ToolBinary::Ssrc.canonical_name().to_owned(), executable.clone());
+        let runner = BoundRecordingRunner::new();
+        let cancel = CancellationToken::new();
+
+        execute_bound_protected_ssrc_once(
+            &strong,
+            &input,
+            &output,
+            &runner,
+            &cancel,
+            &tool_paths,
+            None,
+        )
+        .await
+        .expect("exact binding should execute");
+
+        let transcript = runner.inner.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].binary, ToolBinary::Ssrc);
+        assert_eq!(
+            transcript[0].sanitized_args,
+            vec![
+                "--rate",
+                "44100",
+                "--profile",
+                "high",
+                "--bits",
+                "-64",
+                "--att",
+                "0.0",
+                "--dstContainer",
+                "w64",
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        assert!(!transcript[0]
+            .sanitized_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--dither" | "--pdf" | "--mixChannels")));
+        assert_eq!(runner.bound_executables.lock().unwrap().len(), 1);
+        assert_eq!(
+            runner.bound_executables.lock().unwrap()[0].canonical_path,
+            fs::canonicalize(&executable).unwrap()
+        );
+
+        let mut wrong_scope = strong.clone();
+        wrong_scope.resolved_resampler.source_rate_hz = 48_000;
+        assert!(protected_ssrc_command(&wrong_scope, &input, &output).is_err());
+
+        assert!(validate_protected_ssrc_selected_scope(&strong, 96_000, 44_100).is_ok());
+        assert!(validate_protected_ssrc_selected_scope(&strong, 48_000, 44_100).is_err());
+        assert!(validate_protected_ssrc_selected_scope(&strong, 96_000, 48_000).is_err());
+
+        let mut wrong_arch = strong.clone();
+        wrong_arch.binary64_preservation.runtime_architecture =
+            format!("wrong-{}", std::env::consts::ARCH);
+        let runner = BoundRecordingRunner::new();
+        assert!(execute_bound_protected_ssrc_once(
+            &wrong_arch,
+            &input,
+            &output,
+            &runner,
+            &cancel,
+            &tool_paths,
+            None,
+        )
+        .await
+        .is_err());
+        assert!(runner.inner.transcript().is_empty());
+
+        let mut wrong_digest = strong;
+        wrong_digest.binary64_preservation.expected_executable_sha256 = "00".repeat(32);
+        let runner = BoundRecordingRunner::new();
+        assert!(execute_bound_protected_ssrc_once(
+            &wrong_digest,
+            &input,
+            &output,
+            &runner,
+            &cancel,
+            &tool_paths,
+            None,
+        )
+        .await
+        .is_err());
+        assert!(runner.inner.transcript().is_empty());
+    }
+
+    #[test]
+    fn protected_ssrc_w64_bridge_accepts_exact_float64_and_rejects_geometry_or_extent_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let w64 = temp.path().join("valid.w64");
+        let raw = temp.path().join("valid.f64le");
+        let (bytes, payload) = float64_w64_fixture(44_100, 2, 4);
+        fs::write(&w64, &bytes).expect("write valid W64 fixture");
+        bridge_validated_ssrc_w64_payload(&w64, &raw, 44_100, 2)
+            .expect("exact Float64 W64 should bridge");
+        assert_eq!(fs::read(&raw).unwrap(), payload);
+
+        let wrong_rate_raw = temp.path().join("wrong-rate.f64le");
+        assert!(bridge_validated_ssrc_w64_payload(&w64, &wrong_rate_raw, 48_000, 2).is_err());
+        assert!(!wrong_rate_raw.exists());
+
+        let malformed = temp.path().join("malformed.w64");
+        let mut malformed_bytes = bytes;
+        malformed_bytes[16..24].copy_from_slice(&0_u64.to_le_bytes());
+        fs::write(&malformed, malformed_bytes).expect("write malformed W64 fixture");
+        let malformed_raw = temp.path().join("malformed.f64le");
+        assert!(bridge_validated_ssrc_w64_payload(&malformed, &malformed_raw, 44_100, 2).is_err());
+        assert!(!malformed_raw.exists());
+    }
+}
+
+fn pcm_registered_effect_base_request(
+    req: &PipelineRequest,
+    sample_rate_hz: u32,
+) -> PipelineRequest {
+    let mut carrier_req = req.clone();
+    carrier_req.registered_effects.clear();
+    carrier_req.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+    carrier_req.settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
+    carrier_req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    // This private request materializes the typed signal immediately before a
+    // separately frozen resample node. It must never interpret the user's
+    // resampler preference/force as a second semantic resample operation.
+    carrier_req.settings.preferred_tool = PreferredTool::Auto;
+    carrier_req.settings.nyquist_transition = NyquistTransition::Gentle;
+    carrier_req.settings.ssrc.force = false;
+    carrier_req.settings.ssrc.dither_id = None;
+    carrier_req.settings.ssrc.pdf_type = None;
+    carrier_req.settings.dither_type = DitherType::None;
+    carrier_req.settings.dither_explicit = false;
+    carrier_req.settings.force_encode = true;
+    carrier_req.settings.flac.verify = false;
+    carrier_req.settings.metadata.transfer_tags = false;
+    carrier_req.settings.metadata.preserve_artwork = false;
+    carrier_req.settings.metadata.store_source_audio_md5 = false;
+    carrier_req.settings.verification.verify_after_encode = false;
+    carrier_req.settings.replay_gain.mode = None;
+    carrier_req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+    carrier_req.settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+    carrier_req.container_extension = None;
+    carrier_req.container_ffmpeg_flags.clear();
+    carrier_req
+}
+
+fn exact_flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == flag {
+            if found.is_some() {
+                return Err(format!("selected resampler command repeats {flag}"));
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("selected resampler command has {flag} without a value"))?;
+            found = Some(value.as_str());
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(found)
+}
+
+fn validate_selected_registered_resampler_command(
+    execution: &super::plan_bridge::SelectedPcmResamplerExecutionContract,
+    planned: &tonepoet_pipeline::PlannedCommand,
+) -> Result<(), String> {
+    if planned.tool != execution.selected.tool {
+        return Err(format!(
+            "selected registered-effect resampler {} lowered with {} instead of frozen tool {}",
+            execution.selected.identity, planned.tool, execution.selected.tool,
+        ));
+    }
+    let tonepoet_pipeline::ResolvedOperationParameters::ResampleSsrc {
+        requested,
+        effective_profile,
+        effective_attenuation_db,
+        effective_output_depth,
+        output_role,
+        computation_precision,
+        emitted_processing_domain,
+        effective_dither,
+        authority_reason,
+    } = &execution.resolved_parameters
+    else {
+        return Ok(());
+    };
+    if execution.selected.tool != tonepoet_pipeline::ToolIdentifier::Ssrc {
+        return Err(format!(
+            "registered-effect resampler {} carries SSRC parameters but selected tool is {}",
+            execution.selected.identity, execution.selected.tool,
+        ));
+    }
+    let tonepoet_pipeline::PlanOperation::ResamplePcm {
+        target_rate_hz,
+        target_bit_depth,
+        profile,
+        brick_wall,
+    } = &execution.operation
+    else {
+        return Err("frozen SSRC execution parameters are attached to a non-resample operation".to_string());
+    };
+    if !*brick_wall || *target_rate_hz != execution.output_rate_hz {
+        return Err("frozen SSRC operation disagrees with its typed rate-change contract".to_string());
+    }
+    if target_bit_depth != &Some(*effective_output_depth)
+        || profile.map(|value| value != *effective_profile).unwrap_or(false)
+    {
+        return Err("frozen SSRC operation disagrees with its resolved output depth/profile".to_string());
+    }
+    let expected_precision = match effective_profile {
+        SsrcProfile::High | SsrcProfile::Long | SsrcProfile::Insane => {
+            tonepoet_pipeline::SsrcComputationPrecision::Double
+        }
+        SsrcProfile::Standard | SsrcProfile::Short | SsrcProfile::Fast | SsrcProfile::Lightning => {
+            tonepoet_pipeline::SsrcComputationPrecision::Single
+        }
+    };
+    let expected_domain = if effective_output_depth.is_float() {
+        tonepoet_pipeline::ProcessingDomain::PcmFloating
+    } else {
+        tonepoet_pipeline::ProcessingDomain::PcmInteger(*effective_output_depth)
+    };
+    if *computation_precision != expected_precision || *emitted_processing_domain != expected_domain {
+        return Err("frozen SSRC precision/domain parameters are internally inconsistent".to_string());
+    }
+    let expected_authority = if requested.force {
+        tonepoet_pipeline::SsrcAuthorityReason::ExplicitForce
+    } else {
+        tonepoet_pipeline::SsrcAuthorityReason::CapabilitySelected
+    };
+    if *authority_reason != expected_authority {
+        return Err("frozen SSRC authority reason disagrees with the selected request".to_string());
+    }
+    let expected_rate = execution.output_rate_hz.to_string();
+    if exact_flag_value(&planned.args, "--rate")? != Some(expected_rate.as_str()) {
+        return Err("selected SSRC command rate disagrees with the frozen typed contract".to_string());
+    }
+    if exact_flag_value(&planned.args, "--profile")? != Some(effective_profile.as_arg()) {
+        return Err("selected SSRC command profile disagrees with the frozen typed contract".to_string());
+    }
+    let expected_bits = match effective_output_depth {
+        PcmBitDepth::Float32 => "-32".to_string(),
+        PcmBitDepth::Float64 => "-64".to_string(),
+        depth => depth.bits().to_string(),
+    };
+    if exact_flag_value(&planned.args, "--bits")? != Some(expected_bits.as_str()) {
+        return Err("selected SSRC command bit depth disagrees with the frozen typed contract".to_string());
+    }
+    let command_att = exact_flag_value(&planned.args, "--att")?;
+    match (effective_attenuation_db, command_att) {
+        (None, None) => {}
+        (Some(expected), Some(actual))
+            if actual.parse::<f32>().ok() == Some(*expected) => {}
+        _ => {
+            return Err("selected SSRC command attenuation disagrees with the frozen typed contract".to_string())
+        }
+    }
+    if planned.args.iter().any(|arg| arg == "--minPhase") != requested.min_phase {
+        return Err("selected SSRC command phase mode disagrees with the frozen typed contract".to_string());
+    }
+    let expected_dither = effective_dither.dither_id.map(|value| value.to_string());
+    if exact_flag_value(&planned.args, "--dither")? != expected_dither.as_deref() {
+        return Err("selected SSRC command dither id disagrees with the frozen typed contract".to_string());
+    }
+    let expected_pdf = effective_dither.pdf_type.map(|value| match value {
+        SsrcPdfType::Rectangular => "0",
+        SsrcPdfType::Triangular => "1",
+    });
+    if exact_flag_value(&planned.args, "--pdf")? != expected_pdf {
+        return Err("selected SSRC command dither PDF disagrees with the frozen typed contract".to_string());
+    }
+    if matches!(output_role, tonepoet_pipeline::SsrcOutputRole::Nonterminal)
+        && (*effective_output_depth != PcmBitDepth::Float64
+            || effective_dither.dither_id.is_some()
+            || effective_dither.pdf_type.is_some())
+    {
+        return Err("nonterminal SSRC execution is not an undithered Float64 boundary".to_string());
+    }
+    Ok(())
+}
+
+fn selected_registered_resampler_command(
+    plan_request: &tonepoet_pipeline::PlanRequest,
+    execution: &super::plan_bridge::SelectedPcmResamplerExecutionContract,
+    input: &Path,
+    output: &Path,
+    expected_duration: Option<Duration>,
+) -> Result<tonepoet_pipeline::PlannedCommand, String> {
+    let step = tonepoet_pipeline::PlanStep::new(
+        0,
+        execution.operation.clone(),
+        tonepoet_pipeline::InputSource::Path(input.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Path(output.to_path_buf()),
+        format!("Phase-3 selected registered-effect resampler {}", execution.selected.identity),
+    );
+    let mut planned = tonepoet_pipeline::ToolRegistry::with_builtin_tools()
+        .build_command_for_tool(&plan_request.context(), &step, &execution.selected.tool)
+        .map_err(|error| error.to_string())?;
+    planned.expected_duration = expected_duration;
+    validate_selected_registered_resampler_command(execution, &planned)?;
+    Ok(planned)
+}
+
+fn registered_resampler_output_representation(
+    execution: &super::plan_bridge::SelectedPcmResamplerExecutionContract,
+) -> Result<RegisteredEffectCarrierRepresentation, String> {
+    match &execution.resolved_parameters {
+        tonepoet_pipeline::ResolvedOperationParameters::ResampleSsrc {
+            effective_output_depth,
+            output_role,
+            effective_dither,
+            ..
+        } => match output_role {
+            tonepoet_pipeline::SsrcOutputRole::Nonterminal => {
+                if *effective_output_depth != PcmBitDepth::Float64
+                    || effective_dither.dither_id.is_some()
+                    || effective_dither.pdf_type.is_some()
+                {
+                    return Err("typed nonterminal SSRC resampler is not an undithered Float64 boundary".to_string());
+                }
+                Ok(RegisteredEffectCarrierRepresentation::Float64Wav)
+            }
+            tonepoet_pipeline::SsrcOutputRole::Terminal => {
+                let realization = match execution.selected.terminal_realization.as_ref() {
+                    Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) => realization,
+                    other => {
+                        return Err(format!(
+                            "typed terminal SSRC resampler {} has no PCM terminal realization: {:?}",
+                            execution.selected.identity, other,
+                        ))
+                    }
+                };
+                if realization.kind != tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                    || realization.selected_tool != tonepoet_pipeline::ToolIdentifier::Ssrc
+                    || realization.target_bit_depth != *effective_output_depth
+                    || realization.ssrc_dither.as_ref() != Some(effective_dither)
+                {
+                    return Err(format!(
+                        "typed terminal SSRC resampler {} disagrees with its terminal realization",
+                        execution.selected.identity,
+                    ));
+                }
+                Ok(RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                    bit_depth: *effective_output_depth,
+                    terminal_candidate: execution.selected.clone(),
+                })
+            }
+        },
+        _ => Ok(RegisteredEffectCarrierRepresentation::Float64Wav),
+    }
 }
 
 fn pcm_true_peak_track_stem(track_id: &TrackId) -> String {
@@ -33767,6 +35692,7 @@ fn pcm_true_peak_track_stem(track_id: &TrackId) -> String {
 async fn prepare_pcm_true_peak_carrier_for_track(
     req: &PipelineRequest,
     track: PreparedTrack,
+    planned_output: &Path,
     staging: &StagingDir,
     carrier_dir: &Path,
     runner: &dyn ToolRunner,
@@ -33787,6 +35713,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         runner,
         cancel,
         tool_concurrency_limits.clone(),
+        false,
         None,
     )
     .await
@@ -33820,7 +35747,66 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         .channels
         .filter(|channels| *channels > 0)
         .ok_or_else(|| format!("PCM track {} has no valid channel count", track.id.source_ordinal))?;
-    let target_rate_hz = pcm_true_peak_carrier_rate_hz(&req.settings, &source)?;
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let typed_request = plan_request_for_track_with_resolved_source(
+        req,
+        &track,
+        &realized.path,
+        planned_output,
+        carrier_dir.join(format!("plan-{track_stem}")),
+        source.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not bind PCM track {} to its common typed execution plan: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let execution = if req.registered_effects.is_empty() {
+        certified_true_peak_execution_contract(&typed_request)
+    } else {
+        certified_true_peak_execution_contract_with_effects(
+            &typed_request,
+            &req.registered_effects,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "could not bind PCM track {} certified observation/decision contract: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    if execution.level_basis != tonepoet_pipeline::LevelBasis::Ordinary {
+        return Err(format!(
+            "PCM track {} certified observation has non-ordinary level basis {:?}",
+            track.id.source_ordinal, execution.level_basis,
+        ));
+    }
+    let terminal_realization = validate_certified_terminal_proof_binding(
+        &execution.terminal_proof,
+        &execution.charged_terminal,
+        tonepoet_pipeline::TerminalProofAuthorityFamily::PcmTruePeakV2,
+    )
+    .map_err(|error| {
+        format!(
+            "PCM track {} selected terminal proof/realization mismatch: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    if execution.channels != channels {
+        return Err(format!(
+            "PCM track {} geometry changed after planning: typed observation expects {} channel(s), realized source has {}",
+            track.id.source_ordinal, execution.channels, channels,
+        ));
+    }
+    let target_rate_hz = execution.sample_rate_hz;
+    let legacy_target_rate_hz = pcm_true_peak_carrier_rate_hz(&req.settings, &source)?;
+    if legacy_target_rate_hz != target_rate_hz {
+        return Err(format!(
+            "PCM track {} target-rate premise changed after planning: typed observation expects {} Hz, retained carrier route resolved {} Hz",
+            track.id.source_ordinal, target_rate_hz, legacy_target_rate_hz,
+        ));
+    }
     let source_rate_hz = source
         .sample_rate_hz
         .filter(|rate| *rate > 0)
@@ -33834,46 +35820,117 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         &req.settings,
         source_rate_hz,
         target_rate_hz,
+        execution.pre_observation_resampler.as_ref(),
     )?;
     let carrier_hash = stable_path_hash(&original_source_path);
-    let track_stem = pcm_true_peak_track_stem(&track.id);
-    let carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
-    let _ = fs::remove_file(&carrier_path);
-    let carrier_req = pcm_true_peak_carrier_request(req, target_rate_hz);
-    let convert_root = carrier_dir.join(format!("work-{track_stem}"));
-    let mut progress = OperationProgressTracker::new(
-        req.item_id.clone(),
-        PipelineStage::Convert,
-        None,
-    );
-    execute_planned_track_conversion(
-        &carrier_req,
-        &track,
-        &realized.path,
-        &carrier_path,
-        &convert_root,
-        runner,
-        cancel,
-        tool_paths,
-        tool_concurrency_limits,
-        &mut progress,
-        0.0,
-        1.0,
-    )
-    .await
-    .map_err(|error| {
-        let _ = fs::remove_file(&carrier_path);
-        format!(
-            "PCM track {} could not be rendered to its final-rate Float64 analysis carrier: {error}",
-            track.id.source_ordinal,
+    let raw_carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
+    let mut carrier_path = raw_carrier_path.clone();
+    let _ = fs::remove_file(&raw_carrier_path);
+    if let Some(resampler) = execution
+        .pre_observation_resampler
+        .as_ref()
+        .filter(|resampler| {
+            resampler.selected.tool == tonepoet_pipeline::ToolIdentifier::Ssrc
+        })
+    {
+        if execution.post_resample.is_some() {
+            return Err(format!(
+                "PCM track {} commissioned protected SSRC route unexpectedly retained an unqualified post-resample registered-effect segment",
+                track.id.source_ordinal,
+            ));
+        }
+        realize_protected_ssrc_true_peak_carrier(
+            req,
+            &track,
+            &realized.path,
+            &carrier_path,
+            carrier_dir,
+            &track_stem,
+            source_rate_hz,
+            target_rate_hz,
+            channels,
+            &resampler.selected,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
         )
-    })?;
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&carrier_path);
+            format!(
+                "PCM track {} could not realize its commissioned protected SSRC carrier: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    } else {
+        let carrier_req = pcm_true_peak_carrier_request(req, target_rate_hz);
+        let convert_root = carrier_dir.join(format!("work-{track_stem}"));
+        validate_pcm_true_peak_carrier_lowering(
+            &carrier_req,
+            &track,
+            &realized.path,
+            &carrier_path,
+            &convert_root,
+            source_rate_hz,
+            target_rate_hz,
+            execution
+                .pre_observation_resampler
+                .as_ref()
+                .map(|resampler| &resampler.selected),
+        )?;
+        let mut progress = OperationProgressTracker::new(
+            req.item_id.clone(),
+            PipelineStage::Convert,
+            None,
+        );
+        execute_planned_track_conversion(
+            &carrier_req,
+            &track,
+            &realized.path,
+            &carrier_path,
+            &convert_root,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
+            &mut progress,
+            0.0,
+            1.0,
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&carrier_path);
+            format!(
+                "PCM track {} could not be rendered to its final-rate Float64 analysis carrier: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+        realize_certified_post_resample_effects(
+            &execution,
+            &mut carrier_path,
+            carrier_dir,
+            &track_stem,
+            source.duration,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&carrier_path);
+            format!(
+                "PCM track {} could not realize its typed post-resample effect segment: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    }
 
     let scan_path = carrier_path.clone();
     let scan_cancel = cancel.clone();
-    let scan_mode = req.settings.pcm_true_peak.scan_mode;
-    let measurement = tokio::task::spawn_blocking(move || {
-        scan_pcm_true_peak_f64le(
+    let scan_mode = execution.scan;
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_pcm_true_peak_f64le_identity(
             &scan_path,
             target_rate_hz,
             channels,
@@ -33890,21 +35947,54 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         let _ = fs::remove_file(&carrier_path);
         format!("PCM true-peak measurement failed for track {}: {error}", track.id.source_ordinal)
     })?;
+    let measurement = scan.measurement;
+    let bound_path = certified_carrier_bound_path(
+        carrier_dir,
+        &format!("track-{track_stem}-{carrier_hash}"),
+        scan.content_sha256,
+    );
+    let _ = fs::remove_file(&bound_path);
+    fs::rename(&carrier_path, &bound_path).map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!(
+            "could not bind PCM track {} retained carrier to its certified content identity: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    carrier_path = bound_path;
 
     let terminal_settings = pcm_true_peak_terminal_settings(req, &track);
-    let terminal_bound = pcm_true_peak_terminal_bound(&terminal_settings, target_rate_hz)?;
-    let (effective_target_dbtp, lossy_target_capped) = req.settings.pcm_true_peak.effective_target(
-        &req.settings.target_format,
-        req.settings.wavpack.hybrid,
-    );
-    let gain_db = if req.settings.pcm_true_peak.scope
-        == tonepoet_pipeline::PcmTruePeakScope::Track
-    {
+    let terminal_bound = pcm_true_peak_terminal_bound(
+        &terminal_settings,
+        target_rate_hz,
+        &terminal_realization,
+    )?;
+    let execution_policy = if execution.allow_boost {
+        SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: execution.requested_target_dbtp,
+            scope: execution.scope,
+            scan: execution.scan,
+        }
+    } else {
+        SampleGainPolicy::TruePeakGuard {
+            target_dbtp: execution.requested_target_dbtp,
+            scope: execution.scope,
+            scan: execution.scan,
+        }
+    };
+    let (effective_target_dbtp, lossy_target_capped) =
+        tonepoet_pipeline::effective_true_peak_target(
+            execution_policy,
+            &req.settings.target_format,
+            req.settings.wavpack.hybrid,
+        )
+        .ok_or_else(|| "typed PCM true-peak decision lost its effective target".to_string())?;
+    let gain_db = if execution.scope == tonepoet_pipeline::TruePeakScope::Track {
         Some(
             tonepoet_pipeline::resolve_true_peak_gain_constraints(
                 effective_target_dbtp,
                 &[(measurement, terminal_bound)],
-                req.settings.pcm_true_peak.allow_boost,
+                execution.allow_boost,
             )
             .map_err(|error| {
                 format!("could not resolve PCM true-peak gain for track {}: {error}", track.id.source_ordinal)
@@ -33921,7 +36011,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     if lossy_target_capped {
         log::warn!(
             "PCM true-peak target {} dBTP capped to {} dBTP for {} encoder-input PCM; decoded lossy output is outside the hard-ceiling contract",
-            req.settings.pcm_true_peak.target_dbtp.render(false),
+            execution.requested_target_dbtp.render(false),
             effective_target_dbtp.render(false),
             req.settings.target_format,
         );
@@ -33949,11 +36039,13 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             point_dbtp,
             effective_target_dbtp,
             lossy_target_capped,
+            terminal_candidate: Some(execution.charged_terminal.clone()),
         },
-        measurement: PcmTruePeakPreparedMeasurement {
+        measurement: CertifiedTruePeakPreparedMeasurement {
             track_id: track.id,
             measurement,
             terminal_bound,
+            execution,
         },
     })
 }
@@ -33968,7 +36060,10 @@ async fn prepare_pcm_true_peak_carriers(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> Result<PreparedPcmTruePeakCarriers, String> {
-    if !req.settings.pcm_true_peak.enabled {
+    if !req.settings.pcm_true_peak.is_true_peak()
+        || req.settings.pcm_true_peak.scope()
+            != Some(tonepoet_pipeline::TruePeakScope::Album)
+    {
         return Ok(PreparedPcmTruePeakCarriers::default());
     }
     let selected = album_plan
@@ -33976,20 +36071,6 @@ async fn prepare_pcm_true_peak_carriers(
         .iter()
         .map(|entry| entry.track_id.clone())
         .collect::<BTreeSet<_>>();
-    let selected_contains_dsd = prepared.tracks.iter().any(|track| {
-        selected.contains(&track.id)
-            && (matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
-                || source_track_dsd_rate(track).is_some())
-    });
-    if req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album
-        && selected_contains_dsd
-    {
-        return Err(
-            "PCM true-peak Album scope cannot partially normalize a submitted set that also contains DSD tracks; use Track scope for the PCM members or the existing DSD gain controls for a DSD-only batch"
-                .to_string(),
-        );
-    }
-
     let carrier_dir = staging.root.join("pcm-true-peak");
     fs::create_dir_all(&carrier_dir)
         .map_err(|error| format!("could not create PCM true-peak staging: {error}"))?;
@@ -33997,12 +36078,21 @@ async fn prepare_pcm_true_peak_carriers(
         .tracks
         .iter()
         .enumerate()
-        .filter(|(_, track)| {
-            selected.contains(&track.id)
-                && !matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
-                && source_track_dsd_rate(track).is_none()
+        .filter_map(|(index, track)| {
+            if !selected.contains(&track.id)
+                || matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+                || source_track_dsd_rate(track).is_some()
+            {
+                return None;
+            }
+            let planned_output = album_plan
+                .entries
+                .iter()
+                .find(|entry| entry.track_id == track.id)?
+                .final_path
+                .clone();
+            Some((index, track.clone(), planned_output))
         })
-        .map(|(index, track)| (index, track.clone()))
         .collect::<Vec<_>>();
     if jobs.is_empty() {
         return Ok(PreparedPcmTruePeakCarriers::default());
@@ -34018,7 +36108,7 @@ async fn prepare_pcm_true_peak_carriers(
     >;
     let mut pending: Vec<Option<PcmTruePeakFuture<'_>>> = jobs
         .into_iter()
-        .map(|(index, track)| {
+        .map(|(index, track, planned_output)| {
             let task_cancel = analysis_cancel.clone();
             let task_tool_limits = tool_concurrency_limits.clone();
             let task_carrier_dir = carrier_dir.as_path();
@@ -34026,6 +36116,7 @@ async fn prepare_pcm_true_peak_carriers(
                 let result = prepare_pcm_true_peak_carrier_for_track(
                     req,
                     track,
+                    &planned_output,
                     staging,
                     task_carrier_dir,
                     runner,
@@ -34083,22 +36174,21 @@ async fn prepare_pcm_true_peak_carriers(
         return Err(error);
     }
 
-    let album_scope =
-        req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album;
     let mut measurements = Vec::new();
     for (track_index, carrier) in carriers.into_iter().enumerate() {
         let Some(carrier) = carrier else {
             continue;
         };
+        let decision_scope = carrier.measurement.execution.scope;
         prepared.tracks[track_index].source_ref = carrier.source_ref;
-        if album_scope {
+        if decision_scope == tonepoet_pipeline::TruePeakScope::Album {
             measurements.push(carrier.measurement);
         }
     }
     Ok(PreparedPcmTruePeakCarriers { measurements })
 }
 
-fn pcm_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) -> PathBuf {
+fn certified_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) -> PathBuf {
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -34108,7 +36198,7 @@ fn pcm_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) ->
     path.with_file_name(format!("{stem}.gain-{sign}{magnitude}.f64le"))
 }
 
-fn scale_pcm_true_peak_f64le(
+fn scale_certified_true_peak_f64le(
     input: &Path,
     output: &Path,
     sample_rate_hz: u32,
@@ -34127,6 +36217,7 @@ fn scale_pcm_true_peak_f64le(
         .metadata()
         .map_err(|error| format!("could not stat PCM true-peak carrier for gain: {error}"))?
         .len();
+    let expected_sha256 = certified_carrier_digest_from_path(input)?;
     let frame_bytes = u64::from(channels)
         .checked_mul(std::mem::size_of::<f64>() as u64)
         .ok_or_else(|| "PCM true-peak gain frame size overflowed".to_string())?;
@@ -34158,6 +36249,7 @@ fn scale_pcm_true_peak_f64le(
             .map_err(|_| "PCM true-peak gain frame size does not fit this platform".to_string())?;
         let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes_usize).max(1) * frame_bytes_usize;
         let mut bytes = vec![0_u8; buffer_len];
+        let mut content_hasher = Sha256::new();
         let mut written = 0_u64;
         let mut remaining = input_len;
         while remaining > 0 {
@@ -34169,17 +36261,8 @@ fn scale_pcm_true_peak_f64le(
             input_file
                 .read_exact(&mut bytes[..count])
                 .map_err(|error| format!("could not read PCM true-peak gain payload: {error}"))?;
-            for raw in bytes[..count].chunks_exact_mut(8) {
-                let sample = f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
-                if !sample.is_finite() {
-                    return Err("PCM true-peak gain input contains a non-finite sample".to_string());
-                }
-                let scaled = sample * gain;
-                if !scaled.is_finite() {
-                    return Err("PCM true-peak gain produced a non-finite sample".to_string());
-                }
-                raw.copy_from_slice(&scaled.to_le_bytes());
-            }
+            content_hasher.update(&bytes[..count]);
+            scale_certified_f64le_chunk_in_place(&mut bytes[..count], gain)?;
             output_file
                 .write_all(&bytes[..count])
                 .map_err(|error| format!("could not write PCM true-peak gain payload: {error}"))?;
@@ -34187,6 +36270,24 @@ fn scale_pcm_true_peak_f64le(
                 .checked_add(count as u64)
                 .ok_or_else(|| "PCM true-peak gained carrier byte count overflowed".to_string())?;
             remaining -= count as u64;
+        }
+        require_complete_file_reader_eof(
+            &mut input_file,
+            input,
+            input_len,
+            "PCM true-peak gain input",
+        )?;
+        let digest = content_hasher.finalize();
+        let mut digest_bytes = [0_u8; 32];
+        digest_bytes.copy_from_slice(&digest);
+        let actual_sha256 = tonepoet_pipeline::Sha256Digest(digest_bytes);
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "PCM true-peak gain input changed after certification: expected {}, got {} at {}",
+                expected_sha256,
+                actual_sha256,
+                input.display(),
+            ));
         }
         if written != input_len {
             return Err(format!(
@@ -34217,29 +36318,1116 @@ fn scale_pcm_true_peak_f64le(
     result
 }
 
-struct PreparedAlbumGainCarrier {
+struct PreparedDsdTruePeakCarrier {
     source_ref: TrackSourceRef,
-    measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    measurement: CertifiedTruePeakPreparedMeasurement,
     timing: DsdAlbumGainTiming,
 }
 
 #[derive(Default)]
-struct PreparedAlbumGainCarriers {
-    measurements: Vec<tonepoet_pipeline::AlbumPeakMeasurement>,
+struct PreparedDsdTruePeakCarriers {
+    measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
 }
 
-async fn prepare_album_gain_carrier_for_track(
+fn track_scoped_certified_true_peak_requested(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+) -> bool {
+    if prepared_track_uses_dsd_source(track) {
+        matches!(
+            req.settings.dsd.gain_policy(),
+            SampleGainPolicy::TruePeakGuard { .. }
+                | SampleGainPolicy::TruePeakNormalize { .. }
+        ) && req.settings.dsd.true_peak_scope()
+            == Some(tonepoet_pipeline::TruePeakScope::Track)
+    } else {
+        req.settings.pcm_true_peak.is_true_peak()
+            && req.settings.pcm_true_peak.scope()
+                == Some(tonepoet_pipeline::TruePeakScope::Track)
+    }
+}
+
+async fn prepare_registered_effect_carrier_for_track(
+    req: &PipelineRequest,
+    mut track: PreparedTrack,
+    planned_output: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedTrack, String> {
+    if req.registered_effects.is_empty() {
+        return Ok(track);
+    }
+    if matches!(&track.source_ref, TrackSourceRef::RegisteredEffectCarrier { .. }) {
+        return Ok(track);
+    }
+    let source_is_dsd = prepared_track_uses_dsd_source(&track);
+    let policy = if source_is_dsd {
+        req.settings.dsd.gain_policy()
+    } else {
+        req.settings.pcm_true_peak.policy
+    };
+    if policy.is_true_peak() {
+        return Ok(track);
+    }
+    if cancel.is_cancelled() {
+        return Err("registered-effect carrier preparation cancelled".to_string());
+    }
+
+    let original_source_path = track_source_identity_path(&track).to_path_buf();
+    let source_ref = track.source_ref.clone();
+    let realized = realize_track_with_tool_limits_and_stats(
+        &source_ref,
+        Some(&track),
+        req,
+        staging,
+        runner,
+        cancel,
+        tool_concurrency_limits.clone(),
+        false,
+        None,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not realize track {} for registered-effect execution: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let source = source_info_for_true_peak_realized_track(
+        &track,
+        &realized.path,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not resolve source facts for registered effects on track {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    if source.is_dsd() != source_is_dsd {
+        return Err(format!(
+            "track {} source domain changed while binding registered effects",
+            track.id.source_ordinal,
+        ));
+    }
+
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let carrier_dir = staging.root.join("registered-effects");
+    fs::create_dir_all(&carrier_dir)
+        .map_err(|error| format!("could not create registered-effect staging: {error}"))?;
+    let plan_request = plan_request_for_track_with_resolved_source(
+        req,
+        &track,
+        &realized.path,
+        planned_output,
+        carrier_dir.join(format!("plan-{track_stem}")),
+        source.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not bind track {} registered effects to the common typed plan: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let execution = registered_effect_execution_contract(&plan_request, &req.registered_effects)
+        .map_err(|error| {
+            format!(
+                "could not bind track {} registered-effect execution contract: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    let source_channels = source.channels.filter(|channels| *channels > 0).ok_or_else(|| {
+        format!(
+            "track {} has no authoritative channel geometry for registered effects",
+            track.id.source_ordinal,
+        )
+    })?;
+    if execution.channels != source_channels {
+        return Err(format!(
+            "track {} registered-effect geometry changed after planning: typed output expects {} channel(s), realized source has {}",
+            track.id.source_ordinal, execution.channels, source_channels,
+        ));
+    }
+    if source_is_dsd && execution.level_basis == tonepoet_pipeline::LevelBasis::Ordinary {
+        return Err(format!(
+            "track {} registered-effect execution lost its declared DSD level basis",
+            track.id.source_ordinal,
+        ));
+    }
+    if !source_is_dsd && execution.level_basis != tonepoet_pipeline::LevelBasis::Ordinary {
+        return Err(format!(
+            "track {} PCM registered-effect execution has unexpected level basis {:?}",
+            track.id.source_ordinal, execution.level_basis,
+        ));
+    }
+    if source_is_dsd && execution.resampler.is_some() {
+        return Err(format!(
+            "track {} typed DSD registered-effect route unexpectedly contains a separate PCM resampler; this correction does not synthesize DSD -> PCM -> SSRC topology",
+            track.id.source_ordinal,
+        ));
+    }
+
+    let carrier_hash = stable_path_hash(&original_source_path);
+    let base_rate_hz = execution
+        .resampler
+        .as_ref()
+        .map(|resampler| resampler.input_rate_hz)
+        .unwrap_or(execution.sample_rate_hz);
+    let mut carrier_path;
+    let first_input_is_raw_f64le;
+    if source_is_dsd {
+        carrier_path = carrier_dir.join(format!(
+            "track-{track_stem}-{carrier_hash}.base.f64le"
+        ));
+        let _ = fs::remove_file(&carrier_path);
+        match req.settings.dsd.general_from_dsd.reconstruction {
+            tonepoet_pipeline::DsdGeneralReconstruction::General => {
+                let planned = tonepoet_pipeline::build_dsd_general_processing_carrier_command_at_rate(
+                    &req.settings,
+                    &source,
+                    &realized.path,
+                    &carrier_path,
+                    source.duration,
+                    base_rate_hz,
+                )
+                .map_err(|error| error.to_string())?;
+                run_dsd_true_peak_planned_command(
+                    &planned,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await
+                .map_err(|error| {
+                    let _ = fs::remove_file(&carrier_path);
+                    format!(
+                        "DSD track {} could not realize its ordinary pre-effect carrier: {error}",
+                        track.id.source_ordinal,
+                    )
+                })?;
+            }
+            tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected => {
+                let source_rate = source.dsd_rate().ok_or_else(|| {
+                    format!(
+                        "DSD track {} has no authoritative DSD rate for protected ordinary reconstruction",
+                        track.id.source_ordinal,
+                    )
+                })?;
+                let profile = tonepoet_pipeline::resolve_reference_profile(
+                    source_rate,
+                    base_rate_hz,
+                    req.settings.dsd.from_dsd.profile,
+                )
+                .map_err(|error| error.to_string())?;
+                let protected_path = carrier_dir.join(format!(
+                    "track-{track_stem}-{carrier_hash}.protected.w64"
+                ));
+                let _ = fs::remove_file(&protected_path);
+                let protected = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+                    &realized.path,
+                    &protected_path,
+                    base_rate_hz,
+                    profile,
+                    source.duration,
+                );
+                run_dsd_true_peak_planned_command(
+                    &protected,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await
+                .map_err(|error| {
+                    let _ = fs::remove_file(&protected_path);
+                    format!(
+                        "DSD track {} could not realize its protected reconstruction prefix: {error}",
+                        track.id.source_ordinal,
+                    )
+                })?;
+                let export = tonepoet_pipeline::build_reference_protected_export_command(
+                    &req.settings,
+                    &protected_path,
+                    &carrier_path,
+                    source.duration,
+                )
+                .map_err(|error| {
+                    let _ = fs::remove_file(&protected_path);
+                    error.to_string()
+                })?;
+                let export_result = run_dsd_true_peak_planned_command(
+                    &export,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits.as_ref(),
+                )
+                .await;
+                let _ = fs::remove_file(&protected_path);
+                export_result.map_err(|error| {
+                    let _ = fs::remove_file(&carrier_path);
+                    format!(
+                        "DSD track {} could not realize its declared export level before registered effects: {error}",
+                        track.id.source_ordinal,
+                    )
+                })?;
+            }
+        }
+        first_input_is_raw_f64le = true;
+    } else {
+        carrier_path = carrier_dir.join(format!(
+            "track-{track_stem}-{carrier_hash}.base.wav"
+        ));
+        let _ = fs::remove_file(&carrier_path);
+        let carrier_req = pcm_registered_effect_base_request(req, base_rate_hz);
+        let convert_root = carrier_dir.join(format!("work-{track_stem}"));
+        let mut progress = OperationProgressTracker::new(
+            req.item_id.clone(),
+            PipelineStage::Convert,
+            None,
+        );
+        execute_planned_track_conversion(
+            &carrier_req,
+            &track,
+            &realized.path,
+            &carrier_path,
+            &convert_root,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
+            &mut progress,
+            0.0,
+            1.0,
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&carrier_path);
+            format!(
+                "PCM track {} could not realize its no-rate-change Float64 pre-resample carrier: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+        first_input_is_raw_f64le = false;
+    }
+
+    let mut representation = RegisteredEffectCarrierRepresentation::RawFloat64;
+    if let Some(resampler) = execution.resampler.as_ref() {
+        if source_is_dsd {
+            unreachable!("DSD resampler was rejected above");
+        }
+        if let Some(pre) = execution.pre_resample.as_ref() {
+            if pre.sample_rate_hz != resampler.input_rate_hz || pre.channels != resampler.channels {
+                let _ = fs::remove_file(&carrier_path);
+                return Err("typed pre-resample effect geometry changed after execution binding".to_string());
+            }
+            realize_registered_effect_chain(
+                &pre.lowerings,
+                pre.sample_rate_hz,
+                pre.channels,
+                first_input_is_raw_f64le,
+                RegisteredEffectOutputCarrier::WavFloat64,
+                &mut carrier_path,
+                &carrier_dir,
+                &format!("{track_stem}.pre"),
+                source.duration,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&carrier_path);
+                format!(
+                    "track {} could not realize its pre-resample registered-effect segment: {error}",
+                    track.id.source_ordinal,
+                )
+            })?;
+        }
+
+        let resampled_path = carrier_dir.join(format!(
+            "track-{track_stem}-{carrier_hash}.resampled.wav"
+        ));
+        let _ = fs::remove_file(&resampled_path);
+        let planned = selected_registered_resampler_command(
+            &plan_request,
+            resampler,
+            &carrier_path,
+            &resampled_path,
+            source.duration,
+        )?;
+        run_dsd_true_peak_planned_command(
+            &planned,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&resampled_path);
+            format!(
+                "track {} selected resampler {} failed: {error}",
+                track.id.source_ordinal, resampler.selected.identity,
+            )
+        })?;
+        if let Err(error) = fs::remove_file(&carrier_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                let _ = fs::remove_file(&resampled_path);
+                return Err(format!(
+                    "could not remove consumed pre-resample carrier {}: {error}",
+                    carrier_path.display(),
+                ));
+            }
+        }
+        carrier_path = resampled_path;
+        representation = registered_resampler_output_representation(resampler)?;
+
+        if let Some(post) = execution.post_resample.as_ref() {
+            if matches!(
+                representation,
+                RegisteredEffectCarrierRepresentation::TerminalPcmWav { .. }
+            ) {
+                let _ = fs::remove_file(&carrier_path);
+                return Err("typed terminal SSRC resampler cannot feed a post-resample sample-changing effect".to_string());
+            }
+            realize_registered_effect_chain(
+                &post.lowerings,
+                post.sample_rate_hz,
+                post.channels,
+                false,
+                RegisteredEffectOutputCarrier::RawFloat64,
+                &mut carrier_path,
+                &carrier_dir,
+                &format!("{track_stem}.post"),
+                source.duration,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&carrier_path);
+                format!(
+                    "track {} could not realize its post-resample registered-effect segment: {error}",
+                    track.id.source_ordinal,
+                )
+            })?;
+            representation = RegisteredEffectCarrierRepresentation::RawFloat64;
+        }
+    } else {
+        if execution.pre_resample.is_some() {
+            let _ = fs::remove_file(&carrier_path);
+            return Err("typed pre-resample registered effect has no PCM resample barrier".to_string());
+        }
+        let post = execution.post_resample.as_ref().ok_or_else(|| {
+            "registered-effect execution contains neither an effect segment nor a resampler".to_string()
+        })?;
+        realize_registered_effect_chain(
+            &post.lowerings,
+            post.sample_rate_hz,
+            post.channels,
+            first_input_is_raw_f64le,
+            RegisteredEffectOutputCarrier::RawFloat64,
+            &mut carrier_path,
+            &carrier_dir,
+            &track_stem,
+            source.duration,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&carrier_path);
+            format!(
+                "track {} could not realize its typed registered-effect chain: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    }
+
+    let carrier_len = fs::metadata(&carrier_path)
+        .map_err(|error| {
+            format!(
+                "could not stat registered-effect carrier for track {}: {error}",
+                track.id.source_ordinal,
+            )
+        })?
+        .len();
+    if carrier_len == 0 {
+        let _ = fs::remove_file(&carrier_path);
+        return Err(format!(
+            "track {} registered-effect carrier is empty",
+            track.id.source_ordinal,
+        ));
+    }
+    if matches!(representation, RegisteredEffectCarrierRepresentation::RawFloat64) {
+        let frame_bytes = u64::from(execution.channels)
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .ok_or_else(|| "registered-effect carrier frame size overflowed".to_string())?;
+        if frame_bytes == 0 || carrier_len % frame_bytes != 0 {
+            let _ = fs::remove_file(&carrier_path);
+            return Err(format!(
+                "track {} registered-effect carrier is frame-misaligned",
+                track.id.source_ordinal,
+            ));
+        }
+    }
+
+    track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+        path: carrier_path,
+        source_path: original_source_path,
+        sample_rate_hz: execution.sample_rate_hz,
+        channels: execution.channels,
+        duration: source.duration,
+        source_was_dsd: source_is_dsd,
+        resampler_consumed: execution.resampler.is_some(),
+        representation,
+    };
+    Ok(track)
+}
+
+
+/// Realize a Track-scoped certified observation inside the existing per-track
+/// work unit. Album-scoped policies deliberately stay in the submitted-batch
+/// prepass because their scalar cannot bind until every declared participant is
+/// complete. Keeping Track scope here avoids creating an accidental album
+/// barrier merely because Album scope needs one.
+async fn prepare_track_scoped_certified_true_peak_carrier(
+    req: &PipelineRequest,
+    mut track: PreparedTrack,
+    planned_output: &Path,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedTrack, String> {
+    if !track_scoped_certified_true_peak_requested(req, &track) {
+        let source_is_dsd = prepared_track_uses_dsd_source(&track);
+        let source_policy = if source_is_dsd {
+            req.settings.dsd.gain_policy()
+        } else {
+            req.settings.pcm_true_peak.policy
+        };
+        if !source_policy.is_true_peak() && !req.registered_effects.is_empty() {
+            return prepare_registered_effect_carrier_for_track(
+                req,
+                track,
+                planned_output,
+                staging,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+            )
+            .await;
+        }
+        return Ok(track);
+    }
+
+    match &track.source_ref {
+        TrackSourceRef::DsdTruePeakCarrier { gain_db, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } => {
+            if gain_db.is_some() {
+                return Ok(track);
+            }
+            return Err(format!(
+                "track {} reached Track-scoped execution with an unbound Album true-peak carrier",
+                track.id.source_ordinal,
+            ));
+        }
+        _ => {}
+    }
+
+    let is_dsd = prepared_track_uses_dsd_source(&track);
+    let carrier_dir = staging.root.join(if is_dsd {
+        "dsd-certified-true-peak"
+    } else {
+        "pcm-true-peak"
+    });
+    fs::create_dir_all(&carrier_dir).map_err(|error| {
+        format!(
+            "could not create Track-scoped certified true-peak staging: {error}"
+        )
+    })?;
+
+    if is_dsd {
+        let carrier = prepare_dsd_true_peak_carrier_for_track(
+            req,
+            track.clone(),
+            planned_output,
+            staging,
+            &carrier_dir,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await?;
+        if carrier.measurement.execution.scope != tonepoet_pipeline::TruePeakScope::Track {
+            return Err(format!(
+                "track {} certified DSD observation resolved {:?} scope inside a Track-scoped worker",
+                track.id.source_ordinal, carrier.measurement.execution.scope,
+            ));
+        }
+        track.source_ref = carrier.source_ref;
+        return Ok(track);
+    }
+
+    let carrier = prepare_pcm_true_peak_carrier_for_track(
+        req,
+        track.clone(),
+        planned_output,
+        staging,
+        &carrier_dir,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+    )
+    .await?;
+    if carrier.measurement.execution.scope != tonepoet_pipeline::TruePeakScope::Track {
+        return Err(format!(
+            "track {} certified PCM observation resolved {:?} scope inside a Track-scoped worker",
+            track.id.source_ordinal, carrier.measurement.execution.scope,
+        ));
+    }
+    track.source_ref = carrier.source_ref;
+    Ok(track)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisteredEffectOutputCarrier {
+    RawFloat64,
+    WavFloat64,
+}
+
+fn registered_sox_effect_f64le_command(
+    effect_args: &[String],
+    input: &Path,
+    input_is_raw_f64le: bool,
+    output: &Path,
+    output_carrier: RegisteredEffectOutputCarrier,
+    sample_rate_hz: u32,
+    channels: u16,
+    expected_duration: Option<Duration>,
+    reason: &'static str,
+) -> Result<tonepoet_pipeline::PlannedCommand, String> {
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("registered effect requires positive PCM rate/channel geometry".to_string());
+    }
+    let mut args = vec!["-S".to_string(), "-D".to_string()];
+    if input_is_raw_f64le {
+        args.extend([
+            "-t".to_string(), "raw".to_string(),
+            "-e".to_string(), "floating-point".to_string(),
+            "-b".to_string(), "64".to_string(),
+            "-L".to_string(),
+            "-r".to_string(), sample_rate_hz.to_string(),
+            "-c".to_string(), channels.to_string(),
+        ]);
+    }
+    args.push(input.display().to_string());
+    match output_carrier {
+        RegisteredEffectOutputCarrier::RawFloat64 => args.extend([
+            "-t".to_string(), "raw".to_string(),
+            "-e".to_string(), "floating-point".to_string(),
+            "-b".to_string(), "64".to_string(),
+            "-L".to_string(),
+            "-r".to_string(), sample_rate_hz.to_string(),
+            "-c".to_string(), channels.to_string(),
+            output.display().to_string(),
+        ]),
+        RegisteredEffectOutputCarrier::WavFloat64 => args.extend([
+            "-t".to_string(), "wav".to_string(),
+            "-e".to_string(), "floating-point".to_string(),
+            "-b".to_string(), "64".to_string(),
+            "-L".to_string(),
+            "-r".to_string(), sample_rate_hz.to_string(),
+            "-c".to_string(), channels.to_string(),
+            output.display().to_string(),
+        ]),
+    }
+    args.extend(effect_args.iter().cloned());
+    Ok(tonepoet_pipeline::PlannedCommand::new(
+        tonepoet_pipeline::ToolIdentifier::Sox,
+        args,
+        tonepoet_pipeline::InputSource::Path(input.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Path(output.to_path_buf()),
+        expected_duration,
+        reason,
+    ))
+}
+
+fn registered_effect_f64le_command(
+    lowering: &tonepoet_pipeline::EffectLowering,
+    input: &Path,
+    input_is_raw_f64le: bool,
+    output: &Path,
+    output_carrier: RegisteredEffectOutputCarrier,
+    sample_rate_hz: u32,
+    channels: u16,
+    expected_duration: Option<Duration>,
+) -> Result<tonepoet_pipeline::PlannedCommand, String> {
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("registered effect requires positive PCM rate/channel geometry".to_string());
+    }
+    let (tool, args) = match (&lowering.tool, &lowering.arguments) {
+        (
+            tonepoet_pipeline::ToolIdentifier::Sox,
+            tonepoet_pipeline::EffectArgumentMapping::SoxEffect(effect_args),
+        ) => {
+            return registered_sox_effect_f64le_command(
+                effect_args,
+                input,
+                input_is_raw_f64le,
+                output,
+                output_carrier,
+                sample_rate_hz,
+                channels,
+                expected_duration,
+                "Phase-3 registered pre-gain effect",
+            );
+        }
+        (
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter(filter),
+        ) => {
+            let mut args = vec![
+                "-y".to_string(), "-hide_banner".to_string(),
+                "-nostdin".to_string(), "-loglevel".to_string(), "error".to_string(),
+            ];
+            if input_is_raw_f64le {
+                args.extend([
+                    "-f".to_string(), "f64le".to_string(),
+                    "-ar".to_string(), sample_rate_hz.to_string(),
+                    "-ac".to_string(), channels.to_string(),
+                ]);
+            }
+            args.extend([
+                "-i".to_string(), input.display().to_string(),
+                "-map".to_string(), "0:a:0".to_string(),
+                "-vn".to_string(), "-sn".to_string(), "-dn".to_string(),
+                "-af".to_string(), filter.clone(),
+                "-c:a".to_string(), "pcm_f64le".to_string(),
+            ]);
+            match output_carrier {
+                RegisteredEffectOutputCarrier::RawFloat64 => {
+                    args.extend(["-f".to_string(), "f64le".to_string()]);
+                }
+                RegisteredEffectOutputCarrier::WavFloat64 => {
+                    args.extend(["-f".to_string(), "wav".to_string()]);
+                }
+            }
+            args.push(output.display().to_string());
+            (tonepoet_pipeline::ToolIdentifier::Ffmpeg, args)
+        }
+        (tool, arguments) => {
+            return Err(format!(
+                "registered effect lowering pairs incompatible tool {tool:?} and arguments {arguments:?}",
+            ))
+        }
+    };
+
+    Ok(tonepoet_pipeline::PlannedCommand::new(
+        tool,
+        args,
+        tonepoet_pipeline::InputSource::Path(input.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Path(output.to_path_buf()),
+        expected_duration,
+        "Phase-3 registered pre-gain effect",
+    ))
+}
+
+fn fusible_ordinary_sox_highpass_lowpass_pair(
+    lowerings: &[tonepoet_pipeline::EffectLowering],
+) -> Option<Vec<String>> {
+    if lowerings.len() != 2 {
+        return None;
+    }
+    let mut fused = Vec::with_capacity(4);
+    for (index, lowering) in lowerings.iter().enumerate() {
+        if lowering.tool != tonepoet_pipeline::ToolIdentifier::Sox {
+            return None;
+        }
+        let tonepoet_pipeline::EffectArgumentMapping::SoxEffect(args) = &lowering.arguments else {
+            return None;
+        };
+        let expected_effect = if index == 0 { "highpass" } else { "lowpass" };
+        if args.len() != 2 || args[0] != expected_effect {
+            return None;
+        }
+        // The typed lowerer has already validated the frequency. Requiring the
+        // second token to remain an integer keeps this optimization confined to
+        // the measured highpass -> lowpass pair rather than becoming a generic
+        // SoX effects optimizer.
+        if args[1].parse::<u32>().is_err() {
+            return None;
+        }
+        fused.extend(args.iter().cloned());
+    }
+    Some(fused)
+}
+
+async fn realize_registered_effect_chain(
+    lowerings: &[tonepoet_pipeline::EffectLowering],
+    sample_rate_hz: u32,
+    channels: u16,
+    first_input_is_raw_f64le: bool,
+    final_output_carrier: RegisteredEffectOutputCarrier,
+    carrier_path: &mut PathBuf,
+    carrier_dir: &Path,
+    track_stem: &str,
+    expected_duration: Option<Duration>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<Duration, String> {
+    realize_registered_effect_chain_impl(
+        lowerings,
+        sample_rate_hz,
+        channels,
+        first_input_is_raw_f64le,
+        final_output_carrier,
+        carrier_path,
+        carrier_dir,
+        track_stem,
+        expected_duration,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+        false,
+    )
+    .await
+}
+
+// Candidate C2 implementation retained for qualification. The production
+// wrapper above deliberately withholds fusion until an application-level Stage A
+// profile establishes multi-effect process/I/O segmentation as a material cost.
+async fn realize_registered_effect_chain_impl(
+    lowerings: &[tonepoet_pipeline::EffectLowering],
+    sample_rate_hz: u32,
+    channels: u16,
+    first_input_is_raw_f64le: bool,
+    final_output_carrier: RegisteredEffectOutputCarrier,
+    carrier_path: &mut PathBuf,
+    carrier_dir: &Path,
+    track_stem: &str,
+    expected_duration: Option<Duration>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    allow_ordinary_sox_pair_fusion: bool,
+) -> Result<Duration, String> {
+    if lowerings.is_empty() {
+        return Ok(Duration::ZERO);
+    }
+    let _baseline_scope = super::baseline::scoped_event(
+        "registered_effect_chain",
+        serde_json::json!({
+            "effect_count": lowerings.len(),
+            "track_stem": track_stem,
+        }),
+    );
+    let baseline_enabled = super::baseline::enabled();
+    let mut baseline_generated_sizes = HashMap::<PathBuf, u64>::new();
+    let mut baseline_live_generated_bytes = 0_u64;
+    let mut baseline_scratch_high_water_bytes = 0_u64;
+    let frame_bytes = u64::from(channels)
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| "registered effect frame size overflowed".to_string())?;
+
+    if allow_ordinary_sox_pair_fusion {
+        if let Some(effect_args) = fusible_ordinary_sox_highpass_lowpass_pair(lowerings) {
+            if cancel.is_cancelled() {
+                return Err("registered effect chain cancelled".to_string());
+            }
+            let extension = match final_output_carrier {
+                RegisteredEffectOutputCarrier::RawFloat64 => "f64le",
+                RegisteredEffectOutputCarrier::WavFloat64 => "wav",
+            };
+            // Preserve the final path identity of the unfused two-effect chain.
+            let next = carrier_dir.join(format!("track-{track_stem}.effect-002.{extension}"));
+            let _ = fs::remove_file(&next);
+            let planned = registered_sox_effect_f64le_command(
+                &effect_args,
+                carrier_path,
+                first_input_is_raw_f64le,
+                &next,
+                final_output_carrier,
+                sample_rate_hz,
+                channels,
+                expected_duration,
+                "Phase-3 fused ordinary SoX high/low-pass pair",
+            )?;
+            let elapsed = run_dsd_true_peak_planned_command(
+                &planned,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&next);
+                format!("registered fused effect pair failed: {error}")
+            })?;
+            let len = fs::metadata(&next)
+                .map_err(|error| format!("could not stat registered fused effect output {}: {error}", next.display()))?
+                .len();
+            if len == 0
+                || (matches!(final_output_carrier, RegisteredEffectOutputCarrier::RawFloat64)
+                    && (frame_bytes == 0 || len % frame_bytes != 0))
+            {
+                let _ = fs::remove_file(&next);
+                return Err(format!(
+                    "registered fused effect pair produced an invalid {:?} carrier: {}",
+                    final_output_carrier,
+                    next.display(),
+                ));
+            }
+            if baseline_enabled {
+                super::baseline::emit(
+                    "effect_intermediate_created",
+                    serde_json::json!({
+                        "path": next.display().to_string(),
+                        "bytes": len,
+                        "live_generated_bytes": len,
+                        "scratch_high_water_bytes": len,
+                    }),
+                );
+                super::baseline::emit(
+                    "registered_effect_pair_fused",
+                    serde_json::json!({
+                        "tool": "sox",
+                        "effect_count": 2,
+                        "effect_args": effect_args,
+                        "bytes": len,
+                    }),
+                );
+                super::baseline::emit(
+                    "registered_effect_chain_scratch_summary",
+                    serde_json::json!({
+                        "effect_count": lowerings.len(),
+                        "scratch_high_water_bytes": len,
+                        "promoted_carrier_bytes": len,
+                        "generated_artifact_count": 1,
+                    }),
+                );
+            }
+            let original = std::mem::replace(carrier_path, next);
+            if original != *carrier_path {
+                if let Err(error) = fs::remove_file(&original) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!(
+                            "could not remove consumed registered-effect input {}: {error}",
+                            original.display(),
+                        ));
+                    }
+                }
+            }
+            return Ok(elapsed);
+        }
+    }
+
+    let mut elapsed = Duration::ZERO;
+    let mut current = carrier_path.clone();
+    let mut owned_intermediates = Vec::new();
+    for (index, lowering) in lowerings.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err("registered effect chain cancelled".to_string());
+        }
+        let is_last = index + 1 == lowerings.len();
+        let output_carrier = if is_last {
+            final_output_carrier
+        } else {
+            RegisteredEffectOutputCarrier::RawFloat64
+        };
+        let extension = match output_carrier {
+            RegisteredEffectOutputCarrier::RawFloat64 => "f64le",
+            RegisteredEffectOutputCarrier::WavFloat64 => "wav",
+        };
+        let next = carrier_dir.join(format!(
+            "track-{track_stem}.effect-{:03}.{extension}",
+            index + 1,
+        ));
+        let _ = fs::remove_file(&next);
+        let planned = registered_effect_f64le_command(
+            lowering,
+            &current,
+            first_input_is_raw_f64le || index > 0,
+            &next,
+            output_carrier,
+            sample_rate_hz,
+            channels,
+            expected_duration,
+        )?;
+        let effect_elapsed = run_dsd_true_peak_planned_command(
+            &planned,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&next);
+            format!("registered effect {} failed: {error}", index + 1)
+        })?;
+        let len = fs::metadata(&next)
+            .map_err(|error| format!("could not stat registered effect output {}: {error}", next.display()))?
+            .len();
+        if len == 0
+            || (matches!(output_carrier, RegisteredEffectOutputCarrier::RawFloat64)
+                && (frame_bytes == 0 || len % frame_bytes != 0))
+        {
+            let _ = fs::remove_file(&next);
+            return Err(format!(
+                "registered effect {} produced an invalid {:?} carrier: {}",
+                index + 1,
+                output_carrier,
+                next.display(),
+            ));
+        }
+        if baseline_enabled {
+            baseline_generated_sizes.insert(next.clone(), len);
+            baseline_live_generated_bytes = baseline_live_generated_bytes.saturating_add(len);
+            baseline_scratch_high_water_bytes = baseline_scratch_high_water_bytes
+                .max(baseline_live_generated_bytes);
+            super::baseline::emit(
+                "effect_intermediate_created",
+                serde_json::json!({
+                    "path": next.display().to_string(),
+                    "bytes": len,
+                    "live_generated_bytes": baseline_live_generated_bytes,
+                    "scratch_high_water_bytes": baseline_scratch_high_water_bytes,
+                }),
+            );
+        }
+        elapsed = elapsed.saturating_add(effect_elapsed);
+        if current != *carrier_path {
+            owned_intermediates.push(current);
+        }
+        current = next;
+    }
+
+    let original = std::mem::replace(carrier_path, current);
+    if original != *carrier_path {
+        owned_intermediates.push(original);
+    }
+    for path in owned_intermediates {
+        if path != *carrier_path {
+            let baseline_len = baseline_generated_sizes.get(&path).copied().unwrap_or(0);
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "could not remove consumed registered-effect intermediate {}: {error}",
+                        path.display(),
+                    ));
+                }
+            }
+            if baseline_enabled && baseline_len != 0 {
+                baseline_live_generated_bytes =
+                    baseline_live_generated_bytes.saturating_sub(baseline_len);
+                super::baseline::emit(
+                    "effect_intermediate_retired",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "bytes": baseline_len,
+                        "live_generated_bytes": baseline_live_generated_bytes,
+                    }),
+                );
+            }
+        }
+    }
+    if baseline_enabled {
+        let promoted_bytes = baseline_generated_sizes
+            .get(carrier_path)
+            .copied()
+            .unwrap_or(0);
+        super::baseline::emit(
+            "registered_effect_chain_scratch_summary",
+            serde_json::json!({
+                "effect_count": lowerings.len(),
+                "scratch_high_water_bytes": baseline_scratch_high_water_bytes,
+                "promoted_carrier_bytes": promoted_bytes,
+                "generated_artifact_count": baseline_generated_sizes.len(),
+            }),
+        );
+    }
+    Ok(elapsed)
+}
+
+async fn realize_certified_post_resample_effects(
+    execution: &CertifiedTruePeakExecutionContract,
+    carrier_path: &mut PathBuf,
+    carrier_dir: &Path,
+    track_stem: &str,
+    expected_duration: Option<Duration>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<Duration, String> {
+    let Some(post) = execution.post_resample.as_ref() else {
+        return Ok(Duration::ZERO);
+    };
+    if post.sample_rate_hz != execution.sample_rate_hz || post.channels != execution.channels {
+        return Err(
+            "typed post-resample effect geometry disagrees with certified observation geometry"
+                .to_string(),
+        );
+    }
+    realize_registered_effect_chain(
+        &post.lowerings,
+        post.sample_rate_hz,
+        post.channels,
+        true,
+        RegisteredEffectOutputCarrier::RawFloat64,
+        carrier_path,
+        carrier_dir,
+        track_stem,
+        expected_duration,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+}
+
+async fn run_dsd_true_peak_planned_command(
+    planned: &tonepoet_pipeline::PlannedCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<std::time::Duration, String> {
+    let command = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let output = run_tool_command_with_concurrency(
+        command,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(output.elapsed)
+}
+
+async fn prepare_dsd_true_peak_carrier_for_track(
     req: &PipelineRequest,
     track: PreparedTrack,
+    planned_output: &Path,
     staging: &StagingDir,
     carrier_dir: &Path,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
-) -> Result<PreparedAlbumGainCarrier, String> {
+) -> Result<PreparedDsdTruePeakCarrier, String> {
     if cancel.is_cancelled() {
-        return Err("album DSD analysis cancelled before the submitted-batch barrier".to_string());
+        return Err("DSD certified true-peak analysis cancelled".to_string());
     }
 
     let original_source_path = track_source_identity_path(&track).to_path_buf();
@@ -34253,12 +37441,13 @@ async fn prepare_album_gain_carrier_for_track(
         runner,
         cancel,
         tool_concurrency_limits.clone(),
+        false,
         None,
     )
     .await
     .map_err(|error| {
         format!(
-            "could not realize DSD track {} for album peak analysis: {error}",
+            "could not realize DSD track {} for certified true-peak analysis: {error}",
             track.id.source_ordinal,
         )
     })?;
@@ -34273,13 +37462,13 @@ async fn prepare_album_gain_carrier_for_track(
     .await
     .map_err(|error| {
         format!(
-            "could not resolve DSD facts for album peak analysis on track {}: {error}",
+            "could not resolve DSD facts for certified true-peak analysis on track {}: {error}",
             track.id.source_ordinal,
         )
     })?;
     if !source.is_dsd() {
         return Err(format!(
-            "track {} was classified as DSD at materialization but its realized analysis input is not DSD; refusing to derive a batch gain from a decoded or ambiguous carrier",
+            "track {} was classified as DSD at materialization but its realized certified-analysis input is not DSD; refusing to bind a gain to a decoded or ambiguous source",
             track.id.source_ordinal,
         ));
     }
@@ -34288,30 +37477,215 @@ async fn prepare_album_gain_carrier_for_track(
         .filter(|channels| *channels > 0)
         .ok_or_else(|| {
             format!(
-                "DSD track {} has no valid channel count for album peak analysis",
+                "DSD track {} has no valid channel count for certified true-peak analysis",
                 track.id.source_ordinal,
             )
         })?;
-    let target_rate_hz = tonepoet_pipeline::album_gain_target_rate_hz(&req.settings, &source)
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let typed_request = plan_request_for_track_with_resolved_source(
+        req,
+        &track,
+        &realized.path,
+        planned_output,
+        carrier_dir.join(format!("plan-{track_stem}")),
+        source.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not bind DSD track {} to its common typed execution plan: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let execution = if req.registered_effects.is_empty() {
+        certified_true_peak_execution_contract(&typed_request)
+    } else {
+        certified_true_peak_execution_contract_with_effects(
+            &typed_request,
+            &req.registered_effects,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "could not bind DSD track {} certified observation/decision contract: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    match execution.level_basis {
+        tonepoet_pipeline::LevelBasis::DsdNative
+        | tonepoet_pipeline::LevelBasis::DsdNominalCompensated
+        | tonepoet_pipeline::LevelBasis::DsdNativeWithOffset(_) => {}
+        // ProtectedR64 is an admitted *explicit* export convention. The
+        // ordinary default remains DsdNative, which restores the private
+        // reconstruction headroom before the observation. When the user
+        // explicitly selects ProtectedR64, unity/Guard are relative to that
+        // declared base and no implicit +12 dB restoration is permitted.
+        tonepoet_pipeline::LevelBasis::ProtectedR64 => {}
+        tonepoet_pipeline::LevelBasis::Ordinary => {
+            return Err(format!(
+                "DSD track {} certified observation lost its declared DSD reconstruction level basis",
+                track.id.source_ordinal,
+            ));
+        }
+    }
+    let terminal_realization = validate_certified_terminal_proof_binding(
+        &execution.terminal_proof,
+        &execution.charged_terminal,
+        tonepoet_pipeline::TerminalProofAuthorityFamily::AlbumGainV2,
+    )
+    .map_err(|error| {
+        format!(
+            "DSD track {} selected terminal proof/realization mismatch: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    if execution.channels != channels {
+        return Err(format!(
+            "DSD track {} geometry changed after planning: typed observation expects {} channel(s), realized source has {}",
+            track.id.source_ordinal, execution.channels, channels,
+        ));
+    }
+    let target_rate_hz = execution.sample_rate_hz;
+    let legacy_target_rate_hz = tonepoet_pipeline::album_gain_target_rate_hz(&req.settings, &source)
         .map_err(|error| error.to_string())?;
+    if legacy_target_rate_hz != target_rate_hz {
+        return Err(format!(
+            "DSD track {} target-rate premise changed after planning: typed observation expects {} Hz, retained carrier route resolved {} Hz",
+            track.id.source_ordinal, target_rate_hz, legacy_target_rate_hz,
+        ));
+    }
+    let scan_mode = execution.scan;
+    let execution_policy = if execution.allow_boost {
+        SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: execution.requested_target_dbtp,
+            scope: execution.scope,
+            scan: execution.scan,
+        }
+    } else {
+        SampleGainPolicy::TruePeakGuard {
+            target_dbtp: execution.requested_target_dbtp,
+            scope: execution.scope,
+            scan: execution.scan,
+        }
+    };
+    let (effective_target_dbtp, lossy_target_capped) =
+        tonepoet_pipeline::effective_true_peak_target(
+            execution_policy,
+            &req.settings.target_format,
+            req.settings.wavpack.hybrid,
+        )
+        .ok_or_else(|| "typed DSD true-peak decision lost its effective target".to_string())?;
     let carrier_hash = stable_path_hash(&original_source_path);
-    let carrier_path = carrier_dir.join(format!(
-        "track-{:04}-{carrier_hash}.f64le",
-        track.id.source_ordinal,
+    let mut carrier_path = carrier_dir.join(format!(
+        "track-{track_stem}-{carrier_hash}.f64le",
     ));
     let _ = fs::remove_file(&carrier_path);
-    let planned = tonepoet_pipeline::build_album_gain_analysis_command(
-        &req.settings,
-        &source,
-        &realized.path,
-        &carrier_path,
+
+    let reconstruction_elapsed = match req.settings.dsd.general_from_dsd.reconstruction {
+        tonepoet_pipeline::DsdGeneralReconstruction::General => {
+            let planned = tonepoet_pipeline::build_dsd_true_peak_analysis_command(
+                &req.settings,
+                &source,
+                &realized.path,
+                &carrier_path,
+                source.duration,
+            )
+            .map_err(|error| error.to_string())?;
+            run_dsd_true_peak_planned_command(
+                &planned,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&carrier_path);
+                format!(
+                    "DSD track {} could not be reconstructed to its declared ordinary level for certified true-peak analysis: {error}",
+                    track.id.source_ordinal,
+                )
+            })?
+        }
+        tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected => {
+            let source_rate = source.dsd_rate().ok_or_else(|| {
+                format!(
+                    "DSD track {} has no authoritative DSD rate for Reference-protected ordinary reconstruction",
+                    track.id.source_ordinal,
+                )
+            })?;
+            let profile = tonepoet_pipeline::resolve_reference_profile(
+                source_rate,
+                target_rate_hz,
+                req.settings.dsd.from_dsd.profile,
+            )
+            .map_err(|error| error.to_string())?;
+            let protected_path = carrier_dir.join(format!(
+                "track-{track_stem}-{carrier_hash}.protected.w64",
+            ));
+            let _ = fs::remove_file(&protected_path);
+            let protected = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+                &realized.path,
+                &protected_path,
+                target_rate_hz,
+                profile,
+                source.duration,
+            );
+            let reconstruction_elapsed = run_dsd_true_peak_planned_command(
+                &protected,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&protected_path);
+                format!(
+                    "DSD track {} could not realize the Reference-protected ordinary reconstruction prefix: {error}",
+                    track.id.source_ordinal,
+                )
+            })?;
+            let export = tonepoet_pipeline::build_reference_protected_export_command(
+                &req.settings,
+                &protected_path,
+                &carrier_path,
+                source.duration,
+            )
+            .map_err(|error| {
+                let _ = fs::remove_file(&protected_path);
+                error.to_string()
+            })?;
+            let export_elapsed = run_dsd_true_peak_planned_command(
+                &export,
+                runner,
+                cancel,
+                tool_concurrency_limits.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&protected_path);
+                let _ = fs::remove_file(&carrier_path);
+                format!(
+                    "DSD track {} could not restore the declared ordinary export level from protected R64: {error}",
+                    track.id.source_ordinal,
+                )
+            })?;
+            if let Err(error) = fs::remove_file(&protected_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    let _ = fs::remove_file(&carrier_path);
+                    return Err(format!(
+                        "could not remove protected R64 intermediate for DSD track {}: {error}",
+                        track.id.source_ordinal,
+                    ));
+                }
+            }
+            reconstruction_elapsed.saturating_add(export_elapsed)
+        }
+    };
+    let effect_elapsed = realize_certified_post_resample_effects(
+        &execution,
+        &mut carrier_path,
+        carrier_dir,
+        &track_stem,
         source.duration,
-    )
-    .map_err(|error| error.to_string())?;
-    let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    let decode_output = run_tool_command_with_concurrency(
-        command,
         runner,
         cancel,
         tool_concurrency_limits.as_ref(),
@@ -34320,30 +37694,36 @@ async fn prepare_album_gain_carrier_for_track(
     .map_err(|error| {
         let _ = fs::remove_file(&carrier_path);
         format!(
-            "DSD track {} could not be reconstructed for submitted-batch album true-peak analysis: {error}",
+            "DSD track {} could not realize its typed post-conversion effect segment: {error}",
             track.id.source_ordinal,
         )
     })?;
-    let dsd_to_pcm_decode_elapsed = decode_output.elapsed;
+    let dsd_to_pcm_decode_elapsed = reconstruction_elapsed.saturating_add(effect_elapsed);
+
     let carrier_len = fs::metadata(&carrier_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+        .map_err(|error| {
+            format!(
+                "could not stat DSD certified true-peak carrier for track {}: {error}",
+                track.id.source_ordinal,
+            )
+        })?
+        .len();
     let frame_bytes = u64::from(channels) * 8;
     if carrier_len == 0 || carrier_len % frame_bytes != 0 {
         let _ = fs::remove_file(&carrier_path);
         return Err(format!(
-            "DSD track {} album analysis produced an empty or truncated Float64 PCM carrier ({} bytes is not aligned to {}-byte frames)",
+            "DSD track {} certified analysis produced an empty or truncated Float64 PCM carrier ({} bytes is not aligned to {}-byte frames)",
             track.id.source_ordinal,
             carrier_len,
             frame_bytes,
         ));
     }
+
     let scan_path = carrier_path.clone();
     let scan_cancel = cancel.clone();
-    let scan_mode = req.settings.dsd.true_peak_scan_mode();
     let scan_started = Instant::now();
-    let measurement = tokio::task::spawn_blocking(move || {
-        scan_album_gain_true_peak_carrier(
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_album_gain_true_peak_carrier_identity(
             &scan_path,
             target_rate_hz,
             channels,
@@ -34355,37 +37735,110 @@ async fn prepare_album_gain_carrier_for_track(
     .map_err(|error| {
         let _ = fs::remove_file(&carrier_path);
         format!(
-            "DSD track {} true-peak worker failed: {error}",
+            "DSD track {} certified true-peak worker failed: {error}",
             track.id.source_ordinal,
         )
     })?
     .map_err(|error| {
         let _ = fs::remove_file(&carrier_path);
         format!(
-            "DSD track {} produced an invalid album true-peak measurement: {error}",
+            "DSD track {} produced an invalid certified true-peak observation: {error}",
             track.id.source_ordinal,
         )
     })?;
     let true_peak_scan_elapsed = scan_started.elapsed();
+    let measurement = scan.measurement;
+    let bound_path = certified_carrier_bound_path(
+        carrier_dir,
+        &format!("track-{track_stem}-{carrier_hash}"),
+        scan.content_sha256,
+    );
+    let _ = fs::remove_file(&bound_path);
+    fs::rename(&carrier_path, &bound_path).map_err(|error| {
+        let _ = fs::remove_file(&carrier_path);
+        format!(
+            "could not bind DSD track {} retained carrier to its certified content identity: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    carrier_path = bound_path;
+
+    let terminal_settings = pcm_true_peak_terminal_settings(req, &track);
+    let terminal_bound = pcm_true_peak_terminal_bound(
+        &terminal_settings,
+        target_rate_hz,
+        &terminal_realization,
+    )
+        .map_err(|error| {
+            format!(
+                "could not prove the actual terminal suffix for DSD track {}: {error}",
+                track.id.source_ordinal,
+            )
+        })?;
+    let gain_db = if execution.scope == tonepoet_pipeline::TruePeakScope::Track {
+        Some(
+            tonepoet_pipeline::resolve_true_peak_gain_constraints(
+                effective_target_dbtp,
+                &[(measurement, terminal_bound)],
+                execution.allow_boost,
+            )
+            .map_err(|error| {
+                format!(
+                    "could not resolve DSD certified true-peak gain for track {}: {error}",
+                    track.id.source_ordinal,
+                )
+            })?
+            .gain_db,
+        )
+    } else {
+        None
+    };
+    let point_dbtp = match measurement {
+        tonepoet_pipeline::AlbumPeakMeasurement::Finite { point_db, .. } => Some(point_db),
+        tonepoet_pipeline::AlbumPeakMeasurement::Silence => None,
+    };
+    if lossy_target_capped {
+        log::warn!(
+            "DSD true-peak target {} dBTP capped to {} dBTP for {} encoder-input PCM; decoded lossy output is outside the hard-ceiling contract",
+            execution.requested_target_dbtp.render(false),
+            effective_target_dbtp.render(false),
+            req.settings.target_format,
+        );
+    }
     log::info!(
-        "album-scoped DSD analysis measured item={} track={} true_peak={:?} carrier={} rate={} channels={} scan_mode={:?}",
+        "DSD certified true-peak measured item={} track={} scope={:?} point={:?} effective_target={} dBTP gain={:?} carrier={} rate={} channels={} scan_mode={:?}",
         req.item_id,
         track.id.source_ordinal,
-        measurement,
+        execution.scope,
+        point_dbtp,
+        effective_target_dbtp.render(false),
+        gain_db,
         carrier_path.display(),
         target_rate_hz,
         channels,
         scan_mode,
     );
-    Ok(PreparedAlbumGainCarrier {
-        source_ref: TrackSourceRef::DsdAlbumGainCarrier {
+
+    let track_id = track.id.clone();
+    Ok(PreparedDsdTruePeakCarrier {
+        source_ref: TrackSourceRef::DsdTruePeakCarrier {
             path: carrier_path,
             source_path: original_source_path,
             sample_rate_hz: target_rate_hz,
             channels,
             duration: source.duration,
+            gain_db,
+            point_dbtp,
+            effective_target_dbtp,
+            lossy_target_capped,
+            terminal_candidate: Some(execution.charged_terminal.clone()),
         },
-        measurement,
+        measurement: CertifiedTruePeakPreparedMeasurement {
+            track_id,
+            measurement,
+            terminal_bound,
+            execution,
+        },
         timing: DsdAlbumGainTiming {
             realization: realization_elapsed,
             dsd_to_pcm_decode: dsd_to_pcm_decode_elapsed,
@@ -34394,7 +37847,7 @@ async fn prepare_album_gain_carrier_for_track(
     })
 }
 
-async fn prepare_album_gain_carriers(
+async fn prepare_dsd_true_peak_carriers(
     req: &PipelineRequest,
     prepared: &mut PreparedSource,
     album_plan: &AlbumPlan,
@@ -34402,17 +37855,14 @@ async fn prepare_album_gain_carriers(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
-) -> Result<PreparedAlbumGainCarriers, String> {
-    if !req.settings.dsd.album_auto_gain_selected() {
-        return Ok(PreparedAlbumGainCarriers::default());
-    }
-    if matches!(req.settings.target_format, tonepoet_pipeline::AudioFormat::WavPack)
-        && req.settings.wavpack.hybrid
+) -> Result<PreparedDsdTruePeakCarriers, String> {
+    if !matches!(
+        req.settings.dsd.gain_policy(),
+        SampleGainPolicy::TruePeakGuard { .. } | SampleGainPolicy::TruePeakNormalize { .. }
+    ) || req.settings.dsd.true_peak_scope()
+        != Some(tonepoet_pipeline::TruePeakScope::Album)
     {
-        return Err(
-            "album-scoped DSD auto-gain is not available with WavPack hybrid output because its native encoder cannot apply the submitted-batch fixed gain"
-                .to_string(),
-        );
+        return Ok(PreparedDsdTruePeakCarriers::default());
     }
 
     let selected = album_plan
@@ -34420,46 +37870,56 @@ async fn prepare_album_gain_carriers(
         .iter()
         .map(|entry| entry.track_id.clone())
         .collect::<BTreeSet<_>>();
-    let carrier_dir = staging.root.join("dsd-album-gain");
+    let carrier_dir = staging.root.join("dsd-certified-true-peak");
     fs::create_dir_all(&carrier_dir)
-        .map_err(|error| format!("could not create album DSD analysis staging: {error}"))?;
+        .map_err(|error| format!("could not create DSD certified-analysis staging: {error}"))?;
 
     let jobs = prepared
         .tracks
         .iter()
         .enumerate()
-        .filter(|(_, track)| {
-            selected.contains(&track.id)
-                && matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+        .filter_map(|(index, track)| {
+            if !selected.contains(&track.id)
+                || !(matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
+                    || source_track_dsd_rate(track).is_some())
+            {
+                return None;
+            }
+            let planned_output = album_plan
+                .entries
+                .iter()
+                .find(|entry| entry.track_id == track.id)?
+                .final_path
+                .clone();
+            Some((index, track.clone(), planned_output))
         })
-        .map(|(index, track)| (index, track.clone()))
         .collect::<Vec<_>>();
     if jobs.is_empty() {
-        return Ok(PreparedAlbumGainCarriers::default());
+        return Ok(PreparedDsdTruePeakCarriers::default());
     }
 
-    // Keep the expensive DSD work parallel for multi-track sources. Every
-    // future still passes through the existing per-tool semaphores, so this
-    // restores scheduler-class fan-out without inventing a second concurrency
-    // authority inside materialization.
+    // Keep expensive DSD realization parallel under the existing per-tool
+    // semaphores. This preserves one concurrency authority rather than adding
+    // another scheduler for certified observation work.
     let analysis_cancel = cancel.child_token();
-    type AlbumGainFuture<'a> = std::pin::Pin<
+    type DsdTruePeakFuture<'a> = std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = (usize, Result<PreparedAlbumGainCarrier, String>)>
+            dyn std::future::Future<Output = (usize, Result<PreparedDsdTruePeakCarrier, String>)>
                 + Send
                 + 'a,
         >,
     >;
-    let mut pending: Vec<Option<AlbumGainFuture<'_>>> = jobs
+    let mut pending: Vec<Option<DsdTruePeakFuture<'_>>> = jobs
         .into_iter()
-        .map(|(index, track)| {
+        .map(|(index, track, planned_output)| {
             let task_cancel = analysis_cancel.clone();
             let task_tool_limits = tool_concurrency_limits.clone();
             let task_carrier_dir = carrier_dir.as_path();
             Some(Box::pin(async move {
-                let result = prepare_album_gain_carrier_for_track(
+                let result = prepare_dsd_true_peak_carrier_for_track(
                     req,
                     track,
+                    &planned_output,
                     staging,
                     task_carrier_dir,
                     runner,
@@ -34468,25 +37928,26 @@ async fn prepare_album_gain_carriers(
                 )
                 .await;
                 (index, result)
-            }) as AlbumGainFuture<'_>)
+            }) as DsdTruePeakFuture<'_>)
         })
         .collect();
     let mut remaining = pending.len();
-    let mut measurements = vec![None; prepared.tracks.len()];
-    let mut timings = BTreeMap::new();
+    let mut carriers = std::iter::repeat_with(|| None)
+        .take(prepared.tracks.len())
+        .collect::<Vec<Option<PreparedDsdTruePeakCarrier>>>();
     let mut first_error = None;
 
     while remaining > 0 {
         let (track_index, result) = std::future::poll_fn(|cx| {
-            for slot_index in 0..pending.len() {
-                let ready = pending[slot_index]
-                    .as_mut()
-                    .and_then(|future| match std::future::Future::poll(future.as_mut(), cx) {
+            for slot in &mut pending {
+                let ready = slot.as_mut().and_then(|future| {
+                    match std::future::Future::poll(future.as_mut(), cx) {
                         std::task::Poll::Ready(output) => Some(output),
                         std::task::Poll::Pending => None,
-                    });
+                    }
+                });
                 if let Some(output) = ready {
-                    pending[slot_index] = None;
+                    *slot = None;
                     return std::task::Poll::Ready(output);
                 }
             }
@@ -34496,15 +37957,9 @@ async fn prepare_album_gain_carriers(
         remaining -= 1;
         match result {
             Ok(carrier) if first_error.is_none() => {
-                let track_id = prepared.tracks[track_index].id.clone();
-                prepared.tracks[track_index].source_ref = carrier.source_ref;
-                measurements[track_index] = Some(carrier.measurement);
-                timings.insert(track_id, carrier.timing);
+                carriers[track_index] = Some(carrier);
             }
-            Ok(_) => {
-                // A sibling already failed. The staging directory owns this
-                // carrier and will remove it with the blocked materialization.
-            }
+            Ok(_) => {}
             Err(error) => {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -34513,12 +37968,26 @@ async fn prepare_album_gain_carriers(
             }
         }
     }
-
     if let Some(error) = first_error {
         return Err(error);
     }
-    Ok(PreparedAlbumGainCarriers {
-        measurements: measurements.into_iter().flatten().collect(),
+
+    let mut measurements = Vec::new();
+    let mut timings = BTreeMap::new();
+    for (track_index, carrier) in carriers.into_iter().enumerate() {
+        let Some(carrier) = carrier else {
+            continue;
+        };
+        let track_id = prepared.tracks[track_index].id.clone();
+        prepared.tracks[track_index].source_ref = carrier.source_ref;
+        timings.insert(track_id, carrier.timing);
+        if carrier.measurement.execution.scope == tonepoet_pipeline::TruePeakScope::Album {
+            measurements.push(carrier.measurement);
+        }
+    }
+
+    Ok(PreparedDsdTruePeakCarriers {
+        measurements,
         timings,
     })
 }
@@ -34890,9 +38359,8 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     // ordinary per-item rerun gate skip one participant before the aggregate is
     // bound; doing so could silently reuse an output normalized against a
     // different submitted set.
-    let submitted_album_gain_selected = req.settings.dsd.album_auto_gain_selected()
-        || (req.settings.pcm_true_peak.enabled
-            && req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album);
+    let submitted_album_gain_selected = req.settings.dsd.album_true_peak_gain_selected()
+        || req.settings.pcm_true_peak.album_true_peak_gain_selected();
     if !submitted_album_gain_selected {
         if let super::rerun::RerunDecision::Skip {
             manifest,
@@ -34966,7 +38434,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         pre_actions_completed_before_album_gain_rerun = true;
     }
 
-    let prepared_album_gain_carriers = match prepare_album_gain_carriers(
+    let prepared_album_gain_carriers = match prepare_dsd_true_peak_carriers(
         &req,
         &mut prepared,
         &album_plan,
@@ -35017,9 +38485,9 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         }
     };
 
-    let PreparedAlbumGainCarriers {
-        measurements: album_gain_measurements,
-        timings: album_gain_timings,
+    let PreparedDsdTruePeakCarriers {
+        measurements: dsd_true_peak_measurements,
+        timings: dsd_true_peak_timings,
     } = prepared_album_gain_carriers;
 
     let prepared_pcm_true_peak_carriers = match prepare_pcm_true_peak_carriers(
@@ -35081,9 +38549,9 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         plan: album_plan,
         stages,
         source_replaygain: None,
-        album_gain_measurements,
+        dsd_true_peak_measurements,
         pcm_true_peak_measurements,
-        album_gain_timings,
+        dsd_true_peak_timings,
         album_gain_scope_disclosure: None,
         run_timing,
         pre_actions_completed_before_album_gain_rerun,
@@ -35097,7 +38565,208 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
 /// The ordinary per-track planner remains authoritative. We coalesce only when
 /// every track independently plans as one source-rate/no-DSP FFmpeg encode.
 /// Otherwise the group falls back to the established per-track realization +
-/// encode path, staging at most one carrier at a time.
+/// encode path. Compatible missing fallback carriers may be cut in bounded
+/// same-source batches; existing valid carriers and singleton remainders keep
+/// the established per-track baseline.
+// Keep one structured FFmpeg cutter comfortably below ordinary command/FD
+// pressure. This is a transport bound only: larger fallback groups are split
+// into independent same-source batches without changing segment identity.
+const CUE_FALLBACK_BATCH_MAX_OUTPUTS: usize = 32;
+
+async fn prepare_required_cue_fallback_batches(
+    tracks: &[ScheduledCueStreamTrack],
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> BTreeMap<usize, String> {
+    let mut failures = BTreeMap::new();
+    if tracks.len() < 2 || cancel.is_cancelled() {
+        return failures;
+    }
+
+    let Some(first) = tracks.first() else {
+        return failures;
+    };
+    let (
+        source_image,
+        decode_path,
+        carrier,
+        channels,
+        image_samples,
+        sample_rate,
+    ) = match (&first.track.source_ref, first.track.sample_rate.filter(|rate| *rate > 0)) {
+        (
+            TrackSourceRef::CueStreamSegment {
+                source_image,
+                decode_path,
+                carrier,
+                channels,
+                image_samples,
+                ..
+            },
+            Some(sample_rate),
+        ) => (
+            source_image.clone(),
+            decode_path.clone(),
+            *carrier,
+            *channels,
+            *image_samples,
+            sample_rate,
+        ),
+        _ => return failures,
+    };
+
+    // This helper is only an optimization over the established fallback.
+    // If the caller accidentally hands it a mixed source/reader/geometry set,
+    // leave every track on the per-track baseline rather than guessing a
+    // common decoder authority.
+    let compatible = tracks.iter().all(|input| {
+        input.track.sample_rate == Some(sample_rate)
+            && match &input.track.source_ref {
+                TrackSourceRef::CueStreamSegment {
+                    source_image: candidate_source,
+                    decode_path: candidate_decode,
+                    carrier: candidate_carrier,
+                    channels: candidate_channels,
+                    image_samples: candidate_image_samples,
+                    start_sample,
+                    samples,
+                    ..
+                } => {
+                    candidate_source == &source_image
+                        && candidate_decode == &decode_path
+                        && candidate_carrier == &carrier
+                        && candidate_channels == &channels
+                        && candidate_image_samples == &image_samples
+                        && *samples > 0
+                        && start_sample
+                            .checked_add(*samples)
+                            .is_some_and(|end| end <= image_samples)
+                }
+                _ => false,
+            }
+    });
+    if !compatible {
+        return failures;
+    }
+
+    let mut pending = Vec::new();
+    for input in tracks {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let TrackSourceRef::CueStreamSegment {
+            fallback_path,
+            start_sample,
+            samples,
+            ..
+        } = &input.track.source_ref
+        else {
+            continue;
+        };
+        match super::materializer_cue::cue_stream_fallback_carrier_is_reusable(
+            fallback_path,
+            sample_rate,
+            *samples,
+            carrier,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => pending.push((
+                input.index,
+                super::materializer_cue::StructuredSegmentRequest {
+                    start_sample: *start_sample,
+                    samples: *samples,
+                    destination: fallback_path.clone(),
+                    lossy_tail: false,
+                },
+            )),
+            Err(error) => {
+                failures.insert(
+                    input.index,
+                    format!("CUE fallback carrier validation failed: {error}"),
+                );
+            }
+        }
+    }
+
+    // A lone pending requirement keeps the established single-segment path.
+    // Batching only removes repeated source traversals when at least two cuts
+    // are actually missing/invalid and share this exact reader contract.
+    if pending.len() < 2 {
+        return failures;
+    }
+
+    for batch in pending.chunks(CUE_FALLBACK_BATCH_MAX_OUTPUTS) {
+        if cancel.is_cancelled() {
+            for (index, _) in batch {
+                failures.entry(*index).or_insert_with(|| {
+                    "album cancelled before grouped CUE fallback realization".to_string()
+                });
+            }
+            continue;
+        }
+        // A final one-element remainder has no batching benefit and should use
+        // the existing single-segment realization when its track is encoded.
+        if batch.len() == 1 {
+            continue;
+        }
+        let requests = batch
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        match super::materializer_cue::stage_structured_segments_as_wav(
+            &decode_path,
+            sample_rate,
+            carrier,
+            &requests,
+            runner,
+            cancel,
+        )
+        .await
+        {
+            Ok(staged) if staged.len() == batch.len() => {
+                for ((index, request), (path, measured_samples)) in
+                    batch.iter().zip(staged.into_iter())
+                {
+                    if path != request.destination || measured_samples != request.samples {
+                        failures.insert(
+                            *index,
+                            format!(
+                                "grouped CUE fallback returned mismatched carrier {} ({} samples; expected {} at {})",
+                                path.display(),
+                                measured_samples,
+                                request.samples,
+                                request.destination.display(),
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(staged) => {
+                let error = format!(
+                    "grouped CUE fallback returned {} carriers for {} requests",
+                    staged.len(),
+                    batch.len(),
+                );
+                for (index, _) in batch {
+                    failures.insert(*index, error.clone());
+                }
+            }
+            Err(error) => {
+                let message = format!("grouped CUE fallback realization failed: {error}");
+                for (index, _) in batch {
+                    failures.insert(*index, message.clone());
+                }
+            }
+        }
+    }
+
+    failures
+}
+
 async fn encode_cue_stream_group_fallback(
     tracks: Vec<ScheduledCueStreamTrack>,
     req: &PipelineRequest,
@@ -35111,7 +38780,18 @@ async fn encode_cue_stream_group_fallback(
     cancel: &CancellationToken,
 ) -> Vec<ScheduledTrackOutput> {
     let mut outputs = Vec::with_capacity(tracks.len());
+    let batch_failures = prepare_required_cue_fallback_batches(&tracks, runner, cancel).await;
     for input in tracks {
+        if let Some(error) = batch_failures.get(&input.index) {
+            outputs.push(scheduled_worker_failure_output(
+                input.index,
+                &input.track,
+                None,
+                Some(input.final_path),
+                error.clone(),
+            ));
+            continue;
+        }
         if cancel.is_cancelled() {
             outputs.push(scheduled_worker_failure_output(
                 input.index,
@@ -35284,7 +38964,7 @@ fn cue_source_replaygain_eligible(source: &PreparedSource, req: &PipelineRequest
             && req.settings.wavpack.hybrid
         || !matches!(replaygain_format_support(req), ReplayGainFormatSupport::Supported)
         || !matches!(
-            inherited_replaygain_tag_policy(Some(source), &req.settings),
+            inherited_replaygain_tag_policy(Some(source), req),
             ReplayGainInheritedTagPolicy::Trust
         )
     {
@@ -35464,40 +39144,27 @@ fn cue_stream_album_direct_preflight(
     true
 }
 
-fn cue_source_replaygain_scan_command(
-    grouping: crate::convert::replaygain::LoudgainGrouping,
-    prevent_clipping: bool,
-    paths: &[PathBuf],
-    cwd: PathBuf,
-) -> ToolCommand {
-    ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-        binary: ToolBinary::Loudgain,
-        args: crate::convert::replaygain::loudgain_scan_args(
-            grouping,
-            prevent_clipping,
-            paths,
-        ),
-        secret_args: vec![],
-        cwd: Some(cwd),
-        env: vec![],
-        // Source-pass analysis consumes live FIFOs behind the sequential
-        // encoders, so its healthy lifetime is the conversion work unit. Keep
-        // the ordinary post-hoc loudgain scan's shorter timeout unchanged.
-        timeout: DEFAULT_CONVERT_TIMEOUT,
-    }
+#[derive(Debug, Clone)]
+struct CueReplayGainMirrorObserver {
+    path: PathBuf,
+    header: Vec<u8>,
+    member_id: String,
+    sample_rate_hz: u32,
+    channels: u16,
+    frames: u64,
+    encoding: crate::convert::replaygain::PcmMirrorEncoding,
 }
 
 fn cue_stream_replaygain_mirrors(
     tracks: &[ScheduledCueStreamTrack],
     root: &Path,
-) -> io::Result<(PathBuf, Vec<PathBuf>, BTreeMap<usize, ToolStreamMirror>)> {
+) -> io::Result<(PathBuf, Vec<CueReplayGainMirrorObserver>, BTreeMap<usize, ToolStreamMirror>)> {
     let dir = root.join(".cue-replaygain-stream");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
 
-    let build = (|| -> io::Result<(Vec<PathBuf>, BTreeMap<usize, ToolStreamMirror>)> {
-        let mut relative_paths = Vec::with_capacity(tracks.len());
+    let build = (|| -> io::Result<(Vec<CueReplayGainMirrorObserver>, BTreeMap<usize, ToolStreamMirror>)> {
+        let mut observers = Vec::with_capacity(tracks.len());
         let mut mirrors = BTreeMap::new();
         for (ordinal, input) in tracks.iter().enumerate() {
             let (carrier, channels, samples) = match &input.track.source_ref {
@@ -35523,25 +39190,39 @@ fn cue_stream_replaygain_mirrors(
             let name = format!("track-{:03}.wav", ordinal + 1);
             let absolute = dir.join(&name);
             create_cue_replaygain_fifo(&absolute)?;
-            relative_paths.push(PathBuf::from(name));
+            let header = cue_stream_analysis_wav_header(
+                sample_rate,
+                channels,
+                carrier,
+                samples,
+            )?;
+            let encoding = match carrier {
+                CueSegmentCarrier::PcmS32LeWav => crate::convert::replaygain::PcmMirrorEncoding::S32Le,
+                CueSegmentCarrier::PcmF32LeWav => crate::convert::replaygain::PcmMirrorEncoding::F32Le,
+                CueSegmentCarrier::PcmF64LeWav => crate::convert::replaygain::PcmMirrorEncoding::F64Le,
+            };
+            observers.push(CueReplayGainMirrorObserver {
+                path: absolute.clone(),
+                header: header.clone(),
+                member_id: replaygain_member_id(&input.track.id),
+                sample_rate_hz: sample_rate,
+                channels,
+                frames: samples,
+                encoding,
+            });
             mirrors.insert(
                 input.index,
                 ToolStreamMirror {
                     path: absolute,
-                    prefix: cue_stream_analysis_wav_header(
-                        sample_rate,
-                        channels,
-                        carrier,
-                        samples,
-                    )?,
+                    prefix: header,
                 },
             );
         }
-        Ok((relative_paths, mirrors))
+        Ok((observers, mirrors))
     })();
 
     match build {
-        Ok((relative_paths, mirrors)) => Ok((dir, relative_paths, mirrors)),
+        Ok((observers, mirrors)) => Ok((dir, observers, mirrors)),
         Err(error) => {
             // FIFOs are an optional analysis sidecar, not durable conversion
             // state. A partial setup must leave no stale readers/writers for a
@@ -35572,7 +39253,6 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
     );
     let groups = cue_stream_groups(&tracks);
     let source_rg = cue_source_replaygain_eligible(&source, &req)
-        && runner.tool_available(ToolBinary::Loudgain)
         && cue_stream_album_direct_preflight(&tracks, &req, &convert_root);
 
     if !source_rg {
@@ -35601,7 +39281,7 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
         };
     }
 
-    let (rg_dir, rg_paths, mirrors) = match cue_stream_replaygain_mirrors(&tracks, &convert_root) {
+    let (rg_dir, rg_observers, mirrors) = match cue_stream_replaygain_mirrors(&tracks, &convert_root) {
         Ok(value) => value,
         Err(error) => {
             log::warn!(
@@ -35639,40 +39319,193 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
         .replay_gain
         .mode
         .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
-    let grouping = if matches!(
+    let needs_album = matches!(
         mode,
         tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
-    ) {
-        crate::convert::replaygain::LoudgainGrouping::Album
-    } else {
-        crate::convert::replaygain::LoudgainGrouping::Track
-    };
-    let scan_cmd = cue_source_replaygain_scan_command(
-        grouping,
-        req.settings.replay_gain.prevent_clipping,
-        &rg_paths,
-        rg_dir.clone(),
     );
+    let demand = crate::convert::replaygain::MetricDemand::IntegratedOnly;
+    let manifest_members = rg_observers
+        .iter()
+        .map(|observer| observer.member_id.clone())
+        .collect::<Vec<_>>();
+    let manifest = match crate::convert::replaygain::ReplayGainManifestBinding::new(manifest_members) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&rg_dir);
+            log::warn!(
+                "source-pass ReplayGain manifest setup failed for job {}; using output-measured ReplayGain: {error}",
+                req.job_id
+            );
+            let mut outputs = Vec::with_capacity(tracks.len());
+            for group in groups {
+                outputs.extend(
+                    Box::pin(encode_cue_stream_group_with_runner(
+                        group,
+                        req.clone(),
+                        staging_root.clone(),
+                        staging_job.clone(),
+                        convert_root.clone(),
+                        tool_paths.clone(),
+                        tool_concurrency_limits.clone(),
+                        &runner,
+                        Some(reporter),
+                        cancel.clone(),
+                        None,
+                    ))
+                    .await,
+                );
+            }
+            return ScheduledCueStreamBatch { outputs, source_replaygain: None };
+        }
+    };
+
+    let observer_storage_limit = match crate::convert::replaygain::cue_observer_storage_limit(
+        rg_observers.len(),
+    ) {
+        Ok(limit) => limit,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&rg_dir);
+            log::warn!(
+                "source-pass ReplayGain resource admission failed for job {}; using output-measured ReplayGain: {error}",
+                req.job_id
+            );
+            let mut outputs = Vec::with_capacity(tracks.len());
+            for group in groups {
+                outputs.extend(
+                    Box::pin(encode_cue_stream_group_with_runner(
+                        group,
+                        req.clone(),
+                        staging_root.clone(),
+                        staging_job.clone(),
+                        convert_root.clone(),
+                        tool_paths.clone(),
+                        tool_concurrency_limits.clone(),
+                        &runner,
+                        Some(reporter),
+                        cancel.clone(),
+                        None,
+                    ))
+                    .await,
+                );
+            }
+            return ScheduledCueStreamBatch { outputs, source_replaygain: None };
+        }
+    };
+    if let Some(error) = rg_observers.iter().find_map(|observer| {
+        crate::convert::replaygain::preflight_cue_observer(
+            observer.sample_rate_hz,
+            observer.channels,
+            demand,
+            observer_storage_limit,
+        )
+        .err()
+    }) {
+        let _ = fs::remove_dir_all(&rg_dir);
+        log::warn!(
+            "source-pass ReplayGain meter setup failed for job {}; using output-measured ReplayGain: {error}",
+            req.job_id
+        );
+        let mut outputs = Vec::with_capacity(tracks.len());
+        for group in groups {
+            outputs.extend(
+                Box::pin(encode_cue_stream_group_with_runner(
+                    group,
+                    req.clone(),
+                    staging_root.clone(),
+                    staging_job.clone(),
+                    convert_root.clone(),
+                    tool_paths.clone(),
+                    tool_concurrency_limits.clone(),
+                    &runner,
+                    Some(reporter),
+                    cancel.clone(),
+                    None,
+                ))
+                .await,
+            );
+        }
+        return ScheduledCueStreamBatch { outputs, source_replaygain: None };
+    }
+
+    // The source-pass observer is optional. Keep a first-cause marker so a
+    // mirror-side failure can trigger the one admitted non-mirrored recovery,
+    // while an independent decoder/encoder failure is never hidden by that
+    // recovery. Interrupted/early-EOF observers do not claim causality: those
+    // are expected secondary symptoms when the conversion owner fails first.
+    const CUE_CAUSE_NONE: u8 = 0;
+    const CUE_CAUSE_OBSERVER: u8 = 1;
+    const CUE_CAUSE_CONVERSION: u8 = 2;
+    let first_failure_cause = Arc::new(AtomicU8::new(CUE_CAUSE_NONE));
     let rg_cancel = cancel.child_token();
     let analysis_cancel = rg_cancel.clone();
-    let analysis_limits = tool_concurrency_limits.clone();
-    // The production album path polls analysis and conversion concurrently.
-    // Keep both album-sized futures behind heap boundaries so the scheduler's
-    // `join!` does not re-aggregate the stack depth removed below.
+    let analysis_failure_cause = Arc::clone(&first_failure_cause);
+    // Open every FIFO reader before the segmented producer attempts to open a
+    // writer. Each native observer validates exact header, exact payload, and
+    // EOF after the payload; no external process owns this observation.
+    let mut observer_handles = Vec::with_capacity(rg_observers.len());
+    for observer in rg_observers {
+        let observer_cancel = analysis_cancel.clone();
+        observer_handles.push(tokio::task::spawn_blocking(move || {
+            crate::convert::replaygain::observe_cue_mirror(
+                &observer.path,
+                observer.member_id,
+                &observer.header,
+                observer.sample_rate_hz,
+                observer.channels,
+                observer.frames,
+                observer.encoding,
+                demand,
+                observer_storage_limit,
+                &observer_cancel,
+            )
+        }));
+    }
     let analysis = Box::pin(async {
-        let result = run_tool_command_with_concurrency(
-            scan_cmd,
-            &runner,
-            &analysis_cancel,
-            analysis_limits.as_ref(),
-        )
-        .await;
-        if result.is_err() {
-            analysis_cancel.cancel();
+        let mut observations = Vec::with_capacity(observer_handles.len());
+        for handle in observer_handles {
+            match handle.await {
+                Ok(Ok(observation)) => observations.push(observation),
+                Ok(Err(error)) => {
+                    if !cancel.is_cancelled()
+                        && !analysis_cancel.is_cancelled()
+                        && !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof)
+                    {
+                        let _ = analysis_failure_cause.compare_exchange(
+                            CUE_CAUSE_NONE,
+                            CUE_CAUSE_OBSERVER,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        analysis_cancel.cancel();
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    if !cancel.is_cancelled() && !analysis_cancel.is_cancelled() {
+                        let _ = analysis_failure_cause.compare_exchange(
+                            CUE_CAUSE_NONE,
+                            CUE_CAUSE_OBSERVER,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        analysis_cancel.cancel();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("native CUE ReplayGain observer task failed: {error}"),
+                    ));
+                }
+            }
         }
-        result
+        crate::convert::replaygain::reduce_cue_observations(
+            manifest,
+            demand,
+            observations,
+            needs_album,
+        )
     });
     let conversion_cancel = rg_cancel.clone();
+    let conversion_failure_cause = Arc::clone(&first_failure_cause);
     let conversion = Box::pin(async {
         let mut outputs = Vec::with_capacity(tracks.len());
         let mut direct = true;
@@ -35693,25 +39526,28 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
             .await;
             if group_outputs.iter().any(|output| !output.ok || output.record.realized_input.is_some()) {
                 direct = false;
+                let _ = conversion_failure_cause.compare_exchange(
+                    CUE_CAUSE_NONE,
+                    CUE_CAUSE_CONVERSION,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 conversion_cancel.cancel();
             }
             outputs.extend(group_outputs);
-            // This album-scoped work unit owns accounting for every coalesced
-            // CUE track. Even after cancellation, keep walking the remaining
-            // groups: the group encoder emits cheap terminal cancellation
-            // records without starting tools, preventing scheduler accounting
-            // from being left short of `pending.expected`.
         }
         (outputs, direct)
     });
 
     let (analysis_result, (mut outputs, direct)) = tokio::join!(analysis, conversion);
     let _ = fs::remove_dir_all(&rg_dir);
+    let failure_cause = first_failure_cause.load(Ordering::Acquire);
 
-    if !direct && !cancel.is_cancelled() {
-        // A source-RG sidecar failure is an optimization failure, never an
-        // album conversion failure. Re-run through the established non-mirrored
-        // streaming/fallback path and let ReplayGain scan the outputs later.
+    if failure_cause == CUE_CAUSE_OBSERVER && !direct && !cancel.is_cancelled() {
+        // The optional observer was the causal failure and disrupted the
+        // mirrored attempt. Settle that attempt first, then perform exactly one
+        // non-mirrored conversion rerun. The ordinary required final-output
+        // scan owns ReplayGain for the regenerated artifact.
         outputs.clear();
         for group in cue_stream_groups(&tracks) {
             outputs.extend(
@@ -35738,26 +39574,21 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
     }
 
     let source_replaygain = match analysis_result {
-        Ok(output) if direct && outputs.len() == tracks.len() && outputs.iter().all(|o| o.ok) => {
-            match crate::convert::replaygain::parse_loudgain_scan_output(
-                &output.stdout_tail,
-                tracks.len(),
-                grouping,
-            ) {
-                Ok(scan) => Some(scan),
-                Err(error) => {
-                    log::warn!(
-                        "source-pass ReplayGain output could not be parsed for job {}; using output-measured ReplayGain: {error}",
-                        req.job_id
-                    );
-                    None
-                }
-            }
+        Ok(scan)
+            if direct
+                && outputs.len() == tracks.len()
+                && outputs.iter().all(|output| output.ok) =>
+        {
+            Some(scan)
         }
         Ok(_) => None,
         Err(error) => {
+            // Healthy conversion outputs survive an optional observation
+            // failure and are scanned at the required final-output boundary.
+            // If conversion itself failed first, preserve that failure and do
+            // not spend the bounded recovery on an unrelated rerun.
             log::warn!(
-                "source-pass ReplayGain failed for job {}; using output-measured ReplayGain: {error}",
+                "source-pass native ReplayGain failed for job {}; using output-measured ReplayGain where conversion succeeded: {error}",
                 req.job_id
             );
             None
@@ -36601,8 +40432,38 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     cancel: CancellationToken,
 ) -> Result<ScheduledRealizedTrack, ScheduledTrackOutput> {
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
-    let runner = real_tool_runner_with_optional_version_cache(tool_paths, version_cache, &req);
+    let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let track = match prepare_track_scoped_certified_true_peak_carrier(
+        &req,
+        track.clone(),
+        &final_path,
+        &staging,
+        &runner,
+        &cancel,
+        &tool_paths,
+        tool_concurrency_limits.clone(),
+    )
+    .await
+    {
+        Ok(track) => track,
+        Err(err) => {
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                Vec::new(),
+                err,
+            );
+            return Err(ScheduledTrackOutput {
+                index: track_index,
+                record,
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+    };
     let mut progress_tracker = OperationProgressTracker::new(req.item_id.clone(), PipelineStage::Convert, Some(reporter));
     match realize_track_with_tool_limits_and_stats(
         &track.source_ref,
@@ -36612,22 +40473,52 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
         &runner,
         &cancel,
         tool_concurrency_limits,
+        true,
         Some(&mut progress_tracker),
     )
     .await
     {
-        Ok(realized) => Ok(ScheduledRealizedTrack {
-            index: track_index,
-            track,
-            final_path,
-            realized_path: realized.path,
-            realized_dsd_dst_stats: realized.dsd_dst_stats,
-            req,
-            staging_root,
-            staging_job,
-            convert_root,
-            cancel,
-        }),
+        Ok(realized) => match select_scalar_transport_or_materialized_baseline(
+            realized,
+            &req,
+            &track,
+            &staged_path,
+            &convert_root,
+            &runner,
+            &cancel,
+        )
+        .await
+        {
+            Ok(realized) => Ok(ScheduledRealizedTrack {
+                index: track_index,
+                track,
+                final_path,
+                realized_path: realized.path,
+                realized_dsd_dst_stats: realized.dsd_dst_stats,
+                scalar_pump: realized.scalar_pump,
+                req,
+                staging_root,
+                staging_job,
+                convert_root,
+                cancel,
+            }),
+            Err(err) => {
+                let record = failed_track_record(
+                    &track,
+                    None,
+                    Some(staged_path),
+                    Vec::new(),
+                    err.to_string(),
+                );
+                Err(ScheduledTrackOutput {
+                    index: track_index,
+                    record,
+                    artifact: None,
+                    ok: false,
+                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                })
+            }
+        },
         Err(err) => {
             let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
             Err(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
@@ -36692,10 +40583,11 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
     }
 
     let bytes_in = file_len(&realized.realized_path);
-    let executed = execute_planned_track_conversion(
+    let executed = execute_planned_track_conversion_with_scalar_pump(
         &realized.req,
         &realized.track,
         &realized.realized_path,
+        realized.scalar_pump.clone(),
         &staged_path,
         &realized.convert_root,
         &runner,
@@ -36935,33 +40827,20 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     retry_tool_paths: Option<&HashMap<String, PathBuf>>,
 ) -> PipelineReport {
-    let resolved_dsd_album_gain_scratch_authority = album.staging.is_scratch_staging()
-        && album.req.settings.dsd.runtime_album_gain_db().is_some();
-    let resolved_pcm_album_gain_scratch_authority = album.staging.is_scratch_staging()
-        && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some();
-    let resolved_album_gain_scratch_authority = resolved_dsd_album_gain_scratch_authority
-        || resolved_pcm_album_gain_scratch_authority;
-    let (mut album_gain_retry_seed, album_gain_retry_seed_error) =
-        if resolved_dsd_album_gain_scratch_authority {
-            match DsdAlbumGainScratchRetrySeed::capture(&album) {
-                Ok(seed) => (seed, None),
-                Err(error) => (None, Some(error)),
-            }
-        } else if resolved_pcm_album_gain_scratch_authority {
-            (
-                None,
-                Some(
-                    "PCM true-peak Album scope has a resolved submitted-batch gain; generic source retry is unsafe because it would discard the retained measured carrier"
-                        .to_string(),
-                ),
-            )
-        } else {
-            (None, None)
+    let resolved_album_gain_scratch_authority = album.staging.is_scratch_staging()
+        && (album.req.settings.dsd.runtime_album_gain_db().is_some()
+            || album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some());
+    let (mut certified_true_peak_retry_seed, certified_true_peak_retry_seed_error) =
+        match CertifiedTruePeakScratchRetrySeed::capture(&album, &track_outputs) {
+            Ok(seed) => (seed, None),
+            Err(error) => (None, Some(error)),
         };
+    let certified_true_peak_scratch_authority = certified_true_peak_retry_seed.is_some()
+        || resolved_album_gain_scratch_authority;
     let run_timing = album.run_timing.clone();
     let action_output = album.action_output;
     let source_replaygain = album.source_replaygain;
-    let album_gain_timings = album.album_gain_timings;
+    let dsd_true_peak_timings = album.dsd_true_peak_timings;
     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
     let req = album.req;
     let item_id = req.item_id.clone();
@@ -36995,18 +40874,18 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                 &outcome_for_retry,
             ) {
                 let original_error = scratch_retry_original_error_from_outcome(&outcome_for_retry);
-                if resolved_album_gain_scratch_authority {
+                if certified_true_peak_scratch_authority {
                     if cancel.is_cancelled() {
                         log::warn!(
-                            "resolved album-gain scratch retry suppressed by cancellation: job_id={}, item_id={}, original_error={}",
+                            "certified true-peak scratch retry suppressed by cancellation: job_id={}, item_id={}, original_error={}",
                             req.job_id,
                             item_id,
                             original_error,
                         );
                     } else if let (Some(seed), Some(tool_paths)) =
-                        (album_gain_retry_seed.take(), retry_tool_paths)
+                        (certified_true_peak_retry_seed.take(), retry_tool_paths)
                     {
-                        match Box::pin(retry_resolved_dsd_album_gain_once_on_disk(
+                        match Box::pin(retry_resolved_certified_true_peak_once_on_disk(
                             seed,
                             runner,
                             reporter,
@@ -37020,7 +40899,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                             Ok(report) => return report,
                             Err(error) => {
                                 log::error!(
-                                    "resolved album-gain scratch disk retry failed; refusing unsafe generic source retry: job_id={}, item_id={}, error={}, original_error={}",
+                                    "certified true-peak scratch disk retry failed; refusing unsafe generic source retry: job_id={}, item_id={}, error={}, original_error={}",
                                     req.job_id,
                                     item_id,
                                     error,
@@ -37029,20 +40908,21 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                             }
                         }
                     } else {
-                        let reason = album_gain_retry_seed_error
+                        let reason = certified_true_peak_retry_seed_error
                             .as_deref()
-                            .unwrap_or("scheduler did not provide album-aware retry tool paths");
+                            .unwrap_or("scheduler did not provide certified-carrier retry tool paths");
                         log::error!(
-                            "resolved album-gain scratch retry unavailable; refusing unsafe generic source retry: job_id={}, item_id={}, reason={}, original_error={}",
+                            "certified true-peak scratch retry unavailable; refusing unsafe generic source retry: job_id={}, item_id={}, reason={}, original_error={}",
                             req.job_id,
                             item_id,
                             reason,
                             original_error,
                         );
                     }
-                    // Fall through to the ordinary terminal publication path.
-                    // A visible Blocked outcome is preferable to silently
-                    // re-running this one source with track-scoped `norm`.
+                    // Fall through to ordinary terminal publication.  Once a
+                    // certified carrier/scalar exists, generic source retry is
+                    // not allowed to discard that authority and rescan or apply
+                    // another gain path.
                 } else {
                     log::warn!(
                         "scratch failure eligible for disk retry; deferring terminal failure publication: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
@@ -37209,21 +41089,11 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         });
         let replaygain_result = match source_scan_record {
             Some(Ok(record)) => Ok(record),
-            Some(Err(error)) => {
-                log::warn!(
-                    "source-pass ReplayGain tagging failed for job {}; rescanning encoded outputs: {error}",
-                    req.job_id
-                );
-                Box::pin(apply_replaygain_with_source_and_tool_limits(
-                    artifacts.as_ref().expect("artifacts present"),
-                    source.as_ref(),
-                    &req,
-                    runner,
-                    cancel,
-                    tool_concurrency_limits.clone(),
-                ))
-                .await
-            }
+            // Observation recovery is completed before this point. Once a
+            // retained source-pass result is selected, failure to apply its
+            // required metadata state is publication-blocking; do not hide a
+            // writer/identity failure behind an unrelated final-output rescan.
+            Some(Err(error)) => Err(error),
             None => Box::pin(apply_replaygain_with_source_and_tool_limits(
                 artifacts.as_ref().expect("artifacts present"),
                 source.as_ref(),
@@ -37258,9 +41128,41 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             }
         }
     } else {
-        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::NotRequested);
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
+        // Disabled scanning still owns inherited ReplayGain/R128 applicability.
+        // Run the metadata-disposition-only path; it constructs no meter.
+        emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
+        match Box::pin(apply_replaygain_with_source_and_tool_limits(
+            artifacts.as_ref().expect("artifacts present"),
+            source.as_ref(),
+            &req,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+        ))
+        .await
+        {
+            Ok(record) => {
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+            }
+            Err(err) => {
+                let record = stage_record(PipelineStage::ReplayGain, StageOutcome::Failed(err.to_string()));
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                current_outcome = aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_with_album_gain_scope_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                    Some(runner),
+                    album_gain_scope_disclosure.as_ref(),
+                );
+                return Box::pin(finalize_report(&req, reporter, source, plan, artifacts, published, current_outcome)).await;
+            }
+        }
     }
 
     if let Some(artifacts_mut) = artifacts.as_mut() {
@@ -37308,7 +41210,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             &staging,
             runner,
             album_gain_scope_disclosure.as_ref(),
-            Some(&album_gain_timings),
+            Some(&dsd_true_peak_timings),
             Some(&run_timing),
         ))
         .await
@@ -37679,6 +41581,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     run_timing: &ConversionRunTiming,
 ) -> PipelineReport {
     let item_id = req.item_id.clone();
+    super::baseline::run_started(&item_id);
     let mut source = None;
     let mut plan = None;
     let mut artifacts = None;
@@ -38325,9 +42228,53 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             }
         }
     } else {
-        let record = stage_record(PipelineStage::ReplayGain, StageOutcome::NotRequested);
-        emit_stage_finished(reporter, &item_id, record.clone()).await;
-        stages.push(record);
+        // Disabled scanning still owns inherited ReplayGain/R128 applicability.
+        // Run only the metadata-disposition path; it constructs no loudness meter.
+        emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
+        match apply_replaygain_with_source_and_tool_limits(
+            artifacts.as_ref().expect("artifacts present"),
+            source.as_ref(),
+            &req,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+        )
+        .await
+        {
+            Ok(record) => {
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+            }
+            Err(err) => {
+                let record = stage_record(
+                    PipelineStage::ReplayGain,
+                    StageOutcome::Failed(err.to_string()),
+                );
+                emit_stage_finished(reporter, &item_id, record.clone()).await;
+                stages.push(record);
+                current_outcome =
+                    aggregate_album_outcome(tracks.clone(), stages.clone(), req.failure_policy);
+                return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+                published = publish_terminal_conversion_log_fragment_if_needed(
+                    &req,
+                    source.as_ref(),
+                    artifacts.as_ref(),
+                    &current_outcome,
+                    staging,
+                    Some(runner),
+                );
+                return finalize_report(
+                    &req,
+                    reporter,
+                    source,
+                    plan,
+                    artifacts,
+                    published,
+                    current_outcome,
+                )
+                .await;
+            }
+        }
     }
 
     if let Some(artifacts_mut) = artifacts.as_mut() {
@@ -40773,8 +44720,9 @@ fn companion_track_source_path_and_role(
 ) -> Option<(&Path, CompanionSourceRefRole)> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
-        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => {
+        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => {
             Some((source_path.as_path(), CompanionSourceRefRole::File))
         }
         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -42211,9 +46159,12 @@ mod companion_copy_hardening_tests {
 
     fn test_request(root: &Path, container: PathBuf) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "companion-test-job".to_string(),
             item_id: "companion-test-item".to_string(),
+            submission_id: None,
+            submission_size: None,
             container,
             source: SourceOptions {
                 archive_password: None,
@@ -46160,6 +50111,31 @@ async fn finalize_report_with_binding_and_timing(
         warning_count,
         terminal_error_override,
     );
+    if super::baseline::enabled() {
+        let records: Vec<&TrackRecord> = match &outcome {
+            AlbumOutcome::Complete { tracks, .. } => tracks.iter().collect(),
+            AlbumOutcome::Partial { successful, failed, .. }
+            | AlbumOutcome::Blocked { successful, failed, .. } => {
+                successful.iter().chain(failed.iter()).collect()
+            }
+        };
+        for record in records {
+            super::baseline::emit(
+                "track_record",
+                serde_json::json!({
+                    "track_id": format!("{:?}", record.track_id),
+                    "outcome": format!("{:?}", record.outcome),
+                    "realized_input": record.realized_input.as_ref().map(|path| path.display().to_string()),
+                    "output_file": record.output_file.as_ref().map(|path| path.display().to_string()),
+                    "bytes_in": record.bytes_in,
+                    "bytes_out": record.bytes_out,
+                    "command_count": record.commands.len(),
+                    "command_elapsed_ms": record.duration.map(|duration| duration.as_secs_f64() * 1000.0),
+                }),
+            );
+        }
+    }
+    super::baseline::run_finished(&item_id, &format!("{status:?}"));
     reporter
         .emit(PipelineEvent::Terminal { item_id, status })
         .await;
@@ -46797,6 +50773,7 @@ fn first_dsd_dst_error_suffix(stats: &DsdDstPipelineStats) -> String {
 }
 
 async fn emit_stage_started(reporter: &dyn PipelineReporter, item_id: &str, stage: PipelineStage) {
+    super::baseline::stage_started(item_id, &format!("{stage:?}"));
     reporter
         .emit(PipelineEvent::StageStarted {
             item_id: item_id.to_string(),
@@ -46806,6 +50783,11 @@ async fn emit_stage_started(reporter: &dyn PipelineReporter, item_id: &str, stag
 }
 
 async fn emit_stage_finished(reporter: &dyn PipelineReporter, item_id: &str, record: StageRecord) {
+    super::baseline::stage_finished(
+        item_id,
+        &format!("{:?}", record.stage),
+        &format!("{:?}", record.outcome),
+    );
     reporter
         .emit(PipelineEvent::StageFinished {
             item_id: item_id.to_string(),
@@ -48416,8 +52398,9 @@ fn track_disc_number_from_source_ref_path(track: &PreparedTrack) -> Option<u32> 
 fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
-        TrackSourceRef::DsdAlbumGainCarrier { .. }
+        TrackSourceRef::DsdTruePeakCarrier { .. }
         | TrackSourceRef::PcmTruePeakCarrier { .. }
+        | TrackSourceRef::RegisteredEffectCarrier { .. }
         | TrackSourceRef::CueStreamSegment { .. }
         | TrackSourceRef::CueSegmentCarrier { .. }
         | TrackSourceRef::EmbeddedChapterCarrier { .. }
@@ -48432,8 +52415,9 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
 fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
-        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
-        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => Some(source_path.as_path()),
+        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => Some(source_path.as_path()),
         TrackSourceRef::CueStreamSegment { source_image, .. }
         | TrackSourceRef::CueSegmentCarrier { source_image, .. }
         | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => Some(source_image.as_path()),
@@ -51036,6 +55020,7 @@ fn stage_record_has_storage_exhaustion_for_scratch_retry(record: &StageRecord) -
     match &record.outcome {
         StageOutcome::Failed(message) => storage_exhaustion_message_looks_like(message),
         StageOutcome::Ok
+        | StageOutcome::OkWithDetail(_)
         | StageOutcome::NotRequested
         | StageOutcome::Skipped
         | StageOutcome::SkippedWithReason(_) => false,
@@ -51129,6 +55114,7 @@ fn stage_record_has_scratch_scoped_storage_exhaustion_for_retry(
     let message = match &record.outcome {
         StageOutcome::Failed(message) => message,
         StageOutcome::Ok
+        | StageOutcome::OkWithDetail(_)
         | StageOutcome::NotRequested
         | StageOutcome::Skipped
         | StageOutcome::SkippedWithReason(_) => return false,
@@ -51200,6 +55186,7 @@ fn scratch_retry_original_error_from_outcome(outcome: &AlbumOutcome) -> String {
         stages.iter().rev().find_map(|stage| match &stage.outcome {
             StageOutcome::Failed(error) => Some(format!("{:?}: {}", stage.stage, error)),
             StageOutcome::Ok
+            | StageOutcome::OkWithDetail(_)
             | StageOutcome::NotRequested
             | StageOutcome::Skipped
             | StageOutcome::SkippedWithReason(_) => None,
@@ -51428,8 +55415,7 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
         return StagingParentSelection::disk(disk_parent);
     }
 
-    if req.settings.pcm_true_peak.enabled
-        && req.settings.pcm_true_peak.scope == tonepoet_pipeline::PcmTruePeakScope::Album
+    if req.settings.pcm_true_peak.album_true_peak_gain_selected()
     {
         // Album scope retains a final-rate Float64 carrier until the complete
         // submitted set reaches the gain barrier. Before materialization, the
@@ -51463,7 +55449,7 @@ fn select_staging_parent_for(req: &PipelineRequest) -> StagingParentSelection {
     let (mut estimated_bytes, cue_streaming_facts) =
         scratch_peak_estimate_for_request(req, source_kind);
 
-    if req.settings.dsd.album_auto_gain_selected() {
+    if req.settings.dsd.album_true_peak_gain_selected() {
         match source_kind {
             Some(SourceKind::SingleFile) => match standalone_dsd_album_carrier_bytes(req) {
                 Ok(Some(carrier_bytes)) => {
@@ -51620,11 +55606,11 @@ mod scratch_staging_parent_tests {
         let mut req = pipeline_test_helpers::log_test_request();
         req.container = input;
         req.output_root = temp.path().join("out");
-        req.settings.dsd.set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
-        req.settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
+        req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         req.scratch_staging = Some(ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
             temp.path().join("scratch"),
             50,
@@ -51651,8 +55637,8 @@ mod scratch_staging_parent_tests {
         let mut req = pipeline_test_helpers::log_test_request();
         req.container = input;
         req.output_root = temp.path().join("out");
-        req.settings.pcm_true_peak.enabled = true;
-        req.settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        req.settings.pcm_true_peak.policy = req.settings.pcm_true_peak.policy.with_scope(tonepoet_pipeline::TruePeakScope::Album);
         req.scratch_staging = Some(ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
             temp.path().join("scratch"),
             50,
@@ -52130,8 +56116,9 @@ fn build_manifest_for_album(
                     .find(|t| t.id == artifact.track_id)
                     .map(|t| match &t.source_ref {
                         TrackSourceRef::StagedFile(p) => p.clone(),
-                        TrackSourceRef::DsdAlbumGainCarrier { source_path, .. }
-                        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. } => {
+                        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+                        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
+                        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => {
                             source_path.clone()
                         }
                         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -52185,6 +56172,7 @@ fn build_manifest_for_album(
     build_conversion_manifest(ManifestBuildInput {
         album_dir: album_plan.album_dir.clone(),
         settings: req.settings.clone(),
+        registered_effects: req.registered_effects.clone(),
         tracks: track_inputs,
     })
     .map_err(|err| format!("manifest build: {err}"))
@@ -52375,13 +56363,13 @@ mod pipeline_test_helpers {
         req.settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
         req.settings.target_bit_depth = BitDepthTarget::Pcm(depth);
         req.settings.dither_type = dither;
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         req.settings.dsd.from_dsd.gain_mode =
             tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
         req.settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
         req.settings
             .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
     }
 
     #[test]
@@ -52606,12 +56594,17 @@ mod pipeline_test_helpers {
             Some(SourceAudioCoding::Dsd),
         );
         track.bit_depth = Some(64);
-        track.source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+        track.source_ref = TrackSourceRef::DsdTruePeakCarrier {
             path: PathBuf::from("/stage/album-gain.f64le"),
             source_path: PathBuf::from("/music/source.dsf"),
             sample_rate_hz: 44_100,
             channels: 2,
             duration: None,
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: None,
         };
 
         let mut req = log_test_request();
@@ -52637,9 +56630,12 @@ mod pipeline_test_helpers {
 
     pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".to_string(),
             item_id: "item-1".to_string(),
+            submission_id: None,
+            submission_size: None,
             container: PathBuf::from("/tmp/input.7z"),
             source: SourceOptions {
                 archive_password: None,
@@ -53506,24 +57502,12 @@ mod conversion_log_tests {
     use super::*;
     use super::pipeline_test_helpers::*;
 
-    fn legacy_dsd_settings(
-        gain_mode: DsdToPcmGainMode,
-        gain_db: Option<f32>,
+    fn dsd_settings_with_gain(
+        policy: tonepoet_pipeline::SampleGainPolicy,
     ) -> tonepoet_pipeline::DsdSettings {
-        let native = tonepoet_pipeline::DsdSettings::native_v2();
-        serde_json::from_value(serde_json::json!({
-            "noise_shaper": native.pcm_to_dsd.noise_shaper,
-            "modulator_order": native.pcm_to_dsd.modulator_order,
-            "trellis": native.pcm_to_dsd.trellis,
-            "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
-            "dsd_to_pcm_lowpass": tonepoet_pipeline::DsdLowpassMethod::Auto,
-            "dsd_to_pcm_gain_mode": gain_mode,
-            "dsd_to_pcm_auto_gain_margin_db": 0.15,
-            "dsd_to_pcm_gain_db": gain_db,
-            "sinc": native.pcm_to_dsd.sinc,
-            "gain_compensation": native.pcm_to_dsd.gain_compensation,
-        }))
-        .expect("exact legacy DSD settings fixture")
+        let mut settings = tonepoet_pipeline::DsdSettings::default();
+        settings.set_gain_policy(policy);
+        settings
     }
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
@@ -53598,8 +57582,8 @@ mod conversion_log_tests {
         let source = log_test_source();
         let req = log_test_request();
         let record = ok_record();
-        let mut album_gain_timings = BTreeMap::new();
-        album_gain_timings.insert(
+        let mut dsd_true_peak_timings = BTreeMap::new();
+        dsd_true_peak_timings.insert(
             record.track_id.clone(),
             DsdAlbumGainTiming {
                 realization: Duration::from_millis(125),
@@ -53621,7 +57605,7 @@ mod conversion_log_tests {
             chrono::Utc::now(),
             None,
             None,
-            Some(&album_gain_timings),
+            Some(&dsd_true_peak_timings),
             None,
         );
 
@@ -53895,7 +57879,7 @@ mod conversion_log_tests {
             vec![stage_record(
                 PipelineStage::ReplayGain,
                 StageOutcome::SkippedWithReason(
-                    "DSF output is not supported by loudgain".to_string(),
+                    "ReplayGain writer is unavailable for this output".to_string(),
                 ),
             )],
             FailurePolicy::FailAlbumOnAnyTrackFailure,
@@ -53912,7 +57896,7 @@ mod conversion_log_tests {
 
         assert!(log.contains("ReplayGain: Enabled"));
         assert!(log.contains(
-            "ReplayGain: Skipped (DSF output is not supported by loudgain)"
+            "ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"
         ));
         assert!(!log.contains("ReplayGain: Not requested"));
         assert!(log.contains("Result: Complete"));
@@ -54076,41 +58060,40 @@ mod conversion_log_tests {
         dsd_source.tracks[0].sample_rate = Some(2_822_400);
         dsd_source.tracks[0].bit_depth = None;
         let mut dsd_req = log_test_request();
-        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Auto, None);
-        let dsd_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(dsd_log.contains("DSD gain mode: auto"));
-        assert!(dsd_log.contains("DSD auto gain margin"));
-        assert!(!dsd_log.contains("DSD true-peak scan"));
+        dsd_req.settings.dsd = dsd_settings_with_gain(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default(),
+        );
+        let guard_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(guard_log.contains("DSD path: general"));
+        assert!(guard_log.contains("DSD gain mode: true-peak guard"));
+        assert!(guard_log.contains("DSD true-peak target: -0.1 dBTP"));
+        assert!(guard_log.contains("DSD true-peak scope: track"));
+        assert!(guard_log.contains("DSD true-peak scan: reference"));
+        assert!(guard_log.contains("DSD->PCM lowpass method"));
+        assert!(!guard_log.contains("DSD fixed gain"));
 
-        dsd_req
-            .settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
-        dsd_req
-            .settings
-            .dsd
-            .set_true_peak_scan_mode(tonepoet_pipeline::DsdTruePeakScanMode::Fast);
-        let album_fast_log =
-            build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(album_fast_log.contains(
-            "DSD true-peak scan: fast"
-        ));
-        assert!(dsd_log.contains("DSD→PCM lowpass method"));
-        assert!(!dsd_log.contains("DSD manual gain"));
-        assert!(!dsd_log.contains("DSD filter preset"));
-        assert!(!dsd_log.contains("PCM→DSD filter preset"));
+        dsd_req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_normalize_default()
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album)
+                .with_scan(tonepoet_pipeline::TruePeakScanTier::Fast),
+        );
+        let normalize_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(normalize_log.contains("DSD gain mode: true-peak normalize"));
+        assert!(normalize_log.contains("DSD true-peak scope: album"));
+        assert!(normalize_log.contains("DSD true-peak scan: fast"));
 
-        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Disabled, Some(6.0));
-        let disabled_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(disabled_log.contains("DSD gain mode: disabled"));
-        assert!(!disabled_log.contains("DSD auto gain margin"));
-        assert!(!disabled_log.contains("DSD manual gain"));
+        dsd_req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+        let off_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(off_log.contains("DSD gain mode: off"));
+        assert!(!off_log.contains("DSD true-peak target"));
 
-        dsd_req.settings.dsd = legacy_dsd_settings(DsdToPcmGainMode::Manual, Some(6.0));
-        let manual_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(manual_log.contains("DSD gain mode: manual"));
-        assert!(!manual_log.contains("DSD auto gain margin"));
-        assert!(manual_log.contains("DSD manual gain: 6 dB"));
+        dsd_req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::FixedGain {
+            gain_db: "6.000000000".parse().expect("fixed gain"),
+        });
+        let fixed_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
+        assert!(fixed_log.contains("DSD gain mode: fixed gain"));
+        assert!(fixed_log.contains("DSD fixed gain: 6 dB"));
+        assert!(!fixed_log.contains("DSD true-peak target"));
     }
 
     #[test]
@@ -54448,11 +58431,9 @@ mod conversion_log_tests {
         let mut req = log_test_request();
         req.settings.target_format = PlannerAudioFormat::Flac;
         req.settings.target_sample_rate = RateTarget::Source;
-        // Reference-policy log labels are gated on the native-v2 DSD origin
-        // (selects_reference_dsd_to_pcm requires is_native_v2). Without it the
-        // planner would treat this as an ordinary SoX DSD→PCM conversion and the
-        // log would omit the "Reference policy" wording under test.
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        // Select the qualified Reference pathway explicitly so the log exercises
+        // Reference policy wording rather than ordinary general DSD processing.
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
 
         let artifacts = log_test_artifacts();
         let mut record = ok_record();
@@ -55004,9 +58985,12 @@ mod naming_template_tests {
 
     pub(super) fn template_request(folder_template: Option<String>) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-test".to_string(),
             item_id: "item-test".to_string(),
+            submission_id: None,
+            submission_size: None,
             container: PathBuf::from("/tmp/container.7z"),
             source: SourceOptions {
                 archive_password: None,
@@ -57606,9 +61590,12 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         overwrite: OverwritePolicy,
     ) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-2-1-3".to_string(),
             item_id: format!("item-{:?}", policy),
+            submission_id: None,
+            submission_size: None,
             container: root.join("input.flac"),
             source: SourceOptions {
                 archive_password: None,
@@ -58194,21 +62181,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
     }
 
-    #[test]
-    fn cue_source_replaygain_scan_uses_conversion_lifetime_budget() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let command = cue_source_replaygain_scan_command(
-            crate::convert::replaygain::LoudgainGrouping::Album,
-            false,
-            &[PathBuf::from("track-001.wav")],
-            temp.path().to_path_buf(),
-        );
-        assert_eq!(command.timeout, DEFAULT_CONVERT_TIMEOUT);
-        assert!(
-            command.timeout > Duration::from_secs(600),
-            "live FIFO analysis must not inherit the ten-minute post-hoc scan timeout"
-        );
-    }
+
 
     #[test]
     fn cue_stream_direct_plan_preserves_24_bit_source_fast_path() {
@@ -59336,9 +63309,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 plan,
                 stages: Vec::new(),
                 source_replaygain: None,
-                album_gain_measurements: Vec::new(),
+                dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),
-                album_gain_timings: BTreeMap::new(),
+                dsd_true_peak_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
                 run_timing: ConversionRunTiming::start(),
                 pre_actions_completed_before_album_gain_rerun: false,
@@ -59384,19 +63357,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
     fn configure_album_gain_manifest_skip(fixture: &mut AlbumFixture, gain_db: &str) {
         fixture.album.req.publish.overwrite = OverwritePolicy::SkipIfManifestMatch;
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(tonepoet_pipeline::DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy album auto gain");
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         fixture.album.req.settings.dsd.bind_runtime_album_gain(
             gain_db.parse().expect("gain db"),
             Some("-0.500000000".parse().expect("peak db")),
@@ -59545,19 +63510,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stage_policy(false, true, true),
             OverwritePolicy::FailIfExists,
         );
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(tonepoet_pipeline::DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy album auto gain");
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         fixture.album.req.settings.dsd.bind_runtime_album_gain(
             "0.340000000".parse().expect("album gain"),
             Some("-0.500000000".parse().expect("album peak")),
@@ -59571,12 +63528,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&retained_carrier, b"float64-raw-placeholder")
             .expect("retained album-gain carrier");
         let single_file_track_id = fixture.album.source.tracks[0].id.clone();
-        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
             path: retained_carrier,
             source_path: a_source.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: Some(Duration::from_secs(1)),
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: None,
         };
         fixture.album.source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
         fixture.album.album_gain_scope_disclosure = Some(DsdAlbumGainScopeDisclosure {
@@ -60074,23 +64036,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.req.settings.target_format = PlannerAudioFormat::Flac;
         fixture.album.req.settings.metadata.transfer_tags = true;
         fixture.album.req.settings.metadata.preserve_artwork = true;
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(
-                tonepoet_pipeline::DsdToPcmGainMode::Auto,
-                0.15,
-                None,
-            )
-            .expect("SACD album-scope gain settings");
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         fixture.album.req.settings.dsd.bind_runtime_album_gain(
             "0.000000000".parse().expect("SACD album gain"),
             Some("-1.000000000".parse().expect("SACD album peak")),
@@ -60122,12 +64072,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&carrier, b"raw f64 album-gain carrier").expect("SACD carrier fixture");
         fixture.album.req.container = iso.clone();
         fixture.album.source.container = iso.clone();
-        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
             path: carrier,
             source_path: iso.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: Some(Duration::from_secs(30)),
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: None,
         };
         fixture.album.source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
 
@@ -60539,12 +64494,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .expect("original DSF fixture");
         std::fs::write(&carrier, b"raw f64 carrier").expect("carrier fixture");
         fixture.album.source.container = original_dsd.clone();
-        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
             path: carrier.clone(),
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: Some(Duration::from_secs(123)),
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: None,
         };
 
         let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
@@ -60675,19 +64635,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
         fixture.album.req.settings.metadata.transfer_tags = true;
         fixture.album.req.settings.metadata.preserve_artwork = true;
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(tonepoet_pipeline::DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("album auto gain settings");
-        fixture
-            .album
-            .req
-            .settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        fixture.album.req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         fixture.album.req.settings.dsd.bind_runtime_album_gain(
             "2.840000000".parse().expect("fixed album gain"),
             Some("-3.000000000".parse().expect("album peak")),
@@ -60757,12 +64709,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let carrier = root.join("Presence-01.album-gain.f64le");
         std::fs::write(&carrier, b"carrier provenance only").expect("carrier fixture");
         fixture.album.source.container = original_dsd.clone();
-        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdAlbumGainCarrier {
+        fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
             path: carrier,
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: Some(Duration::from_millis(100)),
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: None,
         };
 
         let mut artifact = successful_output(&fixture, 0).artifact.expect("artifact");
@@ -62148,48 +66105,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(!staging_root.exists(), "owned staging dir is dropped when prepare exits cancelled");
     }
 
-    #[tokio::test]
-    async fn all_tracks_ok_runs_metadata_replaygain_features_and_publish() {
-        let fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(true, true, true),
-            OverwritePolicy::FailIfExists,
-        );
-        let runner = BlockingToolRunner::with_behaviors([
-            ToolBehavior::Succeed,
-            ToolBehavior::Succeed,
-        ]);
-        let reporter = RecordingReporter::new();
-        let cancel = CancellationToken::new();
-        let outputs = vec![successful_output(&fixture, 0)];
 
-        let report = finish_pipeline_album_for_scheduler(
-            fixture.album,
-            outputs,
-            &runner,
-            &reporter,
-            &cancel,
-        )
-        .await;
-
-        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
-        // SingleFile FLAC→FLAC: planner transfers source tags via ffmpeg, so
-        // the orchestrator metadata stage is correctly skipped (no authoritative
-        // materializer metadata to apply).
-        assert!(matches!(
-            stage_outcome(&report, PipelineStage::Metadata),
-            Some(StageOutcome::SkippedWithReason(reason))
-                if reason == "already satisfied by the output planner"
-        ));
-        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Ok)));
-        assert!(matches!(stage_outcome(&report, PipelineStage::Features), Some(StageOutcome::Ok)));
-        assert!(matches!(stage_outcome(&report, PipelineStage::Publish), Some(StageOutcome::Ok)));
-        let transcript = runner.transcript();
-        assert_eq!(transcript.len(), 1);
-        assert_eq!(transcript[0].binary, ToolBinary::Loudgain);
-        assert!(report.published.is_some());
-    }
 
     #[tokio::test]
     async fn optional_stages_not_requested_remain_nonblocking_and_publish() {
@@ -62226,39 +66142,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(report.published.is_some());
     }
 
-    #[tokio::test]
-    async fn unsupported_requested_replaygain_remains_nonblocking_and_publishes() {
-        let mut fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, true, false),
-            OverwritePolicy::FailIfExists,
-        );
-        fixture.album.req.settings.target_format = PlannerAudioFormat::Dsf;
-        let runner = BlockingToolRunner::new();
-        let reporter = RecordingReporter::new();
-        let cancel = CancellationToken::new();
-        let outputs = vec![successful_output(&fixture, 0)];
 
-        let report = finish_pipeline_album_for_scheduler(
-            fixture.album,
-            outputs,
-            &runner,
-            &reporter,
-            &cancel,
-        )
-        .await;
-
-        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
-        assert_eq!(
-            stage_outcome(&report, PipelineStage::ReplayGain),
-            Some(&StageOutcome::SkippedWithReason(
-                "DSF output is not supported by loudgain".to_string()
-            ))
-        );
-        assert!(runner.transcript().is_empty());
-        assert!(report.published.is_some());
-    }
 
     #[tokio::test]
     async fn five_track_fail_fast_blocks_after_convert_and_runs_no_postprocessing_tools() {
@@ -62428,38 +66312,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(report.published.is_none());
     }
 
-    #[tokio::test]
-    async fn replaygain_failure_blocks_features_and_publish() {
-        let fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, true, true),
-            OverwritePolicy::FailIfExists,
-        );
-        let runner = BlockingToolRunner::with_behaviors([
-            ToolBehavior::FailWithStderr("replaygain failed".to_string()),
-        ]);
-        let reporter = RecordingReporter::new();
-        let cancel = CancellationToken::new();
-        let outputs = vec![successful_output(&fixture, 0)];
 
-        let report = finish_pipeline_album_for_scheduler(
-            fixture.album,
-            outputs,
-            &runner,
-            &reporter,
-            &cancel,
-        )
-        .await;
-
-        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Failed(_))));
-        assert!(stage_outcome(&report, PipelineStage::Features).is_none());
-        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
-        assert!(matches!(report.outcome, AlbumOutcome::Blocked { .. }));
-        assert_eq!(runner.transcript().len(), 1);
-        assert_eq!(runner.transcript()[0].binary, ToolBinary::Loudgain);
-        assert!(report.published.is_none());
-    }
 
     #[tokio::test]
     async fn publish_failure_blocks_and_still_writes_durable_log() {
@@ -62551,45 +66404,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert_eq!(runner.transcript().len(), 1);
     }
 
-    #[tokio::test]
-    async fn cancellation_during_replaygain_runs_no_features_or_publish() {
-        let fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, true, true),
-            OverwritePolicy::FailIfExists,
-        );
-        let (gate, blocker) = tool_gate();
-        let runner = std::sync::Arc::new(BlockingToolRunner::with_behaviors([
-            ToolBehavior::BlockThenSucceed(blocker),
-        ]));
-        let reporter = RecordingReporter::new();
-        let cancel = CancellationToken::new();
-        let outputs = vec![successful_output(&fixture, 0)];
-        let run_cancel = cancel.clone();
-        let run_runner = runner.clone();
-        let handle = tokio::spawn(async move {
-            finish_pipeline_album_for_scheduler(
-                fixture.album,
-                outputs,
-                run_runner.as_ref(),
-                &reporter,
-                &run_cancel,
-            )
-            .await
-        });
 
-        let release = gate.wait_started().await;
-        cancel.cancel();
-        let report = handle.await.expect("finish task joins");
-        drop(release);
-
-        assert!(matches!(stage_outcome(&report, PipelineStage::ReplayGain), Some(StageOutcome::Failed(_))));
-        assert!(stage_outcome(&report, PipelineStage::Features).is_none());
-        assert!(stage_outcome(&report, PipelineStage::Publish).is_none());
-        assert!(report.published.is_none());
-        assert_eq!(runner.transcript().len(), 1);
-    }
 
 
     #[tokio::test]
@@ -64740,7 +68555,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stage_record(
                 PipelineStage::ReplayGain,
                 StageOutcome::SkippedWithReason(
-                    "DSF output is not supported by loudgain".to_string(),
+                    "ReplayGain writer is unavailable for this output".to_string(),
                 ),
             ),
             stage_record(PipelineStage::Features, StageOutcome::NotRequested),
@@ -64775,7 +68590,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             "Metadata: Skipped (already satisfied by the output planner)"
         ));
         assert!(assembled.contains(
-            "ReplayGain: Skipped (DSF output is not supported by loudgain)"
+            "ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"
         ));
         assert!(assembled.contains("Features: Not requested"));
         assert!(!assembled.contains("Metadata: Not requested"));
@@ -68381,7 +72196,7 @@ mod validate_encoded_output_tests {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
         settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
         settings.wavpack.hybrid = true;
-        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
 
         for (source_bits, expected) in [
@@ -68400,8 +72215,8 @@ mod validate_encoded_output_tests {
             );
         }
 
-        settings.pcm_true_peak.enabled = false;
-        settings.pcm_true_peak.fixed_gain_db = Some("2.500000000".parse().unwrap());
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::Off;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::FixedGain { gain_db: "2.500000000".parse().unwrap() };
         track.bit_depth = Some(320);
         track.source_audio.bit_depth = Some(320);
         assert_eq!(
@@ -68410,7 +72225,7 @@ mod validate_encoded_output_tests {
             "fixed-gain hybrid Source must validate against the same integer working depth as planning",
         );
 
-        settings.pcm_true_peak.fixed_gain_db = None;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::Off;
         settings.wavpack.hybrid = false;
         track.bit_depth = Some(320);
         track.source_audio.bit_depth = Some(320);
@@ -68546,7 +72361,7 @@ mod validate_encoded_output_tests {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
         settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
         settings.wavpack.hybrid = true;
-        settings.pcm_true_peak.enabled = true;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
         let expected_depth = expected_post_encode_depth_for_track(&track, &settings)
             .expect("hybrid Float32 Source must resolve a strict integer validation depth");

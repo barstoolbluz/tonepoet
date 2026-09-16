@@ -480,6 +480,15 @@ impl PipelineReporter for BroadcastReporter {
                             true,
                         );
                     }
+                    StageOutcome::OkWithDetail(detail) => {
+                        let window = Self::window(record.stage);
+                        self.send_processing(
+                            record.stage,
+                            window.end,
+                            Some(format!("{}: {detail}", Self::stage_complete_message(record.stage))),
+                            true,
+                        );
+                    }
                     StageOutcome::NotRequested => {
                         let window = Self::window(record.stage);
                         self.send_processing(
@@ -771,7 +780,7 @@ mod broadcast_reporter_tests {
                 record: StageRecord {
                     stage: PipelineStage::ReplayGain,
                     outcome: StageOutcome::SkippedWithReason(
-                        "DSF output is not supported by loudgain".to_string(),
+                        "ReplayGain writer is unavailable for this output".to_string(),
                     ),
                     dsd_dst_stats: None,
                 },
@@ -784,7 +793,7 @@ mod broadcast_reporter_tests {
             crate::convert::ConversionStatus::Processing { message, .. } => {
                 assert_eq!(
                     message.as_deref(),
-                    Some("ReplayGain skipped: DSF output is not supported by loudgain")
+                    Some("ReplayGain skipped: ReplayGain writer is unavailable for this output")
                 );
             }
             other => panic!("expected processing update, got {other:?}"),

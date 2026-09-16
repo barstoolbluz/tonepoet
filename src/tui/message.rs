@@ -763,7 +763,7 @@ pub enum AppMessage {
         generation: u64,
         mode: crate::tui::app::MetadataReplayGainScanMode,
         paths: Vec<std::path::PathBuf>,
-        result: Result<Vec<crate::tui::probe::SourceMetadata>, String>,
+        result: Result<(Vec<crate::tui::probe::SourceMetadata>, String), String>,
     },
     /// Generic reusable file-picker completion. All picker owners send this
     /// message so purpose dispatch is centralized in the event loop instead of

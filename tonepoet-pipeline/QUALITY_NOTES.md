@@ -10,7 +10,7 @@ Key invariants:
 - Metadata-strip, ReplayGain-only, source-MD5-only, and verify-only requests use deterministic stream-copy/post-processing paths where possible.
 - Metadata pruning runs after registry plugin selection; a metadata step is skipped only when the selected plugin reports `MetadataDisposition::WritesRequestedPolicy`.
 - Built-in FFmpeg metadata handling is target-aware. It does not claim DSF/DFF artwork/tag support or artwork support for containers that the command builder cannot write safely.
-- Built-in loudgain support is target-aware. Unsupported targets fail through plugin selection rather than settings validation, so custom plugins can support additional targets.
+- ReplayGain is not a command plugin. The common executor admits its production reader and metadata writer independently on the realized artifact; unsupported required writes fail or report the existing optional skip contract.
 - Passthrough and execute plans carry deterministic work paths plus cleanup paths for interruption-safe executors.
 - FLAC source-MD5 tagging uses `metaflac --set-tag=SOURCE_AUDIO_MD5=...`; no ID3v2 write path exists for FLAC.
 - FLAC verification uses real decode testing through `flac -t -s`; generic verification uses FFmpeg decode-to-null.

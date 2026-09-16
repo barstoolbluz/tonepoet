@@ -15,8 +15,11 @@ fast-stage-timing = []
 [dependencies]
 num-complex = "=0.4.6"
 
-# Preserve the release-codegen shape used for the supplied performance baseline.
-# This is not the LLVM-21 loop-vectorizer workaround: the operator still needs
-# the documented vectorizer-disable flag for the known compiler fault.
+# Preserve the release-codegen shape used for standalone extraction/builds.
+# Cargo ignores member-local profiles when this crate is built from the Tonepoet
+# workspace; the workspace root supplies the equivalent package-specific
+# override for integrated builds. This is not the LLVM-21 loop-vectorizer
+# workaround: the operator still needs the documented vectorizer-disable flag
+# for the known compiler fault.
 [profile.release]
 codegen-units = 1

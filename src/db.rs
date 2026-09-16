@@ -2799,7 +2799,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 25;
+    const ANALYSIS_ALGO_VERSION: i32 = 26;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -2846,6 +2846,7 @@ impl Database {
                         duration_secs: row.get(9)?,
                         lufs: row.get(10)?,
                         true_peak_dbtp: row.get(11)?,
+                        loudness_status: crate::tui::analyze::LoudnessAnalysisStatus::Available,
                         preemphasis,
                         preemphasis_corr: row.get(13)?,
                         preemphasis_detail: row.get(14)?,
@@ -3024,6 +3025,16 @@ impl Database {
         size: u64,
         r: &crate::tui::analyze::AnalysisResult,
     ) -> Result<(), String> {
+        // The current cache schema predates typed native-loudness status. Cache
+        // only finite completed loudness results; unavailable/failed scans are
+        // re-observed so their typed reason is never collapsed into a nullable
+        // LUFS field on reload.
+        if !matches!(
+            &r.loudness_status,
+            crate::tui::analyze::LoudnessAnalysisStatus::Available
+        ) {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO analysis_cache (
                 file_path, file_mtime, file_size, algo_version,

@@ -8,6 +8,7 @@
 //! S16 preparation is a consumer/front-end concern and is not performed here.
 
 mod k_weighting;
+mod simd;
 mod statistics;
 mod windows;
 
@@ -41,6 +42,52 @@ pub enum LoudnessProfile {
     NativeEbu2023,
     /// Compatibility profile matching libebur128 1.2.6 on identical prepared PCM.
     Libebur128126,
+}
+
+/// Metrics requested from a loudness observation or album reduction.
+///
+/// Integrated-only demand is intentionally limited to the native profile at
+/// meter construction. Compatibility observations retain their historical
+/// full-metric behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoudnessMetricDemand {
+    IntegratedOnly,
+    IntegratedAndRange,
+}
+
+impl LoudnessMetricDemand {
+    #[inline]
+    const fn includes_range(self) -> bool {
+        matches!(self, Self::IntegratedAndRange)
+    }
+}
+
+/// Metrics actually present in owned sufficient statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoudnessMetricCoverage {
+    IntegratedOnly,
+    IntegratedAndRange,
+}
+
+impl LoudnessMetricCoverage {
+    #[must_use]
+    pub const fn satisfies(self, demand: LoudnessMetricDemand) -> bool {
+        match demand {
+            LoudnessMetricDemand::IntegratedOnly => true,
+            LoudnessMetricDemand::IntegratedAndRange => {
+                matches!(self, Self::IntegratedAndRange)
+            }
+        }
+    }
+}
+
+impl From<LoudnessMetricDemand> for LoudnessMetricCoverage {
+    fn from(value: LoudnessMetricDemand) -> Self {
+        match value {
+            LoudnessMetricDemand::IntegratedOnly => Self::IntegratedOnly,
+            LoudnessMetricDemand::IntegratedAndRange => Self::IntegratedAndRange,
+        }
+    }
 }
 
 /// Loudness role of one decoded channel, in decoded channel order.
@@ -101,6 +148,9 @@ impl IntegratedLoudness {
 /// observations is represented separately.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoudnessRange {
+    /// Range was intentionally omitted because no declared consumer requested
+    /// it. This is distinct from a requested range with no eligible windows.
+    NotRequested,
     Finite { lu: f64, observations: usize },
     Unavailable { observations: usize },
 }
@@ -110,7 +160,7 @@ impl LoudnessRange {
     pub const fn finite_lu(&self) -> Option<f64> {
         match self {
             Self::Finite { lu, .. } => Some(*lu),
-            Self::Unavailable { .. } => None,
+            Self::NotRequested | Self::Unavailable { .. } => None,
         }
     }
 
@@ -118,6 +168,7 @@ impl LoudnessRange {
     pub const fn observations(&self) -> usize {
         match self {
             Self::Finite { observations, .. } | Self::Unavailable { observations } => *observations,
+            Self::NotRequested => 0,
         }
     }
 }
@@ -128,6 +179,7 @@ pub struct LoudnessSummary {
     pub sample_rate_hz: u32,
     pub roles: Vec<ChannelRole>,
     pub profile: LoudnessProfile,
+    pub metric_coverage: LoudnessMetricCoverage,
     pub real_frames: u64,
     pub integrated: IntegratedLoudness,
     pub range: LoudnessRange,
@@ -143,6 +195,7 @@ pub struct LoudnessSummary {
 #[derive(Debug)]
 pub struct LoudnessStatistics {
     profile: LoudnessProfile,
+    metric_coverage: LoudnessMetricCoverage,
     integrated_energies: Vec<f64>,
     // Sorted at track finalization.  Temporal order is not needed by the LRA
     // rank calculation, and sorting in place avoids a permanent second copy.
@@ -154,6 +207,11 @@ impl LoudnessStatistics {
     #[must_use]
     pub const fn profile(&self) -> LoudnessProfile {
         self.profile
+    }
+
+    #[must_use]
+    pub const fn metric_coverage(&self) -> LoudnessMetricCoverage {
+        self.metric_coverage
     }
 
     #[must_use]
@@ -189,6 +247,7 @@ pub struct LoudnessMeasurement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlbumLoudnessSummary {
     pub profile: LoudnessProfile,
+    pub metric_coverage: LoudnessMetricCoverage,
     pub track_count: usize,
     pub integrated: IntegratedLoudness,
     pub range: LoudnessRange,
@@ -210,6 +269,14 @@ pub enum LoudnessError {
     ResourceLimit { required_bytes: usize, limit_bytes: usize },
     AllocationFailed,
     MeterFailed,
+    UnsupportedMetricDemand {
+        profile: LoudnessProfile,
+        demand: LoudnessMetricDemand,
+    },
+    IncompleteMetricCoverage {
+        required: LoudnessMetricDemand,
+        available: LoudnessMetricCoverage,
+    },
     IncompatibleProfile,
     InvalidReportingPeak,
     EmptyAlbum,
@@ -241,6 +308,14 @@ impl fmt::Display for LoudnessError {
             ),
             Self::AllocationFailed => f.write_str("loudness buffer allocation failed"),
             Self::MeterFailed => f.write_str("loudness meter is terminal after a previous processing failure"),
+            Self::UnsupportedMetricDemand { profile, demand } => write!(
+                f,
+                "loudness metric demand {demand:?} is not supported for profile {profile:?}"
+            ),
+            Self::IncompleteMetricCoverage { required, available } => write!(
+                f,
+                "loudness statistics provide {available:?}, but {required:?} is required"
+            ),
             Self::IncompatibleProfile => f.write_str("album tracks use incompatible loudness profiles"),
             Self::InvalidReportingPeak => f.write_str("reporting peak must be finite and nonnegative"),
             Self::EmptyAlbum => f.write_str("album contains no tracks"),
@@ -258,6 +333,8 @@ pub struct LoudnessMeter {
     roles: Vec<ChannelRole>,
     weights: Vec<f64>,
     profile: LoudnessProfile,
+    metric_demand: LoudnessMetricDemand,
+    simd_backend: simd::Backend,
     coefficients: KWeightingCoefficients,
     filters: Vec<FilterState>,
     ring: Vec<f64>,
@@ -305,6 +382,24 @@ impl LoudnessMeter {
         )
     }
 
+    /// Construct a meter with explicit metric demand using the default storage
+    /// allowance. Integrated-only demand is available for the native profile;
+    /// existing constructors continue to request integrated loudness and LRA.
+    pub fn with_roles_and_metric_demand(
+        sample_rate_hz: u32,
+        roles: &[ChannelRole],
+        profile: LoudnessProfile,
+        metric_demand: LoudnessMetricDemand,
+    ) -> Result<Self, LoudnessError> {
+        Self::with_roles_and_metric_demand_and_limit(
+            sample_rate_hz,
+            roles,
+            profile,
+            metric_demand,
+            DEFAULT_LOUDNESS_STORAGE_LIMIT_BYTES,
+        )
+    }
+
     /// Explicit libebur128 1.2.6 count-based default channel mapping.
     /// This constructor is compatibility behavior, not native role inference.
     pub fn libebur128_126_default_layout(
@@ -327,6 +422,24 @@ impl LoudnessMeter {
         profile: LoudnessProfile,
         storage_limit_bytes: usize,
     ) -> Result<Self, LoudnessError> {
+        Self::with_roles_and_metric_demand_and_limit(
+            sample_rate_hz,
+            roles,
+            profile,
+            LoudnessMetricDemand::IntegratedAndRange,
+            storage_limit_bytes,
+        )
+    }
+
+    /// Advanced constructor with explicit metric demand and retained-storage
+    /// admission limit.
+    pub fn with_roles_and_metric_demand_and_limit(
+        sample_rate_hz: u32,
+        roles: &[ChannelRole],
+        profile: LoudnessProfile,
+        metric_demand: LoudnessMetricDemand,
+        storage_limit_bytes: usize,
+    ) -> Result<Self, LoudnessError> {
         if sample_rate_hz == 0 {
             return Err(LoudnessError::InvalidSampleRate);
         }
@@ -337,11 +450,24 @@ impl LoudnessMeter {
             return Err(LoudnessError::InvalidChannelCount);
         }
         validate_roles(roles, profile)?;
+        if profile == LoudnessProfile::Libebur128126
+            && metric_demand == LoudnessMetricDemand::IntegratedOnly
+        {
+            return Err(LoudnessError::UnsupportedMetricDemand {
+                profile,
+                demand: metric_demand,
+            });
+        }
 
         let channels = roles.len();
         let coefficients = KWeightingCoefficients::for_rate(sample_rate_hz)?;
         let clock = WindowClock::new(sample_rate_hz, profile)?;
-        let ring_frames = usize::try_from(clock.ring_frames())
+        let requested_ring_frames = if metric_demand.includes_range() {
+            clock.ring_frames()
+        } else {
+            clock.integrated_window_frames()
+        };
+        let ring_frames = usize::try_from(requested_ring_frames)
             .map_err(|_| LoudnessError::InputTooLong)?;
         let ring_samples = ring_frames
             .checked_mul(channels)
@@ -425,12 +551,19 @@ impl LoudnessMeter {
             });
         }
 
+        let simd_backend = match profile {
+            LoudnessProfile::NativeEbu2023 => simd::Backend::production(),
+            LoudnessProfile::Libebur128126 => simd::Backend::scalar(),
+        };
+
         Ok(Self {
             sample_rate_hz,
             channels,
             roles: owned_roles,
             weights,
             profile,
+            metric_demand,
+            simd_backend,
             coefficients,
             filters,
             ring,
@@ -451,6 +584,11 @@ impl LoudnessMeter {
     #[must_use]
     pub const fn profile(&self) -> LoudnessProfile {
         self.profile
+    }
+
+    #[must_use]
+    pub const fn metric_demand(&self) -> LoudnessMetricDemand {
+        self.metric_demand
     }
 
     #[must_use]
@@ -502,12 +640,22 @@ impl LoudnessMeter {
             .frames_seen
             .checked_add(new_frames)
             .ok_or(LoudnessError::InputTooLong)?;
-        self.preflight_history(target, true, true)?;
+        let include_lra = self.metric_demand.includes_range();
+        self.preflight_history(target, true, include_lra)?;
 
-        for frame in samples.chunks_exact(self.channels) {
-            if let Err(error) = self.process_frame(frame, true, true) {
-                self.failed = true;
-                return Err(error);
+        if self.simd_backend.is_scalar() {
+            for frame in samples.chunks_exact(self.channels) {
+                if let Err(error) = self.process_frame_scalar(frame, true, include_lra) {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+        } else {
+            for frame in samples.chunks_exact(self.channels) {
+                if let Err(error) = self.process_frame_simd(frame, true, include_lra) {
+                    self.failed = true;
+                    return Err(error);
+                }
             }
         }
         self.real_frames = self
@@ -526,7 +674,10 @@ impl LoudnessMeter {
             return Err(LoudnessError::MeterFailed);
         }
         let real_frames = self.real_frames;
-        if self.profile == LoudnessProfile::NativeEbu2023 && real_frames > 0 {
+        if self.profile == LoudnessProfile::NativeEbu2023
+            && self.metric_demand.includes_range()
+            && real_frames > 0
+        {
             let continuation_frames = u64::from(self.sample_rate_hz)
                 .checked_mul(3)
                 .and_then(|value| value.checked_add(1))
@@ -542,23 +693,37 @@ impl LoudnessMeter {
                 .try_reserve_exact(self.channels)
                 .map_err(|_| LoudnessError::AllocationFailed)?;
             zero_frame.resize(self.channels, 0.0);
-            for _ in 0..continuation_frames {
-                self.process_frame(&zero_frame, false, true)?;
+            if self.simd_backend.is_scalar() {
+                for _ in 0..continuation_frames {
+                    self.process_frame_scalar(&zero_frame, false, true)?;
+                }
+            } else {
+                for _ in 0..continuation_frames {
+                    self.process_frame_simd(&zero_frame, false, true)?;
+                }
             }
         }
 
-        sort_lra_energies(&mut self.lra_energies);
+        if self.metric_demand.includes_range() {
+            sort_lra_energies(&mut self.lra_energies);
+        }
         let integrated = integrated_from_absolute_energies(
             &self.integrated_energies,
             self.profile,
             real_frames,
             self.clock.integrated_window_frames(),
         );
-        let range = lra_from_sorted_absolute_energies(&self.lra_energies, self.profile);
+        let metric_coverage = LoudnessMetricCoverage::from(self.metric_demand);
+        let range = if self.metric_demand.includes_range() {
+            lra_from_sorted_absolute_energies(&self.lra_energies, self.profile)
+        } else {
+            LoudnessRange::NotRequested
+        };
         let summary = LoudnessSummary {
             sample_rate_hz: self.sample_rate_hz,
             roles: self.roles.clone(),
             profile: self.profile,
+            metric_coverage,
             real_frames,
             integrated,
             range,
@@ -568,6 +733,7 @@ impl LoudnessMeter {
         };
         let statistics = LoudnessStatistics {
             profile: self.profile,
+            metric_coverage,
             integrated_energies: self.integrated_energies,
             lra_energies: self.lra_energies,
             real_frames,
@@ -622,7 +788,7 @@ impl LoudnessMeter {
         result
     }
 
-    fn process_frame(
+    fn process_frame_scalar(
         &mut self,
         frame: &[f64],
         emit_integrated: bool,
@@ -633,6 +799,7 @@ impl LoudnessMeter {
             .write_frame
             .checked_mul(self.channels)
             .ok_or(LoudnessError::InputTooLong)?;
+        // This remains the authority graph and portable fallback.
         for channel in 0..self.channels {
             let filtered = self.filters[channel].process(frame[channel], self.coefficients);
             if !filtered.is_finite() {
@@ -640,6 +807,45 @@ impl LoudnessMeter {
             }
             self.ring[base + channel] = filtered;
         }
+        self.finish_frame(emit_integrated, emit_lra)
+    }
+
+    fn process_frame_simd(
+        &mut self,
+        frame: &[f64],
+        emit_integrated: bool,
+        emit_lra: bool,
+    ) -> Result<(), LoudnessError> {
+        debug_assert_eq!(frame.len(), self.channels);
+        debug_assert!(!self.simd_backend.is_scalar());
+        let base = self
+            .write_frame
+            .checked_mul(self.channels)
+            .ok_or(LoudnessError::InputTooLong)?;
+        let channels = self.channels;
+        let backend = self.simd_backend;
+        let coefficients = self.coefficients;
+        simd::filter_frame(
+            backend,
+            frame,
+            &mut self.filters,
+            coefficients,
+            &mut self.ring[base..base + channels],
+        );
+        if self.ring[base..base + channels]
+            .iter()
+            .any(|filtered| !filtered.is_finite())
+        {
+            return Err(LoudnessError::NumericalRange);
+        }
+        self.finish_frame(emit_integrated, emit_lra)
+    }
+
+    fn finish_frame(
+        &mut self,
+        emit_integrated: bool,
+        emit_lra: bool,
+    ) -> Result<(), LoudnessError> {
         self.write_frame += 1;
         if self.write_frame == self.ring_frames {
             self.write_frame = 0;
@@ -666,6 +872,64 @@ impl LoudnessMeter {
     }
 
     fn window_energy(&self, window_frames: u64) -> Result<f64, LoudnessError> {
+        if self.simd_backend.is_scalar() {
+            return self.window_energy_scalar(window_frames);
+        }
+
+        let window_frames = usize::try_from(window_frames).map_err(|_| LoudnessError::InputTooLong)?;
+        if window_frames == 0 || window_frames > self.ring_frames {
+            return Err(LoudnessError::InputTooLong);
+        }
+        let start_frame = if self.write_frame >= window_frames {
+            self.write_frame - window_frames
+        } else {
+            self.ring_frames - (window_frames - self.write_frame)
+        };
+        let first_frames = window_frames.min(self.ring_frames - start_frame);
+        let second_frames = window_frames - first_frames;
+
+        let mut spans = [(0_usize, 0_usize); 2];
+        let span_count;
+        if self.profile == LoudnessProfile::Libebur128126 && second_frames > 0 {
+            spans[0] = (0, second_frames);
+            spans[1] = (start_frame, first_frames);
+            span_count = 2;
+        } else {
+            spans[0] = (start_frame, first_frames);
+            if second_frames > 0 {
+                spans[1] = (0, second_frames);
+                span_count = 2;
+            } else {
+                span_count = 1;
+            }
+        }
+
+        let mut channel_sums = [0.0_f64; MAX_CHANNELS];
+        simd::window_channel_sums(
+            self.simd_backend,
+            &self.ring,
+            self.channels,
+            &self.weights,
+            &spans[..span_count],
+            &mut channel_sums,
+        );
+
+        let mut total = 0.0;
+        for channel in 0..self.channels {
+            if self.weights[channel] == 0.0 {
+                continue;
+            }
+            total += self.weights[channel] * channel_sums[channel];
+        }
+        let energy = total / window_frames as f64;
+        if energy.is_finite() && energy >= 0.0 {
+            Ok(energy)
+        } else {
+            Err(LoudnessError::NumericalRange)
+        }
+    }
+
+    fn window_energy_scalar(&self, window_frames: u64) -> Result<f64, LoudnessError> {
         let window_frames = usize::try_from(window_frames).map_err(|_| LoudnessError::InputTooLong)?;
         if window_frames == 0 || window_frames > self.ring_frames {
             return Err(LoudnessError::InputTooLong);
@@ -733,12 +997,13 @@ impl LoudnessMeter {
     }
 }
 
-/// Builder for a loudgain/libebur128-style album: each track is independently
-/// windowed and filtered, then its retained observations are pooled in declared
-/// manifest order.  PCM is never concatenated.
+/// Builder for album loudness reduction: each track is independently windowed
+/// and filtered, then the demanded retained observations are pooled in declared
+/// manifest order. PCM is never concatenated.
 #[derive(Debug)]
 pub struct AlbumLoudnessBuilder {
     profile: Option<LoudnessProfile>,
+    metric_demand: LoudnessMetricDemand,
     tracks: usize,
     real_frames: u64,
     integrated_energies: Vec<f64>,
@@ -752,8 +1017,20 @@ pub struct AlbumLoudnessBuilder {
 impl AlbumLoudnessBuilder {
     #[must_use]
     pub fn new(storage_limit_bytes: usize) -> Self {
+        Self::with_metric_demand(
+            storage_limit_bytes,
+            LoudnessMetricDemand::IntegratedAndRange,
+        )
+    }
+
+    #[must_use]
+    pub fn with_metric_demand(
+        storage_limit_bytes: usize,
+        metric_demand: LoudnessMetricDemand,
+    ) -> Self {
         Self {
             profile: None,
+            metric_demand,
             tracks: 0,
             real_frames: 0,
             integrated_energies: Vec::new(),
@@ -763,6 +1040,11 @@ impl AlbumLoudnessBuilder {
             storage_bytes: 0,
             failed: false,
         }
+    }
+
+    #[must_use]
+    pub const fn metric_demand(&self) -> LoudnessMetricDemand {
+        self.metric_demand
     }
 
     pub fn push_track(
@@ -782,6 +1064,12 @@ impl AlbumLoudnessBuilder {
             }
             _ => {}
         }
+        if !statistics.metric_coverage.satisfies(self.metric_demand) {
+            return Err(LoudnessError::IncompleteMetricCoverage {
+                required: self.metric_demand,
+                available: statistics.metric_coverage,
+            });
+        }
 
         let next_real_frames = self
             .real_frames
@@ -796,10 +1084,15 @@ impl AlbumLoudnessBuilder {
             .len()
             .checked_add(statistics.integrated_energies.len())
             .ok_or(LoudnessError::InputTooLong)?;
+        let incoming_lra_len = if self.metric_demand.includes_range() {
+            statistics.lra_energies.len()
+        } else {
+            0
+        };
         let needed_lra = self
             .lra_energies
             .len()
-            .checked_add(statistics.lra_energies.len())
+            .checked_add(incoming_lra_len)
             .ok_or(LoudnessError::InputTooLong)?;
         let needed_bytes = needed_integrated
             .checked_add(needed_lra)
@@ -811,6 +1104,47 @@ impl AlbumLoudnessBuilder {
                 limit_bytes: self.storage_limit_bytes,
             });
         }
+
+
+        // The first participant already owns exactly the buffers the album
+        // reducer needs. Reuse them only when every consumed buffer is tight;
+        // retaining spare capacity here could make a later track fail where the
+        // established compact-copy path would still fit.
+        let can_adopt_first = self.tracks == 0
+            && self.integrated_energies.is_empty()
+            && self.lra_energies.is_empty()
+            && statistics.integrated_energies.capacity()
+                == statistics.integrated_energies.len()
+            && (!self.metric_demand.includes_range()
+                || statistics.lra_energies.capacity() == statistics.lra_energies.len());
+        if can_adopt_first {
+            let adopted_bytes = statistics
+                .integrated_energies
+                .capacity()
+                .checked_add(if self.metric_demand.includes_range() {
+                    statistics.lra_energies.capacity()
+                } else {
+                    0
+                })
+                .and_then(|count| count.checked_mul(std::mem::size_of::<f64>()))
+                .ok_or(LoudnessError::InputTooLong)?;
+            if adopted_bytes <= self.storage_limit_bytes {
+                if self.profile.is_none() {
+                    self.profile = Some(statistics.profile);
+                }
+                self.real_frames = next_real_frames;
+                self.reporting_peak_linear =
+                    self.reporting_peak_linear.max(reporting_peak_linear);
+                self.integrated_energies = statistics.integrated_energies;
+                if self.metric_demand.includes_range() {
+                    self.lra_energies = statistics.lra_energies;
+                }
+                self.tracks = next_tracks;
+                self.storage_bytes = adopted_bytes;
+                return Ok(());
+            }
+        }
+
         let capacities_before = (
             self.integrated_energies.capacity(),
             self.lra_energies.capacity(),
@@ -819,9 +1153,11 @@ impl AlbumLoudnessBuilder {
             self.integrated_energies
                 .try_reserve_exact(statistics.integrated_energies.len())
                 .map_err(|_| LoudnessError::AllocationFailed)?;
-            self.lra_energies
-                .try_reserve_exact(statistics.lra_energies.len())
-                .map_err(|_| LoudnessError::AllocationFailed)?;
+            if self.metric_demand.includes_range() {
+                self.lra_energies
+                    .try_reserve_exact(statistics.lra_energies.len())
+                    .map_err(|_| LoudnessError::AllocationFailed)?;
+            }
             Ok::<(), LoudnessError>(())
         })();
         if let Err(error) = reserve_result {
@@ -867,7 +1203,9 @@ impl AlbumLoudnessBuilder {
         self.reporting_peak_linear = self.reporting_peak_linear.max(reporting_peak_linear);
         self.integrated_energies
             .append(&mut statistics.integrated_energies);
-        self.lra_energies.append(&mut statistics.lra_energies);
+        if self.metric_demand.includes_range() {
+            self.lra_energies.append(&mut statistics.lra_energies);
+        }
         self.tracks = next_tracks;
         self.storage_bytes = actual_storage_bytes;
         Ok(())
@@ -895,10 +1233,16 @@ impl AlbumLoudnessBuilder {
                 0,
             )
         };
-        sort_lra_energies(&mut self.lra_energies);
-        let range = lra_from_sorted_absolute_energies(&self.lra_energies, profile);
+        let metric_coverage = LoudnessMetricCoverage::from(self.metric_demand);
+        let range = if self.metric_demand.includes_range() {
+            sort_lra_energies(&mut self.lra_energies);
+            lra_from_sorted_absolute_energies(&self.lra_energies, profile)
+        } else {
+            LoudnessRange::NotRequested
+        };
         Ok(AlbumLoudnessSummary {
             profile,
+            metric_coverage,
             track_count: self.tracks,
             integrated,
             range,
@@ -1331,6 +1675,7 @@ mod tests {
     ) -> LoudnessStatistics {
         LoudnessStatistics {
             profile,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
             integrated_energies: integrated_energies.to_vec(),
             lra_energies: lra_energies.to_vec(),
             real_frames,
@@ -1628,6 +1973,857 @@ mod tests {
         let mut one_short = LoudnessMeter::new(48_000, 2).unwrap();
         one_short.push_interleaved(&tone(48_000, frames - 1, 0.1, 0)).unwrap();
         assert_eq!(one_short.finalize().unwrap().statistics.lra_observations(), 0);
+    }
+
+    fn native_meter_with_demand(
+        rate: u32,
+        roles: &[ChannelRole],
+        demand: LoudnessMetricDemand,
+    ) -> LoudnessMeter {
+        LoudnessMeter::with_roles_and_metric_demand(
+            rate,
+            roles,
+            LoudnessProfile::NativeEbu2023,
+            demand,
+        )
+        .unwrap()
+    }
+
+    fn assert_bits_eq(left: &[f64], right: &[f64]) {
+        assert_eq!(left.len(), right.len());
+        for (index, (left, right)) in left.iter().zip(right).enumerate() {
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "binary64 mismatch at index {index}: {left:?} != {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perf06_native_integrated_only_preserves_integrated_bits_and_real_extent() {
+        const RATE: u32 = 44_101;
+        const FRAMES: usize = RATE as usize * 4 + 777;
+        let roles = [ChannelRole::Left, ChannelRole::Right, ChannelRole::Lfe];
+        let mut pcm = Vec::with_capacity(FRAMES * roles.len());
+        for n in 0..FRAMES {
+            let phase = 2.0 * std::f64::consts::PI * 997.0 * n as f64 / f64::from(RATE);
+            let tiny = if n % 997 == 0 { f64::from_bits(1) } else { 0.0 };
+            pcm.extend([
+                0.125 * phase.sin() + tiny,
+                -0.0625 * (1.7 * phase).cos(),
+                if n % 211 == 0 { -0.9 } else { 0.0 },
+            ]);
+        }
+
+        let mut full = native_meter_with_demand(
+            RATE,
+            &roles,
+            LoudnessMetricDemand::IntegratedAndRange,
+        );
+        let mut reduced = native_meter_with_demand(
+            RATE,
+            &roles,
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        let pattern = [1usize, 37, 4_411, 2, 8_903, 113, 7, 2_047];
+        let mut offset_frames = 0usize;
+        let mut chunk_index = 0usize;
+        while offset_frames < FRAMES {
+            let chunk_frames = pattern[chunk_index % pattern.len()];
+            let count = chunk_frames.min(FRAMES - offset_frames);
+            let start = offset_frames * roles.len();
+            let end = (offset_frames + count) * roles.len();
+            full.push_interleaved(&pcm[start..end]).unwrap();
+            reduced.push_interleaved(&pcm[start..end]).unwrap();
+            offset_frames += count;
+            chunk_index += 1;
+        }
+
+        assert_eq!(full.real_frames(), FRAMES as u64);
+        assert_eq!(reduced.real_frames(), FRAMES as u64);
+        assert_bits_eq(&full.integrated_energies, &reduced.integrated_energies);
+        assert_eq!(reduced.lra_energies.len(), 0);
+        assert_eq!(reduced.frames_seen, reduced.real_frames);
+
+        let full = full.finalize().unwrap();
+        let reduced = reduced.finalize().unwrap();
+        assert_eq!(full.summary.integrated, reduced.summary.integrated);
+        assert_bits_eq(
+            &full.statistics.integrated_energies,
+            &reduced.statistics.integrated_energies,
+        );
+        assert_eq!(
+            reduced.summary.metric_coverage,
+            LoudnessMetricCoverage::IntegratedOnly
+        );
+        assert_eq!(reduced.summary.range, LoudnessRange::NotRequested);
+        assert_eq!(reduced.summary.absolute_lra_observations, 0);
+        assert_eq!(reduced.statistics.lra_observations(), 0);
+    }
+
+    #[test]
+    fn perf07_metric_coverage_is_explicit_and_album_admission_is_subset_safe() {
+        let compatibility_error = LoudnessMeter::with_roles_and_metric_demand(
+            48_000,
+            &[ChannelRole::Left, ChannelRole::Right],
+            LoudnessProfile::Libebur128126,
+            LoudnessMetricDemand::IntegratedOnly,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            compatibility_error,
+            LoudnessError::UnsupportedMetricDemand { .. }
+        ));
+
+        let pcm = tone(48_000, 48_000, 0.1, 0);
+        let mut reduced_meter = native_meter_with_demand(
+            48_000,
+            &[ChannelRole::Left, ChannelRole::Right],
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        reduced_meter.push_interleaved(&pcm).unwrap();
+        let reduced = reduced_meter.finalize().unwrap();
+
+        let mut full_builder = AlbumLoudnessBuilder::new(DEFAULT_LOUDNESS_STORAGE_LIMIT_BYTES);
+        assert!(matches!(
+            full_builder.push_track(reduced.statistics, 0.75),
+            Err(LoudnessError::IncompleteMetricCoverage {
+                required: LoudnessMetricDemand::IntegratedAndRange,
+                available: LoudnessMetricCoverage::IntegratedOnly,
+            })
+        ));
+        assert_eq!(full_builder.tracks, 0);
+        assert!(full_builder.profile.is_none());
+
+        let mut full_meter = LoudnessMeter::new(48_000, 2).unwrap();
+        full_meter.push_interleaved(&pcm).unwrap();
+        let full = full_meter.finalize().unwrap();
+        full_builder.push_track(full.statistics, 0.5).unwrap();
+        assert_eq!(full_builder.tracks, 1);
+
+        let mut subset_builder = AlbumLoudnessBuilder::with_metric_demand(
+            DEFAULT_LOUDNESS_STORAGE_LIMIT_BYTES,
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        let short = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedOnly,
+            integrated_energies: Vec::new(),
+            lra_energies: Vec::new(),
+            real_frames: 100,
+        };
+        subset_builder.push_track(short, 0.9).unwrap();
+
+        let mut full_meter = LoudnessMeter::new(48_000, 2).unwrap();
+        full_meter.push_interleaved(&pcm).unwrap();
+        let full = full_meter.finalize().unwrap();
+        subset_builder.push_track(full.statistics, 0.25).unwrap();
+        let subset = subset_builder.finalize().unwrap();
+        assert_eq!(subset.metric_coverage, LoudnessMetricCoverage::IntegratedOnly);
+        assert_eq!(subset.range, LoudnessRange::NotRequested);
+        assert_eq!(subset.track_count, 2);
+        assert_eq!(subset.reporting_peak_linear.to_bits(), 0.9_f64.to_bits());
+
+        // Requested-but-mathematically-unavailable range remains distinct
+        // from a deliberately omitted range on the same short programme.
+        let short_pcm = tone(48_000, 100, 0.1, 0);
+        let mut short_full = LoudnessMeter::new(48_000, 2).unwrap();
+        short_full.push_interleaved(&short_pcm).unwrap();
+        let short_full = short_full.finalize().unwrap();
+        assert_eq!(
+            short_full.summary.metric_coverage,
+            LoudnessMetricCoverage::IntegratedAndRange
+        );
+        assert_eq!(
+            short_full.summary.range,
+            LoudnessRange::Unavailable { observations: 0 }
+        );
+
+        let mut short_reduced = native_meter_with_demand(
+            48_000,
+            &[ChannelRole::Left, ChannelRole::Right],
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        short_reduced.push_interleaved(&short_pcm).unwrap();
+        let short_reduced = short_reduced.finalize().unwrap();
+        assert_eq!(short_reduced.summary.range, LoudnessRange::NotRequested);
+    }
+
+    #[test]
+    fn perf08_integrated_only_ring_and_history_use_the_reduced_resource_geometry() {
+        let roles = [ChannelRole::Left, ChannelRole::Right];
+        let full = LoudnessMeter::with_roles(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+        let reduced = native_meter_with_demand(
+            48_000,
+            &roles,
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        assert_eq!(full.ring_frames, 144_000);
+        assert_eq!(reduced.ring_frames, 19_200);
+        assert!(reduced.fixed_storage_bytes < full.fixed_storage_bytes);
+
+        let exact_reduced_limit = reduced.fixed_storage_bytes;
+        drop(reduced);
+        let reduced = LoudnessMeter::with_roles_and_metric_demand_and_limit(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+            LoudnessMetricDemand::IntegratedOnly,
+            exact_reduced_limit,
+        )
+        .unwrap();
+        assert_eq!(reduced.fixed_storage_bytes, exact_reduced_limit);
+        assert!(matches!(
+            LoudnessMeter::with_roles_and_limit(
+                48_000,
+                &roles,
+                LoudnessProfile::NativeEbu2023,
+                exact_reduced_limit,
+            ),
+            Err(LoudnessError::ResourceLimit { .. })
+        ));
+
+        let mut reduced = LoudnessMeter::with_roles_and_metric_demand_and_limit(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+            LoudnessMetricDemand::IntegratedOnly,
+            DEFAULT_LOUDNESS_STORAGE_LIMIT_BYTES,
+        )
+        .unwrap();
+        reduced
+            .push_interleaved(&tone(48_000, 5 * 48_000, 0.1, 0))
+            .unwrap();
+        assert_eq!(reduced.lra_energies.len(), 0);
+        assert_eq!(reduced.lra_energies.capacity(), 0);
+    }
+
+    #[test]
+    fn perf10_first_track_adopts_only_tight_consumed_buffers() {
+        let tight_integrated = vec![1.0, 2.0, 3.0].into_boxed_slice().into_vec();
+        let tight_lra = vec![4.0, 5.0].into_boxed_slice().into_vec();
+        assert_eq!(tight_integrated.capacity(), tight_integrated.len());
+        assert_eq!(tight_lra.capacity(), tight_lra.len());
+        let integrated_ptr = tight_integrated.as_ptr();
+        let lra_ptr = tight_lra.as_ptr();
+        let stats = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
+            integrated_energies: tight_integrated,
+            lra_energies: tight_lra,
+            real_frames: 48_000,
+        };
+        let mut builder = AlbumLoudnessBuilder::new(5 * std::mem::size_of::<f64>());
+        builder.push_track(stats, 0.4).unwrap();
+        assert_eq!(builder.integrated_energies.as_ptr(), integrated_ptr);
+        assert_eq!(builder.lra_energies.as_ptr(), lra_ptr);
+        assert_eq!(builder.storage_bytes, 5 * std::mem::size_of::<f64>());
+
+        // Admission failures happen before ownership transfer can alter the
+        // logical album. Exact allowance succeeds above; one f64 less and an
+        // invalid peak both leave a fresh builder empty and reusable.
+        let insufficient = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
+            integrated_energies: vec![1.0, 2.0, 3.0].into_boxed_slice().into_vec(),
+            lra_energies: vec![4.0, 5.0].into_boxed_slice().into_vec(),
+            real_frames: 48_000,
+        };
+        let mut too_small = AlbumLoudnessBuilder::new(4 * std::mem::size_of::<f64>());
+        assert!(matches!(
+            too_small.push_track(insufficient, 0.4),
+            Err(LoudnessError::ResourceLimit { .. })
+        ));
+        assert_eq!(too_small.tracks, 0);
+        assert!(too_small.profile.is_none());
+        assert_eq!(too_small.storage_bytes, 0);
+
+        let invalid_peak = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
+            integrated_energies: vec![1.0].into_boxed_slice().into_vec(),
+            lra_energies: vec![2.0].into_boxed_slice().into_vec(),
+            real_frames: 48_000,
+        };
+        let mut invalid_peak_builder = AlbumLoudnessBuilder::new(16 * std::mem::size_of::<f64>());
+        assert_eq!(
+            invalid_peak_builder.push_track(invalid_peak, f64::NAN),
+            Err(LoudnessError::InvalidReportingPeak)
+        );
+        assert_eq!(invalid_peak_builder.tracks, 0);
+        assert!(invalid_peak_builder.profile.is_none());
+
+        let mut slack = Vec::with_capacity(16);
+        slack.extend([1.0, 2.0, 3.0]);
+        let incoming_ptr = slack.as_ptr();
+        let stats = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedOnly,
+            integrated_energies: slack,
+            lra_energies: Vec::new(),
+            real_frames: 48_000,
+        };
+        let mut builder = AlbumLoudnessBuilder::with_metric_demand(
+            64 * std::mem::size_of::<f64>(),
+            LoudnessMetricDemand::IntegratedOnly,
+        );
+        builder.push_track(stats, 0.2).unwrap();
+        assert_ne!(builder.integrated_energies.as_ptr(), incoming_ptr);
+        assert_eq!(builder.integrated_energies.as_slice(), &[1.0, 2.0, 3.0]);
+        assert_eq!(
+            builder.storage_bytes,
+            builder.integrated_energies.capacity() * std::mem::size_of::<f64>()
+        );
+
+        let first = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
+            integrated_energies: vec![1.0, 2.0].into_boxed_slice().into_vec(),
+            lra_energies: vec![3.0].into_boxed_slice().into_vec(),
+            real_frames: 48_000,
+        };
+        let second = LoudnessStatistics {
+            profile: LoudnessProfile::NativeEbu2023,
+            metric_coverage: LoudnessMetricCoverage::IntegratedAndRange,
+            integrated_energies: vec![4.0].into_boxed_slice().into_vec(),
+            lra_energies: vec![5.0].into_boxed_slice().into_vec(),
+            real_frames: 48_000,
+        };
+        let mut builder = AlbumLoudnessBuilder::new(16 * std::mem::size_of::<f64>());
+        builder.push_track(first, 0.2).unwrap();
+        builder.push_track(second, 0.8).unwrap();
+        assert_eq!(builder.integrated_energies.as_slice(), &[1.0, 2.0, 4.0]);
+        assert_eq!(builder.lra_energies.as_slice(), &[3.0, 5.0]);
+        assert_eq!(builder.tracks, 2);
+        assert_eq!(builder.reporting_peak_linear.to_bits(), 0.8_f64.to_bits());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd01_runtime_selection_respects_profile_commissioning_boundary() {
+        let sse2_available = std::is_x86_feature_detected!("sse2");
+        let native = LoudnessMeter::with_roles(
+            48_000,
+            &[ChannelRole::Left, ChannelRole::Right],
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+        let compatibility_default =
+            LoudnessMeter::libebur128_126_default_layout(48_000, 2).unwrap();
+        let compatibility_roles = LoudnessMeter::with_roles(
+            48_000,
+            &[ChannelRole::Left, ChannelRole::Right],
+            LoudnessProfile::Libebur128126,
+        )
+        .unwrap();
+
+        assert_eq!(native.simd_backend.is_scalar(), !sse2_available);
+        assert!(compatibility_default.simd_backend.is_scalar());
+        assert!(compatibility_roles.simd_backend.is_scalar());
+        assert_eq!(
+            simd::Backend::sse2_if_available().is_some(),
+            sse2_available
+        );
+
+        if let Some(avx) = simd::Backend::avx_if_available() {
+            assert_ne!(native.simd_backend, avx);
+            assert_ne!(compatibility_default.simd_backend, avx);
+            assert_ne!(compatibility_roles.simd_backend, avx);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd02_k_weighting_matches_scalar_outputs_and_delay_bits() {
+        let coefficients = KWeightingCoefficients::for_rate(48_000).unwrap();
+        for backend in [
+            simd::Backend::sse2_if_available(),
+            simd::Backend::avx_if_available(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for channels in [1usize, 2, 3, 4, 5, 7] {
+                let mut scalar_states = vec![FilterState::default(); channels];
+                let mut vector_states = scalar_states.clone();
+                let mut scalar_out = vec![0.0; channels];
+                let mut vector_out = vec![0.0; channels];
+                for frame_index in 0..2_003usize {
+                    let mut frame = vec![0.0; channels];
+                    for (channel, sample) in frame.iter_mut().enumerate() {
+                        *sample = match (frame_index + channel) % 11 {
+                            0 => -0.0,
+                            1 => f64::from_bits(1),
+                            _ => ((frame_index * (channel + 3)) as f64 * 0.013).sin() * 1.75,
+                        };
+                    }
+                    simd::filter_frame(
+                        simd::Backend::scalar(),
+                        &frame,
+                        &mut scalar_states,
+                        coefficients,
+                        &mut scalar_out,
+                    );
+                    simd::filter_frame(
+                        backend,
+                        &frame,
+                        &mut vector_states,
+                        coefficients,
+                        &mut vector_out,
+                    );
+                    assert_bits_eq(&scalar_out, &vector_out);
+                    for (left, right) in scalar_states.iter().zip(&vector_states) {
+                        assert_bits_eq(&left.delay, &right.delay);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd03_window_energy_matches_scalar_for_wrapped_profiles_and_zero_weights() {
+        for backend in [
+            simd::Backend::sse2_if_available(),
+            simd::Backend::avx_if_available(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for profile in [LoudnessProfile::NativeEbu2023, LoudnessProfile::Libebur128126] {
+                let roles = if profile == LoudnessProfile::NativeEbu2023 {
+                    vec![
+                        ChannelRole::Left,
+                        ChannelRole::Right,
+                        ChannelRole::Center,
+                        ChannelRole::Lfe,
+                        ChannelRole::LeftSurround,
+                    ]
+                } else {
+                    vec![
+                        ChannelRole::Left,
+                        ChannelRole::Right,
+                        ChannelRole::Center,
+                        ChannelRole::Unused,
+                        ChannelRole::LeftSurround,
+                    ]
+                };
+                let mut meter = LoudnessMeter::with_roles(48_000, &roles, profile).unwrap();
+                meter.write_frame = 13;
+                for (index, sample) in meter.ring.iter_mut().enumerate() {
+                    *sample = match index % 17 {
+                        0 => -0.0,
+                        1 => f64::from_bits(2),
+                        _ => ((index as f64) * 0.001_003).sin() * 0.25,
+                    };
+                }
+                let windows = [
+                    meter.clock.integrated_window_frames(),
+                    meter.clock.lra_window_frames(),
+                ];
+                for window in windows {
+                    let scalar = meter.window_energy_scalar(window).unwrap();
+                    meter.simd_backend = backend;
+                    let vector = meter.window_energy(window).unwrap();
+                    meter.simd_backend = simd::Backend::scalar();
+                    assert_eq!(scalar.to_bits(), vector.to_bits(), "{profile:?} {window}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd03_per_channel_window_sums_preserve_rounding_sensitive_order() {
+        for backend in [
+            simd::Backend::sse2_if_available(),
+            simd::Backend::avx_if_available(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let channels = 5usize;
+            let frames = 37usize;
+            let weights = [1.0, 1.0, 1.0, 0.0, 1.41];
+            let mut ring = vec![0.0_f64; frames * channels];
+            for frame in 0..frames {
+                for channel in 0..channels {
+                    ring[frame * channels + channel] = match (frame + channel) % 8 {
+                        0 => 1.0,
+                        1 => f64::from_bits(1),
+                        2 => -0.0,
+                        3 => 2.0_f64.powi(-27),
+                        4 => -2.0_f64.powi(-27),
+                        5 => 0.5,
+                        6 => -0.25,
+                        _ => 1.0_f64 + 2.0_f64.powi(-52),
+                    };
+                }
+            }
+            for spans in [
+                &[(3usize, 29usize)][..],
+                &[(0usize, 11usize), (19usize, 18usize)][..],
+                &[(19usize, 18usize), (0usize, 11usize)][..],
+            ] {
+                let mut scalar = [0.0_f64; MAX_CHANNELS];
+                let mut vector = [0.0_f64; MAX_CHANNELS];
+                simd::window_channel_sums(
+                    simd::Backend::scalar(),
+                    &ring,
+                    channels,
+                    &weights,
+                    spans,
+                    &mut scalar,
+                );
+                simd::window_channel_sums(
+                    backend,
+                    &ring,
+                    channels,
+                    &weights,
+                    spans,
+                    &mut vector,
+                );
+                assert_bits_eq(&scalar[..channels], &vector[..channels]);
+                assert_eq!(scalar[3].to_bits(), 0.0_f64.to_bits());
+                assert_eq!(vector[3].to_bits(), 0.0_f64.to_bits());
+
+                let scalar_total = weights
+                    .iter()
+                    .zip(&scalar)
+                    .filter(|(weight, _)| **weight != 0.0)
+                    .fold(0.0_f64, |total, (weight, sum)| total + *weight * *sum);
+                let vector_total = weights
+                    .iter()
+                    .zip(&vector)
+                    .filter(|(weight, _)| **weight != 0.0)
+                    .fold(0.0_f64, |total, (weight, sum)| total + *weight * *sum);
+                assert_eq!(scalar_total.to_bits(), vector_total.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd04_full_and_reduced_meter_state_matches_scalar_authority() {
+        let backend = simd::Backend::best_available();
+        if backend.is_scalar() {
+            return;
+        }
+        let roles = [
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::Lfe,
+            ChannelRole::LeftSurround,
+        ];
+        let frames = 48_000usize + 137;
+        let mut pcm = Vec::with_capacity(frames * roles.len());
+        for n in 0..frames {
+            for channel in 0..roles.len() {
+                pcm.push(((n * (channel + 5)) as f64 * 0.0097).sin() * (0.05 + channel as f64 * 0.01));
+            }
+        }
+        for demand in [
+            LoudnessMetricDemand::IntegratedOnly,
+            LoudnessMetricDemand::IntegratedAndRange,
+        ] {
+            let mut scalar = native_meter_with_demand(48_000, &roles, demand);
+            let mut vector = native_meter_with_demand(48_000, &roles, demand);
+            vector.simd_backend = backend;
+            let pattern = [1usize, 511, 4_800, 17, 9_601];
+            let mut offset = 0usize;
+            let mut chunk_index = 0usize;
+            while offset < frames {
+                let chunk_frames = pattern[chunk_index % pattern.len()];
+                let count = chunk_frames.min(frames - offset);
+                let start = offset * roles.len();
+                let end = (offset + count) * roles.len();
+                scalar.push_interleaved(&pcm[start..end]).unwrap();
+                vector.push_interleaved(&pcm[start..end]).unwrap();
+                offset += count;
+                chunk_index += 1;
+            }
+            assert_bits_eq(&scalar.ring, &vector.ring);
+            for (left, right) in scalar.filters.iter().zip(&vector.filters) {
+                assert_bits_eq(&left.delay, &right.delay);
+            }
+            assert_bits_eq(&scalar.integrated_energies, &vector.integrated_energies);
+            assert_bits_eq(&scalar.lra_energies, &vector.lra_energies);
+            let scalar = scalar.finalize().unwrap();
+            let vector = vector.finalize().unwrap();
+            assert_eq!(scalar.summary.integrated, vector.summary.integrated);
+            assert_eq!(scalar.summary.range, vector.summary.range);
+            assert_bits_eq(
+                &scalar.statistics.integrated_energies,
+                &vector.statistics.integrated_energies,
+            );
+            assert_bits_eq(&scalar.statistics.lra_energies, &vector.statistics.lra_energies);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd05_invalid_block_is_rejected_before_any_state_mutation() {
+        let backend = simd::Backend::best_available();
+        if backend.is_scalar() {
+            return;
+        }
+        let mut meter = LoudnessMeter::new(48_000, 2).unwrap();
+        meter.simd_backend = backend;
+        let ring_before = meter.ring.clone();
+        let filters_before = meter.filters.clone();
+        assert_eq!(
+            meter.push_interleaved(&[0.25, 0.5, f64::NAN, 0.0]),
+            Err(LoudnessError::NonFiniteSample { sample_index: 2 })
+        );
+        assert_bits_eq(&ring_before, &meter.ring);
+        for (left, right) in filters_before.iter().zip(&meter.filters) {
+            assert_bits_eq(&left.delay, &right.delay);
+        }
+        assert_eq!(meter.frames_seen, 0);
+        assert_eq!(meter.real_frames, 0);
+
+        let mut overflow = LoudnessMeter::new(48_000, 2).unwrap();
+        overflow.simd_backend = backend;
+        assert_eq!(
+            overflow.push_interleaved(&[f64::MAX, f64::MAX]),
+            Err(LoudnessError::NumericalRange)
+        );
+        assert_eq!(
+            overflow.push_interleaved(&[0.0, 0.0]),
+            Err(LoudnessError::MeterFailed)
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    fn simd06_daz_ftz_preserves_scalar_vector_filter_bits_and_restores_mxcsr() {
+        unsafe fn read_mxcsr() -> u32 {
+            core::arch::x86_64::_mm_getcsr()
+        }
+        unsafe fn write_mxcsr(value: u32) {
+            core::arch::x86_64::_mm_setcsr(value);
+        }
+
+        std::thread::spawn(|| {
+            let backend = simd::Backend::best_available();
+            if backend.is_scalar() {
+                return;
+            }
+            let coefficients = KWeightingCoefficients::for_rate(48_000).unwrap();
+            let original = unsafe { read_mxcsr() };
+            const DAZ_FTZ: u32 = (1 << 6) | (1 << 15);
+            unsafe { write_mxcsr(original | DAZ_FTZ) };
+
+            let channels = 5usize;
+            let mut scalar_states = vec![FilterState::default(); channels];
+            let mut vector_states = scalar_states.clone();
+            let mut scalar_out = vec![0.0_f64; channels];
+            let mut vector_out = vec![0.0_f64; channels];
+            let mut equal = true;
+            for frame_index in 0..257usize {
+                let mut frame = vec![0.0_f64; channels];
+                for (channel, sample) in frame.iter_mut().enumerate() {
+                    *sample = match (frame_index + channel) % 5 {
+                        0 => f64::from_bits(1),
+                        1 => f64::from_bits(11),
+                        2 => -0.0,
+                        3 => -f64::from_bits(7),
+                        _ => 0.25,
+                    };
+                }
+                simd::filter_frame(
+                    simd::Backend::scalar(),
+                    &frame,
+                    &mut scalar_states,
+                    coefficients,
+                    &mut scalar_out,
+                );
+                simd::filter_frame(
+                    backend,
+                    &frame,
+                    &mut vector_states,
+                    coefficients,
+                    &mut vector_out,
+                );
+                equal &= scalar_out
+                    .iter()
+                    .zip(&vector_out)
+                    .all(|(left, right)| left.to_bits() == right.to_bits());
+                equal &= scalar_states.iter().zip(&vector_states).all(|(left, right)| {
+                    left.delay
+                        .iter()
+                        .zip(right.delay.iter())
+                        .all(|(left, right)| left.to_bits() == right.to_bits())
+                });
+            }
+
+            unsafe { write_mxcsr(original) };
+            assert_eq!(unsafe { read_mxcsr() }, original);
+            assert!(equal, "DAZ/FTZ changed scalar/vector same-graph bits");
+        })
+        .join()
+        .expect("SIMD DAZ/FTZ test thread");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd10_reconstructed_meters_reset_all_authoritative_state() {
+        let backend = simd::Backend::best_available();
+        if backend.is_scalar() {
+            return;
+        }
+        let roles = [ChannelRole::Left, ChannelRole::Right, ChannelRole::Center];
+        let frames = 48_000usize + 311;
+        let mut pcm = Vec::with_capacity(frames * roles.len());
+        for n in 0..frames {
+            pcm.extend([
+                ((n as f64) * 0.011).sin() * 0.11,
+                -((n as f64) * 0.017).sin() * 0.07,
+                ((n as f64) * 0.023).cos() * 0.03,
+            ]);
+        }
+
+        let observe = |backend: simd::Backend| {
+            let mut meter = LoudnessMeter::with_roles(
+                48_000,
+                &roles,
+                LoudnessProfile::NativeEbu2023,
+            )
+            .unwrap();
+            meter.simd_backend = backend;
+            let pattern = [37usize, 1, 4_799, 503, 8_003];
+            let mut offset = 0usize;
+            let mut part = 0usize;
+            while offset < frames {
+                let count = pattern[part % pattern.len()].min(frames - offset);
+                let start = offset * roles.len();
+                let end = (offset + count) * roles.len();
+                meter.push_interleaved(&pcm[start..end]).unwrap();
+                offset += count;
+                part += 1;
+            }
+            meter.finalize().unwrap()
+        };
+
+        let scalar = observe(simd::Backend::scalar());
+        let first = observe(backend);
+        let second = observe(backend);
+        assert_eq!(first.summary.integrated, scalar.summary.integrated);
+        assert_eq!(first.summary.range, scalar.summary.range);
+        assert_eq!(second.summary.integrated, scalar.summary.integrated);
+        assert_eq!(second.summary.range, scalar.summary.range);
+        assert_bits_eq(
+            &first.statistics.integrated_energies,
+            &second.statistics.integrated_energies,
+        );
+        assert_bits_eq(&first.statistics.lra_energies, &second.statistics.lra_energies);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd11_backend_adds_no_persistent_storage_or_history_penalty() {
+        let backend = simd::Backend::best_available();
+        if backend.is_scalar() {
+            return;
+        }
+        let roles = [ChannelRole::Left, ChannelRole::Right, ChannelRole::Center];
+        let mut probe = LoudnessMeter::with_roles(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+        let fixed_storage_bytes = probe.fixed_storage_bytes;
+
+        let frames = 72_000usize;
+        let mut pcm = Vec::with_capacity(frames * roles.len());
+        for n in 0..frames {
+            let sample = ((n as f64) * 0.01).sin() * 0.1;
+            pcm.extend([sample, -sample, sample * 0.5]);
+        }
+        // Treat the source as unknown extent by feeding unrelated chunk sizes;
+        // the meter has no predeclared total duration.
+        let pattern = [1usize, 997, 4_801, 31, 8_003];
+        let mut offset = 0usize;
+        let mut part = 0usize;
+        while offset < frames {
+            let count = pattern[part % pattern.len()].min(frames - offset);
+            let start = offset * roles.len();
+            let end = (offset + count) * roles.len();
+            probe.push_interleaved(&pcm[start..end]).unwrap();
+            offset += count;
+            part += 1;
+        }
+        let history_after_push = probe.history_storage_bytes;
+        let probe = probe.finalize().unwrap();
+        let final_history = probe
+            .summary
+            .retained_storage_bytes
+            .checked_sub(fixed_storage_bytes)
+            .unwrap();
+        assert!(final_history > history_after_push);
+        // This is the allocator-observed scalar boundary. A hypothetical
+        // persistent 64-byte lane pad would fit at construction but steal
+        // headroom required by final LRA continuation.
+        let limit = fixed_storage_bytes + final_history;
+
+        let mut scalar = LoudnessMeter::with_roles_and_limit(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+            limit,
+        )
+        .unwrap();
+        let mut vector = LoudnessMeter::with_roles_and_limit(
+            48_000,
+            &roles,
+            LoudnessProfile::NativeEbu2023,
+            limit,
+        )
+        .unwrap();
+        vector.simd_backend = backend;
+        assert_eq!(scalar.fixed_storage_bytes, vector.fixed_storage_bytes);
+        assert_eq!(scalar.retained_storage_bytes(), vector.retained_storage_bytes());
+
+        let mut offset = 0usize;
+        let mut part = 0usize;
+        while offset < frames {
+            let count = pattern[part % pattern.len()].min(frames - offset);
+            let start = offset * roles.len();
+            let end = (offset + count) * roles.len();
+            let scalar_result = scalar.push_interleaved(&pcm[start..end]);
+            let vector_result = vector.push_interleaved(&pcm[start..end]);
+            assert_eq!(scalar_result, vector_result);
+            offset += count;
+            part += 1;
+        }
+        assert_eq!(scalar.retained_storage_bytes(), vector.retained_storage_bytes());
+        let scalar = scalar.finalize().unwrap();
+        let vector = vector.finalize().unwrap();
+        assert_eq!(scalar.summary.integrated, vector.summary.integrated);
+        assert_eq!(scalar.summary.range, vector.summary.range);
+        assert_eq!(
+            scalar.summary.retained_storage_bytes,
+            vector.summary.retained_storage_bytes
+        );
+
+        assert!(matches!(
+            LoudnessMeter::with_roles_and_limit(
+                48_000,
+                &roles,
+                LoudnessProfile::NativeEbu2023,
+                fixed_storage_bytes - 1,
+            ),
+            Err(LoudnessError::ResourceLimit { .. })
+        ));
     }
 
 }

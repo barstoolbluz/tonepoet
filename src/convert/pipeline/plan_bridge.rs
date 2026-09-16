@@ -15,14 +15,15 @@ use tonepoet_pipeline::{
     default_pcm_depth_for_format, AudioCodec as PlannerCodec, AudioFormat as PlannerFormat,
     BitDepthTarget, DsdSourceKind, PcmBitDepth, PipelineSettings, PlanRequest, PreferredTool,
     RateTarget, ReferenceProgrammeScope, ResolvedOutputTarget, SacdAreaKind, SacdFrameEncoding,
-    SacdTrackSelection, SampleKind, Sha256Digest, SourceInfo, SourceRepresentationKind,
-    selects_reference_dsd_to_pcm,
+    SacdTrackSelection, SampleKind, Sha256Digest, SourceFrameExtent, SourceInfo,
+    SourceRepresentationKind, selects_reference_dsd_to_pcm,
 };
 
 use super::errors::ConvertError;
 use super::types::{
     AlbumMetadata, MetadataValueList, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource,
-    PreparedTrack, CueSegmentCarrier, SourceAudioCoding, SourceKind, StageRequirement,
+    PreparedTrack, CueSegmentCarrier, RegisteredEffectCarrierRepresentation,
+    SelectedPhysicalCandidateBinding, SourceAudioCoding, SourceKind, StageRequirement,
     TrackMetadata, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
 };
 
@@ -112,6 +113,45 @@ fn planned_riff_non_audio_upper_bound(
     Ok(Some(upper))
 }
 
+fn certified_terminal_candidate_for_track(
+    track: &PreparedTrack,
+) -> Result<Option<&SelectedPhysicalCandidateBinding>, ConvertError> {
+    match &track.source_ref {
+        TrackSourceRef::DsdTruePeakCarrier { terminal_candidate, .. }
+        | TrackSourceRef::PcmTruePeakCarrier { terminal_candidate, .. } => terminal_candidate
+            .as_ref()
+            .map(Some)
+            .ok_or_else(|| {
+                ConvertError::Backend(format!(
+                    "certified true-peak carrier for track {} lost the typed charged-terminal candidate binding",
+                    track.id.source_ordinal,
+                ))
+            }),
+        _ => Ok(None),
+    }
+}
+
+fn preferred_tool_for_selected_candidate(
+    candidate: &SelectedPhysicalCandidateBinding,
+) -> Result<PreferredTool, ConvertError> {
+    match &candidate.tool {
+        tonepoet_pipeline::ToolIdentifier::Ffmpeg => Ok(PreferredTool::Ffmpeg),
+        tonepoet_pipeline::ToolIdentifier::Sox => Ok(PreferredTool::Sox),
+        tonepoet_pipeline::ToolIdentifier::Ssrc => Ok(PreferredTool::Ssrc),
+        tonepoet_pipeline::ToolIdentifier::Custom(name) => Ok(PreferredTool::Custom(name.clone())),
+        other => Err(ConvertError::Backend(format!(
+            "typed charged-terminal candidate {} selected unsupported terminal tool {}",
+            candidate.identity, other,
+        ))),
+    }
+}
+
+pub(crate) fn certified_terminal_candidate_binding(
+    track: &PreparedTrack,
+) -> Result<Option<SelectedPhysicalCandidateBinding>, ConvertError> {
+    certified_terminal_candidate_for_track(track).map(|candidate| candidate.cloned())
+}
+
 pub fn plan_request_for_track(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -119,7 +159,46 @@ pub fn plan_request_for_track(
     staged_output: &Path,
     intermediate_dir: PathBuf,
 ) -> Result<PlanRequest, ConvertError> {
-    let mut source = source_info_for_realized_track(track, realized_input)?;
+    plan_request_for_track_impl(
+        request,
+        track,
+        realized_input,
+        staged_output,
+        intermediate_dir,
+        None,
+    )
+}
+
+pub(crate) fn plan_request_for_track_with_resolved_source(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    staged_output: &Path,
+    intermediate_dir: PathBuf,
+    source: SourceInfo,
+) -> Result<PlanRequest, ConvertError> {
+    plan_request_for_track_impl(
+        request,
+        track,
+        realized_input,
+        staged_output,
+        intermediate_dir,
+        Some(source),
+    )
+}
+
+fn plan_request_for_track_impl(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    staged_output: &Path,
+    intermediate_dir: PathBuf,
+    source_override: Option<SourceInfo>,
+) -> Result<PlanRequest, ConvertError> {
+    let mut source = match source_override {
+        Some(source) => source,
+        None => source_info_for_realized_track(track, realized_input)?,
+    };
     let selects_reference = selects_reference_dsd_to_pcm(&request.settings, source.is_dsd());
     if selects_reference {
         source.dsd_source_kind = Some(reference_source_kind(track, realized_input)?);
@@ -135,6 +214,30 @@ pub fn plan_request_for_track(
     }
 
     let mut settings = request.settings.clone();
+    let registered_effect_terminal = match &track.source_ref {
+        TrackSourceRef::RegisteredEffectCarrier {
+            representation:
+                RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                    bit_depth,
+                    terminal_candidate,
+                },
+            ..
+        } => Some((*bit_depth, terminal_candidate)),
+        _ => None,
+    };
+    let registered_effect_resampler_consumed = matches!(
+        &track.source_ref,
+        TrackSourceRef::RegisteredEffectCarrier {
+            resampler_consumed: true,
+            ..
+        }
+    );
+    if let Some(candidate) = certified_terminal_candidate_for_track(track)? {
+        // Phase 2 already selected the only fully admitted physical terminal.
+        // Bind the retained legacy lowerer to that candidate instead of
+        // reinterpreting the user's original soft backend preference.
+        settings.preferred_tool = preferred_tool_for_selected_candidate(candidate)?;
+    }
     // Album-scoped DSD normalization has already performed the expensive DSD
     // reconstruction into an audio-only headerless Float64 carrier. The
     // carrier must be encoded, never stream-copied, and must not become a
@@ -142,7 +245,9 @@ pub fn plan_request_for_track(
     // planner input.
     if matches!(
         &track.source_ref,
-        TrackSourceRef::DsdAlbumGainCarrier { .. } | TrackSourceRef::PcmTruePeakCarrier { .. }
+        TrackSourceRef::DsdTruePeakCarrier { .. }
+            | TrackSourceRef::PcmTruePeakCarrier { .. }
+            | TrackSourceRef::RegisteredEffectCarrier { .. }
     ) {
         if request.settings.metadata.transfer_tags
             && !request
@@ -166,20 +271,87 @@ pub fn plan_request_for_track(
                 request.settings.target_format
             );
         }
-        settings.force_encode = true;
+        settings.force_encode = registered_effect_terminal.is_none();
         disable_planner_source_tag_transfer(&mut settings);
         disable_planner_artwork_transfer(&mut settings);
         disable_planner_source_audio_md5(&mut settings);
-        if let TrackSourceRef::PcmTruePeakCarrier { sample_rate_hz, .. } = &track.source_ref {
+        let retained_true_peak_rate = match &track.source_ref {
+            TrackSourceRef::DsdTruePeakCarrier { sample_rate_hz, .. }
+            | TrackSourceRef::PcmTruePeakCarrier { sample_rate_hz, .. }
+            | TrackSourceRef::RegisteredEffectCarrier { sample_rate_hz, .. } => Some(*sample_rate_hz),
+            _ => None,
+        };
+        if let Some(sample_rate_hz) = retained_true_peak_rate {
             // The carrier is the exact final-rate waveform that was measured.
             // Pin the final encoder to that rate so no resampler can run after
-            // the hard-ceiling measurement. Keep the PCM true-peak policy in
-            // the final planner settings: the lower-level planner does not run
-            // analysis, and retaining it makes target/scope/scan/runtime gain
-            // part of the output settings fingerprint. Only the temporary
-            // carrier-render request disables the policy.
-            settings.target_sample_rate = RateTarget::PcmHz(*sample_rate_hz);
-            if request.settings.target_bit_depth == BitDepthTarget::Source {
+            // the hard-ceiling observation. The one certified scalar is owned
+            // by TrackSourceRef realization/execution: Phase 3 may stream it
+            // from the retained carrier or select the materialized baseline
+            // before terminal launch, so no DSD-side gain may be lowered again
+            // here. For a DSD-derived carrier, mirror the
+            // same true-peak policy into the existing PCM terminal-selection
+            // surface solely so the proved dither/quantizer route remains the
+            // one selected by the legacy command lowerer.
+            if !settings.target_format.is_dsd() {
+                settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
+            }
+            if registered_effect_resampler_consumed {
+                // The common realizer has already executed the frozen typed
+                // resampler. This private downstream request may encode or
+                // package its retained result, but it must not reinterpret
+                // the user's original resampler preference and execute a
+                // second rate change (or fail merely because forced SSRC now
+                // sees no rate change).
+                settings.preferred_tool = PreferredTool::Auto;
+                settings.nyquist_transition = tonepoet_pipeline::NyquistTransition::Gentle;
+                settings.ssrc.force = false;
+                settings.ssrc.dither_id = None;
+                settings.ssrc.pdf_type = None;
+            }
+            if let Some((bit_depth, terminal_candidate)) = registered_effect_terminal {
+                if request.settings.target_format != tonepoet_pipeline::AudioFormat::Wav {
+                    return Err(ConvertError::Backend(format!(
+                        "registered-effect terminal carrier {} is a direct SSRC WAV realization but requested target is {:?}",
+                        terminal_candidate.identity, request.settings.target_format,
+                    )));
+                }
+                match terminal_candidate.terminal_realization.as_ref() {
+                    Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization))
+                        if realization.kind
+                            == tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                            && realization.target_bit_depth == bit_depth => {}
+                    other => {
+                        return Err(ConvertError::Backend(format!(
+                            "registered-effect terminal carrier {} lost its direct SSRC terminal binding: {:?}",
+                            terminal_candidate.identity, other,
+                        )))
+                    }
+                }
+                // Sample realization is complete. Downstream work is a WAV
+                // payload-preserving copy plus orchestrator-owned metadata;
+                // none of the original sample-changing terminal settings may
+                // run again.
+                settings.target_bit_depth = BitDepthTarget::Pcm(bit_depth);
+                settings.dither_type = tonepoet_pipeline::DitherType::None;
+                settings.dither_explicit = false;
+                settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+                settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+                settings.force_encode = false;
+            }
+            let dsd_derived = matches!(
+                &track.source_ref,
+                TrackSourceRef::DsdTruePeakCarrier { .. }
+                    | TrackSourceRef::RegisteredEffectCarrier { source_was_dsd: true, .. }
+            );
+            if dsd_derived {
+                let source_domain_policy = request.settings.dsd.gain_policy();
+                settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+                settings.pcm_true_peak.set_policy(source_domain_policy);
+            }
+            if registered_effect_terminal.is_none()
+                && !request.settings.target_format.is_dsd()
+                && request.settings.target_bit_depth == BitDepthTarget::Source
+            {
                 let depth = if request.settings.target_format
                     == tonepoet_pipeline::AudioFormat::WavPack
                     && request.settings.wavpack.hybrid
@@ -291,9 +463,9 @@ pub fn plan_request_for_track(
     if source.audio_md5.is_none() {
         disable_planner_source_audio_md5(&mut settings);
     }
-    // ReplayGain remains orchestrator-owned because album mode requires all
-    // completed tracks.
-    settings.replay_gain.mode = None;
+    // ReplayGain is owned by the native common-plan executor. The command
+    // planner no longer lowers ReplayGain into an external per-track step, so
+    // retain the logical request here for semantic identity and native execution.
     if matches!(settings.target_bit_depth, BitDepthTarget::Source)
         && settings.target_format.is_pcm_lossless()
     {
@@ -327,7 +499,7 @@ pub fn plan_request_for_track(
     }
 
     // settings-sentinel-allow: settings originates from request.settings.clone() above
-    // Native-v2 admission resolves through the static enabled product catalog.
+    // Reference admission resolves through the static enabled product catalog.
     // Raw caller strings are accepted only when they identify exactly one trusted
     // catalog entry; arbitrary flags never become planner authority.
     let resolved_output_target = if selects_reference {
@@ -358,14 +530,23 @@ pub fn plan_request_for_track(
         resolved_output_target,
     )?;
 
+    let plan_scope = match request.submission_id.as_ref() {
+        Some(submission_id) => tonepoet_pipeline::PlanScope::submitted_batch(
+            submission_id.clone(),
+            request.item_id.clone(),
+            request.submission_size,
+        ),
+        None => tonepoet_pipeline::PlanScope::track(request.item_id.clone()),
+    };
+
     // settings-sentinel-allow: `settings` is `request.settings.clone()` (bound
-    // at the top of this function) plus the documented BluRay tool-preference
-    // and legacy-DSD adjustments; no defaults are synthesized outside the
-    // typed request.
+    // at the top of this function) plus the documented per-track realization
+    // adjustments above; no defaults are synthesized outside the typed request.
     Ok(PlanRequest {
         resolved_output_target,
         reference_programme_scope,
         planned_riff_non_audio_upper_bound_bytes,
+        plan_scope,
         input_path: realized_input.to_path_buf(),
         output_path: staged_output.to_path_buf(),
         source,
@@ -592,6 +773,994 @@ fn disable_planner_source_audio_md5(settings: &mut PipelineSettings) {
 /// user requested that policy but the source lacks the required fact, the bridge
 /// disables the per-track planner flag to avoid a late planner validation error.
 /// This helper keeps that downgrade explicit and testable rather than silent.
+
+/// One ordered registered-effect segment on one side of the PCM resampler barrier.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RegisteredEffectSegment {
+    pub input: tonepoet_pipeline::SignalId,
+    pub output: tonepoet_pipeline::SignalId,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub level_basis: tonepoet_pipeline::LevelBasis,
+    pub lowerings: Vec<tonepoet_pipeline::EffectLowering>,
+}
+
+/// Frozen selected PCM resampler between optional registered-effect segments.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SelectedPcmResamplerExecutionContract {
+    pub input: tonepoet_pipeline::SignalId,
+    pub output: tonepoet_pipeline::SignalId,
+    pub input_rate_hz: u32,
+    pub output_rate_hz: u32,
+    pub channels: u16,
+    pub operation: tonepoet_pipeline::PlanOperation,
+    pub selected: SelectedPhysicalCandidateBinding,
+    pub resolved_parameters: tonepoet_pipeline::ResolvedOperationParameters,
+}
+
+/// Phase-3 execution contract for an ordinary registered-effect chain.
+///
+/// Effects are partitioned by the typed resampler barrier. The selected
+/// resampler is frozen with its exact operation/parameters so runtime executes
+/// it once rather than replanning backend authority after the effects run.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RegisteredEffectExecutionContract {
+    pub pre_resample: Option<RegisteredEffectSegment>,
+    pub resampler: Option<SelectedPcmResamplerExecutionContract>,
+    pub post_resample: Option<RegisteredEffectSegment>,
+    pub output: tonepoet_pipeline::SignalId,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub level_basis: tonepoet_pipeline::LevelBasis,
+}
+
+fn registered_effect_segment_from_nodes(
+    typed: &tonepoet_pipeline::TypedConversionPlan,
+    nodes: &[(tonepoet_pipeline::SignalId, tonepoet_pipeline::SignalId, tonepoet_pipeline::EffectLowering)],
+) -> Result<Option<RegisteredEffectSegment>, ConvertError> {
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+    for pair in nodes.windows(2) {
+        if pair[0].1 != pair[1].0 {
+            return Err(ConvertError::Backend(format!(
+                "typed registered-effect segment is discontinuous between {:?} and {:?}",
+                pair[0].1, pair[1].0,
+            )));
+        }
+    }
+    let input = nodes[0].0;
+    let output = nodes.last().expect("effect segment is nonempty").1;
+    let output_state = typed
+        .audio_states
+        .iter()
+        .find(|state| state.id == output)
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "typed registered-effect output {:?} has no audio-state facts",
+                output,
+            ))
+        })?;
+    let sample_rate_hz = match &output_state.sample_rate_hz {
+        tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "typed registered-effect output {:?} has no authoritative sample rate: {:?}",
+                output, fact,
+            )))
+        }
+    };
+    let channels = match &output_state.channels {
+        tonepoet_pipeline::Fact::Known(channels) if *channels > 0 => *channels,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "typed registered-effect output {:?} has no authoritative channel geometry: {:?}",
+                output, fact,
+            )))
+        }
+    };
+    Ok(Some(RegisteredEffectSegment {
+        input,
+        output,
+        sample_rate_hz,
+        channels,
+        level_basis: output_state.level_basis,
+        lowerings: nodes
+            .iter()
+            .map(|(_, _, lowering)| lowering.clone())
+            .collect(),
+    }))
+}
+
+fn segmented_registered_effect_execution_from_typed(
+    typed: &tonepoet_pipeline::TypedConversionPlan,
+    node_limit: usize,
+    role: &str,
+    bind_strong_ssrc: bool,
+) -> Result<
+    (
+        Option<RegisteredEffectSegment>,
+        Option<SelectedPcmResamplerExecutionContract>,
+        Option<RegisteredEffectSegment>,
+        usize,
+    ),
+    ConvertError,
+> {
+    let nodes = typed.nodes.get(..node_limit).ok_or_else(|| {
+        ConvertError::Backend(format!(
+            "typed {role} node limit {node_limit} exceeds plan length {}",
+            typed.nodes.len(),
+        ))
+    })?;
+    let resampler_nodes = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| match node {
+            tonepoet_pipeline::TypedPlanNode::Operation {
+                operation: operation @ tonepoet_pipeline::PlanOperation::ResamplePcm { .. },
+                input_signal: Some(input),
+                output_signal: Some(output),
+                candidates,
+                selected_candidate,
+                resolved_parameters,
+            } => candidates.get(*selected_candidate).map(|candidate| {
+                (
+                    index,
+                    operation.clone(),
+                    *input,
+                    *output,
+                    candidate,
+                    resolved_parameters.clone(),
+                )
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if resampler_nodes.len() > 1 {
+        return Err(ConvertError::Backend(format!(
+            "typed {role} plan contains {} PCM resamplers; Phase-3 common execution supports one barrier",
+            resampler_nodes.len(),
+        )));
+    }
+    let resampler_index = resampler_nodes.first().map(|entry| entry.0);
+
+    let mut pre_nodes = Vec::new();
+    let mut post_nodes = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if let tonepoet_pipeline::TypedPlanNode::ApplyEffect {
+            input,
+            output,
+            lowering,
+            ..
+        } = node
+        {
+            if resampler_index.is_some_and(|barrier| index < barrier) {
+                pre_nodes.push((*input, *output, lowering.clone()));
+            } else {
+                post_nodes.push((*input, *output, lowering.clone()));
+            }
+        }
+    }
+    let effect_count = pre_nodes.len() + post_nodes.len();
+    let pre_resample = registered_effect_segment_from_nodes(typed, &pre_nodes)?;
+    let post_resample = registered_effect_segment_from_nodes(typed, &post_nodes)?;
+
+    let resampler = resampler_nodes
+        .first()
+        .map(|(_, operation, input, output, candidate, resolved_parameters)| {
+            let input_state = typed
+                .audio_states
+                .iter()
+                .find(|state| state.id == *input)
+                .ok_or_else(|| {
+                    ConvertError::Backend(format!(
+                        "typed {role} resampler input {:?} has no audio-state facts",
+                        input,
+                    ))
+                })?;
+            let output_state = typed
+                .audio_states
+                .iter()
+                .find(|state| state.id == *output)
+                .ok_or_else(|| {
+                    ConvertError::Backend(format!(
+                        "typed {role} resampler output {:?} has no audio-state facts",
+                        output,
+                    ))
+                })?;
+            let input_rate_hz = match &input_state.sample_rate_hz {
+                tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
+                fact => {
+                    return Err(ConvertError::Backend(format!(
+                        "typed {role} resampler input {:?} has no authoritative sample rate: {:?}",
+                        input, fact,
+                    )))
+                }
+            };
+            let output_rate_hz = match &output_state.sample_rate_hz {
+                tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
+                fact => {
+                    return Err(ConvertError::Backend(format!(
+                        "typed {role} resampler output {:?} has no authoritative sample rate: {:?}",
+                        output, fact,
+                    )))
+                }
+            };
+            let channels = match &output_state.channels {
+                tonepoet_pipeline::Fact::Known(channels) if *channels > 0 => *channels,
+                fact => {
+                    return Err(ConvertError::Backend(format!(
+                        "typed {role} resampler output {:?} has no authoritative channel geometry: {:?}",
+                        output, fact,
+                    )))
+                }
+            };
+            let mut selected = selected_physical_candidate_binding(candidate, role)?;
+            if bind_strong_ssrc {
+                selected.strong_ssrc_resampler =
+                    selected_strong_ssrc_resampler_binding(candidate, resolved_parameters)?;
+            }
+            Ok(SelectedPcmResamplerExecutionContract {
+                input: *input,
+                output: *output,
+                input_rate_hz,
+                output_rate_hz,
+                channels,
+                operation: operation.clone(),
+                selected,
+                resolved_parameters: resolved_parameters.clone(),
+            })
+        })
+        .transpose()?;
+
+    if let (Some(pre), Some(resampler)) = (&pre_resample, &resampler) {
+        if pre.output != resampler.input {
+            return Err(ConvertError::Backend(format!(
+                "typed pre-resample effect output {:?} does not feed selected resampler input {:?}",
+                pre.output, resampler.input,
+            )));
+        }
+        if pre.sample_rate_hz != resampler.input_rate_hz || pre.channels != resampler.channels {
+            return Err(ConvertError::Backend(
+                "typed pre-resample effect geometry disagrees with selected resampler ingress"
+                    .to_string(),
+            ));
+        }
+    }
+    if let (Some(resampler), Some(post)) = (&resampler, &post_resample) {
+        if resampler.output != post.input {
+            return Err(ConvertError::Backend(format!(
+                "typed selected resampler output {:?} does not feed post-resample effect input {:?}",
+                resampler.output, post.input,
+            )));
+        }
+        if resampler.output_rate_hz != post.sample_rate_hz || resampler.channels != post.channels {
+            return Err(ConvertError::Backend(
+                "typed selected resampler egress geometry disagrees with post-resample effects"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok((pre_resample, resampler, post_resample, effect_count))
+}
+
+pub(crate) fn registered_effect_execution_contract(
+    request: &PlanRequest,
+    effects: &[tonepoet_pipeline::EffectIntent],
+) -> Result<RegisteredEffectExecutionContract, ConvertError> {
+    if effects.is_empty() {
+        return Err(ConvertError::Backend(
+            "registered-effect execution contract requires at least one effect".to_string(),
+        ));
+    }
+    let typed = match tonepoet_pipeline::plan_typed_with_effects(request, effects).map_err(|error| {
+        ConvertError::Backend(format!(
+            "could not build common typed plan for registered-effect execution: {error}"
+        ))
+    })? {
+        tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+        tonepoet_pipeline::PlanningOutcome::Refused(refusal) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan refused registered-effect execution ({}): {}",
+                refusal.code, refusal.reason,
+            )))
+        }
+        tonepoet_pipeline::PlanningOutcome::NeedFacts(needs) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan still needs facts before registered-effect execution: {:?}",
+                needs
+            )))
+        }
+    };
+    if typed.intent.reference_delivery {
+        return Err(ConvertError::Backend(
+            "qualified Reference delivery remains sealed outside the Phase-3 ordinary common realizer"
+                .to_string(),
+        ));
+    }
+    if typed.execution_capability
+        != tonepoet_pipeline::ExecutionCapability::RequiresPhase3CommonRealizer
+        && typed.execution_capability
+            != tonepoet_pipeline::ExecutionCapability::ExecutableByPhase3CommonRealizer
+    {
+        return Err(ConvertError::Backend(format!(
+            "typed registered-effect route is not assigned to the Phase-3 common realizer: {:?}",
+            typed.execution_capability,
+        )));
+    }
+    if typed.nodes.iter().any(|node| {
+        matches!(
+            node,
+            tonepoet_pipeline::TypedPlanNode::Observe(observation)
+                if matches!(observation.kind, tonepoet_pipeline::ObservationKind::CertifiedTruePeak { .. })
+        )
+    }) {
+        return Err(ConvertError::Backend(
+            "registered-effect-only contract cannot consume a certified true-peak plan; use the certified execution contract"
+                .to_string(),
+        ));
+    }
+
+    let (pre_resample, resampler, post_resample, effect_count) =
+        segmented_registered_effect_execution_from_typed(
+            &typed,
+            typed.nodes.len(),
+            "registered-effect",
+            false,
+        )?;
+    if effect_count != effects.len() {
+        return Err(ConvertError::Backend(format!(
+            "typed registered-effect plan contains {} effect node(s) for {} requested effect(s)",
+            effect_count,
+            effects.len(),
+        )));
+    }
+    let output = post_resample
+        .as_ref()
+        .map(|segment| segment.output)
+        .or_else(|| resampler.as_ref().map(|selected| selected.output))
+        .or_else(|| pre_resample.as_ref().map(|segment| segment.output))
+        .ok_or_else(|| ConvertError::Backend("registered-effect plan has no execution output".to_string()))?;
+    let output_state = typed
+        .audio_states
+        .iter()
+        .find(|state| state.id == output)
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "typed registered-effect execution output {:?} has no audio-state facts",
+                output,
+            ))
+        })?;
+    let sample_rate_hz = match &output_state.sample_rate_hz {
+        tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "typed registered-effect execution output {:?} has no authoritative sample rate: {:?}",
+                output, fact,
+            )))
+        }
+    };
+    let channels = match &output_state.channels {
+        tonepoet_pipeline::Fact::Known(channels) if *channels > 0 => *channels,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "typed registered-effect execution output {:?} has no authoritative channel geometry: {:?}",
+                output, fact,
+            )))
+        }
+    };
+    Ok(RegisteredEffectExecutionContract {
+        pre_resample,
+        resampler,
+        post_resample,
+        output,
+        sample_rate_hz,
+        channels,
+        level_basis: output_state.level_basis,
+    })
+}
+
+/// Phase-3 execution identity for one certified ordinary true-peak decision.
+///
+/// This is deliberately extracted from the common typed plan after concrete
+/// source facts are known. Runtime carrier preparation and the submitted-batch
+/// barrier consume this contract; they do not reconstruct scope, scan tier,
+/// signal identity, or terminal proof from mutable settings.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CertifiedTruePeakExecutionContract {
+    pub scope: tonepoet_pipeline::TruePeakScope,
+    pub observation: tonepoet_pipeline::ScopedObservationId,
+    pub observation_subject: tonepoet_pipeline::SignalId,
+    pub decision: tonepoet_pipeline::DecisionId,
+    pub binding: tonepoet_pipeline::GainDecisionBinding,
+    pub gain_input: tonepoet_pipeline::SignalId,
+    pub gain_output: tonepoet_pipeline::SignalId,
+    pub scan: tonepoet_pipeline::TruePeakScanTier,
+    pub requested_target_dbtp: tonepoet_pipeline::DbNano,
+    pub allow_boost: bool,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub level_basis: tonepoet_pipeline::LevelBasis,
+    pub read_contract: tonepoet_pipeline::ObservationReadContract,
+    pub terminal_subject: tonepoet_pipeline::SignalId,
+    pub terminal_proof: tonepoet_pipeline::TerminalProofContract,
+    /// Frozen selected PCM resampler before the certified observation, when a
+    /// rate change is part of the typed signal spine.
+    pub pre_observation_resampler: Option<SelectedPcmResamplerExecutionContract>,
+    /// Ordered registered effects after the selected PCM resampler and before
+    /// the certified observation.
+    pub post_resample: Option<RegisteredEffectSegment>,
+    /// Exact physical terminal candidate whose proof is charged by this
+    /// decision. Phase 3 must realize this candidate, not search again.
+    pub charged_terminal: SelectedPhysicalCandidateBinding,
+}
+
+pub(crate) fn certified_true_peak_execution_contract(
+    request: &PlanRequest,
+) -> Result<CertifiedTruePeakExecutionContract, ConvertError> {
+    let typed = match tonepoet_pipeline::plan_typed(request).map_err(|error| {
+        ConvertError::Backend(format!(
+            "could not build common typed plan for certified true-peak execution: {error}"
+        ))
+    })? {
+        tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+        tonepoet_pipeline::PlanningOutcome::Refused(refusal) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan refused certified true-peak execution ({}): {}",
+                refusal.code, refusal.reason,
+            )))
+        }
+        tonepoet_pipeline::PlanningOutcome::NeedFacts(needs) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan still needs facts before certified true-peak execution: {:?}",
+                needs
+            )))
+        }
+    };
+
+    certified_true_peak_execution_contract_from_typed(&typed)
+}
+
+pub(crate) fn certified_true_peak_execution_contract_with_effects(
+    request: &PlanRequest,
+    effects: &[tonepoet_pipeline::EffectIntent],
+) -> Result<CertifiedTruePeakExecutionContract, ConvertError> {
+    let typed = match tonepoet_pipeline::plan_typed_with_effects(request, effects).map_err(|error| {
+        ConvertError::Backend(format!(
+            "could not build common typed plan with registered effects for certified true-peak execution: {error}"
+        ))
+    })? {
+        tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+        tonepoet_pipeline::PlanningOutcome::Refused(refusal) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan refused certified true-peak execution ({}): {}",
+                refusal.code, refusal.reason,
+            )))
+        }
+        tonepoet_pipeline::PlanningOutcome::NeedFacts(needs) => {
+            return Err(ConvertError::Backend(format!(
+                "common typed plan still needs facts before certified true-peak execution: {:?}",
+                needs
+            )))
+        }
+    };
+    certified_true_peak_execution_contract_from_typed(&typed)
+}
+
+fn selected_physical_candidate_binding(
+    candidate: &tonepoet_pipeline::PhysicalCandidate,
+    role: &str,
+) -> Result<SelectedPhysicalCandidateBinding, ConvertError> {
+    if candidate.identity.trim().is_empty() {
+        return Err(ConvertError::Backend(format!(
+            "typed {role} candidate has an empty physical identity",
+        )));
+    }
+    let tool = candidate.tool.clone().ok_or_else(|| {
+        ConvertError::Backend(format!(
+            "typed {role} candidate {} has no executable tool identity",
+            candidate.identity,
+        ))
+    })?;
+    if let Some(realization) = candidate.contract.terminal_realization.as_ref() {
+        match realization {
+            tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)
+                if realization.selected_tool != tool =>
+            {
+                return Err(ConvertError::Backend(format!(
+                    "typed {role} candidate {} tool {} disagrees with its selected PCM terminal realization tool {}",
+                    candidate.identity, tool, realization.selected_tool,
+                )))
+            }
+            tonepoet_pipeline::SelectedTerminalRealization::LossyFfmpegEncoderInput { .. }
+                if tool != tonepoet_pipeline::ToolIdentifier::Ffmpeg =>
+            {
+                return Err(ConvertError::Backend(format!(
+                    "typed {role} candidate {} binds lossy FFmpeg encoder-input realization to {}",
+                    candidate.identity, tool,
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(SelectedPhysicalCandidateBinding {
+        identity: candidate.identity.clone(),
+        tool,
+        terminal_realization: candidate.contract.terminal_realization.clone(),
+        strong_ssrc_resampler: None,
+    })
+}
+
+fn selected_strong_ssrc_resampler_binding(
+    candidate: &tonepoet_pipeline::PhysicalCandidate,
+    resolved_parameters: &tonepoet_pipeline::ResolvedOperationParameters,
+) -> Result<Option<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>, ConvertError> {
+    use tonepoet_pipeline::{
+        Binary64ResamplePreservationEvidence, PcmBitDepth, ProcessingDomain,
+        ResolvedOperationParameters, SsrcComputationPrecision, SsrcOutputRole, ToolIdentifier,
+    };
+    use tonepoet_pipeline::plugins::SsrcDitherAvailability;
+
+    let Some(Binary64ResamplePreservationEvidence::Established {
+        authority_id,
+        evidence_id,
+        qualification_report_sha256,
+        runtime_attestation,
+        scope,
+    }) = candidate.binary64_resample_preservation_evidence.as_ref()
+    else {
+        return Ok(None);
+    };
+    if candidate.tool.as_ref() != Some(&ToolIdentifier::Ssrc) {
+        return Err(ConvertError::Backend(format!(
+            "candidate {} carries SSRC Binary64 evidence but is not bound to SSRC",
+            candidate.identity,
+        )));
+    }
+    let ingress = candidate
+        .protected_float64_ingress_authority
+        .clone()
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "candidate {} has established SSRC Binary64 evidence but no protected Float64 ingress authority",
+                candidate.identity,
+            ))
+        })?;
+    let ResolvedOperationParameters::ResampleSsrc {
+        effective_profile,
+        effective_attenuation_db,
+        effective_output_depth,
+        output_role,
+        computation_precision,
+        emitted_processing_domain,
+        effective_dither,
+        ..
+    } = resolved_parameters
+    else {
+        return Err(ConvertError::Backend(format!(
+            "candidate {} has established SSRC Binary64 evidence without resolved SSRC parameters",
+            candidate.identity,
+        )));
+    };
+    let attenuation_db = Some(
+        effective_attenuation_db
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "0.0".to_owned()),
+    );
+    if *effective_profile != scope.profile
+        || scope.source_rate_hz == 0
+        || scope.target_rate_hz == 0
+        || attenuation_db.as_deref() != scope.attenuation_db.as_deref()
+        || scope.min_phase != candidate_scope_min_phase(resolved_parameters)
+        || *effective_output_depth != PcmBitDepth::Float64
+        || *output_role != SsrcOutputRole::Nonterminal
+        || *computation_precision != SsrcComputationPrecision::Double
+        || *emitted_processing_domain != ProcessingDomain::Binary64
+        || effective_dither.dither_id.is_some()
+        || effective_dither.pdf_type.is_some()
+        || !matches!(&effective_dither.availability, SsrcDitherAvailability::Inactive)
+        || scope.input_container.as_str() != ingress.input_container.as_str()
+        || scope.input_sample_format.as_str() != ingress.input_sample_format.as_str()
+        || scope.output_container != "w64"
+        || scope.output_sample_format != "pcm_f64le"
+    {
+        return Err(ConvertError::Backend(format!(
+            "candidate {} established SSRC Binary64 evidence does not match its resolved physical cell",
+            candidate.identity,
+        )));
+    }
+    if runtime_attestation.architecture != scope.architecture
+        || runtime_attestation.source_revision.trim().is_empty()
+        || runtime_attestation.build_identity.trim().is_empty()
+        || runtime_attestation.expected_executable_sha256.trim().is_empty()
+        || qualification_report_sha256.trim().is_empty()
+    {
+        return Err(ConvertError::Backend(format!(
+            "candidate {} established SSRC Binary64 evidence has incomplete runtime attestation",
+            candidate.identity,
+        )));
+    }
+
+    Ok(Some(tonepoet_pipeline::SelectedStrongSsrcResamplerBinding {
+        binary64_preservation: tonepoet_pipeline::SelectedBinary64ResamplePreservationBinding {
+            contract_id: tonepoet_pipeline::TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1.to_owned(),
+            authority_id: authority_id.clone(),
+            evidence_id: evidence_id.clone(),
+            qualification_report_sha256: qualification_report_sha256.clone(),
+            expected_executable_sha256: runtime_attestation.expected_executable_sha256.clone(),
+            runtime_architecture: runtime_attestation.architecture.clone(),
+            source_revision: runtime_attestation.source_revision.clone(),
+            build_identity: runtime_attestation.build_identity.clone(),
+            evidence_scope: scope.clone(),
+            protected_output_container: "w64".to_owned(),
+        },
+        protected_ingress: ingress,
+        resolved_resampler: tonepoet_pipeline::SelectedStrongSsrcResamplerParameters {
+            source_rate_hz: scope.source_rate_hz,
+            target_rate_hz: scope.target_rate_hz,
+            profile: *effective_profile,
+            attenuation_db,
+            min_phase: scope.min_phase,
+            output_depth: *effective_output_depth,
+            dither_none: true,
+        },
+    }))
+}
+
+fn candidate_scope_min_phase(
+    resolved_parameters: &tonepoet_pipeline::ResolvedOperationParameters,
+) -> bool {
+    match resolved_parameters {
+        tonepoet_pipeline::ResolvedOperationParameters::ResampleSsrc { requested, .. } => {
+            requested.min_phase
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn certified_true_peak_execution_contract_from_typed(
+    typed: &tonepoet_pipeline::TypedConversionPlan,
+) -> Result<CertifiedTruePeakExecutionContract, ConvertError> {
+    if typed.intent.reference_delivery {
+        return Err(ConvertError::Backend(
+            "qualified Reference delivery remains sealed outside the Phase-3 ordinary common realizer"
+                .to_string(),
+        ));
+    }
+    if !matches!(
+        typed.execution_capability,
+        tonepoet_pipeline::ExecutionCapability::ExecutableNow
+            | tonepoet_pipeline::ExecutionCapability::ExecutableByPhase3CommonRealizer
+            | tonepoet_pipeline::ExecutionCapability::RequiresPhase3CommonRealizer
+    ) {
+        return Err(ConvertError::Backend(format!(
+            "typed certified true-peak route is not connected to the Phase-3 ordinary realizer: {:?}",
+            typed.execution_capability,
+        )));
+    }
+
+    let certified_observations = typed
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            tonepoet_pipeline::TypedPlanNode::Observe(observation)
+                if matches!(
+                    observation.kind,
+                    tonepoet_pipeline::ObservationKind::CertifiedTruePeak { .. }
+                ) => Some(observation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if certified_observations.len() != 1 {
+        return Err(ConvertError::Backend(format!(
+            "Phase-3 ordinary true-peak execution requires exactly one certified observation; typed plan contains {}",
+            certified_observations.len(),
+        )));
+    }
+    let observation = certified_observations[0];
+    if !observation.complete_reader_required
+        || !observation.read_contract.complete_reader
+        || !observation.read_contract.connected_executor
+    {
+        return Err(ConvertError::Backend(format!(
+            "certified observation {:?} does not carry a connected complete-reader contract",
+            observation.id,
+        )));
+    }
+    let scan = match &observation.kind {
+        tonepoet_pipeline::ObservationKind::CertifiedTruePeak { scan } => *scan,
+        _ => unreachable!("certified observation filter guarantees the kind"),
+    };
+
+    let true_peak_decisions = typed
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            tonepoet_pipeline::TypedPlanNode::Decide(decision) => match &decision.kind {
+                tonepoet_pipeline::DecisionKind::TruePeakGain { .. } => Some(decision),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if true_peak_decisions.len() != 1 {
+        return Err(ConvertError::Backend(format!(
+            "Phase-3 ordinary true-peak execution requires exactly one gain decision; typed plan contains {}",
+            true_peak_decisions.len(),
+        )));
+    }
+    let decision = true_peak_decisions[0];
+    if decision.observations.len() != 1
+        || !tonepoet_pipeline::observation_satisfies_dependency(
+            observation,
+            &decision.observations[0],
+        )
+    {
+        return Err(ConvertError::Backend(format!(
+            "certified observation {:?} does not satisfy decision {:?}'s exact scoped dependency",
+            observation.id, decision.id,
+        )));
+    }
+    let dependency = decision.observations[0].clone();
+    let (scope, requested_target_dbtp, allow_boost, binding, album_participant) =
+        match &decision.kind {
+            tonepoet_pipeline::DecisionKind::TruePeakGain {
+                scope,
+                target_dbtp,
+                allow_boost,
+                binding,
+                album_participant,
+            } => (
+                *scope,
+                *target_dbtp,
+                *allow_boost,
+                binding.clone(),
+                album_participant.clone(),
+            ),
+            _ => unreachable!("true-peak decision filter guarantees the kind"),
+        };
+
+    let gain_nodes = typed
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            tonepoet_pipeline::TypedPlanNode::ApplyGain {
+                input,
+                output,
+                policy,
+                decision: Some(node_decision),
+            } if *node_decision == decision.id => Some((*input, *output, *policy)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if gain_nodes.len() != 1 {
+        return Err(ConvertError::Backend(format!(
+            "decision {:?} must bind exactly one typed gain node; found {}",
+            decision.id,
+            gain_nodes.len(),
+        )));
+    }
+    let (gain_input, gain_output, gain_policy) = gain_nodes[0];
+    if gain_input != observation.subject {
+        return Err(ConvertError::Backend(format!(
+            "certified observation subject {:?} does not equal decision {:?}'s gain input {:?}",
+            observation.subject, decision.id, gain_input,
+        )));
+    }
+    let policy_matches_decision = match gain_policy {
+        tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp,
+            scope: policy_scope,
+            scan: policy_scan,
+        } => {
+            !allow_boost
+                && target_dbtp == requested_target_dbtp
+                && policy_scope == scope
+                && policy_scan == scan
+        }
+        tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+            target_dbtp,
+            scope: policy_scope,
+            scan: policy_scan,
+        } => {
+            allow_boost
+                && target_dbtp == requested_target_dbtp
+                && policy_scope == scope
+                && policy_scan == scan
+        }
+        tonepoet_pipeline::SampleGainPolicy::Off
+        | tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => false,
+    };
+    if !policy_matches_decision {
+        return Err(ConvertError::Backend(format!(
+            "typed gain policy and decision {:?} disagree on Guard/Normalize semantics",
+            decision.id,
+        )));
+    }
+
+    let input_state = typed
+        .audio_states
+        .iter()
+        .find(|state| state.id == gain_input)
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "typed gain input {:?} has no audio-state facts",
+                gain_input,
+            ))
+        })?;
+    let sample_rate_hz = match &input_state.sample_rate_hz {
+        tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "certified observation subject {:?} has no authoritative sample rate: {:?}",
+                observation.subject, fact,
+            )))
+        }
+    };
+    let channels = match &input_state.channels {
+        tonepoet_pipeline::Fact::Known(channels) if *channels > 0 => *channels,
+        fact => {
+            return Err(ConvertError::Backend(format!(
+                "certified observation subject {:?} has no authoritative channel geometry: {:?}",
+                observation.subject, fact,
+            )))
+        }
+    };
+
+    let observation_node_index = typed
+        .nodes
+        .iter()
+        .position(|node| {
+            matches!(
+                node,
+                tonepoet_pipeline::TypedPlanNode::Observe(candidate) if candidate.id == observation.id
+            )
+        })
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "certified observation {:?} disappeared from the typed node order",
+                observation.id,
+            ))
+        })?;
+    if typed.nodes[observation_node_index + 1..]
+        .iter()
+        .any(|node| matches!(node, tonepoet_pipeline::TypedPlanNode::ApplyEffect { .. }))
+    {
+        return Err(ConvertError::Backend(format!(
+            "certified observation {:?} is followed by a registered effect; Phase-3 requires all sample-changing effects to precede observation",
+            observation.id,
+        )));
+    }
+    let (pre_resample, pre_observation_resampler, post_resample, _) =
+        segmented_registered_effect_execution_from_typed(
+            typed,
+            observation_node_index,
+            "certified pre-observation",
+            true,
+        )?;
+    if pre_resample.is_some() {
+        return Err(ConvertError::Backend(
+            "certified true-peak execution cannot consume an unqualified pre-resample registered effect"
+                .to_string(),
+        ));
+    }
+    let pre_observation_output = post_resample
+        .as_ref()
+        .map(|segment| segment.output)
+        .or_else(|| {
+            pre_observation_resampler
+                .as_ref()
+                .map(|resampler| resampler.output)
+        });
+    if let Some(output) = pre_observation_output {
+        if output != observation.subject {
+            return Err(ConvertError::Backend(format!(
+                "typed pre-observation execution ends at {:?}, but certified observation reads {:?}",
+                output, observation.subject,
+            )));
+        }
+    }
+
+    let terminal_nodes = typed
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            tonepoet_pipeline::TypedPlanNode::Operation {
+                input_signal: Some(input_signal),
+                candidates,
+                selected_candidate,
+                ..
+            } if *input_signal == gain_output => {
+                candidates.get(*selected_candidate).map(|candidate| candidate)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if terminal_nodes.len() != 1 {
+        return Err(ConvertError::Backend(format!(
+            "typed gain output {:?} must feed exactly one selected terminal candidate; found {}",
+            gain_output,
+            terminal_nodes.len(),
+        )));
+    }
+    let terminal_proof = terminal_nodes[0]
+        .contract
+        .terminal_proof
+        .clone()
+        .ok_or_else(|| {
+            ConvertError::Backend(format!(
+                "selected terminal for certified gain output {:?} has no terminal-error proof",
+                gain_output,
+            ))
+        })?;
+    if !terminal_nodes[0]
+        .contract
+        .runtime_obligations
+        .contains("terminal_bound_recheck")
+    {
+        return Err(ConvertError::Backend(format!(
+            "selected terminal for certified gain output {:?} omitted the runtime terminal-bound recheck",
+            gain_output,
+        )));
+    }
+
+    let charged_terminal =
+        selected_physical_candidate_binding(terminal_nodes[0], "charged terminal")?;
+
+    match (&binding, scope, album_participant.as_ref()) {
+        (
+            tonepoet_pipeline::GainDecisionBinding::Track { scope: owner_scope },
+            tonepoet_pipeline::TruePeakScope::Track,
+            None,
+        ) if *owner_scope == dependency.scope => {}
+        (
+            tonepoet_pipeline::GainDecisionBinding::SubmittedBatch {
+                scope: owner_scope,
+                participant,
+                expected_participants,
+            },
+            tonepoet_pipeline::TruePeakScope::Album,
+            Some(album),
+        ) if *owner_scope == dependency.scope
+            && *participant == dependency.participant
+            && album.scope == *owner_scope
+            && album.participant == *participant
+            && album.expected_participants == *expected_participants
+            && album.observation == dependency
+            && album.terminal_subject == gain_output
+            && album.terminal_proof.as_ref() == Some(&terminal_proof) => {}
+        _ => {
+            return Err(ConvertError::Backend(format!(
+                "typed decision {:?} has an inconsistent scope/participant/terminal binding",
+                decision.id,
+            )))
+        }
+    }
+
+    Ok(CertifiedTruePeakExecutionContract {
+        scope,
+        observation: dependency,
+        observation_subject: observation.subject,
+        decision: decision.id,
+        binding,
+        gain_input,
+        gain_output,
+        scan,
+        requested_target_dbtp,
+        allow_boost,
+        sample_rate_hz,
+        channels,
+        level_basis: input_state.level_basis,
+        read_contract: observation.read_contract.clone(),
+        terminal_subject: gain_output,
+        terminal_proof,
+        pre_observation_resampler,
+        post_resample,
+        charged_terminal,
+    })
+}
+
 #[must_use]
 pub fn source_audio_md5_policy_downgrade_message(
     request: &PipelineRequest,
@@ -717,7 +1886,9 @@ pub fn planner_metadata_obligations_for_track(
     // PreparedSource-level decision made by the metadata stage.
     let post_encode_metadata_obligation = matches!(
         &track.source_ref,
-        TrackSourceRef::DsdAlbumGainCarrier { .. } | TrackSourceRef::PcmTruePeakCarrier { .. }
+        TrackSourceRef::DsdTruePeakCarrier { .. }
+            | TrackSourceRef::PcmTruePeakCarrier { .. }
+            | TrackSourceRef::RegisteredEffectCarrier { .. }
     );
     PlannedMetadataSatisfaction {
         source_tags_transferred: req.settings.metadata.transfer_tags
@@ -1060,7 +2231,7 @@ pub fn source_info_for_realized_track(
     track: &PreparedTrack,
     realized_input: &Path,
 ) -> Result<SourceInfo, ConvertError> {
-    if let TrackSourceRef::DsdAlbumGainCarrier {
+    if let TrackSourceRef::DsdTruePeakCarrier {
         sample_rate_hz,
         channels,
         duration,
@@ -1078,10 +2249,15 @@ pub fn source_info_for_realized_track(
             sample_rate_hz: Some(*sample_rate_hz),
             bit_depth: Some(PcmBitDepth::Float64),
             true_source_depth: None,
-            source_representation: SourceRepresentationKind::Dsd,
+            // Phase 3 has already realized and certified the named DSD-derived
+            // PCM signal. The physical planner must therefore treat this
+            // headerless carrier as PCM and must not reconstruct the original
+            // DSD again. Original DSD provenance remains on TrackSourceRef.
+            source_representation: SourceRepresentationKind::Pcm,
             sample_kind: Some(SampleKind::Float),
             channels: Some(*channels),
             duration: *duration,
+            frame_extent: None,
             audio_md5: None,
         });
     }
@@ -1104,6 +2280,47 @@ pub fn source_info_for_realized_track(
             sample_kind: Some(SampleKind::Float),
             channels: Some(*channels),
             duration: *duration,
+            frame_extent: None,
+            audio_md5: None,
+        });
+    }
+
+    if let TrackSourceRef::RegisteredEffectCarrier {
+        sample_rate_hz,
+        channels,
+        duration,
+        representation,
+        ..
+    } = &track.source_ref
+    {
+        let (codec, bit_depth, sample_kind) = match representation {
+            RegisteredEffectCarrierRepresentation::RawFloat64
+            | RegisteredEffectCarrierRepresentation::Float64Wav => (
+                PlannerCodec::PcmFloat,
+                PcmBitDepth::Float64,
+                SampleKind::Float,
+            ),
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav { bit_depth, .. } => {
+                let (codec, sample_kind) = if bit_depth.is_float() {
+                    (PlannerCodec::PcmFloat, SampleKind::Float)
+                } else {
+                    (PlannerCodec::PcmSigned, SampleKind::SignedInteger)
+                };
+                (codec, *bit_depth, sample_kind)
+            }
+        };
+        return Ok(SourceInfo {
+            dsd_source_kind: None,
+            format: PlannerFormat::Wav,
+            codec,
+            sample_rate_hz: Some(*sample_rate_hz),
+            bit_depth: Some(bit_depth),
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Pcm,
+            sample_kind: Some(sample_kind),
+            channels: Some(*channels),
+            duration: *duration,
+            frame_extent: None,
             audio_md5: None,
         });
     }
@@ -1187,10 +2404,21 @@ pub fn source_info_for_realized_track(
         sample_kind,
         channels,
         duration,
+        frame_extent: authoritative_source_frame_extent(track),
         audio_md5: flac_streaminfo_audio_md5(realized_input),
     })
 }
 
+
+fn authoritative_source_frame_extent(track: &PreparedTrack) -> Option<SourceFrameExtent> {
+    match &track.source_ref {
+        TrackSourceRef::CueStreamSegment { samples, .. }
+        | TrackSourceRef::CueSegmentCarrier { samples, .. }
+        | TrackSourceRef::EmbeddedChapterCarrier { samples, .. }
+        | TrackSourceRef::ImageSegment { samples, .. } => Some(SourceFrameExtent::Exact(*samples)),
+        _ => None,
+    }
+}
 
 fn planner_source_representation(track: &PreparedTrack) -> SourceRepresentationKind {
     match track.source_audio.coding.unwrap_or(SourceAudioCoding::Unknown) {
@@ -1393,13 +2621,15 @@ mod tests {
 
     use tempfile::TempDir;
     use tonepoet_pipeline::{
-        AudioFormat as PlannerFormat, PcmBitDepth, PipelineSettings, PlanAction, PlanOperation,
-        PlanRequest, PreferredTool, TopologyPlan,
+        AudioFormat as PlannerFormat, EffectInstanceId, EffectIntent, EffectPlacement,
+        PcmBitDepth, PipelineSettings, PlanAction, PlanOperation, PlanRequest, PreferredTool,
+        RegisteredUnaryEffect, TopologyPlan,
     };
 
     use super::{
         apply_unsupported_target_metadata_policy_downgrades,
-        authoritative_dsd_sample_timing_from_path, dsd_source_metadata_from_path,
+        authoritative_dsd_sample_timing_from_path, certified_true_peak_execution_contract,
+        certified_true_peak_execution_contract_with_effects, dsd_source_metadata_from_path,
         resolve_wavpack_hybrid_source_working_depth, SourceAudioCoding,
         flac_streaminfo_audio_md5, metadata_obligations_for_request,
         orchestrator_metadata_stage_required, plan_request_for_track,
@@ -1415,16 +2645,20 @@ mod tests {
         ExtractionProvenance, FailurePolicy, LogPolicy, CueSegmentCarrier,
         PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
         PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea,
-        SourceAudioDescriptor, SourceKind, SourceOptions, StagePolicy, StageRequirement, TrackId,
+        SelectedPhysicalCandidateBinding, SourceAudioDescriptor, SourceKind, SourceOptions,
+        StagePolicy, StageRequirement, TrackId,
         TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
         FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
     };
 
     fn request(root: &Path) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             job_id: "job".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "item".to_string(),
+            submission_id: None,
+            submission_size: None,
             container: root.join("album.iso"),
             source: SourceOptions {
                 archive_password: None,
@@ -1530,6 +2764,15 @@ mod tests {
         }
     }
 
+    fn selected_terminal(tool: tonepoet_pipeline::ToolIdentifier) -> SelectedPhysicalCandidateBinding {
+        SelectedPhysicalCandidateBinding {
+            identity: format!("registered:test-terminal:{tool}"),
+            tool,
+            terminal_realization: None,
+            strong_ssrc_resampler: None,
+        }
+    }
+
     fn cue_carrier(path: PathBuf, source_image: PathBuf, start_sample: u64, samples: u64) -> TrackSourceRef {
         TrackSourceRef::CueSegmentCarrier {
             path,
@@ -1598,6 +2841,14 @@ mod tests {
         let plan = tonepoet_pipeline::plan_conversion(plan_request).expect("planner builds command plan");
         match plan.action {
             PlanAction::Execute { commands, .. } => commands.into_iter().map(|cmd| cmd.args).collect(),
+            PlanAction::PassthroughCopy { .. } => Vec::new(),
+        }
+    }
+
+    fn planned_command_tools(plan_request: &PlanRequest) -> Vec<tonepoet_pipeline::ToolIdentifier> {
+        let plan = tonepoet_pipeline::plan_conversion(plan_request).expect("planner builds command plan");
+        match plan.action {
+            PlanAction::Execute { commands, .. } => commands.into_iter().map(|cmd| cmd.tool).collect(),
             PlanAction::PassthroughCopy { .. } => Vec::new(),
         }
     }
@@ -1845,6 +3096,63 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn phase04_native_replaygain_keeps_logical_request_without_static_external_operation() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.dsf");
+        write_minimal_dsf(&input);
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Both);
+        req.submission_id = Some("submission-rg".to_owned());
+        req.submission_size = Some(1);
+        let track = track(TrackSourceRef::StagedFile(input.clone()));
+
+        let planned = plan_request_for_track(
+            &req,
+            &track,
+            &input,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("DSF ReplayGain plan request builds");
+
+        assert_eq!(
+            planned.settings.replay_gain.logical_mode(),
+            Some(tonepoet_pipeline::ReplayGainMode::Both),
+            "the native common planner must retain the logical ReplayGain request"
+        );
+
+        let Ok(tonepoet_pipeline::PlanningOutcome::Ready(typed)) =
+            tonepoet_pipeline::plan_typed(&planned)
+        else {
+            panic!("native ReplayGain request should remain a valid typed plan")
+        };
+        assert_eq!(
+            typed.intent.replay_gain.map(|policy| policy.mode),
+            Some(tonepoet_pipeline::ReplayGainMode::Both)
+        );
+        assert_eq!(
+            typed
+                .intent
+                .replay_gain
+                .and_then(|policy| policy.prevention_ceiling_dbtp),
+            Some(tonepoet_pipeline::ReplayGainProjectionPolicy::PREVENT_CLIPPING_CEILING)
+        );
+        assert!(!typed.intent.reference_delivery);
+        assert!(typed.bridges.iter().all(|bridge| matches!(
+            bridge,
+            tonepoet_pipeline::ExecutionBridge::ExistingCommandPlan
+        )));
+        let operations = topology_operations(&planned);
+        assert!(operations.iter().all(|operation| operation.label() != "replaygain"),
+            "ReplayGain must remain owned by the native common-plan executor, not a static external command");
     }
 
     #[test]
@@ -2504,7 +3812,7 @@ mod tests {
             let output = temp.path().join(format!("out.{extension}"));
             let missing_iso = temp.path().join("missing-album.iso");
             let mut req = request(temp.path());
-            req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+            req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
             req.settings.target_format = target_format;
             let track = track(TrackSourceRef::SacdTrack {
                 iso: missing_iso,
@@ -2519,7 +3827,7 @@ mod tests {
                 &output,
                 temp.path().join("work"),
             )
-            .expect("native-v2 SACD to DSD must remain on the ordinary DSD topology");
+            .expect("SACD to DSD must remain on the ordinary DSD topology");
 
             assert!(planned.resolved_output_target.is_none());
             assert!(planned.source.dsd_source_kind.is_none());
@@ -2540,7 +3848,7 @@ mod tests {
             }
             let output = temp.path().join(format!("out-{extension}.dsf"));
             let mut req = request(temp.path());
-            req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+            req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
             req.settings.target_format = PlannerFormat::Dsf;
             let track = track(TrackSourceRef::StagedFile(input.clone()));
 
@@ -2551,7 +3859,7 @@ mod tests {
                 &output,
                 temp.path().join("work"),
             )
-            .expect("native-v2 staged DSD to DSF must use ordinary DSD planning");
+            .expect("staged DSD to DSF must use ordinary DSD planning");
 
             assert!(planned.resolved_output_target.is_none());
             assert!(
@@ -2570,7 +3878,7 @@ mod tests {
         write_minimal_dsf(&input);
         let output = temp.path().join("out.w64");
         let mut req = request(temp.path());
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         req.settings.target_format = PlannerFormat::Wav;
         req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
             tonepoet_pipeline::PcmBitDepth::Int24,
@@ -2622,7 +3930,7 @@ mod tests {
         let output = temp.path().join("out.flac");
         let missing_iso = temp.path().join("missing-album.iso");
         let mut req = request(temp.path());
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         req.settings.target_format = PlannerFormat::Flac;
         req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
             tonepoet_pipeline::PcmBitDepth::Int24,
@@ -2666,28 +3974,27 @@ mod tests {
         req.settings.metadata.preserve_artwork = true;
         req.settings.metadata.store_source_audio_md5 = true;
         req.settings.preferred_tool = PreferredTool::Sox;
-        req.settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(
-                tonepoet_pipeline::DsdToPcmGainMode::Auto,
-                0.15,
-                None,
-            )
-            .expect("legacy auto gain");
-        req.settings
-            .dsd
-            .set_auto_gain_scope(tonepoet_pipeline::DsdAutoGainScope::Album);
+        req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
+                .with_target("-0.150000000".parse().expect("target"))
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         req.settings.dsd.bind_runtime_album_gain(
             "2.840000000".parse().expect("fixed album gain"),
             Some("-3.000000000".parse().expect("album peak")),
             2,
         );
-        let mut prepared_track = track(TrackSourceRef::DsdAlbumGainCarrier {
+        let mut prepared_track = track(TrackSourceRef::DsdTruePeakCarrier {
             path: carrier.clone(),
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
             channels: 2,
             duration: None,
+            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: None,
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Sox)),
         });
         prepared_track.source_audio = SourceAudioDescriptor::from_scalar(
             Some(5_644_800),
@@ -2703,6 +4010,13 @@ mod tests {
             temp.path().join("work"),
         )
         .expect("album-gain carrier plan request builds");
+        assert_eq!(planned.settings.preferred_tool, PreferredTool::Sox);
+        assert!(
+            planned_command_tools(&planned)
+                .iter()
+                .any(|tool| *tool == tonepoet_pipeline::ToolIdentifier::Sox),
+            "an admitted SoX lossless terminal must remain bound to SoX",
+        );
         assert_eq!(
             planned
                 .settings
@@ -2774,12 +4088,11 @@ mod tests {
         req.settings.metadata.transfer_tags = false;
         req.settings.metadata.preserve_artwork = false;
         req.settings.metadata.store_source_audio_md5 = false;
-        req.settings.pcm_true_peak.enabled = true;
-        req.settings.pcm_true_peak.target_dbtp =
-            "-0.500000000".parse().expect("true-peak target");
-        req.settings.pcm_true_peak.allow_boost = true;
-        req.settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
-        req.settings.pcm_true_peak.scan_mode = tonepoet_pipeline::PcmTruePeakScanMode::Standard;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-0.500000000".parse().expect("true-peak target"),
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
         req.settings
             .pcm_true_peak
             .bind_runtime_album_gain("-0.375000000".parse().expect("album gain"));
@@ -2794,6 +4107,7 @@ mod tests {
             point_dbtp: Some("-0.080000000".parse().expect("measured point")),
             effective_target_dbtp: "-0.500000000".parse().expect("effective target"),
             lossy_target_capped: false,
+            terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
         });
 
         let planned = plan_request_for_track(
@@ -2806,21 +4120,24 @@ mod tests {
         .expect("PCM true-peak carrier plan request builds");
 
         assert!(
-            planned.settings.pcm_true_peak.enabled,
-            "final carrier planning must retain the enabled PCM true-peak policy so target/scope/scan remain in the output settings fingerprint",
+            planned.settings.pcm_true_peak.policy.is_true_peak(),
+            "final carrier planning must retain the PCM true-peak policy so target/scope/scan remain in the output settings fingerprint",
         );
         assert_eq!(
-            planned.settings.pcm_true_peak.target_dbtp.render(false),
+            planned.settings.pcm_true_peak.target_dbtp().expect("target").render(false),
             "-0.500000000"
         );
-        assert!(planned.settings.pcm_true_peak.allow_boost);
+        assert!(matches!(
+            planned.settings.pcm_true_peak.policy,
+            tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. }
+        ));
         assert_eq!(
-            planned.settings.pcm_true_peak.scope,
-            tonepoet_pipeline::PcmTruePeakScope::Album
+            planned.settings.pcm_true_peak.scope(),
+            Some(tonepoet_pipeline::TruePeakScope::Album)
         );
         assert_eq!(
-            planned.settings.pcm_true_peak.scan_mode,
-            tonepoet_pipeline::PcmTruePeakScanMode::Standard
+            planned.settings.pcm_true_peak.scan_tier(),
+            Some(tonepoet_pipeline::TruePeakScanTier::Standard)
         );
         assert_eq!(
             planned
@@ -2870,6 +4187,430 @@ mod tests {
     }
 
     #[test]
+    fn certified_pcm_rate_change_keeps_typed_ffmpeg_soxr_candidate_over_soft_sox_preference() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut settings = PipelineSettings::default();
+        settings.target_format = PlannerFormat::Flac;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.preferred_tool = PreferredTool::Sox;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
+        let request = PlanRequest {
+            input_path: temp.path().join("in.wav"),
+            output_path: temp.path().join("out.flac"),
+            source: tonepoet_pipeline::SourceInfo {
+                format: PlannerFormat::Wav,
+                codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+                sample_rate_hz: Some(96_000),
+                bit_depth: Some(PcmBitDepth::Int24),
+                true_source_depth: Some(PcmBitDepth::Int24),
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("pcm-rate-change"),
+            intermediate_dir: Some(temp.path().join("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+
+        let typed = match tonepoet_pipeline::plan_typed(&request).expect("typed planner succeeds") {
+            tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("expected admitted typed plan, got {other:?}"),
+        };
+        assert_eq!(
+            typed.execution_capability,
+            tonepoet_pipeline::ExecutionCapability::RequiresPhase3CommonRealizer,
+            "Phase 2 keeps the accepted generic common-realizer marker",
+        );
+
+        let execution = certified_true_peak_execution_contract(&request)
+            .expect("Phase 3 certified realizer must consume the admitted common-realizer plan");
+        let resampler = execution
+            .pre_observation_resampler
+            .expect("rate-changing certified plan must retain its physical resampler");
+        assert_eq!(resampler.input_rate_hz, 96_000);
+        assert_eq!(resampler.output_rate_hz, 44_100);
+        assert_eq!(resampler.selected.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert!(
+            resampler.selected.identity.to_ascii_lowercase().contains("ffmpeg")
+                || resampler.selected.identity.to_ascii_lowercase().contains("soxr"),
+            "unexpected selected resampler identity: {}",
+            resampler.selected.identity,
+        );
+    }
+
+    #[test]
+    fn certified_pcm_pre_resample_effect_refuses_but_post_effect_remains_bound() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut settings = PipelineSettings::default();
+        settings.target_format = PlannerFormat::Flac;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.preferred_tool = PreferredTool::Auto;
+        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
+        let request = PlanRequest {
+            input_path: temp.path().join("in.wav"),
+            output_path: temp.path().join("out.flac"),
+            source: tonepoet_pipeline::SourceInfo {
+                format: PlannerFormat::Wav,
+                codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+                sample_rate_hz: Some(96_000),
+                bit_depth: Some(PcmBitDepth::Int24),
+                true_source_depth: Some(PcmBitDepth::Int24),
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: Some(tonepoet_pipeline::SourceFrameExtent::Exact(5_760_000)),
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("pcm-protected-effects"),
+            intermediate_dir: Some(temp.path().join("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+        let pre = EffectIntent {
+            id: EffectInstanceId(1),
+            effect: RegisteredUnaryEffect::SoxHighPass { frequency_hz: 20 },
+            after: Vec::new(),
+            placement: EffectPlacement::BeforePcmResample,
+        };
+        let post = EffectIntent {
+            id: EffectInstanceId(2),
+            effect: RegisteredUnaryEffect::FfmpegLowPass { frequency_hz: 20_000 },
+            after: Vec::new(),
+            placement: EffectPlacement::AfterPcmResample,
+        };
+
+        let pre_error = certified_true_peak_execution_contract_with_effects(
+            &request,
+            std::slice::from_ref(&pre),
+        )
+        .expect_err("unqualified pre-resample effect must be refused before certified execution");
+        assert!(pre_error
+            .to_string()
+            .contains("protected_pre_resample_effect_unqualified"));
+
+        let mixed_error = certified_true_peak_execution_contract_with_effects(
+            &request,
+            &[pre, post.clone()],
+        )
+        .expect_err("mixed certified route must refuse when its pre-resample effect is unqualified");
+        assert!(mixed_error
+            .to_string()
+            .contains("protected_pre_resample_effect_unqualified"));
+
+        let post_only = certified_true_peak_execution_contract_with_effects(
+            &request,
+            std::slice::from_ref(&post),
+        )
+        .expect("existing post-resample certified route remains executable");
+        let post_resampler = post_only
+            .pre_observation_resampler
+            .as_ref()
+            .expect("selected resampler");
+        let post_segment = post_only.post_resample.as_ref().expect("post segment");
+        assert_eq!(post_resampler.output, post_segment.input);
+        assert_eq!(post_resampler.input_rate_hz, 96_000);
+        assert_eq!(post_resampler.output_rate_hz, 44_100);
+        assert_eq!(post_segment.sample_rate_hz, 44_100);
+        assert_eq!(post_segment.channels, 2);
+        assert_eq!(post_segment.output, post_only.observation_subject);
+        assert_eq!(
+            post_resampler.selected.tool,
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+        );
+    }
+
+    #[test]
+    fn certified_pcm_lossless_sox_terminal_stays_bound_to_typed_selected_sox() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("pcm.true-peak.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let original = temp.path().join("source.wav");
+        std::fs::write(&original, b"source").expect("source placeholder");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        req.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        req.settings.preferred_tool = PreferredTool::Sox;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
+
+        let typed_request = PlanRequest {
+            input_path: original.clone(),
+            output_path: output.clone(),
+            source: tonepoet_pipeline::SourceInfo {
+                format: PlannerFormat::Wav,
+                codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+                sample_rate_hz: Some(48_000),
+                bit_depth: Some(PcmBitDepth::Int24),
+                true_source_depth: Some(PcmBitDepth::Int24),
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings: req.settings.clone(),
+            plan_scope: tonepoet_pipeline::PlanScope::track("pcm-lossless-sox"),
+            intermediate_dir: Some(temp.path().join("typed-work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+        let execution = certified_true_peak_execution_contract(&typed_request)
+            .expect("typed lossless hard-ceiling plan exposes its selected terminal");
+        assert_eq!(
+            execution.charged_terminal.tool,
+            tonepoet_pipeline::ToolIdentifier::Sox,
+            "a fully admitted explicit SoX lossless candidate must remain selected",
+        );
+
+        let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+            path: carrier.clone(),
+            source_path: original,
+            sample_rate_hz: 48_000,
+            channels: 2,
+            duration: None,
+            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: Some("-2.000000000".parse().expect("point")),
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: false,
+            terminal_candidate: Some(execution.charged_terminal.clone()),
+        });
+        prepared.sample_rate = Some(48_000);
+        prepared.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(48_000),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared,
+            &carrier,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("certified lossless PCM carrier plan request builds");
+        assert_eq!(planned.settings.preferred_tool, PreferredTool::Sox);
+        let tools = planned_command_tools(&planned);
+        assert_eq!(
+            tools.last(),
+            Some(&execution.charged_terminal.tool),
+            "the retained-carrier terminal must preserve the typed selected SoX candidate",
+        );
+    }
+
+    #[test]
+    fn certified_pcm_lossy_terminal_keeps_typed_ffmpeg_candidate_over_soft_sox_preference() {
+        for (format, extension) in [
+            (PlannerFormat::Mp3, "mp3"),
+            (PlannerFormat::Opus, "opus"),
+        ] {
+            let temp = TempDir::new().expect("temp dir");
+            let carrier = temp.path().join("pcm.true-peak.f64le");
+            std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+            let original = temp.path().join("source.wav");
+            std::fs::write(&original, b"source").expect("source placeholder");
+            let output = temp.path().join(format!("out.{extension}"));
+            let mut req = request(temp.path());
+            req.settings.target_format = format;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+            req.settings.preferred_tool = PreferredTool::Sox;
+            req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            };
+
+            let typed_request = PlanRequest {
+                input_path: original.clone(),
+                output_path: output.clone(),
+                source: tonepoet_pipeline::SourceInfo {
+                    format: PlannerFormat::Wav,
+                    codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+                    sample_rate_hz: Some(48_000),
+                    bit_depth: Some(PcmBitDepth::Int24),
+                    true_source_depth: Some(PcmBitDepth::Int24),
+                    source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                    sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                    channels: Some(2),
+                    duration: Some(std::time::Duration::from_secs(60)),
+                    frame_extent: None,
+                    dsd_source_kind: None,
+                    audio_md5: None,
+                },
+                settings: req.settings.clone(),
+                plan_scope: tonepoet_pipeline::PlanScope::track(format!("pcm-{extension}")),
+                intermediate_dir: Some(temp.path().join("typed-work")),
+                container_ffmpeg_flags: Vec::new(),
+                resolved_output_target: None,
+                reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+                planned_riff_non_audio_upper_bound_bytes: None,
+            };
+            let execution = certified_true_peak_execution_contract(&typed_request)
+                .expect("typed hard-ceiling lossy plan exposes its charged terminal");
+            assert_eq!(
+                execution.charged_terminal.tool,
+                tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            );
+
+            let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+                path: carrier.clone(),
+                source_path: original,
+                sample_rate_hz: 48_000,
+                channels: 2,
+                duration: None,
+                gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                point_dbtp: Some("-2.000000000".parse().expect("point")),
+                effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                lossy_target_capped: true,
+                terminal_candidate: Some(execution.charged_terminal.clone()),
+            });
+            prepared.sample_rate = Some(48_000);
+            prepared.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(48_000),
+                Some(64),
+                Some(SourceAudioCoding::Pcm),
+            );
+
+            let planned = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join("work"),
+            )
+            .expect("certified lossy PCM carrier plan request builds");
+            assert_eq!(planned.settings.preferred_tool, PreferredTool::Ffmpeg);
+            let tools = planned_command_tools(&planned);
+            assert_eq!(
+                tools.last(),
+                Some(&execution.charged_terminal.tool),
+                "the emitted terminal must equal the physical candidate whose proof was charged",
+            );
+            assert!(!tools.iter().any(|tool| *tool == tonepoet_pipeline::ToolIdentifier::Sox));
+        }
+    }
+
+    #[test]
+    fn certified_dsd_lossy_terminal_keeps_typed_ffmpeg_candidate_over_soft_sox_preference() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("dsd.true-peak.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let original = temp.path().join("source.dsf");
+        std::fs::write(&original, b"source").expect("source placeholder");
+        let output = temp.path().join("out.opus");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Opus;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        req.settings.preferred_tool = PreferredTool::Sox;
+        req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        });
+
+        let typed_request = PlanRequest {
+            input_path: original.clone(),
+            output_path: output.clone(),
+            source: tonepoet_pipeline::SourceInfo {
+                format: PlannerFormat::Dsf,
+                codec: tonepoet_pipeline::AudioCodec::Dsd,
+                sample_rate_hz: Some(5_644_800),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Dsd,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
+                channels: Some(2),
+                duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings: req.settings.clone(),
+            plan_scope: tonepoet_pipeline::PlanScope::track("dsd-opus"),
+            intermediate_dir: Some(temp.path().join("typed-work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+        let execution = certified_true_peak_execution_contract(&typed_request)
+            .expect("typed DSD hard-ceiling lossy plan exposes its charged terminal");
+        assert_eq!(
+            execution.charged_terminal.tool,
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+        );
+
+        let mut prepared = track(TrackSourceRef::DsdTruePeakCarrier {
+            path: carrier.clone(),
+            source_path: original,
+            sample_rate_hz: 48_000,
+            channels: 2,
+            duration: None,
+            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: Some("-2.000000000".parse().expect("point")),
+            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            lossy_target_capped: true,
+            terminal_candidate: Some(execution.charged_terminal.clone()),
+        });
+        prepared.sample_rate = Some(5_644_800);
+        prepared.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(5_644_800),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        );
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared,
+            &carrier,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("certified lossy DSD carrier plan request builds");
+        assert_eq!(planned.settings.preferred_tool, PreferredTool::Ffmpeg);
+        let tools = planned_command_tools(&planned);
+        assert_eq!(
+            tools.last(),
+            Some(&execution.charged_terminal.tool),
+            "the DSD retained-carrier terminal must equal the typed proof candidate",
+        );
+        assert!(!tools.iter().any(|tool| *tool == tonepoet_pipeline::ToolIdentifier::Sox));
+    }
+
+    #[test]
     fn pcm_true_peak_wavpack_hybrid_source_depth_resolves_to_integer_working_default() {
         let temp = TempDir::new().expect("temp dir");
         let original_pcm = temp.path().join("source.wav");
@@ -2886,7 +4627,7 @@ mod tests {
         req.settings.metadata.transfer_tags = false;
         req.settings.metadata.preserve_artwork = false;
         req.settings.metadata.store_source_audio_md5 = false;
-        req.settings.pcm_true_peak.enabled = true;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
         let mut prepared_track = track(TrackSourceRef::PcmTruePeakCarrier {
             path: carrier.clone(),
@@ -2898,6 +4639,7 @@ mod tests {
             point_dbtp: Some("-0.080000000".parse().expect("measured point")),
             effective_target_dbtp: "-1.000000000".parse().expect("effective target"),
             lossy_target_capped: true,
+            terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
         });
         prepared_track.bit_depth = Some(640);
         prepared_track.source_audio.bit_depth = Some(640);
@@ -3369,6 +5111,7 @@ mod tests {
             output_path: output,
             source: source_info_for_realized_track(&track, &input).expect("source facts"),
             settings: req.settings.clone(),
+            plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(temp.path().join("work")),
             container_ffmpeg_flags: Vec::new(),
         };

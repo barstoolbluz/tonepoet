@@ -314,19 +314,12 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 TuiButton::PcmGainDbField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
-            FormatField::PcmTruePeakScope => register_pill_row(
+            FormatField::TruePeakScope => register_pill_row(
                 buttons,
                 &state.pcm_true_peak_scope,
                 y,
                 label_col,
-                TuiButton::PcmTruePeakScopePill,
-            ),
-            FormatField::PcmTruePeakBoost => register_pill_row(
-                buttons,
-                &state.pcm_true_peak_boost,
-                y,
-                label_col,
-                TuiButton::PcmTruePeakBoostPill,
+                TuiButton::TruePeakScopePill,
             ),
             FormatField::PcmTruePeakScan => register_pill_row(
                 buttons,
@@ -345,14 +338,18 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::DsdPath => register_pill_row(buttons, &state.dsd_pathway, y, label_col, TuiButton::DsdPathPill),
             FormatField::DsdProfile => register_pill_row(buttons, &state.dsd_profile, y, label_col, TuiButton::DsdProfilePill),
             FormatField::DsdGain => register_enabled_pill_row(buttons, &state.dsd_gain_mode, y, label_col, TuiButton::DsdGainPill),
-            FormatField::DsdGainScope => register_pill_row(buttons, &state.dsd_auto_gain_scope, y, label_col, TuiButton::DsdGainScopePill),
+            FormatField::DsdTruePeakScope => register_pill_row(buttons, &state.dsd_true_peak_scope, y, label_col, TuiButton::DsdTruePeakScopePill),
             FormatField::DsdTruePeakScan => register_pill_row(buttons, &state.dsd_true_peak_scan_mode, y, label_col, TuiButton::DsdTruePeakScanPill),
             FormatField::DsdGainDb => buttons.record_button(
                 TuiButton::DsdGainDbField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
-            FormatField::DsdNormalizeTarget => buttons.record_button(
-                TuiButton::DsdNormalizeTargetField,
+            FormatField::DsdTruePeakTarget => buttons.record_button(
+                TuiButton::DsdTruePeakTargetField,
+                ratatui::layout::Rect::new(area.x, y, area.width, 1),
+            ),
+            FormatField::DsdSamplePeakTarget => buttons.record_button(
+                TuiButton::DsdSamplePeakTargetField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
             FormatField::Container => {
@@ -825,7 +822,7 @@ mod format_render_registration_tests {
         app.convert.format.set_source_is_dsd(true);
         assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
         assert!(app.convert.format.resampler.select_value(&ResamplerChoice::Sox));
-        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::Auto));
+        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
         app.convert.format.resample_quality = ResampleQuality::Ultra;
         app.convert.format.apply_format_constraints();
 
@@ -836,37 +833,37 @@ mod format_render_registration_tests {
             .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
             .expect("draw DSD-to-PCM format pane");
 
-        let gain_scope_y = rendered_row(&terminal, WIDTH, HEIGHT, "gain scope");
-        let auto_margin_y = rendered_row(&terminal, WIDTH, HEIGHT, "auto margin");
+        let gain_scope_y = rendered_row(&terminal, WIDTH, HEIGHT, "TP scope");
+        let true_peak_target_y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
         let container_y = rendered_row(&terminal, WIDTH, HEIGHT, "container");
         let resample_quality_y = rendered_row(&terminal, WIDTH, HEIGHT, "insane");
         let gain_y = rendered_row(&terminal, WIDTH, HEIGHT, "DSD gain");
 
         let album_scope_rect = app
             .button_map
-            .find_button_rect(&TuiButton::DsdGainScopePill(1))
+            .find_button_rect(&TuiButton::DsdTruePeakScopePill(1))
             .expect("gain-scope album pill hit region");
         assert_eq!(album_scope_rect.y, gain_scope_y);
         assert_eq!(
             app.button_map.find_button_at(album_scope_rect.x, album_scope_rect.y),
-            Some(TuiButton::DsdGainScopePill(1)),
+            Some(TuiButton::DsdTruePeakScopePill(1)),
         );
         assert!(crate::tui::format_interactions::handle_convert_format_button(
             &mut app.convert,
-            TuiButton::DsdGainScopePill(1),
+            TuiButton::DsdTruePeakScopePill(1),
         ));
-        assert_eq!(app.convert.format.dsd_gain_mode.selected_value(), &DsdGainMode::Auto);
-        assert_eq!(app.convert.format.dsd_auto_gain_scope.selected, 1);
+        assert_eq!(app.convert.format.dsd_gain_mode.selected_value(), &DsdGainMode::TruePeakGuard);
+        assert_eq!(app.convert.format.dsd_true_peak_scope.selected, 1);
         assert_eq!(
             app.button_map
-                .find_button_rect(&TuiButton::DsdNormalizeTargetField)
-                .expect("auto-margin hit region")
+                .find_button_rect(&TuiButton::DsdTruePeakTargetField)
+                .expect("true-peak target hit region")
                 .y,
-            auto_margin_y,
+            true_peak_target_y,
         );
         assert!(
             app.button_map.find_button_rect(&TuiButton::DsdGainDbField).is_none(),
-            "manual-gain row is inactive in auto mode and must not render or receive a hit target"
+            "fixed-gain row is inactive under certified true-peak policy and must not render or receive a hit target"
         );
         assert_eq!(
             app.button_map
@@ -884,16 +881,16 @@ mod format_render_registration_tests {
         );
 
         let gain_text = row_text(&terminal, gain_y, WIDTH);
-        assert!(gain_text.contains("disabled"));
-        assert!(gain_text.contains("auto"));
-        assert!(gain_text.contains("manual"));
-        assert!(!gain_text.contains("reference"));
-        assert!(!gain_text.contains("native"));
-        assert!(!gain_text.contains("normalize"));
+        assert!(gain_text.contains("off"));
+        assert!(gain_text.contains("true-peak guard"));
+        assert!(gain_text.contains("true-peak normalize"));
+        assert!(gain_text.contains("fixed gain"));
+        assert!(!gain_text.contains("auto"));
 
         let keyboard_rows = app.convert.format.visible_fields(true);
-        assert!(keyboard_rows.contains(&FormatField::DsdGainScope));
-        assert!(keyboard_rows.contains(&FormatField::DsdNormalizeTarget));
+        assert!(keyboard_rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(keyboard_rows.contains(&FormatField::DsdTruePeakScope));
+        assert!(keyboard_rows.contains(&FormatField::DsdTruePeakScan));
         assert!(keyboard_rows.contains(&FormatField::Container));
         assert!(keyboard_rows.contains(&FormatField::ResampleQuality));
         assert!(!keyboard_rows.contains(&FormatField::DsdGainDb));
@@ -916,7 +913,7 @@ mod format_render_registration_tests {
         app.convert.format.select_focused_next(None, None);
         assert_eq!(app.convert.format.resample_quality, ResampleQuality::Insane);
 
-        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
         app.convert.format.apply_format_constraints();
         app.button_map.clear();
         terminal
@@ -934,15 +931,15 @@ mod format_render_registration_tests {
         let all_text: String = (0..HEIGHT)
             .map(|y| row_text(&terminal, y, WIDTH))
             .collect();
-        assert!(!all_text.contains("gain scope"));
-        assert!(!all_text.contains("auto margin"));
+        assert!(!all_text.contains("TP scope"));
+        assert!(!all_text.contains("TP target"));
         assert!(app
             .button_map
-            .find_button_rect(&TuiButton::DsdGainScopePill(0))
+            .find_button_rect(&TuiButton::DsdTruePeakScopePill(0))
             .is_none());
         assert!(app
             .button_map
-            .find_button_rect(&TuiButton::DsdNormalizeTargetField)
+            .find_button_rect(&TuiButton::DsdTruePeakTargetField)
             .is_none());
     }
 }

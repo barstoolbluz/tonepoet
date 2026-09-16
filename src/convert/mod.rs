@@ -832,10 +832,10 @@ impl ConversionManager {
             .pipeline_settings
             .as_ref()
             .map(|settings| {
-                settings.dsd.album_auto_gain_selected()
-                    || (settings.pcm_true_peak.enabled
-                        && settings.pcm_true_peak.scope
-                            == tonepoet_pipeline::PcmTruePeakScope::Album)
+                settings.dsd.album_true_peak_gain_selected()
+                    || (settings.pcm_true_peak.is_true_peak()
+                        && settings.pcm_true_peak.scope()
+                            == Some(tonepoet_pipeline::TruePeakScope::Album))
             })
             .unwrap_or(false);
         let mut outcome = CommitBatchOutcome::success();
@@ -3195,9 +3195,12 @@ mod bluray_queue_admission_tests {
         };
 
         crate::convert::pipeline::PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("job-{item_id}"),
             item_id: item_id.to_string(),
+            submission_id: None,
+            submission_size: None,
             container: path.to_path_buf(),
             source: SourceOptions {
                 archive_password: None,
@@ -4960,8 +4963,11 @@ mod per_track_epoch_tests {
 
         let mut options = ConversionOptions::default();
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.scope = tonepoet_pipeline::PcmTruePeakScope::Album;
+        settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            scan: tonepoet_pipeline::TruePeakScanTier::Fast,
+        });
         options.pipeline_settings = Some(settings);
 
         let transaction = manager.commit_batch_with_cue_artifacts(

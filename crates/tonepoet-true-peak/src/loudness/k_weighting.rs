@@ -78,7 +78,7 @@ impl KWeightingCoefficients {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FilterState {
-    delay: [f64; 4],
+    pub(super) delay: [f64; 4],
 }
 
 impl FilterState {

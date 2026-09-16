@@ -2100,13 +2100,14 @@ reason the behaviour survives.
   isolated work, unless the hidden files become annoying enough to justify deleting the
   OR-clause on its own, which is a small and independently safe change.
 
-## 28. Displayed true peak should come from `tonepoet-true-peak`, in its reporting mode
+## 28. Displayed true peak should come from `tonepoet-true-peak`, in its reporting mode — RESOLVED
 
-The `tonepoet-true-peak` crate now measures true peak in-process, with no dependencies and no
-subprocess. Its first consumer is album DSD auto-gain. The `:analyze` display still gets its
-true-peak figure by shelling out to `loudgain` and parsing tab-separated text
-(`src/tui/analyze.rs`, `measure_loudness`), which predates the crate. We plan to move that
-display onto the crate.
+**Resolved by planner/pipeline Phase 4 on 2026-09-13.** `:analyze` now uses the same in-process
+NativeEbu2023 loudness observation and native `ReportingPeakMeter` used by the common ReplayGain
+path. Production ReplayGain writing likewise uses the native path; no production caller shells
+out to `loudgain`. The compatibility code in `tonepoet-true-peak::compat::loudgain_068` remains
+diagnostic/differential tooling only. The historical analysis below is retained to explain why
+the reporting peak remains distinct from the certified hard-ceiling peak.
 
 ### The mode selection this settles
 
@@ -2141,18 +2142,15 @@ that rides along with a far more expensive decode.
 - One fewer external-tool text-parsing dependency on a display path.
 - The mode stays chosen at the call site. No config key, no pill, no `:set` option.
 
-### Notes for whoever picks this up
+### Resolution notes
 
-- **This does not retire the `loudgain` shell-out.** `measure_loudness` returns LUFS *and*
-  true peak from one invocation, and the crate measures peak only -- it has no loudness
-  meter. Only the true-peak column can move. Whether that is worth a second pass over the
-  audio, or whether the display should keep taking both from loudgain until something also
-  supplies LUFS in-process, is the first thing to decide.
-- The crate takes interleaved `f64` frames, so this needs a decode path to feed it. The album
-  gain site already has one because it measures a retained PCM carrier; the `:analyze` site
-  currently hands `loudgain` a file path and lets it do its own decoding.
-- ReplayGain *writing* (`command.rs`) is a separate use of `loudgain` and is not in scope.
-- Expected to be folded into the planned pipeline redesign rather than done as isolated work.
+- `:analyze` now decodes the complete programme in-process and feeds NativeEbu2023 loudness plus
+  the independent reporting-peak meter; ReplayGain-only demand is integrated-only.
+- ReplayGain writing in conversion, command mode, and the metadata editor uses the same native
+  observation/projection owner and the existing format-specific metadata writer.
+- The certified hard-ceiling meter remains a separate Phase 3 contract and is not substituted
+  for the reporting peak.
+- The external loudgain runtime/build dependency was retired after the caller inventory closed.
 
 ## 29. Hard-ceiling headroom reserve for 16-bit aggressive noise shaping
 

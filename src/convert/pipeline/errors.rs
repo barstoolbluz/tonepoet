@@ -193,6 +193,8 @@ pub enum ConvertError {
     TrackValidation(String),
     #[error("backend encode failed: {0}")]
     Backend(String),
+    #[error("qualification unavailable: {0}")]
+    QualificationUnavailable(String),
     #[error("tool error: {0}")]
     Tool(#[from] ToolRunnerError),
     #[error("io error: {0}")]

@@ -4,7 +4,7 @@ This document lists the public API exposed by `tonepoet-pipeline`.
 
 ## Modules
 
-`enums`, `error`, `mapping`, `plan`, `plugins`, `settings`, `source`, `tools`.
+`enums`, `error`, `mapping`, `plan`, `plugins`, `semantic_plan`, `settings`, `source`, `tools`.
 
 The crate root re-exports the public items from these modules.
 
@@ -31,6 +31,8 @@ The crate root re-exports the public items from these modules.
 - `Mp3Mode`: `Cbr`, `Vbr`, `Abr`
 - `AacProfile`: `LcAac`, `HeAac`, `HeAacV2`
 - `ReplayGainMode`: `Track`, `Album`, `Both`
+- `TruePeakScope`: `Track`, `Album`
+- `TruePeakScanTier`: `Fast`, `Standard`, `Reference`
 - `OpusContentType`: `Auto`, `Music`, `Speech`
 - `WavPackMode`: `Normal`, `Fast`, `High`, `VeryHigh`
 - `SsrcProfile`: `Insane`, `High`, `Long`, `Standard`, `Short`, `Fast`, `Lightning`
@@ -50,7 +52,7 @@ The crate root re-exports the public items from these modules.
 - `PlanOperation`: `DecodeToPcm`, `ResamplePcm`, `EncodePcm`, `EncodeLossy`, `PcmToDsd`, `DsdToPcm`, `DsdRateChange`, `MetadataTransfer`, `StoreSourceAudioMd5`, `ReplayGain { target_format, mode }`, `Verify`
   - Methods: `label`
 - `TopologyPlan`: `Passthrough`, `Execute`
-- `ToolIdentifier`: `Ffmpeg`, `Sox`, `Ssrc`, `Loudgain`, `Metaflac`, `Flac`, `Custom(String)`
+- `ToolIdentifier`: `Ffmpeg`, `Sox`, `Ssrc`, `Metaflac`, `Flac`, `Custom(String)`
   - Methods: `program`, `matches_preference`
 - `MetadataDisposition`: `DoesNotWrite`, `WritesRequestedPolicy`
   - Methods: `writes_requested_policy`
@@ -70,18 +72,24 @@ The crate root re-exports the public items from these modules.
 - `SsrcSettings`: `force`, `insane_mode`, `profile`
 - `SoxResamplerSettings`: `chebyshev`, `bandwidth_pct`, `phase`, `allow_aliasing`, `sinc_taps`, `sinc_attenuation_db`, `sinc_passband_hz`, `sinc_transition_hz`, `sinc_kaiser_beta`, `sinc_phase`
 - `SoxrResamplerSettings`: `chebyshev`, `cutoff`, `phase`
-- `DsdSettings`: `pcm_to_dsd`, `from_dsd`; album-gain control via `auto_gain_scope`, `set_auto_gain_scope`, `true_peak_scan_mode`, `set_true_peak_scan_mode`; legacy-v1 origin and wire are private compatibility state
-- `DsdTruePeakScanMode`: `Reference`, `Standard`, `Fast` (only effective for album-scoped automatic DSD gain; serialized with Fast066V2 schema-qualified names)
+- `SampleGainPolicy`: `Off`, `TruePeakGuard { target_dbtp, scope, scan }`, `TruePeakNormalize { target_dbtp, scope, scan }`, `FixedGain { gain_db }`
+  - Guard is attenuation-only; Normalize may boost or attenuate toward a dBTP ceiling. Any solver `allow_boost` boolean is derived privately from the variant and is not a settings/API authority.
+  - Methods: `is_true_peak`, `is_active`, `is_album_true_peak`, `target_dbtp`, `scope`, `scan`, `fixed_gain_db`, `with_scope`, `with_scan`, `with_target`
+- `DsdSettings`: `pcm_to_dsd`, `from_dsd`, `general_from_dsd`; one strict persisted representation plus runtime-only album authority
+  - Methods: `reference`, `reference_delivery_selected`, `gain_policy`, `set_gain_policy`, `true_peak_scope`, `true_peak_scan_tier`, `set_true_peak_scope`, `set_true_peak_scan_tier`, `album_true_peak_gain_selected`, `album_true_peak_target_dbtp`, runtime album binding/clearing accessors
+- `DsdToPcmSettings`: `reconstruction`, `lowpass`, `sinc`, `export_level`, `gain`
+- `DsdGeneralReconstruction`: `General`, `ReferenceProtected`
+- `DsdGeneralExportLevel`: `Native`, `NominalCompensated`, `ProtectedR64`, `NativeWithOffset { offset_db }`
+- `DsdToPcmSincSettings`: directional general DSD-to-PCM sinc parameters
 - `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
-- `DsdSourceSettings`: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
-- `PcmTruePeakGainSettings`: `enabled`, `target_dbtp`, `allow_boost`, `scope`, `scan_mode`, `fixed_gain_db`; automatic and fixed gain are mutually exclusive
-- `PcmTruePeakScope`: `Track`, `Album`
-- `PcmTruePeakScanMode`: `Reference`, `Standard`, `Fast` (serialized with Fast066V2 schema-qualified names)
+- `DsdSourceSettings`: qualified Reference-delivery controls: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
+- `PcmTruePeakGainSettings`: `policy` plus runtime-only album gain authority
+  - Methods: `is_true_peak`, `is_active`, `album_true_peak_gain_selected`, `target_dbtp`, `scope`, `scan_tier`, `fixed_gain_db`, policy/scope/tier setters, effective target and runtime album binding/clearing accessors
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`
 - `PcmToDsdSincSettings`: `oversample_factor`, `taps`, `passband_hz`, `transition_hz`, `kaiser_beta`, `linear_phase`, `allow_aliasing`
 - `MetadataSettings`: `transfer_tags`, `preserve_artwork`, `store_source_audio_md5` (validated against target-aware built-in tag/artwork support)
 - `VerificationSettings`: `verify_after_encode`, `prefer_native_flac_verify`
-- `ReplayGainSettings`: `mode`, `prevent_clipping` (built-in support is target-aware)
+- `ReplayGainSettings`: persisted native-owner `mode`, `prevent_clipping`, `existing_tags`; `logical_mode` exposes the single production request without a delegated external-owner slot
 - `SourceInfo`
   - Fields: `format`, `codec`, `sample_rate_hz`, `bit_depth` (realized carrier), `true_source_depth` (authoritative original PCM width), `source_representation`, `sample_kind`, `channels`, `duration`, `audio_md5`
   - Methods: `is_dsd`, `representation_kind`, `authoritative_pcm_depth`, `dsd_rate`, `validate`
@@ -103,10 +111,25 @@ The crate root re-exports the public items from these modules.
   - Constructor: `new`
 - `ToolSupport`
   - Constants: `UNSUPPORTED`, `FALLBACK`, `SUPPORTED`, `PREFERRED`, `CANONICAL`
+
+## Phase 2 typed planner surface
+
+- `NormalizedIntent`: strict, context-resolved request semantics used by the pure planner.
+- `TypedConversionPlan`: named audio states, artifacts, observations, decisions, ordered nodes, claims/obligations, physical candidates with one selected candidate per operation, execution capability and transition bridges.
+- `ExecutionCapability`: `ExecutableNow`, `ExecutableByPhase3CommonRealizer`, plus the retained transition markers `RequiresPhase3DsdTrackTruePeak` and `RequiresPhase3CommonRealizer`.
+- `ValueDomain` distinguishes arbitrary finite floating-point signals from `Q1_31DerivedBinary64`; equal storage precision alone does not prove an exact-value lattice.
+- `PlanningOutcome<T>`: `Ready(T)`, `NeedFacts { ... }`, `Refused(...)`.
+- Planner entry points: `normalize_intent`, `plan_typed`, `plan_typed_with_effects`, `require_current_executor`.
+- Candidate admission: `select_candidate`, `select_candidate_for_requirements`, `select_candidate_bounded`; representation/reader/terminal proof requirements are checked independently of preference.
+- Registered unary effects: `explicit_effect_sequence`, `order_registered_effects`, `lower_registered_effect`; repeated and mixed registered effects preserve explicit order and effective arguments.
+- `contract_for_operation` registers the proof/representation contract for every existing `PlanOperation` family.
+- `common_semantic_plan_fingerprint_v1` binds normalized semantics and proof contracts without backend identity; `common_execution_plan_fingerprint_v1` additionally binds selected candidate/tool, execution capability, temporary bridge ownership and retained lowering operations.
+
+Phase 3 connects ordinary DSD Track Guard/True-peak normalize and registered-effect routes through `ExecutableByPhase3CommonRealizer`. The common realizer consumes the typed observation/decision/signal contract; `require_current_executor` still refuses common-realizer-only routes rather than inventing a legacy lowering or substituting SoX `norm`. The `RequiresPhase3*` values remain only as bounded transition/diagnostic markers for older call paths and are not the capability emitted by newly connected DSD Track plans.
   - Methods: `new`, `is_supported`, `score`
 - `ToolRegistry`
   - Constructors/methods: `empty`, `with_builtin_tools`, `register`, `tool_ids`, `selected_tool_id`, `metadata_disposition_for_step`, `build_command`
-- Built-in plugin structs: `FfmpegPlugin`, `SoxPlugin`, `SsrcPlugin`, `LoudgainPlugin`, `MetaflacPlugin`, `FlacPlugin`
+- Built-in plugin structs: `FfmpegPlugin`, `SoxPlugin`, `SsrcPlugin`, `MetaflacPlugin`, `FlacPlugin`
 
 ## Traits
 

@@ -726,6 +726,12 @@ where
                 Err(error) => {
                     let _ = event_parent.write_all(&[EVENT_ABORT]);
                     let _ = send_control(&mut control_parent, CONTROL_CANCEL);
+                    // The helper may emit terminal lifecycle events while
+                    // honoring the abort. Close both parent channels before
+                    // waiting so those best-effort emissions observe EOF
+                    // instead of blocking forever for an ACK we will not read.
+                    drop(event_parent);
+                    drop(control_parent);
                     let _ = helper.wait();
                     output_stop.store(true, Ordering::Release);
                     let _ = join_optional_tail_reader(stdout_reader, "stdout");

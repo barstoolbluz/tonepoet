@@ -6,13 +6,13 @@
 //! qualification corpus.
 
 use crate::dsd_reference::{resolve_reference_profile, DbNano};
-use crate::enums::{DsdAutoGainScope, DsdLowpassMethod, RateTarget};
+use crate::enums::{TruePeakScope, DsdLowpassMethod, RateTarget};
 use crate::error::{PlanningError, Result};
 use crate::mapping;
 use crate::plan::{
     CommandEnvironmentPolicy, InputSource, OutputSink, PlannedCommand,
 };
-use crate::settings::PipelineSettings;
+use crate::settings::{PipelineSettings, SampleGainPolicy};
 use crate::source::SourceInfo;
 use crate::tools::ToolIdentifier;
 use std::path::Path;
@@ -315,8 +315,30 @@ pub fn conservative_linear_gain_lower(db: DbNano) -> std::result::Result<f64, St
     db_nano_to_linear_lower(db)
 }
 
-fn db_nano_to_linear_upper(db: DbNano) -> std::result::Result<f64, String> {
+/// Conservative upward-rounded linear scalar for an exact dB-nano value.
+///
+/// Reference gain uses this public helper so the common terminal solver and the
+/// general Track/Album ceiling solver share one directed conversion authority.
+pub fn conservative_linear_gain_upper(db: DbNano) -> std::result::Result<f64, String> {
     db_nano_to_linear_interval(db).map(|(_, upper)| upper)
+}
+
+/// Conservative upward-rounded product for nonnegative finite linear terms.
+///
+/// Reference terminal-error lifting uses this helper so it shares the same
+/// directed binary64 arithmetic authority as the ordinary Track/Album solver.
+pub fn conservative_product_upper_nonnegative(
+    left: f64,
+    right: f64,
+) -> std::result::Result<f64, String> {
+    if !left.is_finite() || left < 0.0 || !right.is_finite() || right < 0.0 {
+        return Err("conservative linear product requires finite nonnegative operands".to_string());
+    }
+    Ok(mul_up_nonnegative(left, right))
+}
+
+fn db_nano_to_linear_upper(db: DbNano) -> std::result::Result<f64, String> {
+    conservative_linear_gain_upper(db)
 }
 
 /// Outward-rounded interval for the mathematical amplitude `10^(dB/20)`.
@@ -535,7 +557,7 @@ pub fn album_gain_target_rate_hz(
         return Err(PlanningError::invalid_settings(
             "target_sample_rate",
             format!(
-                "album-scoped DSD NormalizePeak requires the retained carrier rate to equal the lossy encoder-input PCM rate; {} at {} Hz would require FFmpeg to resample after the proved gain",
+                "album-scoped DSD certified true-peak gain requires the retained carrier rate to equal the lossy encoder-input PCM rate; {} at {} Hz would require FFmpeg to resample after the proved gain",
                 settings.target_format,
                 target_rate_hz,
             ),
@@ -545,7 +567,8 @@ pub fn album_gain_target_rate_hz(
     Ok(target_rate_hz)
 }
 
-/// Build the single expensive decode used by album-scoped DSD normalization.
+/// Build the retained pre-gain Float64 realization used by certified ordinary
+/// general DSD Track or Album Guard/Normalize.
 ///
 /// The command writes a headerless little-endian Float64 carrier. The root
 /// crate streams that retained carrier through the standalone true-peak meter
@@ -558,22 +581,68 @@ pub fn album_gain_target_rate_hz(
 /// from the file. No normalization gain or output dither is applied in this
 /// pass; the submitted-batch barrier binds one fixed gain only after every
 /// participating track has reported its peak.
-pub fn build_album_gain_analysis_command(
+pub fn build_dsd_true_peak_analysis_command(
     settings: &PipelineSettings,
     source: &SourceInfo,
     input: &Path,
     output: &Path,
     duration: Option<std::time::Duration>,
 ) -> Result<PlannedCommand> {
-    if settings.dsd.auto_gain_scope() != DsdAutoGainScope::Album
-        || !settings.dsd.album_auto_gain_selected()
-    {
+    if !matches!(
+        settings.dsd.gain_policy(),
+        SampleGainPolicy::TruePeakGuard { .. } | SampleGainPolicy::TruePeakNormalize { .. }
+    ) {
         return Err(PlanningError::invalid_settings(
-            "dsd.auto_gain_scope",
-            "album DSD peak analysis requires an active album-scoped automatic gain mode",
+            "dsd.general_from_dsd.gain",
+            "certified DSD true-peak analysis requires True-peak guard or True-peak normalize",
         ));
     }
+    build_dsd_general_processing_carrier_command(settings, source, input, output, duration)
+}
+
+/// Realize the policy-independent general DSD pre-gain PCM boundary.
+///
+/// This is the same reconstruction/export/final-rate boundary used by the
+/// certified true-peak observer, but it is also the correct input to registered
+/// ordinary effects when gain is Off or Fixed. It never applies the requested
+/// ordinary gain policy itself.
+pub fn build_dsd_general_processing_carrier_command(
+    settings: &PipelineSettings,
+    source: &SourceInfo,
+    input: &Path,
+    output: &Path,
+    duration: Option<std::time::Duration>,
+) -> Result<PlannedCommand> {
     let target_rate_hz = album_gain_target_rate_hz(settings, source)?;
+    build_dsd_general_processing_carrier_command_at_rate(
+        settings, source, input, output, duration, target_rate_hz,
+    )
+}
+
+/// Variant used by the common realizer after the typed plan has resolved the
+/// effective final PCM rate (including any lossy encoder-input adjustment).
+pub fn build_dsd_general_processing_carrier_command_at_rate(
+    settings: &PipelineSettings,
+    source: &SourceInfo,
+    input: &Path,
+    output: &Path,
+    duration: Option<std::time::Duration>,
+    target_rate_hz: u32,
+) -> Result<PlannedCommand> {
+    if !source.is_dsd() || target_rate_hz == 0 {
+        return Err(PlanningError::invalid_source(
+            "source",
+            "general DSD processing carrier requires a DSD source and positive PCM target rate",
+        ));
+    }
+    if settings.dsd.general_from_dsd.reconstruction
+        == crate::settings::DsdGeneralReconstruction::ReferenceProtected
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.general_from_dsd.reconstruction",
+            "Reference-protected general reconstruction must use the qualified protected-R64 prefix before ordinary export realization",
+        ));
+    }
     let mut args = vec![
         "-S".to_string(),
         "-D".to_string(),
@@ -588,41 +657,23 @@ pub fn build_album_gain_analysis_command(
         output.display().to_string(),
     ];
 
-    if settings.dsd.is_native_v2() {
-        let source_rate = source.dsd_rate().ok_or_else(|| {
-            PlanningError::invalid_source(
-                "sample_rate_hz",
-                "native album DSD peak analysis requires a recognized DSD source rate",
-            )
-        })?;
-        let profile = resolve_reference_profile(
-            source_rate,
-            target_rate_hz,
-            settings.dsd.from_dsd.profile,
-        )?;
-        // Match the native reconstruction front end while remaining outside
-        // qualified Reference policy/attestation. The later shared fixed gain
-        // restores whatever level the aggregate target requires.
-        args.extend([
-            "gain".to_string(),
-            DbNano::REFERENCE_HEADROOM.render(false),
-            "rate".to_string(),
-            "-u".to_string(),
-            target_rate_hz.to_string(),
-        ]);
-        if let Some((transition_hz, center_hz)) = profile.sinc() {
-            args.extend([
-                "sinc".to_string(),
-                "-a".to_string(),
-                "180".to_string(),
-                "-L".to_string(),
-                "-t".to_string(),
-                transition_hz.to_string(),
-                format!("-{center_hz}"),
-            ]);
-        }
-    } else {
-        add_legacy_reconstruction_effects(settings, source, &mut args, target_rate_hz);
+    // Ordinary album protection uses the general DSD reconstruction contract.
+    // A qualified Reference delivery request remains a separate pathway and is
+    // never inferred from the numerical scan tier.
+    add_general_reconstruction_effects(settings, source, &mut args, target_rate_hz);
+    let export_gain_db = crate::semantic_plan::resolve_dsd_general_export_gain(
+        settings.dsd.general_from_dsd.reconstruction,
+        settings.dsd.general_from_dsd.export_level,
+    )
+    .map_err(|refusal| {
+        PlanningError::invalid_settings(
+            "dsd.general_from_dsd.export_level",
+            format!("{}: {}", refusal.code, refusal.reason),
+        )
+    })?;
+    if export_gain_db != DbNano::ZERO {
+        args.push("gain".to_string());
+        args.push(export_gain_db.render(false));
     }
     let mut command = PlannedCommand::new(
         ToolIdentifier::Sox,
@@ -630,22 +681,99 @@ pub fn build_album_gain_analysis_command(
         InputSource::Path(input.to_path_buf()),
         OutputSink::Path(output.to_path_buf()),
         duration,
-        "Decode DSD once for submitted-batch album true-peak analysis",
+        "Realize general DSD pre-gain carrier",
     );
     command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
     command.environment.insert("LC_ALL".to_string(), "C".to_string());
     Ok(command)
 }
 
-fn add_legacy_reconstruction_effects(
+/// Realize the explicit ordinary export-level boundary from a protected R64
+/// carrier into headerless little-endian Float64 PCM. The protected
+/// reconstruction itself is built by the qualified Reference prefix; this
+/// command owns only the distinct ordinary export scalar.
+pub fn build_reference_protected_export_command(
+    settings: &PipelineSettings,
+    input: &Path,
+    output: &Path,
+    duration: Option<std::time::Duration>,
+) -> Result<PlannedCommand> {
+    if settings.dsd.general_from_dsd.reconstruction
+        != crate::settings::DsdGeneralReconstruction::ReferenceProtected
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.general_from_dsd.reconstruction",
+            "protected-R64 export requires ReferenceProtected reconstruction",
+        ));
+    }
+    let export_gain_db = crate::semantic_plan::resolve_dsd_general_export_gain(
+        settings.dsd.general_from_dsd.reconstruction,
+        settings.dsd.general_from_dsd.export_level,
+    )
+    .map_err(|refusal| {
+        PlanningError::invalid_settings(
+            "dsd.general_from_dsd.export_level",
+            format!("{}: {}", refusal.code, refusal.reason),
+        )
+    })?;
+    let mut args = vec![
+        "-S".to_string(),
+        "-D".to_string(),
+        input.display().to_string(),
+        "-t".to_string(),
+        "raw".to_string(),
+        "-e".to_string(),
+        "floating-point".to_string(),
+        "-b".to_string(),
+        "64".to_string(),
+        "-L".to_string(),
+        output.display().to_string(),
+    ];
+    if export_gain_db != DbNano::ZERO {
+        args.push("gain".to_string());
+        args.push(export_gain_db.render(false));
+    }
+    let mut command = PlannedCommand::new(
+        ToolIdentifier::Sox,
+        args,
+        InputSource::Path(input.to_path_buf()),
+        OutputSink::Path(output.to_path_buf()),
+        duration,
+        "Restore declared ordinary level from protected R64",
+    );
+    command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
+    command.environment.insert("LC_ALL".to_string(), "C".to_string());
+    Ok(command)
+}
+
+/// Backward-compatible Phase-2 helper name. Phase 3 callers should use
+/// [`build_dsd_true_peak_analysis_command`].
+#[deprecated(note = "use build_dsd_true_peak_analysis_command")]
+pub fn build_album_gain_analysis_command(
+    settings: &PipelineSettings,
+    source: &SourceInfo,
+    input: &Path,
+    output: &Path,
+    duration: Option<std::time::Duration>,
+) -> Result<PlannedCommand> {
+    if settings.dsd.true_peak_scope() != Some(TruePeakScope::Album) {
+        return Err(PlanningError::invalid_settings(
+            "dsd.general_from_dsd.gain.scope",
+            "album DSD peak analysis requires Album scope",
+        ));
+    }
+    build_dsd_true_peak_analysis_command(settings, source, input, output, duration)
+}
+
+fn add_general_reconstruction_effects(
     settings: &PipelineSettings,
     source: &SourceInfo,
     args: &mut Vec<String>,
     target_rate_hz: u32,
 ) {
-    match settings.dsd.legacy_dsd_to_pcm_lowpass() {
+    match settings.dsd.general_from_dsd.lowpass {
         DsdLowpassMethod::Sinc => {
-            let sinc = settings.dsd.pcm_to_dsd.sinc;
+            let sinc = settings.dsd.general_from_dsd.sinc;
             args.push("sinc".to_string());
             args.push(format!("-{:.0}", sinc.passband_hz));
             args.push("-n".to_string());
@@ -708,15 +836,11 @@ mod tests {
     fn album_analysis_carrier_is_headerless_little_endian_float64() {
         let mut settings = PipelineSettings::default();
         settings.target_sample_rate = RateTarget::PcmHz(96_000);
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(
-                crate::enums::DsdToPcmGainMode::Auto,
-                0.15,
-                None,
-            )
-            .expect("album auto gain settings");
-        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings.dsd.set_gain_policy(crate::settings::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: crate::settings::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Album,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
         let source = SourceInfo {
             dsd_source_kind: None,
             format: crate::enums::AudioFormat::Dsf,
@@ -728,6 +852,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
         let command = build_album_gain_analysis_command(
@@ -792,6 +917,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
 
@@ -816,6 +942,7 @@ mod tests {
             sample_kind: Some(crate::enums::SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         };
 

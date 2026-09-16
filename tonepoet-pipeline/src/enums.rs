@@ -513,6 +513,7 @@ pub enum AacProfile {
 /// ReplayGain scanning mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum ReplayGainMode {
     /// Track gain only.
     Track,
@@ -699,83 +700,30 @@ pub enum GainCompensation {
     Disabled,
 }
 
-/// DSD-to-PCM output gain strategy.
+/// Scope for certified ordinary sample-domain true-peak gain.
 ///
-/// This is intentionally separate from [`GainCompensation`], which is used by
-/// PCM-to-DSD sinc upsampling and defaults to `Auto` for that path. Reusing it
-/// here would make DSD-to-PCM auto-normalization opt-out instead of opt-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum DsdToPcmGainMode {
-    /// Leave decoded PCM at SoX's natural DSD reconstruction level.
-    Disabled,
-    /// Peak-normalize after DSD decoding and low-pass filtering.
-    Auto,
-    /// Apply the fixed dB value retained by the private legacy-v1 DSD wire.
-    Manual,
-}
-
-impl Default for DsdToPcmGainMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
-/// Peak-normalization scope for DSD-to-PCM automatic gain.
-///
-/// `Track` preserves the historical one-input SoX `norm` behavior. `Album`
-/// requests one submitted-batch authority derived from the loudest DSD track.
+/// PCM and general DSD-to-PCM requests intentionally share this type. Scope
+/// selects gain authority, not measurement concatenation: Album still observes
+/// each track independently and resolves one common scalar.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum DsdAutoGainScope {
-    /// Normalize each DSD track independently. This is the compatibility default.
+pub enum TruePeakScope {
+    /// Resolve one certified gain per track.
     #[default]
     Track,
-    /// Normalize all DSD tracks in one submitted conversion batch with one gain.
+    /// Resolve one certified gain from the complete submitted participant set.
     Album,
 }
 
-/// Accuracy/speed tier for submitted-batch DSD true-peak analysis.
+/// Certified true-peak scan tier used by ordinary sample-domain gain policy.
 ///
-/// This remains an application-independent policy token: the pipeline crate
-/// does not import the true-peak crate or encode interpolation details. Track
-/// normalization does not use this setting; it is effective only for album
-/// scope, where Tonepoet performs an in-process retained-carrier scan.
+/// The serialized names retain the Fast066V2 algorithm identity so an old
+/// bare `fast`/`standard`/`reference` token cannot be silently reinterpreted.
+/// Contextual defaults are deliberately not encoded here: ordinary PCM raw
+/// settings select Fast while general DSD raw settings select Reference.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum DsdTruePeakScanMode {
-    /// Tightest certified interval tier.
-    #[default]
-    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_reference"))]
-    Reference,
-    /// Ordinary certified interval tier.
-    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_standard"))]
-    Standard,
-    /// Fastest certified tier; interval width is content-dependent.
-    #[cfg_attr(feature = "serde", serde(rename = "fast066v2_fast"))]
-    Fast,
-}
-
-/// Peak-normalization scope for ordinary PCM conversions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum PcmTruePeakScope {
-    /// Measure and normalize each converted track independently.
-    #[default]
-    Track,
-    /// Measure the complete submitted conversion batch and apply one shared gain.
-    Album,
-}
-
-/// Accuracy/speed tier for PCM pre-conversion true-peak analysis.
-///
-/// The serialized names deliberately carry the Fast066V2 schema identity.
-/// Previous Tonepoet scan-mode strings used the same human words for different
-/// algorithms, so accepting those bare strings would silently reinterpret an
-/// old preset/configuration under the new certified meter.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum PcmTruePeakScanMode {
+pub enum TruePeakScanTier {
     /// Tightest certified interval tier.
     #[cfg_attr(feature = "serde", serde(rename = "fast066v2_reference"))]
     Reference,

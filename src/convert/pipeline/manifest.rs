@@ -50,7 +50,7 @@ pub enum ManifestRouteIdentityV2 {
         settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
         resolved_output_target: ResolvedOutputTarget,
         policy: DsdReferencePolicyVersion,
-        qualification_manifest_digest: Sha256Digest,
+        qualification_candidate_manifest_digest: Sha256Digest,
     },
     DsdManualV2 {
         settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
@@ -73,7 +73,7 @@ pub enum ManifestTrackExecutionIdentityV2 {
         semantic_plan_hash_v1: SemanticPlanHashV1,
         /// Digest of the executed measurements, fully resolved argv, carrier probes,
         /// and pre/post-metadata decoded-sample verification. Missing on an
-        /// early native-v2 candidate manifest deserializes as zero and is
+        /// early Reference candidate manifest deserializes as zero and is
         /// rejected as insufficient authority rather than reported as corrupt JSON.
         #[serde(default = "zero_sha256_digest")]
         executed_evidence_digest_v1: Sha256Digest,
@@ -148,6 +148,24 @@ impl ConversionManifest {
         tracks: Vec<ConversionManifestTrack>,
     ) -> Self {
         let settings_fingerprint_v1 = legacy_settings_fingerprint_v1(&settings);
+        Self::new_legacy_with_fingerprint(
+            album_dir,
+            settings,
+            settings_fingerprint_v1,
+            tracks,
+        )
+    }
+
+    /// Construct an ordinary manifest with an execution identity that may
+    /// extend the historical settings-only fingerprint (for example with the
+    /// Phase-3 registered effect chain). The route and every track still bind
+    /// exactly the same digest.
+    pub fn new_legacy_with_fingerprint(
+        album_dir: PathBuf,
+        settings: PipelineSettings,
+        settings_fingerprint_v1: LegacySettingsFingerprintV1,
+        tracks: Vec<ConversionManifestTrack>,
+    ) -> Self {
         Self {
             manifest_version: MANIFEST_VERSION,
             album_dir,
@@ -617,7 +635,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
             settings_snapshot_fingerprint_v2: route_settings_snapshot,
             resolved_output_target,
             policy,
-            qualification_manifest_digest,
+            qualification_candidate_manifest_digest,
         } => {
             if manifest.total_tracks != 1 {
                 return Err(ManifestError::InvalidAuthority(
@@ -629,13 +647,12 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                     "Reference route settings snapshot does not match manifest settings".to_string(),
                 ));
             }
-            if !manifest.settings.dsd.is_native_v2()
-                || manifest.settings.dsd.from_dsd.pathway
+            if manifest.settings.dsd.from_dsd.pathway
                     != tonepoet_pipeline::DsdSourcePathway::Reference
                 || manifest.settings.dsd.from_dsd.reference_policy != *policy
             {
                 return Err(ManifestError::InvalidAuthority(
-                    "Reference route settings do not match native-v2 policy".to_string(),
+                    "Reference route settings do not match the qualified Reference policy".to_string(),
                 ));
             }
             if !resolved_output_target.is_p0_reference_lossless() {
@@ -773,7 +790,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                     }
                 }
             }
-            if *qualification_manifest_digest == Sha256Digest([0; 32]) {
+            if *qualification_candidate_manifest_digest == Sha256Digest([0; 32]) {
                 return Err(ManifestError::InvalidAuthority(
                     "Reference qualification digest is empty".to_string(),
                 ));
@@ -1058,7 +1075,7 @@ mod manifest_merge_gap_tests {
         fs::write(&source, b"reference source").expect("write source");
         let metadata = fs::metadata(&source).expect("source metadata");
         let mut settings = PipelineSettings::default();
-        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         settings.dsd.from_dsd.reference_policy = policy;
         let track = ConversionManifestTrack::new_reference(
             source,
@@ -1084,7 +1101,7 @@ mod manifest_merge_gap_tests {
             settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&settings),
             resolved_output_target: ResolvedOutputTarget::WavW64,
             policy,
-            qualification_manifest_digest: Sha256Digest([7; 32]),
+            qualification_candidate_manifest_digest: Sha256Digest([7; 32]),
         };
         ConversionManifest::new_reference(album_dir, settings, route, vec![track])
     }
@@ -1327,7 +1344,7 @@ mod manifest_merge_gap_tests {
             settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2(Sha256Digest([1; 32])),
             resolved_output_target: ResolvedOutputTarget::WavW64,
             policy: DsdReferencePolicyVersion::SoxNg14801V6,
-            qualification_manifest_digest: Sha256Digest([2; 32]),
+            qualification_candidate_manifest_digest: Sha256Digest([2; 32]),
         };
         let route_json = serde_json::to_value(route).expect("serialize route identity");
         assert_eq!(route_json["route"], "dsd_reference_v2");

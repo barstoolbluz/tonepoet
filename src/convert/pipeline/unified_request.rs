@@ -33,6 +33,8 @@ pub fn build_pipeline_request(item: &ConversionItem) -> ConversionResult<Pipelin
     // before browse expansion attached its sidecar-CUE decision, so the
     // ConversionItem remains authoritative for this field.
     if let Some(mut request) = item.pipeline_request.clone() {
+        request.submission_id = item.submission_id.clone();
+        request.submission_size = item.submission_size;
         request.settings.validate().map_err(|err| {
             ConversionError::ValidationError(format!("invalid prebuilt pipeline settings: {err}"))
         })?;
@@ -107,8 +109,11 @@ pub fn build_pipeline_request_from_settings(
         .unwrap_or_else(|| cue_policy_for_input_path(&item.input_path));
 
     Ok(PipelineRequest {
+        registered_effects: Vec::new(),
         job_id: format!("job-{}", item.id),
         item_id: item.id.clone(),
+        submission_id: item.submission_id.clone(),
+        submission_size: item.submission_size,
         // The processor re-applies this via apply_conversion_options_request_contract;
         // seed the same value so both builder paths agree.
         actions: item.options.actions.clone(),
@@ -337,7 +342,11 @@ fn legacy_pipeline_settings_for_item(item: &ConversionItem) -> ConversionResult<
                 .map(backend_nyquist_transition)
         })
         .unwrap_or(NyquistTransition::Gentle);
-    settings.ssrc.force = matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
+    // Compatibility-only legacy projection: preserve historical BrickWall
+    // promotion here, but do not let it define canonical request semantics.
+    // Explicit backend selection also retains hard SSRC authority.
+    settings.ssrc.force = matches!(settings.preferred_tool, PreferredTool::Ssrc)
+        || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
 
     settings.ssrc.insane_mode = item
         .options
@@ -528,7 +537,7 @@ fn apply_explicit_pipeline_defaults(settings: &mut PipelineSettings, item: &Conv
         && settings.verification.prefer_native_flac_verify;
 
     settings.ssrc.force = settings.ssrc.force
-        || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
+        || matches!(settings.preferred_tool, PreferredTool::Ssrc);
 
     if settings.ssrc.insane_mode {
         settings.ssrc.profile = Some(SsrcProfile::Insane);

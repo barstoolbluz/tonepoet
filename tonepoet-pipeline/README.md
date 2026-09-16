@@ -10,7 +10,7 @@ It owns the single conversion settings type and unified enum domain that replace
 - Every settings field feeds validation, topology, plugin selection, or command construction.
 - Passthrough is explicit and selected only when source format, codec class, rate/depth targets, metadata policy, and encoder-specific settings prove a copy is safe.
 - Output writes target deterministic work paths; callers atomically rename the completed work file and can use `ConversionPlan::cleanup_paths()` to delete known work files after success, failure, or interruption.
-- SSRC, FFmpeg, SoX, loudgain, metaflac, and flac verification are plugins behind one trait.
+- SSRC, FFmpeg, SoX, metaflac, and flac verification are plugins behind one trait. ReplayGain is a native common-executor observation/projection stage, not a planner tool plugin.
 - FLAC source-MD5 storage uses a Vorbis-comment tag via `metaflac --set-tag=SOURCE_AUDIO_MD5=...`; it never writes ID3v2 tags to FLAC.
 
 ## Main entry points
@@ -66,4 +66,4 @@ This sandbox did not include `cargo` or `rustc`, so the bundle includes static c
 
 ## Custom targets
 
-`AudioFormat::Custom` is routed through `ToolRegistry` as an `EncodePcm` operation. Built-in tools intentionally do not claim custom targets; caller-registered plugins can build them without changing planner topology. Custom plugins can also declare metadata support through `metadata_disposition()` or implement explicit metadata/ReplayGain steps.
+`AudioFormat::Custom` is routed through `ToolRegistry` as an `EncodePcm` operation. Built-in tools intentionally do not claim custom targets; caller-registered plugins can build them without changing planner topology. Custom plugins can also declare metadata support through `metadata_disposition()`. ReplayGain remains owned by the native common executor rather than custom command plugins.

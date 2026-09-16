@@ -36,7 +36,6 @@ pub enum ToolBinary {
     Sox,
     /// SSRC brick-wall resampler.
     Ssrc,
-    Loudgain,
     Metaflac,
     /// Native FLAC command-line verifier/encoder.
     Flac,
@@ -66,7 +65,6 @@ impl ToolBinary {
             Self::Ffprobe => "ffprobe",
             Self::Sox => "sox",
             Self::Ssrc => "ssrc",
-            Self::Loudgain => "loudgain",
             Self::Metaflac => "metaflac",
             Self::Flac => "flac",
             Self::Opustags => "opustags",
@@ -228,6 +226,33 @@ pub struct ToolOutput {
     pub command: CommandRecord,
 }
 
+/// Immutable retained-PCM input plus the one certified scalar bound by the
+/// common Phase-3 plan.  This is intentionally narrower than a general
+/// in-process producer: it accepts only whole-frame headerless f64le whose
+/// byte extent was fixed before the consumer starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedPcmScalarPump {
+    pub input_path: PathBuf,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub gain_db: tonepoet_pipeline::DbNano,
+    pub expected_bytes: u64,
+    /// Digest produced by the same complete traversal that certified the
+    /// pre-gain signal. The pump recomputes it while reading the retained
+    /// carrier, so byte mutation at the same private path cannot inherit a
+    /// stale observation/scalar binding without adding another traversal.
+    pub expected_sha256: Sha256Digest,
+}
+
+/// Successful supervised retained-PCM scalar transport.  The scalar pump has
+/// no external command record; `consumer` is the actual terminal process and
+/// `pumped_bytes` is retained for PERF01/accounting assertions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolPcmScalarPumpOutput {
+    pub consumer: ToolOutput,
+    pub pumped_bytes: u64,
+}
+
 /// Result of a typed two-process pipeline whose producer stdout is connected
 /// directly to the consumer stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +308,152 @@ pub struct ToolSegmentedPipelineError {
     /// outputs remain valid work products for AllowPartialAlbum callers.
     pub completed_consumers: Vec<ToolOutput>,
     pub other_commands: Vec<CommandRecord>,
+}
+
+/// Apply the already-resolved linear scalar to one complete f64le chunk.
+/// File materialization and the streaming pump both call this exact helper so
+/// they cannot drift in finite-value handling or floating-point arithmetic.
+pub(crate) fn scale_certified_f64le_chunk_in_place(
+    bytes: &mut [u8],
+    gain: f64,
+) -> Result<(), String> {
+    if bytes.len() % std::mem::size_of::<f64>() != 0 {
+        return Err(format!(
+            "certified PCM scalar chunk is not whole Float64 samples: {} byte(s)",
+            bytes.len(),
+        ));
+    }
+    for raw in bytes.chunks_exact_mut(std::mem::size_of::<f64>()) {
+        let sample = f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+        if !sample.is_finite() {
+            return Err("certified PCM scalar input contains a non-finite sample".to_string());
+        }
+        let scaled = sample * gain;
+        if !scaled.is_finite() {
+            return Err("certified PCM scalar produced a non-finite sample".to_string());
+        }
+        raw.copy_from_slice(&scaled.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pump_retained_pcm_scalar_blocking(
+    pump: &RetainedPcmScalarPump,
+    mut writer: std::fs::File,
+    cancel: &CancellationToken,
+) -> std::io::Result<u64> {
+    use std::io::{Read as _, Write as _};
+
+    if pump.sample_rate_hz == 0 || pump.channels == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "retained PCM scalar pump requires a positive rate and channel count",
+        ));
+    }
+    let frame_bytes = u64::from(pump.channels)
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "PCM scalar frame size overflowed"))?;
+    if pump.expected_bytes == 0 || pump.expected_bytes % frame_bytes != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "retained PCM scalar extent {} is not positive whole-frame f64le for {} channel(s)",
+                pump.expected_bytes, pump.channels,
+            ),
+        ));
+    }
+
+    let mut input = std::fs::File::open(&pump.input_path)?;
+    let actual_bytes = input.metadata()?.len();
+    if actual_bytes != pump.expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "retained PCM scalar input extent changed before execution: expected {} bytes, found {} at {}",
+                pump.expected_bytes,
+                actual_bytes,
+                pump.input_path.display(),
+            ),
+        ));
+    }
+    let gain = tonepoet_pipeline::conservative_linear_gain_lower(pump.gain_db)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
+    const TARGET_BUFFER_BYTES: usize = 1024 * 1024;
+    let frame_bytes_usize = usize::try_from(frame_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PCM scalar frame size does not fit this platform",
+        )
+    })?;
+    let buffer_len = (TARGET_BUFFER_BYTES / frame_bytes_usize).max(1) * frame_bytes_usize;
+    let mut bytes = vec![0_u8; buffer_len];
+    let mut content_hasher = Sha256::new();
+    let mut remaining = pump.expected_bytes;
+    let mut pumped = 0_u64;
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "retained PCM scalar pump cancelled",
+            ));
+        }
+        let count = usize::try_from(remaining.min(buffer_len as u64)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "retained PCM scalar extent does not fit this platform",
+            )
+        })?;
+        input.read_exact(&mut bytes[..count])?;
+        content_hasher.update(&bytes[..count]);
+        scale_certified_f64le_chunk_in_place(&mut bytes[..count], gain)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        writer.write_all(&bytes[..count])?;
+        pumped = pumped.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "PCM scalar pump byte count overflowed")
+        })?;
+        remaining -= count as u64;
+    }
+
+    // Success is EOF, not merely receipt of the expected prefix.  A producer
+    // that appends a later frame must invalidate this attempt.
+    let mut trailing = [0_u8; 1];
+    match input.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "retained PCM scalar input contains unexpected trailing payload",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let digest = content_hasher.finalize();
+    let mut digest_bytes = [0_u8; 32];
+    digest_bytes.copy_from_slice(&digest);
+    let actual_sha256 = Sha256Digest(digest_bytes);
+    if actual_sha256 != pump.expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "retained PCM scalar input changed after certification: expected {}, got {} at {}",
+                pump.expected_sha256,
+                actual_sha256,
+                pump.input_path.display(),
+            ),
+        ));
+    }
+    if pumped != pump.expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "retained PCM scalar pump emitted {pumped} bytes; expected {}",
+                pump.expected_bytes,
+            ),
+        ));
+    }
+    Ok(pumped)
 }
 
 #[cfg(unix)]
@@ -359,6 +530,47 @@ pub trait ToolRunner: Send + Sync {
         _consumer: ToolCommand,
         _cancel: &CancellationToken,
     ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+        Err(ToolPipelineError {
+            error: ToolRunnerError::UnsupportedPipeline,
+            other_commands: Vec::new(),
+        })
+    }
+
+    /// Return whether this runner implements the narrow retained-f64le scalar
+    /// pump. Test/fake runners default to false so existing fixtures retain the
+    /// materialized baseline unless they explicitly model the transport.
+    fn supports_pcm_scalar_pump(&self) -> bool {
+        false
+    }
+
+    /// Feed one immutable retained f64le carrier through Tonepoet's certified
+    /// scalar arithmetic directly to a single stdin-backed consumer.  The
+    /// implementation must supervise pump and child as one attempt and must
+    /// fail if either side fails or the retained input violates its extent,
+    /// finite-value, frame-alignment, or EOF contract.
+    async fn run_pcm_scalar_pump(
+        &self,
+        _pump: RetainedPcmScalarPump,
+        _consumer: ToolCommand,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolPcmScalarPumpOutput, ToolPipelineError> {
+        Err(ToolPipelineError {
+            error: ToolRunnerError::UnsupportedPipeline,
+            other_commands: Vec::new(),
+        })
+    }
+
+    /// Exact-executable variant of the retained f64le scalar pump. Certified
+    /// terminal authorities whose proof depends on one qualified executable
+    /// use this instead of proving one path and then launching a newly resolved
+    /// configured binary.
+    async fn run_pcm_scalar_pump_bound(
+        &self,
+        _pump: RetainedPcmScalarPump,
+        _consumer: ToolCommand,
+        _executable: &BoundToolExecutable,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolPcmScalarPumpOutput, ToolPipelineError> {
         Err(ToolPipelineError {
             error: ToolRunnerError::UnsupportedPipeline,
             other_commands: Vec::new(),
@@ -799,7 +1011,6 @@ fn version_command_args(binary: ToolBinary) -> &'static [&'static str] {
         ToolBinary::AtomicParsley => &[],
         ToolBinary::Ffmpeg
         | ToolBinary::Ffprobe
-        | ToolBinary::Loudgain
         | ToolBinary::Metaflac
         | ToolBinary::Flac
         | ToolBinary::Wvunpack
@@ -850,8 +1061,7 @@ pub(crate) fn parse_tool_version_output(binary: ToolBinary, stdout: &str, stderr
                 .or_else(|| first_version_after_marker(line, "version")),
             ToolBinary::SevenZip => first_version_after_marker(line, "7-Zip")
                 .or_else(|| first_version_after_marker(line, "7z")),
-            ToolBinary::Loudgain
-            | ToolBinary::Metaflac
+            ToolBinary::Metaflac
             | ToolBinary::Flac
             | ToolBinary::Wvunpack
             | ToolBinary::Wvtag
@@ -1341,6 +1551,8 @@ impl RealToolRunner {
         // Reject embedded NULs here, before containment turns the protocol
         // error into a generic worker exit status and discards the cause.
         validate_tool_command_process_boundary(&cmd)?;
+        let _baseline_guard =
+            super::baseline::tool_run_started(cmd.binary.canonical_name(), cmd.args.len());
 
         #[cfg(unix)]
         {
@@ -1531,6 +1743,173 @@ impl RealToolRunner {
         self.run_supervised_with_stdio(cmd, binary_path, cancel, None, None, None).await
     }
 
+    #[cfg(unix)]
+    async fn run_pcm_scalar_pump_with_binary_path(
+        &self,
+        pump: RetainedPcmScalarPump,
+        consumer: ToolCommand,
+        consumer_path: PathBuf,
+        cancel: &CancellationToken,
+    ) -> Result<ToolPcmScalarPumpOutput, ToolPipelineError> {
+            let (read_end, write_end) = create_cloexec_pipe().map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            })?;
+            let read_end = Arc::new(read_end);
+            let attempt_cancel = CancellationToken::new();
+            let pump_cancel = attempt_cancel.clone();
+            let pump_future = tokio::task::spawn_blocking(move || {
+                pump_retained_pcm_scalar_blocking(&pump, write_end, &pump_cancel)
+            });
+            let consumer_future = self.run_supervised_with_stdio(
+                consumer,
+                consumer_path,
+                &attempt_cancel,
+                Some(read_end),
+                None,
+                None,
+            );
+            tokio::pin!(pump_future);
+            tokio::pin!(consumer_future);
+
+            enum FirstStageResult {
+                Pump(Result<std::io::Result<u64>, tokio::task::JoinError>),
+                Consumer(Result<ToolOutput, ToolRunnerError>),
+                ExternalCancellation,
+            }
+
+            let pump_error = |error: std::io::Error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            };
+            let join_error = |error: tokio::task::JoinError| ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("retained PCM scalar pump task failed: {error}"),
+                )),
+                other_commands: Vec::new(),
+            };
+
+            let first = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => FirstStageResult::ExternalCancellation,
+                result = &mut pump_future => FirstStageResult::Pump(result),
+                result = &mut consumer_future => FirstStageResult::Consumer(result),
+            };
+
+            match first {
+                FirstStageResult::Pump(pump_result) => {
+                    let pumped_bytes = match pump_result {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(error)) => {
+                            attempt_cancel.cancel();
+                            let consumer_result = consumer_future.await;
+                            let mut error = pump_error(error);
+                            if let Ok(output) = consumer_result {
+                                error.other_commands.push(output.command);
+                            } else if let Err(consumer_error) = consumer_result {
+                                if let Some(command) = command_record_from_runner_error(&consumer_error) {
+                                    error.other_commands.push(command);
+                                }
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            attempt_cancel.cancel();
+                            let consumer_result = consumer_future.await;
+                            let mut error = join_error(error);
+                            if let Ok(output) = consumer_result {
+                                error.other_commands.push(output.command);
+                            } else if let Err(consumer_error) = consumer_result {
+                                if let Some(command) = command_record_from_runner_error(&consumer_error) {
+                                    error.other_commands.push(command);
+                                }
+                            }
+                            return Err(error);
+                        }
+                    };
+                    let consumer_result = tokio::select! {
+                        result = &mut consumer_future => result,
+                        _ = cancel.cancelled() => {
+                            attempt_cancel.cancel();
+                            consumer_future.await
+                        }
+                    };
+                    match consumer_result {
+                        Ok(consumer) => Ok(ToolPcmScalarPumpOutput { consumer, pumped_bytes }),
+                        Err(error) => Err(ToolPipelineError {
+                            error,
+                            other_commands: Vec::new(),
+                        }),
+                    }
+                }
+                FirstStageResult::Consumer(consumer_result) => {
+                    if consumer_result.is_err() {
+                        // Closing/cancelling the consumer side is what releases a
+                        // pump blocked on pipe backpressure.
+                        attempt_cancel.cancel();
+                    }
+                    let pump_result = tokio::select! {
+                        result = &mut pump_future => result,
+                        _ = cancel.cancelled() => {
+                            attempt_cancel.cancel();
+                            pump_future.await
+                        }
+                    };
+                    match (consumer_result, pump_result) {
+                        (Ok(consumer), Ok(Ok(pumped_bytes))) => {
+                            Ok(ToolPcmScalarPumpOutput { consumer, pumped_bytes })
+                        }
+                        (Ok(consumer), Ok(Err(error))) => {
+                            let mut failure = pump_error(error);
+                            failure.other_commands.push(consumer.command);
+                            Err(failure)
+                        }
+                        (Ok(consumer), Err(error)) => {
+                            let mut failure = join_error(error);
+                            failure.other_commands.push(consumer.command);
+                            Err(failure)
+                        }
+                        (Err(error), _) => {
+                            // A downstream failure commonly makes the pump see
+                            // BrokenPipe. Preserve the child failure as primary.
+                            Err(ToolPipelineError {
+                                error,
+                                other_commands: Vec::new(),
+                            })
+                        }
+                    }
+                }
+                FirstStageResult::ExternalCancellation => {
+                    attempt_cancel.cancel();
+                    let (pump_result, consumer_result) = tokio::join!(pump_future, consumer_future);
+                    match consumer_result {
+                        Err(error) => Err(ToolPipelineError {
+                            error,
+                            other_commands: Vec::new(),
+                        }),
+                        Ok(consumer) => match pump_result {
+                            Ok(Ok(pumped_bytes)) => {
+                                // Parent cancellation raced after both sides
+                                // completed. A complete supervised attempt wins.
+                                Ok(ToolPcmScalarPumpOutput { consumer, pumped_bytes })
+                            }
+                            Ok(Err(error)) => {
+                                let mut failure = pump_error(error);
+                                failure.other_commands.push(consumer.command);
+                                Err(failure)
+                            }
+                            Err(error) => {
+                                let mut failure = join_error(error);
+                                failure.other_commands.push(consumer.command);
+                                Err(failure)
+                            }
+                        },
+                    }
+                }
+            }
+    }
+
 }
 
 #[async_trait]
@@ -1614,6 +1993,129 @@ impl ToolRunner for RealToolRunner {
             .await
     }
 
+
+    fn supports_pcm_scalar_pump(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn run_pcm_scalar_pump(
+        &self,
+        pump: RetainedPcmScalarPump,
+        consumer: ToolCommand,
+        cancel: &CancellationToken,
+    ) -> Result<ToolPcmScalarPumpOutput, ToolPipelineError> {
+        #[cfg(unix)]
+        {
+            if consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(consumer.binary);
+            }
+            let consumer_path = resolve_command_launch_path(
+                self.resolve_binary(consumer.binary),
+                consumer.environment_policy,
+            )
+            .map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            })?;
+            self.run_pcm_scalar_pump_with_binary_path(pump, consumer, consumer_path, cancel)
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pump, consumer, cancel);
+            Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "retained PCM scalar streaming requires Unix descriptor handoff",
+                )),
+                other_commands: Vec::new(),
+            })
+        }
+    }
+
+    async fn run_pcm_scalar_pump_bound(
+        &self,
+        pump: RetainedPcmScalarPump,
+        consumer: ToolCommand,
+        executable: &BoundToolExecutable,
+        cancel: &CancellationToken,
+    ) -> Result<ToolPcmScalarPumpOutput, ToolPipelineError> {
+        if consumer.environment_policy != CommandEnvironmentPolicy::ClearAndSet {
+            return Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "bound retained PCM scalar execution requires a cleared parent environment",
+                )),
+                other_commands: Vec::new(),
+            });
+        }
+        let resolved = self.resolved_tool_path(consumer.binary).ok_or_else(|| ToolPipelineError {
+            error: ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "cannot resolve {} for bound retained PCM scalar execution",
+                    consumer.binary.canonical_name(),
+                ),
+            )),
+            other_commands: Vec::new(),
+        })?;
+        if resolved != executable.canonical_path {
+            return Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "bound {} scalar-pump path drift: expected {}, resolved {}",
+                        consumer.binary.canonical_name(),
+                        executable.canonical_path.display(),
+                        resolved.display(),
+                    ),
+                )),
+                other_commands: Vec::new(),
+            });
+        }
+        let actual_sha256 = executable_sha256(&executable.canonical_path).map_err(|error| {
+            ToolPipelineError {
+                error: ToolRunnerError::Io(error),
+                other_commands: Vec::new(),
+            }
+        })?;
+        if actual_sha256 != executable.executable_sha256 {
+            return Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "bound {} scalar-pump executable digest drift at {}: expected {}, got {}",
+                        consumer.binary.canonical_name(),
+                        executable.canonical_path.display(),
+                        executable.executable_sha256,
+                        actual_sha256,
+                    ),
+                )),
+                other_commands: Vec::new(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            self.run_pcm_scalar_pump_with_binary_path(
+                pump,
+                consumer,
+                executable.canonical_path.clone(),
+                cancel,
+            )
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pump, consumer, cancel);
+            Err(ToolPipelineError {
+                error: ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "retained PCM scalar streaming requires Unix descriptor handoff",
+                )),
+                other_commands: Vec::new(),
+            })
+        }
+    }
 
     async fn run_pipeline(
         &self,
@@ -2731,6 +3233,21 @@ mod real_tool_runner_tests {
         let mut paths = HashMap::new();
         paths.insert(binary.canonical_name().to_string(), PathBuf::from(program));
         RealToolRunner::new(paths)
+    }
+
+    #[cfg(unix)]
+    fn bound_scalar_pump_fixture(directory: &std::path::Path) -> RetainedPcmScalarPump {
+        let bytes = 0.25_f64.to_le_bytes();
+        let input = directory.join("bound-scalar-input.f64le");
+        std::fs::write(&input, bytes).expect("write scalar-pump fixture");
+        RetainedPcmScalarPump {
+            input_path: input,
+            sample_rate_hz: 48_000,
+            channels: 1,
+            gain_db: tonepoet_pipeline::DbNano::ZERO,
+            expected_bytes: bytes.len() as u64,
+            expected_sha256: Sha256Digest::of_bytes(&bytes),
+        }
     }
 
     #[test]
@@ -3997,7 +4514,6 @@ exec /bin/cat >/dev/null
             (ToolBinary::SevenZip, "7-Zip 25.01 (x64) : Copyright...", "", "25.01"),
             (ToolBinary::Metaflac, "metaflac 1.5.0", "", "1.5.0"),
             (ToolBinary::Flac, "flac 1.5.0", "", "1.5.0"),
-            (ToolBinary::Loudgain, "loudgain 0.6.8 - using:", "", "0.6.8"),
             (ToolBinary::Opustags, "opustags version 1.10.1", "", "1.10.1"),
             (ToolBinary::Wvtag, "wvtag 5.8.1", "", "5.8.1"),
             (ToolBinary::Wvunpack, "wvunpack 5.8.1", "", "5.8.1"),
@@ -4139,6 +4655,140 @@ exit 0
             .await
             .expect_err("digest drift must be rejected");
         assert!(matches!(error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_scalar_pump_spawns_the_exact_attested_executable() {
+        let script = write_executable_script(
+            "bound-pump-exact",
+            "#!/bin/sh
+cat >/dev/null
+printf 'bound-pump-exact\n'
+",
+        );
+        let canonical = std::fs::canonicalize(&script).expect("canonical bound pump script");
+        let authority = BoundToolExecutable {
+            canonical_path: canonical.clone(),
+            executable_sha256: executable_sha256(&canonical).expect("hash bound pump script"),
+        };
+        let pump = bound_scalar_pump_fixture(
+            canonical.parent().expect("bound pump script has parent"),
+        );
+        let runner = runner_with_override(ToolBinary::Metaflac, canonical.to_str().unwrap());
+        let output = runner
+            .run_pcm_scalar_pump_bound(
+                pump,
+                closed_command(ToolBinary::Metaflac, Vec::new(), Duration::from_secs(5)),
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("bound scalar-pump execution succeeds");
+        assert_eq!(output.pumped_bytes, std::mem::size_of::<f64>() as u64);
+        assert_eq!(output.consumer.exit, ProcessExit::Code(0));
+        assert!(output.consumer.stdout_tail.contains("bound-pump-exact"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_scalar_pump_rejects_inherited_environment() {
+        let script = write_executable_script(
+            "bound-pump-inherited-env",
+            "#!/bin/sh\ncat >/dev/null\n",
+        );
+        let canonical = std::fs::canonicalize(&script).expect("canonical bound pump script");
+        let authority = BoundToolExecutable {
+            canonical_path: canonical.clone(),
+            executable_sha256: executable_sha256(&canonical).expect("hash bound pump script"),
+        };
+        let pump = bound_scalar_pump_fixture(
+            canonical.parent().expect("bound pump script has parent"),
+        );
+        let runner = runner_with_override(ToolBinary::Metaflac, canonical.to_str().unwrap());
+        let mut consumer = closed_command(
+            ToolBinary::Metaflac,
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+        consumer.environment_policy = CommandEnvironmentPolicy::InheritAndSet;
+        let error = runner
+            .run_pcm_scalar_pump_bound(
+                pump,
+                consumer,
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("bound scalar-pump execution must reject the inherited parent environment");
+        assert!(matches!(error.error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_scalar_pump_rejects_runner_path_override_drift() {
+        let certified = write_executable_script(
+            "bound-pump-certified",
+            "#!/bin/sh
+cat >/dev/null
+",
+        );
+        let replacement = write_executable_script(
+            "bound-pump-replacement",
+            "#!/bin/sh
+cat >/dev/null
+",
+        );
+        let certified = std::fs::canonicalize(certified).expect("canonical certified pump script");
+        let replacement = std::fs::canonicalize(replacement).expect("canonical replacement pump script");
+        let authority = BoundToolExecutable {
+            canonical_path: certified.clone(),
+            executable_sha256: executable_sha256(&certified).expect("hash certified pump script"),
+        };
+        let pump = bound_scalar_pump_fixture(
+            certified.parent().expect("certified pump script has parent"),
+        );
+        let runner = runner_with_override(ToolBinary::Wvtag, replacement.to_str().unwrap());
+        let error = runner
+            .run_pcm_scalar_pump_bound(
+                pump,
+                closed_command(ToolBinary::Wvtag, Vec::new(), Duration::from_secs(5)),
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("configured scalar-pump replacement must be rejected");
+        assert!(matches!(error.error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_scalar_pump_rejects_executable_content_drift() {
+        let script = write_executable_script(
+            "bound-pump-digest",
+            "#!/bin/sh
+cat >/dev/null
+",
+        );
+        let canonical = std::fs::canonicalize(script).expect("canonical bound pump script");
+        let authority = BoundToolExecutable {
+            canonical_path: canonical.clone(),
+            executable_sha256: Sha256Digest::of_bytes(b"not-the-executable"),
+        };
+        let pump = bound_scalar_pump_fixture(
+            canonical.parent().expect("bound pump script has parent"),
+        );
+        let runner = runner_with_override(ToolBinary::AtomicParsley, canonical.to_str().unwrap());
+        let error = runner
+            .run_pcm_scalar_pump_bound(
+                pump,
+                closed_command(ToolBinary::AtomicParsley, Vec::new(), Duration::from_secs(5)),
+                &authority,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("scalar-pump digest drift must be rejected");
+        assert!(matches!(error.error, ToolRunnerError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
     }
 
     #[cfg(unix)]

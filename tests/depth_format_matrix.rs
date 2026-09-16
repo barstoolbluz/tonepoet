@@ -269,9 +269,12 @@ fn assert_measurement(path: &Path, requested: PcmBitDepth) -> Result<(), String>
 
 fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> PipelineRequest {
     PipelineRequest {
+        registered_effects: Vec::new(),
         actions: ActionPipeline::default(),
         job_id: "depth-matrix".to_string(),
         item_id: "depth-matrix".to_string(),
+        submission_id: None,
+        submission_size: None,
         container,
         source: SourceOptions {
             sidecar_cue_track_metadata: None,
@@ -569,10 +572,10 @@ fn assert_m4a_custom_artwork_state(path: &Path, pass: &str) -> BTreeMap<String, 
 }
 
 #[tokio::test]
-async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_invariants() {
+async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_native_replaygain_invariants() {
     const TEST: &str =
-        "strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_invariants";
-    if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe", "AtomicParsley", "loudgain"]) {
+        "strict_gate_exercises_single_file_m4a_freeform_artwork_and_native_replaygain_invariants";
+    if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe", "AtomicParsley"]) {
         return;
     }
 
@@ -594,6 +597,11 @@ async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_inv
     );
     request.job_id = "single-m4a-freeform-artwork-rg".to_string();
     request.item_id = request.job_id.clone();
+    // Runnable production queue items always carry their submitted-batch
+    // identity, including singleton submissions. Album/Both ReplayGain binds
+    // to that exact scope rather than inferring album ownership from tags.
+    request.submission_id = Some(request.job_id.clone());
+    request.submission_size = Some(1);
     request.settings.target_format = AudioFormat::Alac;
     request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
     request.settings.force_encode = true;
@@ -708,10 +716,10 @@ async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_inv
         None,
     )
     .await
-    .expect("loudgain scan");
+    .expect("native ReplayGain scan");
     assert!(matches!(replaygain.outcome, StageOutcome::Ok));
 
-    let after_replaygain = assert_m4a_custom_artwork_state(&output_path, "after loudgain");
+    let after_replaygain = assert_m4a_custom_artwork_state(&output_path, "after native ReplayGain");
     for key in [
         "REPLAYGAIN_TRACK_GAIN",
         "REPLAYGAIN_TRACK_PEAK",
@@ -722,7 +730,7 @@ async fn strict_gate_exercises_single_file_m4a_freeform_artwork_and_loudgain_inv
             after_replaygain
                 .get(key)
                 .is_some_and(|value| !value.trim().is_empty()),
-            "after loudgain: missing {key}; tags were {after_replaygain:?}",
+            "after native ReplayGain: missing {key}; tags were {after_replaygain:?}",
         );
     }
 }

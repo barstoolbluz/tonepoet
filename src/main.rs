@@ -142,39 +142,40 @@ enum Commands {
         #[arg(long)]
         backend: Option<String>,
 
-        /// DSD-source pathway (reference or reserved manual).
-        #[arg(long = "dsd-path", value_name = "reference|manual")]
+        /// DSD-source pathway for general processing or qualified Reference delivery.
+        #[arg(long = "dsd-path", value_name = "general|reference")]
         dsd_path: Option<String>,
 
-        /// Reference DSD reconstruction profile.
+        /// Qualified Reference reconstruction profile; requires --dsd-path reference.
         #[arg(long = "dsd-profile", value_name = "reference|wideband")]
         dsd_profile: Option<String>,
 
-        /// DSD gain policy. `auto` selects the live legacy auto-normalizer;
-        /// the other values select the native Reference-era controls.
+        /// Ordinary DSD-to-PCM sample-domain gain policy. Obsolete `auto`, bare
+        /// `normalize`, and bare `fixed` tokens are rejected rather than migrated.
         #[arg(
             long = "dsd-gain",
-            value_name = "reference|native|fixed|normalize|auto"
+            value_name = "off|true-peak-guard|true-peak-normalize|fixed-gain|reference|native-level|reference-fixed|sample-peak-normalize"
         )]
         dsd_gain: Option<String>,
 
-        /// Fixed DSD gain in dB; valid only with --dsd-gain fixed.
+        /// Fixed gain in dB; valid with fixed-gain or Reference-only reference-fixed.
         #[arg(long = "dsd-gain-db", value_name = "DB")]
         dsd_gain_db: Option<String>,
 
-        /// NormalizePeak target in dBFS; valid only with --dsd-gain normalize.
-        #[arg(long = "dsd-normalize-target-dbfs", value_name = "DBFS")]
-        dsd_normalize_target_dbfs: Option<String>,
+        /// Certified ordinary true-peak target in dBTP (-12.0 through 0.0).
+        #[arg(long = "dsd-true-peak-target-dbtp", value_name = "DBTP")]
+        dsd_true_peak_target_dbtp: Option<String>,
 
-        /// Peak-normalization scope for DSD automatic gain.
-        #[arg(long = "dsd-auto-gain-scope", value_name = "track|album")]
-        dsd_auto_gain_scope: Option<String>,
+        /// Reference-only sample-peak normalize target in dBFS.
+        #[arg(long = "dsd-sample-peak-target-dbfs", value_name = "DBFS")]
+        dsd_sample_peak_target_dbfs: Option<String>,
 
-        /// Certified album true-peak scan tier; valid only with album-scoped automatic DSD gain.
-        #[arg(
-            long = "dsd-true-peak-scan",
-            value_name = "reference|standard|fast"
-        )]
+        /// Ordinary certified true-peak gain scope.
+        #[arg(long = "dsd-true-peak-scope", value_name = "track|album")]
+        dsd_true_peak_scope: Option<String>,
+
+        /// Ordinary certified true-peak scan tier; valid for Track and Album.
+        #[arg(long = "dsd-true-peak-scan", value_name = "reference|standard|fast")]
         dsd_true_peak_scan: Option<String>,
 
         /// Append Lineage.txt content to COMMENT tag
@@ -618,8 +619,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dsd_profile,
             dsd_gain,
             dsd_gain_db,
-            dsd_normalize_target_dbfs,
-            dsd_auto_gain_scope,
+            dsd_true_peak_target_dbtp,
+            dsd_sample_peak_target_dbfs,
+            dsd_true_peak_scope,
             dsd_true_peak_scan,
             append_lineage,
             write_log,
@@ -657,8 +659,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dsd_profile,
                 dsd_gain,
                 dsd_gain_db,
-                dsd_normalize_target_dbfs,
-                dsd_auto_gain_scope,
+                dsd_true_peak_target_dbtp,
+                dsd_sample_peak_target_dbfs,
+                dsd_true_peak_scope,
                 dsd_true_peak_scan,
                 append_lineage,
                 write_log,
@@ -1008,9 +1011,11 @@ mod bit_depth_cli_tests {
                 sample_kind: Some(SampleKind::Dsd),
                 channels: Some(2),
                 duration: None,
+                frame_extent: None,
                 audio_md5: None,
             },
             settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
         };
@@ -1105,25 +1110,28 @@ fn apply_cli_dsd_reference_settings(
     profile: Option<&str>,
     gain: Option<&str>,
     fixed_gain: Option<&str>,
-    normalize_target: Option<&str>,
-    auto_gain_scope: Option<&str>,
+    true_peak_target: Option<&str>,
+    sample_peak_target: Option<&str>,
+    true_peak_scope: Option<&str>,
     true_peak_scan: Option<&str>,
 ) -> anyhow::Result<()> {
     use tonepoet_pipeline::{
-        DbNano, DsdAutoGainScope, DsdReconstructionSelection, DsdSourceGainMode,
-        DsdSourcePathway, DsdToPcmGainMode, DsdTruePeakScanMode, ReferenceErrorCode,
+        DbNano, DsdReconstructionSelection, DsdSourceGainMode, DsdSourcePathway,
+        ReferenceErrorCode, SampleGainPolicy, TruePeakScanTier, TruePeakScope,
+        PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
     };
 
     let any_flag = pathway.is_some()
         || profile.is_some()
         || gain.is_some()
         || fixed_gain.is_some()
-        || normalize_target.is_some()
-        || auto_gain_scope.is_some()
+        || true_peak_target.is_some()
+        || sample_peak_target.is_some()
+        || true_peak_scope.is_some()
         || true_peak_scan.is_some();
-    // Preserve the pre-existing WavPack CLI canonicalization independently of
-    // whether native DSD Reference was selected. D1 must not change non-DSD
-    // conversion behavior.
+
+    // Preserve the established WavPack CLI canonicalization independently of
+    // DSD controls.
     if matches!(output_format, AudioFormat::WavPack) && !settings.wavpack.hybrid {
         settings.wavpack.correction_file = false;
     }
@@ -1132,402 +1140,381 @@ fn apply_cli_dsd_reference_settings(
     }
     if matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
         anyhow::bail!(
-            "DSD Reference flags apply only to DSD-to-PCM conversions, not PCM-to-DSD targets"
+            "DSD-source controls apply only to DSD-to-PCM conversions, not PCM-to-DSD targets"
         );
     }
 
-    let requested_scope = match auto_gain_scope.map(|value| value.to_ascii_lowercase()) {
-        Some(value) if value == "track" => Some(DsdAutoGainScope::Track),
-        Some(value) if value == "album" => Some(DsdAutoGainScope::Album),
+    let parsed_scope = match true_peak_scope.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "track" => Some(TruePeakScope::Track),
+        Some(value) if value == "album" => Some(TruePeakScope::Album),
         Some(value) => anyhow::bail!(
-            "invalid --dsd-auto-gain-scope '{value}'; expected track or album"
+            "invalid --dsd-true-peak-scope '{value}'; expected track or album"
         ),
         None => None,
     };
-
-    let requested_scan = match true_peak_scan.map(|value| value.to_ascii_lowercase()) {
-        Some(value) if value == "reference" => Some(DsdTruePeakScanMode::Reference),
-        Some(value) if value == "standard" => Some(DsdTruePeakScanMode::Standard),
-        Some(value) if value == "fast" => Some(DsdTruePeakScanMode::Fast),
+    let parsed_scan = match true_peak_scan.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "reference" => Some(TruePeakScanTier::Reference),
+        Some(value) if value == "standard" => Some(TruePeakScanTier::Standard),
+        Some(value) if value == "fast" => Some(TruePeakScanTier::Fast),
         Some(value) => anyhow::bail!(
             "invalid --dsd-true-peak-scan '{value}'; expected reference, standard, or fast"
         ),
         None => None,
     };
+    let parsed_true_peak_target = true_peak_target
+        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
+        .transpose()?;
+    let parsed_fixed_gain = fixed_gain
+        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
+        .transpose()?;
+    let parsed_sample_peak_target = sample_peak_target
+        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
+        .transpose()?;
 
-    let requested_gain = gain.map(|value| value.to_ascii_lowercase());
-    if matches!(requested_gain.as_deref(), Some("auto")) {
-        if pathway.is_some() || profile.is_some() || fixed_gain.is_some() || normalize_target.is_some()
-        {
-            anyhow::bail!(
-                "--dsd-gain auto is the legacy auto-normalizer and cannot be combined with \
-                 --dsd-path, --dsd-profile, --dsd-gain-db, or --dsd-normalize-target-dbfs"
-            );
-        }
-        let legacy = settings.dsd.legacy_behavior().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--dsd-gain auto cannot replace native-v2 DSD settings; use --dsd-gain normalize instead"
-            )
-        })?;
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(
-                DsdToPcmGainMode::Auto,
-                legacy.auto_gain_margin_db,
-                None,
-            )
-            .map_err(anyhow::Error::msg)?;
-        if let Some(scope) = requested_scope {
-            settings.dsd.set_auto_gain_scope(scope);
-        }
-        if let Some(scan_mode) = requested_scan {
-            if settings.dsd.auto_gain_scope() != DsdAutoGainScope::Album {
-                anyhow::bail!(
-                    "--dsd-true-peak-scan requires album-scoped automatic DSD gain; \
-                     add --dsd-auto-gain-scope album"
-                );
+    if let Some(pathway) = pathway {
+        settings.dsd.from_dsd.pathway = match pathway.trim().to_ascii_lowercase().as_str() {
+            "general" => DsdSourcePathway::General,
+            "reference" => {
+                // Explicit Reference selection resets Reference-owned controls
+                // to their canonical defaults before applying explicit overrides.
+                settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
+                settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
+                settings.dsd.from_dsd.fixed_gain_db = None;
+                DsdSourcePathway::Reference
             }
-            settings.dsd.set_true_peak_scan_mode(scan_mode);
-        }
-        return Ok(());
-    }
-
-    // Scope/scan-only overrides are useful when a preset already selects either
-    // automatic regime. Do not migrate origins just because these orthogonal
-    // controls were supplied.
-    if gain.is_none()
-        && pathway.is_none()
-        && profile.is_none()
-        && fixed_gain.is_none()
-        && normalize_target.is_none()
-    {
-        let automatic = settings
-            .dsd
-            .legacy_behavior()
-            .map(|legacy| legacy.gain_mode == DsdToPcmGainMode::Auto)
-            .unwrap_or(settings.dsd.from_dsd.gain_mode == DsdSourceGainMode::NormalizePeak);
-        if !automatic {
-            anyhow::bail!(
-                "--dsd-auto-gain-scope/--dsd-true-peak-scan require automatic DSD gain \
-                 (--dsd-gain auto, --dsd-gain normalize, or a preset selecting one)"
-            );
-        }
-        if let Some(scope) = requested_scope {
-            settings.dsd.set_auto_gain_scope(scope);
-        }
-        if let Some(scan_mode) = requested_scan {
-            if settings.dsd.auto_gain_scope() != DsdAutoGainScope::Album {
-                anyhow::bail!(
-                    "--dsd-true-peak-scan requires album-scoped automatic DSD gain; \
-                     add --dsd-auto-gain-scope album"
-                );
-            }
-            settings.dsd.set_true_peak_scan_mode(scan_mode);
-        }
-        return Ok(());
-    }
-
-    settings.dsd = settings.dsd.migrate_to_native_v2();
-    settings.dsd.from_dsd.pathway = match pathway
-        .unwrap_or("reference")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "reference" => DsdSourcePathway::Reference,
-        "manual" => {
-            anyhow::bail!(tonepoet_pipeline::reference_error_text(
+            "manual" => anyhow::bail!(tonepoet_pipeline::reference_error_text(
                 ReferenceErrorCode::ManualUnavailable,
-            ));
-        }
-        other => anyhow::bail!("invalid --dsd-path '{other}'; expected reference or manual"),
-    };
-    settings.dsd.from_dsd.profile = match profile
-        .unwrap_or("reference")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "reference" => DsdReconstructionSelection::Reference,
-        "wideband" => DsdReconstructionSelection::Wideband,
-        other => anyhow::bail!(
-            "invalid --dsd-profile '{other}'; expected reference or wideband"
-        ),
-    };
-    settings.dsd.from_dsd.gain_mode = match gain
-        .unwrap_or("reference")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "reference" => DsdSourceGainMode::Reference,
-        "native" | "native-level" => DsdSourceGainMode::NativeLevel,
-        "fixed" => DsdSourceGainMode::Fixed,
-        "normalize" | "normalize-peak" => DsdSourceGainMode::NormalizePeak,
-        other => anyhow::bail!(
-            "invalid --dsd-gain '{other}'; expected reference, native, fixed, normalize, or auto"
-        ),
-    };
-
-    if fixed_gain.is_some() && settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::Fixed {
-        anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed");
+            )),
+            other => anyhow::bail!(
+                "invalid --dsd-path '{other}'; expected general or reference"
+            ),
+        };
     }
-    if normalize_target.is_some()
-        && settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::NormalizePeak
-    {
+
+    if let Some(profile) = profile {
+        if settings.dsd.from_dsd.pathway != DsdSourcePathway::Reference {
+            anyhow::bail!("--dsd-profile requires --dsd-path reference");
+        }
+        settings.dsd.from_dsd.profile = match profile.trim().to_ascii_lowercase().as_str() {
+            "reference" => DsdReconstructionSelection::Reference,
+            "wideband" => DsdReconstructionSelection::Wideband,
+            other => anyhow::bail!(
+                "invalid --dsd-profile '{other}'; expected reference or wideband"
+            ),
+        };
+    }
+
+    let gain_token = gain.map(|value| value.trim().to_ascii_lowercase());
+    if matches!(gain_token.as_deref(), Some("auto" | "normalize" | "fixed" | "native")) {
         anyhow::bail!(
-            "--dsd-normalize-target-dbfs requires --dsd-gain normalize"
+            "obsolete ambiguous --dsd-gain token '{}'; use off, true-peak-guard, true-peak-normalize, fixed-gain, or an explicitly named Reference-only mode",
+            gain.unwrap_or_default()
         );
     }
-    settings.dsd.from_dsd.fixed_gain_db = match fixed_gain {
-        Some(value) => Some(value.parse::<DbNano>().map_err(anyhow::Error::msg)?),
-        None => None,
-    };
-    if let Some(value) = normalize_target {
-        settings.dsd.from_dsd.normalize_peak_target_dbfs =
-            value.parse::<DbNano>().map_err(anyhow::Error::msg)?;
+
+    let reference_gain = matches!(
+        gain_token.as_deref(),
+        Some("reference" | "native-level" | "reference-fixed" | "sample-peak-normalize")
+    );
+    let ordinary_gain = matches!(
+        gain_token.as_deref(),
+        Some("off" | "true-peak-guard" | "true-peak-normalize" | "fixed-gain")
+    );
+    if gain_token.is_some() && !reference_gain && !ordinary_gain {
+        anyhow::bail!(
+            "invalid --dsd-gain '{}'; expected off, true-peak-guard, true-peak-normalize, fixed-gain, reference, native-level, reference-fixed, or sample-peak-normalize",
+            gain.unwrap_or_default()
+        );
     }
-    if let Some(scope) = requested_scope {
-        if settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::NormalizePeak {
+
+    if reference_gain {
+        if settings.dsd.from_dsd.pathway != DsdSourcePathway::Reference {
             anyhow::bail!(
-                "--dsd-auto-gain-scope requires --dsd-gain normalize in native-v2 DSD settings"
+                "Reference-only --dsd-gain modes require --dsd-path reference"
             );
         }
-        settings.dsd.set_auto_gain_scope(scope);
-    }
-    if let Some(scan_mode) = requested_scan {
-        if settings.dsd.from_dsd.gain_mode != DsdSourceGainMode::NormalizePeak {
+        if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
             anyhow::bail!(
-                "--dsd-true-peak-scan requires --dsd-gain normalize in native-v2 DSD settings"
+                "--dsd-true-peak-target-dbtp/--dsd-true-peak-scope/--dsd-true-peak-scan apply only to ordinary true-peak guard/normalize"
             );
         }
-        if settings.dsd.auto_gain_scope() != DsdAutoGainScope::Album {
+        settings.dsd.from_dsd.gain_mode = match gain_token.as_deref().unwrap() {
+            "reference" => DsdSourceGainMode::Reference,
+            "native-level" => DsdSourceGainMode::NativeLevel,
+            "reference-fixed" => DsdSourceGainMode::Fixed,
+            "sample-peak-normalize" => DsdSourceGainMode::NormalizePeak,
+            _ => unreachable!(),
+        };
+        match settings.dsd.from_dsd.gain_mode {
+            DsdSourceGainMode::Fixed => {
+                settings.dsd.from_dsd.fixed_gain_db = Some(parsed_fixed_gain.ok_or_else(|| {
+                    anyhow::anyhow!("--dsd-gain reference-fixed requires --dsd-gain-db")
+                })?);
+                if parsed_sample_peak_target.is_some() {
+                    anyhow::bail!(
+                        "--dsd-sample-peak-target-dbfs requires --dsd-gain sample-peak-normalize"
+                    );
+                }
+            }
+            DsdSourceGainMode::NormalizePeak => {
+                if parsed_fixed_gain.is_some() {
+                    anyhow::bail!("--dsd-gain-db requires fixed-gain or reference-fixed");
+                }
+                settings.dsd.from_dsd.fixed_gain_db = None;
+                if let Some(target) = parsed_sample_peak_target {
+                    settings.dsd.from_dsd.normalize_peak_target_dbfs = target;
+                }
+            }
+            DsdSourceGainMode::Reference | DsdSourceGainMode::NativeLevel => {
+                if parsed_fixed_gain.is_some() {
+                    anyhow::bail!("--dsd-gain-db requires fixed-gain or reference-fixed");
+                }
+                if parsed_sample_peak_target.is_some() {
+                    anyhow::bail!(
+                        "--dsd-sample-peak-target-dbfs requires --dsd-gain sample-peak-normalize"
+                    );
+                }
+                settings.dsd.from_dsd.fixed_gain_db = None;
+            }
+        }
+        return Ok(());
+    }
+
+    if settings.dsd.from_dsd.pathway == DsdSourcePathway::Reference
+        && (ordinary_gain
+            || parsed_true_peak_target.is_some()
+            || parsed_scope.is_some()
+            || parsed_scan.is_some())
+    {
+        anyhow::bail!(
+            "ordinary DSD true-peak/fixed gain controls require --dsd-path general"
+        );
+    }
+    if parsed_sample_peak_target.is_some() {
+        anyhow::bail!(
+            "--dsd-sample-peak-target-dbfs requires --dsd-path reference --dsd-gain sample-peak-normalize"
+        );
+    }
+
+    if let Some(gain_token) = gain_token.as_deref() {
+        let new_policy = match gain_token {
+            "off" => {
+                if parsed_fixed_gain.is_some()
+                    || parsed_true_peak_target.is_some()
+                    || parsed_scope.is_some()
+                    || parsed_scan.is_some()
+                {
+                    anyhow::bail!("--dsd-gain off does not accept gain/target/scope/scan controls");
+                }
+                SampleGainPolicy::Off
+            }
+            "fixed-gain" => {
+                if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+                    anyhow::bail!(
+                        "fixed-gain does not accept true-peak target/scope/scan controls"
+                    );
+                }
+                SampleGainPolicy::FixedGain {
+                    gain_db: parsed_fixed_gain.ok_or_else(|| {
+                        anyhow::anyhow!("--dsd-gain fixed-gain requires --dsd-gain-db")
+                    })?,
+                }
+            }
+            "true-peak-guard" | "true-peak-normalize" => {
+                if parsed_fixed_gain.is_some() {
+                    anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed-gain");
+                }
+                let previous = settings.dsd.gain_policy();
+                let target_dbtp = parsed_true_peak_target
+                    .or_else(|| previous.target_dbtp())
+                    .unwrap_or(PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP);
+                let scope = parsed_scope.or_else(|| previous.scope()).unwrap_or(TruePeakScope::Track);
+                let scan = parsed_scan.or_else(|| previous.scan()).unwrap_or(TruePeakScanTier::Reference);
+                if gain_token == "true-peak-guard" {
+                    SampleGainPolicy::TruePeakGuard { target_dbtp, scope, scan }
+                } else {
+                    SampleGainPolicy::TruePeakNormalize { target_dbtp, scope, scan }
+                }
+            }
+            _ => unreachable!(),
+        };
+        settings.dsd.set_gain_policy(new_policy);
+    } else if parsed_fixed_gain.is_some() {
+        anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed-gain or reference-fixed");
+    } else if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+        let mut policy = settings.dsd.gain_policy();
+        if !policy.is_true_peak() {
             anyhow::bail!(
-                "--dsd-true-peak-scan requires album-scoped automatic DSD gain; \
-                 add --dsd-auto-gain-scope album"
+                "DSD true-peak target/scope/scan controls require true-peak-guard or true-peak-normalize"
             );
         }
-        settings.dsd.set_true_peak_scan_mode(scan_mode);
+        if let Some(target) = parsed_true_peak_target {
+            policy = policy.with_target(target);
+        }
+        if let Some(scope) = parsed_scope {
+            policy = policy.with_scope(scope);
+        }
+        if let Some(scan) = parsed_scan {
+            policy = policy.with_scan(scan);
+        }
+        settings.dsd.set_gain_policy(policy);
     }
-    // Native-v2 Reference validation is planner-owned so every unsupported
-    // cell reaches the stable DSD-REF-P0 error selected by the immutable
-    // policy. Generic legacy validation can otherwise preempt those errors
-    // with a format/depth message before the Reference planner runs.
+
     Ok(())
 }
 
 #[cfg(test)]
 mod dsd_reference_cli_settings_tests {
     use super::*;
-    use tonepoet_pipeline::DsdSourceGainMode;
+    use tonepoet_pipeline::{
+        DsdSourceGainMode, DsdSourcePathway, SampleGainPolicy, TruePeakScanTier,
+        TruePeakScope,
+    };
 
-    #[test]
-    fn absent_reference_flags_preserve_pre_promotion_legacy_default() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+    fn apply(
+        settings: &mut tonepoet_pipeline::PipelineSettings,
+        pathway: Option<&str>,
+        gain: Option<&str>,
+        fixed: Option<&str>,
+        target: Option<&str>,
+        sample_target: Option<&str>,
+        scope: Option<&str>,
+        scan: Option<&str>,
+    ) -> anyhow::Result<()> {
         apply_cli_dsd_reference_settings(
-            &mut settings,
+            settings,
             AudioFormat::Flac,
+            pathway,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            gain,
+            fixed,
+            target,
+            sample_target,
+            scope,
+            scan,
         )
-        .expect("default DSD CLI settings");
-
-        assert!(!settings.dsd.is_native_v2());
     }
 
     #[test]
-    fn absent_reference_flags_preserve_existing_wavpack_cli_canonicalization() {
+    fn absent_dsd_flags_preserve_strict_general_off_default() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply_cli_dsd_reference_settings(
+            &mut settings, AudioFormat::Flac, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::General);
+        assert_eq!(settings.dsd.gain_policy(), SampleGainPolicy::Off);
+    }
+
+    #[test]
+    fn obsolete_ambiguous_primary_gain_tokens_are_rejected() {
+        for token in ["auto", "normalize", "fixed", "native"] {
+            let mut settings = tonepoet_pipeline::PipelineSettings::default();
+            let error = apply(&mut settings, None, Some(token), None, None, None, None, None)
+                .expect_err("ambiguous token must fail");
+            assert!(error.to_string().contains("obsolete ambiguous"), "{error}");
+        }
+    }
+
+    #[test]
+    fn guard_track_fast_and_normalize_album_reference_are_both_expressible() {
+        let mut guard = tonepoet_pipeline::PipelineSettings::default();
+        apply(
+            &mut guard, None, Some("true-peak-guard"), None, Some("-0.500000000"),
+            None, Some("track"), Some("fast"),
+        )
+        .unwrap();
+        assert_eq!(
+            guard.dsd.gain_policy(),
+            SampleGainPolicy::TruePeakGuard {
+                target_dbtp: "-0.500000000".parse().unwrap(),
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Fast,
+            }
+        );
+
+        let mut normalize = tonepoet_pipeline::PipelineSettings::default();
+        apply(
+            &mut normalize, None, Some("true-peak-normalize"), None, None,
+            None, Some("album"), Some("reference"),
+        )
+        .unwrap();
+        assert!(matches!(
+            normalize.dsd.gain_policy(),
+            SampleGainPolicy::TruePeakNormalize {
+                scope: TruePeakScope::Album,
+                scan: TruePeakScanTier::Reference,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn track_scope_preserves_selected_standard_tier() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(
+            &mut settings, None, Some("true-peak-guard"), None, None,
+            None, Some("track"), Some("standard"),
+        )
+        .unwrap();
+        assert_eq!(settings.dsd.true_peak_scan_tier(), Some(TruePeakScanTier::Standard));
+    }
+
+    #[test]
+    fn reference_sample_peak_normalize_is_separate_and_uses_dbfs_target() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(
+            &mut settings, Some("reference"), Some("sample-peak-normalize"), None,
+            None, Some("-1.250000000"), None, None,
+        )
+        .unwrap();
+        assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Reference);
+        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::NormalizePeak);
+        assert_eq!(
+            settings.dsd.from_dsd.normalize_peak_target_dbfs,
+            "-1.250000000".parse().unwrap()
+        );
+        assert_eq!(settings.dsd.gain_policy(), SampleGainPolicy::Off);
+    }
+
+    #[test]
+    fn ordinary_gain_is_refused_on_reference_delivery_path() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        let error = apply(
+            &mut settings, Some("reference"), Some("true-peak-guard"), None,
+            None, None, None, None,
+        )
+        .expect_err("ordinary gain cannot silently mutate Reference delivery");
+        assert!(error.to_string().contains("require --dsd-path general"), "{error}");
+    }
+
+    #[test]
+    fn fixed_gain_is_explicit_and_unguarded() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(
+            &mut settings, None, Some("fixed-gain"), Some("3.000000000"),
+            None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.dsd.gain_policy(),
+            SampleGainPolicy::FixedGain { gain_db: "3.000000000".parse().unwrap() }
+        );
+    }
+
+    #[test]
+    fn absent_flags_preserve_wavpack_cli_canonicalization() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
         assert!(!settings.wavpack.hybrid);
         assert!(settings.wavpack.correction_file);
-
         apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::WavPack,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &mut settings, AudioFormat::WavPack, None, None, None, None, None, None, None, None,
         )
-        .expect("default WavPack CLI settings");
-
-        assert!(!settings.dsd.is_native_v2());
+        .unwrap();
         assert!(!settings.wavpack.correction_file);
     }
-
-    #[test]
-    fn any_reference_flag_is_an_explicit_native_v2_opt_in() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            Some("reference"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("explicit Reference opt-in");
-
-        assert!(settings.dsd.is_native_v2());
-    }
-
-    #[test]
-    fn explicit_cli_opt_in_applies_canonical_defaults_for_omitted_reference_flags() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
-        settings.dsd.from_dsd.profile =
-            tonepoet_pipeline::DsdReconstructionSelection::Wideband;
-        settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-        settings.dsd.from_dsd.fixed_gain_db = Some("2.500000000".parse().unwrap());
-
-        apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            Some("reference"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("apply explicit Reference pathway");
-
-        assert!(settings.dsd.is_native_v2());
-        assert_eq!(
-            settings.dsd.from_dsd.profile,
-            tonepoet_pipeline::DsdReconstructionSelection::Reference
-        );
-        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Reference);
-        assert_eq!(settings.dsd.from_dsd.fixed_gain_db, None);
-    }
-
-
-    #[test]
-    fn cli_album_scope_attaches_to_live_legacy_auto_without_promoting_reference() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            None,
-            None,
-            Some("auto"),
-            None,
-            None,
-            Some("album"),
-            None,
-        )
-        .expect("legacy album auto gain");
-
-        assert!(!settings.dsd.is_native_v2());
-        assert!(settings.dsd.album_auto_gain_selected());
-        assert_eq!(
-            settings.dsd.auto_gain_scope(),
-            tonepoet_pipeline::DsdAutoGainScope::Album
-        );
-    }
-
-    #[test]
-    fn cli_album_scope_attaches_to_native_normalize_peak_without_reference_qualification() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            Some("reference"),
-            None,
-            Some("normalize"),
-            None,
-            Some("-1.250000000"),
-            Some("album"),
-            None,
-        )
-        .expect("native album normalize gain");
-
-        assert!(settings.dsd.is_native_v2());
-        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::NormalizePeak);
-        assert!(settings.dsd.album_auto_gain_selected());
-        assert_eq!(
-            settings.dsd.album_auto_gain_target_dbfs(),
-            Some("-1.250000000".parse().unwrap())
-        );
-    }
-
-    #[test]
-    fn cli_album_scope_rejects_nonautomatic_native_gain() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        let error = apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            Some("reference"),
-            None,
-            Some("native"),
-            None,
-            None,
-            Some("album"),
-            None,
-        )
-        .expect_err("album scope requires normalize in native v2");
-        assert!(
-            error.to_string().contains("requires --dsd-gain normalize"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn cli_fast_scan_attaches_to_legacy_album_auto() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            None,
-            None,
-            Some("auto"),
-            None,
-            None,
-            Some("album"),
-            Some("fast"),
-        )
-        .expect("legacy album fast true-peak scan");
-
-        assert_eq!(
-            settings.dsd.true_peak_scan_mode(),
-            tonepoet_pipeline::DsdTruePeakScanMode::Fast
-        );
-    }
-
-    #[test]
-    fn cli_fast_scan_rejects_track_scoped_automatic_gain() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        let error = apply_cli_dsd_reference_settings(
-            &mut settings,
-            AudioFormat::Flac,
-            None,
-            None,
-            Some("auto"),
-            None,
-            None,
-            Some("track"),
-            Some("standard"),
-        )
-        .expect_err("true-peak scan tier is meaningful only for album automatic gain");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires album-scoped automatic DSD gain"),
-            "{error}"
-        );
-    }
-
 }
+
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
     paths: Vec<PathBuf>,
@@ -1547,8 +1534,9 @@ async fn run_convert(
     dsd_profile: Option<String>,
     dsd_gain: Option<String>,
     dsd_gain_db: Option<String>,
-    dsd_normalize_target_dbfs: Option<String>,
-    dsd_auto_gain_scope: Option<String>,
+    dsd_true_peak_target_dbtp: Option<String>,
+    dsd_sample_peak_target_dbfs: Option<String>,
+    dsd_true_peak_scope: Option<String>,
     dsd_true_peak_scan: Option<String>,
     append_lineage: bool,
     write_log: bool,
@@ -1707,8 +1695,9 @@ async fn run_convert(
         dsd_profile.as_deref(),
         dsd_gain.as_deref(),
         dsd_gain_db.as_deref(),
-        dsd_normalize_target_dbfs.as_deref(),
-        dsd_auto_gain_scope.as_deref(),
+        dsd_true_peak_target_dbtp.as_deref(),
+        dsd_sample_peak_target_dbfs.as_deref(),
+        dsd_true_peak_scope.as_deref(),
         dsd_true_peak_scan.as_deref(),
     )?;
     options.pipeline_settings = Some(cli_pipeline_settings);
@@ -2405,11 +2394,14 @@ fn build_pipeline_request_template(
         .unwrap_or(options.calculate_replaygain);
 
     let mut request = PipelineRequest {
+        registered_effects: Vec::new(),
         actions: tonepoet::convert::pipeline::ActionPipeline::default(),
         worker_count: None,
         scratch_staging: None,
         job_id: String::new(),     // filled per-item
         item_id: String::new(),    // filled per-item
+        submission_id: None,
+        submission_size: None,
         container: PathBuf::new(), // filled per-item
         source: SourceOptions {
             archive_password: archive_password

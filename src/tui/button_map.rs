@@ -49,8 +49,7 @@ pub enum TuiButton {
     DitherPill(usize),
     ReplayGainPill(usize),
     PcmTruePeakPill(usize),
-    PcmTruePeakScopePill(usize),
-    PcmTruePeakBoostPill(usize),
+    TruePeakScopePill(usize),
     PcmTruePeakScanPill(usize),
     PcmTruePeakTargetField,
     PcmGainDbField,
@@ -60,10 +59,11 @@ pub enum TuiButton {
     DsdPathPill(usize),
     DsdProfilePill(usize),
     DsdGainPill(usize),
-    DsdGainScopePill(usize),
+    DsdTruePeakScopePill(usize),
     DsdTruePeakScanPill(usize),
     DsdGainDbField,
-    DsdNormalizeTargetField,
+    DsdTruePeakTargetField,
+    DsdSamplePeakTargetField,
     MergePill(usize),
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
@@ -596,8 +596,7 @@ impl TuiButton {
             | Self::DitherPill(_)
             | Self::ReplayGainPill(_)
             | Self::PcmTruePeakPill(_)
-            | Self::PcmTruePeakScopePill(_)
-            | Self::PcmTruePeakBoostPill(_)
+            | Self::TruePeakScopePill(_)
             | Self::PcmTruePeakScanPill(_)
             | Self::PcmTruePeakTargetField
             | Self::PcmGainDbField
@@ -607,10 +606,11 @@ impl TuiButton {
             | Self::DsdPathPill(_)
             | Self::DsdProfilePill(_)
             | Self::DsdGainPill(_)
-            | Self::DsdGainScopePill(_)
+            | Self::DsdTruePeakScopePill(_)
             | Self::DsdTruePeakScanPill(_)
             | Self::DsdGainDbField
-            | Self::DsdNormalizeTargetField
+            | Self::DsdTruePeakTargetField
+            | Self::DsdSamplePeakTargetField
             | Self::MergePill(_)
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)

@@ -1,10 +1,65 @@
 //! Audio analysis: DR meter, peak, RMS, clipping, DC bias, bit depth.
 //!
-//! Single-pass PCM decode via ffmpeg-next computes all metrics from one
-//! read of the file. LUFS and true peak are obtained separately via the
-//! loudgain subprocess.
+//! Single-pass PCM decode via ffmpeg-next computes DR-family metrics.
+//! Production LUFS and ReplayGain reporting peak use the same native
+//! NativeEbu2023 observation path as conversion and metadata writing.
 
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoudnessUnavailableReason {
+    TooShort { frames: u64, required_frames: u64 },
+    BelowAbsoluteGate,
+    BelowRelativeGate,
+    NoEligibleBlocks,
+}
+
+impl From<crate::convert::replaygain::MathematicalUnavailability>
+    for LoudnessUnavailableReason
+{
+    fn from(reason: crate::convert::replaygain::MathematicalUnavailability) -> Self {
+        match reason {
+            crate::convert::replaygain::MathematicalUnavailability::TooShort {
+                frames,
+                required_frames,
+            } => Self::TooShort {
+                frames,
+                required_frames,
+            },
+            crate::convert::replaygain::MathematicalUnavailability::BelowAbsoluteGate => {
+                Self::BelowAbsoluteGate
+            }
+            crate::convert::replaygain::MathematicalUnavailability::BelowRelativeGate => {
+                Self::BelowRelativeGate
+            }
+            crate::convert::replaygain::MathematicalUnavailability::NoEligibleBlocks => {
+                Self::NoEligibleBlocks
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LoudnessUnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort {
+                frames,
+                required_frames,
+            } => write!(f, "too short ({frames} frames; {required_frames} required)"),
+            Self::BelowAbsoluteGate => f.write_str("below absolute loudness gate"),
+            Self::BelowRelativeGate => f.write_str("below relative loudness gate"),
+            Self::NoEligibleBlocks => f.write_str("no eligible loudness blocks"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoudnessAnalysisStatus {
+    NotScanned,
+    Available,
+    Unavailable(LoudnessUnavailableReason),
+    Failed(String),
+}
 
 /// Results of a single-file audio analysis.
 #[derive(Debug, Clone)]
@@ -27,10 +82,13 @@ pub struct AnalysisResult {
     pub sample_rate: u32,
     pub channels: u32,
     pub duration_secs: f64,
-    /// Integrated loudness in LUFS (from loudgain, None if unavailable).
+    /// NativeEbu2023 integrated loudness in LUFS (None when mathematically unavailable).
     pub lufs: Option<f64>,
-    /// True peak in dBTP (from loudgain, None if unavailable).
+    /// ReplayGain reporting peak in dBTP (None for digital silence).
     pub true_peak_dbtp: Option<f64>,
+    /// Distinguishes a finite native loudness result, typed mathematical
+    /// unavailability, and operational scan failure.
+    pub loudness_status: LoudnessAnalysisStatus,
     /// CD pre-emphasis detection result from fast checks (metadata + catalog).
     pub preemphasis: Option<super::preemphasis::PreemphasisConfidence>,
     /// Pre-emphasis diagnostic correlation value.
@@ -418,6 +476,7 @@ pub fn analyze_file(
         duration_secs: duration_secs.abs(),
         lufs: None,
         true_peak_dbtp: None,
+        loudness_status: LoudnessAnalysisStatus::NotScanned,
         preemphasis: None,
         preemphasis_corr: None,
         preemphasis_detail: None,
@@ -485,44 +544,43 @@ fn compute_dr(
     dr.round() as i32
 }
 
-/// Run loudgain in scan-only mode to get LUFS and true peak.
-/// Returns (lufs, true_peak_dbtp) or None if loudgain fails.
-pub async fn measure_loudness(path: &Path) -> Option<(f64, f64)> {
-    use tokio::process::Command;
+/// Measure production loudness and ReplayGain reporting peak without writing tags.
+///
+/// This is deliberately the same raw observation path used by conversion and
+/// metadata writing. ReplayGain-only scan demand is integrated-only: LRA state
+/// is not constructed merely for this UI analysis.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLoudnessScan {
+    pub integrated_lufs: Option<f64>,
+    pub reporting_peak_dbtp: Option<f64>,
+    pub unavailable: Option<crate::convert::replaygain::MathematicalUnavailability>,
+}
 
-    let output = Command::new("loudgain")
-        .args(["-s", "s", "-O", "-r", "-q"])
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse the -O format: File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\t...
-    for line in stdout.lines() {
-        if line.starts_with("File\t") {
-            continue;
-        } // Header.
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() >= 5 {
-            let lufs = cols[1]
-                .trim()
-                .strip_suffix(" LUFS")
-                .and_then(|s| s.parse::<f64>().ok())?;
-            let true_peak = cols[4]
-                .trim()
-                .strip_suffix(" dBTP")
-                .and_then(|s| s.parse::<f64>().ok())?;
-            return Some((lufs, true_peak));
-        }
-    }
-    None
+pub(crate) async fn measure_loudness(path: &Path) -> Result<NativeLoudnessScan, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let member = format!("scan-only:{}", path.display());
+        let scan = crate::convert::replaygain::measure_paths(
+            std::slice::from_ref(&path),
+            std::slice::from_ref(&member),
+            tonepoet_pipeline::ReplayGainMode::Track,
+            crate::convert::replaygain::MetricDemand::IntegratedOnly,
+        )
+        .map_err(|error| error.to_string())?;
+        let summary = scan
+            .tracks
+            .first()
+            .ok_or_else(|| "native loudness scan returned no track observation".to_string())?;
+        let unavailable = crate::convert::replaygain::integrated_unavailability(summary)
+            .map_err(|error| error.to_string())?;
+        Ok(NativeLoudnessScan {
+            integrated_lufs: crate::convert::replaygain::finite_integrated_lufs(summary),
+            reporting_peak_dbtp: crate::convert::replaygain::reporting_peak_dbtp(summary),
+            unavailable,
+        })
+    })
+    .await
+    .map_err(|error| format!("native loudness scan task failed: {error}"))?
 }
 
 // ── HDCD detection ──────────────────────────────────────────────────
@@ -651,5 +709,38 @@ pub fn dr_label(dr: i32) -> &'static str {
         8..=13 => "good",
         14..=20 => "excellent",
         _ => "exceptional",
+    }
+}
+
+#[cfg(test)]
+mod loudness_status_tests {
+    use super::*;
+
+    #[test]
+    fn native_unavailability_maps_without_collapsing_reasons() {
+        use crate::convert::replaygain::MathematicalUnavailability as Native;
+
+        assert_eq!(
+            LoudnessUnavailableReason::from(Native::TooShort {
+                frames: 100,
+                required_frames: 19_200,
+            }),
+            LoudnessUnavailableReason::TooShort {
+                frames: 100,
+                required_frames: 19_200,
+            }
+        );
+        assert_eq!(
+            LoudnessUnavailableReason::from(Native::BelowAbsoluteGate),
+            LoudnessUnavailableReason::BelowAbsoluteGate
+        );
+        assert_eq!(
+            LoudnessUnavailableReason::from(Native::BelowRelativeGate),
+            LoudnessUnavailableReason::BelowRelativeGate
+        );
+        assert_eq!(
+            LoudnessUnavailableReason::from(Native::NoEligibleBlocks),
+            LoudnessUnavailableReason::NoEligibleBlocks
+        );
     }
 }

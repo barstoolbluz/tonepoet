@@ -20,21 +20,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tonepoet_pipeline::{
-    build_reference_silence_scan_command,
-    extract_single_sox_stats_peak_report, parse_reference_sox_stats_true_peak_measurement,
-    plan_conversion, resolve_reference_deferred_command,
-    validate_post_final_true_peak, validate_reference_decode_mechanism,
-    validate_signed_zero_f64le, reference_error_text, reference_scratch_paths, ConversionPlan,
+    plan_conversion, validate_reference_decode_mechanism,
+    reference_error_text, reference_scratch_paths, ConversionPlan,
     DsdReferencePlanSummary, DsdSourceKind,
-    Finalization, MeasurementId, MeasurementParser, PlanAction, PlanRequest, PlannedCommand,
-    PlannedCommandPipeline, PlannedDeferredCommand, PlannedExecutionStep, PlannedMeasurement,
+    CommandEnvironmentPolicy, Finalization, MeasurementId, PlanAction, PlanRequest, PlannedCommand,
+    PlannedCommandPipeline,
     ReferenceDecodeAuthority, ReferenceDecodeMechanism, ReferenceDecodedCarrier,
     ReferenceDecodedCarrierSelector, ReferenceSampleHashEncoding,
     ReferenceScratchPaths, ReferenceErrorCode,
     SacdAreaKind, SacdFrameEncoding, Sha256Digest, ToolIdentifier,
     W64ExactStructure, W64PcmExpectation, W64PcmFormatExpectation, W64SampleEncoding,
-    inspect_exact_w64_pcm, validate_exact_w64_pcm,
-    TruePeakMeasurement, TruePeakPurpose,
+    inspect_exact_w64_pcm, validate_exact_w64_pcm, TruePeakPurpose,
 };
 use tonepoet_pipeline::fingerprint::{
     conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
@@ -46,7 +42,8 @@ use tonepoet_pipeline::fingerprint::{
 
 use super::errors::{ConvertError, ToolRunnerError};
 use super::plan_bridge::{
-    plan_request_for_track, planner_metadata_obligations_for_track, reference_sacd_source_kind,
+    certified_terminal_candidate_binding, plan_request_for_track,
+    planner_metadata_obligations_for_track, reference_sacd_source_kind,
     settings_request_metadata, source_info_for_realized_track,
 };
 use super::planned_adapter::{planned_command_to_tool_command, DEFAULT_PLANNED_COMMAND_TIMEOUT};
@@ -56,8 +53,8 @@ use super::progress::{
 };
 use super::tool::{
     parse_tool_version_output, BoundToolExecutable, CommandRecord, EnvVar, ProcessExit,
-    ToolBinary, ToolCommand, ToolOutput, ToolRunner, ToolSegmentedPipelineError,
-    ToolSegmentedPipelineOutput, ToolStreamSegment,
+    RetainedPcmScalarPump, ToolBinary, ToolCommand, ToolOutput, ToolRunner,
+    ToolSegmentedPipelineError, ToolSegmentedPipelineOutput, ToolStreamSegment,
 };
 use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
 
@@ -110,7 +107,10 @@ impl ReferenceMetadataMutatorToolchain {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceToolchainEvidence {
-    pub qualification_manifest_digest: Sha256Digest,
+    pub qualification_candidate_manifest_digest: Sha256Digest,
+    pub common_runtime_closure_fingerprint_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_mutation_closure_fingerprint_sha256: Option<String>,
     pub sox_ng: ReferenceToolIdentity,
     pub ffmpeg: ReferenceToolIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,8 +119,6 @@ pub struct ReferenceToolchainEvidence {
     pub dst_fixture_digest: Sha256Digest,
     pub platform_abi_digest: Sha256Digest,
     pub runtime_dispatch_digest: Sha256Digest,
-    pub reporting_uncertainty: tonepoet_pipeline::DbNano,
-    pub analyzer_residual: tonepoet_pipeline::DbNano,
 }
 
 pub(crate) fn reference_execution_identity_input(
@@ -155,8 +153,8 @@ pub(crate) fn reference_execution_identity_input(
         }),
         sacd_rs_build_identity: toolchain.sacd_rs_build_identity.clone(),
         dst_fixture_digest: toolchain.dst_fixture_digest,
-        reporting_uncertainty: toolchain.reporting_uncertainty,
-        analyzer_residual: toolchain.analyzer_residual,
+        common_runtime_closure_fingerprint_sha256:
+            toolchain.common_runtime_closure_fingerprint_sha256.clone(),
     }
 }
 
@@ -166,7 +164,7 @@ pub(crate) struct ReferenceRerunPreflightAuthority {
     pub settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
     pub resolved_output_target: tonepoet_pipeline::ResolvedOutputTarget,
     pub policy: tonepoet_pipeline::DsdReferencePolicyVersion,
-    pub qualification_manifest_digest: Sha256Digest,
+    pub qualification_candidate_manifest_digest: Sha256Digest,
     pub source_content_sha256: Sha256Digest,
     pub source_probe_digest: Sha256Digest,
     pub original_source_kind: DsdSourceKind,
@@ -227,7 +225,7 @@ pub struct ReferenceExecutionEvidence {
     /// Immutable pure-plan facts.
     pub plan: DsdReferencePlanSummary,
     /// Typed measurements keyed by their plan-local IDs.
-    pub measurements: BTreeMap<MeasurementId, TruePeakMeasurement>,
+    pub measurements: BTreeMap<MeasurementId, tonepoet_pipeline::ReferenceCertifiedPeakObservation>,
     /// Exact attested toolchain and analyzer policy.
     pub toolchain: ReferenceToolchainEvidence,
     /// Exact fully resolved command transcript hash, including carrier and pre-metadata package verification.
@@ -251,7 +249,7 @@ pub struct ExecutedTrackPlan {
     pub metadata_required: PlannedMetadataSatisfaction,
     /// SHA-256 of the planned command sequence, for legacy manifest rerun identity.
     pub command_hash: Option<String>,
-    /// Native-v2 Reference execution authority, absent for all existing routes.
+    /// Qualified Reference execution authority, absent for ordinary routes.
     pub reference: Option<ReferenceExecutionEvidence>,
 }
 
@@ -458,6 +456,13 @@ impl Default for ToolConcurrencyLimits {
     }
 }
 
+fn reference_metadata_attestation_required(request: &PipelineRequest) -> bool {
+    matches!(
+        request.stages.metadata,
+        super::types::StageRequirement::Enabled
+    )
+}
+
 pub(crate) async fn preflight_reference_rerun_authority(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -501,11 +506,13 @@ pub(crate) async fn preflight_reference_rerun_authority(
     let Some(summary) = plan.reference else {
         return Ok(None);
     };
+    validate_reference_production_promotion_preflight(&summary)?;
+    let metadata_enabled = reference_metadata_attestation_required(request);
     let toolchain = attest_reference_toolchain(
         runner,
         cancel,
         summary.front_end,
-        request.stages.metadata == super::types::StageRequirement::Enabled,
+        metadata_enabled,
     )
     .await?;
     let original_authority = match &track.source_ref {
@@ -570,7 +577,7 @@ pub(crate) async fn preflight_reference_rerun_authority(
     let execution_fingerprint_v1 = execution_fingerprint_v1(
         behavior_fingerprint_v1,
         semantic_plan_hash_v1,
-        summary.qualification_manifest_digest,
+        summary.qualification_candidate_manifest_digest,
         &reference_execution_identity_input(&toolchain),
     );
 
@@ -583,7 +590,7 @@ pub(crate) async fn preflight_reference_rerun_authority(
         settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&request.settings),
         resolved_output_target: summary.target,
         policy: summary.policy,
-        qualification_manifest_digest: summary.qualification_manifest_digest,
+        qualification_candidate_manifest_digest: summary.qualification_candidate_manifest_digest,
         source_content_sha256,
         source_probe_digest,
         original_source_kind,
@@ -1083,7 +1090,6 @@ fn cue_stream_phase1_direct_plan_for_paths(
 
     let PlanAction::Execute {
         commands,
-        steps,
         finalization,
         ..
     } = &plan.action
@@ -1091,7 +1097,6 @@ fn cue_stream_phase1_direct_plan_for_paths(
         return Ok(None);
     };
     if plan.reference.is_some()
-        || !steps.is_empty()
         || commands.len() != 1
         || finalization.is_none()
     {
@@ -1227,6 +1232,85 @@ pub(crate) fn cleanup_cue_stream_direct_track_plan(plan: &CueStreamDirectTrackPl
     let _ = fs::remove_dir_all(&plan.work_dir);
 }
 
+fn planned_command_with_retained_pcm_scalar_stdin(
+    planned: &PlannedCommand,
+    retained_input: &Path,
+) -> Option<PlannedCommand> {
+    let tonepoet_pipeline::InputSource::Path(planned_input) = &planned.input else {
+        return None;
+    };
+    if planned_input != retained_input {
+        return None;
+    }
+    let stdin_token = match planned.tool {
+        ToolIdentifier::Sox => "-",
+        ToolIdentifier::Ffmpeg => "pipe:0",
+        _ => return None,
+    };
+    let input_spelling = retained_input.to_string_lossy();
+    let matching_args = planned
+        .args
+        .iter()
+        .filter(|arg| arg.as_str() == input_spelling.as_ref())
+        .count();
+    if matching_args != 1 {
+        return None;
+    }
+    let mut streamed = planned.clone();
+    streamed.input = tonepoet_pipeline::InputSource::Stdin;
+    let mut replaced = false;
+    for arg in &mut streamed.args {
+        if !replaced && arg.as_str() == input_spelling.as_ref() {
+            *arg = stdin_token.to_string();
+            replaced = true;
+        }
+    }
+    replaced.then_some(streamed)
+}
+
+/// Pure preflight for P2's retained-f64le scalar transport.  Unsupported
+/// command shapes remain on the materialized baseline; this function never
+/// weakens planner admission or changes the selected tool/terminal route.
+pub(crate) fn retained_pcm_scalar_stream_plan_admitted(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    retained_input: &Path,
+    staged_output: &Path,
+    convert_root: &Path,
+) -> Result<bool, ConvertError> {
+    let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
+    let plan_request = plan_request_for_track(
+        request,
+        track,
+        retained_input,
+        staged_output,
+        work_dir,
+    )?;
+    let plan = plan_conversion(&plan_request)
+        .map_err(|error| ConvertError::Backend(format!("planner failed: {error}")))?;
+    let PlanAction::Execute { commands, .. } = &plan.action else {
+        return Ok(false);
+    };
+    if plan.reference.is_some() || commands.is_empty() {
+        return Ok(false);
+    }
+    if planned_command_with_retained_pcm_scalar_stdin(&commands[0], retained_input).is_none() {
+        return Ok(false);
+    }
+    // Later commands may consume the first command's path-backed output, but
+    // none may independently reread the pre-gain carrier or the scalar would
+    // cease to have one unambiguous application point.
+    if commands.iter().skip(1).any(|command| {
+        matches!(
+            &command.input,
+            tonepoet_pipeline::InputSource::Path(path) if path == retained_input
+        )
+    }) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub async fn execute_planned_track_conversion(
     request: &PipelineRequest,
     track: &PreparedTrack,
@@ -1241,6 +1325,697 @@ pub async fn execute_planned_track_conversion(
     start_fraction: f32,
     end_fraction: f32,
 ) -> Result<ExecutedTrackPlan, TrackExecutionError> {
+    execute_planned_track_conversion_with_scalar_pump(
+        request,
+        track,
+        realized_input,
+        None,
+        staged_output,
+        convert_root,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+        progress,
+        start_fraction,
+        end_fraction,
+    )
+    .await
+}
+
+fn finalized_artifact_producing_command<'a>(
+    commands: &'a [PlannedCommand],
+    finalization: Option<&Finalization>,
+) -> Result<&'a PlannedCommand, String> {
+    let Some(Finalization::AtomicRename { from, .. }) = finalization else {
+        return Err("plan has no atomic-rename finalization authority".to_string());
+    };
+
+    let mut producers = commands.iter().filter(|command| {
+        matches!(
+            &command.output,
+            tonepoet_pipeline::OutputSink::Path(path) if path == from
+        )
+    });
+    let producer = producers.next().ok_or_else(|| {
+        format!(
+            "no command creates the finalized work artifact {}",
+            from.display(),
+        )
+    })?;
+    if producers.next().is_some() {
+        return Err(format!(
+            "multiple commands create the finalized work artifact {}",
+            from.display(),
+        ));
+    }
+    Ok(producer)
+}
+
+fn validate_certified_terminal_candidate_realization(
+    track: &PreparedTrack,
+    plan_request: &PlanRequest,
+    plan: &ConversionPlan,
+) -> Result<(), ConvertError> {
+    let Some(selected) = certified_terminal_candidate_binding(track)? else {
+        return Ok(());
+    };
+
+    let PlanAction::Execute {
+        commands,
+        finalization,
+        ..
+    } = &plan.action
+    else {
+        return Err(ConvertError::Backend(format!(
+            "certified true-peak terminal candidate {} ({}) lowered to passthrough instead of an encode",
+            selected.identity, selected.tool,
+        )));
+    };
+
+    // The charged proof governs the command that created the work artifact
+    // committed by finalization. Verification commands may legally follow that
+    // encoder and can even use the same executable, so command order is not an
+    // identity proof. Fail closed unless the finalization path has one unique
+    // path-producing command.
+    let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+        .map_err(|reason| {
+            ConvertError::Backend(format!(
+                "certified true-peak terminal candidate {} ({}) has no unique lowered artifact-producing terminal: {reason}",
+                selected.identity, selected.tool,
+            ))
+        })?;
+    let selected_terminal_matches = terminal.tool == selected.tool;
+    // FFmpeg owns admission for WavPack hybrid, but its registered lowering
+    // deliberately delegates the terminal encode to the native wavpack tool.
+    // Keep that single established delegation explicit rather than treating a
+    // different terminal backend as generally interchangeable.
+    let admitted_delegate_matches = selected.tool == ToolIdentifier::Ffmpeg
+        && plan_request.settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+        && plan_request.settings.wavpack.hybrid
+        && terminal.tool == ToolIdentifier::Custom("wavpack".to_string());
+    if !selected_terminal_matches && !admitted_delegate_matches {
+        let emitted = commands
+            .iter()
+            .map(|command| command.tool.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ConvertError::Backend(format!(
+            "certified true-peak terminal candidate {} ({}) does not match lowered artifact-producing terminal {} in command chain [{}]",
+            selected.identity, selected.tool, terminal.tool, emitted,
+        )));
+    }
+
+    selected.terminal_realization.as_ref().ok_or_else(|| {
+        ConvertError::Backend(format!(
+            "certified true-peak terminal candidate {} ({}) has no structured terminal realization",
+            selected.identity, selected.tool,
+        ))
+    })?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct QualifiedTerminalExecutableBinding {
+    command_index: usize,
+    executable: BoundToolExecutable,
+}
+
+/// Close the process environment for the exact command governed by the
+/// qualified FFmpeg terminal authority. The executable path/store binding is
+/// not sufficient if ambient loader variables can substitute libswresample or
+/// interpose libc rounding functions. Keep this as a runtime obligation of the
+/// canonical selected terminal rather than teaching the ordinary FFmpeg lowerer
+/// a second qualification rule.
+fn close_qualified_terminal_environment(
+    plan: &mut ConversionPlan,
+    binding: &QualifiedTerminalExecutableBinding,
+) -> Result<(), TrackExecutionError> {
+    let PlanAction::Execute { commands, .. } = &mut plan.action else {
+        return Err(qualified_ffmpeg_int32_dither_error(
+            "qualified terminal environment cannot be bound on a passthrough plan",
+        ));
+    };
+    let command = commands.get_mut(binding.command_index).ok_or_else(|| {
+        qualified_ffmpeg_int32_dither_error(
+            "qualified terminal command index is outside the lowered command chain",
+        )
+    })?;
+    if command.tool != ToolIdentifier::Ffmpeg {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "qualified terminal environment resolved to {} instead of FFmpeg",
+            command.tool,
+        )));
+    }
+    if !command.environment.is_empty() {
+        return Err(qualified_ffmpeg_int32_dither_error(
+            "qualified terminal command requested explicit environment variables outside the inspected closure",
+        ));
+    }
+    command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
+    Ok(())
+}
+
+fn unique_planned_arg_value<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
+    let mut values = args
+        .windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str());
+    let value = values
+        .next()
+        .ok_or_else(|| format!("qualified terminal command is missing {flag}"))?;
+    if values.next().is_some() {
+        return Err(format!(
+            "qualified terminal command contains more than one {flag} option"
+        ));
+    }
+    Ok(value)
+}
+
+/// Revalidate the lowered command shape assumed by the FFmpeg Int32 triangular
+/// terminal proof. The semantic realization is the canonical owner, but the
+/// deterministic numerical argument also depends on the terminal actually
+/// entering libswresample as same-rate DBLP, adding exactly plain triangular
+/// dither there, and converting directly to S32. Refuse any lowerer drift that
+/// could add another sample-changing operation while retaining the same typed
+/// realization.
+fn validate_qualified_ffmpeg_int32_terminal_command_shape(
+    terminal: &PlannedCommand,
+    realization: &tonepoet_pipeline::SelectedPcmTerminalRealization,
+) -> Result<(), String> {
+    if !tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(realization) {
+        return Err("selected terminal realization is outside the retained FFmpeg Int32 triangular model".to_string());
+    }
+    if terminal.tool != ToolIdentifier::Ffmpeg {
+        return Err(format!(
+            "qualified terminal lowered with {} instead of FFmpeg",
+            terminal.tool,
+        ));
+    }
+
+    let input_path = terminal
+        .input
+        .as_path()
+        .ok_or_else(|| "qualified FFmpeg terminal input is not path-backed".to_string())?;
+    let output_path = terminal
+        .output
+        .as_path()
+        .ok_or_else(|| "qualified FFmpeg terminal output is not path-backed".to_string())?;
+    let expected_output = output_path.to_string_lossy();
+    if terminal.args.last().map(String::as_str) != Some(expected_output.as_ref()) {
+        return Err("qualified FFmpeg terminal output path is not the final argv element".to_string());
+    }
+
+    let input_format = unique_planned_arg_value(&terminal.args, "-f")?;
+    if input_format != "f64le" {
+        return Err(format!(
+            "qualified FFmpeg terminal requires raw f64le input, got {input_format}"
+        ));
+    }
+    let input_rate = unique_planned_arg_value(&terminal.args, "-ar")?
+        .parse::<u32>()
+        .map_err(|_| "qualified FFmpeg terminal input rate is not a positive integer".to_string())?;
+    if input_rate == 0 {
+        return Err("qualified FFmpeg terminal input rate is zero".to_string());
+    }
+    let channels = unique_planned_arg_value(&terminal.args, "-ac")?
+        .parse::<u16>()
+        .map_err(|_| "qualified FFmpeg terminal channel count is not a positive integer".to_string())?;
+    if channels == 0 {
+        return Err("qualified FFmpeg terminal channel count is zero".to_string());
+    }
+    let input_arg = unique_planned_arg_value(&terminal.args, "-i")?;
+    if input_arg != input_path.to_string_lossy().as_ref() {
+        return Err(format!(
+            "qualified FFmpeg terminal argv input {input_arg} does not match planned input {}",
+            input_path.display(),
+        ));
+    }
+    let input_index = terminal
+        .args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("unique -i was validated above");
+    for flag in ["-f", "-ar", "-ac"] {
+        let option_index = terminal
+            .args
+            .iter()
+            .position(|arg| arg == flag)
+            .expect("required input option was validated above");
+        if option_index >= input_index {
+            return Err(format!(
+                "qualified FFmpeg terminal requires input option {flag} before -i"
+            ));
+        }
+    }
+
+    let filter_alias_present = terminal.args.iter().any(|arg| {
+        arg == "-filter_complex"
+            || arg == "-filter_complex_script"
+            || arg == "-af_script"
+            || arg == "-filter:a"
+            || arg.starts_with("-filter:a:")
+    });
+    if filter_alias_present {
+        return Err(
+            "qualified FFmpeg terminal contains an alternate audio-filter option outside the inspected lowering"
+                .to_string(),
+        );
+    }
+    let filter = unique_planned_arg_value(&terminal.args, "-af")?;
+    let filter_index = terminal
+        .args
+        .iter()
+        .position(|arg| arg == "-af")
+        .expect("unique -af was validated above");
+    if filter_index <= input_index {
+        return Err("qualified FFmpeg terminal requires -af after the input".to_string());
+    }
+    if filter
+        .chars()
+        .any(|character| matches!(character, ',' | ';' | '[' | ']'))
+    {
+        return Err(format!(
+            "qualified FFmpeg terminal must contain exactly one simple aresample filter, got {filter}"
+        ));
+    }
+    let options = filter.strip_prefix("aresample=").ok_or_else(|| {
+        format!(
+            "qualified FFmpeg terminal filter is not the inspected aresample form: {filter}"
+        )
+    })?;
+    let mut parsed = BTreeMap::<&str, &str>::new();
+    for option in options.split(':') {
+        let (key, value) = option.split_once('=').ok_or_else(|| {
+            format!("qualified FFmpeg terminal aresample option is malformed: {option}")
+        })?;
+        if !matches!(
+            key,
+            "resampler"
+                | "out_sample_rate"
+                | "precision"
+                | "cutoff"
+                | "cheby"
+                | "phase_shift"
+                | "dither_method"
+                | "out_sample_fmt"
+        ) {
+            return Err(format!(
+                "qualified FFmpeg terminal contains unqualified aresample option {key}"
+            ));
+        }
+        if value.is_empty() || parsed.insert(key, value).is_some() {
+            return Err(format!(
+                "qualified FFmpeg terminal contains empty or duplicate aresample option {key}"
+            ));
+        }
+    }
+    for required in ["resampler", "precision", "cutoff", "dither_method", "out_sample_fmt"] {
+        if !parsed.contains_key(required) {
+            return Err(format!(
+                "qualified FFmpeg terminal aresample filter is missing {required}"
+            ));
+        }
+    }
+    if parsed.get("resampler") != Some(&"soxr") {
+        return Err("qualified FFmpeg terminal requires resampler=soxr".to_string());
+    }
+    if parsed.get("dither_method") != Some(&"triangular") {
+        return Err("qualified FFmpeg terminal requires dither_method=triangular".to_string());
+    }
+    if parsed.get("out_sample_fmt") != Some(&"s32") {
+        return Err("qualified FFmpeg terminal requires out_sample_fmt=s32".to_string());
+    }
+    if parsed.get("cheby").is_some_and(|value| *value != "1") {
+        return Err("qualified FFmpeg terminal permits only cheby=1 when cheby is emitted".to_string());
+    }
+    if let Some(phase) = parsed.get("phase_shift") {
+        phase.parse::<u32>().map_err(|_| {
+            "qualified FFmpeg terminal phase_shift is not an unsigned integer".to_string()
+        })?;
+    }
+    parsed
+        .get("precision")
+        .ok_or_else(|| "qualified FFmpeg terminal is missing precision".to_string())?
+        .parse::<u32>()
+        .map_err(|_| "qualified FFmpeg terminal precision is not an unsigned integer".to_string())?;
+    let cutoff = parsed
+        .get("cutoff")
+        .ok_or_else(|| "qualified FFmpeg terminal is missing cutoff".to_string())?
+        .parse::<f64>()
+        .map_err(|_| "qualified FFmpeg terminal cutoff is not numeric".to_string())?;
+    if !cutoff.is_finite() || cutoff <= 0.0 {
+        return Err("qualified FFmpeg terminal cutoff is not finite and positive".to_string());
+    }
+
+    match realization.target_rate_hz {
+        Some(target_rate) => {
+            let filter_rate = parsed
+                .get("out_sample_rate")
+                .ok_or_else(|| {
+                    "qualified FFmpeg terminal is missing its resolved out_sample_rate".to_string()
+                })?
+                .parse::<u32>()
+                .map_err(|_| {
+                    "qualified FFmpeg terminal out_sample_rate is not a positive integer".to_string()
+                })?;
+            if filter_rate == 0 || filter_rate != input_rate || filter_rate != target_rate {
+                return Err(format!(
+                    "qualified FFmpeg terminal must be same-rate at its physical dither terminal: input={input_rate}, filter={filter_rate}, selected={target_rate}"
+                ));
+            }
+        }
+        None => {
+            if parsed.contains_key("out_sample_rate") {
+                return Err(
+                    "qualified FFmpeg terminal unexpectedly emits out_sample_rate for a source-rate realization"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let expected_codec = match &realization.target_format {
+        tonepoet_pipeline::AudioFormat::Flac => "flac",
+        tonepoet_pipeline::AudioFormat::Wav => "pcm_s32le",
+        tonepoet_pipeline::AudioFormat::Aiff => "pcm_s32be",
+        tonepoet_pipeline::AudioFormat::WavPack => "wavpack",
+        ref other => {
+            return Err(format!(
+                "qualified FFmpeg Int32 triangular authority does not cover {other}"
+            ));
+        }
+    };
+    if unique_planned_arg_value(&terminal.args, "-c:a")? != expected_codec {
+        return Err(format!(
+            "qualified FFmpeg terminal codec does not match selected {} realization",
+            realization.target_format,
+        ));
+    }
+    let codec_index = terminal
+        .args
+        .iter()
+        .position(|arg| arg == "-c:a")
+        .expect("unique -c:a was validated above");
+    if codec_index <= input_index {
+        return Err("qualified FFmpeg terminal requires -c:a after the input".to_string());
+    }
+    if realization.target_format == tonepoet_pipeline::AudioFormat::Flac
+        && !terminal
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-strict" && pair[1] == "experimental")
+    {
+        return Err(
+            "qualified true-32-bit FLAC terminal is missing -strict experimental".to_string(),
+        );
+    }
+
+    // The ordinary lowerer has a deliberately small argv vocabulary for these
+    // lossless terminal encodes. Refusing unknown options here prevents product
+    // container flags from silently inserting a second audio conversion under
+    // an otherwise unchanged semantic realization.
+    let mut index = 0usize;
+    while index + 1 < terminal.args.len() {
+        let arg = terminal.args[index].as_str();
+        let consumed = match arg {
+            "-y" | "-hide_banner" | "-nostdin" | "-vn" => 1,
+            "-f" | "-ar" | "-ac" | "-i" | "-map_metadata" | "-af" | "-c:a"
+            | "-strict" | "-compression_level" | "-flags" | "-rf64" => 2,
+            "-map" => 2,
+            "-c:v" => 2,
+            _ => {
+                return Err(format!(
+                    "qualified FFmpeg terminal contains unqualified argv option {arg}"
+                ));
+            }
+        };
+        if index + consumed > terminal.args.len() - 1 {
+            return Err(format!(
+                "qualified FFmpeg terminal option {arg} is missing its value"
+            ));
+        }
+        index += consumed;
+    }
+    if index != terminal.args.len() - 1 {
+        return Err("qualified FFmpeg terminal argv shape is malformed".to_string());
+    }
+
+    let count = |flag: &str| terminal.args.iter().filter(|arg| arg.as_str() == flag).count();
+    for flag in ["-y", "-hide_banner", "-nostdin", "-f", "-ar", "-ac", "-i", "-map_metadata", "-af", "-c:a"] {
+        if count(flag) != 1 {
+            return Err(format!(
+                "qualified FFmpeg terminal requires exactly one {flag}; observed {}",
+                count(flag),
+            ));
+        }
+    }
+    if !terminal
+        .args
+        .windows(2)
+        .any(|pair| pair[0] == "-map" && pair[1] == "0:a:0")
+    {
+        return Err("qualified FFmpeg terminal is missing the canonical audio stream map".to_string());
+    }
+    let maps = terminal
+        .args
+        .windows(2)
+        .filter(|pair| pair[0] == "-map")
+        .map(|pair| pair[1].as_str())
+        .collect::<Vec<_>>();
+    if maps.iter().filter(|value| **value == "0:a:0").count() != 1
+        || maps
+            .iter()
+            .any(|value| !matches!(*value, "0:a:0" | "0:v?"))
+        || maps.iter().filter(|value| **value == "0:v?").count() > 1
+    {
+        return Err(format!(
+            "qualified FFmpeg terminal has an unqualified stream map set: {maps:?}"
+        ));
+    }
+    if terminal.args.windows(2).any(|pair| {
+        pair[0] == "-map_metadata" && !matches!(pair[1].as_str(), "0" | "-1")
+    }) {
+        return Err("qualified FFmpeg terminal has an unqualified metadata map".to_string());
+    }
+    if terminal
+        .args
+        .windows(2)
+        .any(|pair| pair[0] == "-c:v" && pair[1] != "copy")
+    {
+        return Err("qualified FFmpeg terminal has an unqualified video codec option".to_string());
+    }
+    if terminal.args.windows(2).any(|pair| {
+        pair[0] == "-strict"
+            && (realization.target_format != tonepoet_pipeline::AudioFormat::Flac
+                || pair[1] != "experimental")
+    }) {
+        return Err("qualified FFmpeg terminal has an unqualified strictness option".to_string());
+    }
+    if terminal.args.windows(2).any(|pair| {
+        pair[0] == "-compression_level"
+            && (!matches!(
+                &realization.target_format,
+                tonepoet_pipeline::AudioFormat::Flac | tonepoet_pipeline::AudioFormat::WavPack
+            ) || pair[1].parse::<i32>().is_err())
+    }) {
+        return Err("qualified FFmpeg terminal has an unqualified compression-level option".to_string());
+    }
+    if terminal.args.windows(2).any(|pair| {
+        pair[0] == "-rf64"
+            && (realization.target_format != tonepoet_pipeline::AudioFormat::Wav
+                || pair[1] != "auto")
+    }) {
+        return Err("qualified FFmpeg terminal has an unqualified RF64 option".to_string());
+    }
+    if terminal.args.windows(2).any(|pair| {
+        pair[0] == "-flags"
+            && (realization.target_format != tonepoet_pipeline::AudioFormat::Flac
+                || pair[1] != "-md5")
+    }) {
+        return Err("qualified FFmpeg terminal has an unqualified codec flag".to_string());
+    }
+
+    Ok(())
+}
+
+const QUALIFIED_FFMPEG_INT32_DITHER_VERSION: &str = "7.1.3";
+const QUALIFIED_FFMPEG_INT32_DITHER_NIXPKGS_REVISION: &str =
+    "dd9b079222d43e1943b6ebd802f04fd959dc8e61";
+const QUALIFIED_FFMPEG_INT32_DITHER_NIXPKGS_NAR_HASH: &str =
+    "sha256-I45esRSssFtJ8p/gLHUZ1OUaaTaVLluNkABkk6arQwE=";
+
+fn qualified_ffmpeg_int32_dither_error(detail: impl AsRef<str>) -> TrackExecutionError {
+    TrackExecutionError::new(
+        ConvertError::Backend(format!(
+            "qualified FFmpeg Int32 triangular-dither terminal is unavailable ({})",
+            detail.as_ref(),
+        )),
+        Vec::new(),
+    )
+}
+
+async fn qualified_ffmpeg_int32_dither_terminal_executable(
+    track: &PreparedTrack,
+    plan: &ConversionPlan,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<QualifiedTerminalExecutableBinding>, TrackExecutionError> {
+    let Some(selected) = certified_terminal_candidate_binding(track)
+        .map_err(|error| TrackExecutionError::new(error, Vec::new()))?
+    else {
+        return Ok(None);
+    };
+    let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+        selected.terminal_realization.as_ref()
+    else {
+        return Ok(None);
+    };
+    if !tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) {
+        return Ok(None);
+    }
+
+    if !matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "architecture {} is outside the inspected x86_64/aarch64 implementation set",
+            std::env::consts::ARCH,
+        )));
+    }
+
+    let PlanAction::Execute {
+        commands,
+        finalization,
+        ..
+    } = &plan.action
+    else {
+        return Err(qualified_ffmpeg_int32_dither_error(
+            "selected certified terminal did not lower to an executable command",
+        ));
+    };
+    let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+        .map_err(qualified_ffmpeg_int32_dither_error)?;
+    let command_index = commands
+        .iter()
+        .position(|command| std::ptr::eq(command, terminal))
+        .ok_or_else(|| {
+            qualified_ffmpeg_int32_dither_error(
+                "final artifact-producing command lost its command-chain identity",
+            )
+        })?;
+    if terminal.tool != ToolIdentifier::Ffmpeg {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "selected realization requires FFmpeg but the final artifact is produced by {}",
+            terminal.tool,
+        )));
+    }
+    validate_qualified_ffmpeg_int32_terminal_command_shape(terminal, realization)
+        .map_err(qualified_ffmpeg_int32_dither_error)?;
+
+    let (locked_revision, locked_nar_hash) = embedded_flake_lock_input("nixpkgs")
+        .map_err(|error| qualified_ffmpeg_int32_dither_error(error.to_string()))?;
+    if locked_revision != QUALIFIED_FFMPEG_INT32_DITHER_NIXPKGS_REVISION
+        || locked_nar_hash != QUALIFIED_FFMPEG_INT32_DITHER_NIXPKGS_NAR_HASH
+    {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "nixpkgs source lock is not the qualified {} closure",
+            tonepoet_pipeline::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
+        )));
+    }
+    let binary = ToolBinary::Ffmpeg;
+    if !runner.tool_available(binary) {
+        return Err(qualified_ffmpeg_int32_dither_error("FFmpeg is not available"));
+    }
+    let runner_path = runner.resolved_tool_path(binary).ok_or_else(|| {
+        qualified_ffmpeg_int32_dither_error(
+            "runner cannot prove the FFmpeg executable path it will spawn",
+        )
+    })?;
+    let activation_path = resolve_policy_owned_reference_tool_path(binary).map_err(|error| {
+        qualified_ffmpeg_int32_dither_error(format!(
+            "could not resolve packaged qualified FFmpeg path: {error}",
+        ))
+    })?;
+    let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
+        qualified_ffmpeg_int32_dither_error(format!(
+            "could not resolve compiled qualified FFmpeg closure: {error}",
+        ))
+    })?;
+    if runner_path != activation_path || runner_path != compiled_path {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "runner path {}, activation path {}, and compiled closure path {} do not match",
+            runner_path.display(),
+            activation_path.display(),
+            compiled_path.display(),
+        )));
+    }
+    let executable_sha256 = stable_file_sha256(&runner_path).map_err(|error| {
+        qualified_ffmpeg_int32_dither_error(format!(
+            "could not hash qualified FFmpeg at {}: {error}",
+            runner_path.display(),
+        ))
+    })?;
+    let executable = BoundToolExecutable {
+        canonical_path: runner_path,
+        executable_sha256,
+    };
+    let version_output = runner
+        .run_bound(reference_version_probe_command(binary)?, &executable, cancel)
+        .await
+        .map_err(|error| {
+            qualified_ffmpeg_int32_dither_error(format!("FFmpeg version probe failed: {error}"))
+        })?;
+    if version_output.exit != ProcessExit::Code(0) {
+        return Err(qualified_ffmpeg_int32_dither_error(
+            "FFmpeg version probe did not exit successfully",
+        ));
+    }
+    let reported_version = parse_tool_version_output(
+        binary,
+        &version_output.stdout_tail,
+        &version_output.stderr_tail,
+    )
+    .ok_or_else(|| qualified_ffmpeg_int32_dither_error("FFmpeg version is not parseable"))?;
+    if reported_version != QUALIFIED_FFMPEG_INT32_DITHER_VERSION {
+        return Err(qualified_ffmpeg_int32_dither_error(format!(
+            "expected FFmpeg {}, got {}",
+            QUALIFIED_FFMPEG_INT32_DITHER_VERSION, reported_version,
+        )));
+    }
+
+    Ok(Some(QualifiedTerminalExecutableBinding {
+        command_index,
+        executable,
+    }))
+}
+
+pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    scalar_pump: Option<RetainedPcmScalarPump>,
+    staged_output: &Path,
+    convert_root: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    start_fraction: f32,
+    end_fraction: f32,
+) -> Result<ExecutedTrackPlan, TrackExecutionError> {
+    if let Some(pump) = scalar_pump.as_ref() {
+        if pump.input_path != realized_input {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(format!(
+                    "retained PCM scalar authority path {} does not match executor input {}",
+                    pump.input_path.display(),
+                    realized_input.display(),
+                )),
+                Vec::new(),
+            ));
+        }
+    }
     let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
     let cleanup_guard = TrackExecutionCleanupGuard::acquire(work_dir.clone(), cancel).await?;
     let result = async {
@@ -1265,6 +2040,7 @@ pub async fn execute_planned_track_conversion(
         let admitted_source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
         let admitted_plan = plan_conversion(&plan_request)
             .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+        super::baseline::selected_vs_emitted(&plan_request);
         cleanup_guard.add_planner_paths(admitted_plan.cleanup_paths());
         let reference_scratch = if admitted_plan.reference.is_some() {
             let scratch = reference_scratch_paths(&plan_request)
@@ -1292,15 +2068,22 @@ pub async fn execute_planned_track_conversion(
             if skip_reference_attestation {
                 None
             } else {
-                Some(
-                    attest_reference_toolchain(
-                        runner,
-                        cancel,
-                        summary.front_end,
-                        request.stages.metadata == super::types::StageRequirement::Enabled,
-                    )
-                    .await?,
+                // Checked-in Phase-5 evidence can already prove promotion is
+                // unavailable. Reject that state before any executable lookup,
+                // version probe, source-lock attestation, or Reference DSP. This
+                // preflight is fail-only; successful promotion still requires
+                // current runtime attestation plus the full closure check below.
+                validate_reference_production_promotion_preflight(summary)?;
+                let metadata_enabled = reference_metadata_attestation_required(request);
+                let toolchain = attest_reference_toolchain(
+                    runner,
+                    cancel,
+                    summary.front_end,
+                    metadata_enabled,
                 )
+                .await?;
+                validate_reference_production_promotion(summary, &toolchain)?;
+                Some(toolchain)
             }
         } else {
             None
@@ -1368,6 +2151,7 @@ pub async fn execute_planned_track_conversion(
             rematerialized.source.sample_kind = materialized_source.sample_kind;
             rematerialized.source.channels = materialized_source.channels;
             rematerialized.source.duration = materialized_source.duration;
+            rematerialized.source.frame_extent = materialized_source.frame_extent;
             rematerialized.source.audio_md5 = materialized_source.audio_md5;
             rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
             if rematerialized.resolved_output_target != admitted_target
@@ -1395,8 +2179,8 @@ pub async fn execute_planned_track_conversion(
             })?;
             if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
                 || admitted_summary.policy != rematerialized_summary.policy
-                || admitted_summary.qualification_manifest_digest
-                    != rematerialized_summary.qualification_manifest_digest
+                || admitted_summary.qualification_candidate_manifest_digest
+                    != rematerialized_summary.qualification_candidate_manifest_digest
             {
                 return Err(TrackExecutionError::new(
                     ConvertError::Backend(
@@ -1410,11 +2194,24 @@ pub async fn execute_planned_track_conversion(
         } else {
             None
         };
-        let plan = reference_materialization
+        let mut plan = reference_materialization
             .as_ref()
             .map(|(_, plan)| plan.clone())
             .unwrap_or(admitted_plan);
         cleanup_guard.add_planner_paths(plan.cleanup_paths());
+        validate_certified_terminal_candidate_realization(track, &plan_request, &plan).map_err(|error| {
+            TrackExecutionError::new(error, Vec::new())
+        })?;
+        let qualified_terminal_executable = qualified_ffmpeg_int32_dither_terminal_executable(
+            track,
+            &plan,
+            runner,
+            cancel,
+        )
+        .await?;
+        if let Some(binding) = qualified_terminal_executable.as_ref() {
+            close_qualified_terminal_environment(&mut plan, binding)?;
+        }
         let command_hash = super::manifest::planned_command_hash(&plan).ok();
         let metadata_satisfaction = effective_metadata_satisfaction(&plan_request, &plan);
         let metadata_required =
@@ -1478,66 +2275,65 @@ pub async fn execute_planned_track_conversion(
             }
             PlanAction::Execute {
                 commands,
-                steps,
                 finalization,
                 ..
             } => {
-                let (commands, reference_runtime) = if steps.is_empty() {
-                    (
-                        execute_commands(
+                let (commands, reference_runtime) = if let Some(summary) = plan.reference.as_ref() {
+                    if !commands.is_empty() {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference plan retained an obsolete executable command authority"
+                                    .to_string(),
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                    let runtime = execute_reference_common_plan(
+                        summary,
+                        &plan_request,
+                        runner,
+                        cancel,
+                        tool_paths,
+                        tool_concurrency_limits.clone(),
+                        progress,
+                        start_fraction,
+                        end_fraction,
+                        track_label(track),
+                    )
+                    .await?;
+                    (runtime.commands.clone(), Some(runtime))
+                } else {
+                    let records = if let Some(pump) = scalar_pump.clone() {
+                        execute_commands_with_scalar_pump(
                             commands,
+                            pump,
+                            qualified_terminal_executable.as_ref(),
                             runner,
                             cancel,
                             tool_paths,
-                            tool_concurrency_limits,
+                            tool_concurrency_limits.clone(),
                             progress,
                             start_fraction,
                             end_fraction,
                             track_label(track),
                         )
-                        .await?,
-                        None,
-                    )
-                } else {
-                    let runtime = execute_reference_steps(
-                        steps,
-                        plan.reference.as_ref().ok_or_else(|| {
-                            TrackExecutionError::new(
-                                ConvertError::Backend(
-                                    "measurement-aware plan is missing Reference authority".to_string(),
-                                ),
-                                Vec::new(),
-                            )
-                        })?,
-                        runner,
-                        cancel,
-                        tool_paths,
-                        tool_concurrency_limits,
-                        progress,
-                        start_fraction,
-                        end_fraction,
-                        track_label(track),
-                        &reference_scratch
-                            .as_ref()
-                            .ok_or_else(|| {
-                                TrackExecutionError::new(
-                                    ConvertError::Backend(
-                                        "Reference scratch authority is missing during execution"
-                                            .to_string(),
-                                    ),
-                                    Vec::new(),
-                                )
-                            })?
-                            .silence_scan,
-                        reference_toolchain.as_ref().ok_or_else(|| {
-                            TrackExecutionError::new(
-                                ConvertError::Backend("Reference toolchain evidence is missing".to_string()),
-                                Vec::new(),
-                            )
-                        })?,
-                    )
-                    .await?;
-                    (runtime.commands.clone(), Some(runtime))
+                        .await?
+                    } else {
+                        execute_commands(
+                            commands,
+                            qualified_terminal_executable.as_ref(),
+                            runner,
+                            cancel,
+                            tool_paths,
+                            tool_concurrency_limits.clone(),
+                            progress,
+                            start_fraction,
+                            end_fraction,
+                            track_label(track),
+                        )
+                        .await?
+                    };
+                    (records, None)
                 };
                 if let Some(finalization) = finalization {
                     #[cfg(test)]
@@ -1701,6 +2497,7 @@ struct EmbeddedReferenceQualification {
     streamed_wav_capacity: EmbeddedStreamedWavCapacity,
     cell_contract: EmbeddedQualifiedCellContract,
     qualification_report: EmbeddedQualificationReport,
+    #[allow(dead_code)]
     release_certification: EmbeddedReleaseCertification,
     qualification_basis: String,
     runtime_activation: String,
@@ -1932,6 +2729,7 @@ struct EmbeddedQualificationReport {
     expanded_supported_cell_digest: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmbeddedReleaseCertification {
@@ -2224,6 +3022,7 @@ struct EmbeddedTerminalBound {
     safe_pre_terminal_ceiling_dbtp: tonepoet_pipeline::DbNano,
 }
 
+#[cfg(test)]
 fn json_object_u64(
     object: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
@@ -2233,6 +3032,7 @@ fn json_object_u64(
         .and_then(serde_json::Value::as_u64)
 }
 
+#[cfg(test)]
 fn validate_terminal_effects_certification(
     packages: &serde_json::Map<String, serde_json::Value>,
     manifest: &EmbeddedReferenceQualification,
@@ -2462,34 +3262,8 @@ fn validate_terminal_effects_certification(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct CertifiedMetadataMutatorIdentity {
-    store_path: PathBuf,
-    canonical_path: PathBuf,
-    executable_sha256: Sha256Digest,
-    reported_version: String,
-}
-
-#[derive(Debug, Clone)]
-struct CertifiedMetadataMutatorToolchain {
-    metaflac: CertifiedMetadataMutatorIdentity,
-    wvtag: CertifiedMetadataMutatorIdentity,
-    atomic_parsley: CertifiedMetadataMutatorIdentity,
-}
-
-impl CertifiedMetadataMutatorToolchain {
-    fn identity(&self, binary: ToolBinary) -> Option<&CertifiedMetadataMutatorIdentity> {
-        match binary {
-            ToolBinary::Metaflac => Some(&self.metaflac),
-            ToolBinary::Wvtag => Some(&self.wvtag),
-            ToolBinary::AtomicParsley => Some(&self.atomic_parsley),
-            _ => None,
-        }
-    }
-}
-
-
 /// True when `value` is exactly the given JSON string array, in order.
+#[cfg(test)]
 fn exact_string_array(value: Option<&serde_json::Value>, expected: &[&str]) -> bool {
     value
         .and_then(serde_json::Value::as_array)
@@ -2501,9 +3275,11 @@ fn exact_string_array(value: Option<&serde_json::Value>, expected: &[&str]) -> b
                     .all(|(item, want)| item.as_str() == Some(*want))
         })
 }
+/// Historical v16 release-evidence audit only. Phase-5 runtime attestation must not call this.
+#[cfg(test)]
 fn validate_embedded_release_certification(
     manifest: &EmbeddedReferenceQualification,
-) -> Result<CertifiedMetadataMutatorToolchain, TrackExecutionError> {
+) -> Result<(), TrackExecutionError> {
     let certification = &manifest.release_certification;
     if certification.schema != "tonepoet-dsd-reference-release-certification/v1"
         || certification.path
@@ -2882,7 +3658,6 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report has a non-canonical production metadata mutator set",
         ));
     }
-    let mut certified_mutators = BTreeMap::new();
     for name in ["metaflac", "wvtag", "AtomicParsley"] {
         let identity = production_mutators
             .get(name)
@@ -2944,27 +3719,8 @@ fn validate_embedded_release_certification(
                     "the embedded release-certification report has no reported version for {name}",
                 ))
             })?;
-        certified_mutators.insert(
-            name,
-            CertifiedMetadataMutatorIdentity {
-                store_path: PathBuf::from(store_path),
-                canonical_path: PathBuf::from(canonical_path),
-                executable_sha256,
-                reported_version: reported_version.to_string(),
-            },
-        );
+        let _ = (store_path, canonical_path, executable_sha256, reported_version);
     }
-    let certified_mutators = CertifiedMetadataMutatorToolchain {
-        metaflac: certified_mutators
-            .remove("metaflac")
-            .expect("validated metaflac certification"),
-        wvtag: certified_mutators
-            .remove("wvtag")
-            .expect("validated wvtag certification"),
-        atomic_parsley: certified_mutators
-            .remove("AtomicParsley")
-            .expect("validated AtomicParsley certification"),
-    };
     let runtime_binding = report
         .get("runtime_metadata_mutator_binding")
         .and_then(serde_json::Value::as_object)
@@ -4375,7 +5131,7 @@ fn validate_embedded_release_certification(
             "the embedded release-certification report disagrees with the v8 cell contract",
         ));
     }
-    Ok(certified_mutators)
+    Ok(())
 }
 
 fn validate_embedded_reference_policy_tables(
@@ -5559,6 +6315,285 @@ fn validate_embedded_sinc_profile(
     Ok(())
 }
 
+
+fn embedded_reference_common_candidate(
+) -> Result<(&'static [u8], tonepoet_pipeline::ReferenceCommonQualificationV1), TrackExecutionError> {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+    ));
+    let candidate: tonepoet_pipeline::ReferenceCommonQualificationV1 =
+        serde_json::from_slice(bytes).map_err(|error| {
+            reference_toolchain_error(format!(
+                "could not parse the embedded Phase-5 Reference candidate manifest: {error}"
+            ))
+        })?;
+    candidate
+        .validate_candidate_manifest()
+        .map_err(reference_toolchain_error)?;
+    Ok((bytes.as_slice(), candidate))
+}
+
+fn reference_common_runtime_closure_fingerprint(
+    candidate_bytes: &[u8],
+    candidate: &tonepoet_pipeline::ReferenceCommonQualificationV1,
+    sox_ng: &ReferenceToolIdentity,
+    ffmpeg: &ReferenceToolIdentity,
+    sacd_rs_build_identity: &str,
+    dst_fixture_digest: Sha256Digest,
+    platform_abi_digest: Sha256Digest,
+    runtime_dispatch_digest: Sha256Digest,
+) -> Result<String, TrackExecutionError> {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    let mut hasher = Sha256::new();
+    field(
+        &mut hasher,
+        b"tonepoet-reference-common-runtime-core-closure/v1",
+    );
+    field(
+        &mut hasher,
+        tonepoet_pipeline::reference_sha256_hex(candidate_bytes).as_bytes(),
+    );
+    field(
+        &mut hasher,
+        serde_json::to_vec(&candidate.observer)
+            .map_err(|error| reference_toolchain_error(format!("could not serialize Reference observer closure: {error}")))?
+            .as_slice(),
+    );
+    field(
+        &mut hasher,
+        serde_json::to_vec(&candidate.closure)
+            .map_err(|error| reference_toolchain_error(format!("could not serialize Reference primitive closure: {error}")))?
+            .as_slice(),
+    );
+    field(&mut hasher, tonepoet_pipeline::REFERENCE_COMMON_PLANNER_ID.as_bytes());
+    field(&mut hasher, tonepoet_pipeline::REFERENCE_COMMON_EXECUTOR_ID.as_bytes());
+    field(&mut hasher, super::manifest::tonepoet_pipeline_version().as_bytes());
+    field(
+        &mut hasher,
+        env!("TONEPOET_REFERENCE_COMMON_SOURCE_SHA256").as_bytes(),
+    );
+    field(
+        &mut hasher,
+        env!("TONEPOET_TRUE_PEAK_SOURCE_SHA256").as_bytes(),
+    );
+    field(&mut hasher, env!("TONEPOET_COMPILER_BUILD_CLOSURE").as_bytes());
+    field(
+        &mut hasher,
+        &tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER
+            .to_bits()
+            .to_be_bytes(),
+    );
+    for identity in [sox_ng, ffmpeg] {
+        field(&mut hasher, identity.canonical_path.to_string_lossy().as_bytes());
+        field(&mut hasher, &identity.executable_sha256.0);
+        field(&mut hasher, identity.reported_version.as_bytes());
+        field(&mut hasher, &identity.closure_digest.0);
+        field(&mut hasher, &identity.behavior_probe_digest.0);
+    }
+    field(&mut hasher, sacd_rs_build_identity.as_bytes());
+    field(&mut hasher, &dst_fixture_digest.0);
+    field(&mut hasher, &platform_abi_digest.0);
+    field(&mut hasher, &runtime_dispatch_digest.0);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn reference_metadata_mutation_closure_fingerprint(
+    common_runtime_closure_fingerprint_sha256: &str,
+    metadata_mutators: &ReferenceMetadataMutatorToolchain,
+) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    let mut hasher = Sha256::new();
+    field(
+        &mut hasher,
+        b"tonepoet-reference-common-metadata-mutation-closure/v1",
+    );
+    field(
+        &mut hasher,
+        common_runtime_closure_fingerprint_sha256.as_bytes(),
+    );
+    for identity in [
+        &metadata_mutators.metaflac,
+        &metadata_mutators.wvtag,
+        &metadata_mutators.atomic_parsley,
+    ] {
+        field(
+            &mut hasher,
+            identity.canonical_path.to_string_lossy().as_bytes(),
+        );
+        field(&mut hasher, &identity.executable_sha256.0);
+        field(&mut hasher, identity.reported_version.as_bytes());
+        field(&mut hasher, &identity.closure_digest.0);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_reference_production_promotion_preflight(
+    summary: &DsdReferencePlanSummary,
+) -> Result<(), TrackExecutionError> {
+    let report_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_report.json"
+    ));
+    let certification_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_certification.json"
+    ));
+    validate_reference_production_promotion_preflight_evidence(
+        summary,
+        report_bytes,
+        certification_bytes,
+    )
+}
+
+fn validate_reference_production_promotion_preflight_evidence(
+    summary: &DsdReferencePlanSummary,
+    report_bytes: &[u8],
+    certification_bytes: &[u8],
+) -> Result<(), TrackExecutionError> {
+    let candidate_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+    ));
+    let candidate: tonepoet_pipeline::ReferenceCommonQualificationV1 =
+        serde_json::from_slice(candidate_bytes).map_err(|error| {
+            qualification_unavailable_error(format!(
+                "could not parse the embedded Phase-5 Reference candidate manifest: {error}"
+            ))
+        })?;
+    candidate
+        .validate_candidate_manifest()
+        .map_err(|reason| {
+            qualification_unavailable_error(format!(
+                "Reference production promotion is inactive: {reason}"
+            ))
+        })?;
+    let candidate_digest = Sha256Digest::of_bytes(candidate_bytes);
+    if candidate_digest != summary.qualification_candidate_manifest_digest {
+        return Err(qualification_unavailable_error(
+            "Reference common-model candidate identity does not match the admitted plan",
+        ));
+    }
+
+    let report: tonepoet_pipeline::ReferenceQualificationReportV1 =
+        serde_json::from_slice(report_bytes).map_err(|error| {
+            qualification_unavailable_error(format!(
+                "could not parse the embedded Phase-5 Reference qualification report: {error}"
+            ))
+        })?;
+    report
+        .validate_promotion_preflight(candidate_bytes)
+        .map_err(|reason| {
+            qualification_unavailable_error(format!(
+                "Reference production promotion is inactive: {reason}"
+            ))
+        })?;
+
+    let certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
+        serde_json::from_slice(certification_bytes).map_err(|error| {
+            qualification_unavailable_error(format!(
+                "could not parse the embedded Phase-5 Reference release certification: {error}"
+            ))
+        })?;
+    certification
+        .validate_promotion_preflight(candidate_bytes, report_bytes, &report)
+        .map_err(|reason| {
+            qualification_unavailable_error(format!(
+                "Reference production promotion is inactive: {reason}"
+            ))
+        })
+}
+
+fn validate_reference_production_promotion(
+    summary: &DsdReferencePlanSummary,
+    toolchain: &ReferenceToolchainEvidence,
+) -> Result<(), TrackExecutionError> {
+    let report_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_report.json"
+    ));
+    let certification_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_certification.json"
+    ));
+    validate_reference_production_promotion_evidence(
+        summary,
+        toolchain,
+        report_bytes,
+        certification_bytes,
+    )
+}
+
+fn validate_reference_production_promotion_evidence(
+    summary: &DsdReferencePlanSummary,
+    toolchain: &ReferenceToolchainEvidence,
+    report_bytes: &[u8],
+    certification_bytes: &[u8],
+) -> Result<(), TrackExecutionError> {
+    // Keep the full validator self-contained for tests and non-production callers.
+    // This remains fail-only until the current runtime closure is compared below.
+    validate_reference_production_promotion_preflight_evidence(
+        summary,
+        report_bytes,
+        certification_bytes,
+    )?;
+
+    let (candidate_bytes, _candidate) = embedded_reference_common_candidate()?;
+    let candidate_digest = Sha256Digest::of_bytes(candidate_bytes);
+    if candidate_digest != toolchain.qualification_candidate_manifest_digest {
+        return Err(qualification_unavailable_error(
+            "Reference common-model candidate identity does not match the attested runtime closure",
+        ));
+    }
+    let report: tonepoet_pipeline::ReferenceQualificationReportV1 =
+        serde_json::from_slice(report_bytes).map_err(|error| {
+            qualification_unavailable_error(format!(
+                "could not parse the embedded Phase-5 Reference qualification report: {error}"
+            ))
+        })?;
+    report
+        .validate_completed(
+            candidate_bytes,
+            &toolchain.common_runtime_closure_fingerprint_sha256,
+            toolchain
+                .metadata_mutation_closure_fingerprint_sha256
+                .as_deref(),
+        )
+        .map_err(|reason| {
+            qualification_unavailable_error(format!(
+                "Reference production promotion is inactive: {reason}"
+            ))
+        })?;
+
+    let certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
+        serde_json::from_slice(certification_bytes).map_err(|error| {
+            qualification_unavailable_error(format!(
+                "could not parse the embedded Phase-5 Reference release certification: {error}"
+            ))
+        })?;
+    certification
+        .validate_completed(
+            candidate_bytes,
+            report_bytes,
+            &report,
+            &toolchain.common_runtime_closure_fingerprint_sha256,
+            toolchain
+                .metadata_mutation_closure_fingerprint_sha256
+                .as_deref(),
+        )
+        .map_err(|reason| {
+            qualification_unavailable_error(format!(
+                "Reference production promotion is inactive: {reason}"
+            ))
+        })
+}
+
 async fn attest_reference_toolchain(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
@@ -5582,13 +6617,12 @@ async fn attest_reference_toolchain(
     };
     if manifest.schema_version != 16
         || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY
-        || manifest.status != "qualified_release"
+        || manifest.status != "qualification_candidate"
     {
         return Err(reference_toolchain_error(
-            "the embedded policy artifact is not a qualified v16 release",
+            "the embedded inherited-v16 policy artifact is not the expected historical candidate",
         ));
     }
-    let certified_metadata_mutators = validate_embedded_release_certification(&manifest)?;
     if manifest.qualification_basis.trim().is_empty()
         || manifest.runtime_activation.trim().is_empty()
     {
@@ -5597,6 +6631,19 @@ async fn attest_reference_toolchain(
         ));
     }
     validate_embedded_reference_policy_tables(&manifest)?;
+
+    let inherited_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
+    if inherited_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
+        return Err(reference_toolchain_error(
+            "compiled and packaged inherited-v16 evidence digests disagree",
+        ));
+    }
+    let (candidate_bytes, candidate) = embedded_reference_common_candidate()?;
+    if candidate.inherited_v16_evidence_sha256 != inherited_manifest_digest.to_hex() {
+        return Err(reference_toolchain_error(
+            "the Phase-5 candidate does not bind the exact embedded inherited-v16 evidence",
+        ));
+    }
 
     let (locked_sox_revision, locked_sox_nar_hash) = embedded_flake_lock_input("sox_ng")?;
     if manifest.sox_ng.version != tonepoet_pipeline::DSD_REFERENCE_SOX_NG_VERSION
@@ -5701,29 +6748,20 @@ async fn attest_reference_toolchain(
     .await?;
     let metadata_mutators = if metadata_enabled {
         Some(ReferenceMetadataMutatorToolchain {
-            metaflac: attest_certified_metadata_mutator(
+            metaflac: attest_reference_metadata_mutator(
                 ToolBinary::Metaflac,
-                certified_metadata_mutators
-                    .identity(ToolBinary::Metaflac)
-                    .expect("validated metaflac identity"),
                 runner,
                 cancel,
             )
             .await?,
-            wvtag: attest_certified_metadata_mutator(
+            wvtag: attest_reference_metadata_mutator(
                 ToolBinary::Wvtag,
-                certified_metadata_mutators
-                    .identity(ToolBinary::Wvtag)
-                    .expect("validated wvtag identity"),
                 runner,
                 cancel,
             )
             .await?,
-            atomic_parsley: attest_certified_metadata_mutator(
+            atomic_parsley: attest_reference_metadata_mutator(
                 ToolBinary::AtomicParsley,
-                certified_metadata_mutators
-                    .identity(ToolBinary::AtomicParsley)
-                    .expect("validated AtomicParsley identity"),
                 runner,
                 cancel,
             )
@@ -5742,15 +6780,38 @@ async fn attest_reference_toolchain(
         ))?;
     let dst_fixture_digest = Sha256Digest::from_hex(actual_fixture_digest)
         .map_err(|err| reference_toolchain_error(format!("invalid DST fixture digest: {err}")))?;
-    let qualification_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
-    if qualification_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
+    let qualification_candidate_manifest_digest = Sha256Digest::of_bytes(candidate_bytes);
+    if qualification_candidate_manifest_digest
+        != tonepoet_pipeline::qualification_candidate_manifest_digest()
+    {
         return Err(reference_toolchain_error(
-            "compiled and packaged qualification digests disagree",
+            "compiled and packaged Phase-5 candidate digests disagree",
         ));
     }
+    let common_runtime_closure_fingerprint_sha256 =
+        reference_common_runtime_closure_fingerprint(
+            candidate_bytes,
+            &candidate,
+            &sox_ng,
+            &ffmpeg,
+            sacd_rs::REFERENCE_BUILD_ID,
+            dst_fixture_digest,
+            platform_abi_digest,
+            runtime_dispatch_digest,
+        )?;
+    let metadata_mutation_closure_fingerprint_sha256 = metadata_mutators
+        .as_ref()
+        .map(|mutators| {
+            reference_metadata_mutation_closure_fingerprint(
+                &common_runtime_closure_fingerprint_sha256,
+                mutators,
+            )
+        });
 
     Ok(ReferenceToolchainEvidence {
-        qualification_manifest_digest,
+        qualification_candidate_manifest_digest,
+        common_runtime_closure_fingerprint_sha256,
+        metadata_mutation_closure_fingerprint_sha256,
         sox_ng,
         ffmpeg,
         metadata_mutators,
@@ -5758,8 +6819,6 @@ async fn attest_reference_toolchain(
         dst_fixture_digest,
         platform_abi_digest,
         runtime_dispatch_digest,
-        reporting_uncertainty: manifest.analyzer.reporting_uncertainty_db,
-        analyzer_residual: manifest.analyzer.analyzer_residual_db,
     })
 }
 
@@ -6107,9 +7166,8 @@ async fn attest_external_reference_tool(
     })
 }
 
-async fn attest_certified_metadata_mutator(
+async fn attest_reference_metadata_mutator(
     binary: ToolBinary,
-    certified: &CertifiedMetadataMutatorIdentity,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<ReferenceMetadataMutatorIdentity, TrackExecutionError> {
@@ -6131,50 +7189,28 @@ async fn attest_certified_metadata_mutator(
             binary.canonical_name()
         ))
     })?;
-    let compiled_store = compiled_reference_store_path(binary).ok_or_else(|| {
-        reference_toolchain_error(format!(
-            "{} has no compiled Reference store binding",
-            binary.canonical_name()
-        ))
-    })?;
     let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
         reference_toolchain_error(format!(
             "could not resolve the compiled {} closure: {error}",
             binary.canonical_name()
         ))
     })?;
-    if certified.store_path.as_path() != Path::new(compiled_store)
-        || resolved_path != activation_path
-        || resolved_path != compiled_path
-        || resolved_path.as_path() != certified.canonical_path.as_path()
-    {
+    if resolved_path != activation_path || resolved_path != compiled_path {
         return Err(reference_toolchain_error(format!(
-            "{} certified store {}, compiled store {}, runtime path {}, activation path {}, compiled closure path {}, and certified path {} do not match",
+            "{} runtime path {}, activation path {}, and compiled closure path {} do not match",
             binary.canonical_name(),
-            certified.store_path.display(),
-            compiled_store,
             resolved_path.display(),
             activation_path.display(),
             compiled_path.display(),
-            certified.canonical_path.display(),
         )));
     }
     let executable_sha256 = stable_file_sha256(&resolved_path).map_err(|error| {
         reference_toolchain_error(format!(
-            "could not hash certified {} at {}: {error}",
+            "could not hash Reference {} at {}: {error}",
             binary.canonical_name(),
             resolved_path.display()
         ))
     })?;
-    if executable_sha256 != certified.executable_sha256 {
-        return Err(reference_toolchain_error(format!(
-            "{} executable digest drift at {}: certified {}, runtime {}",
-            binary.canonical_name(),
-            resolved_path.display(),
-            certified.executable_sha256,
-            executable_sha256,
-        )));
-    }
     let bound_executable = BoundToolExecutable {
         canonical_path: resolved_path.clone(),
         executable_sha256,
@@ -6184,7 +7220,7 @@ async fn attest_certified_metadata_mutator(
         .await
         .map_err(|error| {
             reference_toolchain_error(format!(
-                "{} certified version probe failed: {error}",
+                "{} Reference version probe failed: {error}",
                 binary.canonical_name()
             ))
         })?;
@@ -6199,22 +7235,6 @@ async fn attest_certified_metadata_mutator(
             binary.canonical_name()
         ))
     })?;
-    let certified_version = parse_tool_version_output(binary, &certified.reported_version, "")
-        .ok_or_else(|| {
-            reference_toolchain_error(format!(
-                "the certified {} version {:?} is not canonical",
-                binary.canonical_name(),
-                certified.reported_version
-            ))
-        })?;
-    if reported_version != certified_version {
-        return Err(reference_toolchain_error(format!(
-            "{} reported version {}, certified {}",
-            binary.canonical_name(),
-            reported_version,
-            certified_version,
-        )));
-    }
     let closure_digest = reference_installation_identity(
         binary,
         &resolved_path,
@@ -6450,6 +7470,13 @@ fn reference_toolchain_error(detail: impl AsRef<str>) -> TrackExecutionError {
     )
 }
 
+fn qualification_unavailable_error(detail: impl AsRef<str>) -> TrackExecutionError {
+    TrackExecutionError::new(
+        ConvertError::QualificationUnavailable(detail.as_ref().to_string()),
+        Vec::new(),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct ReferenceMaterialization {
     path: PathBuf,
@@ -6568,9 +7595,28 @@ pub(crate) fn reference_materialization_identity_digest(
 #[derive(Debug, Clone)]
 struct ReferenceRuntimeResult {
     commands: Vec<CommandRecord>,
-    measurements: BTreeMap<MeasurementId, TruePeakMeasurement>,
+    measurements: BTreeMap<MeasurementId, tonepoet_pipeline::ReferenceCertifiedPeakObservation>,
     resolved_command_hash: String,
     pcm_verification: ReferencePcmVerificationEvidence,
+}
+
+/// Result returned only by the offline Phase-5 Reference candidate harness.
+///
+/// The harness deliberately stops at the staged/package artifact. It never
+/// applies the production finalization/publication action and therefore cannot
+/// turn candidate evidence into a delivered Reference artifact.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ReferenceCandidateExecutionQualification {
+    pub plan: DsdReferencePlanSummary,
+    pub toolchain: ReferenceToolchainEvidence,
+    pub commands: Vec<CommandRecord>,
+    pub measurements: BTreeMap<MeasurementId, tonepoet_pipeline::ReferenceCertifiedPeakObservation>,
+    pub resolved_command_hash: String,
+    pub pcm_verification: ReferencePcmVerificationEvidence,
+    pub staged_artifact_path: PathBuf,
+    pub common_runtime_closure_fingerprint_sha256: String,
+    pub metadata_mutation_closure_fingerprint_sha256: Option<String>,
 }
 
 fn validate_reference_scratch_cleanup_authority(
@@ -7154,9 +8200,9 @@ fn reference_cancelled_error() -> TrackExecutionError {
     TrackExecutionError::new(ConvertError::Realize("cancelled".to_string()), Vec::new())
 }
 
-async fn execute_reference_steps(
-    steps: &[PlannedExecutionStep],
+async fn execute_reference_common_plan(
     summary: &DsdReferencePlanSummary,
+    plan_request: &PlanRequest,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -7165,123 +8211,269 @@ async fn execute_reference_steps(
     start_fraction: f32,
     end_fraction: f32,
     track_label: String,
-    silence_scan_path: &Path,
-    toolchain: &ReferenceToolchainEvidence,
 ) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
     let mut records = Vec::new();
     let mut measurements = BTreeMap::new();
-    let mut r64_probe = None;
-    let mut qpcm_probe = None;
-    let mut qpcm_hash = None;
-    let mut packaged_hash = None;
-    let mut packaged_identity_mode = None;
-    let step_count = steps.len().max(1) as f32;
     let total_width = (end_fraction - start_fraction).max(0.0);
+    let window = |index: usize, count: usize| {
+        let start = start_fraction + total_width * (index as f32 / count as f32);
+        let end = start_fraction + total_width * ((index + 1) as f32 / count as f32);
+        (start, end)
+    };
+    let total_steps = 8_usize;
+    let cancelled = || {
+        TrackExecutionError::new(ConvertError::Realize("cancelled".to_string()), records.clone())
+    };
+    if cancel.is_cancelled() {
+        progress.cancel_requested().await;
+        return Err(cancelled());
+    }
 
-    for (index, step) in steps.iter().enumerate() {
-        if cancel.is_cancelled() {
-            progress.cancel_requested().await;
+    // 1. Qualified protected reconstruction. This is the same public lowerer
+    // used by general DSD when it explicitly selects the qualified protected
+    // reconstruction; Reference adds the closed admission and proof gates.
+    let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+        &plan_request.input_path,
+        &summary.r64_path,
+        summary.final_pcm.sample_rate_hz,
+        summary.profile,
+        plan_request.source.duration,
+    );
+    let (w0s, w0e) = window(0, total_steps);
+    let mut render_records = execute_commands(
+        std::slice::from_ref(&render),
+        None,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.clone(),
+        progress,
+        w0s,
+        w0e,
+        track_label.clone(),
+    )
+    .await?;
+    records.append(&mut render_records);
+
+    // 2. Independent structural/decoder validation of protected R64.
+    let (w1s, w1e) = window(1, total_steps);
+    let (mut r64_records, r64_probe) = verify_reference_r64_contract(
+        summary,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.as_ref(),
+        progress,
+        w1s,
+        w1e,
+        &track_label,
+    )
+    .await
+    .map_err(|mut error| {
+        let mut all = records.clone();
+        all.append(&mut error.commands);
+        error.commands = all;
+        error
+    })?;
+    records.append(&mut r64_records);
+    let r64_structure = r64_probe.w64_structure.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference R64 verification omitted exact Wave64 structure".to_string()),
+            records.clone(),
+        )
+    })?;
+
+    // 3. Complete full-input certified finite-target observation. Do not use
+    // the ordinary general-DSD constant-prefix optimization here.
+    let pre_id = MeasurementId(1);
+    let pre_observation = super::stages::scan_reference_w64_certified_peak(
+        &summary.r64_path,
+        r64_structure,
+        reference_w64_expectation(summary, r64_structure.sample_frames, 64, true),
+        pre_id,
+        TruePeakPurpose::GainAuthority,
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+        cancel,
+    )
+    .map_err(|reason| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference protected-R64 certified observation failed: {reason}")),
+            records.clone(),
+        )
+    })?;
+    measurements.insert(pre_id, pre_observation.clone());
+
+    // 4. Resolve the sealed Reference gain from the conservative HQ1024V1
+    // upper endpoint and the physical terminal error, charged once in linear
+    // domain. Exact policies fail rather than clamping.
+    let gain_authority = tonepoet_pipeline::resolve_reference_certified_gain(
+        &pre_observation,
+        summary.gain_policy,
+        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    )
+    .map_err(|error| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference gain authority failed: {error}")),
+            records.clone(),
+        )
+    })?;
+
+    // 5. One terminal gain/dither/format realization into authoritative QPCM.
+    let terminal = tonepoet_pipeline::lower_reference_terminal_command(
+        &summary.r64_path,
+        &summary.qpcm_path,
+        summary.final_pcm,
+        gain_authority.selected_gain,
+    )
+    .map_err(|error| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference terminal lowering failed: {error}")),
+            records.clone(),
+        )
+    })?;
+    let (w4s, w4e) = window(4, total_steps);
+    let mut terminal_records = execute_commands(
+        std::slice::from_ref(&terminal),
+        None,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.clone(),
+        progress,
+        w4s,
+        w4e,
+        track_label.clone(),
+    )
+    .await?;
+    records.append(&mut terminal_records);
+
+    // 6. QPCM structure/extent + independent decode/hash authority.
+    let (w5s, w5e) = window(5, total_steps);
+    let (mut qpcm_records, qpcm_probe, qpcm_hash) = verify_reference_qpcm_contract(
+        summary,
+        r64_probe,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits.as_ref(),
+        progress,
+        w5s,
+        w5e,
+        &track_label,
+    )
+    .await
+    .map_err(|mut error| {
+        let mut all = records.clone();
+        all.append(&mut error.commands);
+        error.commands = all;
+        error
+    })?;
+    records.append(&mut qpcm_records);
+    let qpcm_structure = qpcm_probe.w64_structure.ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend("Reference QPCM verification omitted exact Wave64 structure".to_string()),
+            records.clone(),
+        )
+    })?;
+    let (qpcm_bits, qpcm_float) = match summary.final_pcm.bit_depth {
+        tonepoet_pipeline::PcmBitDepth::Int24 => (24, false),
+        tonepoet_pipeline::PcmBitDepth::Float32 => (32, true),
+        tonepoet_pipeline::PcmBitDepth::Float64 => (64, true),
+        other => {
             return Err(TrackExecutionError::new(
-                ConvertError::Realize("cancelled".to_string()),
+                ConvertError::Backend(format!("Reference common executor received unqualified QPCM depth {other:?}")),
                 records,
             ));
         }
-        let window_start = start_fraction + total_width * (index as f32 / step_count);
-        let window_end = start_fraction + total_width * ((index + 1) as f32 / step_count);
-        match step {
-            PlannedExecutionStep::Command(command) => {
-                let mut step_records = execute_commands(
-                    std::slice::from_ref(command),
+    };
+
+    // 7. Independent post-terminal certified observation of the actual QPCM.
+    let post_id = MeasurementId(2);
+    let post_observation = super::stages::scan_reference_w64_certified_peak(
+        &summary.qpcm_path,
+        qpcm_structure,
+        reference_w64_expectation(
+            summary,
+            qpcm_structure.sample_frames,
+            qpcm_bits,
+            qpcm_float,
+        ),
+        post_id,
+        TruePeakPurpose::PostFinalAcceptance,
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm,
+        cancel,
+    )
+    .map_err(|reason| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference terminal-QPCM certified observation failed: {reason}")),
+            records.clone(),
+        )
+    })?;
+    tonepoet_pipeline::validate_reference_post_terminal_certified_peak(
+        &post_observation,
+        summary.gain_policy,
+    )
+    .map_err(|error| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!("Reference post-terminal acceptance failed: {error}")),
+            records.clone(),
+        )
+    })?;
+    measurements.insert(post_id, post_observation);
+
+    // 8. Admitted lossless packaging plus format-specific decoded-sample
+    // identity. Direct Wave64 delivery is continuity of QPCM itself, not an
+    // independently decoded package transformation.
+    let (mut packaged_hash, mut packaged_identity_mode) = if summary.packaged_path == summary.qpcm_path {
+        (
+            Some(qpcm_hash),
+            Some(ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery),
+        )
+    } else {
+        let lowering = tonepoet_pipeline::lower_reference_package(
+            &summary.qpcm_path,
+            &summary.packaged_path,
+            summary.target,
+            summary.final_pcm,
+            &plan_request.settings,
+        )
+        .map_err(|error| {
+            TrackExecutionError::new(
+                ConvertError::Backend(format!("Reference package lowering failed: {error}")),
+                records.clone(),
+            )
+        })?
+        .ok_or_else(|| {
+            TrackExecutionError::new(
+                ConvertError::Backend("Reference package lowering unexpectedly selected direct delivery".to_string()),
+                records.clone(),
+            )
+        })?;
+        let (w7s, w7e) = window(7, total_steps);
+        match lowering {
+            tonepoet_pipeline::ReferencePackageLowering::Command(command) => {
+                let mut package_records = execute_commands(
+                    std::slice::from_ref(&command),
+                    None,
                     runner,
                     cancel,
                     tool_paths,
                     tool_concurrency_limits.clone(),
                     progress,
-                    window_start,
-                    window_end,
+                    w7s,
+                    w7e,
                     track_label.clone(),
                 )
                 .await?;
-                records.append(&mut step_records);
-
-                if command.output.as_path() == Some(summary.r64_path.as_path()) {
-                    let (mut verification_records, probe) = verify_reference_r64_contract(
-                        summary,
-                        runner,
-                        cancel,
-                        tool_paths,
-                        tool_concurrency_limits.as_ref(),
-                        progress,
-                        window_start,
-                        window_end,
-                        &track_label,
-                    )
-                    .await
-                    .map_err(|mut err| {
-                        let mut all = records.clone();
-                        all.append(&mut err.commands);
-                        err.commands = all;
-                        err
-                    })?;
-                    records.append(&mut verification_records);
-                    r64_probe = Some(probe);
-                } else if command.output.as_path() == Some(summary.packaged_path.as_path())
-                    && summary.packaged_path != summary.qpcm_path
-                {
-                    let expected = qpcm_hash.ok_or_else(|| {
-                        TrackExecutionError::new(
-                            ConvertError::Backend(
-                                "Reference package was produced before QPCM verification"
-                                    .to_string(),
-                            ),
-                            records.clone(),
-                        )
-                    })?;
-                    let (mut verification_records, digest) =
-                        reference_decoded_sample_hash_with_plan_carrier(
-                            summary,
-                            ReferenceDecodedCarrierSelector::PackagedOutput,
-                            "Verify packaged output decoded samples",
-                            runner,
-                            cancel,
-                            tool_paths,
-                            tool_concurrency_limits.as_ref(),
-                            progress,
-                            window_start,
-                            window_end,
-                            &track_label,
-                        )
-                        .await
-                        .map_err(|mut err| {
-                            let mut all = records.clone();
-                            all.append(&mut err.commands);
-                            err.commands = all;
-                            err
-                        })?;
-                    records.append(&mut verification_records);
-                    if digest != expected {
-                        return Err(TrackExecutionError::new(
-                            ConvertError::Backend(format!(
-                                "Reference lossless package changed decoded samples: QPCM={}, packaged={}",
-                                expected.to_hex(),
-                                digest.to_hex()
-                            )),
-                            records,
-                        ));
-                    }
-                    packaged_hash = Some(digest);
-                    packaged_identity_mode = Some(
-                        ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
-                    );
-                }
+                records.append(&mut package_records);
             }
-            PlannedExecutionStep::Pipeline(pipeline) => {
-                validate_reference_package_pipeline(summary, pipeline).map_err(|mut err| {
-                    err.commands = records.clone();
-                    err
+            tonepoet_pipeline::ReferencePackageLowering::Pipeline(pipeline) => {
+                validate_reference_package_pipeline(summary, &pipeline).map_err(|mut error| {
+                    error.commands = records.clone();
+                    error
                 })?;
-                let (mut step_records, _) = run_reference_capture_pipeline(
-                    pipeline,
+                let (mut package_records, _) = run_reference_capture_pipeline(
+                    &pipeline,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
@@ -7289,219 +8481,69 @@ async fn execute_reference_steps(
                     &format!("{track_label} - {}", pipeline.description),
                 )
                 .await
-                .map_err(|mut err| {
+                .map_err(|mut error| {
                     let mut all = records.clone();
-                    all.append(&mut err.commands);
-                    err.commands = all;
-                    err
+                    all.append(&mut error.commands);
+                    error.commands = all;
+                    error
                 })?;
-                records.append(&mut step_records);
-
-                let expected = qpcm_hash.ok_or_else(|| {
-                    TrackExecutionError::new(
-                        ConvertError::Backend(
-                            "Reference package pipeline ran before QPCM verification".to_string(),
-                        ),
-                        records.clone(),
-                    )
-                })?;
-                let (mut verification_records, digest) =
-                    reference_decoded_sample_hash_with_plan_carrier(
-                        summary,
-                        ReferenceDecodedCarrierSelector::PackagedOutput,
-                        "Verify packaged output decoded samples",
-                        runner,
-                        cancel,
-                        tool_paths,
-                        tool_concurrency_limits.as_ref(),
-                        progress,
-                        window_start,
-                        window_end,
-                        &track_label,
-                    )
-                    .await
-                    .map_err(|mut err| {
-                        let mut all = records.clone();
-                        all.append(&mut err.commands);
-                        err.commands = all;
-                        err
-                    })?;
-                records.append(&mut verification_records);
-                if digest != expected {
-                    return Err(TrackExecutionError::new(
-                        ConvertError::Backend(format!(
-                            "Reference Float64 package changed decoded samples: QPCM={}, packaged={}",
-                            expected.to_hex(),
-                            digest.to_hex()
-                        )),
-                        records,
-                    ));
-                }
-                packaged_hash = Some(digest);
-                packaged_identity_mode = Some(
-                    ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
-                );
-            }
-            PlannedExecutionStep::Measurement(measurement) => {
-                if measurements.contains_key(&measurement.id) {
-                    return Err(TrackExecutionError::new(
-                        ConvertError::Backend(format!(
-                            "duplicate Reference measurement id {}",
-                            measurement.id.0
-                        )),
-                        records,
-                    ));
-                }
-                validate_reference_measurement_binding(summary, measurement).map_err(|mut err| {
-                    err.commands = records.clone();
-                    err
-                })?;
-                match measurement.purpose {
-                    TruePeakPurpose::GainAuthority if r64_probe.is_none() => {
-                        return Err(TrackExecutionError::new(
-                            ConvertError::Backend(
-                                "Reference gain measurement was scheduled before R64 verification"
-                                    .to_string(),
-                            ),
-                            records,
-                        ));
-                    }
-                    TruePeakPurpose::PostFinalAcceptance if qpcm_probe.is_none() => {
-                        return Err(TrackExecutionError::new(
-                            ConvertError::Backend(
-                                "Reference post-final measurement was scheduled before QPCM verification"
-                                    .to_string(),
-                            ),
-                            records,
-                        ));
-                    }
-                    _ => {}
-                }
-                let (mut measurement_records, parsed) = execute_reference_measurement(
-                    summary,
-                    measurement,
-                    runner,
-                    cancel,
-                    tool_paths,
-                    tool_concurrency_limits.as_ref(),
-                    progress,
-                    window_start,
-                    window_end,
-                    &track_label,
-                    silence_scan_path,
-                    toolchain.reporting_uncertainty,
-                    toolchain.analyzer_residual,
-                )
-                .await
-                .map_err(|mut err| {
-                    let mut all = records.clone();
-                    all.append(&mut err.commands);
-                    err.commands = all;
-                    err
-                })?;
-                records.append(&mut measurement_records);
-                if measurement.purpose == TruePeakPurpose::PostFinalAcceptance {
-                    validate_post_final_true_peak(parsed.conservative_upper, summary.gain_policy)
-                        .map_err(|err| {
-                            TrackExecutionError::new(
-                                ConvertError::Backend(format!(
-                                    "Reference post-final acceptance failed: {err}"
-                                )),
-                                records.clone(),
-                            )
-                        })?;
-                }
-                measurements.insert(measurement.id, parsed);
-            }
-            PlannedExecutionStep::DeferredCommand(command) => {
-                let resolved = resolve_deferred_command(command, &measurements)?;
-                let mut step_records = execute_commands(
-                    std::slice::from_ref(&resolved),
-                    runner,
-                    cancel,
-                    tool_paths,
-                    tool_concurrency_limits.clone(),
-                    progress,
-                    window_start,
-                    window_end,
-                    track_label.clone(),
-                )
-                .await?;
-                records.append(&mut step_records);
-
-                if command.output.as_path() == Some(summary.qpcm_path.as_path()) {
-                    let r64 = r64_probe.ok_or_else(|| {
-                        TrackExecutionError::new(
-                            ConvertError::Backend(
-                                "Reference terminal realization ran without verified R64 authority"
-                                    .to_string(),
-                            ),
-                            records.clone(),
-                        )
-                    })?;
-                    let (mut verification_records, probe, digest) =
-                        verify_reference_qpcm_contract(
-                            summary,
-                            r64,
-                            runner,
-                            cancel,
-                            tool_paths,
-                            tool_concurrency_limits.as_ref(),
-                            progress,
-                            window_start,
-                            window_end,
-                            &track_label,
-                        )
-                        .await
-                        .map_err(|mut err| {
-                            let mut all = records.clone();
-                            all.append(&mut err.commands);
-                            err.commands = all;
-                            err
-                        })?;
-                    records.append(&mut verification_records);
-                    qpcm_probe = Some(probe);
-                    qpcm_hash = Some(digest);
-                    if summary.packaged_path == summary.qpcm_path {
-                        packaged_hash = Some(digest);
-                        packaged_identity_mode = Some(
-                            ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
-                        );
-                    }
-                }
+                records.append(&mut package_records);
             }
         }
-    }
+        let (mut verification_records, digest) =
+            reference_decoded_sample_hash_with_plan_carrier(
+                summary,
+                ReferenceDecodedCarrierSelector::PackagedOutput,
+                "Verify packaged Reference decoded samples",
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits.as_ref(),
+                progress,
+                w7s,
+                w7e,
+                &track_label,
+            )
+            .await
+            .map_err(|mut error| {
+                let mut all = records.clone();
+                all.append(&mut error.commands);
+                error.commands = all;
+                error
+            })?;
+        records.append(&mut verification_records);
+        if digest != qpcm_hash {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(format!(
+                    "Reference lossless package changed decoded samples: QPCM={}, packaged={}",
+                    qpcm_hash.to_hex(),
+                    digest.to_hex(),
+                )),
+                records,
+            ));
+        }
+        (
+            Some(digest),
+            Some(ReferencePackagedSampleIdentityMode::IndependentDecodeComparison),
+        )
+    };
 
-    let r64_probe = r64_probe.ok_or_else(|| {
+    if cancel.is_cancelled() {
+        progress.cancel_requested().await;
+        return Err(TrackExecutionError::new(
+            ConvertError::Realize("cancelled".to_string()),
+            records,
+        ));
+    }
+    let packaged_hash = packaged_hash.take().ok_or_else(|| {
         TrackExecutionError::new(
-            ConvertError::Backend("Reference execution omitted R64 verification".to_string()),
+            ConvertError::Backend("Reference common execution omitted package sample identity".to_string()),
             records.clone(),
         )
     })?;
-    let qpcm_probe = qpcm_probe.ok_or_else(|| {
+    let packaged_identity_mode = packaged_identity_mode.take().ok_or_else(|| {
         TrackExecutionError::new(
-            ConvertError::Backend("Reference execution omitted QPCM verification".to_string()),
-            records.clone(),
-        )
-    })?;
-    let qpcm_hash = qpcm_hash.ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend("Reference execution omitted QPCM sample identity".to_string()),
-            records.clone(),
-        )
-    })?;
-    let packaged_hash = packaged_hash.ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend("Reference execution omitted package sample identity".to_string()),
-            records.clone(),
-        )
-    })?;
-    let packaged_identity_mode = packaged_identity_mode.ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference execution omitted package sample-identity disposition".to_string(),
-            ),
+            ConvertError::Backend("Reference common execution omitted package identity mode".to_string()),
             records.clone(),
         )
     })?;
@@ -7522,6 +8564,185 @@ async fn execute_reference_steps(
         resolved_command_hash,
         pcm_verification,
     })
+}
+
+fn reference_candidate_harness_path_parent(
+    harness_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<(), TrackExecutionError> {
+    let root = fs::canonicalize(harness_root).map_err(|error| {
+        reference_toolchain_error(format!(
+            "Reference candidate harness root {} is not an existing directory: {error}",
+            harness_root.display(),
+        ))
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        reference_toolchain_error(format!(
+            "Reference candidate {label} has no parent directory: {}",
+            path.display(),
+        ))
+    })?;
+    let parent = fs::canonicalize(parent).map_err(|error| {
+        reference_toolchain_error(format!(
+            "Reference candidate {label} parent {} is not an existing harness directory: {error}",
+            parent.display(),
+        ))
+    })?;
+    if !parent.starts_with(&root) {
+        return Err(reference_toolchain_error(format!(
+            "Reference candidate {label} escapes the harness-owned root: {}",
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
+/// Execute an unpromoted Reference candidate using the exact common production
+/// lowerer/observer/reader/terminal/package primitives. This is the Q01 seam.
+///
+/// The caller must provide an already admitted/private source realization in
+/// `plan_request.input_path` (the qualification suite uses the shared
+/// `qualify_reference_source_materialization` seam for front ends that require
+/// it). All candidate artifacts must live beneath `harness_root`. The function
+/// intentionally does **not** call `validate_reference_production_promotion`
+/// and intentionally does **not** apply the plan finalization, so there is no
+/// user-facing or production bypass and no candidate artifact can be published.
+#[doc(hidden)]
+pub async fn qualify_reference_common_candidate_execution(
+    plan_request: &PlanRequest,
+    harness_root: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<ReferenceCandidateExecutionQualification, TrackExecutionError> {
+    if plan_request.output_path.exists() {
+        return Err(reference_toolchain_error(format!(
+            "Reference candidate delivered path must not pre-exist: {}",
+            plan_request.output_path.display(),
+        )));
+    }
+    reference_candidate_harness_path_parent(
+        harness_root,
+        &plan_request.output_path,
+        "delivered output",
+    )?;
+    let intermediate_dir = plan_request.intermediate_dir.as_ref().ok_or_else(|| {
+        reference_toolchain_error(
+            "Reference candidate execution requires an explicit harness-owned intermediate directory",
+        )
+    })?;
+    let intermediate_probe = intermediate_dir.join(".tonepoet-reference-candidate-probe");
+    reference_candidate_harness_path_parent(
+        harness_root,
+        &intermediate_probe,
+        "intermediate directory",
+    )?;
+
+    let plan = plan_conversion(plan_request)
+        .map_err(|error| reference_toolchain_error(format!("Reference candidate planning failed: {error}")))?;
+    let summary = plan.reference.clone().ok_or_else(|| {
+        reference_toolchain_error(
+            "Reference candidate harness received a request that did not admit Reference delivery",
+        )
+    })?;
+    match &plan.action {
+        PlanAction::Execute { commands, .. } if commands.is_empty() => {}
+        PlanAction::Execute { .. } => {
+            return Err(reference_toolchain_error(
+                "Reference candidate plan retained an obsolete executable command authority",
+            ));
+        }
+        PlanAction::PassthroughCopy { .. } => {
+            return Err(reference_toolchain_error(
+                "Reference candidate harness cannot qualify a passthrough plan",
+            ));
+        }
+    }
+    for (label, path) in [
+        ("protected R64", summary.r64_path.as_path()),
+        ("terminal QPCM", summary.qpcm_path.as_path()),
+        ("packaged staging artifact", summary.packaged_path.as_path()),
+    ] {
+        reference_candidate_harness_path_parent(harness_root, path, label)?;
+    }
+    if summary.delivered_path != plan_request.output_path {
+        return Err(reference_toolchain_error(
+            "Reference candidate plan changed the delivered-path authority",
+        ));
+    }
+
+    let metadata_enabled = summary
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, tonepoet_pipeline::DsdReferenceOperation::MutateMetadata));
+    let toolchain = attest_reference_toolchain(
+        runner,
+        cancel,
+        summary.front_end,
+        metadata_enabled,
+    )
+    .await?;
+    // Deliberately no production-promotion validation here. Candidate execution
+    // is the evidence-producing path that must exist before promotion can occur.
+    let mut progress = OperationProgressTracker::new(
+        "reference-candidate-qualification",
+        super::types::PipelineStage::Convert,
+        None,
+    );
+    let runtime = execute_reference_common_plan(
+        &summary,
+        plan_request,
+        runner,
+        cancel,
+        tool_paths,
+        None,
+        &mut progress,
+        0.0,
+        1.0,
+        "Reference candidate qualification".to_string(),
+    )
+    .await?;
+    if plan_request.output_path.exists() {
+        return Err(reference_toolchain_error(format!(
+            "Reference candidate common executor created the delivered path {}; candidate execution must be nonpublishing",
+            plan_request.output_path.display(),
+        )));
+    }
+    if !summary.packaged_path.exists() {
+        return Err(reference_toolchain_error(format!(
+            "Reference candidate common executor did not produce the staged package {}",
+            summary.packaged_path.display(),
+        )));
+    }
+
+    Ok(ReferenceCandidateExecutionQualification {
+        plan: summary.clone(),
+        common_runtime_closure_fingerprint_sha256: toolchain
+            .common_runtime_closure_fingerprint_sha256
+            .clone(),
+        metadata_mutation_closure_fingerprint_sha256: toolchain
+            .metadata_mutation_closure_fingerprint_sha256
+            .clone(),
+        toolchain,
+        commands: runtime.commands,
+        measurements: runtime.measurements,
+        resolved_command_hash: runtime.resolved_command_hash,
+        pcm_verification: runtime.pcm_verification,
+        staged_artifact_path: summary.packaged_path,
+    })
+}
+
+/// Exercise the exact production-promotion gate against evidence produced by
+/// the offline candidate harness. This function does not execute or publish
+/// anything; it exists so Q01/Q02 can prove that unpromoted or mismatched
+/// candidate evidence remains unusable by production.
+#[doc(hidden)]
+pub fn qualify_reference_production_promotion_gate(
+    candidate: &ReferenceCandidateExecutionQualification,
+) -> Result<(), String> {
+    validate_reference_production_promotion(&candidate.plan, &candidate.toolchain)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7726,6 +8947,7 @@ async fn run_reference_capture_command(
     let mut output = run_planned_command(
         command,
         planned,
+        None,
         runner,
         cancel,
         tool_paths,
@@ -8495,41 +9717,11 @@ pub(crate) async fn verify_reference_output_after_metadata(
     Ok(())
 }
 
-fn resolve_deferred_command(
-    deferred: &PlannedDeferredCommand,
-    measurements: &BTreeMap<MeasurementId, TruePeakMeasurement>,
-) -> Result<PlannedCommand, TrackExecutionError> {
-    resolve_reference_deferred_command(deferred, measurements).map_err(|message| {
-        TrackExecutionError::new(ConvertError::Backend(message), Vec::new())
-    })
-}
-
-enum ReferenceMeasurementContract<'a> {
-    SoxPathOversampledStats,
-    Float32FfmpegRawToSoxOversampledStats(&'a PlannedCommand),
-}
-
-fn reference_measurement_environment_is_canonical(command: &PlannedCommand) -> bool {
+fn reference_command_environment_is_canonical(command: &PlannedCommand) -> bool {
     command.environment_policy
         == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
         && command.environment.len() == 1
         && command.environment.get("LC_ALL").map(String::as_str) == Some("C")
-}
-
-fn reference_measurement_deadline_is_canonical(
-    summary: &DsdReferencePlanSummary,
-    command: &PlannedCommand,
-) -> bool {
-    summary.analyzer_deadline
-        >= Duration::from_secs(
-            tonepoet_pipeline::REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS,
-        )
-        && summary.analyzer_deadline
-            <= Duration::from_secs(
-                tonepoet_pipeline::REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS,
-            )
-        && command.expected_duration == Some(summary.analyzer_deadline)
-        && command.timeout_budget == Some(summary.analyzer_deadline)
 }
 
 fn validate_reference_package_pipeline(
@@ -8577,7 +9769,7 @@ fn validate_reference_package_pipeline(
             .iter()
             .map(String::as_str)
             .eq(expected_producer)
-        || !reference_measurement_environment_is_canonical(&pipeline.producer)
+        || !reference_command_environment_is_canonical(&pipeline.producer)
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
@@ -8628,7 +9820,7 @@ fn validate_reference_package_pipeline(
             .iter()
             .map(String::as_str)
             .eq(expected_consumer)
-        || !reference_measurement_environment_is_canonical(&pipeline.consumer)
+        || !reference_command_environment_is_canonical(&pipeline.consumer)
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
@@ -8639,431 +9831,6 @@ fn validate_reference_package_pipeline(
         ));
     }
     Ok(())
-}
-
-fn validate_reference_measurement_binding(
-    summary: &DsdReferencePlanSummary,
-    measurement: &PlannedMeasurement,
-) -> Result<(), TrackExecutionError> {
-    let authority_count = summary
-        .operations
-        .iter()
-        .filter(|operation| {
-            matches!(
-                operation,
-                tonepoet_pipeline::DsdReferenceOperation::MeasureTruePeak {
-                    measurement_id,
-                    scope,
-                    purpose,
-                } if *measurement_id == measurement.id
-                    && *scope == measurement.scope
-                    && *purpose == measurement.purpose
-            )
-        })
-        .count();
-    if authority_count != 1 {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(format!(
-                "Reference measurement {} is not bound exactly once in the plan summary",
-                measurement.id.0
-            )),
-            Vec::new(),
-        ));
-    }
-
-    let expected_carrier = match measurement.purpose {
-        TruePeakPurpose::GainAuthority => summary.r64_path.as_path(),
-        TruePeakPurpose::PostFinalAcceptance => summary.qpcm_path.as_path(),
-    };
-    if measurement.carrier_path() != Some(expected_carrier) {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(format!(
-                "Reference measurement {} is bound to the wrong carrier path",
-                measurement.id.0
-            )),
-            Vec::new(),
-        ));
-    }
-
-    let float32_pipe = measurement.purpose == TruePeakPurpose::PostFinalAcceptance
-        && summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float32;
-    if measurement.input_stage.is_some() != float32_pipe {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(format!(
-                "Reference measurement {} uses the wrong analyzer carrier route for {:?} {:?}",
-                measurement.id.0, measurement.purpose, summary.final_pcm.bit_depth
-            )),
-            Vec::new(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_reference_measurement_contract<'a>(
-    summary: &DsdReferencePlanSummary,
-    measurement: &'a PlannedMeasurement,
-) -> Result<ReferenceMeasurementContract<'a>, TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
-        || measurement.parser != MeasurementParser::SoxStatsPkLevDbV1
-    {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend("unknown or historical Reference measurement parser".to_string()),
-            Vec::new(),
-        ));
-    }
-    if measurement.command.tool != ToolIdentifier::Sox
-        || measurement.command.output != tonepoet_pipeline::OutputSink::Stdout
-        || !reference_measurement_environment_is_canonical(&measurement.command)
-        || !reference_measurement_deadline_is_canonical(summary, &measurement.command)
-    {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference policy v15 measurement has a noncanonical SoX analyzer command"
-                    .to_string(),
-            ),
-            Vec::new(),
-        ));
-    }
-
-    let expected_carrier = match measurement.purpose {
-        TruePeakPurpose::GainAuthority => summary.r64_path.as_path(),
-        TruePeakPurpose::PostFinalAcceptance => summary.qpcm_path.as_path(),
-    };
-    let expected_float32_pipe = measurement.purpose == TruePeakPurpose::PostFinalAcceptance
-        && summary.final_pcm.bit_depth == tonepoet_pipeline::PcmBitDepth::Float32;
-    if measurement.input_stage.is_some() != expected_float32_pipe {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(format!(
-                "Reference measurement {} uses a transport that is not authorized for {:?} {:?}",
-                measurement.id.0, measurement.purpose, summary.final_pcm.bit_depth
-            )),
-            Vec::new(),
-        ));
-    }
-    let sample_rate = summary.final_pcm.sample_rate_hz.to_string();
-    let channels = summary.final_pcm.channels.to_string();
-    let oversampled_rate = summary
-        .final_pcm
-        .sample_rate_hz
-        .checked_mul(tonepoet_pipeline::REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR)
-        .ok_or_else(|| {
-            TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference policy v15 analyzer rate exceeds the execution integer range"
-                        .to_string(),
-                ),
-                Vec::new(),
-            )
-        })?
-        .to_string();
-
-    if let Some(producer) = measurement.input_stage.as_ref() {
-        let carrier = producer.input.as_path().ok_or_else(|| {
-            TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference policy v15 Float32 measurement requires a path-backed W64 carrier"
-                        .to_string(),
-                ),
-                Vec::new(),
-            )
-        })?;
-        if carrier != expected_carrier {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(format!(
-                    "Reference measurement {} producer is bound to the wrong carrier path",
-                    measurement.id.0
-                )),
-                Vec::new(),
-            ));
-        }
-        let carrier_arg = expected_carrier.display().to_string();
-        let producer_args = [
-            "-nostdin", "-hide_banner", "-nostats", "-loglevel", "error", "-i",
-            carrier_arg.as_str(), "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a",
-            "pcm_f64le", "-f", "f64le", "pipe:1",
-        ];
-        let consumer_args = [
-            "-S", "-D", "-t", "raw", "-e", "floating-point", "-b", "64", "-L",
-            "-r", sample_rate.as_str(), "-c", channels.as_str(), "-", "-n", "rate",
-            "-v", "-L", "-s", oversampled_rate.as_str(), "stats",
-        ];
-        if producer.tool != ToolIdentifier::Ffmpeg
-            || producer.output != tonepoet_pipeline::OutputSink::Stdout
-            || !producer.args.iter().map(String::as_str).eq(producer_args)
-            || !reference_measurement_environment_is_canonical(producer)
-            || producer.expected_duration != measurement.command.expected_duration
-            || !reference_measurement_deadline_is_canonical(summary, producer)
-            || measurement.command.input != tonepoet_pipeline::InputSource::Stdin
-            || !measurement
-                .command
-                .args
-                .iter()
-                .map(String::as_str)
-                .eq(consumer_args)
-        {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference policy v15 measurement has a noncanonical FFmpeg-f64le-to-SoX oversampled contract"
-                        .to_string(),
-                ),
-                Vec::new(),
-            ));
-        }
-        return Ok(ReferenceMeasurementContract::Float32FfmpegRawToSoxOversampledStats(
-            producer,
-        ));
-    }
-
-    let carrier = measurement.command.input.as_path().ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference policy v15 direct SoX measurement requires a path-backed W64 carrier"
-                    .to_string(),
-            ),
-            Vec::new(),
-        )
-    })?;
-    if carrier != expected_carrier {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(format!(
-                "Reference measurement {} direct analyzer is bound to the wrong carrier path",
-                measurement.id.0
-            )),
-            Vec::new(),
-        ));
-    }
-    let carrier_arg = expected_carrier.display().to_string();
-    let direct_args = [
-        "-S", "-D", carrier_arg.as_str(), "-n", "rate", "-v", "-L", "-s",
-        oversampled_rate.as_str(), "stats",
-    ];
-    if !measurement
-        .command
-        .args
-        .iter()
-        .map(String::as_str)
-        .eq(direct_args)
-    {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference policy v15 measurement has a noncanonical direct SoX oversampled contract"
-                    .to_string(),
-            ),
-            Vec::new(),
-        ));
-    }
-    Ok(ReferenceMeasurementContract::SoxPathOversampledStats)
-}
-
-async fn execute_reference_measurement(
-    summary: &DsdReferencePlanSummary,
-    measurement: &PlannedMeasurement,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-    _tool_paths: &HashMap<String, PathBuf>,
-    limits: Option<&Arc<ToolConcurrencyLimits>>,
-    progress: &mut OperationProgressTracker<'_>,
-    _window_start: f32,
-    window_end: f32,
-    track_label: &str,
-    silence_scan_path: &Path,
-    reporting_uncertainty: tonepoet_pipeline::DbNano,
-    analyzer_residual: tonepoet_pipeline::DbNano,
-) -> Result<(Vec<CommandRecord>, TruePeakMeasurement), TrackExecutionError> {
-    let contract = validate_reference_measurement_contract(summary, measurement)?;
-    let label = format!("{track_label} - {}", measurement.command.description);
-
-    let (stderr_tail, mut records) = match contract {
-        ReferenceMeasurementContract::Float32FfmpegRawToSoxOversampledStats(input_stage) => {
-            let producer = planned_command_to_tool_command(
-                input_stage,
-                DEFAULT_PLANNED_COMMAND_TIMEOUT,
-            )
-            .map_err(TrackExecutionError::from)?;
-            let consumer = planned_command_to_tool_command(
-                &measurement.command,
-                DEFAULT_PLANNED_COMMAND_TIMEOUT,
-            )
-            .map_err(TrackExecutionError::from)?;
-            let _pipeline_permits = acquire_reference_pipeline_permits(
-                [producer.binary, consumer.binary],
-                limits,
-                cancel,
-            )
-            .await
-            .map_err(TrackExecutionError::from)?;
-            progress
-                .unknown_alive_with_key(
-                    format!("reference-measurement-pipe:{label}"),
-                    format!("{label} - decoding Float32 W64 and measuring qualified 16x view"),
-                )
-                .await;
-            let output = runner
-                .run_pipeline(producer, consumer, cancel)
-                .await
-                .map_err(|pipeline_error| {
-                    let mut commands = pipeline_error.other_commands;
-                    if let Some(command) = command_record_from_tool_error(&pipeline_error.error) {
-                        commands.push(command);
-                    }
-                    TrackExecutionError::new(ConvertError::Tool(pipeline_error.error), commands)
-                })?;
-            let stderr_tail = output.consumer.stderr_tail.clone();
-            let mut producer_record = output.producer.command;
-            producer_record.description = Some(input_stage.description.clone());
-            let mut consumer_record = output.consumer.command;
-            consumer_record.description = Some(measurement.command.description.clone());
-            (stderr_tail, vec![producer_record, consumer_record])
-        }
-        ReferenceMeasurementContract::SoxPathOversampledStats => {
-            let command = planned_command_to_tool_command(
-                &measurement.command,
-                DEFAULT_PLANNED_COMMAND_TIMEOUT,
-            )
-            .map_err(TrackExecutionError::from)?;
-            progress
-                .unknown_alive_with_key(
-                    format!("reference-measurement-direct:{}", measurement.id.0),
-                    format!("{label} - measuring qualified 16x view"),
-                )
-                .await;
-            let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
-                .await
-                .map_err(|error| {
-                    let commands = command_record_from_tool_error(&error).into_iter().collect();
-                    TrackExecutionError::new(ConvertError::Tool(error), commands)
-                })?;
-            let stderr_tail = output.stderr_tail.clone();
-            let mut record = output.command;
-            record.description = Some(measurement.command.description.clone());
-            (stderr_tail, vec![record])
-        }
-    };
-
-    progress
-        .estimated_with_key(
-            window_end,
-            format!("reference-measurement-finish:{}", measurement.id.0),
-            format!("Finished {label}"),
-        )
-        .await;
-
-    let raw_peak =
-        extract_single_sox_stats_peak_report(&stderr_tail, summary.final_pcm.channels).map_err(
-            |message| {
-                TrackExecutionError::new(ConvertError::Backend(message), records.clone())
-            },
-        )?;
-    let needs_silence_proof = raw_peak == "-inf";
-    if needs_silence_proof {
-        let selector = match measurement.purpose {
-            TruePeakPurpose::GainAuthority => ReferenceDecodedCarrierSelector::ReconstructionR64,
-            TruePeakPurpose::PostFinalAcceptance => ReferenceDecodedCarrierSelector::TerminalQpcm,
-        };
-        let carrier = summary.decoded_carrier(selector).map_err(|error| {
-            TrackExecutionError::new(
-                ConvertError::Backend(format!(
-                    "Reference silence verification cannot authorize its carrier route: {error}"
-                )),
-                records.clone(),
-            )
-        })?;
-        let silence_record = verify_signed_zero_audio(
-            &carrier,
-            runner,
-            cancel,
-            limits,
-            silence_scan_path,
-        )
-            .await
-            .map_err(|err| {
-                let mut commands = records.clone();
-                commands.extend(err.commands);
-                TrackExecutionError::new(err.error, commands)
-            })?;
-        records.push(silence_record);
-    }
-    let parsed = parse_reference_sox_stats_true_peak_measurement(
-        measurement.id,
-        measurement.scope,
-        measurement.purpose,
-        raw_peak,
-        reporting_uncertainty,
-        analyzer_residual,
-        needs_silence_proof,
-    )
-    .map_err(|message| {
-        TrackExecutionError::new(ConvertError::Backend(message), records.clone())
-    })?;
-    Ok((records, parsed))
-}
-
-async fn verify_signed_zero_audio(
-    carrier: &ReferenceDecodedCarrier,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-    limits: Option<&Arc<ToolConcurrencyLimits>>,
-    planned_raw_path: &Path,
-) -> Result<CommandRecord, TrackExecutionError> {
-    let mut raw = TemporaryFileCleanupGuard::new(planned_raw_path.to_path_buf())
-    .map_err(|err| TrackExecutionError::new(ConvertError::Io(err), Vec::new()))?;
-    let planned = build_reference_silence_scan_command(carrier, raw.path());
-    let command = planned_command_to_tool_command(&planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
-        .map_err(TrackExecutionError::from)?;
-    let output = run_tool_command_with_concurrency(command, runner, cancel, limits)
-        .await
-        .map_err(|err| {
-            let record = command_record_from_tool_error(&err).into_iter().collect();
-            TrackExecutionError::new(ConvertError::Tool(err), record)
-        })?;
-    let scan_result = (|| -> Result<(), TrackExecutionError> {
-        let mut file = File::open(raw.path()).map_err(|err| {
-            TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
-        })?;
-        let len = file
-            .metadata()
-            .map_err(|err| {
-                TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
-            })?
-            .len();
-        if len == 0 || len % 8 != 0 {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference silence scan produced an empty or truncated f64 stream".to_string(),
-                ),
-                vec![output.command.clone()],
-            ));
-        }
-        let mut buffer = [0_u8; 8 * 4096];
-        let mut remaining = len;
-        while remaining > 0 {
-            let count = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
-                TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference silence scan length does not fit this platform".to_string(),
-                    ),
-                    vec![output.command.clone()],
-                )
-            })?;
-            file.read_exact(&mut buffer[..count]).map_err(|err| {
-                TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
-            })?;
-            validate_signed_zero_f64le(&buffer[..count]).map_err(|message| {
-                TrackExecutionError::new(
-                    ConvertError::Backend(message),
-                    vec![output.command.clone()],
-                )
-            })?;
-            remaining -= count as u64;
-        }
-        Ok(())
-    })();
-    scan_result?;
-    raw.cleanup_now().map_err(|err| {
-        TrackExecutionError::new(ConvertError::Io(err), vec![output.command.clone()])
-    })?;
-    Ok(output.command)
 }
 
 fn command_records_hash(records: &[CommandRecord]) -> String {
@@ -9098,6 +9865,7 @@ fn command_records_hash(records: &[CommandRecord]) -> String {
 
 async fn execute_commands(
     commands: &[PlannedCommand],
+    bound_terminal: Option<&QualifiedTerminalExecutableBinding>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -9149,6 +9917,9 @@ async fn execute_commands(
         let output = match run_planned_command(
             cmd,
             planned,
+            bound_terminal
+                .filter(|binding| binding.command_index == index)
+                .map(|binding| &binding.executable),
             runner,
             cancel,
             tool_paths,
@@ -9178,6 +9949,236 @@ async fn execute_commands(
             .await;
     }
 
+    Ok(records)
+}
+
+async fn execute_commands_with_scalar_pump(
+    commands: &[PlannedCommand],
+    pump: RetainedPcmScalarPump,
+    bound_terminal: Option<&QualifiedTerminalExecutableBinding>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    start_fraction: f32,
+    end_fraction: f32,
+    track_label: String,
+) -> Result<Vec<CommandRecord>, TrackExecutionError> {
+    if commands.is_empty() {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "retained PCM scalar transport requires at least one terminal command".to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+    if !runner.supports_pcm_scalar_pump() {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "selected runner does not implement the admitted retained PCM scalar transport"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+    let streamed_first = planned_command_with_retained_pcm_scalar_stdin(
+        &commands[0],
+        &pump.input_path,
+    )
+    .ok_or_else(|| {
+        TrackExecutionError::new(
+            ConvertError::Backend(
+                "retained PCM scalar transport no longer matches the selected terminal command"
+                    .to_string(),
+            ),
+            Vec::new(),
+        )
+    })?;
+    if commands.iter().skip(1).any(|command| {
+        matches!(
+            &command.input,
+            tonepoet_pipeline::InputSource::Path(path) if path == &pump.input_path
+        )
+    }) {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "retained PCM scalar input is consumed by more than one planned command"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    let mut records = Vec::with_capacity(commands.len());
+    let windows = command_windows(commands, start_fraction, end_fraction);
+    for (index, planned) in commands.iter().enumerate() {
+        if cancel.is_cancelled() {
+            progress.cancel_requested().await;
+            return Err(TrackExecutionError::new(
+                ConvertError::Realize("cancelled".to_string()),
+                records,
+            ));
+        }
+        let (window_start, window_end) = windows[index];
+        let description = user_facing_planned_description(&planned.description);
+        let label = format!(
+            "{} - step {} of {} - {}",
+            track_label,
+            index + 1,
+            commands.len(),
+            description,
+        );
+        progress
+            .estimated_with_key(
+                window_start,
+                format!("cmd-start:{index}"),
+                format!("Starting {label}"),
+            )
+            .await;
+
+        if index == 0 {
+            let mut cmd = planned_command_to_tool_command(
+                &streamed_first,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            )
+            .map_err(|error| TrackExecutionError::new(error, records.clone()))?;
+            let _tool_permit = match acquire_tool_permit(
+                &mut cmd,
+                tool_concurrency_limits.as_ref(),
+                cancel,
+            )
+            .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let error = annotate_tool_error(
+                        tool_permit_error_to_runner_error(error, &cmd),
+                        planned,
+                    );
+                    return Err(track_execution_error_from_tool_error(
+                        index,
+                        planned,
+                        error,
+                        records,
+                    ));
+                }
+            };
+            progress
+                .unknown_alive_with_key(
+                    format!("pcm-scalar-pump:{label}"),
+                    format!("{label} - streaming certified gain"),
+                )
+                .await;
+            let pump_result = if let Some(binding) =
+                bound_terminal.filter(|binding| binding.command_index == index)
+            {
+                runner
+                    .run_pcm_scalar_pump_bound(
+                        pump.clone(),
+                        cmd,
+                        &binding.executable,
+                        cancel,
+                    )
+                    .await
+            } else {
+                runner.run_pcm_scalar_pump(pump.clone(), cmd, cancel).await
+            };
+            match pump_result {
+                Ok(output) => {
+                    if output.pumped_bytes != pump.expected_bytes {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(format!(
+                                "retained PCM scalar pump reported {} bytes but its authority requires {}",
+                                output.pumped_bytes, pump.expected_bytes,
+                            )),
+                            records,
+                        ));
+                    }
+                    let mut record = output.consumer.command;
+                    record.description = non_empty_planned_description(planned);
+                    records.push(record);
+                }
+                Err(mut pipeline_error) => {
+                    records.append(&mut pipeline_error.other_commands);
+                    let error = annotate_tool_error(pipeline_error.error, planned);
+                    return Err(track_execution_error_from_tool_error(
+                        index,
+                        planned,
+                        error,
+                        records,
+                    ));
+                }
+            }
+        } else {
+            let mut cmd = match planned_command_to_tool_command(
+                planned,
+                DEFAULT_PLANNED_COMMAND_TIMEOUT,
+            ) {
+                Ok(cmd) => cmd,
+                Err(error) => return Err(TrackExecutionError::new(error, records)),
+            };
+            let _tool_permit = match acquire_tool_permit(
+                &mut cmd,
+                tool_concurrency_limits.as_ref(),
+                cancel,
+            )
+            .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let error = annotate_tool_error(
+                        tool_permit_error_to_runner_error(error, &cmd),
+                        planned,
+                    );
+                    return Err(track_execution_error_from_tool_error(
+                        index,
+                        planned,
+                        error,
+                        records,
+                    ));
+                }
+            };
+            let output = match run_planned_command(
+                cmd,
+                planned,
+                bound_terminal
+                    .filter(|binding| binding.command_index == index)
+                    .map(|binding| &binding.executable),
+                runner,
+                cancel,
+                tool_paths,
+                progress,
+                window_start,
+                window_end,
+                &label,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let error = annotate_tool_error(error, planned);
+                    return Err(track_execution_error_from_tool_error(
+                        index,
+                        planned,
+                        error,
+                        records,
+                    ));
+                }
+            };
+            let mut record = output.command;
+            record.description = non_empty_planned_description(planned);
+            records.push(record);
+        }
+
+        progress
+            .estimated_with_key(
+                window_end,
+                format!("cmd-finish:{index}"),
+                format!("Finished {label}"),
+            )
+            .await;
+    }
     Ok(records)
 }
 
@@ -9315,6 +10316,19 @@ pub(crate) async fn run_tool_command_with_concurrency(
     runner.run(cmd, cancel).await
 }
 
+pub(crate) async fn run_bound_tool_command_with_concurrency(
+    mut cmd: ToolCommand,
+    executable: &BoundToolExecutable,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<ToolOutput, ToolRunnerError> {
+    let _tool_permit = acquire_tool_permit(&mut cmd, limits, cancel)
+        .await
+        .map_err(|err| tool_permit_error_to_runner_error(err, &cmd))?;
+    runner.run_bound(cmd, executable, cancel).await
+}
+
 fn tool_permit_error_to_runner_error(err: ConvertError, cmd: &ToolCommand) -> ToolRunnerError {
     match err {
         ConvertError::Realize(message) if message == "cancelled" => ToolRunnerError::Cancelled {
@@ -9425,6 +10439,7 @@ fn successful_captured_tool_output_for_test(cmd: ToolCommand) -> ToolOutput {
 async fn run_planned_command(
     cmd: ToolCommand,
     planned: &PlannedCommand,
+    bound_executable: Option<&BoundToolExecutable>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -9433,6 +10448,16 @@ async fn run_planned_command(
     window_end: f32,
     label: &str,
 ) -> Result<super::tool::ToolOutput, ToolRunnerError> {
+    if let Some(executable) = bound_executable {
+        progress
+            .unknown_alive_with_key(
+                format!("bound-tool-heartbeat:{label}"),
+                format!("{label} - running qualified executable"),
+            )
+            .await;
+        return runner.run_bound(cmd, executable, cancel).await;
+    }
+
     #[cfg(test)]
     if TRACK_EXECUTION_USE_INJECTED_RUNNER.try_with(|_| ()).is_ok() {
         return runner.run(cmd, cancel).await;
@@ -10022,8 +11047,8 @@ fn track_label(track: &PreparedTrack) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use tonepoet_pipeline::{extract_single_loudnorm_report, parse_reference_true_peak_measurement};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -10035,8 +11060,9 @@ mod tests {
     use crate::convert::pipeline::types::{
         CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
         NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineStage, PublishPolicy,
-        SacdArea, SourceAudioCoding, SourceAudioDescriptor, SourceOptions, StagePolicy,
-        StageRequirement, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
+        SacdArea, SelectedPhysicalCandidateBinding, SourceAudioCoding, SourceAudioDescriptor,
+        SourceOptions, StagePolicy, StageRequirement, TrackId, TrackMetadata, TrackSelection,
+        TrackSourceRef,
     };
     use tempfile::TempDir;
     use tonepoet_pipeline::{AudioFormat, InputSource, OutputSink, PipelineSettings, ToolIdentifier};
@@ -10057,106 +11083,194 @@ mod tests {
         );
     }
 
-    fn valid_loudnorm_json(input_tp: &str) -> String {
-        format!(
-            r#"{{
-                "input_i": "-23.00",
-                "input_tp": "{input_tp}",
-                "input_lra": "0.10",
-                "input_thresh": "-33.00",
-                "output_i": "-23.00",
-                "output_tp": "-1.00",
-                "output_lra": "0.10",
-                "output_thresh": "-33.00",
-                "normalization_type": "linear",
-                "target_offset": "0.00"
-            }}"#
-        )
-    }
-
-    #[test]
-    fn loudnorm_parser_accepts_only_one_complete_strict_report() {
-        let json = valid_loudnorm_json("-3.125000000");
-        assert_eq!(
-            extract_single_loudnorm_report(&format!("prefix\n{json}\nsuffix")).unwrap(),
-            json
-        );
-        let finite = parse_reference_true_peak_measurement(
-            MeasurementId(1),
-            tonepoet_pipeline::MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            json.clone(),
-            tonepoet_pipeline::DbNano::ZERO,
-            tonepoet_pipeline::DbNano::ZERO,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            finite.reported,
-            tonepoet_pipeline::TruePeakValue::Finite("-3.125000000".parse().unwrap())
-        );
-        let silence = parse_reference_true_peak_measurement(
-            MeasurementId(2),
-            tonepoet_pipeline::MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            valid_loudnorm_json("-inf"),
-            tonepoet_pipeline::DbNano::ZERO,
-            tonepoet_pipeline::DbNano::ZERO,
-            true,
-        )
-        .unwrap();
-        assert_eq!(silence.reported, tonepoet_pipeline::TruePeakValue::VerifiedSilence);
-    }
-
-    #[test]
-    fn loudnorm_parser_rejects_ambiguous_or_malformed_reports() {
-        let json = valid_loudnorm_json("-3.00");
-        assert!(extract_single_loudnorm_report("no report").is_err());
-        assert!(extract_single_loudnorm_report(&format!("{json}\n{json}")).is_err());
-        assert!(extract_single_loudnorm_report(&json[..json.len() - 1]).is_err());
-
-        for invalid in ["1e2", "1E2", "+1.0", "1,0", "inf", "+inf", "NaN", "-1000.000000001", "100.000000001"] {
-            assert!(
-                parse_reference_true_peak_measurement(
-                    MeasurementId(1),
-                    tonepoet_pipeline::MeasurementScope::Plan,
-                    TruePeakPurpose::GainAuthority,
-                    valid_loudnorm_json(invalid),
-                    tonepoet_pipeline::DbNano::ZERO,
-                    tonepoet_pipeline::DbNano::ZERO,
-                    false,
-                )
-                .is_err(),
-                "unsupported input_tp syntax was accepted: {invalid}"
-            );
+    fn qualified_ffmpeg_int32_realization(
+        target_rate_hz: Option<u32>,
+    ) -> tonepoet_pipeline::SelectedPcmTerminalRealization {
+        tonepoet_pipeline::SelectedPcmTerminalRealization {
+            kind: tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            selected_tool: ToolIdentifier::Ffmpeg,
+            input_precision: tonepoet_pipeline::StoragePrecision::Pcm(
+                tonepoet_pipeline::PcmBitDepth::Float64,
+            ),
+            input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
+            target_format: AudioFormat::Wav,
+            target_rate_hz,
+            target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int32,
+            wavpack_hybrid: false,
+            effective_dither: Some(tonepoet_pipeline::DitherType::Tpdf),
+            ssrc_dither: None,
+            dither_owner: tonepoet_pipeline::PcmTerminalDitherOwner::SelectedTerminal,
         }
+    }
 
-        let missing = json.replace("\n                \"target_offset\": \"0.00\"", "");
-        assert!(parse_reference_true_peak_measurement(
-            MeasurementId(1),
-            tonepoet_pipeline::MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            missing,
-            tonepoet_pipeline::DbNano::ZERO,
-            tonepoet_pipeline::DbNano::ZERO,
-            false,
+    fn qualified_ffmpeg_int32_command(filter: &str) -> PlannedCommand {
+        PlannedCommand::new(
+            ToolIdentifier::Ffmpeg,
+            vec![
+                "-y".into(),
+                "-hide_banner".into(),
+                "-nostdin".into(),
+                "-f".into(),
+                "f64le".into(),
+                "-ar".into(),
+                "48000".into(),
+                "-ac".into(),
+                "2".into(),
+                "-i".into(),
+                "carrier.f64le".into(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-map_metadata".into(),
+                "-1".into(),
+                "-vn".into(),
+                "-af".into(),
+                filter.into(),
+                "-c:a".into(),
+                "pcm_s32le".into(),
+                "output.wav".into(),
+            ],
+            InputSource::Path(PathBuf::from("carrier.f64le")),
+            OutputSink::Path(PathBuf::from("output.wav")),
+            None,
+            "qualified FFmpeg Int32 terminal command-shape fixture",
         )
-        .is_err());
-        let unknown = json.replacen(
-            "\n            }",
-            ",\n                \"unexpected\": \"value\"\n            }",
-            1,
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_scalar_pump_rewrite_changes_only_input_transport() {
+        let command = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
         );
-        assert!(parse_reference_true_peak_measurement(
-            MeasurementId(1),
-            tonepoet_pipeline::MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            unknown,
-            tonepoet_pipeline::DbNano::ZERO,
-            tonepoet_pipeline::DbNano::ZERO,
-            false,
+        let streamed = planned_command_with_retained_pcm_scalar_stdin(
+            &command,
+            Path::new("carrier.f64le"),
         )
-        .is_err());
+        .expect("qualified FFmpeg terminal should support retained scalar stdin transport");
+
+        let mut expected_args = command.args.clone();
+        let input = expected_args
+            .iter()
+            .position(|arg| arg == "carrier.f64le")
+            .expect("path-backed terminal input");
+        expected_args[input] = "pipe:0".to_string();
+
+        assert_eq!(streamed.input, InputSource::Stdin);
+        assert_eq!(streamed.args, expected_args);
+        assert_eq!(streamed.tool, command.tool);
+        assert_eq!(streamed.output, command.output);
+        assert_eq!(streamed.environment_policy, command.environment_policy);
+        assert_eq!(streamed.environment, command.environment);
+        assert_eq!(streamed.expected_duration, command.expected_duration);
+        assert_eq!(streamed.timeout_budget, command.timeout_budget);
+        assert_eq!(streamed.description, command.description);
+        assert_eq!(streamed.metadata_effect, command.metadata_effect);
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_terminal_command_shape_accepts_only_same_rate_raw_f64le_terminal() {
+        let realization = qualified_ffmpeg_int32_realization(Some(48_000));
+        let command = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &realization)
+            .expect("canonical same-rate raw-f64le terminal must be covered");
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_terminal_command_shape_rejects_rate_conversion_and_extra_filters() {
+        let realization = qualified_ffmpeg_int32_realization(Some(48_000));
+        let wrong_rate = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=44100:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&wrong_rate, &realization)
+            .expect_err("terminal rate conversion is outside the qualified shape")
+            .contains("same-rate"));
+
+        let extra_filter = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32,volume=-1dB",
+        );
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&extra_filter, &realization)
+            .expect_err("a second audio filter is outside the qualified shape")
+            .contains("exactly one simple aresample filter"));
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_terminal_command_shape_rejects_unqualified_dither_options_and_ingress() {
+        let realization = qualified_ffmpeg_int32_realization(Some(48_000));
+        let dither_scale = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:dither_scale=1:out_sample_fmt=s32",
+        );
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&dither_scale, &realization)
+            .expect_err("dither_scale changes the qualified amplitude premise")
+            .contains("unqualified aresample option dither_scale"));
+
+        let forced_resample = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:flags=res:dither_method=triangular:out_sample_fmt=s32",
+        );
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&forced_resample, &realization)
+            .expect_err("forced same-rate resampling is outside the qualified terminal")
+            .contains("unqualified aresample option flags"));
+
+        let mut wrong_ingress = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        let format = wrong_ingress
+            .args
+            .iter()
+            .position(|arg| arg == "f64le")
+            .expect("raw input format");
+        wrong_ingress.args[format] = "f32le".to_string();
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&wrong_ingress, &realization)
+            .expect_err("non-Float64 ingress is outside the qualified shape")
+            .contains("requires raw f64le input"));
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_terminal_command_shape_rejects_late_audio_override() {
+        let realization = qualified_ffmpeg_int32_realization(Some(48_000));
+        let mut command = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        let output = command.args.pop().expect("output path");
+        command.args.extend(["-sample_fmt".into(), "s16".into(), output]);
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &realization)
+            .expect_err("unknown late audio options must fail closed")
+            .contains("unqualified argv option -sample_fmt"));
+
+        let mut second_ac = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        let output = second_ac.args.pop().expect("output path");
+        second_ac.args.extend(["-ac".into(), "1".into(), output]);
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&second_ac, &realization)
+            .expect_err("an output channel-count override could introduce rematrixing")
+            .contains("more than one -ac option"));
+
+        let mut output_ac = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        let ac_index = output_ac
+            .args
+            .iter()
+            .position(|arg| arg == "-ac")
+            .expect("input -ac");
+        output_ac.args.drain(ac_index..=ac_index + 1);
+        let output = output_ac.args.pop().expect("output path");
+        output_ac.args.extend(["-ac".into(), "2".into(), output]);
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&output_ac, &realization)
+            .expect_err("a lone output -ac must not be mistaken for the input channel declaration")
+            .contains("requires input option -ac before -i"));
+
+        let mut channel_layout = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        let output = channel_layout.args.pop().expect("output path");
+        channel_layout
+            .args
+            .extend(["-channel_layout".into(), "mono".into(), output]);
+        assert!(validate_qualified_ffmpeg_int32_terminal_command_shape(&channel_layout, &realization)
+            .expect_err("an explicit output layout is outside the identity-channel proof")
+            .contains("unqualified argv option -channel_layout"));
     }
 
     fn reference_wav_plan(
@@ -10164,7 +11278,7 @@ mod tests {
         target: tonepoet_pipeline::ResolvedOutputTarget,
     ) -> tonepoet_pipeline::ConversionPlan {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
         settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(depth);
@@ -10187,10 +11301,12 @@ mod tests {
                 sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
                 channels: Some(2),
                 duration: Some(Duration::from_secs(60)),
+                frame_extent: None,
                 dsd_source_kind: Some(tonepoet_pipeline::DsdSourceKind::DsdiffUncompressed),
                 audio_md5: None,
             },
             settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
             resolved_output_target: Some(target),
@@ -10207,157 +11323,64 @@ mod tests {
     }
 
     #[test]
-    fn reference_measurements_are_bound_to_their_summary_carrier_and_route() {
-        for target in [
-            tonepoet_pipeline::ResolvedOutputTarget::WavW64,
-            tonepoet_pipeline::ResolvedOutputTarget::WavRiff,
-            tonepoet_pipeline::ResolvedOutputTarget::WavRf64,
-        ] {
-            let f32 = reference_wav_plan(tonepoet_pipeline::PcmBitDepth::Float32, target);
-            let f32_summary = f32.reference.as_ref().expect("Reference summary");
-            let f32_measurements = f32
-                .steps()
-                .iter()
-                .filter_map(|step| match step {
-                    tonepoet_pipeline::PlannedExecutionStep::Measurement(value) => Some(value),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(f32_measurements.len(), 2);
-            for measurement in &f32_measurements {
-                validate_reference_measurement_binding(f32_summary, measurement)
-                    .expect("planner measurement binding is canonical");
-                validate_reference_measurement_contract(f32_summary, measurement)
-                    .expect("planner measurement transport is canonical");
-            }
-
-            let mut crossed_path = (*f32_measurements
-                .iter()
-                .find(|measurement| {
-                    measurement.purpose == TruePeakPurpose::PostFinalAcceptance
-                })
-                .expect("Float32 post measurement"))
-            .clone();
-            let wrong_path = f32_summary.r64_path.display().to_string();
-            crossed_path.input_stage.as_mut().unwrap().input =
-                InputSource::Path(f32_summary.r64_path.clone());
-            crossed_path.input_stage.as_mut().unwrap().args[6] = wrong_path;
-            assert!(
-                validate_reference_measurement_binding(f32_summary, &crossed_path).is_err(),
-                "crossed Float32 producer binding was accepted for {target:?}"
-            );
-            assert!(
-                validate_reference_measurement_contract(f32_summary, &crossed_path).is_err(),
-                "crossed Float32 producer contract was accepted for {target:?}"
-            );
-        }
-
-        let f64 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
-        let f64_summary = f64.reference.as_ref().expect("Reference summary");
-        let f64_post = f64
-            .steps()
+    fn reference_common_operations_bind_independent_reader_and_observer_authorities() {
+        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let observations = summary
+            .operations
             .iter()
-            .find_map(|step| match step {
-                tonepoet_pipeline::PlannedExecutionStep::Measurement(value)
-                    if value.purpose == TruePeakPurpose::PostFinalAcceptance =>
-                {
-                    Some(value)
-                }
+            .filter_map(|operation| match operation {
+                tonepoet_pipeline::DsdReferenceOperation::ObserveCertifiedTruePeak {
+                    measurement_id,
+                    subject,
+                    purpose,
+                    reader_authority,
+                    observer_identity,
+                } => Some((measurement_id, subject, purpose, reader_authority, observer_identity)),
                 _ => None,
             })
-            .expect("Float64 post measurement");
-        validate_reference_measurement_binding(f64_summary, f64_post)
-            .expect("Float64 post measurement uses direct SoX route");
-        assert!(matches!(
-            validate_reference_measurement_contract(f64_summary, f64_post)
-                .expect("Float64 direct SoX route is canonical"),
-            ReferenceMeasurementContract::SoxPathOversampledStats
-        ));
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(*observations[0].0, MeasurementId(1));
+        assert_eq!(*observations[0].1, tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64);
+        assert_eq!(*observations[0].2, TruePeakPurpose::GainAuthority);
+        assert_eq!(observations[0].3, tonepoet_pipeline::REFERENCE_R64_READER_ID);
+        assert_eq!(observations[0].4, tonepoet_pipeline::REFERENCE_CERTIFIED_OBSERVER_ID);
+        assert_eq!(*observations[1].0, MeasurementId(2));
+        assert_eq!(*observations[1].1, tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm);
+        assert_eq!(*observations[1].2, TruePeakPurpose::PostFinalAcceptance);
+        assert_eq!(observations[1].3, tonepoet_pipeline::REFERENCE_QPCM_READER_ID);
+        assert_eq!(observations[1].4, tonepoet_pipeline::REFERENCE_CERTIFIED_OBSERVER_ID);
+        assert_ne!(observations[0].3, observations[1].3);
     }
 
     #[test]
-    fn reference_measurement_contract_rejects_transport_or_argv_drift() {
-        let f32 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float32);
-        let f32_summary = f32.reference.as_ref().expect("Reference summary");
-        let f32_post = f32
-            .steps()
-            .iter()
-            .find_map(|step| match step {
-                tonepoet_pipeline::PlannedExecutionStep::Measurement(value)
-                    if value.purpose == TruePeakPurpose::PostFinalAcceptance =>
-                {
-                    Some(value)
-                }
-                _ => None,
-            })
-            .expect("Float32 post measurement");
-        assert!(matches!(
-            validate_reference_measurement_contract(f32_summary, f32_post)
-                .expect("canonical v15 Float32 measurement contract is accepted"),
-            ReferenceMeasurementContract::Float32FfmpegRawToSoxOversampledStats(_)
-        ));
-
-        let mut drifted = f32_post.clone();
-        drifted.input_stage.as_mut().unwrap().args[13] = "pcm_f32le".to_string();
-        assert!(validate_reference_measurement_contract(f32_summary, &drifted).is_err());
-
-        let mut drifted = f32_post.clone();
-        drifted.command.args[19] = "705600".to_string();
-        assert!(validate_reference_measurement_contract(f32_summary, &drifted).is_err());
-
-        let mut drifted = f32_post.clone();
-        drifted.command.environment_policy =
-            tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet;
-        assert!(validate_reference_measurement_contract(f32_summary, &drifted).is_err());
-
-        let f64 = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
-        let f64_summary = f64.reference.as_ref().expect("Reference summary");
-        let f64_pre = f64
-            .steps()
-            .iter()
-            .find_map(|step| match step {
-                tonepoet_pipeline::PlannedExecutionStep::Measurement(value)
-                    if value.purpose == TruePeakPurpose::GainAuthority => Some(value),
-                _ => None,
-            })
-            .expect("Float64 pre measurement");
-        assert!(matches!(
-            validate_reference_measurement_contract(f64_summary, f64_pre)
-                .expect("canonical v15 direct SoX contract is accepted"),
-            ReferenceMeasurementContract::SoxPathOversampledStats
-        ));
-        let mut drifted = f64_pre.clone();
-        drifted.command.args[8] = "705600".to_string();
-        assert!(validate_reference_measurement_contract(f64_summary, &drifted).is_err());
-        let mut drifted = f64_pre.clone();
-        drifted.input_stage = Some(PlannedCommand::new(
-            ToolIdentifier::Ffmpeg,
-            Vec::new(),
-            InputSource::Path(f64_summary.r64_path.clone()),
-            OutputSink::Stdout,
-            None,
-            "invalid producer",
-        ));
-        assert!(validate_reference_measurement_contract(f64_summary, &drifted).is_err());
-    }
-
-    #[test]
-    fn v7_float64_package_pipeline_binding_rejects_route_and_environment_drift() {
+    fn float64_package_pipeline_binding_rejects_route_and_environment_drift() {
         let plan = reference_wav_plan(
             tonepoet_pipeline::PcmBitDepth::Float64,
             tonepoet_pipeline::ResolvedOutputTarget::WavRf64,
         );
         let summary = plan.reference.as_ref().expect("Reference summary");
-        let pipeline = plan
-            .steps()
-            .iter()
-            .find_map(|step| match step {
-                tonepoet_pipeline::PlannedExecutionStep::Pipeline(value) => Some(value),
-                _ => None,
-            })
-            .expect("Float64 RF64 package pipeline");
-        validate_reference_package_pipeline(summary, pipeline)
-            .expect("planner-owned package pipeline is canonical");
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Float64);
+        let lowering = tonepoet_pipeline::lower_reference_package(
+            &summary.qpcm_path,
+            &summary.packaged_path,
+            summary.target,
+            summary.final_pcm,
+            &settings,
+        )
+        .expect("qualified package lowering")
+        .expect("RF64 requires package lowering");
+        let tonepoet_pipeline::ReferencePackageLowering::Pipeline(pipeline) = lowering else {
+            panic!("Float64 RF64 must use the qualified SoX-to-FFmpeg pipeline");
+        };
+        validate_reference_package_pipeline(summary, &pipeline)
+            .expect("common package pipeline is canonical");
 
         let mut direct_decode = pipeline.clone();
         direct_decode.consumer.input = InputSource::Path(summary.qpcm_path.clone());
@@ -10720,6 +11743,296 @@ mod tests {
         }
     }
 
+    fn test_reference_tool_identity(binary: ToolBinary, label: &str) -> ReferenceToolIdentity {
+        let command = command_record_for_unstarted_command(&test_tool_command(binary));
+        ReferenceToolIdentity {
+            canonical_path: PathBuf::from(format!("/test/{label}")),
+            executable_sha256: Sha256Digest::of_bytes(format!("{label}-executable").as_bytes()),
+            reported_version: format!("{label}-version"),
+            version_probe_command: command.clone(),
+            closure_digest: Sha256Digest::of_bytes(format!("{label}-closure").as_bytes()),
+            behavior_probe_digest: Sha256Digest::of_bytes(format!("{label}-probe").as_bytes()),
+            behavior_probe_command: command,
+        }
+    }
+
+    fn test_reference_metadata_identity(
+        binary: ToolBinary,
+        label: &str,
+    ) -> ReferenceMetadataMutatorIdentity {
+        ReferenceMetadataMutatorIdentity {
+            canonical_path: PathBuf::from(format!("/test/{label}")),
+            executable_sha256: Sha256Digest::of_bytes(format!("{label}-executable").as_bytes()),
+            reported_version: format!("{label}-version"),
+            version_probe_command: command_record_for_unstarted_command(&test_tool_command(binary)),
+            closure_digest: Sha256Digest::of_bytes(format!("{label}-closure").as_bytes()),
+        }
+    }
+
+    #[test]
+    fn phase5_runtime_closure_separates_core_and_metadata_mutation_binding() {
+        let (candidate_bytes, candidate) =
+            embedded_reference_common_candidate().expect("Phase-5 candidate parses");
+        let sox = test_reference_tool_identity(ToolBinary::Sox, "sox");
+        let ffmpeg = test_reference_tool_identity(ToolBinary::Ffmpeg, "ffmpeg");
+        let platform = Sha256Digest::of_bytes(b"test-platform");
+        let dispatch = Sha256Digest::of_bytes(b"test-dispatch");
+        let fixture = Sha256Digest::of_bytes(b"test-fixture");
+
+        let core = reference_common_runtime_closure_fingerprint(
+            candidate_bytes,
+            &candidate,
+            &sox,
+            &ffmpeg,
+            "test-sacd-rs",
+            fixture,
+            platform,
+            dispatch,
+        )
+        .expect("core runtime closure hashes");
+
+        let mut mutators = ReferenceMetadataMutatorToolchain {
+            metaflac: test_reference_metadata_identity(ToolBinary::Metaflac, "metaflac"),
+            wvtag: test_reference_metadata_identity(ToolBinary::Wvtag, "wvtag"),
+            atomic_parsley: test_reference_metadata_identity(
+                ToolBinary::AtomicParsley,
+                "AtomicParsley",
+            ),
+        };
+        let metadata = reference_metadata_mutation_closure_fingerprint(&core, &mutators);
+
+        mutators.metaflac.executable_sha256 = Sha256Digest::of_bytes(b"changed-metaflac");
+        let changed_metadata =
+            reference_metadata_mutation_closure_fingerprint(&core, &mutators);
+        assert_ne!(
+            metadata, changed_metadata,
+            "metadata executable identity must bind the metadata-mutation closure"
+        );
+
+        let unchanged_core = reference_common_runtime_closure_fingerprint(
+            candidate_bytes,
+            &candidate,
+            &sox,
+            &ffmpeg,
+            "test-sacd-rs",
+            fixture,
+            platform,
+            dispatch,
+        )
+        .expect("core runtime closure remains plan-independent");
+        assert_eq!(
+            core, unchanged_core,
+            "optional metadata identity must not split the core runtime closure"
+        );
+    }
+
+    #[test]
+    fn phase5_promotion_binds_core_and_optional_metadata_closure_variants() {
+        let temp = TempDir::new().expect("temp dir");
+        let source = temp.path().join("source.dsf");
+        write_reference_dsf_fixture(&source);
+        let track = reference_materialization_track(TrackSourceRef::StagedFile(source.clone()));
+
+        let mut metadata_disabled_request = reference_production_request(temp.path());
+        metadata_disabled_request.settings.metadata.transfer_tags = true;
+        metadata_disabled_request.settings.metadata.preserve_artwork = true;
+        metadata_disabled_request.stages.metadata = StageRequirement::Disabled;
+        let metadata_disabled_plan_request = plan_request_for_track(
+            &metadata_disabled_request,
+            &track,
+            &source,
+            &temp.path().join("metadata-disabled.w64"),
+            temp.path().join("metadata-disabled-work"),
+        )
+        .expect("metadata-disabled Reference W64 route is admitted");
+        let metadata_disabled_plan = tonepoet_pipeline::plan_conversion(&metadata_disabled_plan_request)
+            .expect("metadata-disabled Reference route plans");
+        let metadata_disabled_summary = metadata_disabled_plan
+            .reference
+            .as_ref()
+            .expect("metadata-disabled Reference summary");
+        assert!(!reference_metadata_attestation_required(&metadata_disabled_request));
+
+        let mut metadata_enabled_request = metadata_test_request(temp.path());
+        metadata_enabled_request.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        metadata_enabled_request.settings.target_format = AudioFormat::Flac;
+        metadata_enabled_request.settings.target_sample_rate =
+            tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        metadata_enabled_request.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        metadata_enabled_request.settings.force_encode = true;
+        metadata_enabled_request.settings.metadata.transfer_tags = true;
+        metadata_enabled_request.settings.metadata.preserve_artwork = true;
+        metadata_enabled_request.stages.metadata = StageRequirement::Enabled;
+        metadata_enabled_request.container_extension = Some("flac".to_string());
+        let metadata_enabled_plan_request = plan_request_for_track(
+            &metadata_enabled_request,
+            &track,
+            &source,
+            &temp.path().join("metadata-enabled.flac"),
+            temp.path().join("metadata-enabled-work"),
+        )
+        .expect("metadata-enabled Reference FLAC route is admitted");
+        let metadata_enabled_plan = tonepoet_pipeline::plan_conversion(&metadata_enabled_plan_request)
+            .expect("metadata-enabled Reference route plans");
+        let metadata_enabled_summary = metadata_enabled_plan
+            .reference
+            .as_ref()
+            .expect("metadata-enabled Reference summary");
+        assert!(reference_metadata_attestation_required(&metadata_enabled_request));
+        assert_eq!(
+            metadata_disabled_summary.qualification_candidate_manifest_digest,
+            metadata_enabled_summary.qualification_candidate_manifest_digest,
+            "both admitted routes must bind the same Phase-5 candidate",
+        );
+
+        let core_fingerprint = "11".repeat(32);
+        let mutators = ReferenceMetadataMutatorToolchain {
+            metaflac: test_reference_metadata_identity(ToolBinary::Metaflac, "metaflac"),
+            wvtag: test_reference_metadata_identity(ToolBinary::Wvtag, "wvtag"),
+            atomic_parsley: test_reference_metadata_identity(
+                ToolBinary::AtomicParsley,
+                "AtomicParsley",
+            ),
+        };
+        let metadata_fingerprint =
+            reference_metadata_mutation_closure_fingerprint(&core_fingerprint, &mutators);
+        let metadata_disabled_toolchain = ReferenceToolchainEvidence {
+            qualification_candidate_manifest_digest: metadata_disabled_summary.qualification_candidate_manifest_digest,
+            common_runtime_closure_fingerprint_sha256: core_fingerprint.clone(),
+            metadata_mutation_closure_fingerprint_sha256: None,
+            sox_ng: test_reference_tool_identity(ToolBinary::Sox, "sox"),
+            ffmpeg: test_reference_tool_identity(ToolBinary::Ffmpeg, "ffmpeg"),
+            metadata_mutators: None,
+            sacd_rs_build_identity: "test-sacd-rs".to_string(),
+            dst_fixture_digest: Sha256Digest::of_bytes(b"test-fixture"),
+            platform_abi_digest: Sha256Digest::of_bytes(b"test-platform"),
+            runtime_dispatch_digest: Sha256Digest::of_bytes(b"test-dispatch"),
+        };
+
+        let error = validate_reference_production_promotion_preflight(metadata_disabled_summary)
+            .expect_err("checked-in not-run evidence cannot pass production preflight");
+        assert!(
+            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
+            "not-run Phase-5 evidence must be a qualification refusal: {error}"
+        );
+
+        let candidate_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+        ));
+        let candidate_digest = tonepoet_pipeline::reference_sha256_hex(candidate_bytes);
+        let gates = tonepoet_pipeline::REFERENCE_REQUIRED_RELEASE_GATES
+            .iter()
+            .map(|gate| tonepoet_pipeline::ReferenceReleaseGateResultV1 {
+                gate: (*gate).to_string(),
+                status: "passed".to_string(),
+                evidence_sha256: Some(tonepoet_pipeline::reference_sha256_hex(
+                    format!("test-evidence:{gate}").as_bytes(),
+                )),
+            })
+            .collect::<Vec<_>>();
+        let report = tonepoet_pipeline::ReferenceQualificationReportV1 {
+            schema_version: tonepoet_pipeline::REFERENCE_COMMON_QUALIFICATION_SCHEMA_VERSION,
+            execution_model: tonepoet_pipeline::REFERENCE_COMMON_EXECUTION_MODEL.to_string(),
+            status: "passed".to_string(),
+            candidate_manifest_sha256: candidate_digest.clone(),
+            runtime_closure_fingerprint_sha256: core_fingerprint.clone(),
+            metadata_mutation_closure_fingerprint_sha256: Some(metadata_fingerprint.clone()),
+            positive_case_count: 1,
+            expected_negative_case_count: 1,
+            gates: gates.clone(),
+        };
+        let report_bytes = serde_json::to_vec(&report).expect("serialize synthetic report");
+        let certification = tonepoet_pipeline::ReferenceReleaseCertificationV1 {
+            schema_version: tonepoet_pipeline::REFERENCE_COMMON_QUALIFICATION_SCHEMA_VERSION,
+            execution_model: tonepoet_pipeline::REFERENCE_COMMON_EXECUTION_MODEL.to_string(),
+            status: "passed".to_string(),
+            outcome: "qualified".to_string(),
+            candidate_manifest_sha256: candidate_digest,
+            qualification_report_sha256: tonepoet_pipeline::reference_sha256_hex(&report_bytes),
+            runtime_closure_fingerprint_sha256: core_fingerprint.clone(),
+            metadata_mutation_closure_fingerprint_sha256: Some(metadata_fingerprint.clone()),
+            positive_case_count: report.positive_case_count,
+            expected_negative_case_count: report.expected_negative_case_count,
+            gates,
+        };
+        let certification_bytes =
+            serde_json::to_vec(&certification).expect("serialize synthetic certification");
+
+        validate_reference_production_promotion_evidence(
+            metadata_disabled_summary,
+            &metadata_disabled_toolchain,
+            &report_bytes,
+            &certification_bytes,
+        )
+        .expect("one completed release activates the metadata-disabled closure variant");
+
+        let mut candidate_mismatch_toolchain = metadata_disabled_toolchain.clone();
+        candidate_mismatch_toolchain.qualification_candidate_manifest_digest =
+            Sha256Digest::of_bytes(b"different-candidate");
+        let candidate_mismatch = validate_reference_production_promotion_evidence(
+            metadata_disabled_summary,
+            &candidate_mismatch_toolchain,
+            &report_bytes,
+            &certification_bytes,
+        )
+        .expect_err("mismatched Phase-5 candidate cannot promote production");
+        assert!(matches!(
+            &candidate_mismatch.error,
+            ConvertError::QualificationUnavailable(_)
+        ));
+
+        let mut metadata_enabled_toolchain = metadata_disabled_toolchain.clone();
+        metadata_enabled_toolchain.metadata_mutators = Some(mutators.clone());
+        metadata_enabled_toolchain.metadata_mutation_closure_fingerprint_sha256 =
+            Some(metadata_fingerprint.clone());
+        validate_reference_production_promotion_evidence(
+            metadata_enabled_summary,
+            &metadata_enabled_toolchain,
+            &report_bytes,
+            &certification_bytes,
+        )
+        .expect("the same completed release activates the metadata-enabled closure variant");
+
+        let mut changed_mutators = mutators;
+        changed_mutators.metaflac.executable_sha256 =
+            Sha256Digest::of_bytes(b"changed-metaflac");
+        metadata_enabled_toolchain.metadata_mutators = Some(changed_mutators.clone());
+        metadata_enabled_toolchain.metadata_mutation_closure_fingerprint_sha256 = Some(
+            reference_metadata_mutation_closure_fingerprint(
+                &core_fingerprint,
+                &changed_mutators,
+            ),
+        );
+        let metadata_mismatch = validate_reference_production_promotion_evidence(
+            metadata_enabled_summary,
+            &metadata_enabled_toolchain,
+            &report_bytes,
+            &certification_bytes,
+        )
+        .expect_err("changed required metadata executable must invalidate promotion");
+        assert!(matches!(
+            &metadata_mismatch.error,
+            ConvertError::QualificationUnavailable(_)
+        ));
+
+        let mut core_mismatch = metadata_disabled_toolchain;
+        core_mismatch.common_runtime_closure_fingerprint_sha256 = "22".repeat(32);
+        let mismatch = validate_reference_production_promotion_evidence(
+            metadata_disabled_summary,
+            &core_mismatch,
+            &report_bytes,
+            &certification_bytes,
+        )
+        .expect_err("mismatched Phase-5 core runtime closure cannot promote production");
+        assert!(matches!(
+            &mismatch.error,
+            ConvertError::QualificationUnavailable(_)
+        ));
+    }
+
     fn env_value<'a>(cmd: &'a ToolCommand, key: &str) -> Option<&'a str> {
         cmd.env
             .iter()
@@ -10744,9 +12057,12 @@ mod tests {
 
     fn metadata_test_request(root: &Path) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             job_id: "metadata-job".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "metadata-item".to_string(),
+            submission_id: None,
+            submission_size: None,
             container: root.join("album.iso"),
             source: SourceOptions {
                 archive_password: None,
@@ -10832,6 +12148,343 @@ mod tests {
         }
     }
 
+    fn certified_terminal_test_track(
+        root: &Path,
+        tool: ToolIdentifier,
+        target_format: AudioFormat,
+        wavpack_hybrid: bool,
+    ) -> PreparedTrack {
+        let terminal_realization = if target_format.is_lossy() {
+            tonepoet_pipeline::SelectedTerminalRealization::LossyFfmpegEncoderInput {
+                target_format: target_format.clone(),
+                target_rate_hz: Some(48_000),
+                apply_processing: false,
+            }
+        } else {
+            let kind = match (&tool, wavpack_hybrid) {
+                (ToolIdentifier::Sox, false) => {
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect
+                }
+                (ToolIdentifier::Ffmpeg, true) => {
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid
+                }
+                (ToolIdentifier::Ffmpeg, false) => {
+                    tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect
+                }
+                _ => panic!("unsupported certified terminal test realization"),
+            };
+            tonepoet_pipeline::SelectedTerminalRealization::Pcm(
+                tonepoet_pipeline::SelectedPcmTerminalRealization {
+                    kind,
+                    selected_tool: tool.clone(),
+                    input_precision: tonepoet_pipeline::StoragePrecision::Pcm(
+                        tonepoet_pipeline::PcmBitDepth::Float64,
+                    ),
+                    input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
+                    target_format: target_format.clone(),
+                    target_rate_hz: Some(48_000),
+                    target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                    wavpack_hybrid,
+                    effective_dither: None,
+                    ssrc_dither: None,
+                    dither_owner: tonepoet_pipeline::PcmTerminalDitherOwner::None,
+                },
+            )
+        };
+        let mut track = metadata_test_track(TrackSourceRef::PcmTruePeakCarrier {
+            path: root.join("carrier.f64le"),
+            source_path: root.join("source.wav"),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            duration: None,
+            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            point_dbtp: Some("-1.000000000".parse().expect("point")),
+            effective_target_dbtp: "-1.000000000".parse().expect("target"),
+            lossy_target_capped: false,
+            terminal_candidate: Some(SelectedPhysicalCandidateBinding {
+                identity: format!("test-terminal:{tool}"),
+                tool,
+                terminal_realization: Some(terminal_realization),
+                strong_ssrc_resampler: None,
+            }),
+        });
+        track.sample_rate = Some(48_000);
+        track.bit_depth = Some(640);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(48_000),
+            Some(64),
+            Some(SourceAudioCoding::Pcm),
+        );
+        track
+    }
+
+    fn certified_terminal_test_request(
+        root: &Path,
+        target_format: AudioFormat,
+    ) -> tonepoet_pipeline::PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = target_format;
+        settings.verification.verify_after_encode = true;
+        settings.pcm_true_peak.set_policy(
+            tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                target_dbtp: "-1.000000000".parse().expect("target"),
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            },
+        );
+        tonepoet_pipeline::PlanRequest {
+            input_path: root.join("carrier.f64le"),
+            output_path: root.join("out"),
+            source: tonepoet_pipeline::SourceInfo {
+                format: AudioFormat::Wav,
+                codec: tonepoet_pipeline::AudioCodec::PcmFloat,
+                sample_rate_hz: Some(48_000),
+                bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Float64),
+                true_source_depth: None,
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::Float),
+                channels: Some(2),
+                duration: Some(Duration::from_secs(1)),
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("terminal-binding-test"),
+            intermediate_dir: Some(root.join("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        }
+    }
+
+    fn verification_command_for_test(
+        tool: ToolIdentifier,
+        input: &Path,
+    ) -> PlannedCommand {
+        PlannedCommand::new(
+            tool,
+            vec!["verify".to_string()],
+            InputSource::Path(input.to_path_buf()),
+            OutputSink::Stdout,
+            Some(Duration::from_secs(1)),
+            "verify encoded output",
+        )
+    }
+
+    fn finalized_execute_plan_for_test(
+        commands: Vec<PlannedCommand>,
+        from: &Path,
+        to: &Path,
+    ) -> ConversionPlan {
+        ConversionPlan::execute_with_cleanup(
+            commands,
+            Vec::new(),
+            Some(Finalization::AtomicRename {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+            }),
+        )
+    }
+
+    #[test]
+    fn certified_terminal_prelaunch_check_uses_finalized_sox_artifact_before_native_flac_verify() {
+        let temp = TempDir::new().expect("temp dir");
+        let track = certified_terminal_test_track(temp.path(), ToolIdentifier::Sox, AudioFormat::Flac, false);
+        let mut plan_request = certified_terminal_test_request(temp.path(), AudioFormat::Flac);
+        plan_request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Sox;
+        let work = temp.path().join("work/out.flac");
+        let output = temp.path().join("out.flac");
+        let plan = finalized_execute_plan_for_test(
+            vec![
+                planned_command_for_test(
+                    ToolIdentifier::Sox,
+                    vec!["encode".to_string()],
+                    &work,
+                ),
+                verification_command_for_test(ToolIdentifier::Flac, &work),
+            ],
+            &work,
+            &output,
+        );
+        let PlanAction::Execute {
+            commands,
+            finalization,
+            ..
+        } = &plan.action
+        else {
+            panic!("test plan must execute");
+        };
+
+        let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+            .expect("SoX command creates the finalized work artifact");
+        assert_eq!(terminal.tool, ToolIdentifier::Sox);
+        validate_certified_terminal_candidate_realization(&track, &plan_request, &plan)
+            .expect("trailing native FLAC verification must not replace the charged SoX terminal");
+    }
+
+    #[test]
+    fn certified_terminal_prelaunch_check_uses_ffmpeg_encoder_not_ffmpeg_verifier() {
+        let temp = TempDir::new().expect("temp dir");
+        let track = certified_terminal_test_track(temp.path(), ToolIdentifier::Ffmpeg, AudioFormat::Opus, false);
+        let mut plan_request = certified_terminal_test_request(temp.path(), AudioFormat::Opus);
+        plan_request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let work = temp.path().join("work/out.opus");
+        let output = temp.path().join("out.opus");
+        let plan = finalized_execute_plan_for_test(
+            vec![
+                planned_command_for_test(
+                    ToolIdentifier::Ffmpeg,
+                    vec!["encode".to_string()],
+                    &work,
+                ),
+                verification_command_for_test(ToolIdentifier::Ffmpeg, &work),
+            ],
+            &work,
+            &output,
+        );
+        let PlanAction::Execute {
+            commands,
+            finalization,
+            ..
+        } = &plan.action
+        else {
+            panic!("test plan must execute");
+        };
+
+        let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+            .expect("FFmpeg encoder creates the finalized work artifact");
+        assert_eq!(terminal.description, "test command");
+        assert_eq!(terminal.tool, ToolIdentifier::Ffmpeg);
+        validate_certified_terminal_candidate_realization(&track, &plan_request, &plan)
+            .expect("FFmpeg verification after FFmpeg encoding must not become the identity proof");
+    }
+
+    #[test]
+    fn certified_terminal_prelaunch_check_rejects_wrong_artifact_producer_before_valid_verifier() {
+        let temp = TempDir::new().expect("temp dir");
+        let track = certified_terminal_test_track(temp.path(), ToolIdentifier::Ffmpeg, AudioFormat::Opus, false);
+        let mut plan_request = certified_terminal_test_request(temp.path(), AudioFormat::Opus);
+        plan_request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let work = temp.path().join("work/out.opus");
+        let output = temp.path().join("out.opus");
+        let plan = finalized_execute_plan_for_test(
+            vec![
+                planned_command_for_test(
+                    ToolIdentifier::Sox,
+                    vec!["wrong-encoder".to_string()],
+                    &work,
+                ),
+                verification_command_for_test(ToolIdentifier::Ffmpeg, &work),
+            ],
+            &work,
+            &output,
+        );
+
+        let error = validate_certified_terminal_candidate_realization(&track, &plan_request, &plan)
+            .expect_err("a valid FFmpeg verifier must not hide the wrong artifact-producing terminal");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match lowered artifact-producing terminal sox"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn certified_terminal_prelaunch_check_preserves_wavpack_delegate_with_verification() {
+        let temp = TempDir::new().expect("temp dir");
+        let track = certified_terminal_test_track(temp.path(), ToolIdentifier::Ffmpeg, AudioFormat::WavPack, true);
+        let mut plan_request = certified_terminal_test_request(temp.path(), AudioFormat::WavPack);
+        plan_request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        plan_request.settings.wavpack.hybrid = true;
+        let preterminal = temp.path().join("work/hybrid.wav");
+        let work = temp.path().join("work/out.wv");
+        let output = temp.path().join("out.wv");
+        let plan = finalized_execute_plan_for_test(
+            vec![
+                planned_command_for_test(
+                    ToolIdentifier::Ffmpeg,
+                    vec!["preterminal".to_string()],
+                    &preterminal,
+                ),
+                planned_command_for_test(
+                    ToolIdentifier::Custom("wavpack".to_string()),
+                    vec!["encode".to_string()],
+                    &work,
+                ),
+                verification_command_for_test(ToolIdentifier::Ffmpeg, &work),
+            ],
+            &work,
+            &output,
+        );
+        let PlanAction::Execute {
+            commands,
+            finalization,
+            ..
+        } = &plan.action
+        else {
+            panic!("test plan must execute");
+        };
+
+        let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+            .expect("native WavPack command creates the finalized work artifact");
+        assert_eq!(terminal.tool, ToolIdentifier::Custom("wavpack".to_string()));
+        validate_certified_terminal_candidate_realization(&track, &plan_request, &plan)
+            .expect("the established FFmpeg-owned WavPack hybrid delegation must remain valid");
+    }
+
+    #[test]
+    fn certified_terminal_prelaunch_check_fails_closed_without_unique_artifact_producer() {
+        let temp = TempDir::new().expect("temp dir");
+        let track = certified_terminal_test_track(temp.path(), ToolIdentifier::Ffmpeg, AudioFormat::Opus, false);
+        let mut plan_request = certified_terminal_test_request(temp.path(), AudioFormat::Opus);
+        plan_request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let work = temp.path().join("work/out.opus");
+        let output = temp.path().join("out.opus");
+        let ambiguous = finalized_execute_plan_for_test(
+            vec![
+                planned_command_for_test(
+                    ToolIdentifier::Ffmpeg,
+                    vec!["encode-a".to_string()],
+                    &work,
+                ),
+                planned_command_for_test(
+                    ToolIdentifier::Ffmpeg,
+                    vec!["encode-b".to_string()],
+                    &work,
+                ),
+            ],
+            &work,
+            &output,
+        );
+        let error = validate_certified_terminal_candidate_realization(
+            &track,
+            &plan_request,
+            &ambiguous,
+        )
+        .expect_err("ambiguous artifact production must fail closed");
+        assert!(error.to_string().contains("multiple commands create"));
+
+        let missing_finalization = ConversionPlan::execute_with_cleanup(
+            vec![planned_command_for_test(
+                ToolIdentifier::Ffmpeg,
+                vec!["encode".to_string()],
+                &work,
+            )],
+            Vec::new(),
+            None,
+        );
+        let error = validate_certified_terminal_candidate_realization(
+            &track,
+            &plan_request,
+            &missing_finalization,
+        )
+        .expect_err("certified execution without finalization authority must fail closed");
+        assert!(error.to_string().contains("no atomic-rename finalization authority"));
+    }
+
     async fn execute_commands_for_test(
         commands: Vec<PlannedCommand>,
         runner: &dyn ToolRunner,
@@ -10845,6 +12498,7 @@ mod tests {
         );
         execute_commands(
             &commands,
+            None,
             runner,
             cancel,
             &HashMap::new(),
@@ -11966,12 +13620,11 @@ mod tests {
             match &plan.action {
                 PlanAction::Execute {
                     commands,
-                    steps,
                     finalization,
                     ..
                 } => {
                     assert!(
-                        !commands.is_empty() || !steps.is_empty(),
+                        !commands.is_empty(),
                         "cleanup fixture must exercise production command execution"
                     );
                     assert!(
@@ -12020,7 +13673,7 @@ mod tests {
         source_kind: tonepoet_pipeline::DsdSourceKind,
     ) -> tonepoet_pipeline::PlanRequest {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
         settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
@@ -12053,10 +13706,12 @@ mod tests {
                 sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
                 channels: Some(2),
                 duration: Some(Duration::from_secs(1)),
+                frame_extent: None,
                 dsd_source_kind: Some(source_kind),
                 audio_md5: None,
             },
             settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(work_dir.to_path_buf()),
             container_ffmpeg_flags: Vec::new(),
             resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::WavW64),
@@ -12206,7 +13861,7 @@ mod tests {
 
     fn reference_production_request(root: &Path) -> PipelineRequest {
         let mut request = metadata_test_request(root);
-        request.settings.dsd = tonepoet_pipeline::DsdSettings::native_v2();
+        request.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
         request.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
         request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
         request.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
@@ -12220,6 +13875,132 @@ mod tests {
         request.container_extension = Some("w64".to_string());
         request.container_ffmpeg_flags.clear();
         request
+    }
+
+    #[test]
+    fn reference_metadata_attestation_follows_real_stage_policy_not_common_plan_marker() {
+        let temp = tempfile::tempdir().expect("Reference metadata-stage ownership tempdir");
+        let source = temp.path().join("source.dsf");
+        let staged_output = temp.path().join("reference-output.w64");
+        let convert_root = temp.path().join("convert");
+        let work_dir = convert_root.join(".track-0001.work");
+        let mut request = reference_production_request(temp.path());
+        request.settings.metadata.transfer_tags = true;
+        request.settings.metadata.preserve_artwork = true;
+        request.stages.metadata = StageRequirement::Disabled;
+        let track = reference_materialization_track(TrackSourceRef::StagedFile(source.clone()));
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &source,
+            &staged_output,
+            work_dir,
+        )
+        .expect("Reference W64 remains admissible when the real metadata stage is disabled");
+        let plan = tonepoet_pipeline::plan_conversion(&plan_request)
+            .expect("metadata-disabled Reference W64 plans");
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        assert!(
+            summary.operations.iter().any(|operation| matches!(
+                operation,
+                tonepoet_pipeline::DsdReferenceOperation::MutateMetadata
+            )),
+            "PlanRequest intentionally retains metadata intent even though StagePolicy is external"
+        );
+        assert!(
+            !reference_metadata_attestation_required(&request),
+            "production attestation must follow the actual disabled metadata stage"
+        );
+    }
+
+    struct MissingSoxNoInvocationRunner {
+        interactions: AtomicUsize,
+    }
+
+    impl MissingSoxNoInvocationRunner {
+        fn new() -> Self {
+            Self {
+                interactions: AtomicUsize::new(0),
+            }
+        }
+
+        fn interactions(&self) -> usize {
+            self.interactions.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for MissingSoxNoInvocationRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            self.interactions.fetch_add(1, Ordering::SeqCst);
+            Err(ToolRunnerError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "test runner must not launch a tool before Phase-5 promotion preflight",
+            )))
+        }
+
+        fn tool_available(&self, _binary: ToolBinary) -> bool {
+            self.interactions.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+
+        fn resolved_tool_path(&self, _binary: ToolBinary) -> Option<PathBuf> {
+            self.interactions.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn production_not_run_promotion_preflight_precedes_tool_attestation() {
+        let temp = tempfile::tempdir().expect("Reference production preflight tempdir");
+        let source = temp.path().join("source.dsf");
+        write_reference_dsf_fixture(&source);
+        let staged_output = temp.path().join("reference-output.w64");
+        let convert_root = temp.path().join("convert");
+        let request = reference_production_request(temp.path());
+        let track = reference_materialization_track(TrackSourceRef::StagedFile(source.clone()));
+        let runner = MissingSoxNoInvocationRunner::new();
+        let cancel = CancellationToken::new();
+        let mut progress = OperationProgressTracker::new(
+            "reference-production-promotion-preflight".to_string(),
+            PipelineStage::Convert,
+            None,
+        );
+
+        let error = execute_planned_track_conversion(
+            &request,
+            &track,
+            &source,
+            &staged_output,
+            &convert_root,
+            &runner,
+            &cancel,
+            &HashMap::new(),
+            None,
+            &mut progress,
+            0.0,
+            1.0,
+        )
+        .await
+        .expect_err("checked-in not-run Phase-5 evidence must block production");
+
+        assert!(
+            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
+            "known not-run evidence must win over missing SoX: {error}"
+        );
+        assert_eq!(
+            runner.interactions(),
+            0,
+            "production promotion preflight must not query or launch a tool"
+        );
+        assert!(
+            !staged_output.exists(),
+            "promotion refusal must occur before Reference publication"
+        );
     }
 
     async fn assert_reference_production_abort_cleanup(
@@ -12799,93 +14580,6 @@ mod tests {
         drop(release);
     }
 
-    #[tokio::test]
-    async fn silence_scan_temporary_is_removed_on_failure_and_success() {
-        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
-        let carrier = plan
-            .reference
-            .as_ref()
-            .expect("Reference summary")
-            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
-            .expect("qualified Float64 W64 carrier");
-
-        for behavior in [
-            ToolBehavior::FailAfterWriting {
-                path: PathBuf::from("placeholder"),
-                bytes: vec![0; 8],
-                stderr: "decoder failed".to_string(),
-            },
-            ToolBehavior::SucceedAndWrite {
-                path: PathBuf::from("placeholder"),
-                bytes: vec![0; 8],
-            },
-        ] {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let raw = temp.path().join("reference-silence-scan.f64le");
-            let behavior = match behavior {
-                ToolBehavior::FailAfterWriting { bytes, stderr, .. } => {
-                    ToolBehavior::FailAfterWriting {
-                        path: raw.clone(),
-                        bytes,
-                        stderr,
-                    }
-                }
-                ToolBehavior::SucceedAndWrite { bytes, .. } => ToolBehavior::SucceedAndWrite {
-                    path: raw.clone(),
-                    bytes,
-                },
-                _ => unreachable!(),
-            };
-            let runner = BlockingToolRunner::with_behaviors([behavior]);
-            let cancel = CancellationToken::new();
-            let _ = verify_signed_zero_audio(&carrier, &runner, &cancel, None, &raw).await;
-            assert!(!raw.exists(), "silence scan raw stream remains after return");
-        }
-    }
-
-    #[tokio::test]
-    async fn silence_scan_temporary_is_removed_on_decoder_cancellation() {
-        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
-        let carrier = plan
-            .reference
-            .as_ref()
-            .expect("Reference summary")
-            .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
-            .expect("qualified Float64 W64 carrier");
-        let temp = tempfile::tempdir().expect("temp dir");
-        let raw = temp.path().join("reference-silence-scan.f64le");
-        let (gate, blocker) = tool_gate();
-        let runner = Arc::new(BlockingToolRunner::with_behaviors([
-            ToolBehavior::BlockThenSucceed(blocker),
-        ]));
-        let cancel = CancellationToken::new();
-        let run_cancel = cancel.clone();
-        let run_runner = runner.clone();
-        let run_carrier = carrier.clone();
-        let planned_raw_path = raw.clone();
-        let handle = tokio::spawn(async move {
-            verify_signed_zero_audio(
-                &run_carrier,
-                run_runner.as_ref(),
-                &run_cancel,
-                None,
-                &planned_raw_path,
-            )
-            .await
-        });
-
-        let release = gate.wait_started().await;
-        std::fs::write(&raw, vec![0; 8]).expect("seed partial silence stream");
-        cancel.cancel();
-        let error = handle
-            .await
-            .expect("silence task joins")
-            .expect_err("decoder cancellation must fail silence verification");
-        assert!(error.to_string().contains("cancelled"));
-        assert!(!raw.exists());
-        drop(release);
-    }
-
     #[test]
     fn weighted_windows_handle_ffmpeg_ssrc_sox_chain_deterministically() {
         let commands = vec![
@@ -13051,6 +14745,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
             } => {
                 match execute_commands(
                     commands,
+                    None,
                     runner,
                     cancel,
                     &HashMap::new(),

@@ -1,282 +1,1763 @@
-//! Shared ReplayGain command and post-scan policy.
+//! Native production ReplayGain/loudness integration.
 //!
-//! The conversion pipeline and the metadata editor must invoke `loudgain`
-//! with the same argument semantics. Track-only scans also share one cleanup
-//! path for inherited album-level tags so the same file cannot acquire
-//! different ReplayGain state depending on which UI initiated the scan.
+//! Phase 4 deliberately keeps four boundaries separate:
+//! * PCM reading/completion is application-owned;
+//! * loudness and reporting-peak arithmetic are owned by `tonepoet-true-peak`;
+//! * ReplayGain projection is pure policy;
+//! * serialization is owned by Tonepoet's format-specific metadata writer.
+//!
+//! `LoudnessProfile::NativeEbu2023` is the only production profile used here.
+//! The compatibility profiles in the numerical crate remain differential tools
+//! and are never accepted as native observation identity.
 
-use std::io;
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::fmt;
+use std::io::{self, Read};
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 use std::path::{Path, PathBuf};
 
-use lofty::config::WriteOptions;
-use lofty::file::{AudioFile, TaggedFileExt};
+use ffmpeg_next as ffmpeg;
 use lofty::tag::ItemKey;
+use tonepoet_true_peak::loudness::{
+    AlbumLoudnessBuilder, AlbumLoudnessSummary, ChannelRole, IntegratedLoudness,
+    LoudnessMeasurement, LoudnessMetricCoverage, LoudnessMetricDemand, LoudnessProfile,
+    LoudnessSummary, LoudnessMeter,
+};
+use tonepoet_true_peak::replaygain::{
+    calculate_replaygain, gain_db_to_opus_q78, ReplayGainCalculation, ReplayGainOptions,
+};
+use tonepoet_true_peak::{PeakLevel, ReportingPeakMeter, TruePeakResult};
+
+const PRODUCTION_PROFILE: LoudnessProfile = LoudnessProfile::NativeEbu2023;
+const METER_STORAGE_ALLOWANCE_BYTES: usize = 256 * 1024 * 1024;
+const ALBUM_STORAGE_ALLOWANCE_BYTES: usize = 256 * 1024 * 1024;
+// Source-pass CUE observers are simultaneously live. Split one application-
+// level allowance across the group so track count cannot multiply a per-meter
+// allowance without bound. Album reduction has its own independent allowance;
+// the worst overlap is therefore explicitly bounded by these two budgets.
+const CUE_ACTIVE_METER_STORAGE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const ORDINARY_REPLAYGAIN_REFERENCE_LUFS: f64 = -18.0;
+const OPUS_R128_REFERENCE_LUFS: f64 = -23.0;
+const PREVENT_CLIPPING_CEILING_DBTP: f64 = -1.0;
+const OPUS_HEAD_SCAN_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoudgainGrouping {
-    Track,
-    Album,
+pub(crate) enum MetricDemand {
+    IntegratedOnly,
+    IntegratedAndRange,
 }
 
-/// Build the canonical `loudgain` argv used by every caller.
-#[must_use]
-pub(crate) fn loudgain_args(
-    grouping: LoudgainGrouping,
-    prevent_clipping: bool,
-    paths: &[PathBuf],
-) -> Vec<String> {
-    let mut args = Vec::with_capacity(paths.len().saturating_add(4));
-    if grouping == LoudgainGrouping::Album {
-        args.push("-a".to_string());
-    }
-    if prevent_clipping {
-        args.push("-k".to_string());
-    }
-    args.push("-s".to_string());
-    args.push("i".to_string());
-    args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
-    args
-}
-
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReplayGainTrackMeasurement {
-    pub track_gain: String,
-    pub track_peak: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReplayGainSourceScan {
-    pub tracks: Vec<ReplayGainTrackMeasurement>,
-    pub album_gain: Option<String>,
-    pub album_peak: Option<String>,
-}
-
-/// Build a scan-only loudgain command. `-O -q` gives a stable tab-delimited
-/// result. Omitting `-s` is loudgain's documented analyze-only mode, which is
-/// essential here because the inputs are read-only FIFO streams.
-#[must_use]
-pub(crate) fn loudgain_scan_args(
-    grouping: LoudgainGrouping,
-    prevent_clipping: bool,
-    paths: &[PathBuf],
-) -> Vec<String> {
-    let mut args = Vec::with_capacity(paths.len().saturating_add(7));
-    if grouping == LoudgainGrouping::Album {
-        args.push("-a".to_string());
-    }
-    if prevent_clipping {
-        args.push("-k".to_string());
-    }
-    args.extend(["-O".to_string(), "-q".to_string()]);
-    args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
-    args
-}
-
-fn parse_scan_row(line: &str) -> io::Result<(&str, &str, &str)> {
-    let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() < 11 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("loudgain scan row has {} columns, expected at least 11", fields.len()),
-        ));
-    }
-    // The first field is a path and could itself contain tabs. The ten result
-    // columns are fixed at the right edge of the row. We need True_Peak and
-    // Gain, which are respectively the 8th- and 3rd-from-last fields.
-    let track_peak = fields[fields.len() - 8].trim();
-    let gain = fields[fields.len() - 3].trim();
-    let label = fields[..fields.len() - 10].join("\t");
-    if track_peak.is_empty() || gain.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "loudgain scan row omitted peak or gain",
-        ));
-    }
-    // Keep the path/Album label owned only long enough to classify this row.
-    // Returning a leaked value would be wrong, so classify through the caller.
-    let label_kind = if label == "Album" { "Album" } else { "Track" };
-    Ok((label_kind, gain, track_peak))
-}
-
-/// Parse `loudgain -O -q` output. FIFO input names are intentionally short,
-/// so the runner's bounded stdout capture comfortably contains the complete
-/// CUE limit of 99 track rows plus the optional album row.
-pub(crate) fn parse_loudgain_scan_output(
-    stdout: &str,
-    expected_tracks: usize,
-    grouping: LoudgainGrouping,
-) -> io::Result<ReplayGainSourceScan> {
-    let mut tracks = Vec::with_capacity(expected_tracks);
-    let mut album_gain = None;
-    let mut album_peak = None;
-    for line in stdout.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()) {
-        if line.starts_with("File\t") {
-            continue;
-        }
-        let (kind, gain, peak) = parse_scan_row(line)?;
-        if kind == "Album" {
-            if album_gain.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "loudgain scan produced more than one album summary",
-                ));
-            }
-            album_gain = Some(gain.to_string());
-            album_peak = Some(peak.to_string());
+impl MetricDemand {
+    pub(crate) const fn from_requires_lra(requires_lra: bool) -> Self {
+        if requires_lra {
+            Self::IntegratedAndRange
         } else {
-            tracks.push(ReplayGainTrackMeasurement {
-                track_gain: gain.to_string(),
-                track_peak: peak.to_string(),
-            });
+            Self::IntegratedOnly
         }
     }
-    if tracks.len() != expected_tracks {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+
+    pub(crate) const fn native(self) -> LoudnessMetricDemand {
+        match self {
+            Self::IntegratedOnly => LoudnessMetricDemand::IntegratedOnly,
+            Self::IntegratedAndRange => LoudnessMetricDemand::IntegratedAndRange,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderAuthority {
+    FfmpegDecodedArtifact,
+    CueExactPcmMirror,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgrammeSubject {
+    /// Exact track/group participant this programme observation belongs to.
+    /// This is distinct from the artifact identity so album reduction can
+    /// reject reordered, missing, or wrong-member observations before owned
+    /// statistics are consumed.
+    pub participant: String,
+    pub identity: String,
+    pub reader: ReaderAuthority,
+    pub sample_rate_hz: u32,
+    pub roles: Vec<ChannelRole>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NativeObservationSummary {
+    pub subject: ProgrammeSubject,
+    pub profile: LoudnessProfile,
+    pub metric_coverage: LoudnessMetricCoverage,
+    pub real_frames: u64,
+    pub loudness: LoudnessSummary,
+    pub reporting_peak: TruePeakResult,
+    pub completion_evidence: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedTrackObservation {
+    summary: NativeObservationSummary,
+    measurement: LoudnessMeasurement,
+    reporting_peak_linear: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MathematicalUnavailability {
+    TooShort { frames: u64, required_frames: u64 },
+    BelowAbsoluteGate,
+    BelowRelativeGate,
+    NoEligibleBlocks,
+}
+
+impl fmt::Display for MathematicalUnavailability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShort { frames, required_frames } => {
+                write!(f, "too short ({frames} frames; {required_frames} required)")
+            }
+            Self::BelowAbsoluteGate => f.write_str("below absolute loudness gate"),
+            Self::BelowRelativeGate => f.write_str("below relative loudness gate"),
+            Self::NoEligibleBlocks => f.write_str("no eligible loudness blocks"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectedGain {
+    pub calculation: Option<ReplayGainCalculation>,
+    pub unavailable: Option<MathematicalUnavailability>,
+    pub reporting_peak_linear: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplayGainFileWriteReport {
+    pub path: PathBuf,
+    pub member_id: String,
+    pub track: ProjectedGain,
+    pub album: Option<ProjectedGain>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplayGainWriteReport {
+    pub files: Vec<ReplayGainFileWriteReport>,
+}
+
+impl ReplayGainWriteReport {
+    pub(crate) fn has_unavailable_requested_gain(&self) -> bool {
+        self.files.iter().any(|file| {
+            file.track.unavailable.is_some()
+                || file.album.as_ref().is_some_and(|album| album.unavailable.is_some())
+        })
+    }
+
+    pub(crate) fn status_summary(&self) -> String {
+        let mut unavailable = Vec::new();
+        for file in &self.files {
+            let label = file
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.member_id.clone());
+            if let Some(reason) = file.track.unavailable.as_ref() {
+                unavailable.push(format!("{label} Track gain unavailable: {reason}"));
+            }
+            if let Some(reason) = file.album.as_ref().and_then(|album| album.unavailable.as_ref()) {
+                unavailable.push(format!("{label} Album gain unavailable: {reason}"));
+            }
+        }
+        if unavailable.is_empty() {
             format!(
-                "loudgain scan produced {} track rows, expected {expected_tracks}",
-                tracks.len()
-            ),
+                "ReplayGain tags written ({} file{})",
+                self.files.len(),
+                if self.files.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("ReplayGain metadata completed; {}", unavailable.join("; "))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayGainManifestBinding {
+    pub ordered_members: Vec<String>,
+}
+
+impl ReplayGainManifestBinding {
+    pub(crate) fn new(ordered_members: Vec<String>) -> io::Result<Self> {
+        if ordered_members.is_empty() {
+            return Err(invalid("ReplayGain manifest is empty"));
+        }
+        let unique = ordered_members.iter().collect::<BTreeSet<_>>();
+        if unique.len() != ordered_members.len() {
+            return Err(invalid("ReplayGain manifest contains duplicate members"));
+        }
+        Ok(Self { ordered_members })
+    }
+
+    pub(crate) fn matches(&self, members: &[String]) -> bool {
+        self.ordered_members == members
+    }
+}
+
+/// Cloneable source-pass result. Owned sufficient statistics are consumed by
+/// album reduction before this value is formed; they are never cloned or
+/// serialized. The scalar album result is valid only for this exact manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplayGainSourceScan {
+    pub manifest: ReplayGainManifestBinding,
+    pub demand: MetricDemand,
+    pub tracks: Vec<NativeObservationSummary>,
+    pub album: Option<AlbumLoudnessSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PcmMirrorEncoding {
+    S32Le,
+    F32Le,
+    F64Le,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterCapability {
+    Supported(crate::metadata_persistence::MetadataPersistenceBackend),
+    Unsupported(crate::metadata_persistence::MetadataPersistenceBackend),
+}
+
+pub(crate) fn writer_capability(path: &Path) -> io::Result<WriterCapability> {
+    use crate::metadata_persistence::MetadataPersistenceBackend as B;
+    let backend = crate::metadata_persistence::metadata_backend_for_path(path)
+        .map_err(|error| invalid(format!("metadata backend for '{}': {error}", path.display())))?;
+    let capability = match backend {
+        B::NativeFlacVorbis
+        | B::NativeDsfId3
+        | B::NativeWavPackApe
+        | B::LoftyVorbisComments
+        | B::LoftyId3v2
+        | B::LoftyApe
+        | B::LoftyMp4Ilst => WriterCapability::Supported(backend),
+        B::ReadOnlyApeFamily | B::UnsupportedDff | B::UnclassifiedLofty => {
+            WriterCapability::Unsupported(backend)
+        }
+    };
+    Ok(capability)
+}
+
+pub(crate) fn all_writers_supported(paths: &[PathBuf]) -> io::Result<()> {
+    for path in paths {
+        if let WriterCapability::Unsupported(backend) = writer_capability(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("no admitted ReplayGain metadata writer for '{}' ({backend:?})", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct NativeReplayGainObserver {
+    subject: ProgrammeSubject,
+    demand: MetricDemand,
+    loudness: LoudnessMeter,
+    reporting_peak: ReportingPeakMeter,
+}
+
+impl NativeReplayGainObserver {
+    pub(crate) fn new(subject: ProgrammeSubject, demand: MetricDemand) -> io::Result<Self> {
+        Self::new_with_storage_limit(subject, demand, METER_STORAGE_ALLOWANCE_BYTES)
+    }
+
+    fn new_with_storage_limit(
+        subject: ProgrammeSubject,
+        demand: MetricDemand,
+        storage_limit_bytes: usize,
+    ) -> io::Result<Self> {
+        validate_roles(&subject.roles)?;
+        let loudness = LoudnessMeter::with_roles_and_metric_demand_and_limit(
+            subject.sample_rate_hz,
+            &subject.roles,
+            PRODUCTION_PROFILE,
+            demand.native(),
+            storage_limit_bytes,
+        )
+        .map_err(|error| invalid(format!("native loudness meter admission failed: {error}")))?;
+        let reporting_peak = ReportingPeakMeter::new(subject.sample_rate_hz, subject.roles.len())
+            .map_err(|error| invalid(format!("reporting peak meter admission failed: {error}")))?;
+        Ok(Self {
+            subject,
+            demand,
+            loudness,
+            reporting_peak,
+        })
+    }
+
+    pub(crate) fn push_interleaved(&mut self, samples: &[f64]) -> io::Result<()> {
+        // Both observers advance from the same real frame slice. If either
+        // fails, the whole grouped observation is terminal; callers must not
+        // splice a retry of only one observer into the other result.
+        self.loudness
+            .push_interleaved(samples)
+            .map_err(|error| invalid(format!("native loudness observation failed: {error}")))?;
+        self.reporting_peak
+            .push_interleaved(samples)
+            .map_err(|error| invalid(format!("reporting peak observation failed: {error}")))?;
+        Ok(())
+    }
+
+    fn finish(self, completion_evidence: String) -> io::Result<OwnedTrackObservation> {
+        let expected_subject = self.subject.clone();
+        let expected_demand = self.demand;
+        let measurement = self
+            .loudness
+            .finalize()
+            .map_err(|error| invalid(format!("native loudness finalization failed: {error}")))?;
+        let reporting_peak = self
+            .reporting_peak
+            .finalize()
+            .map_err(|error| invalid(format!("reporting peak finalization failed: {error}")))?;
+        validate_completed_measurement(
+            &expected_subject,
+            expected_demand,
+            &measurement.summary,
+            &reporting_peak,
+        )?;
+        let reporting_peak_linear = reporting_peak_linear(&reporting_peak)?;
+        let summary = NativeObservationSummary {
+            subject: expected_subject,
+            profile: PRODUCTION_PROFILE,
+            metric_coverage: measurement.summary.metric_coverage,
+            real_frames: measurement.summary.real_frames,
+            loudness: measurement.summary.clone(),
+            reporting_peak,
+            completion_evidence,
+        };
+        Ok(OwnedTrackObservation {
+            summary,
+            measurement,
+            reporting_peak_linear,
+        })
+    }
+}
+
+fn validate_roles(roles: &[ChannelRole]) -> io::Result<()> {
+    if roles.is_empty() {
+        return Err(invalid("decoded programme has no channel roles"));
+    }
+    if roles.iter().any(|role| *role == ChannelRole::Unused) {
+        return Err(invalid("compatibility/unused channel roles are not valid for NativeEbu2023"));
+    }
+    Ok(())
+}
+
+fn validate_completed_measurement(
+    subject: &ProgrammeSubject,
+    demand: MetricDemand,
+    summary: &LoudnessSummary,
+    reporting_peak: &TruePeakResult,
+) -> io::Result<()> {
+    if summary.profile != PRODUCTION_PROFILE {
+        return Err(invalid("production ReplayGain observation is not NativeEbu2023"));
+    }
+    if summary.sample_rate_hz != subject.sample_rate_hz || summary.roles != subject.roles {
+        return Err(invalid("completed loudness result does not match bound rate/roles"));
+    }
+    if !summary.metric_coverage.satisfies(demand.native()) {
+        return Err(invalid("completed loudness result has insufficient metric coverage"));
+    }
+    if summary.real_frames == 0 || reporting_peak.frames == 0 {
+        return Err(invalid("empty decoder output is an operational observation failure"));
+    }
+    if summary.real_frames != reporting_peak.frames {
+        return Err(invalid(format!(
+            "loudness/reporting-peak frame mismatch: {} versus {}",
+            summary.real_frames, reporting_peak.frames
+        )));
+    }
+    let _ = reporting_peak_linear(reporting_peak)?;
+    match summary.integrated {
+        IntegratedLoudness::NoInput | IntegratedLoudness::NumericalRange => {
+            return Err(invalid("native loudness result is operationally invalid"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_retained_summary(
+    summary: &NativeObservationSummary,
+    demand: MetricDemand,
+) -> io::Result<()> {
+    if summary.profile != PRODUCTION_PROFILE
+        || summary.metric_coverage != summary.loudness.metric_coverage
+        || summary.real_frames != summary.loudness.real_frames
+    {
+        return Err(invalid(
+            "retained ReplayGain observation envelope disagrees with its native loudness result",
         ));
     }
-    if grouping == LoudgainGrouping::Album && (album_gain.is_none() || album_peak.is_none()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "album loudgain scan omitted its album summary",
-        ));
+    validate_completed_measurement(
+        &summary.subject,
+        demand,
+        &summary.loudness,
+        &summary.reporting_peak,
+    )
+}
+
+fn reporting_peak_linear(result: &TruePeakResult) -> io::Result<f64> {
+    let linear = match result.overall {
+        PeakLevel::Silence => 0.0,
+        PeakLevel::Finite { linear, .. } => linear,
+    };
+    if !linear.is_finite() || linear < 0.0 {
+        return Err(invalid("reporting peak is non-finite or negative"));
     }
-    Ok(ReplayGainSourceScan {
-        tracks,
-        album_gain,
-        album_peak,
+    if result.channel_linear_peaks.iter().any(|peak| !peak.is_finite() || *peak < 0.0) {
+        return Err(invalid("reporting channel peak is non-finite or negative"));
+    }
+    Ok(linear)
+}
+
+pub(crate) fn project_summary(
+    summary: &LoudnessSummary,
+    reporting_peak_linear: f64,
+    prevent_clipping: bool,
+    reference_lufs: f64,
+) -> io::Result<ProjectedGain> {
+    if summary.profile != PRODUCTION_PROFILE {
+        return Err(invalid("refusing to project a non-NativeEbu2023 production observation"));
+    }
+    project_integrated(
+        &summary.integrated,
+        reporting_peak_linear,
+        prevent_clipping,
+        reference_lufs,
+    )
+}
+
+fn project_integrated(
+    integrated: &IntegratedLoudness,
+    reporting_peak_linear: f64,
+    prevent_clipping: bool,
+    reference_lufs: f64,
+) -> io::Result<ProjectedGain> {
+    if !reporting_peak_linear.is_finite() || reporting_peak_linear < 0.0 {
+        return Err(invalid("invalid ReplayGain reporting peak"));
+    }
+    let unavailable = mathematical_unavailability(integrated)?;
+    let calculation = match integrated.finite_lufs() {
+        Some(lufs) => Some(
+            calculate_replaygain(
+                lufs,
+                reporting_peak_linear,
+                ReplayGainOptions {
+                    reference_lufs,
+                    prevention_ceiling_dbtp: if prevent_clipping {
+                        Some(PREVENT_CLIPPING_CEILING_DBTP)
+                    } else {
+                        None
+                    },
+                },
+            )
+            .map_err(|error| invalid(format!("ReplayGain projection failed: {error}")))?,
+        ),
+        None => None,
+    };
+    Ok(ProjectedGain {
+        calculation,
+        unavailable,
+        reporting_peak_linear,
     })
 }
 
-/// Apply a scan-only source measurement to the already-encoded outputs. This
-/// reproduces the four standard `-s i` ReplayGain values; Album and Both use
-/// the same `loudgain -a -s i` semantics in the established path and therefore
-/// write both per-track and album values. Track mode also removes stale album
-/// values exactly as the existing post-scan cleanup does.
-///
-/// Crucially, this does not save a generic Lofty `TaggedFile` after the
-/// authoritative metadata stage. ReplayGain is an unrelated four-field edit,
-/// so it must traverse Tonepoet's existing list-aware metadata mutation
-/// boundary. That boundary owns native FLAC/APEv2 writers, ID3/MP4
-/// preservation, mutation coordination, and post-write verification.
+fn mathematical_unavailability(value: &IntegratedLoudness) -> io::Result<Option<MathematicalUnavailability>> {
+    Ok(match value {
+        IntegratedLoudness::Finite { .. } => None,
+        IntegratedLoudness::InsufficientFrames { frames, required_frames } => {
+            Some(MathematicalUnavailability::TooShort {
+                frames: *frames,
+                required_frames: *required_frames,
+            })
+        }
+        IntegratedLoudness::BelowAbsoluteGate => Some(MathematicalUnavailability::BelowAbsoluteGate),
+        IntegratedLoudness::BelowRelativeGate => Some(MathematicalUnavailability::BelowRelativeGate),
+        IntegratedLoudness::NoEligibleBlocks => Some(MathematicalUnavailability::NoEligibleBlocks),
+        IntegratedLoudness::NoInput => return Err(invalid("empty programme has no valid ReplayGain observation")),
+        IntegratedLoudness::NumericalRange => return Err(invalid("loudness numerical-range failure")),
+    })
+}
+
+fn project_album(
+    album: &AlbumLoudnessSummary,
+    prevent_clipping: bool,
+    reference_lufs: f64,
+) -> io::Result<ProjectedGain> {
+    if album.profile != PRODUCTION_PROFILE {
+        return Err(invalid("album result is not NativeEbu2023"));
+    }
+    project_integrated(
+        &album.integrated,
+        album.reporting_peak_linear,
+        prevent_clipping,
+        reference_lufs,
+    )
+}
+
+fn ordinary_options_reference() -> f64 {
+    ORDINARY_REPLAYGAIN_REFERENCE_LUFS
+}
+
+pub(crate) fn measure_paths(
+    paths: &[PathBuf],
+    member_ids: &[String],
+    grouping: tonepoet_pipeline::ReplayGainMode,
+    demand: MetricDemand,
+) -> io::Result<ReplayGainSourceScan> {
+    if paths.len() != member_ids.len() {
+        return Err(invalid("ReplayGain path/member count mismatch"));
+    }
+    let manifest = ReplayGainManifestBinding::new(member_ids.to_vec())?;
+    let needs_album = matches!(
+        grouping,
+        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
+    );
+    let mut album = needs_album.then(|| AlbumLoudnessBuilder::with_metric_demand(
+        ALBUM_STORAGE_ALLOWANCE_BYTES,
+        demand.native(),
+    ));
+    let mut summaries = Vec::with_capacity(paths.len());
+    for (path, member_id) in paths.iter().zip(member_ids) {
+        let observation = observe_file(path, member_id.clone(), demand)?;
+        if observation.summary.subject.participant != *member_id {
+            return Err(invalid(format!(
+                "ReplayGain observation participant mismatch: expected {member_id:?}, observed {:?}",
+                observation.summary.subject.participant
+            )));
+        }
+        if let Some(builder) = album.as_mut() {
+            builder
+                .push_track(observation.measurement.statistics, observation.reporting_peak_linear)
+                .map_err(|error| invalid(format!("album statistics append failed: {error}")))?;
+        }
+        summaries.push(observation.summary);
+    }
+    let album = match album {
+        Some(builder) => Some(
+            builder
+                .finalize()
+                .map_err(|error| invalid(format!("album loudness finalization failed: {error}")))?,
+        ),
+        None => None,
+    };
+    Ok(ReplayGainSourceScan {
+        manifest,
+        demand,
+        tracks: summaries,
+        album,
+    })
+}
+
+fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Result<OwnedTrackObservation> {
+    crate::tui::probe::ensure_ffmpeg_init_pub();
+    let before = std::fs::metadata(path)?;
+    if !before.is_file() {
+        return Err(invalid(format!("ReplayGain reader requires a regular file: '{}'", path.display())));
+    }
+    let before_len = before.len();
+    let mut baseline_observation =
+        crate::convert::pipeline::baseline::replaygain_observation_started(path, before_len);
+    let subject_identity = artifact_subject_identity(path, &member_id, &before);
+
+    let mut ictx = ffmpeg::format::input(path)
+        .map_err(|error| invalid(format!("open ReplayGain input '{}': {error}", path.display())))?;
+    let audio_stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .ok_or_else(|| invalid(format!("no audio stream in '{}'", path.display())))?;
+    let stream_index = audio_stream.index();
+    let context = ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())
+        .map_err(|error| invalid(format!("read audio parameters '{}': {error}", path.display())))?;
+    let mut decoder = context
+        .decoder()
+        .audio()
+        .map_err(|error| invalid(format!("open audio decoder '{}': {error}", path.display())))?;
+    let rate = decoder.rate();
+    let channels = usize::from(decoder.channels());
+    let roles = ordered_roles_from_layout(decoder.channel_layout(), channels)?;
+    let subject = ProgrammeSubject {
+        participant: member_id.clone(),
+        identity: subject_identity,
+        reader: ReaderAuthority::FfmpegDecodedArtifact,
+        sample_rate_hz: rate,
+        roles: roles.clone(),
+    };
+    let mut observer = NativeReplayGainObserver::new(subject, demand)?;
+    let mut decoded = ffmpeg::util::frame::Audio::empty();
+    let mut decoded_frames = 0_u64;
+    let mut frame_allocations = 0_u64;
+    let mut frame_allocation_bytes = 0_u64;
+
+    loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match packet.read(&mut ictx) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Eof) => break,
+            Err(error) => {
+                return Err(invalid(format!(
+                    "demux ReplayGain input '{}': {error}",
+                    path.display()
+                )))
+            }
+        }
+        if packet.stream() != stream_index {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .map_err(|error| invalid(format!("send audio packet '{}': {error}", path.display())))?;
+        drain_decoder_frames(
+            &mut decoder,
+            &mut decoded,
+            rate,
+            channels,
+            &roles,
+            &mut observer,
+            &mut decoded_frames,
+            &mut frame_allocations,
+            &mut frame_allocation_bytes,
+            false,
+        )?;
+    }
+    decoder
+        .send_eof()
+        .map_err(|error| invalid(format!("flush audio decoder '{}': {error}", path.display())))?;
+    drain_decoder_frames(
+        &mut decoder,
+        &mut decoded,
+        rate,
+        channels,
+        &roles,
+        &mut observer,
+        &mut decoded_frames,
+        &mut frame_allocations,
+        &mut frame_allocation_bytes,
+        true,
+    )?;
+
+    if decoded_frames == 0 {
+        return Err(invalid(format!("decoder produced no audio for '{}'", path.display())));
+    }
+    let after = std::fs::metadata(path)?;
+    if !same_artifact_generation(&before, &after) {
+        return Err(invalid(format!("audio artifact changed while it was being observed: '{}'", path.display())));
+    }
+    let observation = observer.finish(format!(
+        "ffmpeg complete decode; clean decoder EOF; stable extent={} bytes",
+        before_len
+    ))?;
+    if let Some(baseline) = baseline_observation.as_mut() {
+        let decoded_pcm_bytes = decoded_frames
+            .saturating_mul(u64::try_from(channels).unwrap_or(u64::MAX))
+            .saturating_mul(std::mem::size_of::<f64>() as u64);
+        baseline.mark_complete(
+            decoded_pcm_bytes,
+            frame_allocations,
+            frame_allocation_bytes,
+        );
+    }
+    Ok(observation)
+}
+
+fn artifact_subject_identity(
+    path: &Path,
+    member_id: &str,
+    metadata: &std::fs::Metadata,
+) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return format!(
+            "artifact:{member_id}:{}:dev={}:ino={}:len={}:mtime={}.{}:ctime={}.{}",
+            path.display(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos());
+        format!(
+            "artifact:{member_id}:{}:len={}:mtime_ns={modified:?}",
+            path.display(),
+            metadata.len(),
+        )
+    }
+}
+
+fn same_artifact_generation(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn drain_decoder_frames(
+    decoder: &mut ffmpeg::decoder::Audio,
+    frame: &mut ffmpeg::util::frame::Audio,
+    expected_rate: u32,
+    expected_channels: usize,
+    expected_roles: &[ChannelRole],
+    observer: &mut NativeReplayGainObserver,
+    frames: &mut u64,
+    frame_allocations: &mut u64,
+    frame_allocation_bytes: &mut u64,
+    flushing: bool,
+) -> io::Result<()> {
+    loop {
+        match decoder.receive_frame(frame) {
+            Ok(()) => {
+                let rate = frame.rate();
+                let channels = usize::from(frame.channels());
+                if rate != expected_rate || channels != expected_channels {
+                    return Err(invalid("decoder changed sample rate or channel count mid-programme"));
+                }
+                let roles = ordered_roles_from_layout(frame.channel_layout(), channels)?;
+                if roles != expected_roles {
+                    return Err(invalid("decoder changed ordered channel roles mid-programme"));
+                }
+                let interleaved = frame_to_interleaved_f64(frame, channels)?;
+                *frame_allocations = frame_allocations.saturating_add(1);
+                *frame_allocation_bytes = frame_allocation_bytes.saturating_add(
+                    u64::try_from(interleaved.capacity())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(std::mem::size_of::<f64>() as u64),
+                );
+                observer.push_interleaved(&interleaved)?;
+                *frames = frames
+                    .checked_add(u64::try_from(frame.samples()).map_err(|_| invalid("frame sample count overflow"))?)
+                    .ok_or_else(|| invalid("decoded frame count overflow"))?;
+            }
+            Err(ffmpeg::Error::Eof) => return Ok(()),
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => {
+                if flushing {
+                    return Err(invalid("decoder flush ended without clean EOF"));
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(invalid(format!("audio decoder failed: {error}"))),
+        }
+    }
+}
+
+pub(crate) fn ordered_roles_from_layout(
+    layout: ffmpeg::ChannelLayout,
+    channels: usize,
+) -> io::Result<Vec<ChannelRole>> {
+    use ffmpeg::ChannelLayout as L;
+    if channels == 0 {
+        return Err(invalid("decoded audio has zero channels"));
+    }
+    if layout.is_empty() {
+        return match channels {
+            1 => Ok(vec![ChannelRole::Mono]),
+            2 => Ok(vec![ChannelRole::Left, ChannelRole::Right]),
+            _ => Err(invalid(format!(
+                "{channels}-channel programme has no authoritative channel layout"
+            ))),
+        };
+    }
+    if layout.channels() as usize != channels {
+        return Err(invalid("decoder channel layout/count mismatch"));
+    }
+    let roles = if layout == L::MONO {
+        vec![ChannelRole::Mono]
+    } else if layout == L::STEREO {
+        vec![ChannelRole::Left, ChannelRole::Right]
+    } else if layout == L::SURROUND {
+        vec![ChannelRole::Left, ChannelRole::Right, ChannelRole::Center]
+    } else if layout == L::_3POINT1 {
+        vec![ChannelRole::Left, ChannelRole::Right, ChannelRole::Center, ChannelRole::Lfe]
+    } else if layout == L::QUAD {
+        vec![ChannelRole::Left, ChannelRole::Right, ChannelRole::LeftBack, ChannelRole::RightBack]
+    } else if layout == L::_5POINT0 {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::LeftSurround,
+            ChannelRole::RightSurround,
+        ]
+    } else if layout == L::_5POINT1 {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::Lfe,
+            ChannelRole::LeftSurround,
+            ChannelRole::RightSurround,
+        ]
+    } else if layout == L::_5POINT0_BACK {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::LeftBack,
+            ChannelRole::RightBack,
+        ]
+    } else if layout == L::_5POINT1_BACK {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::Lfe,
+            ChannelRole::LeftBack,
+            ChannelRole::RightBack,
+        ]
+    } else if layout == L::_7POINT0 {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::LeftBack,
+            ChannelRole::RightBack,
+            ChannelRole::LeftSurround,
+            ChannelRole::RightSurround,
+        ]
+    } else if layout == L::_7POINT1 {
+        vec![
+            ChannelRole::Left,
+            ChannelRole::Right,
+            ChannelRole::Center,
+            ChannelRole::Lfe,
+            ChannelRole::LeftBack,
+            ChannelRole::RightBack,
+            ChannelRole::LeftSurround,
+            ChannelRole::RightSurround,
+        ]
+    } else {
+        return Err(invalid(format!(
+            "unsupported NativeEbu2023 ordered channel layout: {layout:?}"
+        )));
+    };
+    if roles.len() != channels {
+        return Err(invalid("resolved ordered roles do not match channel count"));
+    }
+    Ok(roles)
+}
+
+fn frame_to_interleaved_f64(frame: &ffmpeg::util::frame::Audio, channels: usize) -> io::Result<Vec<f64>> {
+    use ffmpeg::util::format::sample::{Sample, Type};
+    let samples = frame.samples();
+    let total = samples
+        .checked_mul(channels)
+        .ok_or_else(|| invalid("decoded frame geometry overflow"))?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(total)
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "PCM observer allocation failed"))?;
+
+    macro_rules! planar {
+        ($ty:ty, $convert:expr) => {{
+            let planes = (0..channels)
+                .map(|ch| frame.plane::<$ty>(ch))
+                .collect::<Vec<_>>();
+            for index in 0..samples {
+                for plane in &planes {
+                    output.push(($convert)(plane[index]));
+                }
+            }
+        }};
+    }
+    macro_rules! packed {
+        ($width:expr, $decode:expr, $convert:expr) => {{
+            let raw = frame.data(0);
+            let expected_bytes = total
+                .checked_mul($width)
+                .ok_or_else(|| invalid("decoded packed PCM geometry overflow"))?;
+            if raw.len() < expected_bytes {
+                return Err(invalid("decoded packed PCM plane is truncated"));
+            }
+            for bytes in raw[..expected_bytes].chunks_exact($width) {
+                output.push(($convert)(($decode)(bytes)));
+            }
+        }};
+    }
+
+    match frame.format() {
+        Sample::U8(Type::Planar) => planar!(u8, |v: u8| (f64::from(v) - 128.0) / 128.0),
+        Sample::U8(Type::Packed) => packed!(1, |b: &[u8]| b[0], |v: u8| (f64::from(v) - 128.0) / 128.0),
+        Sample::I16(Type::Planar) => planar!(i16, |v: i16| f64::from(v) / 32768.0),
+        Sample::I16(Type::Packed) => packed!(2, |b: &[u8]| i16::from_ne_bytes([b[0], b[1]]), |v: i16| f64::from(v) / 32768.0),
+        Sample::I32(Type::Planar) => planar!(i32, |v: i32| f64::from(v) / 2147483648.0),
+        Sample::I32(Type::Packed) => packed!(4, |b: &[u8]| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]), |v: i32| f64::from(v) / 2147483648.0),
+        // ffmpeg-next exposes AV_SAMPLE_FMT_S64/P but does not implement its
+        // typed frame::audio::Sample trait for i64. Decode S64P from the raw
+        // per-channel planes instead of using frame.plane::<i64>().
+        Sample::I64(Type::Planar) => {
+            let expected_bytes = samples
+                .checked_mul(8)
+                .ok_or_else(|| invalid("decoded planar s64 geometry overflow"))?;
+            let planes = (0..channels)
+                .map(|channel| {
+                    let raw = frame.data(channel);
+                    if raw.len() < expected_bytes {
+                        return Err(invalid("decoded planar s64 plane is truncated"));
+                    }
+                    Ok(&raw[..expected_bytes])
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            for index in 0..samples {
+                let offset = index * 8;
+                for plane in &planes {
+                    let bytes: [u8; 8] = plane[offset..offset + 8]
+                        .try_into()
+                        .expect("eight-byte s64 sample");
+                    output.push((i64::from_ne_bytes(bytes) as f64) / 9223372036854775808.0);
+                }
+            }
+        }
+        Sample::I64(Type::Packed) => packed!(8, |b: &[u8]| i64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]), |v: i64| (v as f64) / 9223372036854775808.0),
+        Sample::F32(Type::Planar) => planar!(f32, |v: f32| f64::from(v)),
+        Sample::F32(Type::Packed) => packed!(4, |b: &[u8]| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]), |v: f32| f64::from(v)),
+        Sample::F64(Type::Planar) => planar!(f64, |v: f64| v),
+        Sample::F64(Type::Packed) => packed!(8, |b: &[u8]| f64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]), |v: f64| v),
+        Sample::None => return Err(invalid("decoder returned no PCM sample format")),
+    }
+    if output.len() != total {
+        return Err(invalid("decoded PCM extraction returned the wrong sample count"));
+    }
+    if output.iter().any(|sample| !sample.is_finite()) {
+        return Err(invalid("decoded PCM contains a non-finite sample"));
+    }
+    Ok(output)
+}
+
+pub(crate) fn cue_observer_storage_limit(observer_count: usize) -> io::Result<usize> {
+    if observer_count == 0 {
+        return Err(invalid("CUE ReplayGain observer set is empty"));
+    }
+    Ok(CUE_ACTIVE_METER_STORAGE_BUDGET_BYTES / observer_count)
+}
+
+pub(crate) fn preflight_cue_observer(
+    sample_rate_hz: u32,
+    channels: u16,
+    demand: MetricDemand,
+    storage_limit_bytes: usize,
+) -> io::Result<()> {
+    let roles = match channels {
+        1 => vec![ChannelRole::Mono],
+        2 => vec![ChannelRole::Left, ChannelRole::Right],
+        _ => return Err(invalid("CUE source-pass loudness admits only mono/stereo mirror roles")),
+    };
+    let subject = ProgrammeSubject {
+        participant: "admission-probe".to_string(),
+        identity: "cue-source-pass:admission-probe".to_string(),
+        reader: ReaderAuthority::CueExactPcmMirror,
+        sample_rate_hz,
+        roles,
+    };
+    drop(NativeReplayGainObserver::new_with_storage_limit(
+        subject,
+        demand,
+        storage_limit_bytes,
+    )?);
+    Ok(())
+}
+
+/// Exact CUE source-pass reader. It validates the exact header, exact payload,
+/// frame alignment, and EOF *after* the declared payload, so a later surplus
+/// FIFO write cannot be mistaken for a complete observation.
+pub(crate) fn observe_cue_mirror(
+    path: &Path,
+    member_id: String,
+    expected_header: &[u8],
+    sample_rate_hz: u32,
+    channels: u16,
+    frames: u64,
+    encoding: PcmMirrorEncoding,
+    demand: MetricDemand,
+    storage_limit_bytes: usize,
+    cancel: &CancellationToken,
+) -> io::Result<OwnedTrackObservation> {
+    let roles = match channels {
+        1 => vec![ChannelRole::Mono],
+        2 => vec![ChannelRole::Left, ChannelRole::Right],
+        _ => return Err(invalid("CUE source-pass loudness admits only mono/stereo mirror roles")),
+    };
+    let subject = ProgrammeSubject {
+        participant: member_id.clone(),
+        identity: format!("cue-source-pass:{member_id}"),
+        reader: ReaderAuthority::CueExactPcmMirror,
+        sample_rate_hz,
+        roles,
+    };
+    let mut observer = NativeReplayGainObserver::new_with_storage_limit(subject, demand, storage_limit_bytes)?;
+    let mut reader = open_fifo_reader_nonblocking(path)?;
+    let mut saw_data = false;
+    let mut header = vec![0_u8; expected_header.len()];
+    read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data)?;
+    if header != expected_header {
+        return Err(invalid("CUE source-pass mirror header does not match planned geometry"));
+    }
+    let bytes_per_sample = match encoding {
+        PcmMirrorEncoding::S32Le | PcmMirrorEncoding::F32Le => 4_u64,
+        PcmMirrorEncoding::F64Le => 8_u64,
+    };
+    let frame_bytes = bytes_per_sample
+        .checked_mul(u64::from(channels))
+        .ok_or_else(|| invalid("CUE mirror frame-size overflow"))?;
+    let payload_bytes = frames
+        .checked_mul(frame_bytes)
+        .ok_or_else(|| invalid("CUE mirror payload-size overflow"))?;
+    let mut remaining = payload_bytes;
+    let chunk_frames = 16_384_u64;
+    let mut raw = Vec::new();
+    while remaining > 0 {
+        let wanted = remaining.min(chunk_frames * frame_bytes) as usize;
+        raw.resize(wanted, 0);
+        read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data)?;
+        let interleaved = decode_pcm_bytes(&raw, encoding)?;
+        if interleaved.len() % usize::from(channels) != 0 {
+            return Err(invalid("CUE mirror ended on a partial PCM frame"));
+        }
+        observer.push_interleaved(&interleaved)?;
+        remaining -= wanted as u64;
+    }
+    let mut surplus = [0_u8; 1];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
+        }
+        match reader.read(&mut surplus) {
+            Ok(0) => break,
+            Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let result = observer.finish(format!(
+        "exact CUE FIFO header/payload/EOF; {payload_bytes} payload bytes"
+    ))?;
+    if result.summary.real_frames != frames {
+        return Err(invalid("CUE mirror frame count does not match declared programme extent"));
+    }
+    Ok(result)
+}
+
+
+#[cfg(unix)]
+fn open_fifo_reader_nonblocking(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_fifo_reader_nonblocking(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+fn read_fifo_exact(
+    reader: &mut File,
+    output: &mut [u8],
+    cancel: &CancellationToken,
+    saw_data: &mut bool,
+) -> io::Result<()> {
+    let mut offset = 0usize;
+    while offset < output.len() {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "CUE source-pass observation cancelled",
+            ));
+        }
+        match reader.read(&mut output[offset..]) {
+            Ok(0) if !*saw_data => {
+                // Nonblocking FIFO readers report EOF until the writer first
+                // connects. This is setup wait, not programme EOF.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("CUE source-pass FIFO ended with {} bytes remaining", output.len() - offset),
+                ));
+            }
+            Ok(read) => {
+                *saw_data = true;
+                offset += read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn decode_pcm_bytes(raw: &[u8], encoding: PcmMirrorEncoding) -> io::Result<Vec<f64>> {
+    let width = match encoding {
+        PcmMirrorEncoding::S32Le | PcmMirrorEncoding::F32Le => 4,
+        PcmMirrorEncoding::F64Le => 8,
+    };
+    if raw.len() % width != 0 {
+        return Err(invalid("PCM mirror chunk is not sample-aligned"));
+    }
+    let mut output = Vec::with_capacity(raw.len() / width);
+    for bytes in raw.chunks_exact(width) {
+        let value = match encoding {
+            PcmMirrorEncoding::S32Le => {
+                f64::from(i32::from_le_bytes(bytes.try_into().expect("width checked"))) / 2147483648.0
+            }
+            PcmMirrorEncoding::F32Le => {
+                f64::from(f32::from_le_bytes(bytes.try_into().expect("width checked")))
+            }
+            PcmMirrorEncoding::F64Le => {
+                f64::from_le_bytes(bytes.try_into().expect("width checked"))
+            }
+        };
+        if !value.is_finite() {
+            return Err(invalid("PCM mirror contains a non-finite sample"));
+        }
+        output.push(value);
+    }
+    Ok(output)
+}
+
+pub(crate) fn reduce_cue_observations(
+    manifest: ReplayGainManifestBinding,
+    demand: MetricDemand,
+    observations: Vec<OwnedTrackObservation>,
+    needs_album: bool,
+) -> io::Result<ReplayGainSourceScan> {
+    if observations.len() != manifest.ordered_members.len() {
+        return Err(invalid("CUE source-pass observation count does not match manifest"));
+    }
+    for (expected, observation) in manifest.ordered_members.iter().zip(&observations) {
+        if observation.summary.subject.participant != *expected {
+            return Err(invalid(format!(
+                "CUE source-pass observation belongs to {:?}, expected manifest member {expected:?}",
+                observation.summary.subject.participant
+            )));
+        }
+    }
+    let mut builder = needs_album.then(|| AlbumLoudnessBuilder::with_metric_demand(
+        ALBUM_STORAGE_ALLOWANCE_BYTES,
+        demand.native(),
+    ));
+    let mut summaries = Vec::with_capacity(observations.len());
+    for observation in observations {
+        if let Some(album) = builder.as_mut() {
+            album
+                .push_track(observation.measurement.statistics, observation.reporting_peak_linear)
+                .map_err(|error| invalid(format!("CUE album statistics append failed: {error}")))?;
+        }
+        summaries.push(observation.summary);
+    }
+    let album = builder
+        .map(|builder| builder.finalize().map_err(|error| invalid(format!("CUE album finalization failed: {error}"))))
+        .transpose()?;
+    Ok(ReplayGainSourceScan {
+        manifest,
+        demand,
+        tracks: summaries,
+        album,
+    })
+}
+
 pub(crate) fn apply_source_scan(
     paths: &[PathBuf],
+    member_ids: &[String],
     mode: tonepoet_pipeline::ReplayGainMode,
+    prevent_clipping: bool,
     scan: &ReplayGainSourceScan,
-) -> io::Result<()> {
-    if paths.len() != scan.tracks.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "ReplayGain source scan has {} tracks for {} outputs",
-                scan.tracks.len(),
-                paths.len()
-            ),
+) -> io::Result<ReplayGainWriteReport> {
+    if paths.len() != scan.tracks.len() || !scan.manifest.matches(member_ids) {
+        return Err(invalid("source-pass ReplayGain result is not bound to the current manifest"));
+    }
+    if scan
+        .tracks
+        .iter()
+        .zip(member_ids)
+        .any(|(track, member)| track.subject.participant != *member)
+    {
+        return Err(invalid(
+            "source-pass ReplayGain observation order/participant binding does not match the current manifest",
         ));
     }
-    let album_values = match mode {
+    for track in &scan.tracks {
+        validate_retained_summary(track, scan.demand)?;
+    }
+    if let Some(album) = scan.album.as_ref() {
+        if album.profile != PRODUCTION_PROFILE
+            || !album.metric_coverage.satisfies(scan.demand.native())
+            || album.track_count != scan.tracks.len()
+            || !album.reporting_peak_linear.is_finite()
+            || album.reporting_peak_linear < 0.0
+        {
+            return Err(invalid(
+                "retained ReplayGain album envelope does not match the current native manifest/coverage",
+            ));
+        }
+    } else if matches!(
+        mode,
+        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
+    ) {
+        return Err(invalid(
+            "retained Album/Both ReplayGain scan is missing its current-group reduction",
+        ));
+    }
+    all_writers_supported(paths)?;
+    let mut files = Vec::with_capacity(paths.len());
+    for ((path, member_id), track) in paths.iter().zip(member_ids).zip(&scan.tracks) {
+        let projection = write_projected_metadata(path, track, mode, prevent_clipping, scan.album.as_ref())?;
+        files.push(ReplayGainFileWriteReport {
+            path: path.clone(),
+            member_id: member_id.clone(),
+            track: projection.track,
+            album: projection.album,
+        });
+    }
+    Ok(ReplayGainWriteReport { files })
+}
+
+pub(crate) fn measure_and_write_paths(
+    paths: &[PathBuf],
+    member_ids: &[String],
+    mode: tonepoet_pipeline::ReplayGainMode,
+    prevent_clipping: bool,
+    requires_lra: bool,
+) -> io::Result<ReplayGainWriteReport> {
+    all_writers_supported(paths)?;
+    let demand = MetricDemand::from_requires_lra(requires_lra);
+    let measure_scope = crate::convert::pipeline::baseline::scoped_event(
+        "replaygain_measure",
+        serde_json::json!({
+            "path_count": paths.len(),
+            "mode": format!("{mode:?}"),
+            "requires_lra": requires_lra,
+        }),
+    );
+    let scan = measure_paths(paths, member_ids, mode, demand)?;
+    drop(measure_scope);
+    let mut files = Vec::with_capacity(paths.len());
+    for ((path, member_id), track) in paths.iter().zip(member_ids).zip(&scan.tracks) {
+        let write_scope = crate::convert::pipeline::baseline::scoped_event(
+            "replaygain_metadata_write",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "member_id": member_id,
+            }),
+        );
+        let projection = write_projected_metadata(path, track, mode, prevent_clipping, scan.album.as_ref())?;
+        drop(write_scope);
+        files.push(ReplayGainFileWriteReport {
+            path: path.clone(),
+            member_id: member_id.clone(),
+            track: projection.track,
+            album: projection.album,
+        });
+    }
+    Ok(ReplayGainWriteReport { files })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MetadataProjectionReport {
+    track: ProjectedGain,
+    album: Option<ProjectedGain>,
+}
+
+fn write_projected_metadata(
+    path: &Path,
+    track: &NativeObservationSummary,
+    mode: tonepoet_pipeline::ReplayGainMode,
+    prevent_clipping: bool,
+    album: Option<&AlbumLoudnessSummary>,
+) -> io::Result<MetadataProjectionReport> {
+    let is_opus = opus_header_gain_q78(path)?.is_some();
+    let reference = if is_opus {
+        OPUS_R128_REFERENCE_LUFS
+    } else {
+        ordinary_options_reference()
+    };
+    let track_peak = reporting_peak_linear(&track.reporting_peak)?;
+    let track_projection = project_summary(&track.loudness, track_peak, prevent_clipping, reference)?;
+    let album_projection = match mode {
         tonepoet_pipeline::ReplayGainMode::Track => None,
         tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both => {
-            Some((
-                scan.album_gain.as_deref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "source scan has no album gain")
-                })?,
-                scan.album_peak.as_deref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "source scan has no album peak")
-                })?,
-            ))
+            Some(project_album(
+                album.ok_or_else(|| invalid("Album/Both ReplayGain is missing current-group reduction"))?,
+                prevent_clipping,
+                reference,
+            )?)
         }
     };
+    if is_opus {
+        write_opus_r128(path, mode, &track_projection, album_projection.as_ref())?;
+    } else {
+        write_ordinary_replaygain(path, mode, &track_projection, album_projection.as_ref())?;
+    }
+    Ok(MetadataProjectionReport {
+        track: track_projection,
+        album: album_projection,
+    })
+}
 
-    for (path, measurement) in paths.iter().zip(&scan.tracks) {
-        let mut changes = vec![
-            (
-                ItemKey::ReplayGainTrackGain,
-                vec![measurement.track_gain.clone()],
-            ),
-            (
-                ItemKey::ReplayGainTrackPeak,
-                vec![measurement.track_peak.clone()],
-            ),
-        ];
-        if let Some((album_gain, album_peak)) = album_values {
-            changes.push((ItemKey::ReplayGainAlbumGain, vec![album_gain.to_string()]));
-            changes.push((ItemKey::ReplayGainAlbumPeak, vec![album_peak.to_string()]));
-        } else {
-            // Empty lists are deletions at the format-aware writer boundary.
+fn gain_string(projection: &ProjectedGain) -> Vec<String> {
+    projection
+        .calculation
+        .as_ref()
+        .map(|value| vec![format!("{:.2} dB", value.applied_gain_db)])
+        .unwrap_or_default()
+}
+
+fn peak_string(linear: f64) -> Vec<String> {
+    vec![format!("{linear:.6}")]
+}
+
+fn write_ordinary_replaygain(
+    path: &Path,
+    mode: tonepoet_pipeline::ReplayGainMode,
+    track: &ProjectedGain,
+    album: Option<&ProjectedGain>,
+) -> io::Result<()> {
+    let mut changes = vec![
+        (ItemKey::ReplayGainTrackGain, gain_string(track)),
+        (ItemKey::ReplayGainTrackPeak, peak_string(track.reporting_peak_linear)),
+    ];
+    match mode {
+        tonepoet_pipeline::ReplayGainMode::Track => {
             changes.push((ItemKey::ReplayGainAlbumGain, Vec::new()));
             changes.push((ItemKey::ReplayGainAlbumPeak, Vec::new()));
         }
+        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both => {
+            let album = album.ok_or_else(|| invalid("Album/Both ReplayGain has no album projection"))?;
+            changes.push((ItemKey::ReplayGainAlbumGain, gain_string(album)));
+            changes.push((ItemKey::ReplayGainAlbumPeak, peak_string(album.reporting_peak_linear)));
+        }
+    }
+    // Ordinary output must not retain an incompatible Opus R128 family copied
+    // from an input container.
+    changes.push((ItemKey::Unknown("R128_TRACK_GAIN".to_string()), Vec::new()));
+    changes.push((ItemKey::Unknown("R128_ALBUM_GAIN".to_string()), Vec::new()));
+    write_desired_state(path, &changes)
+}
 
-        let report = crate::tui::probe::write_all_tag_value_lists(path, &changes).map_err(
-            |error| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "write source-pass ReplayGain tags to '{}' through metadata preservation boundary: {error}",
-                        path.display()
-                    ),
-                )
-            },
+fn write_opus_r128(
+    path: &Path,
+    mode: tonepoet_pipeline::ReplayGainMode,
+    track: &ProjectedGain,
+    album: Option<&ProjectedGain>,
+) -> io::Result<()> {
+    let header_before = opus_header_gain_q78(path)?
+        .ok_or_else(|| invalid("Opus metadata projection requires an OpusHead"))?;
+    let track_value = projection_to_q78(track)?;
+    let album_value = match mode {
+        tonepoet_pipeline::ReplayGainMode::Track => None,
+        tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both => {
+            projection_to_q78(album.ok_or_else(|| invalid("Opus Album/Both projection is missing"))?)?
+        }
+    };
+    let changes = vec![
+        (ItemKey::ReplayGainTrackGain, Vec::new()),
+        (ItemKey::ReplayGainTrackPeak, Vec::new()),
+        (ItemKey::ReplayGainAlbumGain, Vec::new()),
+        (ItemKey::ReplayGainAlbumPeak, Vec::new()),
+        (
+            ItemKey::Unknown("R128_TRACK_GAIN".to_string()),
+            track_value.map(|value| vec![value.to_string()]).unwrap_or_default(),
+        ),
+        (
+            ItemKey::Unknown("R128_ALBUM_GAIN".to_string()),
+            album_value.map(|value| vec![value.to_string()]).unwrap_or_default(),
+        ),
+    ];
+    write_desired_state(path, &changes)?;
+    let header_after = opus_header_gain_q78(path)?
+        .ok_or_else(|| invalid("OpusHead disappeared after metadata mutation"))?;
+    if header_before != header_after {
+        return Err(invalid(format!(
+            "Opus mandatory header gain changed during ReplayGain metadata mutation: {header_before} -> {header_after}"
+        )));
+    }
+    Ok(())
+}
+
+fn projection_to_q78(projection: &ProjectedGain) -> io::Result<Option<i16>> {
+    projection
+        .calculation
+        .as_ref()
+        .map(|calculation| {
+            gain_db_to_opus_q78(calculation.applied_gain_db)
+                .map_err(|error| invalid(format!("Opus R128 Q7.8 projection failed: {error}")))
+        })
+        .transpose()
+}
+
+fn write_desired_state(path: &Path, changes: &[(ItemKey, Vec<String>)]) -> io::Result<()> {
+    if let WriterCapability::Unsupported(backend) = writer_capability(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("no admitted metadata writer for '{}' ({backend:?})", path.display()),
+        ));
+    }
+    let report = crate::tui::probe::write_all_tag_value_lists(path, changes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("write ReplayGain desired metadata state to '{}': {error}", path.display()),
+        )
+    })?;
+    for warning in report.durability_warnings {
+        log::warn!("ReplayGain metadata write warning for '{}': {warning}", path.display());
+    }
+    Ok(())
+}
+
+/// Remove/suppress inherited ReplayGain and R128 fields without starting any
+/// replacement meter. This is used independently of the scan enablement bit.
+pub(crate) fn remove_inherited_measurement_fields(paths: &[PathBuf]) -> io::Result<()> {
+    for path in paths {
+        // The Phase 4 lifecycle contract permits a separate cleanup mutation
+        // only when an actual inherited measurement field exists. Presence is
+        // key-based rather than value-based so empty, binary, or otherwise
+        // malformed fields still require disposition.
+        if !measurement_fields_present(path)? {
+            continue;
+        }
+        if let WriterCapability::Unsupported(backend) = writer_capability(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "stale ReplayGain/R128 metadata is present on '{}' but backend {backend:?} has no admitted writer to remove it",
+                    path.display()
+                ),
+            ));
+        }
+        write_desired_state(
+            path,
+            &[
+                (ItemKey::ReplayGainTrackGain, Vec::new()),
+                (ItemKey::ReplayGainTrackPeak, Vec::new()),
+                (ItemKey::ReplayGainAlbumGain, Vec::new()),
+                (ItemKey::ReplayGainAlbumPeak, Vec::new()),
+                (ItemKey::Unknown("R128_TRACK_GAIN".to_string()), Vec::new()),
+                (ItemKey::Unknown("R128_ALBUM_GAIN".to_string()), Vec::new()),
+            ],
         )?;
-        for warning in report.durability_warnings {
-            log::warn!(
-                "source-pass ReplayGain metadata write warning for '{}': {warning}",
-                path.display()
-            );
+    }
+    Ok(())
+}
+
+fn measurement_key_name(key: &ItemKey) -> Option<&'static str> {
+    match key {
+        ItemKey::ReplayGainTrackGain => Some("REPLAYGAIN_TRACK_GAIN"),
+        ItemKey::ReplayGainTrackPeak => Some("REPLAYGAIN_TRACK_PEAK"),
+        ItemKey::ReplayGainAlbumGain => Some("REPLAYGAIN_ALBUM_GAIN"),
+        ItemKey::ReplayGainAlbumPeak => Some("REPLAYGAIN_ALBUM_PEAK"),
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("REPLAYGAIN_TRACK_GAIN") => {
+            Some("REPLAYGAIN_TRACK_GAIN")
+        }
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("REPLAYGAIN_TRACK_PEAK") => {
+            Some("REPLAYGAIN_TRACK_PEAK")
+        }
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("REPLAYGAIN_ALBUM_GAIN") => {
+            Some("REPLAYGAIN_ALBUM_GAIN")
+        }
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("REPLAYGAIN_ALBUM_PEAK") => {
+            Some("REPLAYGAIN_ALBUM_PEAK")
+        }
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("R128_TRACK_GAIN") => {
+            Some("R128_TRACK_GAIN")
+        }
+        ItemKey::Unknown(value) if value.eq_ignore_ascii_case("R128_ALBUM_GAIN") => {
+            Some("R128_ALBUM_GAIN")
+        }
+        _ => None,
+    }
+}
+
+fn is_measurement_key(key: &ItemKey) -> bool {
+    measurement_key_name(key).is_some()
+}
+
+fn same_measurement_key(actual: &ItemKey, expected: &ItemKey) -> bool {
+    match (measurement_key_name(actual), measurement_key_name(expected)) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => actual == expected,
+    }
+}
+
+fn tags_contain_any_measurement_key(tags: &[&lofty::tag::Tag], keys: &[ItemKey]) -> bool {
+    tags.iter().any(|tag| {
+        tag.items().any(|item| {
+            keys.iter()
+                .any(|key| same_measurement_key(item.key(), key))
+        })
+    })
+}
+
+fn tags_contain_measurement_field(tags: &[&lofty::tag::Tag]) -> bool {
+    tags.iter()
+        .any(|tag| tag.items().any(|item| is_measurement_key(item.key())))
+}
+
+fn measurement_keys_present(path: &Path, keys: &[ItemKey]) -> io::Result<bool> {
+    use lofty::file::TaggedFileExt;
+    let tagged = lofty::read_from_path(path).map_err(|error| {
+        invalid(format!(
+            "inspect inherited ReplayGain/R128 metadata on '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let tags = tagged.tags().iter().collect::<Vec<_>>();
+    Ok(tags_contain_any_measurement_key(&tags, keys))
+}
+
+fn measurement_fields_present(path: &Path) -> io::Result<bool> {
+    use lofty::file::TaggedFileExt;
+    let tagged = lofty::read_from_path(path).map_err(|error| {
+        invalid(format!(
+            "inspect inherited ReplayGain/R128 metadata on '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let tags = tagged.tags().iter().collect::<Vec<_>>();
+    Ok(tags_contain_measurement_field(&tags))
+}
+
+
+fn exactly_one_valid_value(
+    tags: &[&lofty::tag::Tag],
+    key: &ItemKey,
+    valid: impl Fn(&str) -> bool,
+) -> bool {
+    use lofty::tag::ItemValue;
+
+    // Completeness is about the physical field set, not merely the subset of
+    // values Lofty can expose as text. A valid text value plus a second binary
+    // or malformed instance is still a duplicate and cannot be skip evidence.
+    let mut items = tags
+        .iter()
+        .flat_map(|tag| tag.items())
+        .filter(|item| same_measurement_key(item.key(), key));
+    let Some(item) = items.next() else {
+        return false;
+    };
+    if items.next().is_some() {
+        return false;
+    }
+    match item.value() {
+        ItemValue::Text(value) | ItemValue::Locator(value) => valid(value.trim()),
+        ItemValue::Binary(_) => false,
+    }
+}
+
+fn valid_gain_text(value: &str) -> bool {
+    let numeric = value
+        .strip_suffix("dB")
+        .or_else(|| value.strip_suffix("DB"))
+        .map(str::trim)
+        .unwrap_or(value);
+    numeric.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+fn valid_peak_text(value: &str) -> bool {
+    value
+        .parse::<f64>()
+        .is_ok_and(|peak| peak.is_finite() && peak >= 0.0)
+}
+
+fn valid_opus_q78_text(value: &str) -> bool {
+    value.parse::<i16>().is_ok()
+}
+
+/// Whether the final artifact contains exactly the retained field set required
+/// by Tonepoet's current writer contract. Serialized Album/Both fields still do
+/// not establish current-group identity; callers may use this predicate only
+/// for field-shape validation, never as album manifest proof.
+pub(crate) fn replaygain_metadata_fields_complete(
+    path: &Path,
+    mode: tonepoet_pipeline::ReplayGainMode,
+) -> io::Result<bool> {
+    use lofty::file::TaggedFileExt;
+    let tagged = lofty::read_from_path(path).map_err(|error| {
+        invalid(format!(
+            "inspect ReplayGain completeness on '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let tags = tagged.tags().iter().collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Ok(false);
+    }
+
+    if opus_header_gain_q78(path)?.is_some() {
+        let track = exactly_one_valid_value(
+            &tags,
+            &ItemKey::Unknown("R128_TRACK_GAIN".to_string()),
+            valid_opus_q78_text,
+        );
+        let album = exactly_one_valid_value(
+            &tags,
+            &ItemKey::Unknown("R128_ALBUM_GAIN".to_string()),
+            valid_opus_q78_text,
+        );
+        return Ok(match mode {
+            tonepoet_pipeline::ReplayGainMode::Track => track,
+            tonepoet_pipeline::ReplayGainMode::Album
+            | tonepoet_pipeline::ReplayGainMode::Both => track && album,
+        });
+    }
+
+    let track_gain = exactly_one_valid_value(&tags, &ItemKey::ReplayGainTrackGain, valid_gain_text);
+    let track_peak = exactly_one_valid_value(&tags, &ItemKey::ReplayGainTrackPeak, valid_peak_text);
+    let album_gain = exactly_one_valid_value(&tags, &ItemKey::ReplayGainAlbumGain, valid_gain_text);
+    let album_peak = exactly_one_valid_value(&tags, &ItemKey::ReplayGainAlbumPeak, valid_peak_text);
+    let track = track_gain && track_peak;
+    let album = album_gain && album_peak;
+    Ok(match mode {
+        tonepoet_pipeline::ReplayGainMode::Track => track,
+        tonepoet_pipeline::ReplayGainMode::Album
+        | tonepoet_pipeline::ReplayGainMode::Both => track && album,
+    })
+}
+
+fn track_skip_normalization_changes(is_opus: bool) -> Vec<(ItemKey, Vec<String>)> {
+    if is_opus {
+        vec![
+            (ItemKey::ReplayGainTrackGain, Vec::new()),
+            (ItemKey::ReplayGainTrackPeak, Vec::new()),
+            (ItemKey::ReplayGainAlbumGain, Vec::new()),
+            (ItemKey::ReplayGainAlbumPeak, Vec::new()),
+            (ItemKey::Unknown("R128_ALBUM_GAIN".to_string()), Vec::new()),
+        ]
+    } else {
+        vec![
+            (ItemKey::ReplayGainAlbumGain, Vec::new()),
+            (ItemKey::ReplayGainAlbumPeak, Vec::new()),
+            (ItemKey::Unknown("R128_TRACK_GAIN".to_string()), Vec::new()),
+            (ItemKey::Unknown("R128_ALBUM_GAIN".to_string()), Vec::new()),
+        ]
+    }
+}
+
+/// Normalize a Track + SkipIfComplete artifact to the same format-specific
+/// desired metadata state that a fresh Track write would have produced.
+/// Existing validated requested Track fields are preserved; incompatible or
+/// stale field families are removed without starting a meter.
+pub(crate) fn normalize_track_skip_metadata(paths: &[PathBuf]) -> io::Result<()> {
+    for path in paths {
+        let opus_header_before = opus_header_gain_q78(path)?;
+        let changes = track_skip_normalization_changes(opus_header_before.is_some());
+        let stale_keys = changes
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if !measurement_keys_present(path, &stale_keys)? {
+            // The already-validated requested Track field set is already in
+            // the writer's exact format-specific terminal state. Do not cross
+            // the mutation boundary solely to perform an empty cleanup.
+            continue;
+        }
+        write_desired_state(path, &changes)?;
+        if let Some(header_before) = opus_header_before {
+            let header_after = opus_header_gain_q78(path)?
+                .ok_or_else(|| invalid("OpusHead disappeared after Track-skip metadata normalization"))?;
+            if header_before != header_after {
+                return Err(invalid(format!(
+                    "Opus mandatory header gain changed during Track-skip metadata normalization: {header_before} -> {header_after}"
+                )));
+            }
         }
     }
     Ok(())
 }
 
-/// Remove stale album-level ReplayGain tags after a track-only scan.
-///
-/// Files without either album tag are not rewritten. Each changed file is read
-/// once and rewritten once through Lofty; callers decide how to surface errors.
-pub(crate) fn remove_stale_album_tags(paths: &[PathBuf]) -> io::Result<()> {
-    for path in paths {
-        remove_stale_album_tags_from_path(path)?;
+fn opus_header_gain_q78(path: &Path) -> io::Result<Option<i16>> {
+    // Classify from the actual audio codec before looking for OpusHead bytes.
+    // A magic-byte coincidence in another carrier must never switch the
+    // ReplayGain serialization contract to Opus R128.
+    crate::tui::probe::ensure_ffmpeg_init_pub();
+    let input = ffmpeg::format::input(path)
+        .map_err(|error| invalid(format!("open codec probe '{}': {error}", path.display())))?;
+    let stream = input
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .ok_or_else(|| invalid(format!("no audio stream in '{}'", path.display())))?;
+    let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|error| invalid(format!("read codec parameters '{}': {error}", path.display())))?;
+    if context.id() != ffmpeg::codec::Id::OPUS {
+        return Ok(None);
     }
-    Ok(())
+
+    let mut file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.by_ref()
+        .take(OPUS_HEAD_SCAN_LIMIT as u64)
+        .read_to_end(&mut buffer)?;
+    let offset = buffer
+        .windows(8)
+        .position(|window| window == b"OpusHead")
+        .ok_or_else(|| invalid("Opus codec has no bounded, parseable OpusHead"))?;
+    let gain_start = offset
+        .checked_add(16)
+        .ok_or_else(|| invalid("OpusHead gain offset overflow"))?;
+    if gain_start + 2 > buffer.len() {
+        return Err(invalid("truncated OpusHead before mandatory output gain"));
+    }
+    Ok(Some(i16::from_le_bytes([
+        buffer[gain_start],
+        buffer[gain_start + 1],
+    ])))
 }
 
-fn remove_stale_album_tags_from_path(path: &Path) -> io::Result<()> {
-    let mut tagged = lofty::read_from_path(path).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("read ReplayGain output '{}': {error}", path.display()),
-        )
-    })?;
-    let Some(tag) = tagged.primary_tag_mut() else {
-        return Ok(());
-    };
-    let has_album_gain = tag
-        .get_string(&ItemKey::ReplayGainAlbumGain)
-        .is_some();
-    let has_album_peak = tag
-        .get_string(&ItemKey::ReplayGainAlbumPeak)
-        .is_some();
-    if !has_album_gain && !has_album_peak {
-        return Ok(());
+pub(crate) fn integrated_unavailability(
+    summary: &NativeObservationSummary,
+) -> io::Result<Option<MathematicalUnavailability>> {
+    mathematical_unavailability(&summary.loudness.integrated)
+}
+
+pub(crate) fn reporting_peak_dbtp(summary: &NativeObservationSummary) -> Option<f64> {
+    match summary.reporting_peak.overall {
+        PeakLevel::Silence => None,
+        PeakLevel::Finite { dbtp, .. } if dbtp.is_finite() => Some(dbtp),
+        _ => None,
     }
-    tag.remove_key(&ItemKey::ReplayGainAlbumGain);
-    tag.remove_key(&ItemKey::ReplayGainAlbumPeak);
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "remove stale album ReplayGain tags from '{}': {error}",
-                    path.display()
-                ),
-            )
-        })
+}
+
+pub(crate) fn finite_integrated_lufs(summary: &NativeObservationSummary) -> Option<f64> {
+    summary.loudness.integrated.finite_lufs()
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
@@ -284,352 +1765,317 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loudgain_args_honor_grouping_and_clipping_policy() {
-        let paths = vec![
-            PathBuf::from("/music/01.flac"),
-            PathBuf::from("/music/02.flac"),
-        ];
-
+    fn demand_is_derived_before_meter_construction() {
         assert_eq!(
-            loudgain_args(LoudgainGrouping::Album, true, &paths),
-            vec![
-                "-a".to_string(),
-                "-k".to_string(),
-                "-s".to_string(),
-                "i".to_string(),
-                "/music/01.flac".to_string(),
-                "/music/02.flac".to_string(),
-            ]
+            MetricDemand::from_requires_lra(false).native(),
+            LoudnessMetricDemand::IntegratedOnly
         );
         assert_eq!(
-            loudgain_args(LoudgainGrouping::Track, false, &paths),
-            vec![
-                "-s".to_string(),
-                "i".to_string(),
-                "/music/01.flac".to_string(),
-                "/music/02.flac".to_string(),
-            ]
+            MetricDemand::from_requires_lra(true).native(),
+            LoudnessMetricDemand::IntegratedAndRange
         );
     }
 
     #[test]
-    fn loudgain_scan_args_are_read_only_and_keep_clipping_policy() {
-        let paths = vec![PathBuf::from("track-001.wav"), PathBuf::from("track-002.wav")];
-        assert_eq!(
-            loudgain_scan_args(LoudgainGrouping::Album, true, &paths),
-            vec![
-                "-a".to_string(),
-                "-k".to_string(),
-                "-O".to_string(),
-                "-q".to_string(),
-                "track-001.wav".to_string(),
-                "track-002.wav".to_string(),
-            ]
-        );
-        assert!(!loudgain_scan_args(LoudgainGrouping::Track, false, &paths)
-            .iter()
-            .any(|arg| arg == "-s"));
-    }
-
-    #[test]
-    fn loudgain_scan_parser_uses_gain_and_true_peak_and_album_summary() {
-        let output = concat!(
-            "File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\tReference\tWill_clip\tClip_prevent\tGain\tNew_Peak\tNew_Peak_dBTP\n",
-            "track-001.wav\t-5.16 LUFS\t5.65 dB\t1.057608\t0.49 dBTP\t-18.00 LUFS\tN\tN\t-12.84 dB\t0.241255\t-12.35 dBTP\n",
-            "track-002.wav\t-6.00 LUFS\t4.00 dB\t0.950000\t-0.45 dBTP\t-18.00 LUFS\tN\tN\t-12.00 dB\t0.238000\t-12.45 dBTP\n",
-            "Album\t-5.60 LUFS\t6.00 dB\t1.057608\t0.49 dBTP\t-18.00 LUFS\tN\tN\t-12.40 dB\t0.253700\t-11.91 dBTP\n",
-        );
-        let scan = parse_loudgain_scan_output(output, 2, LoudgainGrouping::Album)
-            .expect("valid loudgain scan");
-        assert_eq!(scan.tracks[0].track_gain, "-12.84 dB");
-        assert_eq!(scan.tracks[0].track_peak, "1.057608");
-        assert_eq!(scan.tracks[1].track_gain, "-12.00 dB");
-        assert_eq!(scan.album_gain.as_deref(), Some("-12.40 dB"));
-        assert_eq!(scan.album_peak.as_deref(), Some("1.057608"));
-    }
-
-    #[test]
-    fn loudgain_scan_parser_tolerates_tabs_in_fifo_label() {
-        let output = "odd\tname.wav\t-5.16 LUFS\t5.65 dB\t1.057608\t0.49 dBTP\t-18.00 LUFS\tN\tN\t-12.84 dB\t0.241255\t-12.35 dBTP\n";
-        let scan = parse_loudgain_scan_output(output, 1, LoudgainGrouping::Track)
-            .expect("tab in input label must not shift result columns");
-        assert_eq!(scan.tracks[0].track_gain, "-12.84 dB");
-        assert_eq!(scan.tracks[0].track_peak, "1.057608");
-        assert!(scan.album_gain.is_none());
-    }
-
-    #[test]
-    fn source_scan_applies_standard_track_and_album_values() {
-        use lofty::file::TaggedFileExt;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("track.flac");
-        std::fs::write(&path, include_bytes!("../../tests/fixtures/silence.flac"))
-            .expect("copy FLAC fixture");
-        let scan = ReplayGainSourceScan {
-            tracks: vec![ReplayGainTrackMeasurement {
-                track_gain: "-7.25 dB".to_string(),
-                track_peak: "0.923100".to_string(),
-            }],
-            album_gain: Some("-6.80 dB".to_string()),
-            album_peak: Some("0.977200".to_string()),
+    fn prevention_mapping_is_explicit_and_projection_only() {
+        let summary = LoudnessSummary {
+            sample_rate_hz: 48_000,
+            roles: vec![ChannelRole::Mono],
+            profile: PRODUCTION_PROFILE,
+            metric_coverage: LoudnessMetricCoverage::IntegratedOnly,
+            real_frames: 48_000,
+            integrated: IntegratedLoudness::Finite {
+                lufs: -30.0,
+                absolute_observations: 1,
+                relative_observations: 1,
+            },
+            range: tonepoet_true_peak::loudness::LoudnessRange::NotRequested,
+            absolute_integrated_observations: 1,
+            absolute_lra_observations: 0,
+            retained_storage_bytes: 0,
         };
-
-        apply_source_scan(
-            std::slice::from_ref(&path),
-            tonepoet_pipeline::ReplayGainMode::Both,
-            &scan,
-        )
-        .expect("apply source ReplayGain values");
-
-        let tagged = lofty::read_from_path(&path).expect("read tagged fixture");
-        let tag = tagged.primary_tag().expect("primary tag");
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackGain), Some("-7.25 dB"));
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainTrackPeak), Some("0.923100"));
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainAlbumGain), Some("-6.80 dB"));
-        assert_eq!(tag.get_string(&ItemKey::ReplayGainAlbumPeak), Some("0.977200"));
+        let limited = project_summary(&summary, 1.0, true, -18.0).unwrap();
+        let unrestricted = project_summary(&summary, 1.0, false, -18.0).unwrap();
+        assert!(limited.calculation.unwrap().limited);
+        assert!(!unrestricted.calculation.unwrap().limited);
     }
 
-    fn metadata_entry_snapshot(
-        path: &Path,
-        key: &ItemKey,
-    ) -> (String, Vec<usize>) {
-        let entries = crate::tui::probe::read_all_tags(path)
-            .expect("read metadata through preservation reader");
-        let entry = entries
-            .iter()
-            .find(|entry| &entry.item_key == key)
-            .unwrap_or_else(|| panic!("missing metadata entry for {key:?}"));
-        (
-            entry.value.clone(),
-            entry.per_file_stored_value_counts.clone(),
-        )
+    #[test]
+    fn short_track_preserves_reporting_peak_without_inventing_gain() {
+        let summary = LoudnessSummary {
+            sample_rate_hz: 48_000,
+            roles: vec![ChannelRole::Mono],
+            profile: PRODUCTION_PROFILE,
+            metric_coverage: LoudnessMetricCoverage::IntegratedOnly,
+            real_frames: 100,
+            integrated: IntegratedLoudness::InsufficientFrames {
+                frames: 100,
+                required_frames: 19_200,
+            },
+            range: tonepoet_true_peak::loudness::LoudnessRange::NotRequested,
+            absolute_integrated_observations: 0,
+            absolute_lra_observations: 0,
+            retained_storage_bytes: 0,
+        };
+        let projected = project_summary(&summary, 0.91, true, -18.0).unwrap();
+        assert!(projected.calculation.is_none());
+        assert_eq!(projected.reporting_peak_linear, 0.91);
+        assert!(matches!(
+            projected.unavailable,
+            Some(MathematicalUnavailability::TooShort { .. })
+        ));
     }
 
-    fn metadata_display_snapshot(path: &Path, display_key: &str) -> (String, Vec<usize>) {
-        let entries = crate::tui::probe::read_all_tags(path)
-            .expect("read metadata through preservation reader");
-        let entry = entries
-            .iter()
-            .find(|entry| entry.display_key == display_key)
-            .unwrap_or_else(|| panic!("missing metadata entry for {display_key}"));
-        (
-            entry.value.clone(),
-            entry.per_file_stored_value_counts.clone(),
-        )
+    #[test]
+    fn manifest_identity_is_ordered_and_rejects_duplicates() {
+        let a = ReplayGainManifestBinding::new(vec!["a".into(), "b".into()]).unwrap();
+        assert!(a.matches(&["a".into(), "b".into()]));
+        assert!(!a.matches(&["b".into(), "a".into()]));
+        assert!(ReplayGainManifestBinding::new(vec!["a".into(), "a".into()]).is_err());
     }
 
-    fn write_minimal_pcm_aiff(path: &Path) {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"FORM");
-        bytes.extend_from_slice(&48u32.to_be_bytes());
-        bytes.extend_from_slice(b"AIFF");
-        bytes.extend_from_slice(b"COMM");
-        bytes.extend_from_slice(&18u32.to_be_bytes());
-        bytes.extend_from_slice(&1u16.to_be_bytes());
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&16u16.to_be_bytes());
-        // 44100.0 as an IEEE 754 80-bit extended precision value.
-        bytes.extend_from_slice(&[0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0]);
-        bytes.extend_from_slice(b"SSND");
-        bytes.extend_from_slice(&10u32.to_be_bytes());
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&0i16.to_be_bytes());
-        std::fs::write(path, bytes).expect("write minimal PCM AIFF fixture");
+    #[test]
+    fn direct_opus_projection_differs_from_shifted_limited_ordinary_projection() {
+        let summary = LoudnessSummary {
+            sample_rate_hz: 48_000,
+            roles: vec![ChannelRole::Mono],
+            profile: PRODUCTION_PROFILE,
+            metric_coverage: LoudnessMetricCoverage::IntegratedOnly,
+            real_frames: 48_000,
+            integrated: IntegratedLoudness::Finite {
+                lufs: -35.0,
+                absolute_observations: 1,
+                relative_observations: 1,
+            },
+            range: tonepoet_true_peak::loudness::LoudnessRange::NotRequested,
+            absolute_integrated_observations: 1,
+            absolute_lra_observations: 0,
+            retained_storage_bytes: 0,
+        };
+        let ordinary = project_summary(&summary, 1.0, true, -18.0).unwrap().calculation.unwrap();
+        let opus = project_summary(&summary, 1.0, true, -23.0).unwrap().calculation.unwrap();
+        assert_ne!(opus.applied_gain_db, ordinary.applied_gain_db - 5.0);
     }
 
-    fn seed_id3v24_carrier(path: &Path) {
-        use lofty::file::{AudioFile, TaggedFileExt};
+    #[test]
+    fn measurement_presence_is_key_based_not_value_based() {
         use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 
-        let mut tagged = lofty::read_from_path(path).expect("read AIFF before ID3 seed");
-        let mut tag = Tag::new(TagType::Id3v2);
-        tag.insert_unchecked(TagItem::new(
-            ItemKey::TrackTitle,
-            ItemValue::Text("ID3 seed".to_string()),
+        assert!(is_measurement_key(&ItemKey::ReplayGainTrackGain));
+        assert!(is_measurement_key(&ItemKey::ReplayGainTrackPeak));
+        assert!(is_measurement_key(&ItemKey::ReplayGainAlbumGain));
+        assert!(is_measurement_key(&ItemKey::ReplayGainAlbumPeak));
+        assert!(is_measurement_key(&ItemKey::Unknown("replaygain_track_gain".into())));
+        assert!(is_measurement_key(&ItemKey::Unknown("r128_track_gain".into())));
+        assert!(is_measurement_key(&ItemKey::Unknown("R128_ALBUM_GAIN".into())));
+        assert!(same_measurement_key(
+            &ItemKey::ReplayGainTrackGain,
+            &ItemKey::Unknown("replaygain_track_gain".into())
         ));
-        tagged.insert_tag(tag);
-        tagged
-            .save_to_path(path, WriteOptions::default())
-            .expect("seed AIFF ID3v2.4 carrier through Lofty");
+        assert!(!is_measurement_key(&ItemKey::TrackTitle));
+
+        let empty = Tag::new(TagType::VorbisComments);
+        assert!(!tags_contain_measurement_field(&[&empty]));
+
+        let mut malformed = Tag::new(TagType::VorbisComments);
+        malformed.push_unchecked(TagItem::new(
+            ItemKey::ReplayGainTrackGain,
+            ItemValue::Binary(vec![0xde, 0xad]),
+        ));
+        assert!(tags_contain_measurement_field(&[&malformed]));
+
+        let mut empty_r128 = Tag::new(TagType::VorbisComments);
+        empty_r128.push_unchecked(TagItem::new(
+            ItemKey::Unknown("r128_album_gain".to_string()),
+            ItemValue::Text(String::new()),
+        ));
+        assert!(tags_contain_measurement_field(&[&empty_r128]));
+        assert!(tags_contain_any_measurement_key(
+            &[&empty_r128],
+            &[ItemKey::Unknown("R128_ALBUM_GAIN".to_string())],
+        ));
     }
 
     #[test]
-    fn source_scan_preserves_unrelated_repeated_flac_metadata() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("track.flac");
-        std::fs::write(&path, include_bytes!("../../tests/fixtures/silence.flac"))
-            .expect("copy FLAC fixture");
-        crate::tui::probe::write_all_tag_value_lists(
-            &path,
-            &[
-                (
-                    ItemKey::TrackArtist,
-                    vec!["Artist A".to_string(), "Artist A".to_string(), "Artist B".to_string()],
-                ),
-                (
-                    ItemKey::Composer,
-                    vec!["Composer A".to_string(), "Composer B".to_string()],
-                ),
-            ],
-        )
-        .expect("seed repeated FLAC metadata through authoritative writer");
-        let artist_before = metadata_entry_snapshot(&path, &ItemKey::TrackArtist);
-        let composer_before = metadata_entry_snapshot(&path, &ItemKey::Composer);
+    fn completeness_rejects_malformed_or_duplicate_physical_instances() {
+        use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 
-        let scan = ReplayGainSourceScan {
-            tracks: vec![ReplayGainTrackMeasurement {
-                track_gain: "-7.25 dB".to_string(),
-                track_peak: "0.923100".to_string(),
-            }],
-            album_gain: Some("-6.80 dB".to_string()),
-            album_peak: Some("0.977200".to_string()),
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.push_unchecked(TagItem::new(
+            ItemKey::ReplayGainTrackGain,
+            ItemValue::Text("+1.00 dB".to_string()),
+        ));
+        assert!(exactly_one_valid_value(
+            &[&tag],
+            &ItemKey::ReplayGainTrackGain,
+            valid_gain_text,
+        ));
+
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Unknown("replaygain_track_gain".to_string()),
+            ItemValue::Binary(vec![0x01, 0x02]),
+        ));
+        assert!(!exactly_one_valid_value(
+            &[&tag],
+            &ItemKey::ReplayGainTrackGain,
+            valid_gain_text,
+        ));
+
+        let mut malformed = Tag::new(TagType::VorbisComments);
+        malformed.push_unchecked(TagItem::new(
+            ItemKey::ReplayGainTrackPeak,
+            ItemValue::Text(String::new()),
+        ));
+        assert!(!exactly_one_valid_value(
+            &[&malformed],
+            &ItemKey::ReplayGainTrackPeak,
+            valid_peak_text,
+        ));
+    }
+
+    #[test]
+    fn track_skip_normalization_matches_format_specific_writer_family() {
+        let ordinary = track_skip_normalization_changes(false)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert!(!ordinary.contains(&ItemKey::ReplayGainTrackGain));
+        assert!(!ordinary.contains(&ItemKey::ReplayGainTrackPeak));
+        assert!(ordinary.contains(&ItemKey::ReplayGainAlbumGain));
+        assert!(ordinary.contains(&ItemKey::ReplayGainAlbumPeak));
+        assert!(ordinary.contains(&ItemKey::Unknown("R128_TRACK_GAIN".into())));
+        assert!(ordinary.contains(&ItemKey::Unknown("R128_ALBUM_GAIN".into())));
+
+        let opus = track_skip_normalization_changes(true)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert!(!opus.contains(&ItemKey::Unknown("R128_TRACK_GAIN".into())));
+        assert!(opus.contains(&ItemKey::Unknown("R128_ALBUM_GAIN".into())));
+        assert!(opus.contains(&ItemKey::ReplayGainTrackGain));
+        assert!(opus.contains(&ItemKey::ReplayGainTrackPeak));
+        assert!(opus.contains(&ItemKey::ReplayGainAlbumGain));
+        assert!(opus.contains(&ItemKey::ReplayGainAlbumPeak));
+    }
+
+    #[test]
+    fn write_report_preserves_typed_unavailability() {
+        let unavailable = MathematicalUnavailability::TooShort {
+            frames: 100,
+            required_frames: 19_200,
         };
-        apply_source_scan(
-            std::slice::from_ref(&path),
-            tonepoet_pipeline::ReplayGainMode::Both,
-            &scan,
-        )
-        .expect("apply source ReplayGain through preservation writer");
-
-        assert_eq!(metadata_entry_snapshot(&path, &ItemKey::TrackArtist), artist_before);
-        assert_eq!(metadata_entry_snapshot(&path, &ItemKey::Composer), composer_before);
-    }
-
-
-    #[test]
-    fn source_scan_preserves_unrelated_aiff_id3_metadata() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("track.aiff");
-        write_minimal_pcm_aiff(&path);
-        seed_id3v24_carrier(&path);
-        crate::tui::probe::write_all_tag_value_lists(
-            &path,
-            &[
-                (
-                    ItemKey::TrackArtist,
-                    vec!["Artist A".to_string(), "Artist A".to_string(), "Artist B".to_string()],
-                ),
-                (ItemKey::Producer, vec!["Producer A".to_string()]),
-                (
-                    ItemKey::Arranger,
-                    vec!["Arranger A".to_string(), "Arranger B".to_string()],
-                ),
-            ],
-        )
-        .expect("seed AIFF ID3 metadata through authoritative writer");
-        let artist_before = metadata_display_snapshot(&path, "ARTIST");
-        let producer_before = metadata_display_snapshot(&path, "PRODUCER");
-        let arranger_before = metadata_display_snapshot(&path, "ARRANGER");
-
-        let scan = ReplayGainSourceScan {
-            tracks: vec![ReplayGainTrackMeasurement {
-                track_gain: "-7.25 dB".to_string(),
-                track_peak: "0.923100".to_string(),
+        let report = ReplayGainWriteReport {
+            files: vec![ReplayGainFileWriteReport {
+                path: PathBuf::from("short.flac"),
+                member_id: "short".into(),
+                track: ProjectedGain {
+                    calculation: None,
+                    unavailable: Some(unavailable.clone()),
+                    reporting_peak_linear: 0.91,
+                },
+                album: None,
             }],
-            album_gain: Some("-6.80 dB".to_string()),
-            album_peak: Some("0.977200".to_string()),
         };
-        apply_source_scan(
-            std::slice::from_ref(&path),
-            tonepoet_pipeline::ReplayGainMode::Both,
-            &scan,
-        )
-        .expect("apply source ReplayGain to AIFF through preservation writer");
-
-        assert_eq!(metadata_display_snapshot(&path, "ARTIST"), artist_before);
-        assert_eq!(metadata_display_snapshot(&path, "PRODUCER"), producer_before);
-        assert_eq!(metadata_display_snapshot(&path, "ARRANGER"), arranger_before);
+        assert!(report.has_unavailable_requested_gain());
+        assert!(report.status_summary().contains(&unavailable.to_string()));
     }
 
     #[test]
-    fn source_scan_preserves_unrelated_mp4_multivalue_metadata() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("track.m4a");
-        std::fs::write(
-            &path,
-            include_bytes!("../../tests/fixtures/metadata_persistence/mp4.m4a"),
-        )
-        .expect("copy MP4 fixture");
-        crate::tui::probe::write_all_tag_value_lists(
-            &path,
-            &[
-                (
-                    ItemKey::Performer,
-                    vec!["Performer A".to_string(), "Performer B".to_string()],
-                ),
-                (
-                    ItemKey::Arranger,
-                    vec!["Arranger A".to_string(), "Arranger B".to_string()],
-                ),
-            ],
-        )
-        .expect("seed MP4 multivalue metadata through authoritative writer");
-        let performer_before = metadata_entry_snapshot(&path, &ItemKey::Performer);
-        let arranger_before = metadata_entry_snapshot(&path, &ItemKey::Arranger);
-
-        let scan = ReplayGainSourceScan {
-            tracks: vec![ReplayGainTrackMeasurement {
-                track_gain: "-7.25 dB".to_string(),
-                track_peak: "0.923100".to_string(),
+    fn write_report_distinguishes_unavailable_track_from_finite_album() {
+        let album_calculation = ReplayGainCalculation {
+            requested_gain_db: 2.0,
+            applied_gain_db: 2.0,
+            reporting_peak_linear: 0.75,
+            proposed_peak_linear: 0.94,
+            resulting_peak_linear: 0.94,
+            limited: false,
+        };
+        let report = ReplayGainWriteReport {
+            files: vec![ReplayGainFileWriteReport {
+                path: PathBuf::from("short-in-album.flac"),
+                member_id: "short-in-album".into(),
+                track: ProjectedGain {
+                    calculation: None,
+                    unavailable: Some(MathematicalUnavailability::TooShort {
+                        frames: 100,
+                        required_frames: 19_200,
+                    }),
+                    reporting_peak_linear: 0.99,
+                },
+                album: Some(ProjectedGain {
+                    calculation: Some(album_calculation),
+                    unavailable: None,
+                    reporting_peak_linear: album_calculation.reporting_peak_linear,
+                }),
             }],
-            album_gain: Some("-6.80 dB".to_string()),
-            album_peak: Some("0.977200".to_string()),
         };
-        apply_source_scan(
-            std::slice::from_ref(&path),
-            tonepoet_pipeline::ReplayGainMode::Both,
-            &scan,
-        )
-        .expect("apply source ReplayGain to MP4 through preservation writer");
-
-        assert_eq!(metadata_entry_snapshot(&path, &ItemKey::Performer), performer_before);
-        assert_eq!(metadata_entry_snapshot(&path, &ItemKey::Arranger), arranger_before);
-    }
-
-    #[test]
-    fn track_cleanup_removes_only_album_level_tags() {
-        use lofty::file::{AudioFile, TaggedFileExt};
-        use lofty::tag::{ItemValue, TagItem};
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("track.flac");
-        std::fs::write(&path, include_bytes!("../../tests/fixtures/silence.flac"))
-            .expect("copy FLAC fixture");
-
-        let mut tagged = lofty::read_from_path(&path).expect("read fixture");
-        if tagged.primary_tag().is_none() {
-            let tag_type = tagged.primary_tag_type();
-            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
-        }
-        let tag = tagged.primary_tag_mut().expect("fixture primary tag");
-        for (key, value) in [
-            (ItemKey::ReplayGainTrackGain, "-7.25 dB"),
-            (ItemKey::ReplayGainTrackPeak, "0.9231"),
-            (ItemKey::ReplayGainAlbumGain, "-6.80 dB"),
-            (ItemKey::ReplayGainAlbumPeak, "0.9772"),
-        ] {
-            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
-        }
-        tagged
-            .save_to_path(&path, WriteOptions::default())
-            .expect("seed ReplayGain tags");
-
-        remove_stale_album_tags(std::slice::from_ref(&path)).expect("remove album tags");
-
-        let tagged = lofty::read_from_path(&path).expect("read cleaned fixture");
-        let tag = tagged.primary_tag().expect("cleaned primary tag");
+        assert!(report.has_unavailable_requested_gain());
+        assert!(report.status_summary().contains("Track gain unavailable"));
         assert_eq!(
-            tag.get_string(&ItemKey::ReplayGainTrackGain),
-            Some("-7.25 dB")
+            report.files[0]
+                .album
+                .as_ref()
+                .and_then(|album| album.calculation),
+            Some(album_calculation)
         );
-        assert_eq!(
-            tag.get_string(&ItemKey::ReplayGainTrackPeak),
-            Some("0.9231")
-        );
-        assert!(tag.get_string(&ItemKey::ReplayGainAlbumGain).is_none());
-        assert!(tag.get_string(&ItemKey::ReplayGainAlbumPeak).is_none());
+        assert_eq!(report.files[0].track.reporting_peak_linear, 0.99);
     }
 
+    #[test]
+    fn write_report_retains_exact_finite_projection_used_by_serializer() {
+        let calculation = ReplayGainCalculation {
+            requested_gain_db: 4.25,
+            applied_gain_db: 1.75,
+            reporting_peak_linear: 0.98,
+            proposed_peak_linear: 1.60,
+            resulting_peak_linear: 1.20,
+            limited: true,
+        };
+        let projected = ProjectedGain {
+            calculation: Some(calculation),
+            unavailable: None,
+            reporting_peak_linear: calculation.reporting_peak_linear,
+        };
+        let report = ReplayGainWriteReport {
+            files: vec![ReplayGainFileWriteReport {
+                path: PathBuf::from("finite.flac"),
+                member_id: "finite".into(),
+                track: projected,
+                album: None,
+            }],
+        };
+        let retained = report.files[0]
+            .track
+            .calculation
+            .expect("finite calculation retained");
+        assert_eq!(retained, calculation);
+        assert_eq!(retained.requested_gain_db, 4.25);
+        assert_eq!(retained.applied_gain_db, 1.75);
+        assert_eq!(retained.reporting_peak_linear, 0.98);
+        assert_eq!(retained.proposed_peak_linear, 1.60);
+        assert_eq!(retained.resulting_peak_linear, 1.20);
+        assert!(retained.limited);
+        assert!(!report.has_unavailable_requested_gain());
+    }
+
+    #[test]
+    fn mathematical_unavailability_reasons_remain_distinct_in_reports() {
+        let reasons = [
+            MathematicalUnavailability::TooShort {
+                frames: 100,
+                required_frames: 19_200,
+            },
+            MathematicalUnavailability::BelowAbsoluteGate,
+            MathematicalUnavailability::BelowRelativeGate,
+            MathematicalUnavailability::NoEligibleBlocks,
+        ];
+        let rendered = reasons.iter().map(ToString::to_string).collect::<BTreeSet<_>>();
+        assert_eq!(rendered.len(), reasons.len());
+    }
+
+    #[test]
+    fn cue_pcm_decoder_rejects_partial_sample_and_nonfinite_float() {
+        assert!(decode_pcm_bytes(&[0, 1, 2], PcmMirrorEncoding::S32Le).is_err());
+        assert!(decode_pcm_bytes(&f32::NAN.to_le_bytes(), PcmMirrorEncoding::F32Le).is_err());
+    }
 }

@@ -54,7 +54,6 @@ pub fn tool_identifier_to_binary(identifier: &ToolIdentifier) -> Result<ToolBina
         ToolIdentifier::Ffmpeg => Ok(ToolBinary::Ffmpeg),
         ToolIdentifier::Sox => Ok(ToolBinary::Sox),
         ToolIdentifier::Ssrc => Ok(ToolBinary::Ssrc),
-        ToolIdentifier::Loudgain => Ok(ToolBinary::Loudgain),
         ToolIdentifier::Metaflac => Ok(ToolBinary::Metaflac),
         ToolIdentifier::Flac => Ok(ToolBinary::Flac),
         ToolIdentifier::Custom(name) => Err(ConvertError::Backend(format!(

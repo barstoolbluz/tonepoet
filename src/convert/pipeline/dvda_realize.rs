@@ -7560,9 +7560,12 @@ mod tests {
         track_selection: TrackSelection,
     ) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             job_id: "dvda-phase3-corpus".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "dvda-phase3-corpus".to_string(),
+            submission_id: None,
+            submission_size: None,
             container,
             source: SourceOptions {
                 archive_password: None,

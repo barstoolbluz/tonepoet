@@ -1,0 +1,183 @@
+{
+  "activation_path": {
+    "protected_ingress_authority_id": "tonepoet:protected-pcm-f64le-riff-ingress/v1",
+    "protected_ingress_boundary_contract": "source-rate/channel-preserving IEEE Float64 RIFF WAV; no gain/dither/mix/resample"
+  },
+  "audit_identity_consistency": {
+    "mismatches": [
+      "build closure identity is incomplete in the audit or characterized report",
+      "compiler/build configuration identity is incomplete in the audit or characterized report",
+      "executable digest identity is incomplete in the audit or characterized report"
+    ],
+    "passed": false
+  },
+  "commissioning": {
+    "decision": "outcome_c_evidence_unavailable",
+    "reason": [
+      "exact SSRC executable unavailable",
+      "static source audit incomplete",
+      "exact build audit incomplete",
+      "Tonepoet exact W64 qualification helper unavailable",
+      "Tonepoet source/archive identity not supplied",
+      "exact build closure identity not supplied",
+      "compiler/build configuration not supplied"
+    ]
+  },
+  "container_validation": {
+    "independent_payload_identity": "not_run",
+    "independent_w64_structure": "not_run",
+    "tonepoet_exact_w64_physical_cell": {
+      "all_characterized_cells_passed": false,
+      "helper": null,
+      "implementation": "tonepoet-pipeline::copy_exact_w64_pcm_payload",
+      "required": true
+    }
+  },
+  "contract_id": "TonepoetBinary64OverloadPreservingResampleV1",
+  "dependency_identity": {
+    "build_closure": null,
+    "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
+  },
+  "evidence_identity": {
+    "note": "The concrete EvidenceIdentity is emitted after the report is finalized to avoid self-reference.",
+    "scheme": "sha256",
+    "subject": "finalized qualification report bytes"
+  },
+  "executable": {
+    "build_info": null,
+    "qualification_path": null,
+    "sha256": null,
+    "version": null
+  },
+  "harness": {
+    "fixtures": "deterministic settling-aware Float64 overload/narrowing/multichannel corpus",
+    "results": [],
+    "source_digest": "047acc7997eec00e3fbad93eb354049d9d50752be0e313d4fa549da06c71388f",
+    "tolerances": {
+      "binary32_narrowing": "exact payload inequality against binary32-rounded control",
+      "finite": "exact predicate",
+      "overload": "requires output extrema beyond +/-1.25 from +/-1.5 and +/-2.0 plateaus",
+      "payload_identity": "exact",
+      "settled_dc_gain": {
+        "absolute_gain_tolerance": 0.01,
+        "rationale": "central-plateau gain must match the declared attenuation closely enough to reject gross hidden normalization",
+        "settle_fraction_each_edge": 0.25
+      },
+      "w64_structure": "exact"
+    }
+  },
+  "outcome": "pending",
+  "platform": {
+    "arch": "x86_64",
+    "os": "Linux"
+  },
+  "schema_version": 1,
+  "source_identity": {
+    "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU=",
+    "owner": "barstoolbluz",
+    "repo": "ssrc",
+    "rev": "b769add0756157ea88d1bbf9023e06c437485a79"
+  },
+  "ssrc_scope": {
+    "architecture_scope": [
+      "x86_64"
+    ],
+    "attenuation": "0.0",
+    "input_container": "wav",
+    "input_format": "pcm_f64le",
+    "output_container": "w64",
+    "output_format": "pcm_f64le",
+    "phase_modes": [
+      "linear"
+    ],
+    "profiles": [
+      "high",
+      "long",
+      "insane"
+    ],
+    "rate_scope": [
+      [
+        44100,
+        48000
+      ],
+      [
+        48000,
+        44100
+      ],
+      [
+        96000,
+        44100
+      ],
+      [
+        44100,
+        96000
+      ],
+      [
+        88200,
+        48000
+      ]
+    ],
+    "single_precision_refuted_profiles": [
+      "standard",
+      "short",
+      "fast",
+      "lightning"
+    ]
+  },
+  "static_audit": {
+    "build_audit": {
+      "build_closure": null,
+      "compiler_configuration": null,
+      "executable_sha256": null,
+      "passed": false,
+      "unresolved_items": [
+        "No exact production SSRC executable/build closure is present in this implementation environment.",
+        "Compiler/build flags for a commissioned executable have not been bound to an executable digest.",
+        "Architecture-specific executable characterization has not been completed."
+      ]
+    },
+    "contract_id": "TonepoetBinary64OverloadPreservingResampleV1",
+    "dependency_identity": {
+      "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
+    },
+    "schema_version": 1,
+    "source_identity": {
+      "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU=",
+      "owner": "barstoolbluz",
+      "repo": "ssrc",
+      "rev": "b769add0756157ea88d1bbf9023e06c437485a79"
+    },
+    "source_review": {
+      "conclusions": [
+        "High, Long, and Insane dispatch to Pipeline<double> at the audited revision.",
+        "Standard, Short, Fast, and Lightning dispatch to Pipeline<float> and are refuted for the strong Binary64 contract only.",
+        "The audited double path reads and writes IEEE Float64 directly and keeps the inspected signal path templated on the same REAL type.",
+        "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode."
+      ],
+      "files": [
+        "src/cli/cli.cpp",
+        "src/libshibatchdsp/dr_wav.hpp",
+        "src/libshibatchdsp/SRC.hpp",
+        "src/libshibatchdsp/FastPP.hpp",
+        "src/libshibatchdsp/DFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilterMT.hpp",
+        "src/libshibatchdsp/Kaiser.hpp",
+        "src/libshibatchdsp/Minrceps.hpp"
+      ],
+      "passed": false,
+      "sleef_dft_type_path_audit": {
+        "conclusions": [],
+        "files": [],
+        "passed": false,
+        "unresolved_items": [
+          "The required SLEEF DFT construction/type-path audit has not yet been represented and bound to the exact SSRC build."
+        ]
+      },
+      "unresolved_items": [
+        "Source-level Pipeline<double> dispatch is documented, but the required SLEEF DFT construction/type-path audit remains incomplete."
+      ]
+    }
+  },
+  "tonepoet_source_identity": null
+}

@@ -3647,8 +3647,7 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::PcmTruePeak => format.pcm_gain_mode.selected_label().to_string(),
         FormatField::PcmGainDb => format!("{} dB", format.pcm_fixed_gain_db.render(true)),
         FormatField::PcmTruePeakTarget => format!("{} dBTP", format.pcm_true_peak_target_dbtp.render(true)),
-        FormatField::PcmTruePeakScope => format.pcm_true_peak_scope.selected_label().to_string(),
-        FormatField::PcmTruePeakBoost => format.pcm_true_peak_boost.selected_label().to_string(),
+        FormatField::TruePeakScope => format.pcm_true_peak_scope.selected_label().to_string(),
         FormatField::PcmTruePeakScan => format.pcm_true_peak_scan_mode.selected_label().to_string(),
         FormatField::NoiseShaper => format.noise_shaper.selected_label().to_string(),
         FormatField::ModulatorOrder => format.modulator_order.selected_label().to_string(),
@@ -3657,8 +3656,9 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::DsdProfile => format.dsd_profile.selected_label().to_string(),
         FormatField::DsdGain => format.dsd_gain_mode.selected_label().to_string(),
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
-        FormatField::DsdNormalizeTarget => format.dsd_normalize_target_dbfs.render(false),
-        FormatField::DsdGainScope => format.dsd_auto_gain_scope.selected_label().to_string(),
+        FormatField::DsdTruePeakTarget => format.dsd_true_peak_target_dbtp.render(false),
+        FormatField::DsdSamplePeakTarget => format.dsd_sample_peak_target_dbfs.render(false),
+        FormatField::DsdTruePeakScope => format.dsd_true_peak_scope.selected_label().to_string(),
         FormatField::DsdTruePeakScan => format.dsd_true_peak_scan_mode.selected_label().to_string(),
         FormatField::Container => format.selected_container().display_name.to_string(),
         FormatField::ResampleQuality => format
@@ -17925,59 +17925,45 @@ fn metadata_editor_start_replaygain_scan(
     let (session_id, generation) = state.begin_replaygain_scan(mode, paths.len());
     let tx = tx.clone();
     let worker_paths = paths.clone();
-    let tool_paths = app.manager.config.tool_paths.clone();
     tokio::spawn(async move {
         use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
 
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let runner = crate::convert::pipeline::tool::RealToolRunner::new(tool_paths);
-        let claims = worker_paths
-            .iter()
-            .map(|path| PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact))
-            .collect::<Result<Vec<_>, _>>();
-        let result = match claims.and_then(MutationClaimGuard::acquire_ephemeral) {
-            Err(error) => Err(format!("ReplayGain mutation admission failed: {error}")),
-            Ok(claim) => match claim.lease().duplicate_lifetime_file() {
-                Err(error) => Err(format!("ReplayGain supervision lease duplication failed: {error}")),
-                Ok(lifetime) => {
-                    let admitted_paths = claim
-                        .claims()
-                        .iter()
-                        .map(|path_claim| path_claim.identity.resolved_io_path.clone())
-                        .collect::<Vec<_>>();
-                    let cmd = metadata_replaygain_tool_command(
-                        mode,
-                        prevent_clipping,
-                        &admitted_paths,
-                    );
-                    let tool_result = crate::concurrency::with_additional_supervision_lifetime_files(
-                        vec![lifetime],
-                        crate::convert::pipeline::tool::ToolRunner::run(&runner, cmd, &cancel),
-                    )
-                    .await;
-                    match tool_result {
-                        Ok(_) => tokio::task::spawn_blocking({
-                            let admitted_paths = admitted_paths.clone();
-                            move || {
-                                if mode == crate::tui::app::MetadataReplayGainScanMode::Track {
-                                    crate::convert::replaygain::remove_stale_album_tags(&admitted_paths)
-                                        .map_err(|error| format!(
-                                            "ReplayGain track scan succeeded, but stale album-tag cleanup failed: {error}"
-                                        ))?;
-                                }
-                                super::probe::read_all_tags_merged_with_metadata(&admitted_paths)
-                                    .map(|read| read.metadata)
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|err| Err(format!(
-                            "ReplayGain tag post-processing task failed: {err}"
-                        ))),
-                        Err(err) => Err(format!("loudgain failed: {err}")),
-                    }
-                }
-            },
-        };
+        let scan_paths = worker_paths.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let claims = scan_paths
+                .iter()
+                .map(|path| PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("ReplayGain mutation admission failed: {error}"))?;
+            let claim = MutationClaimGuard::acquire_ephemeral(claims)
+                .map_err(|error| format!("ReplayGain mutation admission failed: {error}"))?;
+            let admitted_paths = claim
+                .claims()
+                .iter()
+                .map(|path_claim| path_claim.identity.resolved_io_path.clone())
+                .collect::<Vec<_>>();
+            let member_ids = admitted_paths.iter().enumerate()
+                .map(|(index, path)| format!("metadata-editor:{index}:{}", path.display()))
+                .collect::<Vec<_>>();
+            let native_mode = match mode {
+                crate::tui::app::MetadataReplayGainScanMode::Track => tonepoet_pipeline::ReplayGainMode::Track,
+                crate::tui::app::MetadataReplayGainScanMode::Album => tonepoet_pipeline::ReplayGainMode::Album,
+            };
+            let report = crate::convert::replaygain::measure_and_write_paths(
+                &admitted_paths,
+                &member_ids,
+                native_mode,
+                prevent_clipping,
+                false,
+            ).map_err(|error| format!("native ReplayGain failed: {error}"))?;
+            let metadata = super::probe::read_all_tags_merged_with_metadata(&admitted_paths)
+                .map(|read| read.metadata)?;
+            let report_summary = report.status_summary();
+            drop(claim);
+            Ok((metadata, report_summary))
+        }).await.unwrap_or_else(|err| Err(format!(
+            "ReplayGain native scan task failed: {err}"
+        )));
         let _ = tx
             .send(AppMessage::MetadataEditorReplayGainComplete {
                 session_id,
@@ -17996,35 +17982,6 @@ fn metadata_editor_start_replaygain_scan(
     ));
 }
 
-
-fn metadata_replaygain_tool_args(
-    mode: crate::tui::app::MetadataReplayGainScanMode,
-    prevent_clipping: bool,
-    paths: &[std::path::PathBuf],
-) -> Vec<String> {
-    let grouping = if mode == crate::tui::app::MetadataReplayGainScanMode::Album {
-        crate::convert::replaygain::LoudgainGrouping::Album
-    } else {
-        crate::convert::replaygain::LoudgainGrouping::Track
-    };
-    crate::convert::replaygain::loudgain_args(grouping, prevent_clipping, paths)
-}
-
-fn metadata_replaygain_tool_command(
-    mode: crate::tui::app::MetadataReplayGainScanMode,
-    prevent_clipping: bool,
-    paths: &[std::path::PathBuf],
-) -> crate::convert::pipeline::tool::ToolCommand {
-    crate::convert::pipeline::tool::ToolCommand {
-        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
-        binary: crate::convert::pipeline::tool::ToolBinary::Loudgain,
-        args: metadata_replaygain_tool_args(mode, prevent_clipping, paths),
-        secret_args: Vec::new(),
-        cwd: None,
-        env: Vec::new(),
-        timeout: std::time::Duration::from_secs(600),
-    }
-}
 
 fn handle_metadata_artwork_key(
     app: &mut AppState,
@@ -69691,8 +69648,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DitherPill(_)
             | TuiButton::ReplayGainPill(_)
             | TuiButton::PcmTruePeakPill(_)
-            | TuiButton::PcmTruePeakScopePill(_)
-            | TuiButton::PcmTruePeakBoostPill(_)
+            | TuiButton::TruePeakScopePill(_)
             | TuiButton::PcmTruePeakScanPill(_)
             | TuiButton::PcmTruePeakTargetField
             | TuiButton::PcmGainDbField
@@ -69702,10 +69658,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DsdPathPill(_)
             | TuiButton::DsdProfilePill(_)
             | TuiButton::DsdGainPill(_)
-            | TuiButton::DsdGainScopePill(_)
+            | TuiButton::DsdTruePeakScopePill(_)
             | TuiButton::DsdTruePeakScanPill(_)
             | TuiButton::DsdGainDbField
-            | TuiButton::DsdNormalizeTargetField
+            | TuiButton::DsdTruePeakTargetField
+            | TuiButton::DsdSamplePeakTargetField
             | TuiButton::ContainerPill(_)
             | TuiButton::ResampleQualityPill(_) => {
                 app.convert.focus = ConvertFocus::Format;
@@ -84012,39 +83969,6 @@ ignored".to_string()),
         // stereo TITLE; not what we want for per-track ≠ album-
         // level. But the test only edited ALBUM, so this trace is
         // bound to the album-level path.).
-    }
-
-    #[test]
-    fn replaygain_scan_builds_loudgain_tool_command() {
-        let paths = vec![
-            std::path::PathBuf::from("/music/01.flac"),
-            std::path::PathBuf::from("/music/02.flac"),
-        ];
-        let cmd = metadata_replaygain_tool_command(
-            crate::tui::app::MetadataReplayGainScanMode::Album,
-            true,
-            &paths,
-        );
-
-        assert_eq!(cmd.binary, crate::convert::pipeline::tool::ToolBinary::Loudgain);
-        assert_eq!(cmd.args[0], "-a");
-        assert_eq!(&cmd.args[1..4], &["-k".to_string(), "-s".to_string(), "i".to_string()]);
-        assert_eq!(cmd.args[4], "/music/01.flac");
-        assert_eq!(cmd.args[5], "/music/02.flac");
-        assert!(cmd.secret_args.is_empty());
-        assert_eq!(cmd.timeout, std::time::Duration::from_secs(600));
-    }
-
-    #[test]
-    fn replaygain_track_scan_omits_album_flag() {
-        let paths = vec![std::path::PathBuf::from("/music/01.flac")];
-        let args = metadata_replaygain_tool_args(
-            crate::tui::app::MetadataReplayGainScanMode::Track,
-            false,
-            &paths,
-        );
-
-        assert_eq!(args, vec!["-s".to_string(), "i".to_string(), "/music/01.flac".to_string()]);
     }
 
 }

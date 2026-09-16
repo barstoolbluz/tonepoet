@@ -348,7 +348,7 @@ impl AudioFormat {
     /// Resolve the exact trusted codec/container product identity.
     ///
     /// This method is exhaustive over enabled catalog entries. Disabled or
-    /// caller-authored entries return `None` and must fail closed for native-v2
+    /// caller-authored entries return `None` and must fail closed for qualified Reference
     /// Reference DSD admission.
     #[must_use]
     pub fn resolved_output_target(

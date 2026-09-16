@@ -2679,6 +2679,33 @@ struct StagedCueSegment {
     samples: u64,
 }
 
+pub(super) async fn cue_stream_fallback_carrier_is_reusable(
+    path: &Path,
+    expected_sample_rate: u32,
+    expected_samples: u64,
+    carrier: CueSegmentCarrier,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<bool, MaterializeError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    match validate_staged_cue_segment_as(
+        path,
+        expected_sample_rate,
+        expected_samples,
+        carrier,
+        runner,
+        cancel,
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(MaterializeError::Cancelled) => Err(MaterializeError::Cancelled),
+        Err(_) => Ok(false),
+    }
+}
+
 pub(super) async fn realize_cue_stream_segment_fallback(
     image: &Path,
     start_sample: u64,
@@ -4803,9 +4830,12 @@ FILE "album.flac" WAVE
 
     pub(super) fn test_request(container: &Path) -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             job_id: "test-job".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "test-item".to_string(),
+            submission_id: None,
+            submission_size: None,
             container: container.to_path_buf(),
             source: SourceOptions {
                 archive_password: None,

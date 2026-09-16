@@ -10,6 +10,12 @@ pub(super) struct WindowClock {
     ring_frames: u64,
     next_integrated_index: u64,
     next_lra_index: u64,
+    next_integrated_end: Option<u64>,
+    next_lra_end: Option<u64>,
+    #[cfg(test)]
+    integrated_deadline_calculations: u64,
+    #[cfg(test)]
+    lra_deadline_calculations: u64,
 }
 
 impl WindowClock {
@@ -71,6 +77,12 @@ impl WindowClock {
             ring_frames,
             next_integrated_index: 0,
             next_lra_index: 0,
+            next_integrated_end: None,
+            next_lra_end: None,
+            #[cfg(test)]
+            integrated_deadline_calculations: 0,
+            #[cfg(test)]
+            lra_deadline_calculations: 0,
         })
     }
 
@@ -93,7 +105,7 @@ impl WindowClock {
         u64::try_from(numerator / 10).map_err(|_| LoudnessError::InputTooLong)
     }
 
-    pub(super) fn next_integrated_end(&self) -> Result<u64, LoudnessError> {
+    fn calculate_integrated_end(&self) -> Result<u64, LoudnessError> {
         match self.profile {
             LoudnessProfile::Libebur128126 => self
                 .integrated_window_frames
@@ -110,7 +122,7 @@ impl WindowClock {
         }
     }
 
-    pub(super) fn next_lra_end(&self) -> Result<u64, LoudnessError> {
+    fn calculate_lra_end(&self) -> Result<u64, LoudnessError> {
         match self.profile {
             LoudnessProfile::Libebur128126 => self
                 .lra_window_frames
@@ -131,6 +143,45 @@ impl WindowClock {
         }
     }
 
+    /// Return the next integrated-window deadline, caching the exact integer
+    /// result until that event is consumed. The successor is deliberately not
+    /// calculated when a deadline is taken: the previous implementation only
+    /// requested it on the next query, and eagerly calculating it could expose
+    /// an integer-overflow error one event earlier.
+    pub(super) fn next_integrated_end(&mut self) -> Result<u64, LoudnessError> {
+        if let Some(deadline) = self.next_integrated_end {
+            return Ok(deadline);
+        }
+        let deadline = self.calculate_integrated_end()?;
+        self.next_integrated_end = Some(deadline);
+        #[cfg(test)]
+        {
+            self.integrated_deadline_calculations = self
+                .integrated_deadline_calculations
+                .checked_add(1)
+                .ok_or(LoudnessError::InputTooLong)?;
+        }
+        Ok(deadline)
+    }
+
+    /// Return the next range-window deadline with the same lazy cache semantics
+    /// as [`Self::next_integrated_end`].
+    pub(super) fn next_lra_end(&mut self) -> Result<u64, LoudnessError> {
+        if let Some(deadline) = self.next_lra_end {
+            return Ok(deadline);
+        }
+        let deadline = self.calculate_lra_end()?;
+        self.next_lra_end = Some(deadline);
+        #[cfg(test)]
+        {
+            self.lra_deadline_calculations = self
+                .lra_deadline_calculations
+                .checked_add(1)
+                .ok_or(LoudnessError::InputTooLong)?;
+        }
+        Ok(deadline)
+    }
+
     pub(super) fn take_integrated_if_due(
         &mut self,
         frames_seen: u64,
@@ -142,6 +193,7 @@ impl WindowClock {
             .next_integrated_index
             .checked_add(1)
             .ok_or(LoudnessError::InputTooLong)?;
+        self.next_integrated_end = None;
         Ok(true)
     }
 
@@ -153,6 +205,7 @@ impl WindowClock {
             .next_lra_index
             .checked_add(1)
             .ok_or(LoudnessError::InputTooLong)?;
+        self.next_lra_end = None;
         Ok(true)
     }
 
@@ -242,7 +295,7 @@ mod tests {
 
     #[test]
     fn legacy_odd_rate_ring_rounds_up_without_changing_lra_window() {
-        let clock = WindowClock::new(44_101, LoudnessProfile::Libebur128126).unwrap();
+        let mut clock = WindowClock::new(44_101, LoudnessProfile::Libebur128126).unwrap();
         // H=(44101+5)/10=4410.  The LRA window is 30H, but libebur128's
         // physical three-second ring starts from 3*Fs and rounds to a whole H.
         assert_eq!(clock.lra_window_frames(), 132_300);
@@ -307,6 +360,74 @@ mod tests {
         ] {
             assert_eq!(native.events_due_through(frames, false, true).unwrap().1, expected, "native LRA at {frames}");
         }
+    }
+
+    #[test]
+    fn deadline_cache_is_exact_and_lazy() {
+        let mut clock = WindowClock::new(44_101, LoudnessProfile::NativeEbu2023).unwrap();
+        assert_eq!(clock.integrated_deadline_calculations, 0);
+        assert_eq!(clock.next_integrated_end().unwrap(), 17_640);
+        assert_eq!(clock.integrated_deadline_calculations, 1);
+        assert_eq!(clock.next_integrated_end().unwrap(), 17_640);
+        assert_eq!(clock.integrated_deadline_calculations, 1);
+
+        assert!(!clock.take_integrated_if_due(17_639).unwrap());
+        assert_eq!(clock.integrated_deadline_calculations, 1);
+        assert!(clock.take_integrated_if_due(17_640).unwrap());
+        // Consuming an event invalidates the cache but does not eagerly ask for
+        // the successor. This preserves the predecessor's overflow timing.
+        assert_eq!(clock.integrated_deadline_calculations, 1);
+        assert_eq!(clock.next_integrated_end().unwrap(), 22_050);
+        assert_eq!(clock.integrated_deadline_calculations, 2);
+
+        assert_eq!(clock.lra_deadline_calculations, 0);
+        assert_eq!(clock.next_lra_end().unwrap(), 132_303);
+        assert_eq!(clock.next_lra_end().unwrap(), 132_303);
+        assert_eq!(clock.lra_deadline_calculations, 1);
+        assert!(clock.take_lra_if_due(132_303).unwrap());
+        assert_eq!(clock.lra_deadline_calculations, 1);
+    }
+
+    #[test]
+    fn perf09_cached_deadline_sequences_match_the_original_checked_formulas() {
+        for rate in [16_u32, 32_000, 44_100, 44_101, 48_000, 192_000, 2_822_400] {
+            for profile in [LoudnessProfile::NativeEbu2023, LoudnessProfile::Libebur128126] {
+                let mut integrated = WindowClock::new(rate, profile).unwrap();
+                for _ in 0..257 {
+                    let expected = integrated.calculate_integrated_end().unwrap();
+                    assert_eq!(integrated.next_integrated_end().unwrap(), expected);
+                    assert_eq!(integrated.next_integrated_end().unwrap(), expected);
+                    assert!(integrated.take_integrated_if_due(expected).unwrap());
+                }
+                assert_eq!(integrated.integrated_deadline_calculations, 257);
+
+                let mut lra = WindowClock::new(rate, profile).unwrap();
+                for _ in 0..129 {
+                    let expected = lra.calculate_lra_end().unwrap();
+                    assert_eq!(lra.next_lra_end().unwrap(), expected);
+                    assert_eq!(lra.next_lra_end().unwrap(), expected);
+                    assert!(lra.take_lra_if_due(expected).unwrap());
+                }
+                assert_eq!(lra.lra_deadline_calculations, 129);
+            }
+        }
+    }
+
+    #[test]
+    fn consumed_deadline_does_not_eagerly_surface_successor_overflow() {
+        let mut clock = WindowClock::new(48_000, LoudnessProfile::Libebur128126).unwrap();
+        let hop = clock.legacy_hop_frames;
+        let window = clock.integrated_window_frames;
+        let index = (u64::MAX - window) / hop;
+        assert!(index < u64::MAX);
+        clock.next_integrated_index = index;
+        clock.next_integrated_end = None;
+
+        let deadline = clock.next_integrated_end().unwrap();
+        assert!(clock.take_integrated_if_due(deadline).unwrap());
+        // Taking the last representable event succeeds. Only the next query
+        // asks for the successor and therefore observes its checked overflow.
+        assert_eq!(clock.next_integrated_end(), Err(LoudnessError::InputTooLong));
     }
 
     #[test]

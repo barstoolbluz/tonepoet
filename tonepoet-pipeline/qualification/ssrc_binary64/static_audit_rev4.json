@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "contract_id": "TonepoetBinary64OverloadPreservingResampleV1",
+  "source_identity": {
+    "owner": "barstoolbluz",
+    "repo": "ssrc",
+    "rev": "b769add0756157ea88d1bbf9023e06c437485a79",
+    "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU="
+  },
+  "dependency_identity": {
+    "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
+  },
+  "source_review": {
+    "passed": false,
+    "files": [
+      "src/cli/cli.cpp",
+      "src/libshibatchdsp/dr_wav.hpp",
+      "src/libshibatchdsp/SRC.hpp",
+      "src/libshibatchdsp/FastPP.hpp",
+      "src/libshibatchdsp/DFTFilter.hpp",
+      "src/libshibatchdsp/PartDFTFilter.hpp",
+      "src/libshibatchdsp/PartDFTFilterMT.hpp",
+      "src/libshibatchdsp/Kaiser.hpp",
+      "src/libshibatchdsp/Minrceps.hpp"
+    ],
+    "conclusions": [
+      "High, Long, and Insane dispatch to Pipeline<double> at the audited revision.",
+      "Standard, Short, Fast, and Lightning dispatch to Pipeline<float> and are refuted for the strong Binary64 contract only.",
+      "The audited double path reads and writes IEEE Float64 directly and keeps the inspected signal path templated on the same REAL type.",
+      "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode."
+    ],
+    "sleef_dft_type_path_audit": {
+      "passed": false,
+      "files": [],
+      "conclusions": [],
+      "unresolved_items": [
+        "The required SLEEF DFT construction/type-path audit has not yet been represented and bound to the exact SSRC build."
+      ]
+    },
+    "unresolved_items": [
+      "Source-level Pipeline<double> dispatch is documented, but the required SLEEF DFT construction/type-path audit remains incomplete."
+    ]
+  },
+  "build_audit": {
+    "passed": false,
+    "build_closure": null,
+    "compiler_configuration": null,
+    "executable_sha256": null,
+    "unresolved_items": [
+      "No exact production SSRC executable/build closure is present in this implementation environment.",
+      "Compiler/build flags for a commissioned executable have not been bound to an executable digest.",
+      "Architecture-specific executable characterization has not been completed."
+    ]
+  }
+}

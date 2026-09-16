@@ -27,7 +27,6 @@ Built-in plugins:
 - `FfmpegPlugin` for decode, FFmpeg encodes, metadata rewrite, and generic verify.
 - `SoxPlugin` for PCM processing, SoX-supported encodes, PCM/DSD conversion, and DSD rate changes.
 - `SsrcPlugin` for brick-wall or forced SSRC resampling.
-- `LoudgainPlugin` for ReplayGain tagging.
 - `MetaflacPlugin` for FLAC source-audio MD5 Vorbis comments.
 - `FlacPlugin` for native FLAC decode verification.
 
@@ -51,7 +50,7 @@ DSD source detection requires explicit DSD facts: DSF/DFF format, DSD codec, or 
 
 ## ReplayGain policy
 
-ReplayGain operations carry the target format. The built-in loudgain plugin supports FLAC, MP3, AAC/M4A, Opus, ALAC, and WavPack. Other formats need ReplayGain disabled or a custom plugin that explicitly supports `PlanOperation::ReplayGain`.
+ReplayGain is represented in semantic identity but is not lowered to a command plugin. The common executor owns NativeEbu2023 measurement, projection, and admitted format-specific metadata mutation; reader and writer capability are evaluated independently on the realized artifact.
 
 ## Custom format policy
 

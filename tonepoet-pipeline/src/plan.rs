@@ -1,12 +1,11 @@
 //! Deterministic conversion-chain planner.
 
 use crate::dsd_reference::{
-    plan_reference_dsd, DsdReferencePlanSummary, PlannedDeferredCommand, PlannedMeasurement,
-    ReferenceProgrammeScope, ResolvedOutputTarget,
+    DsdReferencePlanSummary, ReferenceProgrammeScope, ResolvedOutputTarget,
 };
 use crate::enums::{
     AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdRate, NyquistTransition, PcmBitDepth, RateTarget, ReplayGainMode, SampleKind, SsrcProfile,
+    DsdRate, NyquistTransition, PcmBitDepth, RateTarget, SampleKind, SsrcProfile,
 };
 use crate::error::{PlanningError, Result};
 use crate::mapping;
@@ -18,6 +17,79 @@ use crate::tools::{ToolIdentifier, ToolRegistry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Opaque owner of a planning/measurement scope.  Submitted-batch scopes use
+/// the queue's existing persisted submission identity; track-local scopes use
+/// the owning participant identity and never infer album membership from tags.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PlanScopeId(pub String);
+
+/// Stable participant identity inside a planning scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PlanParticipantId(pub String);
+
+/// Existing execution ownership projected into the pure planner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PlanScope {
+    /// One independent track.
+    Track {
+        scope_id: PlanScopeId,
+        participant_id: PlanParticipantId,
+    },
+    /// One exact submitted queue cohort.
+    SubmittedBatch {
+        scope_id: PlanScopeId,
+        participant_id: PlanParticipantId,
+        expected_participants: Option<u32>,
+    },
+}
+
+impl PlanScope {
+    /// Construct an explicitly track-local scope.
+    #[must_use]
+    pub fn track(participant_id: impl Into<String>) -> Self {
+        let participant_id = participant_id.into();
+        Self::Track {
+            scope_id: PlanScopeId(format!("track:{participant_id}")),
+            participant_id: PlanParticipantId(participant_id),
+        }
+    }
+
+    /// Construct an exact submitted-batch scope using the queue's authority.
+    #[must_use]
+    pub fn submitted_batch(
+        submission_id: impl Into<String>,
+        participant_id: impl Into<String>,
+        expected_participants: Option<u32>,
+    ) -> Self {
+        let submission_id = submission_id.into();
+        Self::SubmittedBatch {
+            scope_id: PlanScopeId(format!("submission:{submission_id}")),
+            participant_id: PlanParticipantId(participant_id.into()),
+            expected_participants,
+        }
+    }
+
+    /// Scope identity used to bind observations and common decisions.
+    #[must_use]
+    pub const fn scope_id(&self) -> &PlanScopeId {
+        match self {
+            Self::Track { scope_id, .. } | Self::SubmittedBatch { scope_id, .. } => scope_id,
+        }
+    }
+
+    /// Participant identity within the scope.
+    #[must_use]
+    pub const fn participant_id(&self) -> &PlanParticipantId {
+        match self {
+            Self::Track { participant_id, .. }
+            | Self::SubmittedBatch { participant_id, .. } => participant_id,
+        }
+    }
+}
 
 /// Request passed to the pure planner.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +103,8 @@ pub struct PlanRequest {
     pub source: SourceInfo,
     /// Conversion parameters.
     pub settings: PipelineSettings,
+    /// Existing submission/participant ownership for measurement and album decisions.
+    pub plan_scope: PlanScope,
     /// Optional work directory for deterministic intermediate paths.
     pub intermediate_dir: Option<PathBuf>,
     /// Extra ffmpeg output flags for the selected container (e.g., `["-rf64", "auto"]`).
@@ -51,7 +125,7 @@ pub struct PlanRequest {
 }
 
 /// Return whether authoritative source classification and settings select the
-/// native-v2 Reference DSD-to-PCM pathway.
+/// qualified Reference DSD-to-PCM pathway.
 ///
 /// This is the sole admission authority shared by the pure planner and every
 /// orchestrator preflight. Callers with complete source facts pass
@@ -65,8 +139,7 @@ pub fn selects_reference_dsd_to_pcm(
     source_is_dsd: bool,
 ) -> bool {
     source_is_dsd
-        && settings.dsd.is_native_v2()
-        && !settings.dsd.album_auto_gain_selected()
+        && settings.dsd.reference_delivery_selected()
         && !settings.target_format.is_dsd()
 }
 
@@ -370,35 +443,6 @@ pub struct PlannedCommandPipeline {
     pub description: String,
 }
 
-/// One executable P0 step. Existing plans use `Command`; Reference plans may
-/// additionally use a typed pipeline, measure, and bind a later command without
-/// replanning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum PlannedExecutionStep {
-    /// Ordinary fully resolved command.
-    Command(PlannedCommand),
-    /// Shell-free producer-to-consumer pipeline.
-    Pipeline(PlannedCommandPipeline),
-    /// Typed measurement whose result is recorded under a stable ID.
-    Measurement(PlannedMeasurement),
-    /// Command with one or more typed arguments resolved from measurements.
-    DeferredCommand(PlannedDeferredCommand),
-}
-
-impl PlannedExecutionStep {
-    /// Logical output path, when path-backed.
-    #[must_use]
-    pub fn output_path(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::Command(command) => command.output.as_path(),
-            Self::Pipeline(pipeline) => pipeline.consumer.output.as_path(),
-            Self::Measurement(measurement) => measurement.command.output.as_path(),
-            Self::DeferredCommand(command) => command.output.as_path(),
-        }
-    }
-}
-
 /// Post-command finalization the caller performs atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -433,11 +477,9 @@ pub enum PlanAction {
     },
     /// Execute commands in order, then perform finalization.
     Execute {
-        /// Legacy/static planned command list. Empty for a native-v2 Reference plan.
+        /// Static planned command list. Empty for a qualified Reference plan,
+        /// whose authoritative common graph is lowered by the shared executor.
         commands: Vec<PlannedCommand>,
-        /// Measurement-aware execution steps. Empty for existing legacy/static plans.
-        #[cfg_attr(feature = "serde", serde(default))]
-        steps: Vec<PlannedExecutionStep>,
         /// Deterministic work files the executor may delete after success or failure.
         /// Paths are listed here so interrupted reruns can clean or overwrite known
         /// stage files instead of leaving untracked outputs.
@@ -453,7 +495,7 @@ pub enum PlanAction {
 pub struct ConversionPlan {
     /// Chosen action.
     pub action: PlanAction,
-    /// Native-v2 Reference policy facts, absent for legacy/general plans.
+    /// Qualified Reference policy facts, absent for general plans.
     #[cfg_attr(feature = "serde", serde(default))]
     pub reference: Option<DsdReferencePlanSummary>,
 }
@@ -500,7 +542,6 @@ impl ConversionPlan {
         Self {
             action: PlanAction::Execute {
                 commands,
-                steps: Vec::new(),
                 cleanup_paths,
                 finalization,
             },
@@ -508,10 +549,13 @@ impl ConversionPlan {
         }
     }
 
-    /// Create a measurement-aware Reference plan.
+    /// Create a common-model Reference staging plan.
+    ///
+    /// The executable Reference region is lowered by the common runtime from
+    /// the authoritative typed plan; no independent command/step vector is
+    /// stored here.
     #[must_use]
-    pub fn execute_steps_with_cleanup(
-        steps: Vec<PlannedExecutionStep>,
+    pub fn execute_reference_with_cleanup(
         cleanup_paths: Vec<PathBuf>,
         finalization: Option<Finalization>,
         reference: DsdReferencePlanSummary,
@@ -519,7 +563,6 @@ impl ConversionPlan {
         Self {
             action: PlanAction::Execute {
                 commands: Vec::new(),
-                steps,
                 cleanup_paths,
                 finalization,
             },
@@ -536,15 +579,6 @@ impl ConversionPlan {
         }
     }
 
-    /// Return measurement-aware steps, or an empty slice for legacy plans.
-    #[must_use]
-    pub fn steps(&self) -> &[PlannedExecutionStep] {
-        match &self.action {
-            PlanAction::PassthroughCopy { .. } => &[],
-            PlanAction::Execute { steps, .. } => steps,
-        }
-    }
-
     /// Return deterministic work paths that an executor may delete after success or failure.
     #[must_use]
     pub fn cleanup_paths(&self) -> &[PathBuf] {
@@ -552,6 +586,61 @@ impl ConversionPlan {
             PlanAction::PassthroughCopy { cleanup_paths, .. } => cleanup_paths,
             PlanAction::Execute { cleanup_paths, .. } => cleanup_paths,
         }
+    }
+}
+
+/// Provenance of the emitted command used by the Stage A selected-vs-emitted observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum StageALoweringProvenance {
+    /// The command was built with the physical tool already frozen by typed terminal selection.
+    FixedTool,
+    /// The retained command-plan bridge selected a plugin from the registry.
+    RegistryReselection,
+}
+
+/// Measurement-only Stage A record comparing one typed built-in physical selection
+/// with the command realization emitted by the retained lowerer.
+///
+/// These records are diagnostics only. They do not participate in planning,
+/// admission, lowering, or execution decisions.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StageASelectedVsEmittedRecord {
+    /// Index of the typed operation node in the common semantic plan.
+    pub typed_node_index: usize,
+    /// Typed logical operation whose selected physical candidate is being checked.
+    pub operation: PlanOperation,
+    /// Stable identity of the selected physical candidate.
+    pub candidate_identity: String,
+    /// Tool selected by the typed planner.
+    pub selected_tool: ToolIdentifier,
+    /// Index of the retained logical step that physically realizes this operation.
+    pub emitted_step_index: usize,
+    /// Retained logical operation owning the emitted command. Folded typed
+    /// operations can therefore name a different operation here.
+    pub emitted_operation: PlanOperation,
+    /// Tool on the command emitted by the retained lowerer.
+    pub emitted_tool: ToolIdentifier,
+    /// Typed resolved parameters relevant to the selected operation.
+    pub resolved_parameters: crate::semantic_plan::ResolvedOperationParameters,
+    /// Operation-specific semantic projection of the command expected from the
+    /// selected tool. Paths and unrelated command plumbing are excluded.
+    pub selected_parameter_signature: Vec<String>,
+    /// Operation-specific semantic projection of the actual emitted command.
+    pub emitted_parameter_signature: Vec<String>,
+    /// Whether command construction used a frozen tool or registry reselection.
+    pub lowering_provenance: StageALoweringProvenance,
+}
+
+impl StageASelectedVsEmittedRecord {
+    /// True when both the selected physical tool and the operation-relevant
+    /// emitted parameters agree with the typed selection.
+    #[must_use]
+    pub fn matches_selected_realization(&self) -> bool {
+        self.selected_tool == self.emitted_tool
+            && self.selected_parameter_signature == self.emitted_parameter_signature
     }
 }
 
@@ -638,13 +727,6 @@ pub enum PlanOperation {
         /// Target format.
         target_format: AudioFormat,
     },
-    /// ReplayGain scan/tag command.
-    ReplayGain {
-        /// Target format being tagged.
-        target_format: AudioFormat,
-        /// ReplayGain mode.
-        mode: ReplayGainMode,
-    },
     /// Decode verification command.
     Verify {
         /// Target format.
@@ -666,7 +748,6 @@ impl PlanOperation {
             Self::DsdRateChange { .. } => "dsd_rate_change",
             Self::MetadataTransfer { .. } => "metadata_transfer",
             Self::StoreSourceAudioMd5 { .. } => "store_source_audio_md5",
-            Self::ReplayGain { .. } => "replaygain",
             Self::Verify { .. } => "verify",
         }
     }
@@ -808,10 +889,97 @@ pub fn plan_conversion_with_registry(
     request: &PlanRequest,
     registry: &ToolRegistry,
 ) -> Result<ConversionPlan> {
-    if selects_reference_dsd_to_pcm(&request.settings, request.source.is_dsd()) {
-        return plan_reference_dsd(request);
+    let reference_delivery =
+        selects_reference_dsd_to_pcm(&request.settings, request.source.is_dsd());
+    if request.source.is_dsd()
+        && !request.settings.target_format.is_dsd()
+        && !matches!(
+            request.settings.dsd.from_dsd.pathway,
+            crate::dsd_reference::DsdSourcePathway::General
+        )
+    {
+        // Preserve the sealed Reference/Manual pathway admission precedence and
+        // exact public diagnostics before the common planner wraps typed refusals.
+        crate::dsd_reference::resolve_reference_static_admission(request)?;
     }
-    match plan_topology(request)? {
+
+    // Preserve the established public validation and topology error precedence.
+    // The typed planner adds authority/selection proof; it must not mask basic
+    // settings, source, or path errors that the executable topology already owns.
+    let topology = if reference_delivery {
+        None
+    } else {
+        Some(plan_topology(request)?)
+    };
+
+    let topology_has_sample_processing = topology.as_ref().is_some_and(|topology| match topology {
+        TopologyPlan::Passthrough { .. } => false,
+        TopologyPlan::Execute { steps, .. } => steps.iter().any(|step| {
+            matches!(
+                step.operation,
+                PlanOperation::DecodeToPcm { .. }
+                    | PlanOperation::ResamplePcm { .. }
+                    | PlanOperation::EncodePcm { .. }
+                    | PlanOperation::EncodeLossy { .. }
+                    | PlanOperation::PcmToDsd { .. }
+                    | PlanOperation::DsdToPcm { .. }
+                    | PlanOperation::DsdRateChange { .. }
+            )
+        }),
+    });
+    // The common typed planner presently knows only the built-in physical
+    // registry. Preserve the existing caller-provided registry contract for
+    // custom formats until that registry is plumbed into typed selection.
+    let typed_required = reference_delivery
+        || (topology_has_sample_processing
+            && !matches!(request.settings.target_format, AudioFormat::Custom { .. }));
+
+    let typed = if typed_required {
+        Some(match crate::semantic_plan::plan_typed(request) {
+            Ok(crate::semantic_plan::PlanningOutcome::Ready(typed)) => {
+                crate::semantic_plan::require_current_executor(&typed)?;
+                typed
+            }
+            Ok(crate::semantic_plan::PlanningOutcome::NeedFacts(facts)) => {
+                let reason = facts
+                    .into_iter()
+                    .map(|fact| format!("{}: {}", fact.key, fact.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(PlanningError::invalid_source(
+                    "semantic_plan",
+                    format!("planning requires authoritative source facts: {reason}"),
+                ));
+            }
+            Ok(crate::semantic_plan::PlanningOutcome::Refused(refusal)) => {
+                return Err(PlanningError::invalid_settings(
+                    "semantic_plan",
+                    format!("{}: {}", refusal.code, refusal.reason),
+                ));
+            }
+            Err(limit) => {
+                return Err(PlanningError::PlanningResourceLimit {
+                    resource: limit.resource,
+                    requested: limit.requested,
+                    limit: limit.limit,
+                });
+            }
+        })
+    } else {
+        None
+    };
+    if reference_delivery {
+        let typed = typed
+            .as_ref()
+            .expect("reference delivery always requires the typed common plan");
+        let semantic_plan_hash_v1 =
+            crate::fingerprint::common_semantic_plan_fingerprint_v1(request, typed).0;
+        return crate::dsd_reference::plan_reference_dsd_with_common_hash(
+            request,
+            semantic_plan_hash_v1,
+        );
+    }
+    match topology.expect("non-reference planning preflights executable topology") {
         TopologyPlan::Passthrough { reason } => {
             let work_path = request.context().final_work_path();
             Ok(ConversionPlan::passthrough(
@@ -828,9 +996,43 @@ pub fn plan_conversion_with_registry(
             let context = request.context();
             let (steps, finalization) =
                 prune_redundant_metadata_steps(&context, registry, &steps, finalization)?;
+            let selected_direct_pcm_terminal = typed
+                .as_ref()
+                .map(selected_terminal_realization)
+                .transpose()?
+                .flatten()
+                .and_then(|realization| match realization {
+                    crate::semantic_plan::SelectedTerminalRealization::Pcm(realization)
+                        if matches!(
+                            realization.kind,
+                            crate::semantic_plan::PcmTerminalRealizationKind::SoxDirect
+                                | crate::semantic_plan::PcmTerminalRealizationKind::FfmpegDirect
+                        ) => Some(realization),
+                    _ => None,
+                });
             let mut commands = Vec::with_capacity(steps.len());
             for step in &steps {
-                commands.push(registry.build_command(&context, step)?);
+                let frozen_tool = selected_direct_pcm_terminal.and_then(|realization| {
+                    matches!(
+                        &step.operation,
+                        PlanOperation::EncodePcm {
+                            target_format,
+                            target_rate_hz,
+                            target_bit_depth,
+                            ..
+                        } if target_format == &realization.target_format
+                            && target_rate_hz == &realization.target_rate_hz
+                            && target_bit_depth == &realization.target_bit_depth
+                    )
+                    .then_some(&realization.selected_tool)
+                });
+                commands.push(match frozen_tool {
+                    Some(tool) => registry.build_command_for_tool(&context, step, tool)?,
+                    None => registry.build_command(&context, step)?,
+                });
+            }
+            if let Some(typed) = typed.as_ref() {
+                validate_selected_terminal_lowering(typed, &steps, &commands)?;
             }
             let cleanup_paths =
                 collect_cleanup_paths(&commands, &finalization, &request.output_path);
@@ -841,6 +1043,940 @@ pub fn plan_conversion_with_registry(
             ))
         }
     }
+}
+
+/// Build the Stage A selected-vs-emitted diagnostic records using the built-in registry.
+///
+/// This is an observational planning pass only. It does not alter the command plan
+/// returned by [`plan_conversion`] and must not be used as execution authority.
+pub fn stage_a_selected_vs_emitted_diagnostics(
+    request: &PlanRequest,
+) -> Result<Vec<StageASelectedVsEmittedRecord>> {
+    stage_a_selected_vs_emitted_diagnostics_with_registry(
+        request,
+        &ToolRegistry::with_builtin_tools(),
+    )
+}
+
+/// Build Stage A selected-vs-emitted diagnostic records with an explicit registry.
+///
+/// Caller-defined target formats intentionally return no typed records because the
+/// common typed planner still models only built-in physical candidates. Existing
+/// caller-registry semantics therefore remain unchanged.
+pub fn stage_a_selected_vs_emitted_diagnostics_with_registry(
+    request: &PlanRequest,
+    registry: &ToolRegistry,
+) -> Result<Vec<StageASelectedVsEmittedRecord>> {
+    if selects_reference_dsd_to_pcm(&request.settings, request.source.is_dsd())
+        || matches!(request.settings.target_format, AudioFormat::Custom { .. })
+    {
+        return Ok(Vec::new());
+    }
+
+    let topology = plan_topology(request)?;
+    let TopologyPlan::Execute { steps, finalization } = topology else {
+        return Ok(Vec::new());
+    };
+    let topology_has_sample_processing = steps.iter().any(|step| {
+        matches!(
+            &step.operation,
+            PlanOperation::DecodeToPcm { .. }
+                | PlanOperation::ResamplePcm { .. }
+                | PlanOperation::EncodePcm { .. }
+                | PlanOperation::EncodeLossy { .. }
+                | PlanOperation::PcmToDsd { .. }
+                | PlanOperation::DsdToPcm { .. }
+                | PlanOperation::DsdRateChange { .. }
+        )
+    });
+    if !topology_has_sample_processing {
+        return Ok(Vec::new());
+    }
+
+    let typed = match crate::semantic_plan::plan_typed(request) {
+        Ok(crate::semantic_plan::PlanningOutcome::Ready(typed)) => {
+            crate::semantic_plan::require_current_executor(&typed)?;
+            typed
+        }
+        Ok(crate::semantic_plan::PlanningOutcome::NeedFacts(facts)) => {
+            let reason = facts
+                .into_iter()
+                .map(|fact| format!("{}: {}", fact.key, fact.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(PlanningError::invalid_source(
+                "stage_a_selected_vs_emitted",
+                format!("diagnostic requires authoritative source facts: {reason}"),
+            ));
+        }
+        Ok(crate::semantic_plan::PlanningOutcome::Refused(refusal)) => {
+            return Err(PlanningError::invalid_settings(
+                "stage_a_selected_vs_emitted",
+                format!("{}: {}", refusal.code, refusal.reason),
+            ));
+        }
+        Err(limit) => {
+            return Err(PlanningError::PlanningResourceLimit {
+                resource: limit.resource,
+                requested: limit.requested,
+                limit: limit.limit,
+            });
+        }
+    };
+
+    let context = request.context();
+    let (steps, _) = prune_redundant_metadata_steps(
+        &context,
+        registry,
+        &steps,
+        finalization,
+    )?;
+    let lowered = plan_conversion_with_registry(request, registry)?;
+    let commands = lowered.commands();
+    stage_a_selected_vs_emitted_records_from_lowered(
+        &typed,
+        &context,
+        registry,
+        &steps,
+        commands,
+    )
+}
+
+fn stage_a_is_builtin_tool(tool: &ToolIdentifier) -> bool {
+    !matches!(tool, ToolIdentifier::Custom(_))
+}
+
+fn stage_a_associated_step_index(
+    operation: &PlanOperation,
+    steps: &[PlanStep],
+    exact_claimed: &mut [bool],
+) -> Option<usize> {
+    if let Some((index, _)) = steps
+        .iter()
+        .enumerate()
+        .find(|(index, step)| !exact_claimed[*index] && &step.operation == operation)
+    {
+        exact_claimed[index] = true;
+        return Some(index);
+    }
+
+    match operation {
+        // The retained bridge can fold an ordinary PCM resample into the
+        // terminal encoder command. Associate the typed resampler with that
+        // physical realization instead of silently dropping the node.
+        PlanOperation::ResamplePcm { target_rate_hz, .. } => steps
+            .iter()
+            .position(|step| match &step.operation {
+                PlanOperation::EncodePcm {
+                    target_rate_hz: Some(rate),
+                    apply_processing: true,
+                    ..
+                }
+                | PlanOperation::EncodeLossy {
+                    target_rate_hz: Some(rate),
+                    apply_processing: true,
+                    ..
+                } => rate == target_rate_hz,
+                _ => false,
+            }),
+        // General DSD-to-PCM can still be one retained SoX command even though
+        // the common semantic spine exposes reconstruction and terminal encode
+        // as distinct typed operations.
+        PlanOperation::EncodePcm {
+            target_format,
+            target_rate_hz: Some(target_rate_hz),
+            target_bit_depth,
+            ..
+        } => steps.iter().position(|step| {
+            matches!(
+                &step.operation,
+                PlanOperation::DsdToPcm {
+                    target_format: emitted_format,
+                    target_rate_hz: emitted_rate_hz,
+                    target_bit_depth: emitted_bit_depth,
+                    ..
+                } if emitted_format == target_format
+                    && emitted_rate_hz == target_rate_hz
+                    && emitted_bit_depth == target_bit_depth
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn stage_a_normalized_command_args(command: &PlannedCommand) -> Vec<String> {
+    let input = command
+        .input
+        .as_path()
+        .map(|path| path.to_string_lossy().into_owned());
+    let output = command
+        .output
+        .as_path()
+        .map(|path| path.to_string_lossy().into_owned());
+    command
+        .args
+        .iter()
+        .map(|arg| {
+            if input.as_deref() == Some(arg.as_str()) {
+                "<input>".to_owned()
+            } else if output.as_deref() == Some(arg.as_str()) {
+                "<output>".to_owned()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect()
+}
+
+fn stage_a_ffmpeg_aresample_filter(command: &PlannedCommand) -> Option<String> {
+    command
+        .args
+        .windows(2)
+        .filter(|pair| pair[0] == "-af")
+        .flat_map(|pair| pair[1].split(','))
+        .find(|filter| filter.starts_with("aresample="))
+        .map(str::to_owned)
+}
+
+fn stage_a_ffmpeg_aresample_field(command: &PlannedCommand, key: &str) -> Option<String> {
+    let filter = stage_a_ffmpeg_aresample_filter(command)?;
+    filter
+        .strip_prefix("aresample=")?
+        .split(':')
+        .find_map(|field| {
+            let (field_key, value) = field.split_once('=')?;
+            (field_key == key).then(|| value.to_owned())
+        })
+}
+
+fn stage_a_last_flag_value(command: &PlannedCommand, flag: &str) -> Option<String> {
+    command
+        .args
+        .windows(2)
+        .filter_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
+        .last()
+}
+
+fn stage_a_resample_signature(
+    emitted_operation: &PlanOperation,
+    command: &PlannedCommand,
+) -> Vec<String> {
+    match &command.tool {
+        ToolIdentifier::Ffmpeg => {
+            let mut signature = Vec::new();
+            if let Some(filter) = stage_a_ffmpeg_aresample_filter(command) {
+                signature.push(filter);
+            }
+            if matches!(emitted_operation, PlanOperation::EncodeLossy { .. }) {
+                if let Some(rate) = stage_a_last_flag_value(command, "-ar") {
+                    signature.push(format!("encoder_rate={rate}"));
+                }
+            }
+            signature
+        }
+        ToolIdentifier::Sox => {
+            let output_index = command
+                .output
+                .as_path()
+                .map(|path| path.to_string_lossy())
+                .and_then(|output| command.args.iter().position(|arg| arg == output.as_ref()));
+            let tail = output_index
+                .map(|index| &command.args[index + 1..])
+                .unwrap_or(command.args.as_slice());
+            let start = tail
+                .iter()
+                .position(|arg| arg == "sinc")
+                .or_else(|| tail.iter().position(|arg| arg == "rate"));
+            start.map_or_else(Vec::new, |index| tail[index..].to_vec())
+        }
+        ToolIdentifier::Ssrc => stage_a_normalized_command_args(command),
+        _ => stage_a_normalized_command_args(command),
+    }
+}
+
+fn stage_a_terminal_signature(
+    operation: &PlanOperation,
+    command: &PlannedCommand,
+) -> Vec<String> {
+    match &command.tool {
+        ToolIdentifier::Ffmpeg => {
+            let output_index = command
+                .output
+                .as_path()
+                .map(|path| path.to_string_lossy())
+                .and_then(|output| command.args.iter().position(|arg| arg == output.as_ref()))
+                .unwrap_or(command.args.len());
+            let mut signature = command
+                .args
+                .iter()
+                .position(|arg| arg == "-c:a")
+                .map(|start| command.args[start..output_index].to_vec())
+                .unwrap_or_default();
+            if matches!(operation, PlanOperation::EncodeLossy { .. }) {
+                if let Some(rate) = stage_a_last_flag_value(command, "-ar") {
+                    signature.push(format!("encoder_rate={rate}"));
+                }
+            }
+            for key in ["out_sample_fmt", "dither_method"] {
+                if let Some(value) = stage_a_ffmpeg_aresample_field(command, key) {
+                    signature.push(format!("{key}={value}"));
+                }
+            }
+            signature
+        }
+        ToolIdentifier::Sox => {
+            let input_index = command
+                .input
+                .as_path()
+                .map(|path| path.to_string_lossy())
+                .and_then(|input| command.args.iter().position(|arg| arg == input.as_ref()));
+            let output_index = command
+                .output
+                .as_path()
+                .map(|path| path.to_string_lossy())
+                .and_then(|output| command.args.iter().position(|arg| arg == output.as_ref()));
+            let mut signature = match (input_index, output_index) {
+                (Some(input), Some(output)) if input < output => {
+                    command.args[input + 1..output].to_vec()
+                }
+                _ => Vec::new(),
+            };
+            if command.args.iter().any(|arg| arg == "-D") {
+                signature.push("implicit_dither_disabled".to_owned());
+            }
+            if let Some(dither) = command.args.iter().position(|arg| arg == "dither") {
+                signature.extend(command.args[dither..].iter().cloned());
+            }
+            signature
+        }
+        _ => stage_a_normalized_command_args(command),
+    }
+}
+
+fn stage_a_semantic_parameter_signature(
+    operation: &PlanOperation,
+    emitted_operation: &PlanOperation,
+    command: &PlannedCommand,
+) -> Vec<String> {
+    match operation {
+        PlanOperation::ResamplePcm { .. } => {
+            stage_a_resample_signature(emitted_operation, command)
+        }
+        PlanOperation::EncodePcm { .. } | PlanOperation::EncodeLossy { .. } => {
+            stage_a_terminal_signature(operation, command)
+        }
+        _ => stage_a_normalized_command_args(command),
+    }
+}
+
+fn stage_a_matching_fixed_terminal_tool<'a>(
+    typed: &'a crate::semantic_plan::TypedConversionPlan,
+    operation: &PlanOperation,
+) -> Option<&'a ToolIdentifier> {
+    selected_terminal_realization(typed)
+        .ok()
+        .flatten()
+        .and_then(|realization| match realization {
+            crate::semantic_plan::SelectedTerminalRealization::Pcm(realization)
+                if matches!(
+                    realization.kind,
+                    crate::semantic_plan::PcmTerminalRealizationKind::SoxDirect
+                        | crate::semantic_plan::PcmTerminalRealizationKind::FfmpegDirect
+                ) && matches!(
+                    operation,
+                    PlanOperation::EncodePcm {
+                        target_format,
+                        target_rate_hz,
+                        target_bit_depth,
+                        ..
+                    } if target_format == &realization.target_format
+                        && target_rate_hz == &realization.target_rate_hz
+                        && target_bit_depth == &realization.target_bit_depth
+                ) => Some(&realization.selected_tool),
+            _ => None,
+        })
+}
+
+fn stage_a_selected_vs_emitted_records_from_lowered(
+    typed: &crate::semantic_plan::TypedConversionPlan,
+    context: &PlanContext<'_>,
+    registry: &ToolRegistry,
+    steps: &[PlanStep],
+    commands: &[PlannedCommand],
+) -> Result<Vec<StageASelectedVsEmittedRecord>> {
+    if steps.len() != commands.len() {
+        return Err(PlanningError::invalid_settings(
+            "stage_a_selected_vs_emitted",
+            "pruned operation list no longer has a one-to-one relationship with emitted commands",
+        ));
+    }
+
+    let mut exact_claimed = vec![false; steps.len()];
+    let mut records = Vec::new();
+    for (typed_node_index, node) in typed.nodes.iter().enumerate() {
+        let crate::semantic_plan::TypedPlanNode::Operation {
+            operation,
+            candidates,
+            selected_candidate,
+            resolved_parameters,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        let Some(candidate) = candidates.get(*selected_candidate) else {
+            return Err(PlanningError::invalid_settings(
+                "stage_a_selected_vs_emitted",
+                format!(
+                    "typed operation node {typed_node_index} selected candidate index {selected_candidate} outside its candidate set"
+                ),
+            ));
+        };
+        let Some(selected_tool) = candidate.tool.as_ref() else {
+            continue;
+        };
+        if !stage_a_is_builtin_tool(selected_tool) {
+            continue;
+        }
+
+        let emitted_step_index = stage_a_associated_step_index(
+            operation,
+            steps,
+            &mut exact_claimed,
+        )
+        .ok_or_else(|| {
+            PlanningError::invalid_settings(
+                "stage_a_selected_vs_emitted",
+                format!(
+                    "typed built-in operation node {typed_node_index} ({}) has no emitted realization",
+                    operation.label(),
+                ),
+            )
+        })?;
+        let step = &steps[emitted_step_index];
+        let emitted = &commands[emitted_step_index];
+        let selected = registry.build_command_for_tool(context, step, selected_tool)?;
+        let selected_parameter_signature = stage_a_semantic_parameter_signature(
+            operation,
+            &step.operation,
+            &selected,
+        );
+        let emitted_parameter_signature = stage_a_semantic_parameter_signature(
+            operation,
+            &step.operation,
+            emitted,
+        );
+        let lowering_provenance = if stage_a_matching_fixed_terminal_tool(typed, &step.operation).is_some() {
+            StageALoweringProvenance::FixedTool
+        } else {
+            StageALoweringProvenance::RegistryReselection
+        };
+
+        records.push(StageASelectedVsEmittedRecord {
+            typed_node_index,
+            operation: operation.clone(),
+            candidate_identity: candidate.identity.clone(),
+            selected_tool: selected_tool.clone(),
+            emitted_step_index,
+            emitted_operation: step.operation.clone(),
+            emitted_tool: emitted.tool.clone(),
+            resolved_parameters: resolved_parameters.clone(),
+            selected_parameter_signature,
+            emitted_parameter_signature,
+            lowering_provenance,
+        });
+    }
+    Ok(records)
+}
+
+fn selected_terminal_realization(
+    typed: &crate::semantic_plan::TypedConversionPlan,
+) -> Result<Option<&crate::semantic_plan::SelectedTerminalRealization>> {
+    let mut selected = typed.nodes.iter().filter_map(|node| {
+        let crate::semantic_plan::TypedPlanNode::Operation {
+            candidates,
+            selected_candidate,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        candidates
+            .get(*selected_candidate)
+            .and_then(|candidate| candidate.contract.terminal_realization.as_ref())
+    });
+    let realization = selected.next();
+    if selected.next().is_some() {
+        return Err(PlanningError::invalid_settings(
+            "terminal_realization",
+            "typed plan selected more than one physical terminal realization",
+        ));
+    }
+    Ok(realization)
+}
+
+fn command_args_contain_sequence(args: &[String], sequence: &[String]) -> bool {
+    !sequence.is_empty()
+        && args
+            .windows(sequence.len())
+            .any(|window| window == sequence)
+}
+
+fn command_ffmpeg_dither_method_count(command: &PlannedCommand) -> usize {
+    command
+        .args
+        .iter()
+        .map(|arg| arg.match_indices("dither_method=").count())
+        .sum()
+}
+
+fn command_flag_values<'a>(command: &'a PlannedCommand, flag: &str) -> Vec<&'a str> {
+    command
+        .args
+        .windows(2)
+        .filter_map(|pair| (pair[0] == flag).then_some(pair[1].as_str()))
+        .collect()
+}
+
+fn validate_ssrc_terminal_command(
+    command: &PlannedCommand,
+    realization: &crate::semantic_plan::SelectedPcmTerminalRealization,
+) -> Result<()> {
+    if command.tool != ToolIdentifier::Ssrc {
+        return Err(PlanningError::invalid_settings(
+            "terminal_realization",
+            format!(
+                "selected SSRC terminal lowered with {} instead of ssrc",
+                command.tool,
+            ),
+        ));
+    }
+    let bits = command_flag_values(command, "--bits");
+    let expected_bits = crate::plugins::ssrc_bits_arg(realization.target_bit_depth);
+    if bits.as_slice() != [expected_bits.as_str()] {
+        return Err(PlanningError::invalid_settings(
+            "terminal_realization",
+            format!(
+                "selected SSRC terminal expected exactly one --bits {expected_bits}; observed {bits:?}",
+            ),
+        ));
+    }
+    let resolved = realization.ssrc_dither.as_ref().ok_or_else(|| {
+        PlanningError::invalid_settings(
+            "terminal_realization",
+            "selected SSRC terminal is missing its structured native dither resolution",
+        )
+    })?;
+    if matches!(
+        resolved.availability,
+        crate::plugins::SsrcDitherAvailability::UnavailableForSsrcTerminal { .. }
+    ) {
+        return Err(PlanningError::invalid_settings(
+            "terminal_realization",
+            "selected SSRC terminal carries an unavailable native dither resolution",
+        ));
+    }
+    let dither_values = command_flag_values(command, "--dither");
+    match resolved.dither_id {
+        Some(id) => {
+            let expected_id = id.to_string();
+            if dither_values.len() == 1 && dither_values[0] == expected_id {
+                // Exact one native dither id.
+            } else {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                format!(
+                    "selected SSRC terminal expected exactly one --dither {id}; observed {dither_values:?}",
+                ),
+            ));
+            }
+        }
+        None if dither_values.is_empty() => {}
+        None => {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                "selected SSRC terminal says native dither is inactive but lowering emits --dither",
+            ));
+        }
+    }
+    let pdf_values = command_flag_values(command, "--pdf");
+    let expected_pdf = resolved.pdf_type.map(|pdf| match pdf {
+        crate::enums::SsrcPdfType::Rectangular => "0",
+        crate::enums::SsrcPdfType::Triangular => "1",
+    });
+    match expected_pdf {
+        Some(pdf) if pdf_values.as_slice() == [pdf] => {}
+        Some(pdf) => {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                format!(
+                    "selected SSRC terminal expected exactly one --pdf {pdf}; observed {pdf_values:?}",
+                ),
+            ));
+        }
+        None if pdf_values.is_empty() => {}
+        None => {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                "selected SSRC terminal says no native PDF is active but lowering emits --pdf",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_direct_terminal_dither(
+    command: &PlannedCommand,
+    realization: &crate::semantic_plan::SelectedPcmTerminalRealization,
+) -> Result<()> {
+    use crate::semantic_plan::PcmTerminalRealizationKind;
+
+    match realization.kind {
+        PcmTerminalRealizationKind::SsrcDirectWav => {
+            validate_ssrc_terminal_command(command, realization)?;
+        }
+        PcmTerminalRealizationKind::FfmpegDirect => {
+            if command.tool != ToolIdentifier::Ffmpeg {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected FFmpeg terminal lowered with {} instead of ffmpeg",
+                        command.tool,
+                    ),
+                ));
+            }
+            let emitted = command_ffmpeg_dither_method_count(command);
+            match realization.effective_dither {
+                Some(dither) => {
+                    let method = mapping::soxr_dither_method(dither).ok_or_else(|| {
+                        PlanningError::invalid_settings(
+                            "terminal_realization",
+                            format!(
+                                "selected FFmpeg terminal dither {dither:?} has no FFmpeg mapping",
+                            ),
+                        )
+                    })?;
+                    let expected = format!("dither_method={method}");
+                    if emitted != 1 || !command.args.iter().any(|arg| arg.contains(&expected)) {
+                        return Err(PlanningError::invalid_settings(
+                            "terminal_realization",
+                            format!(
+                                "lowered FFmpeg terminal disagrees with selected dither {dither:?}: expected exactly one {expected}, observed {emitted} dither_method option(s)",
+                            ),
+                        ));
+                    }
+                }
+                None if emitted != 0 => {
+                    return Err(PlanningError::invalid_settings(
+                        "terminal_realization",
+                        "lowered FFmpeg terminal emits dither_method while the selected terminal realization says dither=none",
+                    ));
+                }
+                None => {}
+            }
+        }
+        PcmTerminalRealizationKind::SoxDirect => {
+            if command.tool != ToolIdentifier::Sox {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected SoX terminal lowered with {} instead of sox",
+                        command.tool,
+                    ),
+                ));
+            }
+            match realization.effective_dither {
+                Some(dither) => {
+                    let expected = mapping::sox_dither_args(dither);
+                    if !command_args_contain_sequence(&command.args, &expected) {
+                        return Err(PlanningError::invalid_settings(
+                            "terminal_realization",
+                            format!(
+                                "lowered SoX terminal omits selected dither {dither:?}",
+                            ),
+                        ));
+                    }
+                }
+                None if command.args.iter().any(|arg| arg == "dither") => {
+                    return Err(PlanningError::invalid_settings(
+                        "terminal_realization",
+                        "lowered SoX terminal contains an explicit dither effect while the selected terminal realization says dither=none",
+                    ));
+                }
+                None => {}
+            }
+        }
+        PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+        | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
+        | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid
+        | PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                "non-direct terminal realization was passed to the direct-terminal dither validator",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_selected_terminal_lowering(
+    typed: &crate::semantic_plan::TypedConversionPlan,
+    steps: &[PlanStep],
+    commands: &[PlannedCommand],
+) -> Result<()> {
+    use crate::semantic_plan::{
+        PcmTerminalRealizationKind, SelectedTerminalRealization,
+    };
+
+    let Some(realization) = selected_terminal_realization(typed)? else {
+        return Ok(());
+    };
+    let SelectedTerminalRealization::Pcm(realization) = realization else {
+        return Ok(());
+    };
+    if steps.len() != commands.len() {
+        return Err(PlanningError::invalid_settings(
+            "terminal_realization",
+            "lowered command list no longer has a one-to-one relationship with the pruned operation list",
+        ));
+    }
+
+    let direct_indices = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| match &step.operation {
+            PlanOperation::EncodePcm {
+                target_format,
+                target_rate_hz,
+                target_bit_depth,
+                ..
+            } if target_format == &realization.target_format
+                && target_rate_hz == &realization.target_rate_hz
+                && target_bit_depth == &realization.target_bit_depth => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let fused_dsd_indices = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| match &step.operation {
+            PlanOperation::DsdToPcm {
+                target_format,
+                target_rate_hz,
+                target_bit_depth,
+                ..
+            } if target_format == &realization.target_format
+                && Some(*target_rate_hz) == realization.target_rate_hz
+                && target_bit_depth == &realization.target_bit_depth => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let ssrc_indices = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| match &step.operation {
+            PlanOperation::ResamplePcm {
+                target_rate_hz,
+                target_bit_depth: Some(target_bit_depth),
+                ..
+            } if Some(*target_rate_hz) == realization.target_rate_hz
+                && target_bit_depth == &realization.target_bit_depth => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    match realization.kind {
+        PcmTerminalRealizationKind::SsrcDirectWav => {
+            if realization.target_format != AudioFormat::Wav
+                || realization.selected_tool != ToolIdentifier::Ssrc
+                || ssrc_indices.len() != 1
+            {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected direct SSRC WAV terminal has invalid binding or {} matching resample operations",
+                        ssrc_indices.len(),
+                    ),
+                ));
+            }
+            if !direct_indices.is_empty() {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "selected direct SSRC WAV terminal lowered with a second PCM terminal operation",
+                ));
+            }
+            let terminal_index = ssrc_indices[0];
+            validate_direct_terminal_dither(&commands[terminal_index], realization)?;
+            if steps.iter().skip(terminal_index + 1).any(|step| {
+                matches!(
+                    step.operation,
+                    PlanOperation::ResamplePcm { .. }
+                        | PlanOperation::EncodePcm { .. }
+                        | PlanOperation::EncodeLossy { .. }
+                        | PlanOperation::PcmToDsd { .. }
+                        | PlanOperation::DsdRateChange { .. }
+                )
+            }) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "selected direct SSRC terminal is followed by another sample-changing terminal operation",
+                ));
+            }
+            if commands
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != terminal_index)
+                .any(|(_, command)| {
+                    command_ffmpeg_dither_method_count(command) != 0
+                        || command.args.iter().any(|arg| arg == "--dither" || arg == "dither")
+                })
+            {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "selected direct SSRC terminal lowered with downstream or duplicate dither",
+                ));
+            }
+        }
+        PcmTerminalRealizationKind::SoxDirect | PcmTerminalRealizationKind::FfmpegDirect => {
+            if direct_indices.is_empty() && fused_dsd_indices.len() == 1 {
+                // The semantic spine names DSD reconstruction and terminal PCM
+                // separately, while the retained executor can fuse both into
+                // one SoX DsdToPcm command. There is no standalone EncodePcm
+                // command whose backend can be bound to the synthetic terminal.
+                // Still require the one registered fused physical owner.
+                let fused = &commands[fused_dsd_indices[0]];
+                if fused.tool != ToolIdentifier::Sox {
+                    return Err(PlanningError::invalid_settings(
+                        "terminal_realization",
+                        format!(
+                            "fused DSD-to-PCM terminal lowered with {} instead of sox",
+                            fused.tool,
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            if direct_indices.len() != 1 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected direct terminal has {} matching lowered PCM operations instead of one",
+                        direct_indices.len(),
+                    ),
+                ));
+            }
+            validate_direct_terminal_dither(&commands[direct_indices[0]], realization)?;
+        }
+        PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
+            return Err(PlanningError::invalid_settings(
+                "terminal_realization",
+                "SSRC preterminal package-only cells are not admitted in this build",
+            ));
+        }
+        PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
+        | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
+            if direct_indices.len() != 1 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected compound terminal has {} matching package operations instead of one",
+                        direct_indices.len(),
+                    ),
+                ));
+            }
+            let package = &commands[direct_indices[0]];
+            let expected_package_tool = match realization.kind {
+                PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage => ToolIdentifier::Ffmpeg,
+                PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
+                    ToolIdentifier::Custom("wavpack".to_owned())
+                }
+                _ => unreachable!("guarded by compound-terminal match"),
+            };
+            if package.tool != expected_package_tool {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected compound terminal package lowered with {} instead of {}",
+                        package.tool, expected_package_tool,
+                    ),
+                ));
+            }
+            if command_ffmpeg_dither_method_count(package) != 0 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "compound terminal package command emits FFmpeg dither although selected realization assigns dither ownership to the SoX preterminal",
+                ));
+            }
+
+            let sox_dither_commands = match realization.effective_dither {
+                Some(dither) => {
+                    let expected = mapping::sox_dither_args(dither);
+                    commands
+                        .iter()
+                        .filter(|command| {
+                            command.tool == ToolIdentifier::Sox
+                                && command_args_contain_sequence(&command.args, &expected)
+                        })
+                        .count()
+                }
+                None => commands
+                    .iter()
+                    .filter(|command| {
+                        command.tool == ToolIdentifier::Sox
+                            && command.args.iter().any(|arg| arg == "dither")
+                    })
+                    .count(),
+            };
+            match realization.effective_dither {
+                Some(dither) if sox_dither_commands != 1 => {
+                    return Err(PlanningError::invalid_settings(
+                        "terminal_realization",
+                        format!(
+                            "selected compound terminal dither {dither:?} must be emitted by exactly one SoX preterminal; observed {sox_dither_commands}",
+                        ),
+                    ));
+                }
+                None if sox_dither_commands != 0 => {
+                    return Err(PlanningError::invalid_settings(
+                        "terminal_realization",
+                        "lowered compound terminal contains explicit SoX dither while the selected terminal realization says dither=none",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
+            if direct_indices.len() != 1 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected native WavPack hybrid terminal has {} matching package operations instead of one",
+                        direct_indices.len(),
+                    ),
+                ));
+            }
+            let package = &commands[direct_indices[0]];
+            if package.tool != ToolIdentifier::Custom("wavpack".to_owned()) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected native WavPack hybrid terminal lowered with {} instead of wavpack",
+                        package.tool,
+                    ),
+                ));
+            }
+            if realization.effective_dither.is_some()
+                || command_ffmpeg_dither_method_count(package) != 0
+            {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "native WavPack hybrid package unexpectedly carries terminal dither",
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn prune_redundant_metadata_steps(
@@ -1149,7 +2285,7 @@ fn validate_step_paths(
     Ok(())
 }
 
-fn validate_request_semantics(request: &PlanRequest) -> Result<()> {
+pub(crate) fn validate_forced_ssrc_semantics(request: &PlanRequest) -> Result<()> {
     if request.settings.ssrc.force
         && (request.source.is_dsd()
             || request.settings.target_format.is_dsd()
@@ -1158,6 +2294,20 @@ fn validate_request_semantics(request: &PlanRequest) -> Result<()> {
         return Err(PlanningError::invalid_settings(
             "ssrc.force",
             "forced SSRC requires a PCM source, a PCM target, and an actual PCM sample-rate change",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_request_semantics(request: &PlanRequest) -> Result<()> {
+    validate_forced_ssrc_semantics(request)?;
+    if request.source.is_dsd()
+        && request.settings.dsd.general_from_dsd.lowpass == DsdLowpassMethod::Sinc
+        && request.settings.dsd.general_from_dsd.sinc.allow_aliasing
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.general_from_dsd.sinc.allow_aliasing",
+            "general DSD-to-PCM sinc alias permission is not supported by the retained SoX lowerer",
         ));
     }
     Ok(())
@@ -1202,6 +2352,18 @@ fn conversion_is_stream_copy_only(request: &PlanRequest) -> bool {
 fn audio_content_matches_requested(request: &PlanRequest) -> bool {
     let settings = &request.settings;
     if settings.force_encode {
+        return false;
+    }
+    // Explicit FFmpeg Int32 dither is a real terminal transformation even
+    // when source and target PCM lattices already match. Resolve Source to
+    // the authoritative PCM depth so passthrough cannot swallow that request.
+    let requested_pcm_depth = match settings.target_bit_depth {
+        BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+        BitDepthTarget::Pcm(depth) => Some(depth),
+    };
+    if settings.target_format.is_pcm_lossless()
+        && crate::plugins::explicit_int32_dither_requested(settings, requested_pcm_depth)
+    {
         return false;
     }
     if settings.dither_type != DitherType::None && !requested_depth_matches_source(request) {
@@ -1295,7 +2457,7 @@ fn plan_to_dsd(
         PlanOperation::DsdRateChange {
             target_format: request.settings.target_format.clone(),
             target_rate,
-            lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
+            lowpass: request.settings.dsd.general_from_dsd.lowpass,
         }
     } else {
         PlanOperation::PcmToDsd {
@@ -1322,10 +2484,10 @@ fn plan_from_dsd(
     current_input: &mut InputSource,
     final_work: PathBuf,
 ) -> Result<()> {
-    if request.settings.pcm_true_peak.fixed_gain_db.is_some() {
+    if request.settings.pcm_true_peak.fixed_gain_db().is_some() {
         return Err(PlanningError::invalid_settings(
-            "pcm_true_peak.fixed_gain_db",
-            "PCM fixed gain is a PCM-source control; use the DSD gain-mode Fixed control for DSD-to-PCM conversion",
+            "pcm_true_peak.policy.gain_db",
+            "PCM fixed gain is a PCM-source control; use the DSD Fixed gain policy for DSD-to-PCM conversion",
         ));
     }
     let requested_target_rate_hz = match request.settings.target_sample_rate {
@@ -1375,7 +2537,7 @@ fn plan_from_dsd(
                 target_format: request.settings.target_format.clone(),
                 target_rate_hz,
                 target_bit_depth: target_depth,
-                lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
+                lowpass: request.settings.dsd.general_from_dsd.lowpass,
             },
             current_input.clone(),
             OutputSink::Path(final_work.clone()),
@@ -1392,7 +2554,7 @@ fn plan_from_dsd(
             target_format: AudioFormat::Wav,
             target_rate_hz,
             target_bit_depth: target_depth,
-            lowpass: request.settings.dsd.legacy_dsd_to_pcm_lowpass(),
+            lowpass: request.settings.dsd.general_from_dsd.lowpass,
         },
         current_input.clone(),
         OutputSink::Path(pcm_intermediate.clone()),
@@ -1463,12 +2625,12 @@ fn plan_from_pcm(
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
 
-    let pcm_gain_wavpack_hybrid = (request.settings.pcm_true_peak.enabled
-        || request.settings.pcm_true_peak.fixed_gain_db.is_some())
+    let pcm_gain_wavpack_hybrid = (request.settings.pcm_true_peak.is_true_peak()
+        || request.settings.pcm_true_peak.fixed_gain_db().is_some())
         && request.settings.target_format == AudioFormat::WavPack
         && request.settings.wavpack.hybrid;
     if pcm_gain_wavpack_hybrid {
-        if request.settings.pcm_true_peak.enabled && processing_rate.is_some() {
+        if request.settings.pcm_true_peak.is_true_peak() && processing_rate.is_some() {
             return Err(PlanningError::invalid_source(
                 "sample_rate_hz",
                 "PCM true-peak WavPack hybrid carrier must already be at the final sample rate; post-measurement resampling is forbidden",
@@ -1507,10 +2669,16 @@ fn plan_from_pcm(
         BitDepthTarget::Source => false,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
     };
+    let explicit_int32_dither = request.settings.target_format.is_pcm_lossless()
+        && crate::plugins::explicit_int32_dither_requested(
+            &request.settings,
+            Some(target_depth),
+        );
     let needs_processing = processing_rate.is_some()
         || depth_change
+        || explicit_int32_dither
         || request.settings.dsd.runtime_album_gain_db().is_some()
-        || request.settings.pcm_true_peak.fixed_gain_db.is_some();
+        || request.settings.pcm_true_peak.fixed_gain_db().is_some();
     let needs_ssrc = processing_rate.is_some()
         && (request.settings.nyquist_transition == NyquistTransition::BrickWall
             || request.settings.ssrc.force);
@@ -1534,24 +2702,34 @@ fn plan_from_pcm(
         );
         *current_input = InputSource::Path(decode_path);
 
-        let ssrc_path = context.intermediate_path(steps.len(), "wav");
         let profile =
             mapping::ssrc_profile(request.settings.ssrc, request.settings.resample_quality);
-        // A user fixed gain is ordinary PCM processing, not a hard-ceiling
-        // authority. Keep SSRC's output floating when a gain still has to be
-        // applied so the final processing encode performs exactly one target-
-        // depth quantization after gain rather than quantizing both before and
-        // after it.
-        let ssrc_output_depth = if request.settings.pcm_true_peak.fixed_gain_db.is_some() {
-            PcmBitDepth::Float64
+        // Resolve the same immediate representation the typed semantic planner
+        // uses. A direct-WAV terminal lets SSRC own the final integer/float
+        // write; any later sample work or split-only cell keeps SSRC Float64.
+        let immediate = crate::semantic_plan::resolve_ssrc_immediate_output(
+            request,
+            ssrc_target_rate_hz,
+            Some(target_depth),
+            false,
+            request.settings.pcm_true_peak.policy,
+        )
+        .map_err(|refusal| {
+            PlanningError::invalid_settings(
+                "ssrc_terminal",
+                format!("{}: {}", refusal.code, refusal.reason),
+            )
+        })?;
+        let ssrc_path = if immediate.role == crate::semantic_plan::SsrcOutputRole::Terminal {
+            final_work.clone()
         } else {
-            target_depth
+            context.intermediate_path(steps.len(), "wav")
         };
         push_step(
             steps,
             PlanOperation::ResamplePcm {
                 target_rate_hz: ssrc_target_rate_hz,
-                target_bit_depth: Some(ssrc_output_depth),
+                target_bit_depth: Some(immediate.depth),
                 profile: Some(profile),
                 brick_wall: true,
             },
@@ -1560,6 +2738,9 @@ fn plan_from_pcm(
             "Brick-wall PCM resampling with SSRC",
         );
         *current_input = InputSource::Path(ssrc_path);
+        if immediate.role == crate::semantic_plan::SsrcOutputRole::Terminal {
+            return Ok(());
+        }
         push_encode_final(
             request,
             steps,
@@ -1567,7 +2748,9 @@ fn plan_from_pcm(
             final_work,
             lossy_encoder_rate,
             target_depth,
-            request.settings.pcm_true_peak.fixed_gain_db.is_some(),
+            request.settings.pcm_true_peak.fixed_gain_db().is_some()
+                || explicit_int32_dither
+                || request.settings.dither_type != DitherType::None,
         )?;
         return Ok(());
     }
@@ -1577,7 +2760,7 @@ fn plan_from_pcm(
         .dsd
         .runtime_album_gain_db()
         .is_some()
-        || request.settings.pcm_true_peak.enabled)
+        || request.settings.pcm_true_peak.is_true_peak())
         && request.settings.target_format.is_pcm_lossless()
         && request.settings.dither_type != DitherType::None
         && matches!(
@@ -1749,18 +2932,6 @@ fn append_post_processing(
             "Store source audio MD5 metadata",
         );
     }
-    if let Some(mode) = request.settings.replay_gain.mode {
-        push_step(
-            steps,
-            PlanOperation::ReplayGain {
-                target_format: request.settings.target_format.clone(),
-                mode,
-            },
-            InputSource::Path(current_output_path.clone()),
-            OutputSink::InPlace(current_output_path.clone()),
-            "ReplayGain scan",
-        );
-    }
     if request.settings.verification.verify_after_encode || flac_verify_requested(request) {
         push_step(
             steps,
@@ -1896,7 +3067,7 @@ fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
 
 fn dsd_hard_ceiling_requires_exact_encoder_rate(request: &PlanRequest) -> bool {
     request.source.representation_kind() == SourceRepresentationKind::Dsd
-        && (request.settings.dsd.album_auto_gain_selected()
+        && (request.settings.dsd.gain_policy().is_true_peak()
             || request.settings.dsd.runtime_album_gain_db().is_some())
 }
 
@@ -1990,8 +3161,11 @@ fn resolve_target_dsd_rate(request: &PlanRequest) -> Result<DsdRate> {
 }
 
 #[cfg(test)]
-mod reference_admission_tests {
+mod phase2_gain_and_reference_planning_tests {
     use super::*;
+    use crate::enums::{AudioCodec, SampleKind, TruePeakScanTier, TruePeakScope};
+    use crate::settings::{SampleGainPolicy, PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP};
+    use std::path::PathBuf;
 
     fn dsd_source() -> SourceInfo {
         SourceInfo {
@@ -2004,402 +3178,95 @@ mod reference_admission_tests {
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             dsd_source_kind: None,
             audio_md5: None,
         }
     }
 
-    #[test]
-    fn shared_reference_admission_requires_native_dsd_to_pcm() {
-        let source = dsd_source();
-        let mut settings = PipelineSettings::default();
-        settings.dsd = crate::settings::DsdSettings::native_v2();
-        settings.target_format = AudioFormat::Flac;
-        assert!(selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
-
-        settings.target_format = AudioFormat::Dsf;
-        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
-        settings.target_format = AudioFormat::Dff;
-        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
-
-        settings.target_format = AudioFormat::Flac;
-        settings.dsd = crate::settings::DsdSettings::default();
-        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
-
-        settings.dsd = crate::settings::DsdSettings::native_v2();
-        let mut format_only_dsd = source.clone();
-        format_only_dsd.codec = AudioCodec::Custom("unresolved".to_string());
-        format_only_dsd.sample_kind = None;
-        assert!(format_only_dsd.is_dsd());
-        assert!(selects_reference_dsd_to_pcm(
-            &settings,
-            format_only_dsd.is_dsd(),
-        ));
-
-        let mut pcm_source = source;
-        pcm_source.format = AudioFormat::Wav;
-        pcm_source.codec = AudioCodec::PcmSigned;
-        pcm_source.sample_kind = Some(SampleKind::SignedInteger);
-        pcm_source.sample_rate_hz = Some(44_100);
-        pcm_source.source_representation = SourceRepresentationKind::Pcm;
-        assert!(!selects_reference_dsd_to_pcm(&settings, pcm_source.is_dsd()));
-    }
-}
-
-#[cfg(test)]
-mod dsd_album_gain_carrier_planning_tests {
-    use super::*;
-    use crate::enums::{
-        AudioCodec, AudioFormat, BitDepthTarget, DsdAutoGainScope, DsdToPcmGainMode,
-        PcmBitDepth, RateTarget, SampleKind,
-    };
-    use crate::settings::PipelineSettings;
-    use crate::source::{SourceInfo, SourceRepresentationKind};
-    use std::path::PathBuf;
-
-    fn carrier_request(source_rate_hz: u32) -> PlanRequest {
+    fn dsd_request(policy: SampleGainPolicy) -> PlanRequest {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
         settings.target_sample_rate = RateTarget::PcmHz(96_000);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
-        settings
-            .dsd
-            .set_runtime_album_gain_db(Some("2.125000000".parse().unwrap()));
+        settings.dsd.set_gain_policy(policy);
         PlanRequest {
+            input_path: PathBuf::from("input.dsf"),
+            output_path: PathBuf::from("output.flac"),
+            source: dsd_source(),
+            settings,
+            plan_scope: crate::plan::PlanScope::submitted_batch("test-submission", "test-track", Some(1)),
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
-            input_path: PathBuf::from("album-carrier.f64le"),
-            output_path: PathBuf::from("output.flac"),
-            source: SourceInfo {
-                dsd_source_kind: None,
-                format: AudioFormat::Wav,
-                codec: AudioCodec::PcmFloat,
-                sample_rate_hz: Some(source_rate_hz),
-                bit_depth: Some(PcmBitDepth::Float64),
-                true_source_depth: None,
-                source_representation: SourceRepresentationKind::Dsd,
-                sample_kind: Some(SampleKind::Float),
-                channels: Some(2),
-                duration: None,
-                audio_md5: None,
-            },
-            settings,
-            intermediate_dir: None,
-            container_ffmpeg_flags: Vec::new(),
         }
     }
 
     #[test]
-    fn runtime_album_gain_requires_dsd_semantic_carrier() {
-        let mut request = carrier_request(96_000);
-        request.source.source_representation = SourceRepresentationKind::Pcm;
-        let error = plan_topology(&request).expect_err("PCM authority must not receive DSD album gain");
-        assert!(
-            error.to_string().contains("runtime DSD album gain may be applied only"),
-            "{error}"
-        );
+    fn shared_reference_admission_requires_explicit_reference_pathway() {
+        let source = dsd_source();
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+
+        settings.dsd.from_dsd.pathway = crate::dsd_reference::DsdSourcePathway::Reference;
+        assert!(selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+
+        settings.target_format = AudioFormat::Dsf;
+        assert!(!selects_reference_dsd_to_pcm(&settings, source.is_dsd()));
+        settings.target_format = AudioFormat::Flac;
+        assert!(!selects_reference_dsd_to_pcm(&settings, false));
     }
 
     #[test]
-    fn runtime_album_gain_carrier_must_already_be_at_final_rate() {
-        let request = carrier_request(88_200);
-        let error = plan_topology(&request).expect_err("post-measurement resampling must be refused");
-        assert!(
-            error.to_string().contains("carrier rate must already equal"),
-            "{error}"
-        );
+    fn dsd_track_certified_policy_is_owned_by_phase3_common_realizer_not_legacy_lowerer() {
+        let request = dsd_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        });
+        let error = plan_conversion(&request)
+            .expect_err("legacy command lowering must not claim the Phase-3 common-realizer route");
+        assert!(matches!(error, PlanningError::CapabilityUnavailable { capability: "phase3_common_realizer", .. }));
     }
 
     #[test]
-    fn runtime_album_gain_forces_one_processing_encode_without_resample() {
-        let request = carrier_request(96_000);
-        let topology = plan_topology(&request).expect("valid retained DSD carrier topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("runtime album gain must force an executable encode");
+    fn dsd_album_certified_policy_remains_an_executable_existing_bridge() {
+        let request = dsd_request(SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
+        });
+        let typed = crate::semantic_plan::plan_typed(&request);
+        let Ok(crate::semantic_plan::PlanningOutcome::Ready(typed)) = typed else { panic!("typed plan should be ready") };
+        assert_eq!(typed.execution_capability, crate::semantic_plan::ExecutionCapability::ExecutableNow);
+    }
+
+    #[test]
+    fn pcm_fixed_gain_forces_processing_without_claiming_a_ceiling() {
+        let mut request = dsd_request(SampleGainPolicy::Off);
+        request.source = SourceInfo {
+            format: AudioFormat::Wav,
+            codec: AudioCodec::PcmFloat,
+            sample_rate_hz: Some(96_000),
+            bit_depth: Some(PcmBitDepth::Float64),
+            true_source_depth: Some(PcmBitDepth::Float64),
+            source_representation: SourceRepresentationKind::Pcm,
+            sample_kind: Some(SampleKind::Float),
+            channels: Some(2),
+            duration: None,
+            frame_extent: None,
+            dsd_source_kind: None,
+            audio_md5: None,
         };
-        let processing_encodes = steps
-            .iter()
-            .filter(|step| {
-                matches!(
-                    &step.operation,
-                    PlanOperation::EncodePcm {
-                        apply_processing: true,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(processing_encodes, 1, "{steps:#?}");
-        assert!(
-            !steps.iter().any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
-            "post-measurement resampling would invalidate the measured peak: {steps:#?}"
-        );
-    }
-
-    #[test]
-    fn runtime_album_gain_rejects_aac_rate_that_would_be_resampled_after_gain() {
-        let mut request = carrier_request(192_000);
-        request.settings.target_format = AudioFormat::Aac;
-        request.settings.target_sample_rate = RateTarget::PcmHz(192_000);
-        request.output_path = PathBuf::from("output.m4a");
-
-        let error = plan_topology(&request)
-            .expect_err("AAC 192 kHz must not negotiate a post-gain encoder rate");
-        assert!(error.to_string().contains("accept 192000 Hz directly"), "{error}");
-    }
-
-    #[test]
-    fn runtime_album_gain_pins_supported_aac_encoder_input_rate() {
-        let mut request = carrier_request(96_000);
-        request.settings.target_format = AudioFormat::Aac;
-        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
-        request.output_path = PathBuf::from("output.m4a");
-
-        let topology = plan_topology(&request).expect("AAC 96 kHz hard-ceiling topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("runtime album gain must force executable AAC encode");
-        };
-        // A trailing MetadataTransfer step carries no audio and cannot move the
-        // measured peak, so the ceiling invariant is about the audio-affecting
-        // steps. Assert on those, and that metadata transfer is the only extra.
-        let audio_steps: Vec<_> = steps
-            .iter()
-            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-            .collect();
-        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
-        assert!(matches!(
-            &audio_steps[0].operation,
-            PlanOperation::EncodeLossy {
-                target_format: AudioFormat::Aac,
-                target_rate_hz: Some(96_000),
-                apply_processing: true,
-            }
-        ));
-        assert!(
-            !steps.iter().any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
-            "supported encoder-input rate must not add a post-measurement resample: {steps:#?}"
-        );
-    }
-
-    #[test]
-    fn runtime_album_gain_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
-        let mut request = carrier_request(96_000);
-        request.settings.target_format = AudioFormat::Alac;
-        request.settings.dither_type = crate::enums::DitherType::Tpdf;
-        request.output_path = PathBuf::from("output.m4a");
-
-        let topology = plan_topology(&request).expect("ALAC hard-ceiling topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("runtime album gain must force executable ALAC encode");
-        };
-        // See the AAC pin test: a trailing MetadataTransfer step is audio-inert.
-        let audio_steps: Vec<_> = steps
-            .iter()
-            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-            .collect();
-        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
-        assert!(matches!(
-            &audio_steps[0].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Wav,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &audio_steps[1].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Alac,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn pcm_true_peak_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
-        let mut request = carrier_request(96_000);
-        request.settings.dsd = crate::settings::DsdSettings::default();
-        request.settings.pcm_true_peak.enabled = true;
-        request.settings.target_format = AudioFormat::Alac;
-        request.settings.dither_type = crate::enums::DitherType::Tpdf;
-        request.source.source_representation = SourceRepresentationKind::Pcm;
-        request.output_path = PathBuf::from("output.m4a");
-
-        let topology = plan_topology(&request).expect("PCM true-peak ALAC hard-ceiling topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("PCM true-peak carrier must force executable ALAC encode");
-        };
-        let audio_steps: Vec<_> = steps
-            .iter()
-            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-            .collect();
-        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
-        assert!(matches!(
-            &audio_steps[0].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Wav,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &audio_steps[1].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Alac,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn pcm_fixed_gain_forces_one_processing_encode_without_measurement_authority() {
-        let mut request = carrier_request(96_000);
-        request.settings.dsd = crate::settings::DsdSettings::default();
-        request.settings.pcm_true_peak.fixed_gain_db =
-            Some("2.500000000".parse().expect("fixed gain"));
-        request.settings.target_format = AudioFormat::Flac;
-        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
-        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        request.source.source_representation = SourceRepresentationKind::Pcm;
-        request.output_path = PathBuf::from("output.flac");
-
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "2.500000000".parse().unwrap(),
+        });
         let topology = plan_topology(&request).expect("fixed PCM gain topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("fixed PCM gain must force executable processing");
-        };
-        let audio_steps: Vec<_> = steps
-            .iter()
-            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-            .collect();
-        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
-        assert!(matches!(
-            &audio_steps[0].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Flac,
-                target_rate_hz: None,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: true,
-            }
-        ));
-    }
-
-    #[test]
-    fn pcm_fixed_gain_wavpack_hybrid_fuses_resample_gain_and_integer_realization() {
-        let mut request = carrier_request(44_100);
-        request.settings.dsd = crate::settings::DsdSettings::default();
-        request.settings.pcm_true_peak.fixed_gain_db =
-            Some("-3.250000000".parse().expect("fixed gain"));
-        request.settings.target_format = AudioFormat::WavPack;
-        request.settings.wavpack.hybrid = true;
-        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
-        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        request.source.source_representation = SourceRepresentationKind::Pcm;
-        request.output_path = PathBuf::from("output.wv");
-
-        let topology = plan_topology(&request).expect("fixed-gain WavPack hybrid topology");
-        let TopologyPlan::Execute { steps, .. } = topology else {
-            panic!("fixed-gain WavPack hybrid must execute");
-        };
-        let audio_steps: Vec<_> = steps
-            .iter()
-            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-            .collect();
-        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
-        assert!(matches!(
-            &audio_steps[0].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::Wav,
-                target_rate_hz: Some(96_000),
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: true,
-            }
-        ));
-        assert!(matches!(
-            &audio_steps[1].operation,
-            PlanOperation::EncodePcm {
-                target_format: AudioFormat::WavPack,
-                target_rate_hz: None,
-                target_bit_depth: PcmBitDepth::Int24,
-                apply_processing: false,
-            }
-        ));
-        assert!(
-            !steps
-                .iter()
-                .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
-            "fixed gain has no hard-ceiling rate freeze and should realize resampling exactly once: {steps:#?}",
-        );
-    }
-
-    #[test]
-    fn pcm_true_peak_wavpack_hybrid_realizes_one_integer_encoder_input_without_resampling() {
-        for scope in [
-            crate::enums::PcmTruePeakScope::Track,
-            crate::enums::PcmTruePeakScope::Album,
-        ] {
-            let mut request = carrier_request(96_000);
-            request.settings.dsd = crate::settings::DsdSettings::default();
-            request.settings.pcm_true_peak.enabled = true;
-            request.settings.pcm_true_peak.scope = scope;
-            request.settings.target_format = AudioFormat::WavPack;
-            request.settings.wavpack.hybrid = true;
-            request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
-            request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-            request.source.source_representation = SourceRepresentationKind::Pcm;
-            request.output_path = PathBuf::from("output.wv");
-
-            let topology =
-                plan_topology(&request).expect("PCM true-peak hybrid WavPack topology");
-            let TopologyPlan::Execute { steps, .. } = topology else {
-                panic!("PCM true-peak WavPack hybrid must force executable encode");
-            };
-            let audio_steps: Vec<_> = steps
-                .iter()
-                .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
-                .collect();
-            assert_eq!(audio_steps.len(), 2, "scope={scope:?}: {steps:#?}");
-            assert!(matches!(
-                &audio_steps[0].operation,
-                PlanOperation::EncodePcm {
-                    target_format: AudioFormat::Wav,
-                    target_rate_hz: None,
-                    target_bit_depth: PcmBitDepth::Int24,
-                    apply_processing: true,
-                }
-            ));
-            assert!(matches!(
-                &audio_steps[1].operation,
-                PlanOperation::EncodePcm {
-                    target_format: AudioFormat::WavPack,
-                    target_rate_hz: None,
-                    target_bit_depth: PcmBitDepth::Int24,
-                    apply_processing: false,
-                }
-            ));
-            assert_eq!(
-                audio_steps[0].output.as_path(),
-                audio_steps[1].input.as_path(),
-                "native wavpack must receive the exact admitted integer PCM carrier",
-            );
-            assert!(
-                !steps
-                    .iter()
-                    .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
-                "scope={scope:?}: post-measurement resampling would invalidate the governed encoder input: {steps:#?}",
-            );
-        }
+        let TopologyPlan::Execute { steps, .. } = topology else { panic!("fixed gain must execute") };
+        assert!(steps.iter().any(|step| matches!(step.operation, PlanOperation::EncodePcm { apply_processing: true, .. })));
     }
 }
 
@@ -2433,9 +3300,11 @@ mod ordinary_lossy_rate_resolution_tests {
                 sample_kind: Some(SampleKind::SignedInteger),
                 channels: Some(2),
                 duration: None,
+                frame_extent: None,
                 audio_md5: None,
             },
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -2463,9 +3332,11 @@ mod ordinary_lossy_rate_resolution_tests {
                 sample_kind: Some(SampleKind::Dsd),
                 channels: Some(2),
                 duration: None,
+                frame_extent: None,
                 audio_md5: None,
             },
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -2559,15 +3430,11 @@ mod ordinary_lossy_rate_resolution_tests {
     #[test]
     fn pcm_track_carrying_album_auto_gain_settings_still_uses_ordinary_lossy_fallback() {
         let mut request = pcm_request(192_000, RateTarget::Source);
-        request
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(crate::enums::DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy album hard-ceiling settings");
-        request
-            .settings
-            .dsd
-            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
+        request.settings.dsd.set_gain_policy(crate::settings::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: crate::settings::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Album,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
 
         let topology = plan_topology(&request)
             .expect("non-DSD tracks are excluded from album gain and retain ordinary fallback");
@@ -2594,15 +3461,16 @@ mod ordinary_lossy_rate_resolution_tests {
     #[test]
     fn album_hard_ceiling_rejects_unsupported_rate_before_runtime_gain_is_bound() {
         let mut request = dsd_request();
-        request
-            .settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(crate::enums::DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy album hard-ceiling settings");
-        request
-            .settings
-            .dsd
-            .set_auto_gain_scope(crate::enums::DsdAutoGainScope::Album);
+        request.settings.dsd.set_gain_policy(crate::settings::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: crate::settings::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Album,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
+        request.plan_scope = PlanScope::submitted_batch(
+            "album-hard-ceiling-rate",
+            "track-1",
+            Some(1),
+        );
 
         let error = plan_conversion(&request)
             .expect_err("hard-ceiling DSD128 Source -> AAC must not adapt 176.4 kHz to 96 kHz");
@@ -2695,7 +3563,7 @@ mod metadata_pruning_tests {
 
     impl ToolPlugin for MetadataPruningPlugin {
         fn id(&self) -> ToolIdentifier {
-            ToolIdentifier::Custom("metadata-pruning-test".into())
+            ToolIdentifier::Ffmpeg
         }
 
         fn supports(&self, _context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport {
@@ -2773,9 +3641,11 @@ mod metadata_pruning_tests {
                 sample_kind: Some(SampleKind::SignedInteger),
                 channels: Some(2),
                 duration: None,
+                frame_extent: None,
                 audio_md5: None,
             },
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
         }
@@ -2924,3 +3794,644 @@ mod metadata_pruning_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod phase2_retained_gain_carrier_planning_tests {
+    use super::*;
+    use crate::enums::{
+        AudioCodec, AudioFormat, BitDepthTarget, PcmBitDepth, RateTarget, SampleKind,
+        TruePeakScanTier, TruePeakScope,
+    };
+    use crate::settings::{PipelineSettings, SampleGainPolicy, PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP};
+    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use std::path::PathBuf;
+
+    fn carrier_request(source_rate_hz: u32) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
+        });
+        settings
+            .dsd
+            .set_runtime_album_gain_db(Some("2.125000000".parse().unwrap()));
+        PlanRequest {
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+            input_path: PathBuf::from("album-carrier.f64le"),
+            output_path: PathBuf::from("output.flac"),
+            source: SourceInfo {
+                dsd_source_kind: None,
+                format: AudioFormat::Wav,
+                codec: AudioCodec::PcmFloat,
+                sample_rate_hz: Some(source_rate_hz),
+                bit_depth: Some(PcmBitDepth::Float64),
+                true_source_depth: None,
+                source_representation: SourceRepresentationKind::Dsd,
+                sample_kind: Some(SampleKind::Float),
+                channels: Some(2),
+                duration: None,
+                frame_extent: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
+            intermediate_dir: None,
+            container_ffmpeg_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_album_gain_requires_dsd_semantic_carrier() {
+        let mut request = carrier_request(96_000);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        let error = plan_topology(&request).expect_err("PCM authority must not receive DSD album gain");
+        assert!(
+            error.to_string().contains("runtime DSD album gain may be applied only"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_carrier_must_already_be_at_final_rate() {
+        let request = carrier_request(88_200);
+        let error = plan_topology(&request).expect_err("post-measurement resampling must be refused");
+        assert!(error.to_string().contains("carrier rate must already equal"), "{error}");
+    }
+
+    #[test]
+    fn runtime_album_gain_forces_one_processing_encode_without_resample() {
+        let request = carrier_request(96_000);
+        let topology = plan_topology(&request).expect("valid retained DSD carrier topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force an executable encode");
+        };
+        let processing_encodes = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    &step.operation,
+                    PlanOperation::EncodePcm {
+                        apply_processing: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(processing_encodes, 1, "{steps:#?}");
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "post-measurement resampling would invalidate the measured peak: {steps:#?}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_rejects_aac_rate_that_would_be_resampled_after_gain() {
+        let mut request = carrier_request(192_000);
+        request.settings.target_format = AudioFormat::Aac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(192_000);
+        request.output_path = PathBuf::from("output.m4a");
+
+        let error = plan_topology(&request)
+            .expect_err("AAC 192 kHz must not negotiate a post-gain encoder rate");
+        assert!(error.to_string().contains("accept 192000 Hz directly"), "{error}");
+    }
+
+    #[test]
+    fn runtime_album_gain_pins_supported_aac_encoder_input_rate() {
+        let mut request = carrier_request(96_000);
+        request.settings.target_format = AudioFormat::Aac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("AAC 96 kHz hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force executable AAC encode");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac,
+                target_rate_hz: Some(96_000),
+                apply_processing: true,
+            }
+        ));
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "supported encoder-input rate must not add a post-measurement resample: {steps:#?}"
+        );
+    }
+
+    #[test]
+    fn runtime_album_gain_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
+        let mut request = carrier_request(96_000);
+        request.settings.target_format = AudioFormat::Alac;
+        request.settings.dither_type = crate::enums::DitherType::Tpdf;
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("ALAC hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("runtime album gain must force executable ALAC encode");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Alac,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pcm_true_peak_routes_non_sox_lossless_dither_through_one_sox_pcm_terminal() {
+        let mut request = carrier_request(96_000);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        });
+        request.settings.target_format = AudioFormat::Alac;
+        request.settings.dither_type = crate::enums::DitherType::Tpdf;
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.m4a");
+
+        let topology = plan_topology(&request).expect("PCM true-peak ALAC hard-ceiling topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("PCM true-peak carrier must force executable ALAC encode");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Alac,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pcm_fixed_gain_forces_one_processing_encode_without_measurement_authority() {
+        let mut request = carrier_request(96_000);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "2.500000000".parse().expect("fixed gain"),
+        });
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.flac");
+
+        let topology = plan_topology(&request).expect("fixed PCM gain topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("fixed PCM gain must force executable processing");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 1, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Flac,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn pcm_fixed_gain_wavpack_hybrid_fuses_resample_gain_and_integer_realization() {
+        let mut request = carrier_request(44_100);
+        request.settings.dsd = crate::settings::DsdSettings::default();
+        request.settings.pcm_true_peak.set_policy(SampleGainPolicy::FixedGain {
+            gain_db: "-3.250000000".parse().expect("fixed gain"),
+        });
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = true;
+        request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request.source.source_representation = SourceRepresentationKind::Pcm;
+        request.output_path = PathBuf::from("output.wv");
+
+        let topology = plan_topology(&request).expect("fixed-gain WavPack hybrid topology");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("fixed-gain WavPack hybrid must execute");
+        };
+        let audio_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+            .collect();
+        assert_eq!(audio_steps.len(), 2, "{steps:#?}");
+        assert!(matches!(
+            &audio_steps[0].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::Wav,
+                target_rate_hz: Some(96_000),
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: true,
+            }
+        ));
+        assert!(matches!(
+            &audio_steps[1].operation,
+            PlanOperation::EncodePcm {
+                target_format: AudioFormat::WavPack,
+                target_rate_hz: None,
+                target_bit_depth: PcmBitDepth::Int24,
+                apply_processing: false,
+            }
+        ));
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+            "fixed gain should realize resampling exactly once: {steps:#?}",
+        );
+    }
+
+    #[test]
+    fn pcm_true_peak_wavpack_hybrid_realizes_one_integer_encoder_input_without_resampling() {
+        for scope in [TruePeakScope::Track, TruePeakScope::Album] {
+            let mut request = carrier_request(96_000);
+            request.settings.dsd = crate::settings::DsdSettings::default();
+            request.settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakGuard {
+                target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                scope,
+                scan: TruePeakScanTier::Fast,
+            });
+            request.settings.target_format = AudioFormat::WavPack;
+            request.settings.wavpack.hybrid = true;
+            request.settings.target_sample_rate = RateTarget::PcmHz(96_000);
+            request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+            request.source.source_representation = SourceRepresentationKind::Pcm;
+            request.output_path = PathBuf::from("output.wv");
+
+            let topology =
+                plan_topology(&request).expect("PCM true-peak hybrid WavPack topology");
+            let TopologyPlan::Execute { steps, .. } = topology else {
+                panic!("PCM true-peak WavPack hybrid must force executable encode");
+            };
+            let audio_steps: Vec<_> = steps
+                .iter()
+                .filter(|step| !matches!(&step.operation, PlanOperation::MetadataTransfer { .. }))
+                .collect();
+            assert_eq!(audio_steps.len(), 2, "scope={scope:?}: {steps:#?}");
+            assert!(matches!(
+                &audio_steps[0].operation,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::Wav,
+                    target_rate_hz: None,
+                    target_bit_depth: PcmBitDepth::Int24,
+                    apply_processing: true,
+                }
+            ));
+            assert!(matches!(
+                &audio_steps[1].operation,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::WavPack,
+                    target_rate_hz: None,
+                    target_bit_depth: PcmBitDepth::Int24,
+                    apply_processing: false,
+                }
+            ));
+            assert_eq!(
+                audio_steps[0].output.as_path(),
+                audio_steps[1].input.as_path(),
+                "native wavpack must receive the exact admitted integer PCM carrier",
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(&step.operation, PlanOperation::ResamplePcm { .. })),
+                "scope={scope:?}: post-measurement resampling would invalidate the governed encoder input: {steps:#?}",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stage_a_lowering_selection_diagnostics {
+    use super::*;
+    use crate::enums::{
+        AudioCodec, AudioFormat, BitDepthTarget, PcmBitDepth, PreferredTool, RateTarget,
+        SampleKind,
+    };
+    use crate::semantic_plan::{plan_typed, PlanningOutcome, TypedPlanNode};
+    use crate::settings::PipelineSettings;
+    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use std::path::PathBuf;
+
+    fn pcm_request(
+        route: &str,
+        source_rate_hz: u32,
+        target_format: AudioFormat,
+        target_rate_hz: u32,
+        preferred_tool: PreferredTool,
+    ) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = target_format.clone();
+        settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.preferred_tool = preferred_tool;
+        PlanRequest {
+            input_path: PathBuf::from(format!("{route}-input.wav")),
+            output_path: PathBuf::from(format!("{route}-output.{}", target_format.extension())),
+            source: SourceInfo {
+                format: AudioFormat::Wav,
+                codec: AudioCodec::PcmSigned,
+                sample_rate_hz: Some(source_rate_hz),
+                bit_depth: Some(PcmBitDepth::Int24),
+                true_source_depth: Some(PcmBitDepth::Int24),
+                source_representation: SourceRepresentationKind::Pcm,
+                sample_kind: Some(SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: None,
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: PlanScope::track(format!("stage-a-{route}")),
+            intermediate_dir: Some(PathBuf::from(format!("{route}-work")),),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+        }
+    }
+
+    fn eligible_builtin_operation_count(typed: &crate::semantic_plan::TypedConversionPlan) -> usize {
+        typed
+            .nodes
+            .iter()
+            .filter(|node| {
+                let TypedPlanNode::Operation {
+                    candidates,
+                    selected_candidate,
+                    ..
+                } = node
+                else {
+                    return false;
+                };
+                candidates
+                    .get(*selected_candidate)
+                    .and_then(|candidate| candidate.tool.as_ref())
+                    .is_some_and(stage_a_is_builtin_tool)
+            })
+            .count()
+    }
+
+    fn validate_records(
+        route: &str,
+        records: &[StageASelectedVsEmittedRecord],
+    ) -> std::result::Result<(), String> {
+        for record in records {
+            if !record.matches_selected_realization() {
+                return Err(format!(
+                    "{route}: typed operation {} selected {:?} {:?}, emitted {:?} {:?}",
+                    record.operation.label(),
+                    record.selected_tool,
+                    record.selected_parameter_signature,
+                    record.emitted_tool,
+                    record.emitted_parameter_signature,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_no_selected_vs_emitted_divergence(
+        route: &str,
+        request: &PlanRequest,
+    ) -> Vec<StageASelectedVsEmittedRecord> {
+        let typed = match plan_typed(request).expect("typed planner must stay within resource bounds") {
+            PlanningOutcome::Ready(plan) => plan,
+            other => panic!("{route}: typed plan was not ready: {other:?}"),
+        };
+        crate::semantic_plan::require_current_executor(&typed)
+            .unwrap_or_else(|error| panic!("{route}: route must use the current executor: {error}"));
+
+        let eligible = eligible_builtin_operation_count(&typed);
+        let records = stage_a_selected_vs_emitted_diagnostics(request)
+            .unwrap_or_else(|error| panic!("{route}: diagnostic failed: {error}"));
+        assert_eq!(
+            records.len(), eligible,
+            "{route}: every typed operation with a selected built-in candidate must have one diagnostic record"
+        );
+        assert!(eligible > 0, "{route}: diagnostic fixture has no eligible typed operation");
+
+        for record in &records {
+            eprintln!(
+                "I1_DIAG route={route} typed_node={} emitted_step={} operation={} emitted_operation={} candidate={:?} selected_tool={:?} emitted_tool={:?} lowering_mode={:?} resolved={:?} selected_params={:?} emitted_params={:?}",
+                record.typed_node_index,
+                record.emitted_step_index,
+                record.operation.label(),
+                record.emitted_operation.label(),
+                record.candidate_identity,
+                record.selected_tool,
+                record.emitted_tool,
+                record.lowering_provenance,
+                record.resolved_parameters,
+                record.selected_parameter_signature,
+                record.emitted_parameter_signature,
+            );
+        }
+        validate_records(route, &records).unwrap_or_else(|error| panic!("{error}"));
+        records
+    }
+
+    #[test]
+    fn stage_a_builtin_selected_tools_and_parameters_match_every_emitted_operation() {
+        let mut ssrc = pcm_request(
+            "pcm-flac-resample-ssrc",
+            96_000,
+            AudioFormat::Flac,
+            44_100,
+            PreferredTool::Ssrc,
+        );
+        ssrc.settings.ssrc.force = true;
+
+        let routes = [
+            (
+                "pcm-flac-resample-auto",
+                pcm_request(
+                    "pcm-flac-resample-auto",
+                    96_000,
+                    AudioFormat::Flac,
+                    44_100,
+                    PreferredTool::Auto,
+                ),
+            ),
+            (
+                "pcm-flac-resample-ffmpeg",
+                pcm_request(
+                    "pcm-flac-resample-ffmpeg",
+                    96_000,
+                    AudioFormat::Flac,
+                    44_100,
+                    PreferredTool::Ffmpeg,
+                ),
+            ),
+            (
+                "pcm-flac-resample-sox",
+                pcm_request(
+                    "pcm-flac-resample-sox",
+                    96_000,
+                    AudioFormat::Flac,
+                    44_100,
+                    PreferredTool::Sox,
+                ),
+            ),
+            ("pcm-flac-resample-ssrc", ssrc),
+            (
+                "pcm-flac-direct-auto",
+                pcm_request(
+                    "pcm-flac-direct-auto",
+                    44_100,
+                    AudioFormat::Flac,
+                    44_100,
+                    PreferredTool::Auto,
+                ),
+            ),
+            (
+                "pcm-aac-resample-auto",
+                pcm_request(
+                    "pcm-aac-resample-auto",
+                    96_000,
+                    AudioFormat::Aac,
+                    48_000,
+                    PreferredTool::Auto,
+                ),
+            ),
+        ];
+
+        for (route, request) in routes {
+            let source_rate = request.source.sample_rate_hz;
+            let target_rate = match &request.settings.target_sample_rate {
+                RateTarget::PcmHz(rate) => Some(*rate),
+                _ => None,
+            };
+            let records = assert_no_selected_vs_emitted_divergence(route, &request);
+            if source_rate != target_rate {
+                assert!(
+                    records.iter().any(|record| matches!(&record.operation, PlanOperation::ResamplePcm { .. })),
+                    "{route}: resampling route did not account for typed ResamplePcm"
+                );
+                assert!(
+                    records.iter().any(|record| matches!(&record.operation, PlanOperation::EncodePcm { .. } | PlanOperation::EncodeLossy { .. })),
+                    "{route}: resampling route did not separately account for terminal encoding"
+                );
+            }
+            if route == "pcm-flac-resample-ssrc" {
+                let resample = records
+                    .iter()
+                    .find(|record| matches!(&record.operation, PlanOperation::ResamplePcm { .. }))
+                    .expect("forced SSRC fixture must expose typed resampling");
+                assert_eq!(resample.selected_tool, ToolIdentifier::Ssrc);
+                assert_eq!(resample.emitted_tool, ToolIdentifier::Ssrc);
+                assert!(matches!(&resample.emitted_operation, PlanOperation::ResamplePcm { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn stage_a_diagnostic_rejects_tool_or_semantic_parameter_perturbation() {
+        let request = pcm_request(
+            "pcm-flac-resample-sox-perturb",
+            96_000,
+            AudioFormat::Flac,
+            44_100,
+            PreferredTool::Sox,
+        );
+        let registry = ToolRegistry::with_builtin_tools();
+        let typed = match plan_typed(&request).unwrap() {
+            PlanningOutcome::Ready(plan) => plan,
+            other => panic!("typed plan was not ready: {other:?}"),
+        };
+        let TopologyPlan::Execute { steps, finalization } = plan_topology(&request).unwrap() else {
+            panic!("perturbation fixture unexpectedly planned passthrough")
+        };
+        let context = request.context();
+        let (steps, _) = prune_redundant_metadata_steps(&context, &registry, &steps, finalization).unwrap();
+        let emitted = plan_conversion_with_registry(&request, &registry).unwrap();
+        let commands = emitted.commands();
+        let clean = stage_a_selected_vs_emitted_records_from_lowered(
+            &typed, &context, &registry, &steps, commands,
+        ).unwrap();
+        validate_records("clean", &clean).unwrap();
+
+        let mut parameter_commands = commands.to_vec();
+        let changed = parameter_commands.iter_mut().any(|command| {
+            if command.tool != ToolIdentifier::Sox {
+                return false;
+            }
+            if let Some(arg) = command.args.iter_mut().rfind(|arg| arg.as_str() == "44100") {
+                *arg = "48000".to_string();
+                true
+            } else {
+                false
+            }
+        });
+        assert!(changed, "fixture did not expose a semantic resample-rate argument to perturb");
+        let parameter_records = stage_a_selected_vs_emitted_records_from_lowered(
+            &typed, &context, &registry, &steps, &parameter_commands,
+        ).unwrap();
+        assert!(validate_records("parameter-perturbed", &parameter_records).is_err());
+
+        let mut tool_commands = commands.to_vec();
+        tool_commands[0].tool = ToolIdentifier::Ffmpeg;
+        let tool_records = stage_a_selected_vs_emitted_records_from_lowered(
+            &typed, &context, &registry, &steps, &tool_commands,
+        ).unwrap();
+        assert!(validate_records("tool-perturbed", &tool_records).is_err());
+    }
+}
+

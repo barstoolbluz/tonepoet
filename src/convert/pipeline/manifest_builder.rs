@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use tonepoet_pipeline::fingerprint::{
     conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
-    settings_fingerprint, settings_snapshot_fingerprint_v2,
+    settings_and_effects_fingerprint, settings_snapshot_fingerprint_v2,
     SemanticPlanHashV1, SettingsFingerprint,
 };
 use tonepoet_pipeline::settings::PipelineSettings;
@@ -24,6 +24,7 @@ use super::track_executor::{
 pub struct ManifestBuildInput {
     pub album_dir: PathBuf,
     pub settings: PipelineSettings,
+    pub registered_effects: Vec<tonepoet_pipeline::EffectIntent>,
     pub tracks: Vec<ManifestTrackBuildInput>,
 }
 
@@ -42,7 +43,7 @@ pub struct ManifestTrackBuildInput {
     pub staged_output_path: PathBuf,
     pub validation_status: ValidationStatus,
     pub record_output_hash: bool,
-    /// Native-v2 Reference evidence emitted only after qualified execution.
+    /// Qualified Reference evidence emitted only after qualified execution.
     pub reference_evidence: Option<ReferenceExecutionEvidence>,
 }
 
@@ -96,14 +97,15 @@ pub fn build_conversion_manifest(
 }
 
 fn build_legacy_manifest(input: ManifestBuildInput) -> Result<ConversionManifest, ManifestError> {
-    let fingerprint = settings_fingerprint(&input.settings);
+    let fingerprint = settings_and_effects_fingerprint(&input.settings, &input.registered_effects);
     let mut tracks = Vec::with_capacity(input.tracks.len());
     for track in input.tracks {
         tracks.push(build_legacy_manifest_track(track, fingerprint)?);
     }
-    Ok(ConversionManifest::new_legacy(
+    Ok(ConversionManifest::new_legacy_with_fingerprint(
         input.album_dir,
         input.settings,
+        fingerprint,
         tracks,
     ))
 }
@@ -111,6 +113,12 @@ fn build_legacy_manifest(input: ManifestBuildInput) -> Result<ConversionManifest
 fn build_reference_manifest(
     mut input: ManifestBuildInput,
 ) -> Result<ConversionManifest, ManifestError> {
+    if !input.registered_effects.is_empty() {
+        return Err(ManifestError::InvalidAuthority(
+            "qualified Reference manifest cannot include ordinary registered effects before Phase 5"
+                .to_string(),
+        ));
+    }
     let track = input.tracks.pop().ok_or_else(|| {
         ManifestError::InvalidAuthority("Reference manifest has no track".to_string())
     })?;
@@ -128,7 +136,7 @@ fn build_reference_manifest(
         settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&input.settings),
         resolved_output_target: evidence.plan.target,
         policy: evidence.plan.policy,
-        qualification_manifest_digest: evidence.plan.qualification_manifest_digest,
+        qualification_candidate_manifest_digest: evidence.plan.qualification_candidate_manifest_digest,
     };
     let manifest_track = build_reference_manifest_track(track)?;
     ConversionManifest::new_reference(
@@ -205,7 +213,7 @@ fn build_reference_manifest_track(
     let execution = execution_fingerprint_v1(
         behavior,
         semantic_plan,
-        evidence.plan.qualification_manifest_digest,
+        evidence.plan.qualification_candidate_manifest_digest,
         &reference_execution_identity_input(&evidence.toolchain),
     );
     let executed_evidence_digest_v1 = reference_executed_evidence_digest_v1(&evidence)?;
@@ -563,7 +571,7 @@ mod manifest_merge_gap_tests {
     #[test]
     fn native_album_profiles_produce_distinct_legacy_manifest_settings_fingerprints() {
         use tonepoet_pipeline::{
-            DsdAutoGainScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+            TruePeakScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -575,10 +583,10 @@ mod manifest_merge_gap_tests {
 
         let settings_for = |profile| {
             let mut settings = PipelineSettings::default();
-            settings.dsd = DsdSettings::native_v2();
+            settings.dsd = DsdSettings::reference();
             settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
             settings.dsd.from_dsd.profile = profile;
-            settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+            settings.dsd.set_true_peak_scope(TruePeakScope::Album);
             settings.dsd.bind_runtime_album_gain(
                 "-0.750000000".parse().unwrap(),
                 Some("-0.490000000".parse().unwrap()),
@@ -591,6 +599,7 @@ mod manifest_merge_gap_tests {
             build_conversion_manifest(ManifestBuildInput {
                 album_dir: album_dir.clone(),
                 settings,
+                registered_effects: Vec::new(),
                 tracks: vec![ManifestTrackBuildInput {
                     source_path: source.clone(),
                     source_audio_md5: None,
@@ -634,6 +643,7 @@ mod manifest_merge_gap_tests {
         let manifest = build_conversion_manifest(ManifestBuildInput {
             album_dir: album_dir.clone(),
             settings,
+            registered_effects: Vec::new(),
             tracks: vec![ManifestTrackBuildInput::merged_output(
                 source.clone(),
                 "merge-sequence-hash".to_string(),

@@ -17,32 +17,20 @@ fn flac_source() -> SourceInfo {
         sample_kind: Some(SampleKind::SignedInteger),
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     }
 }
 
-fn legacy_dsd_settings(
+fn general_dsd_settings(
     lowpass: DsdLowpassMethod,
-    gain_mode: DsdToPcmGainMode,
-    margin_db: f32,
-    gain_db: Option<f32>,
+    gain: SampleGainPolicy,
 ) -> DsdSettings {
-    let native = DsdSettings::native_v2();
-    serde_json::from_value(serde_json::json!({
-        "noise_shaper": native.pcm_to_dsd.noise_shaper,
-        "modulator_order": native.pcm_to_dsd.modulator_order,
-        "trellis": native.pcm_to_dsd.trellis,
-        "pcm_to_dsd_filter": native.pcm_to_dsd.filter,
-        "dsd_to_pcm_lowpass": lowpass,
-        "dsd_to_pcm_gain_mode": gain_mode,
-        "dsd_to_pcm_auto_gain_margin_db": margin_db,
-        "dsd_to_pcm_gain_db": gain_db,
-        "sinc": native.pcm_to_dsd.sinc,
-        "gain_compensation": native.pcm_to_dsd.gain_compensation,
-    }))
-    .expect("valid frozen legacy DSD wire")
+    let mut settings = DsdSettings::default();
+    settings.general_from_dsd.lowpass = lowpass;
+    settings.set_gain_policy(gain);
+    settings
 }
-
 
 fn request(settings: PipelineSettings) -> PlanRequest {
 
@@ -55,6 +43,7 @@ fn request(settings: PipelineSettings) -> PlanRequest {
         output_path: PathBuf::from("out.flac"),
         source: flac_source(),
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     }
@@ -65,7 +54,7 @@ fn pre_promotion_dsd_default_origin_does_not_change_pcm_planning() {
     let legacy_plan = plan_conversion(&request(PipelineSettings::default())).unwrap();
 
     let mut native_settings = PipelineSettings::default();
-    native_settings.dsd = DsdSettings::native_v2();
+    native_settings.dsd = DsdSettings::reference();
     let native_plan = plan_conversion(&request(native_settings)).unwrap();
 
     assert_eq!(legacy_plan, native_plan);
@@ -321,6 +310,7 @@ fn high_rate_pcm_is_not_misclassified_as_dsd() {
         sample_kind: Some(SampleKind::SignedInteger),
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     };
     assert!(!source.is_dsd());
@@ -339,9 +329,9 @@ fn flac_verify_uses_real_decode_test_not_metaflac_streaminfo_listing() {
 }
 
 #[test]
-fn default_dsd_to_pcm_is_exact_frozen_legacy_plan() {
+fn default_dsd_to_pcm_matches_explicit_strict_general_plan() {
     let mut settings = PipelineSettings::default();
-    assert!(!settings.dsd.is_native_v2());
+    assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::General);
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     let req = PlanRequest {
@@ -363,9 +353,11 @@ fn default_dsd_to_pcm_is_exact_frozen_legacy_plan() {
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
@@ -374,17 +366,15 @@ fn default_dsd_to_pcm_is_exact_frozen_legacy_plan() {
     assert_eq!(plan.commands()[0].tool, ToolIdentifier::Sox);
     assert!(plan.commands()[0].args.iter().any(|arg| arg == "88200"));
 
-    let mut explicit_legacy = req.clone();
-    explicit_legacy.settings.dsd = legacy_dsd_settings(
+    let mut explicit_general = req.clone();
+    explicit_general.settings.dsd = general_dsd_settings(
         DsdLowpassMethod::Auto,
-        DsdToPcmGainMode::Disabled,
-        0.15,
-        None,
+        SampleGainPolicy::Off,
     );
-    let explicit_legacy_plan = plan_conversion(&explicit_legacy).unwrap();
+    let explicit_general_plan = plan_conversion(&explicit_general).unwrap();
     assert_eq!(
-        plan, explicit_legacy_plan,
-        "pre-promotion defaults must emit the exact frozen legacy argv, cleanup, and finalization"
+        plan, explicit_general_plan,
+        "strict general defaults must emit the same argv, cleanup, and finalization as an explicit Off policy"
     );
 }
 
@@ -412,9 +402,11 @@ fn dsd_to_pcm_source_depth_uses_documented_target_default() {
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
@@ -457,9 +449,11 @@ fn lossy_source_depth_uses_documented_target_default() {
             sample_kind: None,
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
@@ -504,9 +498,11 @@ fn lossy_source_default_ignores_decoded_integer_carrier_width() {
             sample_kind: Some(SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
@@ -559,9 +555,11 @@ fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
             sample_kind: None,
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
@@ -577,10 +575,11 @@ fn replaygain_only_uses_stream_copy_then_post_processing_not_reencode() {
     let req = request(settings);
     let plan = plan_conversion(&req).unwrap();
     let commands = plan.commands();
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].tool, ToolIdentifier::Ffmpeg);
     assert!(commands[0].args.iter().any(|arg| arg == "copy"));
-    assert_eq!(commands[1].tool, ToolIdentifier::Loudgain);
+    // ReplayGain is intentionally absent from the static command plan: the
+    // native common executor owns observation, projection, and metadata write.
 }
 
 #[test]
@@ -626,10 +625,6 @@ impl ToolPlugin for CustomEncodePlugin {
     fn supports(&self, _context: &PlanContext<'_>, step: &PlanStep) -> ToolSupport {
         match &step.operation {
             PlanOperation::EncodePcm {
-                target_format: AudioFormat::Custom { .. },
-                ..
-            } => ToolSupport::CANONICAL,
-            PlanOperation::ReplayGain {
                 target_format: AudioFormat::Custom { .. },
                 ..
             } => ToolSupport::CANONICAL,
@@ -691,17 +686,6 @@ impl ToolPlugin for CustomEncodePlugin {
                     step.description.clone(),
                 ))
             }
-            PlanOperation::ReplayGain { .. } => {
-                let input = step.input.as_path().unwrap().to_string_lossy().into_owned();
-                Ok(PlannedCommand::new(
-                    self.id(),
-                    vec!["--replaygain".into(), input],
-                    step.input.clone(),
-                    step.output.clone(),
-                    context.request.source.duration,
-                    step.description.clone(),
-                ))
-            }
             _ => panic!("unexpected custom operation"),
         }
     }
@@ -725,7 +709,7 @@ fn custom_target_is_routed_through_registry_not_rejected_by_topology() {
 }
 
 #[test]
-fn custom_target_can_supply_custom_replaygain_plugin() {
+fn custom_target_replaygain_remains_native_common_executor_owned() {
     let mut settings = PipelineSettings::default();
     settings.target_format = AudioFormat::Custom {
         extension: "cust".into(),
@@ -736,18 +720,8 @@ fn custom_target_can_supply_custom_replaygain_plugin() {
     let mut registry = ToolRegistry::empty();
     registry.register(Box::new(CustomEncodePlugin)).unwrap();
     let plan = plan_conversion_with_registry(&req, &registry).unwrap();
-    let tools: Vec<_> = plan
-        .commands()
-        .iter()
-        .map(|command| command.tool.clone())
-        .collect();
-    assert_eq!(
-        tools,
-        vec![
-            ToolIdentifier::Custom("customenc".into()),
-            ToolIdentifier::Custom("customenc".into())
-        ]
-    );
+    assert_eq!(plan.commands().len(), 1);
+    assert_eq!(plan.commands()[0].tool, ToolIdentifier::Custom("customenc".into()));
 }
 
 #[test]
@@ -800,7 +774,7 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
     auto.target_sample_rate = RateTarget::PcmHz(88_200);
     auto.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     auto.resample_quality = ResampleQuality::Low;
-    auto.dsd = legacy_dsd_settings(DsdLowpassMethod::Auto, DsdToPcmGainMode::Disabled, 0.15, None);
+    auto.dsd = general_dsd_settings(DsdLowpassMethod::Auto, SampleGainPolicy::Off);
 
     let source = SourceInfo {
         dsd_source_kind: None,
@@ -814,6 +788,7 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
         sample_kind: Some(SampleKind::Dsd),
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     };
 
@@ -826,12 +801,13 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
         output_path: PathBuf::from("out.flac"),
         source: source.clone(),
         settings: auto,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };
 
     let mut ultra = req_auto.clone();
-    ultra.settings.dsd = legacy_dsd_settings(DsdLowpassMethod::SoxUltra, DsdToPcmGainMode::Disabled, 0.15, None);
+    ultra.settings.dsd = general_dsd_settings(DsdLowpassMethod::SoxUltra, SampleGainPolicy::Off);
 
     let auto_plan = plan_conversion(&req_auto).unwrap();
     let ultra_plan = plan_conversion(&ultra).unwrap();
@@ -858,6 +834,7 @@ fn dsd_source_rejects_pcm_bit_depth_fact() {
         sample_kind: Some(SampleKind::Dsd),
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     };
     assert!(matches!(
@@ -1017,16 +994,15 @@ fn wav_artwork_preservation_needs_a_metadata_plugin() {
 }
 
 #[test]
-fn wav_replaygain_needs_a_replaygain_plugin() {
+fn wav_replaygain_does_not_require_a_static_replaygain_plugin() {
     let mut settings = PipelineSettings::default();
     settings.target_format = AudioFormat::Wav;
+    settings.metadata.transfer_tags = false;
     settings.metadata.preserve_artwork = false;
     settings.replay_gain.mode = Some(ReplayGainMode::Track);
     let req = request(settings);
-    assert!(matches!(
-        plan_conversion(&req),
-        Err(PlanningError::NoPluginForOperation { .. })
-    ));
+    let plan = plan_conversion(&req).expect("native ReplayGain must not require a command-plan plugin");
+    assert!(plan.commands().iter().all(|command| command.tool != ToolIdentifier::Custom("replaygain".into())));
 }
 
 #[test]
@@ -1070,6 +1046,7 @@ fn dsd_source_rejects_bit_depth_even_without_sample_kind() {
         sample_kind: None,
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     };
     assert!(matches!(
@@ -1121,9 +1098,11 @@ fn dsd_request_for(format: AudioFormat, depth: PcmBitDepth, extension: &str) -> 
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     }
@@ -1154,9 +1133,11 @@ fn source_resolved_int32_alac_is_rejected_through_public_planner() {
             sample_kind: Some(SampleKind::SignedInteger),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings,
+        plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
     };

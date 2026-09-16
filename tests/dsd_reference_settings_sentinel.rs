@@ -1,236 +1,60 @@
-// append-only v15 checker source marker: SoxNg14801V15
-//! Native-v2 DSD settings sentinel.
-//!
-//! The legacy-v1 settings fingerprint and its sentinel remain frozen for old
-//! manifests. This file mechanically inventories the additive directional DSD
-//! snapshot domain used by native-v2 manifests.
+//! Strict DSD settings and Reference-intent sentinel tests.
 
-use std::collections::BTreeSet;
-
-use tonepoet_pipeline::fingerprint::settings_snapshot_fingerprint_v2;
 use tonepoet_pipeline::{
-    DbNano, DsdFilterPreset, DsdNoiseShaper, DsdReconstructionSelection,
-    DsdReferencePolicyVersion, DsdSettings, DsdSourceGainMode, DsdSourcePathway,
-    GainCompensation, ModulatorOrder, PipelineSettings, TrellisSettings,
-    SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT, SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS,
+    fingerprint::settings_snapshot_fingerprint_v2, DbNano, DsdGeneralExportLevel,
+    DsdGeneralReconstruction, DsdSettings, DsdSourcePathway, PipelineSettings,
+    SampleGainPolicy, TruePeakScanTier, TruePeakScope,
 };
 
-fn native_settings() -> PipelineSettings {
+fn db(value: &str) -> DbNano {
+    value.parse().expect("valid dB fixture")
+}
+
+#[test]
+fn reference_constructor_selects_reference_without_schema_origin_state() {
+    let settings = DsdSettings::reference();
+    assert_eq!(settings.from_dsd.pathway, DsdSourcePathway::Reference);
+    assert_eq!(settings.gain_policy(), SampleGainPolicy::Off);
+}
+
+#[test]
+fn general_and_reference_pathway_changes_are_visible_to_audit_snapshot() {
+    let general = PipelineSettings::default();
+    let mut reference = general.clone();
+    reference.dsd = DsdSettings::reference();
+    assert_ne!(
+        settings_snapshot_fingerprint_v2(&general),
+        settings_snapshot_fingerprint_v2(&reference)
+    );
+}
+
+#[test]
+fn ordinary_general_controls_remain_independent_from_reference_delivery_controls() {
     let mut settings = PipelineSettings::default();
-    settings.dsd = DsdSettings::native_v2();
-    settings
-}
-
-fn round_trip(settings: &PipelineSettings) -> PipelineSettings {
-    let json = serde_json::to_vec(settings).expect("serialize native-v2 settings");
-    serde_json::from_slice(&json).expect("deserialize native-v2 settings")
-}
-
-fn serialized_native_dsd_paths(settings: &PipelineSettings) -> BTreeSet<String> {
-    let encoded = serde_json::to_value(settings).expect("serialize native-v2 settings inventory");
-    let dsd = encoded
-        .get("dsd")
-        .and_then(serde_json::Value::as_object)
-        .expect("native-v2 dsd object");
-    let mut paths = BTreeSet::new();
-    paths.insert("dsd.schema".to_string());
-
-    fn visit(prefix: &str, value: &serde_json::Value, paths: &mut BTreeSet<String>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    let path = format!("{prefix}.{key}");
-                    if value.is_object() {
-                        visit(&path, value, paths);
-                    } else {
-                        paths.insert(path);
-                    }
-                }
-            }
-            _ => panic!("expected object at {prefix}"),
-        }
-    }
-
-    visit(
-        "dsd.pcm_to_dsd",
-        dsd.get("pcm_to_dsd").expect("pcm_to_dsd object"),
-        &mut paths,
-    );
-    visit(
-        "dsd.from_dsd",
-        dsd.get("from_dsd").expect("from_dsd object"),
-        &mut paths,
-    );
-    paths
-}
-
-#[test]
-fn pre_promotion_default_is_exact_legacy_v1_wire() {
-    let settings = PipelineSettings::default();
-    assert!(!settings.dsd.is_native_v2());
-
-    let encoded = serde_json::to_value(&settings).expect("serialize default settings");
-    let dsd = encoded["dsd"].as_object().expect("legacy DSD object");
-    assert!(!dsd.contains_key("schema_version"));
-    assert!(!dsd.contains_key("from_dsd"));
-    assert_eq!(dsd["dsd_to_pcm_lowpass"], "Auto");
-    assert_eq!(dsd["dsd_to_pcm_gain_mode"], "Disabled");
-
-    let decoded: PipelineSettings =
-        serde_json::from_value(encoded).expect("deserialize default settings");
-    assert_eq!(decoded, settings);
-    assert!(!decoded.dsd.is_native_v2());
-}
-
-#[test]
-fn legacy_pcm_to_dsd_edits_remain_flat_and_survive_native_migration() {
-    let mut settings = PipelineSettings::default();
-    settings.dsd.pcm_to_dsd.noise_shaper = DsdNoiseShaper::Crfb;
-
-    let encoded = serde_json::to_value(&settings)
-        .expect("serialize edited legacy PCM-to-DSD settings");
-    assert_eq!(
-        encoded["dsd"]["noise_shaper"],
-        serde_json::to_value(DsdNoiseShaper::Crfb).unwrap()
-    );
-    assert!(encoded["dsd"].get("schema_version").is_none());
-
-    let migrated = settings.dsd.migrate_to_native_v2();
-    assert!(migrated.is_native_v2());
-    assert_eq!(migrated.pcm_to_dsd.noise_shaper, DsdNoiseShaper::Crfb);
-}
-
-#[test]
-fn native_v2_migration_is_idempotent_and_preserves_existing_controls() {
-    let mut settings = native_settings();
-    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some("2.500000000".parse().unwrap());
-
-    let migrated = settings.dsd.migrate_to_native_v2();
-
-    assert_eq!(migrated, settings.dsd);
-}
-
-#[test]
-fn native_v2_dsd_inventory_matches_serialized_wire_and_has_no_duplicates() {
-    let expected: BTreeSet<String> = SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS
-        .iter()
-        .map(|path| (*path).to_string())
-        .collect();
-    assert_eq!(
-        expected.len(),
-        SETTINGS_SNAPSHOT_V2_DSD_FIELD_COUNT,
-        "native-v2 DSD inventory contains duplicates"
-    );
-    assert_eq!(serialized_native_dsd_paths(&native_settings()), expected);
-}
-
-#[test]
-fn native_v2_reference_fields_are_persisted_and_fingerprinted_independently() {
-    let baseline = native_settings();
-    assert!(baseline.dsd.is_native_v2());
-    let baseline_fingerprint = settings_snapshot_fingerprint_v2(&baseline);
-
-    let mut variants = Vec::new();
-
-    let mut settings = baseline.clone();
-    settings.dsd.pcm_to_dsd.noise_shaper = DsdNoiseShaper::Crfb;
-    variants.push(("dsd.pcm_to_dsd.noise_shaper", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.pcm_to_dsd.modulator_order = ModulatorOrder::Order7;
-    variants.push(("dsd.pcm_to_dsd.modulator_order", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.pcm_to_dsd.trellis = Some(TrellisSettings {
-        lookahead: 17,
-        nodes: 9,
-        latency: Some(321),
+    settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
+    settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
+    settings.dsd.general_from_dsd.export_level = DsdGeneralExportLevel::Native;
+    settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakGuard {
+        target_dbtp: db("-0.500000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Reference,
     });
-    variants.push(("dsd.pcm_to_dsd.trellis", settings));
 
-    let mut settings = baseline.clone();
-    settings.dsd.pcm_to_dsd.filter = DsdFilterPreset::Sinc;
-    variants.push(("dsd.pcm_to_dsd.filter", settings));
-
-    macro_rules! mutate_sinc {
-        ($path:literal, $field:ident, $value:expr) => {{
-            let mut settings = baseline.clone();
-            settings.dsd.pcm_to_dsd.sinc.$field = $value;
-            variants.push(($path, settings));
-        }};
-    }
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.oversample_factor", oversample_factor, 16);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.taps", taps, 131_072);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.passband_hz", passband_hz, 30_000.0);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.transition_hz", transition_hz, 750.0);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.kaiser_beta", kaiser_beta, 12.5);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.linear_phase", linear_phase, false);
-    mutate_sinc!("dsd.pcm_to_dsd.sinc.allow_aliasing", allow_aliasing, true);
-
-    let mut settings = baseline.clone();
-    settings.dsd.pcm_to_dsd.gain_compensation = GainCompensation::Decibels(1.5);
-    variants.push(("dsd.pcm_to_dsd.gain_compensation", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.from_dsd.pathway = DsdSourcePathway::Manual;
-    variants.push(("dsd.from_dsd.pathway", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    variants.push(("dsd.from_dsd.profile", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NativeLevel;
-    variants.push(("dsd.from_dsd.gain_mode", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some("3.125000000".parse::<DbNano>().unwrap());
-    variants.push(("dsd.from_dsd.fixed_gain_db", settings));
-
-    let mut settings = baseline.clone();
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
-    settings.dsd.from_dsd.normalize_peak_target_dbfs =
-        "-2.500000000".parse::<DbNano>().unwrap();
-    variants.push(("dsd.from_dsd.normalize_peak_target_dbfs", settings));
-
-    let mut fingerprints = BTreeSet::new();
-    fingerprints.insert(baseline_fingerprint.0.to_hex());
-    for (path, settings) in variants {
-        let decoded = round_trip(&settings);
-        assert_eq!(decoded, settings, "serde drift for {path}");
-        let fingerprint = settings_snapshot_fingerprint_v2(&decoded);
-        assert_ne!(
-            fingerprint, baseline_fingerprint,
-            "{path} did not affect the native-v2 settings snapshot"
-        );
-        assert!(
-            fingerprints.insert(fingerprint.0.to_hex()),
-            "{path} collided with another sentinel mutation"
-        );
-    }
+    // Persisted ordinary preferences may be retained for later editing, but
+    // Reference pathway selection remains a separate explicit authority.
+    assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Reference);
+    assert_eq!(settings.dsd.true_peak_scope(), Some(TruePeakScope::Album));
 }
 
+#[cfg(feature = "serde")]
 #[test]
-fn native_v2_immutable_identity_fields_are_serialized_and_hashed() {
-    let settings = native_settings();
-    let encoded = serde_json::to_value(&settings).expect("serialize settings");
-    assert_eq!(encoded["dsd"]["schema_version"], 2);
-    assert_eq!(
-        encoded["dsd"]["from_dsd"]["reference_policy"],
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V16).unwrap()
-    );
-
-    // These fields have one legal P0 value. Pin their exact snapshot tokens so
-    // a future append-only value cannot silently disappear from identity.
-    let snapshot = settings_snapshot_fingerprint_v2(&settings);
-    let expected = settings_snapshot_fingerprint_v2(&round_trip(&settings));
-    assert_eq!(snapshot, expected);
-
-    assert_eq!(
-        serde_json::to_value(DsdReferencePolicyVersion::SoxNg14801V12).unwrap(),
-        serde_json::Value::String("sox_ng_14_8_0_1_v12".to_string()),
-    );
+fn strict_dsd_wire_has_directional_objects_and_no_origin_or_version_selector() {
+    let value = serde_json::to_value(DsdSettings::reference()).expect("serialize DSD settings");
+    let object = value.as_object().expect("DSD settings object");
+    assert!(object.contains_key("pcm_to_dsd"));
+    assert!(object.contains_key("from_dsd"));
+    assert!(object.contains_key("general_from_dsd"));
+    for retired in ["origin", "schema_origin", "settings_version", "legacy"] {
+        assert!(!object.contains_key(retired), "retired selector {retired} leaked into wire");
+    }
 }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use tonepoet_pipeline::fingerprint::{settings_fingerprint, SettingsFingerprint};
+use tonepoet_pipeline::fingerprint::{settings_and_effects_fingerprint, settings_fingerprint, SettingsFingerprint};
 use tonepoet_pipeline::settings::PipelineSettings;
 
 use super::manifest::{
@@ -138,12 +138,46 @@ pub fn decide_rerun(
     settings: &PipelineSettings,
     overwrite: OverwritePolicy,
 ) -> RerunDecision {
-    decide_rerun_with_options(album_dir, settings, overwrite, RerunOptions::default())
+    decide_rerun_with_effects_and_options(
+        album_dir,
+        settings,
+        &[],
+        overwrite,
+        RerunOptions::default(),
+    )
+}
+
+/// Ordinary rerun decision that binds the registered sample-domain effect
+/// chain into the same manifest identity used for settings. Empty chains are
+/// byte-for-byte compatible with the historical settings-only fingerprint.
+pub fn decide_rerun_with_effects(
+    album_dir: &Path,
+    settings: &PipelineSettings,
+    effects: &[tonepoet_pipeline::EffectIntent],
+    overwrite: OverwritePolicy,
+) -> RerunDecision {
+    decide_rerun_with_effects_and_options(
+        album_dir,
+        settings,
+        effects,
+        overwrite,
+        RerunOptions::default(),
+    )
 }
 
 pub fn decide_rerun_with_options(
     album_dir: &Path,
     settings: &PipelineSettings,
+    overwrite: OverwritePolicy,
+    options: RerunOptions,
+) -> RerunDecision {
+    decide_rerun_with_effects_and_options(album_dir, settings, &[], overwrite, options)
+}
+
+pub fn decide_rerun_with_effects_and_options(
+    album_dir: &Path,
+    settings: &PipelineSettings,
+    effects: &[tonepoet_pipeline::EffectIntent],
     overwrite: OverwritePolicy,
     options: RerunOptions,
 ) -> RerunDecision {
@@ -161,7 +195,7 @@ pub fn decide_rerun_with_options(
         };
     }
 
-    let current_fingerprint = settings_fingerprint(settings);
+    let current_fingerprint = settings_and_effects_fingerprint(settings, effects);
     let path = manifest_path(album_dir);
     let manifest = match read_manifest(album_dir) {
         Ok(Some(manifest)) => manifest,
@@ -179,7 +213,7 @@ pub fn decide_rerun_with_options(
     };
 
     let Some(found_fingerprint) = manifest.legacy_settings_fingerprint() else {
-        // Native-v2 skip/verify authority includes source content, semantic
+        // Reference skip/verify authority includes source content, semantic
         // plan, qualification, executable identities, and runtime dispatch.
         // The generic preflight does not yet possess those current facts, so
         // it must never infer equivalence from settings alone.
@@ -266,11 +300,11 @@ pub(crate) fn decide_rerun_with_reference_preflight(
             settings_snapshot_fingerprint_v2,
             resolved_output_target,
             policy,
-            qualification_manifest_digest,
+            qualification_candidate_manifest_digest,
         } if *settings_snapshot_fingerprint_v2 == authority.settings_snapshot_fingerprint_v2
             && *resolved_output_target == authority.resolved_output_target
             && *policy == authority.policy
-            && *qualification_manifest_digest == authority.qualification_manifest_digest
+            && *qualification_candidate_manifest_digest == authority.qualification_candidate_manifest_digest
     );
     if !route_matches {
         return native_authority_redo(
@@ -279,7 +313,7 @@ pub(crate) fn decide_rerun_with_reference_preflight(
     }
     if &manifest.settings != settings {
         return native_authority_redo(
-            "manifest audit settings differ from the current native-v2 settings",
+            "manifest audit settings differ from the current Reference settings",
         );
     }
     if manifest.tracks.len() != 1 {
@@ -711,7 +745,7 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
     #[test]
     fn native_album_profile_change_does_not_match_legacy_album_manifest() {
         use tonepoet_pipeline::{
-            DsdAutoGainScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+            TruePeakScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -723,10 +757,10 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
         write_file(&output, b"encoded audio");
 
         let mut reference = PipelineSettings::default();
-        reference.dsd = DsdSettings::native_v2();
+        reference.dsd = DsdSettings::reference();
         reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
         reference.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
-        reference.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        reference.dsd.set_true_peak_scope(TruePeakScope::Album);
         reference.dsd.bind_runtime_album_gain(
             "-0.750000000".parse().unwrap(),
             Some("-0.490000000".parse().unwrap()),

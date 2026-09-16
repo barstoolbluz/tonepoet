@@ -11,8 +11,7 @@ use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
 use crate::convert::simple_wizard::DitherType;
 use tonepoet_pipeline::enums::{
-    DsdAutoGainScope, DsdFilterPreset, DsdNoiseShaper, DsdTruePeakScanMode, ModulatorOrder,
-    PcmTruePeakScanMode, PcmTruePeakScope,
+    DsdFilterPreset, DsdNoiseShaper, ModulatorOrder, TruePeakScanTier, TruePeakScope,
 };
 use tonepoet_pipeline::{DbNano, DsdReconstructionSelection, DsdSourcePathway};
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
@@ -272,16 +271,24 @@ pub enum ReplayGainChoice {
     BothIfMissing,
 }
 
-/// PCM gain policy exposed by the Convert screen.
-///
-/// Automatic true-peak gain and fixed amplitude gain are intentionally one
-/// mutually-exclusive axis. This mirrors the DSD gain-mode treatment without
-/// changing the DSD axis itself.
+/// Ordinary PCM sample-domain gain policy exposed by the Convert screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmGainMode {
     Off,
-    Auto,
-    Fixed,
+    TruePeakGuard,
+    TruePeakNormalize,
+    FixedGain,
+}
+
+impl PcmGainMode {
+    pub const fn preset_key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::TruePeakGuard => "true-peak-guard",
+            Self::TruePeakNormalize => "true-peak-normalize",
+            Self::FixedGain => "fixed-gain",
+        }
+    }
 }
 
 /// Bit depth options including float formats
@@ -341,30 +348,32 @@ pub enum ResamplerChoice {
 /// Kept as a local UI enum so labels can stay stable even if pipeline names evolve.
 pub type DsdConversionPreset = DsdFilterPreset;
 
-/// Native-v2 DSD-source gain policy exposed in the format pane.
+/// DSD gain choice exposed in the Convert pane. Ordinary general policies and
+/// qualified Reference-only policies share one row, but `dsd_pathway` selects
+/// which family is active; one is never interpreted as the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsdGainMode {
-    /// Exact legacy no-gain behavior.
-    Disabled,
-    /// Exact legacy peak-normalize behavior.
-    Auto,
+    Off,
+    TruePeakGuard,
+    TruePeakNormalize,
+    FixedGain,
     Reference,
     NativeLevel,
-    /// Native fixed gain or legacy manual gain, depending on settings origin.
-    Fixed,
-    NormalizePeak,
+    ReferenceFixed,
+    SamplePeakNormalize,
 }
 
 impl DsdGainMode {
-    /// Stable preset key independent of presentation labels.
     pub const fn preset_key(self) -> &'static str {
         match self {
-            Self::Disabled => "disabled",
-            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::TruePeakGuard => "true-peak-guard",
+            Self::TruePeakNormalize => "true-peak-normalize",
+            Self::FixedGain => "fixed-gain",
             Self::Reference => "reference",
-            Self::NativeLevel => "native",
-            Self::Fixed => "fixed",
-            Self::NormalizePeak => "normalize",
+            Self::NativeLevel => "native-level",
+            Self::ReferenceFixed => "reference-fixed",
+            Self::SamplePeakNormalize => "sample-peak-normalize",
         }
     }
 }
@@ -379,9 +388,6 @@ pub const DSD_TO_PCM_GAIN_DB_STEP: f32 = 0.25;
 const DSD_TO_PCM_GAIN_DB_MIN_NANO: i64 = -24_000_000_000;
 const DSD_TO_PCM_GAIN_DB_MAX_NANO: i64 = 24_000_000_000;
 const DSD_TO_PCM_GAIN_DB_STEP_NANO: i64 = 250_000_000;
-const DSD_AUTO_GAIN_MARGIN_DB_MIN_NANO: i64 = 0;
-const DSD_AUTO_GAIN_MARGIN_DB_MAX_NANO: i64 = 6_000_000_000;
-const DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO: i64 = 50_000_000;
 
 impl ResamplerChoice {
     pub const fn label(self) -> &'static str {
@@ -3234,15 +3240,15 @@ mod clamp_pill_tests {
         format.resampler.select_value(&ResamplerChoice::Soxr);
         format.dither_overridden = true;
         format.resampler_overridden = true;
-        // Stage dormant native-v2 policy directly. Pre-promotion production
+        // Stage the dormant qualified Reference policy directly. Pre-promotion production
         // constraints keep these controls disabled, but reset/recovery must not
         // corrupt values already present in a future-version preset.
         format.source_is_dsd = true;
         format.apply_format_constraints();
         format.dsd_gain_mode.set_all_enabled(true);
         assert!(
-            format.dsd_gain_mode.select_value(&DsdGainMode::Fixed),
-            "fixture must be able to stage dormant native-v2 gain"
+            format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain),
+            "fixture must be able to stage dormant qualified Reference gain"
         );
         format.dsd_gain_db = "5.500000000".parse().unwrap();
 
@@ -3252,7 +3258,7 @@ mod clamp_pill_tests {
         assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
         assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
         assert_eq!(*format.resampler.selected_value(), ResamplerChoice::Soxr);
-        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Fixed);
+        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::FixedGain);
         assert_eq!(format.dsd_gain_db, "5.500000000".parse().unwrap());
         assert!(format.dither_overridden);
         assert!(format.resampler_overridden);
@@ -3294,7 +3300,7 @@ mod clamp_pill_tests {
         let mut format = FormatState::new();
         format.dither.select_value(&DitherType::Shibata);
         format.resampler.select_value(&ResamplerChoice::Soxr);
-        format.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak);
+        format.dsd_gain_mode.select_value(&DsdGainMode::SamplePeakNormalize);
         format.dsd_gain_db = "6.000000000".parse().unwrap();
         assert!(!format.dither_overridden);
         assert!(!format.resampler_overridden);
@@ -3303,7 +3309,7 @@ mod clamp_pill_tests {
 
         assert_eq!(*format.dither.selected_value(), DitherType::None);
         assert_eq!(*format.resampler.selected_value(), ResamplerChoice::None);
-        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
+        assert_eq!(*format.dsd_gain_mode.selected_value(), DsdGainMode::Off);
         assert_eq!(format.dsd_gain_db, tonepoet_pipeline::DbNano::ZERO);
         assert!(!format.dither_overridden);
         assert!(!format.resampler_overridden);
@@ -3801,9 +3807,7 @@ pub enum FormatField {
     /// True-peak target in dBTP.
     PcmTruePeakTarget,
     /// Per-track or submitted-batch scope.
-    PcmTruePeakScope,
-    /// Whether positive gain is permitted below the target.
-    PcmTruePeakBoost,
+    TruePeakScope,
     /// Certified true-peak scan tier.
     PcmTruePeakScan,
     // DSD rows
@@ -3816,14 +3820,16 @@ pub enum FormatField {
     /// Standard or explicit Wideband Reference reconstruction profile.
     DsdProfile,
     DsdGain,
-    /// Track or submitted-batch scope for automatic DSD peak normalization.
-    DsdGainScope,
-    /// Certified scan tier for submitted-batch DSD true-peak analysis.
+    /// Track or submitted-batch scope for certified ordinary DSD true-peak gain.
+    DsdTruePeakScope,
+    /// Certified scan tier for ordinary DSD true-peak analysis.
     DsdTruePeakScan,
-    /// Fixed DSD-to-PCM gain value, edited with left/right controls.
+    /// Certified ordinary DSD true-peak target in dBTP.
+    DsdTruePeakTarget,
+    /// Fixed ordinary/Reference DSD-to-PCM gain value.
     DsdGainDb,
-    /// Native NormalizePeak target or exact legacy Auto safety margin.
-    DsdNormalizeTarget,
+    /// Reference-only sample-peak normalize target in dBFS.
+    DsdSamplePeakTarget,
     /// Below-the-fold output container selector.
     Container,
     /// Below-the-fold resampler quality preset.
@@ -4030,29 +4036,28 @@ pub struct FormatState {
     pub dither: PillState<DitherType>,
     pub replaygain: PillState<ReplayGainChoice>,
     pub pcm_gain_mode: PillState<PcmGainMode>,
-    pub pcm_true_peak_scope: PillState<PcmTruePeakScope>,
-    pub pcm_true_peak_boost: PillState<bool>,
-    pub pcm_true_peak_scan_mode: PillState<PcmTruePeakScanMode>,
+    pub pcm_true_peak_scope: PillState<TruePeakScope>,
+    pub pcm_true_peak_scan_mode: PillState<TruePeakScanTier>,
     pub pcm_true_peak_target_dbtp: DbNano,
     pub pcm_fixed_gain_db: DbNano,
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
     pub conversion_preset: PillState<DsdConversionPreset>,
-    /// Native-v2 DSD-source pathway. Manual is reserved and rejected in P0.
+    /// General processing or qualified Reference delivery.
     pub dsd_pathway: PillState<DsdSourcePathway>,
-    /// Native-v2 Reference reconstruction profile.
+    /// Qualified Reference reconstruction profile.
     pub dsd_profile: PillState<DsdReconstructionSelection>,
     pub dsd_gain_mode: PillState<DsdGainMode>,
-    /// Scope for legacy Auto / native NormalizePeak. Track is compatibility default.
-    pub dsd_auto_gain_scope: PillState<DsdAutoGainScope>,
-    /// Opt-in true-peak scan tier for album scope. Reference is the default.
-    pub dsd_true_peak_scan_mode: PillState<DsdTruePeakScanMode>,
-    /// Fixed DSD-to-PCM gain in dB used when `dsd_gain_mode` is Manual.
+    /// Scope for ordinary certified DSD true-peak gain.
+    pub dsd_true_peak_scope: PillState<TruePeakScope>,
+    /// Certified DSD true-peak scan tier.
+    pub dsd_true_peak_scan_mode: PillState<TruePeakScanTier>,
+    /// Ordinary certified DSD true-peak target in dBTP.
+    pub dsd_true_peak_target_dbtp: DbNano,
+    /// Fixed DSD-to-PCM gain in dB.
     pub dsd_gain_db: DbNano,
-    /// NormalizePeak target in dBFS. Stored as fixed-point text authority.
-    pub dsd_normalize_target_dbfs: DbNano,
-    /// Exact legacy Auto-mode safety margin in dB.
-    pub dsd_auto_gain_margin_db: DbNano,
+    /// Reference-only sample-peak normalize target in dBFS.
+    pub dsd_sample_peak_target_dbfs: DbNano,
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
@@ -4294,20 +4299,20 @@ impl FormatState {
 
         let pcm_gain_mode = PillState::new(vec![
             (PcmGainMode::Off, "off"),
-            (PcmGainMode::Auto, "auto"),
-            (PcmGainMode::Fixed, "fixed"),
+            (PcmGainMode::TruePeakGuard, "true-peak guard"),
+            (PcmGainMode::TruePeakNormalize, "true-peak normalize"),
+            (PcmGainMode::FixedGain, "fixed gain"),
         ]);
         let pcm_true_peak_scope = PillState::new(vec![
-            (PcmTruePeakScope::Track, "track"),
-            (PcmTruePeakScope::Album, "album"),
+            (TruePeakScope::Track, "track"),
+            (TruePeakScope::Album, "album"),
         ]);
-        let pcm_true_peak_boost = PillState::new(vec![(false, "off"), (true, "on")]);
         let mut pcm_true_peak_scan_mode = PillState::new(vec![
-            (PcmTruePeakScanMode::Reference, "reference"),
-            (PcmTruePeakScanMode::Standard, "standard"),
-            (PcmTruePeakScanMode::Fast, "fast"),
+            (TruePeakScanTier::Reference, "reference"),
+            (TruePeakScanTier::Standard, "standard"),
+            (TruePeakScanTier::Fast, "fast"),
         ]);
-        pcm_true_peak_scan_mode.select_value(&PcmTruePeakScanMode::Fast);
+        pcm_true_peak_scan_mode.select_value(&TruePeakScanTier::Fast);
 
         let noise_shaper = PillState::new(vec![
             (DsdNoiseShaper::Clans, "CLANS"),
@@ -4329,27 +4334,28 @@ impl FormatState {
         ]);
 
         let dsd_gain_mode = PillState::new(vec![
-            (DsdGainMode::Disabled, "disabled"),
-            (DsdGainMode::Auto, "auto"),
+            (DsdGainMode::Off, "off"),
+            (DsdGainMode::TruePeakGuard, "true-peak guard"),
+            (DsdGainMode::TruePeakNormalize, "true-peak normalize"),
+            (DsdGainMode::FixedGain, "fixed gain"),
             (DsdGainMode::Reference, "reference"),
-            (DsdGainMode::NativeLevel, "native"),
-            (DsdGainMode::Fixed, "manual"),
-            (DsdGainMode::NormalizePeak, "normalize"),
+            (DsdGainMode::NativeLevel, "native level"),
+            (DsdGainMode::ReferenceFixed, "reference fixed"),
+            (DsdGainMode::SamplePeakNormalize, "sample-peak normalize"),
         ]);
-        let dsd_auto_gain_scope = PillState::new(vec![
-            (DsdAutoGainScope::Track, "track"),
-            (DsdAutoGainScope::Album, "album"),
+        let dsd_true_peak_scope = PillState::new(vec![
+            (TruePeakScope::Track, "track"),
+            (TruePeakScope::Album, "album"),
         ]);
         let dsd_true_peak_scan_mode = PillState::new(vec![
-            (DsdTruePeakScanMode::Reference, "reference"),
-            (DsdTruePeakScanMode::Standard, "standard"),
-            (DsdTruePeakScanMode::Fast, "fast"),
+            (TruePeakScanTier::Reference, "reference"),
+            (TruePeakScanTier::Standard, "standard"),
+            (TruePeakScanTier::Fast, "fast"),
         ]);
-        let mut dsd_pathway = PillState::new(vec![
+        let dsd_pathway = PillState::new(vec![
+            (DsdSourcePathway::General, "general"),
             (DsdSourcePathway::Reference, "reference"),
-            (DsdSourcePathway::Manual, "manual (not yet available)"),
         ]);
-        dsd_pathway.set_enabled(&DsdSourcePathway::Manual, false);
         let mut dsd_profile = PillState::new(vec![
             (DsdReconstructionSelection::Reference, "reference"),
             (DsdReconstructionSelection::Wideband, "wideband"),
@@ -4365,7 +4371,6 @@ impl FormatState {
             replaygain,
             pcm_gain_mode,
             pcm_true_peak_scope,
-            pcm_true_peak_boost,
             pcm_true_peak_scan_mode,
             pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             pcm_fixed_gain_db: DbNano::ZERO,
@@ -4375,11 +4380,11 @@ impl FormatState {
             dsd_pathway,
             dsd_profile,
             dsd_gain_mode,
-            dsd_auto_gain_scope,
+            dsd_true_peak_scope,
             dsd_true_peak_scan_mode,
+            dsd_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             dsd_gain_db: DbNano(0),
-            dsd_normalize_target_dbfs: DbNano(-100_000_000),
-            dsd_auto_gain_margin_db: DbNano(100_000_000),
+            dsd_sample_peak_target_dbfs: DbNano(-100_000_000),
             source_is_dsd: false,
             source_pcm_float_bits: None,
             source_is_lossless: None,
@@ -4547,16 +4552,16 @@ impl FormatState {
         self.source_is_dsd && !self.is_dsd_selected()
     }
 
-    /// Whether the native-v2 DSD Reference controls are exposed in this release.
-    ///
-    /// The pre-promotion default is the exact legacy wire, so merely opening a
-    /// DSD source must not opt the TUI into an unqualified native policy, require
-    /// Reference confirmation, or lock the generic legacy resampler/dither rows.
-    /// The promotion release flips `DsdSettings::default()` to native v2 and this
-    /// gate opens automatically.
+    /// Reference controls are meaningful only for a DSD source rendered to PCM.
+    /// Visibility is not an admission claim: the pure planner still validates the
+    /// qualified Reference route and refuses unsupported realizations.
     pub fn dsd_reference_controls_available(&self) -> bool {
         self.dsd_to_pcm_gain_available()
-            && tonepoet_pipeline::DsdSettings::default().is_native_v2()
+    }
+
+    pub fn dsd_reference_path_selected(&self) -> bool {
+        self.dsd_reference_controls_available()
+            && *self.dsd_pathway.selected_value() == DsdSourcePathway::Reference
     }
 
     /// True when the SSRC overlay is overriding any part of the dither pair
@@ -4599,7 +4604,7 @@ impl FormatState {
         if self.ssrc_dither_override_active() {
             Some("ssrc override")
         } else if self.ssrc_dither_invalid_for_selected_rate() {
-            Some("ssrc invalid")
+            Some("ssrc split")
         } else if self.ssrc_dither_approximation_active() {
             Some("ssrc approx")
         } else {
@@ -4657,7 +4662,7 @@ impl FormatState {
                 FormatPaneRow::Field(FormatField::SampleRate),
                 FormatPaneRow::Field(FormatField::BitDepth),
             ]);
-            if !self.dsd_reference_controls_available() {
+            if !self.dsd_reference_path_selected() {
                 rows.extend([
                     FormatPaneRow::Field(FormatField::Resampler),
                     FormatPaneRow::Field(FormatField::Dither),
@@ -4666,44 +4671,39 @@ impl FormatState {
             if !self.source_is_dsd {
                 rows.push(FormatPaneRow::Field(FormatField::PcmTruePeak));
                 match *self.pcm_gain_mode.selected_value() {
-                    PcmGainMode::Auto => rows.extend([
+                    PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize => rows.extend([
                         FormatPaneRow::Field(FormatField::PcmTruePeakTarget),
-                        FormatPaneRow::Field(FormatField::PcmTruePeakScope),
-                        FormatPaneRow::Field(FormatField::PcmTruePeakBoost),
+                        FormatPaneRow::Field(FormatField::TruePeakScope),
                         FormatPaneRow::Field(FormatField::PcmTruePeakScan),
                     ]),
-                    PcmGainMode::Fixed => {
+                    PcmGainMode::FixedGain => {
                         rows.push(FormatPaneRow::Field(FormatField::PcmGainDb));
                     }
                     PcmGainMode::Off => {}
                 }
             }
-            // ReplayGain is intentionally presented after the sample-changing
-            // true-peak step; the pipeline measures its tags after gain.
+            // ReplayGain remains owned by the existing orchestrator in Phase 2.
             rows.push(FormatPaneRow::Field(FormatField::ReplayGain));
 
             if self.dsd_to_pcm_gain_available() {
-                if self.dsd_reference_controls_available() {
-                    rows.extend([
-                        FormatPaneRow::Field(FormatField::DsdPath),
-                        FormatPaneRow::Field(FormatField::DsdProfile),
-                    ]);
+                rows.push(FormatPaneRow::Field(FormatField::DsdPath));
+                if self.dsd_reference_path_selected() {
+                    rows.push(FormatPaneRow::Field(FormatField::DsdProfile));
                 }
                 rows.push(FormatPaneRow::Field(FormatField::DsdGain));
                 match *self.dsd_gain_mode.selected_value() {
-                    DsdGainMode::Auto | DsdGainMode::NormalizePeak => {
-                        rows.push(FormatPaneRow::Field(FormatField::DsdGainScope));
-                        if *self.dsd_auto_gain_scope.selected_value() == DsdAutoGainScope::Album {
-                            rows.push(FormatPaneRow::Field(FormatField::DsdTruePeakScan));
-                        }
-                        rows.push(FormatPaneRow::Field(FormatField::DsdNormalizeTarget));
-                    }
-                    DsdGainMode::Fixed => {
+                    DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize => rows.extend([
+                        FormatPaneRow::Field(FormatField::DsdTruePeakTarget),
+                        FormatPaneRow::Field(FormatField::DsdTruePeakScope),
+                        FormatPaneRow::Field(FormatField::DsdTruePeakScan),
+                    ]),
+                    DsdGainMode::FixedGain | DsdGainMode::ReferenceFixed => {
                         rows.push(FormatPaneRow::Field(FormatField::DsdGainDb));
                     }
-                    DsdGainMode::Disabled
-                    | DsdGainMode::Reference
-                    | DsdGainMode::NativeLevel => {}
+                    DsdGainMode::SamplePeakNormalize => {
+                        rows.push(FormatPaneRow::Field(FormatField::DsdSamplePeakTarget));
+                    }
+                    DsdGainMode::Off | DsdGainMode::Reference | DsdGainMode::NativeLevel => {}
                 }
             }
         }
@@ -4713,7 +4713,7 @@ impl FormatState {
             rows.push(FormatPaneRow::Field(FormatField::Container));
         }
         let resampler_controls_active = !self.is_dsd_selected()
-            && !self.dsd_reference_controls_available();
+            && !self.dsd_reference_path_selected();
         if maximized
             && resampler_controls_active
             && !matches!(*self.resampler.selected_value(), ResamplerChoice::None)
@@ -4812,9 +4812,9 @@ impl FormatState {
                 && self.auto_gain_target_is_integer_pcm();
             let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
             if !self.source_is_dsd && (float_to_integer || lossless_to_lossy) {
-                self.pcm_gain_mode.select_value(&PcmGainMode::Auto);
+                self.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard);
                 self.pcm_true_peak_scan_mode
-                    .select_value(&PcmTruePeakScanMode::Fast);
+                    .select_value(&TruePeakScanTier::Fast);
             } else {
                 self.pcm_gain_mode.select_value(&PcmGainMode::Off);
             }
@@ -4824,22 +4824,15 @@ impl FormatState {
             let dsd_requires_safety_gain = self.source_is_dsd
                 && self.dsd_to_pcm_gain_available()
                 && (lossy_target || self.auto_gain_target_is_integer_pcm());
+            // Contextual safety defaults are ordinary general-processing policy.
+            // They never silently opt a request into qualified Reference delivery.
+            self.dsd_pathway.select_value(&DsdSourcePathway::General);
             if dsd_requires_safety_gain {
-                let mode = if self.dsd_reference_controls_available() {
-                    DsdGainMode::NormalizePeak
-                } else {
-                    DsdGainMode::Auto
-                };
-                self.dsd_gain_mode.select_value(&mode);
+                self.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard);
                 self.dsd_true_peak_scan_mode
-                    .select_value(&DsdTruePeakScanMode::Fast);
+                    .select_value(&TruePeakScanTier::Fast);
             } else {
-                let mode = if self.dsd_reference_controls_available() {
-                    DsdGainMode::Reference
-                } else {
-                    DsdGainMode::Disabled
-                };
-                self.dsd_gain_mode.select_value(&mode);
+                self.dsd_gain_mode.select_value(&DsdGainMode::Off);
             }
         }
     }
@@ -5072,21 +5065,23 @@ impl FormatState {
             FormatField::ReplayGain => select_enabled_index(&mut self.replaygain, index),
             FormatField::PcmTruePeak => select_enabled_index(&mut self.pcm_gain_mode, index),
             FormatField::PcmGainDb => {
-                self.pcm_gain_mode.select_value(&PcmGainMode::Fixed);
+                self.pcm_gain_mode.select_value(&PcmGainMode::FixedGain);
                 self.pcm_fixed_gain_db = clamp_dsd_to_pcm_gain_db(self.pcm_fixed_gain_db);
                 true
             }
-            FormatField::PcmTruePeakScope => {
+            FormatField::TruePeakScope => {
                 select_enabled_index(&mut self.pcm_true_peak_scope, index)
-            }
-            FormatField::PcmTruePeakBoost => {
-                select_enabled_index(&mut self.pcm_true_peak_boost, index)
             }
             FormatField::PcmTruePeakScan => {
                 select_enabled_index(&mut self.pcm_true_peak_scan_mode, index)
             }
             FormatField::PcmTruePeakTarget => {
-                self.pcm_gain_mode.select_value(&PcmGainMode::Auto);
+                if !matches!(
+                    *self.pcm_gain_mode.selected_value(),
+                    PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize
+                ) {
+                    self.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard);
+                }
                 self.pcm_true_peak_target_dbtp =
                     clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
                 true
@@ -5099,33 +5094,39 @@ impl FormatState {
             FormatField::DsdPath => select_enabled_index(&mut self.dsd_pathway, index),
             FormatField::DsdProfile => select_enabled_index(&mut self.dsd_profile, index),
             FormatField::DsdGain => select_enabled_index(&mut self.dsd_gain_mode, index),
-            FormatField::DsdGainScope => {
-                select_enabled_index(&mut self.dsd_auto_gain_scope, index)
+            FormatField::DsdTruePeakScope => {
+                select_enabled_index(&mut self.dsd_true_peak_scope, index)
             }
             FormatField::DsdTruePeakScan => {
                 select_enabled_index(&mut self.dsd_true_peak_scan_mode, index)
             }
             FormatField::DsdGainDb => {
-                // Clicking/focusing the value row makes Fixed explicit;
-                // keyboard left/right then adjusts the staged dB value.
-                self.dsd_gain_mode.select_value(&DsdGainMode::Fixed);
+                let mode = if self.dsd_reference_path_selected() {
+                    DsdGainMode::ReferenceFixed
+                } else {
+                    DsdGainMode::FixedGain
+                };
+                self.dsd_gain_mode.select_value(&mode);
                 self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
                 true
             }
-            FormatField::DsdNormalizeTarget => {
-                if self.dsd_reference_controls_available() {
-                    if !self.dsd_gain_mode.select_value(&DsdGainMode::NormalizePeak) {
-                        return false;
-                    }
-                    self.dsd_normalize_target_dbfs =
-                        clamp_dsd_normalize_target_dbfs(self.dsd_normalize_target_dbfs);
-                } else {
-                    if !self.dsd_gain_mode.select_value(&DsdGainMode::Auto) {
-                        return false;
-                    }
-                    self.dsd_auto_gain_margin_db =
-                        clamp_dsd_auto_gain_margin_db(self.dsd_auto_gain_margin_db);
+            FormatField::DsdTruePeakTarget => {
+                if !matches!(
+                    *self.dsd_gain_mode.selected_value(),
+                    DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize
+                ) {
+                    self.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard);
                 }
+                self.dsd_true_peak_target_dbtp =
+                    clamp_pcm_true_peak_target(self.dsd_true_peak_target_dbtp);
+                true
+            }
+            FormatField::DsdSamplePeakTarget => {
+                if !self.dsd_gain_mode.select_value(&DsdGainMode::SamplePeakNormalize) {
+                    return false;
+                }
+                self.dsd_sample_peak_target_dbfs =
+                    clamp_dsd_sample_peak_target_dbfs(self.dsd_sample_peak_target_dbfs);
                 true
             }
             FormatField::Container => self.select_container_index(index),
@@ -5162,19 +5163,21 @@ impl FormatState {
             FormatField::PcmTruePeak
                 | FormatField::PcmGainDb
                 | FormatField::PcmTruePeakTarget
-                | FormatField::PcmTruePeakScope
-                | FormatField::PcmTruePeakBoost
+                | FormatField::TruePeakScope
                 | FormatField::PcmTruePeakScan
         ) {
             self.pcm_gain_overridden = true;
         }
         if matches!(
             row,
-            FormatField::DsdGain
-                | FormatField::DsdGainScope
+            FormatField::DsdPath
+                | FormatField::DsdProfile
+                | FormatField::DsdGain
+                | FormatField::DsdTruePeakScope
                 | FormatField::DsdTruePeakScan
                 | FormatField::DsdGainDb
-                | FormatField::DsdNormalizeTarget
+                | FormatField::DsdTruePeakTarget
+                | FormatField::DsdSamplePeakTarget
         ) {
             self.dsd_gain_overridden = true;
         }
@@ -5347,7 +5350,10 @@ impl FormatState {
         self.apply_auto_resampler(None);
         self.apply_auto_gain_defaults();
         if !self.dsd_gain_overridden
-            && *self.dsd_gain_mode.selected_value() != DsdGainMode::Fixed
+            && !matches!(
+                *self.dsd_gain_mode.selected_value(),
+                DsdGainMode::FixedGain | DsdGainMode::ReferenceFixed
+            )
         {
             self.dsd_gain_db = DbNano::ZERO;
         }
@@ -5481,43 +5487,45 @@ impl FormatState {
         self.noise_shaper.set_all_enabled(true);
         self.modulator_order.set_all_enabled(true);
         self.conversion_preset.set_all_enabled(true);
+        let gain_available = self.dsd_to_pcm_gain_available();
         self.dsd_pathway.set_all_enabled(false);
-        self.dsd_pathway
-            .set_enabled(&DsdSourcePathway::Reference, self.dsd_reference_controls_available());
+        self.dsd_pathway.set_enabled(&DsdSourcePathway::General, gain_available);
+        self.dsd_pathway.set_enabled(&DsdSourcePathway::Reference, gain_available);
+
+        let reference_selected = gain_available
+            && *self.dsd_pathway.selected_value() == DsdSourcePathway::Reference;
         self.dsd_profile.set_all_enabled(false);
         self.dsd_profile.set_enabled(
             &DsdReconstructionSelection::Reference,
-            self.dsd_reference_controls_available(),
+            reference_selected,
         );
-        // Pre-promotion exposes the exact legacy Disabled/Auto/Manual family.
-        // Promotion switches this same row to the native Reference family; the
-        // two settings origins are never mixed.
-        let gain_available = self.dsd_to_pcm_gain_available();
-        let reference_available = self.dsd_reference_controls_available();
+
         self.dsd_gain_mode.set_all_enabled(false);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::Disabled, gain_available && !reference_available);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::Auto, gain_available && !reference_available);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::Reference, reference_available);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::NativeLevel, reference_available);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::Fixed, gain_available);
-        self.dsd_gain_mode
-            .set_enabled(&DsdGainMode::NormalizePeak, reference_available);
-        for option in &mut self.dsd_gain_mode.options {
-            option.label = match option.value {
-                DsdGainMode::Disabled => "disabled",
-                DsdGainMode::Auto => "auto",
-                DsdGainMode::Reference => "reference",
-                DsdGainMode::NativeLevel => "native",
-                DsdGainMode::Fixed if reference_available => "fixed",
-                DsdGainMode::Fixed => "manual",
-                DsdGainMode::NormalizePeak => "normalize",
-            }
-            .to_string();
+        for mode in [
+            DsdGainMode::Off,
+            DsdGainMode::TruePeakGuard,
+            DsdGainMode::TruePeakNormalize,
+            DsdGainMode::FixedGain,
+        ] {
+            self.dsd_gain_mode
+                .set_enabled(&mode, gain_available && !reference_selected);
+        }
+        for mode in [
+            DsdGainMode::Reference,
+            DsdGainMode::NativeLevel,
+            DsdGainMode::ReferenceFixed,
+            DsdGainMode::SamplePeakNormalize,
+        ] {
+            self.dsd_gain_mode
+                .set_enabled(&mode, reference_selected);
+        }
+        if gain_available && !self.dsd_gain_mode.options[self.dsd_gain_mode.selected].enabled {
+            let fallback = if reference_selected {
+                DsdGainMode::Reference
+            } else {
+                DsdGainMode::Off
+            };
+            self.dsd_gain_mode.select_value(&fallback);
         }
 
         // DSD rate threshold: rates at or above this are DSD, below are PCM.
@@ -5552,9 +5560,9 @@ impl FormatState {
             self.noise_shaper.set_all_enabled(false);
             self.modulator_order.set_all_enabled(false);
             self.conversion_preset.set_all_enabled(false);
-            if self.dsd_reference_controls_available() {
-                // Reference owns these effects. Preserve the generic selections
-                // but make them inactive so they cannot be mistaken for policy.
+            if self.dsd_reference_path_selected() {
+                // Qualified Reference owns these effects. Preserve generic
+                // selections but make them inactive while that pathway is selected.
                 self.resampler.set_all_enabled(false);
                 self.dither.set_all_enabled(false);
             }
@@ -5650,16 +5658,15 @@ impl FormatState {
             self.source_rate_identity != SourceRateIdentity::Known;
         clamp_sample_rate_pill(&mut self.sample_rate, retain_disabled_sentinel);
         let target_rate_hz = *self.sample_rate.selected_value();
-        let wideband_available = self.dsd_reference_controls_available()
+        let wideband_available = self.dsd_reference_path_selected()
             && self.source_dsd_rate_hz == Some(5_644_800)
             && target_rate_hz >= 176_400
             && target_rate_hz != SOURCE_SAMPLE_RATE_SENTINEL;
         self.dsd_profile
             .set_enabled(&DsdReconstructionSelection::Wideband, wideband_available);
 
-        // Native-v2 Reference owns resampling and dither, but the pre-promotion
-        // legacy DSD-to-PCM route still exposes the generic controls.  Do not
-        // disable them merely because the source is DSD.
+        // Qualified Reference owns its reconstruction. General DSD-to-PCM keeps
+        // the ordinary resampler/dither controls and is planned separately.
 
         self.clamp_disabled_selections();
         let quality_is_available = self
@@ -5700,7 +5707,6 @@ impl FormatState {
         clamp_pill(&mut self.replaygain);
         clamp_pill(&mut self.pcm_gain_mode);
         clamp_pill(&mut self.pcm_true_peak_scope);
-        clamp_pill(&mut self.pcm_true_peak_boost);
         clamp_pill(&mut self.pcm_true_peak_scan_mode);
         self.pcm_true_peak_target_dbtp = clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
         self.pcm_fixed_gain_db = clamp_dsd_to_pcm_gain_db(self.pcm_fixed_gain_db);
@@ -5709,23 +5715,21 @@ impl FormatState {
         clamp_pill(&mut self.conversion_preset);
         clamp_pill(&mut self.dsd_pathway);
         clamp_pill(&mut self.dsd_profile);
-        clamp_pill(&mut self.dsd_auto_gain_scope);
+        clamp_pill(&mut self.dsd_true_peak_scope);
         clamp_pill(&mut self.dsd_true_peak_scan_mode);
-        // Manual gain is an explicit output-policy override. Keep it selected
-        // while source identity is temporarily unavailable; the disabled option
-        // communicates that it cannot currently be applied without erasing it.
+        // Fixed gain is explicit policy; retain it across temporary source-fact
+        // loss rather than silently replacing it with another gain policy.
         clamp_pill_excluding(&mut self.dsd_gain_mode, |option| {
-            option.value == DsdGainMode::Fixed
+            matches!(option.value, DsdGainMode::FixedGain | DsdGainMode::ReferenceFixed)
         });
         self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
-        self.dsd_normalize_target_dbfs =
-            clamp_dsd_normalize_target_dbfs(self.dsd_normalize_target_dbfs);
-        self.dsd_auto_gain_margin_db =
-            clamp_dsd_auto_gain_margin_db(self.dsd_auto_gain_margin_db);
+        self.dsd_true_peak_target_dbtp =
+            clamp_pcm_true_peak_target(self.dsd_true_peak_target_dbtp);
+        self.dsd_sample_peak_target_dbfs =
+            clamp_dsd_sample_peak_target_dbfs(self.dsd_sample_peak_target_dbfs);
     }
 
     pub fn focused_pill_mut(&mut self) -> FocusedPill<'_> {
-        let reference_available = self.dsd_reference_controls_available();
         match self.field_focus {
             FormatField::Format => FocusedPill::Format(&mut self.format),
             FormatField::SampleRate | FormatField::DsdRate => FocusedPill::SampleRate(&mut self.sample_rate),
@@ -5738,15 +5742,8 @@ impl FormatState {
                 gain_db: &mut self.pcm_fixed_gain_db,
                 gain_mode: &mut self.pcm_gain_mode,
             },
-            FormatField::PcmTruePeakScope => {
-                FocusedPill::PcmTruePeakScope(&mut self.pcm_true_peak_scope)
-            }
-            FormatField::PcmTruePeakBoost => {
-                FocusedPill::PcmTruePeakBoost(&mut self.pcm_true_peak_boost)
-            }
-            FormatField::PcmTruePeakScan => {
-                FocusedPill::PcmTruePeakScan(&mut self.pcm_true_peak_scan_mode)
-            }
+            FormatField::TruePeakScope => FocusedPill::TruePeakScope(&mut self.pcm_true_peak_scope),
+            FormatField::PcmTruePeakScan => FocusedPill::PcmTruePeakScan(&mut self.pcm_true_peak_scan_mode),
             FormatField::PcmTruePeakTarget => FocusedPill::PcmTruePeakTarget {
                 target_dbtp: &mut self.pcm_true_peak_target_dbtp,
                 gain_mode: &mut self.pcm_gain_mode,
@@ -5757,24 +5754,17 @@ impl FormatState {
             FormatField::DsdPath => FocusedPill::DsdPath(&mut self.dsd_pathway),
             FormatField::DsdProfile => FocusedPill::DsdProfile(&mut self.dsd_profile),
             FormatField::DsdGain => FocusedPill::DsdGain(&mut self.dsd_gain_mode),
-            FormatField::DsdGainScope => {
-                FocusedPill::DsdGainScope(&mut self.dsd_auto_gain_scope)
-            }
-            FormatField::DsdTruePeakScan => {
-                FocusedPill::DsdTruePeakScan(&mut self.dsd_true_peak_scan_mode)
-            }
-            FormatField::DsdGainDb => FocusedPill::DsdGainDb {
-                gain_db: &mut self.dsd_gain_db,
+            FormatField::DsdTruePeakScope => FocusedPill::DsdTruePeakScope(&mut self.dsd_true_peak_scope),
+            FormatField::DsdTruePeakScan => FocusedPill::DsdTruePeakScan(&mut self.dsd_true_peak_scan_mode),
+            FormatField::DsdTruePeakTarget => FocusedPill::DsdTruePeakTarget {
+                target_dbtp: &mut self.dsd_true_peak_target_dbtp,
                 gain_mode: &mut self.dsd_gain_mode,
             },
-            FormatField::DsdNormalizeTarget if reference_available => {
-                FocusedPill::DsdNormalizeTarget {
-                    target_dbfs: &mut self.dsd_normalize_target_dbfs,
-                    gain_mode: &mut self.dsd_gain_mode,
-                }
-            }
-            FormatField::DsdNormalizeTarget => FocusedPill::DsdAutoGainMargin {
-                margin_db: &mut self.dsd_auto_gain_margin_db,
+            FormatField::DsdGainDb => FocusedPill::DsdGainDb {
+                gain_db: &mut self.dsd_gain_db,
+            },
+            FormatField::DsdSamplePeakTarget => FocusedPill::DsdSamplePeakTarget {
+                target_dbfs: &mut self.dsd_sample_peak_target_dbfs,
                 gain_mode: &mut self.dsd_gain_mode,
             },
             FormatField::Container | FormatField::ResampleQuality => {
@@ -5806,19 +5796,13 @@ fn step_dsd_to_pcm_gain_db(value: &mut DbNano, delta_nano: i64) {
     *value = clamp_dsd_to_pcm_gain_db(DbNano(value.0.saturating_add(delta_nano)));
 }
 
-fn clamp_dsd_normalize_target_dbfs(value: DbNano) -> DbNano {
+fn clamp_dsd_sample_peak_target_dbfs(value: DbNano) -> DbNano {
     DbNano(value.0.clamp(
         DbNano::MIN_NORMALIZE_TARGET.0,
         DbNano::MAX_NORMALIZE_TARGET.0,
     ))
 }
 
-fn clamp_dsd_auto_gain_margin_db(value: DbNano) -> DbNano {
-    DbNano(value.0.clamp(
-        DSD_AUTO_GAIN_MARGIN_DB_MIN_NANO,
-        DSD_AUTO_GAIN_MARGIN_DB_MAX_NANO,
-    ))
-}
 
 fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
     clamp_pill_excluding(pill, |_| false);
@@ -5944,9 +5928,8 @@ pub enum FocusedPill<'a> {
         gain_db: &'a mut DbNano,
         gain_mode: &'a mut PillState<PcmGainMode>,
     },
-    PcmTruePeakScope(&'a mut PillState<PcmTruePeakScope>),
-    PcmTruePeakBoost(&'a mut PillState<bool>),
-    PcmTruePeakScan(&'a mut PillState<PcmTruePeakScanMode>),
+    TruePeakScope(&'a mut PillState<TruePeakScope>),
+    PcmTruePeakScan(&'a mut PillState<TruePeakScanTier>),
     PcmTruePeakTarget {
         target_dbtp: &'a mut DbNano,
         gain_mode: &'a mut PillState<PcmGainMode>,
@@ -5957,20 +5940,37 @@ pub enum FocusedPill<'a> {
     DsdPath(&'a mut PillState<DsdSourcePathway>),
     DsdProfile(&'a mut PillState<DsdReconstructionSelection>),
     DsdGain(&'a mut PillState<DsdGainMode>),
-    DsdGainScope(&'a mut PillState<DsdAutoGainScope>),
-    DsdTruePeakScan(&'a mut PillState<DsdTruePeakScanMode>),
-    DsdGainDb {
-        gain_db: &'a mut DbNano,
+    DsdTruePeakScope(&'a mut PillState<TruePeakScope>),
+    DsdTruePeakScan(&'a mut PillState<TruePeakScanTier>),
+    DsdTruePeakTarget {
+        target_dbtp: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
     },
-    DsdNormalizeTarget {
+    DsdGainDb {
+        gain_db: &'a mut DbNano,
+    },
+    DsdSamplePeakTarget {
         target_dbfs: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
     },
-    DsdAutoGainMargin {
-        margin_db: &'a mut DbNano,
-        gain_mode: &'a mut PillState<DsdGainMode>,
-    },
+}
+
+fn preserve_pcm_true_peak_mode(mode: &mut PillState<PcmGainMode>) {
+    if !matches!(
+        *mode.selected_value(),
+        PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize
+    ) {
+        mode.select_value(&PcmGainMode::TruePeakGuard);
+    }
+}
+
+fn preserve_dsd_true_peak_mode(mode: &mut PillState<DsdGainMode>) {
+    if !matches!(
+        *mode.selected_value(),
+        DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize
+    ) {
+        mode.select_value(&DsdGainMode::TruePeakGuard);
+    }
 }
 
 impl FocusedPill<'_> {
@@ -5984,14 +5984,13 @@ impl FocusedPill<'_> {
             Self::ReplayGain(p) => p.select_next(),
             Self::PcmTruePeak(p) => p.select_next(),
             Self::PcmGainDb { gain_db, gain_mode } => {
-                (*gain_mode).select_value(&PcmGainMode::Fixed);
+                (*gain_mode).select_value(&PcmGainMode::FixedGain);
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::PcmTruePeakScope(p) => p.select_next(),
-            Self::PcmTruePeakBoost(p) => p.select_next(),
+            Self::TruePeakScope(p) => p.select_next(),
             Self::PcmTruePeakScan(p) => p.select_next(),
             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
-                (*gain_mode).select_value(&PcmGainMode::Auto);
+                preserve_pcm_true_peak_mode(gain_mode);
                 step_pcm_true_peak_target(*target_dbtp, 50_000_000);
             }
             Self::NoiseShaper(p) => p.select_next(),
@@ -6000,19 +5999,18 @@ impl FocusedPill<'_> {
             Self::DsdPath(p) => p.select_next(),
             Self::DsdProfile(p) => p.select_next(),
             Self::DsdGain(p) => p.select_next(),
-            Self::DsdGainScope(p) => p.select_next(),
+            Self::DsdTruePeakScope(p) => p.select_next(),
             Self::DsdTruePeakScan(p) => p.select_next(),
-            Self::DsdGainDb { gain_db, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::Fixed);
+            Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
+                preserve_dsd_true_peak_mode(gain_mode);
+                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
+            }
+            Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::DsdNormalizeTarget { target_dbfs, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::NormalizePeak);
-                step_dsd_normalize_target_dbfs(*target_dbfs, DSD_TO_PCM_GAIN_DB_STEP_NANO);
-            }
-            Self::DsdAutoGainMargin { margin_db, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::Auto);
-                step_dsd_auto_gain_margin_db(*margin_db, DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO);
+            Self::DsdSamplePeakTarget { target_dbfs, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::SamplePeakNormalize);
+                step_dsd_sample_peak_target_dbfs(*target_dbfs, DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
         }
     }
@@ -6027,14 +6025,13 @@ impl FocusedPill<'_> {
             Self::ReplayGain(p) => p.select_prev(),
             Self::PcmTruePeak(p) => p.select_prev(),
             Self::PcmGainDb { gain_db, gain_mode } => {
-                (*gain_mode).select_value(&PcmGainMode::Fixed);
+                (*gain_mode).select_value(&PcmGainMode::FixedGain);
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::PcmTruePeakScope(p) => p.select_prev(),
-            Self::PcmTruePeakBoost(p) => p.select_prev(),
+            Self::TruePeakScope(p) => p.select_prev(),
             Self::PcmTruePeakScan(p) => p.select_prev(),
             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
-                (*gain_mode).select_value(&PcmGainMode::Auto);
+                preserve_pcm_true_peak_mode(gain_mode);
                 step_pcm_true_peak_target(*target_dbtp, -50_000_000);
             }
             Self::NoiseShaper(p) => p.select_prev(),
@@ -6043,30 +6040,25 @@ impl FocusedPill<'_> {
             Self::DsdPath(p) => p.select_prev(),
             Self::DsdProfile(p) => p.select_prev(),
             Self::DsdGain(p) => p.select_prev(),
-            Self::DsdGainScope(p) => p.select_prev(),
+            Self::DsdTruePeakScope(p) => p.select_prev(),
             Self::DsdTruePeakScan(p) => p.select_prev(),
-            Self::DsdGainDb { gain_db, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::Fixed);
+            Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
+                preserve_dsd_true_peak_mode(gain_mode);
+                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
+            }
+            Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::DsdNormalizeTarget { target_dbfs, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::NormalizePeak);
-                step_dsd_normalize_target_dbfs(*target_dbfs, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
-            }
-            Self::DsdAutoGainMargin { margin_db, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::Auto);
-                step_dsd_auto_gain_margin_db(*margin_db, -DSD_AUTO_GAIN_MARGIN_DB_STEP_NANO);
+            Self::DsdSamplePeakTarget { target_dbfs, gain_mode } => {
+                (*gain_mode).select_value(&DsdGainMode::SamplePeakNormalize);
+                step_dsd_sample_peak_target_dbfs(*target_dbfs, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
         }
     }
 }
 
-fn step_dsd_normalize_target_dbfs(value: &mut DbNano, delta_nano: i64) {
-    *value = clamp_dsd_normalize_target_dbfs(DbNano(value.0.saturating_add(delta_nano)));
-}
-
-fn step_dsd_auto_gain_margin_db(value: &mut DbNano, delta_nano: i64) {
-    *value = clamp_dsd_auto_gain_margin_db(DbNano(value.0.saturating_add(delta_nano)));
+fn step_dsd_sample_peak_target_dbfs(value: &mut DbNano, delta_nano: i64) {
+    *value = clamp_dsd_sample_peak_target_dbfs(DbNano(value.0.saturating_add(delta_nano)));
 }
 
 /// Which single-file metadata field in the Convert metadata pane is focused
@@ -16945,7 +16937,18 @@ pub fn apply_format_settings_kind(
             let dither_id = parse_optional_u8("SSRC dither id", &dither_id_input.text, 0, 99)?;
             let pdf_type = parse_optional_ssrc_pdf(&pdf_type_input.text)?;
             if let Some(dither_id) = dither_id {
-                validate_ssrc_dither_id_for_target_rate(dither_id, *format.sample_rate.selected_value())?;
+                // Native SSRC dither is inactive on floating output (and on a
+                // source-coupled depth whose effective terminal width is not
+                // yet known), so only validate destination-rate applicability
+                // when this overlay is committing an explicit integer terminal.
+                if !format.bit_depth.selected_value().is_source()
+                    && !format.bit_depth.selected_value().is_float()
+                {
+                    validate_ssrc_dither_id_for_target_rate(
+                        dither_id,
+                        *format.sample_rate.selected_value(),
+                    )?;
+                }
             }
 
             format.ssrc_attenuation_db = attenuation_db;
@@ -17512,12 +17515,12 @@ mod pcm_gain_auto_default_tests {
             lossless.apply_auto_gain_defaults();
             assert_eq!(
                 lossless.pcm_gain_mode.selected_value(),
-                &PcmGainMode::Auto,
-                "lossless WavPack -> {target:?} must default to auto gain",
+                &PcmGainMode::TruePeakGuard,
+                "lossless WavPack -> {target:?} must default to true-peak guard",
             );
             assert_eq!(
                 lossless.pcm_true_peak_scan_mode.selected_value(),
-                &PcmTruePeakScanMode::Fast,
+                &TruePeakScanTier::Fast,
             );
 
             let mut hybrid = pcm_state(target.clone(), BitDepthChoice::Source);
@@ -17546,10 +17549,10 @@ mod pcm_gain_auto_default_tests {
         state.source_pcm_float_bits = Some(64);
         state.source_is_lossless = Some(true);
         state.apply_auto_gain_defaults();
-        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::TruePeakGuard);
         assert_eq!(
             state.pcm_true_peak_scan_mode.selected_value(),
-            &PcmTruePeakScanMode::Fast,
+            &TruePeakScanTier::Fast,
         );
         assert_eq!(
             state.pcm_true_peak_target_dbtp,
@@ -17562,7 +17565,7 @@ mod pcm_gain_auto_default_tests {
         let mut state = pcm_state(AudioFormat::Aac, BitDepthChoice::Source);
         state.source_is_lossless = Some(true);
         state.apply_auto_gain_defaults();
-        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::TruePeakGuard);
 
         state.source_is_lossless = Some(false);
         state.apply_auto_gain_defaults();
@@ -17590,10 +17593,10 @@ mod pcm_gain_auto_default_tests {
         state.apply_auto_gain_defaults();
 
         assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
-        assert_eq!(state.dsd_gain_mode.selected_value(), &DsdGainMode::Auto);
+        assert_eq!(state.dsd_gain_mode.selected_value(), &DsdGainMode::TruePeakGuard);
         assert_eq!(
             state.dsd_true_peak_scan_mode.selected_value(),
-            &DsdTruePeakScanMode::Fast,
+            &TruePeakScanTier::Fast,
         );
     }
 
@@ -17602,7 +17605,7 @@ mod pcm_gain_auto_default_tests {
         let mut state = pcm_state(AudioFormat::Aac, BitDepthChoice::Source);
         state.source_is_lossless = Some(true);
         state.apply_auto_gain_defaults();
-        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::TruePeakGuard);
 
         state.pcm_gain_mode.select_value(&PcmGainMode::Off);
         state.pcm_gain_overridden = true;
@@ -17619,10 +17622,10 @@ mod pcm_gain_auto_default_tests {
 
         state.wavpack_hybrid = true;
         state.apply_auto_gain_defaults();
-        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Auto);
+        assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::TruePeakGuard);
         assert_eq!(
             state.pcm_true_peak_scan_mode.selected_value(),
-            &PcmTruePeakScanMode::Fast,
+            &TruePeakScanTier::Fast,
         );
     }
 }
@@ -17943,7 +17946,7 @@ mod ssrc_format_settings_handler_tests {
         format.dither.select_value(&DitherType::HighShibata);
 
         assert!(format.ssrc_dither_invalid_for_selected_rate());
-        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc invalid"));
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc split"));
 
         format.dither.select_value(&DitherType::TPDF);
         assert!(!format.ssrc_dither_invalid_for_selected_rate());
@@ -18160,43 +18163,48 @@ mod dsd_gain_format_state_tests {
     use super::*;
 
     #[test]
-    fn dsd_gain_rows_are_dynamic_for_the_selected_mode() {
+    fn dsd_gain_rows_are_dynamic_for_the_selected_policy_and_scope() {
         let mut state = FormatState::new();
         assert!(!state.visible_fields(false).contains(&FormatField::DsdGain));
 
         state.set_source_is_dsd(true);
         let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdPath));
         assert!(rows.contains(&FormatField::DsdGain));
-        assert!(!rows.contains(&FormatField::DsdGainScope));
-        assert!(!rows.contains(&FormatField::DsdGainDb));
-        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
-
-        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Auto));
-        let rows = state.visible_fields(false);
-        assert!(rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScope));
         assert!(!rows.contains(&FormatField::DsdTruePeakScan));
-        assert!(rows.contains(&FormatField::DsdNormalizeTarget));
-        assert!(!rows.contains(&FormatField::DsdGainDb));
 
-        assert!(state
-            .dsd_auto_gain_scope
-            .select_value(&DsdAutoGainScope::Album));
+        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
         let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(rows.contains(&FormatField::DsdTruePeakScope));
         assert!(rows.contains(&FormatField::DsdTruePeakScan));
-        assert!(state
-            .dsd_true_peak_scan_mode
-            .select_value(&DsdTruePeakScanMode::Fast));
-        assert_eq!(
-            state.dsd_true_peak_scan_mode.selected_label(),
-            "fast"
-        );
+        assert!(!rows.contains(&FormatField::DsdGainDb));
+        assert_eq!(*state.dsd_true_peak_scope.selected_value(), TruePeakScope::Track);
 
-        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        assert!(state
+            .dsd_true_peak_scope
+            .select_value(&TruePeakScope::Album));
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(rows.contains(&FormatField::DsdTruePeakScope));
+        assert!(rows.contains(&FormatField::DsdTruePeakScan));
+
+        assert!(state
+            .dsd_gain_mode
+            .select_value(&DsdGainMode::TruePeakNormalize));
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(rows.contains(&FormatField::DsdTruePeakScope));
+        assert!(rows.contains(&FormatField::DsdTruePeakScan));
+
+        assert!(state.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
         let rows = state.visible_fields(false);
         assert!(rows.contains(&FormatField::DsdGainDb));
-        assert!(!rows.contains(&FormatField::DsdGainScope));
+        assert!(!rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScope));
         assert!(!rows.contains(&FormatField::DsdTruePeakScan));
-        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
 
         state.format.select_value(&AudioFormat::Dsf);
         state.apply_format_constraints();
@@ -18204,162 +18212,167 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn pre_promotion_reference_controls_remain_hidden_for_dsd_to_pcm() {
-        let mut s = FormatState::new();
-        assert!(!s.dsd_to_pcm_gain_available());
-        assert!(!s.dsd_reference_controls_available());
+    fn reference_controls_are_visible_for_dsd_to_pcm_without_claiming_admission() {
+        let mut state = FormatState::new();
+        assert!(!state.dsd_reference_controls_available());
 
-        s.set_source_is_dsd(true);
-        assert!(s.dsd_to_pcm_gain_available());
-        assert!(!s.dsd_reference_controls_available());
-        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Disabled && option.enabled));
-        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Auto && option.enabled));
-        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Fixed && option.enabled));
-        assert!(s.dsd_gain_mode.options.iter().any(|option| option.value == DsdGainMode::Reference && !option.enabled));
-        let rows = s.visible_fields(false);
+        state.set_source_is_dsd(true);
+        assert!(state.dsd_reference_controls_available());
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdPath));
+        assert!(state
+            .dsd_pathway
+            .options
+            .iter()
+            .any(|option| option.value == DsdSourcePathway::Reference && option.enabled));
+
+        assert!(state.dsd_pathway.select_value(&DsdSourcePathway::Reference));
+        state.apply_format_constraints();
+        let rows = state.visible_fields(false);
+        assert!(rows.contains(&FormatField::DsdProfile));
         assert!(rows.contains(&FormatField::DsdGain));
-        assert!(!rows.contains(&FormatField::DsdGainDb));
-        assert!(!rows.contains(&FormatField::DsdNormalizeTarget));
-        assert!(!rows.contains(&FormatField::DsdPath));
-        assert!(!rows.contains(&FormatField::DsdProfile));
-        assert!(s.resampler.options.iter().any(|option| option.enabled));
-        assert!(s.dither.options.iter().any(|option| option.enabled));
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::Reference);
+        assert!(!rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScope));
+        assert!(!rows.contains(&FormatField::DsdTruePeakScan));
+        assert!(state
+            .dsd_gain_mode
+            .select_value(&DsdGainMode::SamplePeakNormalize));
+        assert!(state
+            .visible_fields(false)
+            .contains(&FormatField::DsdSamplePeakTarget));
     }
 
     #[test]
-    fn dsd_target_hides_reference_controls_even_for_dsd_source() {
-        let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
-        assert!(s.resampler.select_value(&ResamplerChoice::Sox));
-        s.format.select_value(&AudioFormat::Dsf);
-        s.apply_format_constraints();
+    fn dsd_target_hides_dsd_source_to_pcm_controls_even_for_dsd_source() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        assert!(state.resampler.select_value(&ResamplerChoice::Sox));
+        state.format.select_value(&AudioFormat::Dsf);
+        state.apply_format_constraints();
 
-        assert!(!s.dsd_to_pcm_gain_available());
-        assert!(!s.dsd_reference_controls_available());
-        let rows = s.visible_fields(true);
+        assert!(!state.dsd_to_pcm_gain_available());
+        assert!(!state.dsd_reference_controls_available());
+        let rows = state.visible_fields(true);
         assert!(!rows.contains(&FormatField::BitDepth));
+        assert!(!rows.contains(&FormatField::DsdPath));
         assert!(!rows.contains(&FormatField::DsdGain));
         assert!(!rows.contains(&FormatField::ResampleQuality));
     }
 
     #[test]
-    fn resample_quality_is_clamped_when_the_new_resampler_does_not_offer_it() {
-        let mut s = FormatState::new();
-        assert!(s.resampler.select_value(&ResamplerChoice::Sox));
-        s.resample_quality = tonepoet_pipeline::enums::ResampleQuality::Insane;
-        assert!(s.resampler.select_value(&ResamplerChoice::Soxr));
-        s.apply_format_constraints();
+    fn raw_dsd_gain_defaults_are_off_track_reference_tier_with_minus_point_1_targets() {
+        let state = FormatState::new();
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::Off);
+        assert_eq!(
+            state.dsd_true_peak_target_dbtp,
+            tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP
+        );
+        assert_eq!(*state.dsd_true_peak_scope.selected_value(), TruePeakScope::Track);
+        assert_eq!(
+            *state.dsd_true_peak_scan_mode.selected_value(),
+            TruePeakScanTier::Reference
+        );
+        assert_eq!(state.dsd_sample_peak_target_dbfs, "-0.100000000".parse().unwrap());
+        assert_eq!(state.dsd_gain_db, DbNano::ZERO);
+    }
+
+    #[test]
+    fn contextual_dsd_safety_default_selects_guard_and_fast_without_changing_scope() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        state.bit_depth.select_value(&BitDepthChoice::Int24);
+        state.apply_auto_gain_defaults();
+
+        assert_eq!(*state.dsd_pathway.selected_value(), DsdSourcePathway::General);
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::TruePeakGuard);
+        assert_eq!(*state.dsd_true_peak_scope.selected_value(), TruePeakScope::Track);
+        assert_eq!(*state.dsd_true_peak_scan_mode.selected_value(), TruePeakScanTier::Fast);
+    }
+
+    #[test]
+    fn focus_navigation_includes_dsd_path_before_dsd_gain() {
+        let mut state = FormatState::new();
+        state.field_focus = FormatField::ReplayGain;
+        state.focus_next(false);
+        assert_eq!(state.field_focus, FormatField::Format);
+
+        state.set_source_is_dsd(true);
+        state.field_focus = FormatField::ReplayGain;
+        state.focus_next(false);
+        assert_eq!(state.field_focus, FormatField::DsdPath);
+        state.focus_next(false);
+        assert_eq!(state.field_focus, FormatField::DsdGain);
+    }
+
+    #[test]
+    fn fixed_dsd_gain_row_adjusts_value_without_changing_policy() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        state.dsd_gain_mode.select_value(&DsdGainMode::FixedGain);
+        state.field_focus = FormatField::DsdGainDb;
+
+        state.select_focused_next(None, None);
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::FixedGain);
+        assert_eq!(state.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_STEP_NANO));
+
+        state.select_focused_prev(None, None);
+        assert_eq!(state.dsd_gain_db, DbNano::ZERO);
+    }
+
+    #[test]
+    fn fixed_dsd_gain_row_clamps_to_valid_settings_range() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        state.field_focus = FormatField::DsdGainDb;
+        state.dsd_gain_db = DbNano(DSD_TO_PCM_GAIN_DB_MAX_NANO);
+        state.select_focused_next(None, None);
+        assert_eq!(state.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_MAX_NANO));
+
+        state.dsd_gain_db = DbNano(DSD_TO_PCM_GAIN_DB_MIN_NANO);
+        state.select_focused_prev(None, None);
+        assert_eq!(state.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_MIN_NANO));
+    }
+
+    #[test]
+    fn dsd_true_peak_target_steps_in_dbtp_and_selects_guard_when_off() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        state.field_focus = FormatField::DsdTruePeakTarget;
+        state.select_focused_next(None, None);
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::TruePeakGuard);
+        assert_eq!(state.dsd_true_peak_target_dbtp, "-0.050000000".parse().unwrap());
+    }
+
+    #[test]
+    fn reference_sample_peak_target_is_separate_from_ordinary_true_peak_target() {
+        let mut state = FormatState::new();
+        state.set_source_is_dsd(true);
+        state.dsd_pathway.select_value(&DsdSourcePathway::Reference);
+        state.apply_format_constraints();
+        state.field_focus = FormatField::DsdSamplePeakTarget;
+        state.select_focused_prev(None, None);
+
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::SamplePeakNormalize);
+        assert_eq!(state.dsd_sample_peak_target_dbfs, "-0.350000000".parse().unwrap());
+        assert_eq!(
+            state.dsd_true_peak_target_dbtp,
+            tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP
+        );
+    }
+
+    #[test]
+    fn resample_quality_is_clamped_when_new_resampler_does_not_offer_it() {
+        let mut state = FormatState::new();
+        assert!(state.resampler.select_value(&ResamplerChoice::Sox));
+        state.resample_quality = tonepoet_pipeline::enums::ResampleQuality::Insane;
+        assert!(state.resampler.select_value(&ResamplerChoice::Soxr));
+        state.apply_format_constraints();
 
         assert_eq!(
-            s.resample_quality,
+            state.resample_quality,
             tonepoet_pipeline::enums::ResampleQuality::Ultra
         );
-    }
-
-
-    #[test]
-    fn focus_navigation_skips_reference_rows_before_promotion() {
-        let mut s = FormatState::new();
-        s.field_focus = FormatField::ReplayGain;
-        s.focus_next(false);
-        assert_eq!(s.field_focus, FormatField::Format);
-
-        s.set_source_is_dsd(true);
-        s.field_focus = FormatField::ReplayGain;
-        s.focus_next(false);
-        assert_eq!(s.field_focus, FormatField::DsdGain);
-    }
-
-    #[test]
-    fn convert_dsd_gain_defaults_are_disabled_with_point_1_auto_headroom() {
-        let s = FormatState::new();
-        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Disabled);
-        assert_eq!(
-            s.dsd_normalize_target_dbfs,
-            "-0.100000000".parse().unwrap()
-        );
-        assert_eq!(s.dsd_auto_gain_margin_db, "0.100000000".parse().unwrap());
-        assert_eq!(s.dsd_gain_db, DbNano::ZERO);
-        assert!(!s.source_is_dsd);
-    }
-
-    fn enable_native_reference_controls_for_unit_test(s: &mut FormatState) {
-        s.set_source_is_dsd(true);
-        s.dsd_pathway.set_all_enabled(true);
-        s.dsd_profile.set_all_enabled(true);
-        s.dsd_gain_mode.set_all_enabled(true);
-    }
-
-    #[test]
-    fn manual_dsd_gain_row_adjusts_value_and_selects_manual_mode() {
-        let mut s = FormatState::new();
-        enable_native_reference_controls_for_unit_test(&mut s);
-        s.field_focus = FormatField::DsdGainDb;
-
-        s.select_focused_next(None, None);
-        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Fixed);
-        assert_eq!(s.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_STEP_NANO));
-
-        s.select_focused_prev(None, None);
-        assert_eq!(s.dsd_gain_db, DbNano::ZERO);
-    }
-
-    #[test]
-    fn manual_dsd_gain_row_clamps_to_valid_settings_range() {
-        let mut s = FormatState::new();
-        enable_native_reference_controls_for_unit_test(&mut s);
-        s.field_focus = FormatField::DsdGainDb;
-        s.dsd_gain_db = DbNano(DSD_TO_PCM_GAIN_DB_MAX_NANO);
-        s.select_focused_next(None, None);
-        assert_eq!(s.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_MAX_NANO));
-
-        s.dsd_gain_db = DbNano(DSD_TO_PCM_GAIN_DB_MIN_NANO);
-        s.select_focused_prev(None, None);
-        assert_eq!(s.dsd_gain_db, DbNano(DSD_TO_PCM_GAIN_DB_MIN_NANO));
-    }
-
-    #[test]
-    fn native_normalize_target_value_preserves_fixed_point() {
-        let mut mode = PillState::new(vec![
-            (DsdGainMode::NormalizePeak, "normalize"),
-            (DsdGainMode::Fixed, "fixed"),
-        ]);
-        let mut target = DbNano::DEFAULT_NORMALIZE_TARGET;
-        let mut focused = FocusedPill::DsdNormalizeTarget {
-            target_dbfs: &mut target,
-            gain_mode: &mut mode,
-        };
-        focused.select_prev();
-        assert_eq!(*mode.selected_value(), DsdGainMode::NormalizePeak);
-        assert_eq!(target, "-0.400000000".parse().unwrap());
-    }
-
-    #[test]
-    fn pre_promotion_auto_margin_row_selects_auto_and_steps_exact_margin() {
-        let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
-        s.field_focus = FormatField::DsdNormalizeTarget;
-        s.select_focused_next(None, None);
-        assert_eq!(*s.dsd_gain_mode.selected_value(), DsdGainMode::Auto);
-        assert_eq!(s.dsd_auto_gain_margin_db, "0.150000000".parse().unwrap());
-    }
-
-    #[test]
-    fn pre_promotion_wideband_profile_remains_disabled() {
-        let mut s = FormatState::new();
-        s.set_source_is_dsd(true);
-        s.cascade_dsd_source_to_pcm_defaults(5_644_800);
-        s.sample_rate.select_value(&176_400);
-        s.apply_format_constraints();
-
-        assert!(!s.dsd_reference_controls_available());
-        assert!(!s
-            .dsd_profile
-            .options
-            .iter()
-            .find(|option| option.value == DsdReconstructionSelection::Wideband)
-            .unwrap()
-            .enabled);
     }
 }
 
@@ -19212,7 +19225,7 @@ mod source_default_reset_tests {
         assert!(convert
             .format
             .dsd_gain_mode
-            .select_value(&DsdGainMode::Fixed));
+            .select_value(&DsdGainMode::FixedGain));
         convert.format.dsd_gain_db = "4.500000000".parse().unwrap();
         convert.set_source_mode(SourceMode::MultiTrack {
             path: PathBuf::from("/tmp/pending.cue"),
@@ -19255,7 +19268,7 @@ mod source_default_reset_tests {
         assert!(convert.format.resampler_overridden);
         assert_eq!(
             *convert.format.dsd_gain_mode.selected_value(),
-            DsdGainMode::Fixed
+            DsdGainMode::FixedGain
         );
         assert_eq!(
             convert.format.dsd_gain_db,

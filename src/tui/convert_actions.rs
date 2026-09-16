@@ -389,21 +389,25 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     };
 
     let mut pcm_true_peak = tonepoet_pipeline::PcmTruePeakGainSettings::default();
-    pcm_true_peak.enabled = !is_dsd
-        && !format.source_is_dsd
-        && *format.pcm_gain_mode.selected_value() == PcmGainMode::Auto;
-    pcm_true_peak.target_dbtp = format.pcm_true_peak_target_dbtp;
-    pcm_true_peak.allow_boost = *format.pcm_true_peak_boost.selected_value();
-    pcm_true_peak.scope = *format.pcm_true_peak_scope.selected_value();
-    pcm_true_peak.scan_mode = *format.pcm_true_peak_scan_mode.selected_value();
-    pcm_true_peak.fixed_gain_db = if !is_dsd
-        && !format.source_is_dsd
-        && *format.pcm_gain_mode.selected_value() == PcmGainMode::Fixed
-    {
-        Some(format.pcm_fixed_gain_db)
-    } else {
-        None
-    };
+    if !is_dsd && !format.source_is_dsd {
+        let policy = match *format.pcm_gain_mode.selected_value() {
+            PcmGainMode::Off => tonepoet_pipeline::SampleGainPolicy::Off,
+            PcmGainMode::TruePeakGuard => tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                target_dbtp: format.pcm_true_peak_target_dbtp,
+                scope: *format.pcm_true_peak_scope.selected_value(),
+                scan: *format.pcm_true_peak_scan_mode.selected_value(),
+            },
+            PcmGainMode::TruePeakNormalize => tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: format.pcm_true_peak_target_dbtp,
+                scope: *format.pcm_true_peak_scope.selected_value(),
+                scan: *format.pcm_true_peak_scan_mode.selected_value(),
+            },
+            PcmGainMode::FixedGain => tonepoet_pipeline::SampleGainPolicy::FixedGain {
+                gain_db: format.pcm_fixed_gain_db,
+            },
+        };
+        pcm_true_peak.set_policy(policy);
+    }
 
     // settings-sentinel-allow: sub-struct defaults are correct here — user-facing
     // settings (format, rate, depth, dither, resampler, RG) are set from pill state;
@@ -411,59 +415,65 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     // exposes those settings.
     let mut dsd: tonepoet_pipeline::DsdSettings = Default::default();
     if format.dsd_to_pcm_gain_available() {
-        if dsd.is_native_v2() && format.dsd_reference_controls_available() {
-            dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
-            dsd.from_dsd.profile = *format.dsd_profile.selected_value();
-            match *format.dsd_gain_mode.selected_value() {
-                DsdGainMode::Reference => {
-                    dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Reference;
-                    dsd.from_dsd.fixed_gain_db = None;
-                }
-                DsdGainMode::NativeLevel => {
-                    dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NativeLevel;
-                    dsd.from_dsd.fixed_gain_db = None;
-                }
-                DsdGainMode::NormalizePeak => {
-                    dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-                    dsd.from_dsd.fixed_gain_db = None;
-                    dsd.from_dsd.normalize_peak_target_dbfs = format.dsd_normalize_target_dbfs;
-                }
-                DsdGainMode::Fixed => {
-                    dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Fixed;
-                    dsd.from_dsd.fixed_gain_db = Some(format.dsd_gain_db);
-                }
-                DsdGainMode::Disabled | DsdGainMode::Auto => {
-                    return Err("legacy DSD gain mode is unavailable after Reference promotion".to_string());
+        dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
+        dsd.from_dsd.profile = *format.dsd_profile.selected_value();
+        match dsd.from_dsd.pathway {
+            tonepoet_pipeline::DsdSourcePathway::General => {
+                dsd.general_from_dsd.gain = match *format.dsd_gain_mode.selected_value() {
+                    DsdGainMode::Off => tonepoet_pipeline::SampleGainPolicy::Off,
+                    DsdGainMode::TruePeakGuard => tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                        target_dbtp: format.dsd_true_peak_target_dbtp,
+                        scope: *format.dsd_true_peak_scope.selected_value(),
+                        scan: *format.dsd_true_peak_scan_mode.selected_value(),
+                    },
+                    DsdGainMode::TruePeakNormalize => tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                        target_dbtp: format.dsd_true_peak_target_dbtp,
+                        scope: *format.dsd_true_peak_scope.selected_value(),
+                        scan: *format.dsd_true_peak_scan_mode.selected_value(),
+                    },
+                    DsdGainMode::FixedGain => tonepoet_pipeline::SampleGainPolicy::FixedGain {
+                        gain_db: format.dsd_gain_db,
+                    },
+                    DsdGainMode::Reference
+                    | DsdGainMode::NativeLevel
+                    | DsdGainMode::ReferenceFixed
+                    | DsdGainMode::SamplePeakNormalize => {
+                        return Err("Reference-only DSD gain policy selected for the general DSD pathway".to_string());
+                    }
+                };
+            }
+            tonepoet_pipeline::DsdSourcePathway::Reference => {
+                dsd.general_from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::Off;
+                match *format.dsd_gain_mode.selected_value() {
+                    DsdGainMode::Reference => {
+                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Reference;
+                        dsd.from_dsd.fixed_gain_db = None;
+                    }
+                    DsdGainMode::NativeLevel => {
+                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NativeLevel;
+                        dsd.from_dsd.fixed_gain_db = None;
+                    }
+                    DsdGainMode::ReferenceFixed => {
+                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Fixed;
+                        dsd.from_dsd.fixed_gain_db = Some(format.dsd_gain_db);
+                    }
+                    DsdGainMode::SamplePeakNormalize => {
+                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
+                        dsd.from_dsd.fixed_gain_db = None;
+                        dsd.from_dsd.normalize_peak_target_dbfs = format.dsd_sample_peak_target_dbfs;
+                    }
+                    DsdGainMode::Off
+                    | DsdGainMode::TruePeakGuard
+                    | DsdGainMode::TruePeakNormalize
+                    | DsdGainMode::FixedGain => {
+                        return Err("ordinary DSD gain policy selected for the qualified Reference pathway".to_string());
+                    }
                 }
             }
-        } else {
-            let (mode, margin, gain) = match *format.dsd_gain_mode.selected_value() {
-                DsdGainMode::Disabled => (
-                    tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-                    0.15,
-                    None,
-                ),
-                DsdGainMode::Auto => (
-                    tonepoet_pipeline::DsdToPcmGainMode::Auto,
-                    (format.dsd_auto_gain_margin_db.0 as f64 / 1_000_000_000.0) as f32,
-                    None,
-                ),
-                DsdGainMode::Fixed => (
-                    tonepoet_pipeline::DsdToPcmGainMode::Manual,
-                    0.15,
-                    Some((format.dsd_gain_db.0 as f64 / 1_000_000_000.0) as f32),
-                ),
-                DsdGainMode::Reference
-                | DsdGainMode::NativeLevel
-                | DsdGainMode::NormalizePeak => {
-                    return Err("native Reference DSD gain mode is unavailable before policy promotion".to_string());
-                }
-            };
-            dsd.set_legacy_dsd_to_pcm_gain(mode, margin, gain)
-                .map_err(|error| error.to_string())?;
+            tonepoet_pipeline::DsdSourcePathway::Manual => {
+                return Err("the reserved DSD Manual pathway is not executable".to_string());
+            }
         }
-        dsd.set_auto_gain_scope(*format.dsd_auto_gain_scope.selected_value());
-        dsd.set_true_peak_scan_mode(*format.dsd_true_peak_scan_mode.selected_value());
     }
     if is_dsd {
         dsd.pcm_to_dsd.noise_shaper = *format.noise_shaper.selected_value();
@@ -511,7 +521,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             // Reference canonicalizes non-hybrid WavPack to no correction
             // sidecar; an actually hybrid request remains visible to the
             // planner and is rejected fail-closed.
-            correction_file: if format.dsd_reference_controls_available()
+            correction_file: if format.dsd_reference_path_selected()
                 && target_format_is_wavpack
                 && !format.wavpack_hybrid
             {
@@ -521,7 +531,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
             },
         },
         ssrc: tonepoet_pipeline::SsrcSettings {
-            force: false,
+            force: !is_dsd && matches!(*format.resampler.selected_value(), ResamplerChoice::Ssrc),
             insane_mode: false,
             profile: None,
             attenuation_db: format.ssrc_attenuation_db,
@@ -567,14 +577,9 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
     };
 
-    if !format.dsd_reference_controls_available() {
-        settings
-            .validate()
-            .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
-    }
-    // Once a promotion release exposes native Reference controls, its unsupported
-    // cells remain planner-owned so they surface stable DSD-REF-P0 diagnostics.
-    // Pre-promotion legacy settings take the ordinary validation path above.
+    settings
+        .validate()
+        .map_err(|err| format!("invalid PipelineSettings from TUI state: {err}"))?;
     Ok(settings)
 }
 
@@ -923,60 +928,8 @@ mod lifecycle_forwarder_tests {
         }
     }
 
-    fn assert_legacy_gain(
-        settings: &PipelineSettings,
-        mode: tonepoet_pipeline::DsdToPcmGainMode,
-        margin: f32,
-        gain: Option<f32>,
-    ) {
-        assert!(!settings.dsd.is_native_v2());
-        let legacy = settings
-            .dsd
-            .legacy_behavior()
-            .expect("pre-promotion TUI settings retain legacy authority");
-        assert_eq!(legacy.lowpass, tonepoet_pipeline::DsdLowpassMethod::Auto);
-        assert_eq!(legacy.gain_mode, mode);
-        assert!((legacy.auto_gain_margin_db - margin).abs() < 1e-6);
-        assert_eq!(legacy.gain_db, gain);
-        let encoded = serde_json::to_value(settings).expect("serialize exact legacy TUI settings");
-        let dsd = encoded["dsd"].as_object().expect("legacy DSD object");
-        assert!(!dsd.contains_key("schema_version"));
-        assert!(!dsd.contains_key("from_dsd"));
-        assert_eq!(
-            dsd.get("dsd_to_pcm_gain_mode").and_then(serde_json::Value::as_str),
-            // The frozen legacy-v1 wire predates any rename_all attribute:
-            // variant names serialize capitalized, and byte compatibility
-            // with historical queue/settings files pins that spelling.
-            Some(match mode {
-                tonepoet_pipeline::DsdToPcmGainMode::Disabled => "Disabled",
-                tonepoet_pipeline::DsdToPcmGainMode::Auto => "Auto",
-                tonepoet_pipeline::DsdToPcmGainMode::Manual => "Manual",
-            })
-        );
-        let encoded_margin = dsd
-            .get("dsd_to_pcm_auto_gain_margin_db")
-            .and_then(serde_json::Value::as_f64)
-            .expect("legacy auto-gain margin is serialized");
-        assert!((encoded_margin - f64::from(margin)).abs() < 1e-6);
-        match gain {
-            Some(expected) => {
-                let encoded_gain = dsd
-                    .get("dsd_to_pcm_gain_db")
-                    .and_then(serde_json::Value::as_f64)
-                    .expect("legacy manual gain is serialized");
-                assert!((encoded_gain - f64::from(expected)).abs() < 1e-6);
-            }
-            None => assert!(
-                dsd.get("dsd_to_pcm_gain_db")
-                    .is_some_and(serde_json::Value::is_null),
-                "non-manual legacy modes serialize a null manual gain"
-            ),
-        }
-    }
-
-    fn planned_legacy_dsd_commands(format: &FormatState) -> Vec<Vec<String>> {
-        let settings = format_state_to_pipeline_settings(format).expect("TUI settings");
-        let plan = tonepoet_pipeline::plan_conversion(&tonepoet_pipeline::PlanRequest {
+    fn dsd_plan_request(settings: PipelineSettings) -> tonepoet_pipeline::PlanRequest {
+        tonepoet_pipeline::PlanRequest {
             input_path: PathBuf::from("source.dff"),
             output_path: PathBuf::from("output.flac"),
             source: tonepoet_pipeline::SourceInfo {
@@ -989,133 +942,116 @@ mod lifecycle_forwarder_tests {
                 sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
                 channels: Some(2),
                 duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
                 dsd_source_kind: Some(tonepoet_pipeline::DsdSourceKind::DsdiffUncompressed),
                 audio_md5: None,
             },
             settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
             resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::FlacNative),
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
-        })
-        .expect("legacy DSD-to-PCM plan");
-        match plan.action {
-            tonepoet_pipeline::PlanAction::Execute { commands, steps, .. } => {
-                assert!(steps.is_empty(), "legacy plan must not use Reference steps");
-                commands.into_iter().map(|command| command.args).collect()
-            }
-            other => panic!("expected executable legacy DSD plan, got {other:?}"),
         }
     }
 
-    fn command_has_pair(commands: &[Vec<String>], left: &str, right: &str) -> bool {
-        commands.iter().any(|args| {
-            args.windows(2).any(|pair| pair[0] == left && pair[1] == right)
-        })
-    }
-
     #[test]
-    fn pre_promotion_tui_gain_modes_reach_the_legacy_sox_argv() {
-        let mut disabled = FormatState::new();
-        disabled.set_source_is_dsd(true);
-        assert!(disabled.dsd_gain_mode.select_value(&DsdGainMode::Disabled));
-        let disabled_commands = planned_legacy_dsd_commands(&disabled);
-        assert!(!disabled_commands
-            .iter()
-            .any(|args| args.iter().any(|arg| arg == "norm")));
-
-        let mut auto = FormatState::new();
-        auto.set_source_is_dsd(true);
-        assert!(auto.dsd_gain_mode.select_value(&DsdGainMode::Auto));
-        auto.dsd_auto_gain_margin_db = "0.500000000".parse().unwrap();
-        let auto_commands = planned_legacy_dsd_commands(&auto);
-        assert!(command_has_pair(&auto_commands, "norm", "-0.50"));
-
-        let mut manual = FormatState::new();
-        manual.set_source_is_dsd(true);
-        assert!(manual.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
-        manual.dsd_gain_db = "2.250000000".parse().unwrap();
-        let manual_commands = planned_legacy_dsd_commands(&manual);
-        assert!(command_has_pair(&manual_commands, "gain", "+2.25"));
-    }
-
-    #[test]
-    fn pre_promotion_tui_disabled_selection_builds_exact_legacy_disabled_wire() {
+    fn tui_dsd_gain_modes_map_to_mutually_exclusive_typed_policies() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Disabled));
+
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Off));
         let settings = format_state_to_pipeline_settings(&format).unwrap();
-        assert_legacy_gain(
-            &settings,
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            0.15,
-            None,
-        );
-    }
+        assert_eq!(settings.dsd.gain_policy(), tonepoet_pipeline::SampleGainPolicy::Off);
 
-    #[test]
-    fn pre_promotion_tui_auto_selection_builds_exact_legacy_auto_wire() {
-        let mut format = FormatState::new();
-        format.set_source_is_dsd(true);
-        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Auto));
-        format.dsd_auto_gain_margin_db = "0.500000000".parse().unwrap();
-        let settings = format_state_to_pipeline_settings(&format).unwrap();
-        assert_legacy_gain(
-            &settings,
-            tonepoet_pipeline::DsdToPcmGainMode::Auto,
-            0.5,
-            None,
-        );
-    }
-
-    #[test]
-    fn pre_promotion_tui_fixed_selection_builds_exact_legacy_manual_wire() {
-        let mut format = FormatState::new();
-        format.set_source_is_dsd(true);
-        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
         format.dsd_gain_db = "2.250000000".parse().unwrap();
         let settings = format_state_to_pipeline_settings(&format).unwrap();
-        assert_legacy_gain(
-            &settings,
-            tonepoet_pipeline::DsdToPcmGainMode::Manual,
-            0.15,
-            Some(2.25),
+        assert_eq!(
+            settings.dsd.gain_policy(),
+            tonepoet_pipeline::SampleGainPolicy::FixedGain {
+                gain_db: "2.250000000".parse().unwrap(),
+            }
         );
-    }
 
-    #[test]
-    fn pre_promotion_tui_hidden_dsd_controls_leave_pcm_source_settings_legacy() {
-        let mut format = FormatState::new();
-        format.dsd_gain_db = "2.250000000".parse().unwrap();
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
+        format.dsd_true_peak_target_dbtp = "-0.500000000".parse().unwrap();
+        format
+            .dsd_true_peak_scope
+            .select_value(&tonepoet_pipeline::TruePeakScope::Track);
+        format
+            .dsd_true_peak_scan_mode
+            .select_value(&tonepoet_pipeline::TruePeakScanTier::Standard);
         let settings = format_state_to_pipeline_settings(&format).unwrap();
-        assert_legacy_gain(
-            &settings,
-            tonepoet_pipeline::DsdToPcmGainMode::Disabled,
-            0.15,
-            None,
+        assert_eq!(
+            settings.dsd.gain_policy(),
+            tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                target_dbtp: "-0.500000000".parse().unwrap(),
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            }
         );
+
+        assert!(format
+            .dsd_gain_mode
+            .select_value(&DsdGainMode::TruePeakNormalize));
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+        assert!(matches!(
+            settings.dsd.gain_policy(),
+            tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                target_dbtp,
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            } if target_dbtp == "-0.500000000".parse().unwrap()
+        ));
     }
 
-
     #[test]
-    fn pre_promotion_tui_out_of_range_auto_margin_is_rejected() {
+    fn dsd_track_true_peak_is_preserved_and_owned_by_phase3_common_realizer() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Auto));
-        format.dsd_auto_gain_margin_db = tonepoet_pipeline::DbNano(7_000_000_000);
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
+        assert!(format
+            .dsd_true_peak_scope
+            .select_value(&tonepoet_pipeline::TruePeakScope::Track));
+        assert!(format
+            .dsd_true_peak_scan_mode
+            .select_value(&tonepoet_pipeline::TruePeakScanTier::Fast));
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(
+            settings.dsd.true_peak_scan_tier(),
+            Some(tonepoet_pipeline::TruePeakScanTier::Fast)
+        );
+        let request = dsd_plan_request(settings);
+        let typed = tonepoet_pipeline::plan_typed(&request);
+        let Ok(tonepoet_pipeline::PlanningOutcome::Ready(typed)) = typed else {
+            panic!("Track Guard must be a valid typed plan")
+        };
+        assert_eq!(
+            typed.execution_capability,
+            tonepoet_pipeline::ExecutionCapability::ExecutableByPhase3CommonRealizer
+        );
+        let error = tonepoet_pipeline::plan_conversion(&request)
+            .expect_err("legacy command lowering must not claim the Phase-3 common-realizer route");
+        assert!(error.to_string().contains("Phase-3 application common realizer"), "{error}");
+    }
+
+    #[test]
+    fn tui_dsd_gain_validation_uses_true_peak_and_fixed_ranges() {
+        let mut format = FormatState::new();
+        format.set_source_is_dsd(true);
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
+        format.dsd_true_peak_target_dbtp = tonepoet_pipeline::DbNano(1_000_000_000);
         let error = format_state_to_pipeline_settings(&format).unwrap_err();
-        assert!(error.contains("auto gain safety margin must be between 0 and 6 dB"));
-    }
+        assert!(error.contains("true-peak target"), "{error}");
 
-    #[test]
-    fn pre_promotion_tui_out_of_range_fixed_gain_is_rejected() {
         let mut format = FormatState::new();
         format.set_source_is_dsd(true);
-        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::Fixed));
+        assert!(format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
         format.dsd_gain_db = tonepoet_pipeline::DbNano(123_000_000_000);
         let error = format_state_to_pipeline_settings(&format).unwrap_err();
-        assert!(error.contains("gain must be between -24 and +24 dB"));
+        assert!(error.contains("gain must be between -24 and +24 dB"), "{error}");
     }
 
     #[test]
@@ -1145,6 +1081,25 @@ mod lifecycle_forwarder_tests {
         for (ui, expected_pipeline) in cases {
             assert_eq!(map_dither(ui), expected_pipeline);
         }
+    }
+
+    #[test]
+    fn tui_ssrc_selection_sets_explicit_resampler_authority_only_for_ssrc() {
+        let mut format = FormatState::new();
+        assert!(format.resampler.select_value(&ResamplerChoice::Ssrc));
+        let ssrc = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(ssrc.preferred_tool, pipeline_enums::PreferredTool::Ssrc);
+        assert!(ssrc.ssrc.force);
+        assert_eq!(
+            ssrc.nyquist_transition,
+            pipeline_enums::NyquistTransition::BrickWall,
+            "the existing SSRC UI transition default may remain BrickWall without making BrickWall itself explicit authority",
+        );
+
+        assert!(format.resampler.select_value(&ResamplerChoice::None));
+        let automatic = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(automatic.preferred_tool, pipeline_enums::PreferredTool::Auto);
+        assert!(!automatic.ssrc.force);
     }
 
     #[test]

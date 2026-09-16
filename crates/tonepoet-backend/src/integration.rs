@@ -5,7 +5,7 @@
 
 use crate::types::{
     AacProfile, AudioFormat, ConversionSettings, DitherType, Mp3Mode, NyquistTransition,
-    OpusContentType, ReplayGainMode,
+    OpusContentType,
 };
 
 /// Maps from the main project's ConversionOptions to our ConversionSettings
@@ -165,30 +165,19 @@ pub fn map_conversion_item_to_settings(item: &ConversionItem) -> ConversionSetti
         verify_encoding: None,
         store_md5: None,
 
-        // ReplayGain settings
-        replaygain_mode: if item.options.calculate_replaygain {
-            let mode = item
-                .options
-                .replaygain_mode
-                .clone()
-                .map(|mode| {
-                    // Convert from main project's ReplayGainMode to backend's ReplayGainMode
-                    match mode {
-                        MainReplayGainMode::Track => ReplayGainMode::Track,
-                        MainReplayGainMode::Album => ReplayGainMode::Album,
-                        MainReplayGainMode::Both => ReplayGainMode::Both,
-                    }
-                })
-                .or(Some(ReplayGainMode::Track)); // Default to Track if no mode specified
-            log::info!(
-                "🎯 Backend ReplayGain mode for item {}: {:?} (from options: {:?})",
-                item.id,
-                mode,
-                item.options.replaygain_mode
-            );
-            mode
-        } else {
-            log::info!("🎯 Backend ReplayGain disabled for item {}", item.id);
+        // Production ReplayGain is owned after conversion by Tonepoet's native
+        // common-plan executor. Preserve the user's request in ConversionItem/
+        // planner state, but never hand it back to this legacy encoder as a
+        // second execution owner. The backend itself also fails closed if a
+        // direct caller nevertheless supplies replaygain_mode.
+        replaygain_mode: {
+            if item.options.calculate_replaygain {
+                log::info!(
+                    "ReplayGain for item {} remains owned by Tonepoet's native common-plan executor ({:?})",
+                    item.id,
+                    item.options.replaygain_mode
+                );
+            }
             None
         },
 
