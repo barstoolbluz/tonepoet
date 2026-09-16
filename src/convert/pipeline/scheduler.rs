@@ -22,6 +22,14 @@ pub type WorkUnitId = String;
 pub type BoxWorkFuture<R> = Pin<Box<dyn Future<Output = Result<R, String>> + Send + 'static>>;
 pub type WorkFn<R> = Box<dyn FnOnce(CancellationToken) -> BoxWorkFuture<R> + Send + 'static>;
 
+/// Stack reservation for Tokio workers that poll conversion scheduler work.
+///
+/// The album post-process ENOSPC retry continuation overflows a 2 MiB
+/// debug-test stack and completes at 4 MiB. The scheduler polls the same
+/// continuation on Tokio worker threads in production, so the runtime and
+/// focused regression harness use the same explicit bound.
+pub const CONVERSION_RUNTIME_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkKind {
     MaterializeItem,

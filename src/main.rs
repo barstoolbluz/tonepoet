@@ -474,6 +474,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(
+            tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES,
+        )
         .enable_all()
         .build()?;
     runtime.block_on(async_main(cli))

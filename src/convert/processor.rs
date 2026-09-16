@@ -5698,6 +5698,28 @@ mod tests {
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
 
+    fn run_on_conversion_worker_stack<F, Fut>(test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let worker = std::thread::Builder::new()
+            .name("tonepoet-conversion-stack-test".to_string())
+            .stack_size(crate::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build focused conversion test runtime");
+                runtime.block_on(test());
+            })
+            .expect("spawn focused conversion test thread");
+
+        if let Err(payload) = worker.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     fn write_bound_stereo_f64le_carrier(dir: &Path, prefix: &str) -> PathBuf {
         // One stereo Float64 frame is sufficient for retry-fixture validation.
         // Production requires both frame alignment and a filename-bound digest
@@ -7678,8 +7700,15 @@ FILE "track.flac" WAVE
     }
 
 
-    #[tokio::test]
-    async fn resolved_dsd_album_gain_track_enospc_uses_album_aware_retry_and_preserves_batch_authority() {
+    #[test]
+    fn resolved_dsd_album_gain_track_enospc_uses_album_aware_retry_and_preserves_batch_authority() {
+        run_on_conversion_worker_stack(
+            resolved_dsd_album_gain_track_enospc_uses_album_aware_retry_and_preserves_batch_authority_body,
+        );
+    }
+
+    async fn resolved_dsd_album_gain_track_enospc_uses_album_aware_retry_and_preserves_batch_authority_body(
+    ) {
         let temp = tempfile::tempdir().expect("temp dir");
         let scratch_root = temp.path().join("scratch");
         let scratch_parent = scratch_root.join(".tonepoet-staging");
@@ -7989,8 +8018,14 @@ FILE "track.flac" WAVE
         );
     }
 
-    #[tokio::test]
-    async fn resolved_dsd_album_gain_postprocess_enospc_uses_same_album_aware_retry() {
+    #[test]
+    fn resolved_dsd_album_gain_postprocess_enospc_uses_same_album_aware_retry() {
+        run_on_conversion_worker_stack(
+            resolved_dsd_album_gain_postprocess_enospc_uses_same_album_aware_retry_body,
+        );
+    }
+
+    async fn resolved_dsd_album_gain_postprocess_enospc_uses_same_album_aware_retry_body() {
         let temp = tempfile::tempdir().expect("temp dir");
         let scratch_root = temp.path().join("scratch");
         let scratch_parent = scratch_root.join(".tonepoet-staging");

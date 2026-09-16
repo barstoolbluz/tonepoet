@@ -32713,11 +32713,11 @@ mod album_true_peak_carrier_tests {
         req.settings.target_sample_rate = RateTarget::PcmHz(176_400);
         req.settings.target_bit_depth =
             BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-        req.settings.dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-        req.settings
-            .dsd
-            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::default();
+        req.settings.dsd.set_gain_policy(
+            tonepoet_pipeline::SampleGainPolicy::dsd_normalize_default()
+                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
+        );
         let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
         let carrier_dir = temp.path().join("album-gain");
         fs::create_dir_all(&carrier_dir).unwrap();
@@ -33446,36 +33446,40 @@ mod album_true_peak_carrier_tests {
 
     #[test]
     fn disclosed_terminal_headroom_matches_the_proved_reserve_without_tightening_it() {
+        // Independent snapshots of the qualified conservative terminal bound:
+        // SoX gain/quantization/dither support followed by the frozen HQ1024
+        // reconstruction L-inf gain. Keep these literals independent of the
+        // implementation so a future accidental tightening remains visible.
         for (depth, dither, expected_db) in [
             (
                 tonepoet_pipeline::PcmBitDepth::Int16,
                 tonepoet_pipeline::DitherType::None,
-                0.000_542_098_f64,
+                0.000_620_301_f64,
             ),
             (
                 tonepoet_pipeline::PcmBitDepth::Int16,
                 tonepoet_pipeline::DitherType::Tpdf,
-                0.001_626_379_f64,
+                0.001_861_016_f64,
             ),
             (
                 tonepoet_pipeline::PcmBitDepth::Int16,
                 tonepoet_pipeline::DitherType::Gesemann,
-                0.023_884_023_f64,
+                0.027_334_822_f64,
             ),
             (
                 tonepoet_pipeline::PcmBitDepth::Int16,
                 tonepoet_pipeline::DitherType::Shibata,
-                0.091_549_024_f64,
+                0.104_835_362_f64,
             ),
             (
                 tonepoet_pipeline::PcmBitDepth::Int16,
                 tonepoet_pipeline::DitherType::HighShibata,
-                0.169_689_406_f64,
+                0.194_443_742_f64,
             ),
             (
                 tonepoet_pipeline::PcmBitDepth::Int24,
                 tonepoet_pipeline::DitherType::HighShibata,
-                0.000_656_449_f64,
+                0.000_751_149_f64,
             ),
         ] {
             let settings = hard_ceiling_settings(depth, dither);

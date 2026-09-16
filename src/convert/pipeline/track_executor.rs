@@ -1085,8 +1085,19 @@ fn cue_stream_phase1_direct_plan_for_paths(
         staged_output,
         work_dir,
     )?;
-    let plan = plan_conversion(&plan_request)
-        .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+    let plan = match plan_conversion(&plan_request) {
+        Ok(plan) => plan,
+        Err(tonepoet_pipeline::PlanningError::CapabilityUnavailable { capability, .. })
+            if capability == "common_realizer" =>
+        {
+            // This helper only decides whether Phase 1 can own the direct
+            // stream. A valid typed plan delegated to the Phase-3 common
+            // realizer is an ordinary fallback decision here, not a track
+            // failure. Every other planner error remains fail-closed.
+            return Ok(None);
+        }
+        Err(err) => return Err(ConvertError::Backend(format!("planner failed: {err}"))),
+    };
 
     let PlanAction::Execute {
         commands,
