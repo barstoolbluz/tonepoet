@@ -33895,9 +33895,10 @@ mod album_true_peak_carrier_tests {
         if qualified {
             let bound = result.expect("commissioned FFmpeg Int32 triangular dither must expose its bound");
             assert_eq!(
-                bound.stored_error_linear,
-                ffmpeg_int32_triangular_stored_error_component_sum()
+                bound.stored_sample_error_linear.unwrap(),
+                next_up_nonnegative(ffmpeg_int32_triangular_stored_error_component_sum())
             );
+            assert_eq!(bound.domain, tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm);
         } else {
             let error = result.expect_err("uncommissioned FFmpeg Int32 triangular dither must fail closed");
             assert!(error.contains("no qualified deterministic FFmpeg-direct"), "{error}");
