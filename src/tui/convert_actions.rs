@@ -1051,7 +1051,7 @@ mod lifecycle_forwarder_tests {
         assert!(format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
         format.dsd_gain_db = tonepoet_pipeline::DbNano(123_000_000_000);
         let error = format_state_to_pipeline_settings(&format).unwrap_err();
-        assert!(error.contains("gain must be between -24 and +24 dB"), "{error}");
+        assert!(error.contains("gain must be between -24.000000000 and +24.000000000 dB"), "{error}");
     }
 
     #[test]

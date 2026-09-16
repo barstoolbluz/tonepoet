@@ -1192,9 +1192,9 @@ fn save_preset_to_path_locked(preset: &TuiPreset, path: &Path) -> Result<(), Str
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create preset directory '{}': {}", parent.display(), e))?;
     }
-    if preset.version != 4 {
+    if preset.version != 5 {
         return Err(format!(
-            "Refusing to save preset version {}; current saves require version 4",
+            "Refusing to save preset version {}; current saves require version 5",
             preset.version
         ));
     }

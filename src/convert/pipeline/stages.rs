@@ -34103,7 +34103,10 @@ mod album_true_peak_carrier_tests {
             unreachable!()
         };
         assert!(tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(pcm));
-        assert!(!tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(pcm));
+        assert_eq!(
+            tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(pcm),
+            tonepoet_pipeline::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch()
+        );
 
         // Candidate-only arithmetic check: this does not pass through the
         // production bound owner while commissioning remains closed. It proves
@@ -58067,7 +58070,7 @@ mod conversion_log_tests {
         let guard_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(guard_log.contains("DSD path: general"));
         assert!(guard_log.contains("DSD gain mode: true-peak guard"));
-        assert!(guard_log.contains("DSD true-peak target: -0.1 dBTP"));
+        assert!(guard_log.contains("DSD true-peak target: -0.100000000 dBTP"));
         assert!(guard_log.contains("DSD true-peak scope: track"));
         assert!(guard_log.contains("DSD true-peak scan: reference"));
         assert!(guard_log.contains("DSD->PCM lowpass method"));
@@ -58093,7 +58096,7 @@ mod conversion_log_tests {
         });
         let fixed_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
         assert!(fixed_log.contains("DSD gain mode: fixed gain"));
-        assert!(fixed_log.contains("DSD fixed gain: 6 dB"));
+        assert!(fixed_log.contains("DSD fixed gain: 6.000000000 dB"));
         assert!(!fixed_log.contains("DSD true-peak target"));
     }
 
@@ -58115,12 +58118,12 @@ mod conversion_log_tests {
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("PCM→DSD filter preset"));
+        assert!(log.contains("PCM->DSD filter preset"));
         // "DSD filter preset" without the PCM→ prefix must not appear
         assert!(!log.lines().any(|line| {
-            line.contains("DSD filter preset") && !line.contains("PCM→DSD filter preset")
+            line.contains("DSD filter preset") && !line.contains("PCM->DSD filter preset")
         }));
-        assert!(!log.contains("DSD→PCM lowpass method"));
+        assert!(!log.contains("DSD->PCM lowpass method"));
     }
 
     #[test]

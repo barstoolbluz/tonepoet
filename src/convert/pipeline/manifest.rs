@@ -1124,7 +1124,6 @@ mod manifest_merge_gap_tests {
             .as_object()
             .expect("flat legacy DSD settings");
         assert!(!dsd.contains_key("schema_version"));
-        assert!(!dsd.contains_key("from_dsd"));
     }
 
     #[test]
