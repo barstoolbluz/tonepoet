@@ -56466,7 +56466,7 @@ mod pipeline_test_helpers {
         }
     }
 
-    fn configure_native_album_hard_ceiling(
+    fn configure_general_album_hard_ceiling(
         req: &mut PipelineRequest,
         target_rate_hz: u32,
         depth: tonepoet_pipeline::PcmBitDepth,
@@ -56475,13 +56475,14 @@ mod pipeline_test_helpers {
         req.settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
         req.settings.target_bit_depth = BitDepthTarget::Pcm(depth);
         req.settings.dither_type = dither;
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-        req.settings.dsd.from_dsd.gain_mode =
-            tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-        req.settings.dsd.from_dsd.normalize_peak_target_dbfs = tonepoet_pipeline::DbNano::ZERO;
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::default();
         req.settings
             .dsd
-            .set_true_peak_scope(tonepoet_pipeline::TruePeakScope::Album);
+            .set_gain_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: tonepoet_pipeline::DbNano::ZERO,
+                scope: tonepoet_pipeline::TruePeakScope::Album,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            });
     }
 
     #[test]
@@ -56591,7 +56592,7 @@ mod pipeline_test_helpers {
 
         let mut req = log_test_request();
         req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
-        configure_native_album_hard_ceiling(
+        configure_general_album_hard_ceiling(
             &mut req,
             192_000,
             tonepoet_pipeline::PcmBitDepth::Int16,
@@ -56636,7 +56637,7 @@ mod pipeline_test_helpers {
 
         let mut req = log_test_request();
         req.settings.target_format = tonepoet_pipeline::AudioFormat::Aac;
-        configure_native_album_hard_ceiling(
+        configure_general_album_hard_ceiling(
             &mut req,
             192_000,
             tonepoet_pipeline::PcmBitDepth::Int16,
@@ -56673,7 +56674,7 @@ mod pipeline_test_helpers {
 
         let mut req = log_test_request();
         req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
-        configure_native_album_hard_ceiling(
+        configure_general_album_hard_ceiling(
             &mut req,
             44_100,
             tonepoet_pipeline::PcmBitDepth::Int16,
@@ -56683,7 +56684,7 @@ mod pipeline_test_helpers {
         assert!(messages.iter().any(|message| {
             message.contains("Hard-ceiling headroom")
                 && message.contains("16-bit/44.1kHz")
-                && message.contains("0.169689 dB")
+                && message.contains("0.194444 dB")
         }), "{messages:#?}");
 
         req.settings.dither_type = tonepoet_pipeline::DitherType::None;
@@ -56721,7 +56722,7 @@ mod pipeline_test_helpers {
 
         let mut req = log_test_request();
         req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
-        configure_native_album_hard_ceiling(
+        configure_general_album_hard_ceiling(
             &mut req,
             44_100,
             tonepoet_pipeline::PcmBitDepth::Int16,
@@ -56735,7 +56736,7 @@ mod pipeline_test_helpers {
 
         let summary = conversion_summary(track, &req, None, None);
         assert!(
-            summary.contains("hard-ceiling terminal reserve 0.169689 dB below requested 0.000000000 dBTP"),
+            summary.contains("hard-ceiling terminal reserve 0.194444 dB below requested 0.000000000 dBTP"),
             "{summary}",
         );
     }
