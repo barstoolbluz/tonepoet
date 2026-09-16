@@ -32718,6 +32718,10 @@ mod album_true_peak_carrier_tests {
             tonepoet_pipeline::SampleGainPolicy::dsd_normalize_default()
                 .with_scope(tonepoet_pipeline::TruePeakScope::Album),
         );
+        // Album-scoped true-peak gain is bound to a submitted batch; this
+        // single-track fixture is its own one-participant submission.
+        req.submission_id = Some("true-peak-source-fact-submission".to_owned());
+        req.submission_size = Some(1);
         let staging = StagingDir::new(temp.path().join("staging"), req.job_id.clone());
         let carrier_dir = temp.path().join("album-gain");
         fs::create_dir_all(&carrier_dir).unwrap();
@@ -32741,8 +32745,12 @@ mod album_true_peak_carrier_tests {
             Err(error) => error,
         };
 
+        // Both messages are emitted by the carrier validation that follows the
+        // reconstruction command; the stub runner never writes the carrier, so
+        // the stat variant is the reachable one for this fixture.
         assert!(
-            error.contains("empty or truncated Float64 PCM carrier"),
+            error.contains("empty or truncated Float64 PCM carrier")
+                || error.contains("could not stat DSD certified true-peak carrier"),
             "DSD preparation must advance past channel resolution into reconstruction: {error}",
         );
         assert!(
