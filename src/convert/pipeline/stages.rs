@@ -13781,7 +13781,7 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
             .into_iter()
             .find(|case| case.format == tonepoet_pipeline::AudioFormat::Alac)
             .expect("ALAC matrix case");
-        let mut unavailable = case_unavailability_reasons(&case);
+        let unavailable = case_unavailability_reasons(&case);
         if !unavailable.is_empty() {
             let message = format!(
                 "m4a freeform/ReplayGain preservation requires {}",

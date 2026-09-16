@@ -46,7 +46,6 @@ fn ordinary_general_controls_remain_independent_from_reference_delivery_controls
     assert_eq!(settings.dsd.true_peak_scope(), Some(TruePeakScope::Album));
 }
 
-#[cfg(feature = "serde")]
 #[test]
 fn strict_dsd_wire_has_directional_objects_and_no_origin_or_version_selector() {
     let value = serde_json::to_value(DsdSettings::reference()).expect("serialize DSD settings");

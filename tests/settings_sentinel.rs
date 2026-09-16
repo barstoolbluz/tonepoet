@@ -486,7 +486,6 @@ fn deprecated_projection_retains_unrelated_legacy_behavior_but_cannot_invent_new
     assert_eq!(projected.pcm_true_peak.policy, SampleGainPolicy::Off);
 }
 
-#[cfg(feature = "serde")]
 #[test]
 fn strict_settings_round_trip_preserves_typed_gain_and_rejects_unknown_fields() {
     let settings = flac_sentinel();
@@ -509,7 +508,6 @@ fn strict_settings_round_trip_preserves_typed_gain_and_rejects_unknown_fields() 
     assert!(serde_json::from_value::<PipelineSettings>(value).is_err());
 }
 
-#[cfg(feature = "serde")]
 #[test]
 fn obsolete_ambiguous_gain_forms_are_rejected_not_migrated() {
     let current = serde_json::to_value(PipelineSettings::default()).expect("serialize defaults");

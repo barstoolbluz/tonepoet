@@ -5,7 +5,7 @@
 //! not create or consume Reference attestations and never modifies the frozen
 //! qualification corpus.
 
-use crate::dsd_reference::{resolve_reference_profile, DbNano};
+use crate::dsd_reference::DbNano;
 use crate::enums::{TruePeakScope, DsdLowpassMethod, RateTarget};
 use crate::error::{PlanningError, Result};
 use crate::mapping;
@@ -855,7 +855,7 @@ mod tests {
             frame_extent: None,
             audio_md5: None,
         };
-        let command = build_album_gain_analysis_command(
+        let command = build_dsd_true_peak_analysis_command(
             &settings,
             &source,
             std::path::Path::new("input.dsf"),

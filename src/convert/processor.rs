@@ -59,7 +59,7 @@ use crate::convert::pipeline::stages::{
     pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
     prepare_verified_single_file_album_batch_completion_order_fallback,
-    resolve_dsd_album_gain_post_barrier_rerun, album_gain_terminal_bound,
+    resolve_dsd_album_gain_post_barrier_rerun,
     finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths,
     CertifiedTruePeakPreparedMeasurement,
 };

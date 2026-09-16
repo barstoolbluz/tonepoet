@@ -11,15 +11,19 @@ use crate::dsd_reference::{
     ResolvedGainPolicy, ResolvedOutputTarget,
 };
 use crate::enums::{
-    AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod, DsdRate,
-    GainCompensation, Mp3Mode, NyquistTransition, PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode,
-    ResampleQuality, SsrcPdfType, SsrcProfile, TruePeakScanTier, TruePeakScope,
+    AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod, 
+    GainCompensation, Mp3Mode, PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode,
+    ResampleQuality, SsrcProfile, TruePeakScanTier, TruePeakScope,
 };
+#[cfg(test)]
+use crate::enums::{DsdRate, NyquistTransition, SsrcPdfType};
 use crate::error::PlanningError;
+#[cfg(test)]
+use crate::settings::DsdSettings;
 use crate::plan::{plan_topology, validate_forced_ssrc_semantics, InputSource, OutputSink, PlanOperation, PlanParticipantId, PlanRequest, PlanScope, PlanScopeId, PlanStep, TopologyPlan};
 use crate::mapping;
 use crate::settings::{
-    AacSettings, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdSettings, DsdToPcmSettings,
+    AacSettings, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdToPcmSettings,
     DsdToPcmSincSettings, FlacSettings, Mp3Settings, OpusSettings, PcmToDsdSettings,
     PcmToDsdSincSettings, ReplayGainExistingTagPolicy, SampleGainPolicy, SoxResamplerSettings,
     SoxrResamplerSettings, SsrcSettings, WavPackSettings,

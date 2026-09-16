@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use tonepoet_pipeline::fingerprint::{settings_and_effects_fingerprint, settings_fingerprint, SettingsFingerprint};
+use tonepoet_pipeline::fingerprint::{settings_and_effects_fingerprint, SettingsFingerprint};
+#[cfg(test)]
+use tonepoet_pipeline::fingerprint::settings_fingerprint;
 use tonepoet_pipeline::settings::PipelineSettings;
 
 use super::manifest::{

@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonepoet_pipeline::{
-    build_album_gain_analysis_command, extract_single_sox_stats_peak_report, plan_conversion,
+    build_dsd_true_peak_analysis_command, extract_single_sox_stats_peak_report, plan_conversion,
     AudioCodec, AudioFormat, BitDepthTarget, DbNano, TruePeakScope, DsdRate,
     InputSource, OutputSink, PcmBitDepth, PipelineSettings, SampleGainPolicy,
     PlanAction, PlanRequest, PlanScope, PreferredTool, RateTarget, SampleKind, SourceInfo,
@@ -125,7 +125,7 @@ fn carrier_writer_output_args(
     carrier: &Path,
 ) -> Vec<String> {
     let synthetic_input = Path::new("synthetic-album-input.dsf");
-    let planned = build_album_gain_analysis_command(
+    let planned = build_dsd_true_peak_analysis_command(
         settings,
         &dsd_source(),
         synthetic_input,

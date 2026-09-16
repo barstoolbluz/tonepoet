@@ -7490,7 +7490,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                 app.set_status("No analysis results — run :analyze first");
             } else {
                 let tx = tx.clone();
-                let db_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                let _db_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                 app.set_status(format!(
                     "Writing {} ReplayGain tags...",
                     if album { "album + track" } else { "track" },

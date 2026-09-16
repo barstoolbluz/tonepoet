@@ -13,11 +13,10 @@ use crate::enums::{
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::dsd_reference::{
-    reference_error_text, DbNano, DsdReconstructionSelection, DsdReferencePolicyVersion,
+    reference_error_text, DbNano, DsdReferencePolicyVersion,
     DsdSourceGainMode, DsdSourcePathway, DsdSourceSettings, ReferenceErrorCode,
 };
 use crate::error::{PlanningError, Result};
-use crate::mapping;
 
 /// Single source of truth for all conversion parameters.
 #[derive(Debug, Clone, PartialEq)]
