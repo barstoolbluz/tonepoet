@@ -4340,14 +4340,20 @@ mod tests {
             .unwrap();
             let item_id = format!("blocking-authority-{}", Uuid::new_v4());
             let execution_id = Uuid::new_v4();
+            // Queue-execution leases never carry path claims; production keeps
+            // them on supplemental execution leases, so the fixture does too.
             let queue_lease = Arc::new(
+                PersistentLease::create(LeaseFamily::QueueExecution { execution_id }, &[]).unwrap(),
+            );
+            let claim_lease = Arc::new(
                 PersistentLease::create(
-                    LeaseFamily::QueueExecution { execution_id },
+                    LeaseFamily::ExecutionClaim { execution_id },
                     std::slice::from_ref(&claim),
                 )
                 .unwrap(),
             );
             let descriptor_path = queue_lease.descriptor_path().to_path_buf();
+            let claim_descriptor_path = claim_lease.descriptor_path().to_path_buf();
             assert!(
                 runtime_execution_authorities()
                     .lock()
@@ -4357,7 +4363,7 @@ mod tests {
                         RuntimeExecutionAuthority {
                             execution_id,
                             queue_lease: Arc::clone(&queue_lease),
-                            supplemental_leases: Vec::new(),
+                            supplemental_leases: vec![Arc::clone(&claim_lease)],
                             database_path: None,
                             item_supervisor: None,
                         },
@@ -4393,7 +4399,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&item_id);
+            drop(claim_lease);
             drop(queue_lease);
+            let _ = std::fs::remove_file(claim_descriptor_path);
             let _ = std::fs::remove_file(descriptor_path);
         });
     }
