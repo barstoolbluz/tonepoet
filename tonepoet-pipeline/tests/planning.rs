@@ -1192,18 +1192,26 @@ fn dsd_to_aiff_float32_routes_through_wav_then_ffmpeg() {
 }
 
 #[test]
-fn dsd_to_wavpack_float32_is_rejected_through_public_planner() {
-    let err = plan_conversion(&dsd_request_for(
+fn dsd_to_wavpack_float32_routes_through_float_wav_then_ffmpeg() {
+    let plan = plan_conversion(&dsd_request_for(
         AudioFormat::WavPack,
         PcmBitDepth::Float32,
         "wv",
     ))
-    .expect_err("unsupported WavPack float must fail before command construction");
-    match err {
-        PlanningError::InvalidSettings { field, reason } => {
-            assert_eq!(field, "target_bit_depth");
-            assert!(reason.contains("floating-point WavPack"), "{reason}");
-        }
-        other => panic!("unexpected planning error: {other}"),
-    }
+    .expect("lossless WavPack Float32 should be plannable");
+    let commands = plan.commands();
+    assert!(
+        commands.len() >= 2,
+        "expected DSD float-WAV intermediate plus WavPack encode"
+    );
+    assert_eq!(commands[0].tool, ToolIdentifier::Sox);
+    assert_eq!(commands[1].tool, ToolIdentifier::Ffmpeg);
+    assert!(
+        commands[1]
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-c:a" && pair[1] == "wavpack"),
+        "{:?}",
+        commands[1].args
+    );
 }

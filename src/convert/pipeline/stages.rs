@@ -33504,6 +33504,19 @@ mod album_true_peak_carrier_tests {
         let aiff_stored = aiff_bound.stored_sample_error_linear.unwrap();
         assert_eq!(aiff_bound.pre_gain_reconstructed_error_linear, 0.0);
         assert!(aiff_stored < 1.0e-14);
+
+        let wavpack = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Float32,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let wavpack_bound = album_gain_terminal_bound(&wavpack, 48_000).unwrap();
+        let wavpack_stored = wavpack_bound.stored_sample_error_linear.unwrap();
+        assert_eq!(
+            wavpack_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+        assert_eq!(wavpack_stored, next_up_nonnegative(2.0_f64.powi(-24)));
     }
 
     fn hard_ceiling_settings(
@@ -34088,23 +34101,47 @@ mod album_true_peak_carrier_tests {
     }
 
     #[test]
-    fn pcm_true_peak_lossless_wavpack_keeps_lossless_terminal_domain() {
-        let mut settings = terminal_settings(
+    fn pcm_true_peak_lossless_wavpack_keeps_lossless_terminal_domain_for_integer_and_float() {
+        let mut integer = terminal_settings(
             tonepoet_pipeline::AudioFormat::WavPack,
             tonepoet_pipeline::PcmBitDepth::Int24,
             tonepoet_pipeline::DitherType::None,
         );
-        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        integer.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
-        let realization = test_pcm_terminal_realization(
-            &settings,
+        let integer_realization = test_pcm_terminal_realization(
+            &integer,
             tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect,
             None,
         );
-        let bound = pcm_true_peak_terminal_bound(&settings, 96_000, &realization).unwrap();
+        let integer_bound =
+            pcm_true_peak_terminal_bound(&integer, 96_000, &integer_realization).unwrap();
         assert_eq!(
-            bound.domain,
+            integer_bound.domain,
             tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+
+        let mut float = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Float32,
+            tonepoet_pipeline::DitherType::None,
+        );
+        float.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        let float_realization = test_pcm_terminal_realization(
+            &float,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            None,
+        );
+        let float_bound =
+            pcm_true_peak_terminal_bound(&float, 96_000, &float_realization).unwrap();
+        assert_eq!(
+            float_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+        assert_eq!(
+            float_bound.stored_sample_error_linear,
+            Some(next_up_nonnegative(2.0_f64.powi(-24))),
+            "lossless WavPack Float32 must charge the FFmpeg float rounding bound, not an integer LSB",
         );
     }
 
@@ -72640,6 +72677,45 @@ mod validate_encoded_output_tests {
         .expect("WavPack 24-bit should be measured by wvunpack, not ffprobe's s32 container representation");
 
         assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
+        assert_eq!(runner.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_encode_depth_validation_accepts_wavpack_float32() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = stub_with_probe_and_wvunpack(
+            &ffprobe_exact_json_with_depth(
+                48_000,
+                1_000_000,
+                "wavpack",
+                "fltp",
+                32,
+            ),
+            "source:            32-bit floats at 48000 Hz\nduration:          0:00:20.83\n",
+        );
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Float32,
+                class_strict: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("Float32 WavPack must pass authoritative post-encode depth validation");
+
+        assert_eq!(
+            validation.measured_depth,
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+        );
         assert_eq!(runner.transcript().len(), 2);
     }
 

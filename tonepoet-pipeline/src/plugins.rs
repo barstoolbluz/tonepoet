@@ -3490,22 +3490,27 @@ mod tests {
     }
 
     #[test]
-    fn explicit_gesemann_int32_plans_without_ffmpeg_dither() {
+    fn explicit_gesemann_int32_ffmpeg_fails_closed_instead_of_dropping_dither() {
         let mut settings = PipelineSettings::default();
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
         settings.dither_type = DitherType::Gesemann;
         settings.dither_explicit = true;
         let request = pcm_request_with(settings, PcmBitDepth::Float32);
 
-        let filter = ffmpeg_audio_filter(
+        let err = ffmpeg_audio_filter(
             &request.context(),
             None,
             Some(PcmBitDepth::Int32),
         )
-        .expect("unsupported explicit Int32 dither must not become a planning failure");
+        .expect_err("unsupported explicit Int32 dither must fail closed");
 
-        assert!(!filter.contains("dither_method="), "{filter}");
-        assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+        match err {
+            PlanningError::InvalidSettings { field, reason } => {
+                assert_eq!(field, "dither_type");
+                assert!(reason.contains("not supported by FFmpeg/SoXR"), "{reason}");
+            }
+            other => panic!("expected InvalidSettings, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3862,6 +3867,34 @@ mod tests {
     }
 
     #[test]
+    fn wavpack_float32_command_forces_ffmpeg_float_sample_format() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::WavPack;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        settings.metadata.preserve_artwork = false;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
+        request.output_path = PathBuf::from("output.wv");
+
+        let plan = crate::plan_conversion(&request)
+            .expect("Int24 PCM -> lossless WavPack Float32 must plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("explicit Float32 conversion must execute");
+        };
+        let terminal = commands.last().expect("WavPack terminal command");
+        assert_eq!(terminal.tool, ToolIdentifier::Ffmpeg);
+        assert!(
+            terminal
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-c:a" && pair[1] == "wavpack"),
+            "{:?}",
+            terminal.args,
+        );
+        let filter = arg_value(&terminal.args, "-af").expect("Float32 conversion filter");
+        assert!(filter.contains("out_sample_fmt=flt"), "{filter}");
+    }
+
+    #[test]
     fn ffmpeg_is_unsupported_for_wavpack_int24_but_sox_still_encodes_it() {
         // ffmpeg's wavpack encoder cannot write 24-bit (it stores true
         // 32-bit ints) — the plan must never route this cell to ffmpeg.
@@ -3924,8 +3957,13 @@ mod tests {
             );
         }
 
-        // Other integer depths stay ffmpeg-eligible (16 and 32 are faithful).
-        for depth in [PcmBitDepth::Int16, PcmBitDepth::Int32] {
+        // Faithful FFmpeg cells stay eligible. Float32 is the native
+        // floating-point WavPack representation; Float64 is rejected earlier.
+        for depth in [
+            PcmBitDepth::Int16,
+            PcmBitDepth::Int32,
+            PcmBitDepth::Float32,
+        ] {
             let step = PlanStep::new(
                 0,
                 PlanOperation::EncodePcm {
@@ -3942,6 +3980,12 @@ mod tests {
                 FfmpegPlugin.supports(&request.context(), &step).is_supported(),
                 "ffmpeg should stay eligible for WavPack {depth:?}"
             );
+            if depth == PcmBitDepth::Float32 {
+                assert!(
+                    !SoxPlugin.supports(&request.context(), &step).is_supported(),
+                    "SoX must not own WavPack Float32 because it substitutes integer storage"
+                );
+            }
         }
 
         // Hybrid mode is exempt: the ffmpeg plugin delegates hybrid encodes

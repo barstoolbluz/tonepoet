@@ -6744,6 +6744,41 @@ mod tests {
     }
 
     #[test]
+    fn true_peak_lossless_wavpack_float32_selects_ffmpeg_direct_without_dither() {
+        let policy = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+        let mut request = float64_pcm_request(policy);
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        request.output_path = PathBuf::from("out-f32.wv");
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("lossless WavPack Float32 true-peak plan should be admitted");
+        };
+        let (candidate, resolved) = selected_pcm_terminal(&plan);
+        assert_eq!(candidate.tool, Some(ToolIdentifier::Ffmpeg));
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            candidate.contract.terminal_realization.as_ref()
+        else {
+            panic!("WavPack Float32 must carry a structured PCM realization");
+        };
+        assert_eq!(realization.kind, PcmTerminalRealizationKind::FfmpegDirect);
+        assert_eq!(realization.target_bit_depth, PcmBitDepth::Float32);
+        assert!(!realization.wavpack_hybrid);
+        assert_eq!(realization.effective_dither, None);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::None);
+        match resolved {
+            ResolvedOperationParameters::EncodeWavPack {
+                effective_dither, ..
+            } => assert!(effective_dither.is_none()),
+            other => panic!("expected WavPack terminal parameters, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn true_peak_wavpack_hybrid_float_source_uses_int32_preterminal_with_width_sensitive_dither() {
         let policy = SampleGainPolicy::TruePeakGuard {
             target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,

@@ -2642,10 +2642,14 @@ fn plan_from_dsd(
         requested_target_rate_hz
     };
     let target_depth = resolve_target_bit_depth(request)?;
-    reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
+    reject_unsupported_resolved_depth(
+        &request.settings.target_format,
+        request.settings.wavpack.hybrid,
+        target_depth,
+    )?;
 
-    // Combos sox silently substitutes (FLAC 32-bit -> 24; AIFF float -> int)
-    // must NOT take the direct sox DsdToPcm-to-final branch: route them
+    // Combos SoX silently substitutes (FLAC Int32; AIFF/WavPack float)
+    // must NOT take the direct SoX DsdToPcm-to-final branch: route them
     // through the WAV intermediate so the final EncodePcm step carries the
     // per-tool eligibility and ffmpeg encoder flags (D1/D4).
     let sox_silently_substitutes = matches!(
@@ -2750,7 +2754,11 @@ fn plan_from_pcm(
         }
     }
     let target_depth = resolve_target_bit_depth(request)?;
-    reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
+    reject_unsupported_resolved_depth(
+        &request.settings.target_format,
+        request.settings.wavpack.hybrid,
+        target_depth,
+    )?;
 
     let wavpack_hybrid = request.settings.target_format == AudioFormat::WavPack
         && request.settings.wavpack.hybrid;
@@ -3133,6 +3141,7 @@ fn push_step(
 /// and must not become a silent encoder downgrade (the ALAC 32->24 door).
 fn reject_unsupported_resolved_depth(
     format: &AudioFormat,
+    wavpack_hybrid: bool,
     depth: PcmBitDepth,
 ) -> Result<()> {
     match (format, depth) {
@@ -3146,12 +3155,16 @@ fn reject_unsupported_resolved_depth(
                 "FLAC/ALAC floating-point output is not supported; choose 24-bit integer or WAV",
             ))
         }
-        (AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64) => {
+        (AudioFormat::WavPack, PcmBitDepth::Float32) if wavpack_hybrid => {
             Err(PlanningError::invalid_settings(
                 "target_bit_depth",
-                "WavPack float output is not supported by the conversion carrier; choose 32-bit integer or WAV",
+                "32-bit float WavPack output is lossless-only; hybrid WavPack uses integer encoder-input PCM",
             ))
         }
+        (AudioFormat::WavPack, PcmBitDepth::Float64) => Err(PlanningError::invalid_settings(
+            "target_bit_depth",
+            "WavPack supports native 32-bit float output, not 64-bit float; choose 32f or an integer depth",
+        )),
         _ => Ok(()),
     }
 }
@@ -3654,17 +3667,28 @@ mod resolved_depth_rejection_tests {
         // The settings validator only sees BitDepthTarget::Pcm; a Source
         // target over a 32-bit source resolves AFTER validation and must be
         // rejected here instead of silently downgrading at the encoder.
-        let err = reject_unsupported_resolved_depth(&AudioFormat::Alac, PcmBitDepth::Int32)
+        let err = reject_unsupported_resolved_depth(&AudioFormat::Alac, false, PcmBitDepth::Int32)
             .expect_err("resolved ALAC Int32 must fail closed");
         assert!(err.to_string().contains("ALAC 32-bit"), "{err}");
     }
 
     #[test]
     fn honored_resolved_depths_pass() {
-        reject_unsupported_resolved_depth(&AudioFormat::Alac, PcmBitDepth::Int24).expect("alac 24");
-        reject_unsupported_resolved_depth(&AudioFormat::Flac, PcmBitDepth::Int32).expect("flac 32");
-        reject_unsupported_resolved_depth(&AudioFormat::WavPack, PcmBitDepth::Int32).expect("wv 32");
-        reject_unsupported_resolved_depth(&AudioFormat::Aiff, PcmBitDepth::Float32).expect("aiff f32");
+        reject_unsupported_resolved_depth(&AudioFormat::Alac, false, PcmBitDepth::Int24)
+            .expect("alac 24");
+        reject_unsupported_resolved_depth(&AudioFormat::Flac, false, PcmBitDepth::Int32)
+            .expect("flac 32");
+        reject_unsupported_resolved_depth(&AudioFormat::WavPack, false, PcmBitDepth::Int32)
+            .expect("wv 32");
+        reject_unsupported_resolved_depth(&AudioFormat::WavPack, false, PcmBitDepth::Float32)
+            .expect("lossless WavPack f32");
+        reject_unsupported_resolved_depth(&AudioFormat::Aiff, false, PcmBitDepth::Float32)
+            .expect("aiff f32");
+
+        reject_unsupported_resolved_depth(&AudioFormat::WavPack, true, PcmBitDepth::Float32)
+            .expect_err("hybrid WavPack f32 must fail closed");
+        reject_unsupported_resolved_depth(&AudioFormat::WavPack, false, PcmBitDepth::Float64)
+            .expect_err("WavPack f64 must fail closed");
     }
 }
 

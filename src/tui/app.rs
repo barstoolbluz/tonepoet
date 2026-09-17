@@ -5669,10 +5669,14 @@ impl FormatState {
                 }
             }
             AudioFormat::WavPack => {
-                // The current conversion carrier integerizes float sources.
-                // Disable both float targets until float WAV is preserved end-to-end.
-                self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
+                // Lossless WavPack stores Float32 natively. Float64 has no native
+                // WavPack representation, and hybrid mode retains the round-5
+                // integer encoder-input contract. Constraint clamping moves a
+                // selected Float32 pill back to the nearest enabled integer depth.
                 self.bit_depth.set_enabled(&BitDepthChoice::Float64, false);
+                if self.wavpack_hybrid {
+                    self.bit_depth.set_enabled(&BitDepthChoice::Float32, false);
+                }
             }
             AudioFormat::Wav | AudioFormat::Aiff | AudioFormat::Lpcm => {
                 // Full range including float32 and float64.
@@ -17610,6 +17614,45 @@ mod pcm_gain_auto_default_tests {
         state.source_is_lossless = Some(false);
         state.apply_auto_gain_defaults();
         assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+    }
+
+    #[test]
+    fn wavpack_exposes_float32_only_in_lossless_mode() {
+        let mut state = pcm_state(AudioFormat::WavPack, BitDepthChoice::Int24);
+        state.apply_format_constraints();
+        assert!(
+            state
+                .bit_depth
+                .options
+                .iter()
+                .find(|option| option.value == BitDepthChoice::Float32)
+                .is_some_and(|option| option.enabled)
+        );
+        assert!(
+            state
+                .bit_depth
+                .options
+                .iter()
+                .find(|option| option.value == BitDepthChoice::Float64)
+                .is_some_and(|option| !option.enabled)
+        );
+
+        state.bit_depth.select_value(&BitDepthChoice::Float32);
+        state.wavpack_hybrid = true;
+        state.apply_format_constraints();
+        assert!(
+            state
+                .bit_depth
+                .options
+                .iter()
+                .find(|option| option.value == BitDepthChoice::Float32)
+                .is_some_and(|option| !option.enabled)
+        );
+        assert_eq!(
+            state.bit_depth.selected_value(),
+            &BitDepthChoice::Int32,
+            "hybrid mode must not leave a disabled Float32 selection active",
+        );
     }
 
     #[test]
