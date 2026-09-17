@@ -219,7 +219,7 @@ The `FormatState::apply_format_constraints()` method recalculates available opti
 - **AAC**: bit depth and dither disabled; sample rate limited to the encoder's direct-rate table, which tops out at **96 kHz** (`AAC_DIRECT_SAMPLE_RATES_HZ`, `tonepoet-pipeline/src/mapping.rs:609`) — 176.4/192 kHz clamp down to 96 kHz
 - **MP3**: bit depth and dither disabled, sample rate capped at 48 kHz
 - **FLAC/ALAC**: float bit depths (32f, 64f) disabled, and sample rate capped at 384 kHz. ALAC additionally disables Int32
-- **WavPack**: float bit depths **disabled** — the conversion carrier integerizes float sources
+- **WavPack**: lossless output supports explicit **Float32**; Float64 is unsupported, hybrid remains integer-only, and `Source` retains the round-5 float-to-Int32 policy
 - **WAV/AIFF/LPCM**: full range, including float32 and float64
 - **APE/Musepack/Shorten/TTA**: float disabled (lossless but not encodable; same shape as FLAC)
 
