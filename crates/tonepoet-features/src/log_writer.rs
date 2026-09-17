@@ -111,9 +111,6 @@ fn derive_actual_backend(results: &[ConversionResult], preferred: &str) -> Strin
     if tools.contains("wavpack") {
         parts.push("WavPack");
     }
-    if tools.contains("loudgain") {
-        parts.push("loudgain");
-    }
 
     if parts.is_empty() {
         // Unknown tools — fall back to preferred

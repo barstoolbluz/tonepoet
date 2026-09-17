@@ -16,8 +16,6 @@ pub enum ToolIdentifier {
     Sox,
     /// SSRC binary.
     Ssrc,
-    /// loudgain binary.
-    Loudgain,
     /// metaflac binary.
     Metaflac,
     /// FLAC command-line binary for native decode verification.
@@ -34,7 +32,6 @@ impl ToolIdentifier {
             Self::Ffmpeg => "ffmpeg",
             Self::Sox => "sox",
             Self::Ssrc => "ssrc",
-            Self::Loudgain => "loudgain",
             Self::Metaflac => "metaflac",
             Self::Flac => "flac",
             Self::Custom(name) => name.as_str(),
@@ -183,7 +180,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Create a registry containing built-in FFmpeg, SoX, SSRC, loudgain, and metaflac plugins.
+    /// Create a registry containing built-in FFmpeg, SoX, SSRC, metaflac, and flac plugins.
     #[must_use]
     pub fn with_builtin_tools() -> Self {
         let mut registry = Self::empty();
@@ -195,9 +192,6 @@ impl ToolRegistry {
             .expect("unique built-in plugin");
         registry
             .register(Box::new(crate::plugins::SsrcPlugin))
-            .expect("unique built-in plugin");
-        registry
-            .register(Box::new(crate::plugins::LoudgainPlugin))
             .expect("unique built-in plugin");
         registry
             .register(Box::new(crate::plugins::MetaflacPlugin))
@@ -225,6 +219,33 @@ impl ToolRegistry {
     #[must_use]
     pub fn tool_ids(&self) -> BTreeSet<ToolIdentifier> {
         self.plugins.iter().map(|plugin| plugin.id()).collect()
+    }
+
+    /// Return every plugin that supports this step in the registry's normal
+    /// Auto-selection order (highest support score, then stable tool id).
+    ///
+    /// This is a pure registry query used by the common planner to register
+    /// physical candidates before applying user preference and proof contracts.
+    pub fn supported_tool_ids(
+        &self,
+        context: &PlanContext<'_>,
+        step: &PlanStep,
+    ) -> Vec<ToolIdentifier> {
+        let mut supported: Vec<(&dyn ToolPlugin, ToolSupport)> = self
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.as_ref(), plugin.supports(context, step)))
+            .filter(|(_, support)| support.is_supported())
+            .collect();
+        supported.sort_by(
+            |(left_plugin, left_support), (right_plugin, right_support)| {
+                right_support
+                    .score()
+                    .cmp(&left_support.score())
+                    .then_with(|| left_plugin.id().cmp(&right_plugin.id()))
+            },
+        );
+        supported.into_iter().map(|(plugin, _)| plugin.id()).collect()
     }
 
     /// Return the selected plugin id for a step without building the command.
@@ -263,6 +284,37 @@ impl ToolRegistry {
         step: &PlanStep,
     ) -> Result<PlannedCommand> {
         let plugin = self.select_plugin(context, step)?;
+        plugin.build_command(context, step)
+    }
+
+    /// Build one logical step with an already-selected physical tool.
+    ///
+    /// The common typed planner may freeze candidate authority before runtime.
+    /// This path validates that the selected plugin still supports the exact
+    /// step, but it never re-ranks or substitutes another backend.
+    pub fn build_command_for_tool(
+        &self,
+        context: &PlanContext<'_>,
+        step: &PlanStep,
+        tool: &ToolIdentifier,
+    ) -> Result<PlannedCommand> {
+        let plugin = self
+            .plugins
+            .iter()
+            .map(Box::as_ref)
+            .find(|plugin| plugin.id() == *tool)
+            .ok_or_else(|| PlanningError::RegistryError {
+                reason: format!("selected tool {tool} is not registered"),
+            })?;
+        if !plugin.supports(context, step).is_supported() {
+            return Err(PlanningError::plugin_rejected(
+                tool.clone(),
+                format!(
+                    "already-selected tool does not support operation {}",
+                    step.operation.label(),
+                ),
+            ));
+        }
         plugin.build_command(context, step)
     }
 

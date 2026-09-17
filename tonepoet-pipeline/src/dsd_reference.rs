@@ -8,7 +8,12 @@ use crate::enums::{AudioFormat, BitDepthTarget, DsdRate, PcmBitDepth, RateTarget
 use crate::error::{PlanningError, Result};
 use crate::plan::{
     CommandEnvironmentPolicy, ConversionPlan, Finalization, InputSource, OutputSink, PlanRequest,
-    PlannedCommand, PlannedCommandPipeline, PlannedExecutionStep,
+    PlannedCommand, PlannedCommandPipeline,
+};
+use crate::qualification_schema::{
+    REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT, REFERENCE_CERTIFIED_EDGE_POLICY,
+    REFERENCE_CERTIFIED_OBSERVER_ID, REFERENCE_CERTIFIED_RECONSTRUCTION,
+    REFERENCE_CERTIFIED_SCAN_TIER, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
 };
 use crate::tools::ToolIdentifier;
 use sha2::{Digest, Sha256};
@@ -355,10 +360,12 @@ impl DsdReferencePolicyVersion {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum DsdSourcePathway {
-    /// Qualified Reference pathway.
+    /// Ordinary general DSD-to-PCM conversion. This is the raw settings default.
     #[default]
+    General,
+    /// Qualified Reference delivery pathway. Admission remains deliberately narrow.
     Reference,
-    /// Reserved future Manual pathway; P0 rejects it deterministically.
+    /// Reserved future Manual pathway; current planners refuse it deterministically.
     Manual,
 }
 
@@ -388,7 +395,7 @@ pub enum DsdSourceGainMode {
     NormalizePeak,
 }
 
-/// Native-v2 settings for DSD-source conversions.
+/// Directional settings for DSD-source conversions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdSourceSettings {
@@ -409,7 +416,7 @@ pub struct DsdSourceSettings {
 impl Default for DsdSourceSettings {
     fn default() -> Self {
         Self {
-            pathway: DsdSourcePathway::Reference,
+            pathway: DsdSourcePathway::General,
             reference_policy: DsdReferencePolicyVersion::SoxNg14801V16,
             profile: DsdReconstructionSelection::Reference,
             gain_mode: DsdSourceGainMode::Reference,
@@ -1560,43 +1567,171 @@ pub enum TruePeakPurpose {
     PostFinalAcceptance,
 }
 
-/// Strict true-peak value used by deferred binding.
+/// Exact Reference signal boundary observed by the certified in-process meter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum TruePeakValue {
-    /// Conservative finite true-peak upper bound in dBTP.
-    Finite(DbNano),
-    /// The analyzer reported negative infinity and an independent scan proved
-    /// every finite sample was signed zero.
-    VerifiedSilence,
+pub enum ReferenceObservationSubject {
+    /// Protected Float64 Wave64 reconstruction before the Reference scalar.
+    ProtectedR64,
+    /// Authoritative terminal QPCM after gain/dither/format realization.
+    TerminalQpcm,
 }
 
-/// Parsed true-peak measurement and its conservative authority.
+/// Search completion state retained in Reference evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum ReferenceCertifiedSearchStatus {
+    /// The certified search fully resolved every competitive region.
+    Complete,
+    /// Deterministic bounded work ended with a still-conservative finite interval.
+    WorkLimited,
+}
+
+/// Typed result of one complete Reference certified-peak observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum ReferenceCertifiedPeakResult {
+    /// Every sample in the complete declared programme was exactly signed zero.
+    VerifiedSilence,
+    /// Finite certified interval. Binary64 bit patterns are preserved exactly in evidence.
+    Finite {
+        /// Reporting-only selected-tier point estimate.
+        point_linear_bits: u64,
+        /// Conservative finite-peak lower endpoint.
+        lower_linear_bits: u64,
+        /// Conservative finite-peak upper endpoint; this is the ceiling authority.
+        upper_linear_bits: u64,
+        /// Deterministic certified-search completion state.
+        status: ReferenceCertifiedSearchStatus,
+    },
+}
+
+impl ReferenceCertifiedPeakResult {
+    /// Conservative finite upper endpoint, or zero for verified silence.
+    pub fn conservative_upper_linear(self) -> std::result::Result<f64, String> {
+        match self {
+            Self::VerifiedSilence => Ok(0.0),
+            Self::Finite { upper_linear_bits, .. } => {
+                let value = f64::from_bits(upper_linear_bits);
+                if value.is_finite() && value > 0.0 {
+                    Ok(value)
+                } else {
+                    Err("Reference certified peak has an invalid finite upper endpoint".to_string())
+                }
+            }
+        }
+    }
+
+    /// Conservative finite lower endpoint, or zero for verified silence.
+    pub fn conservative_lower_linear(self) -> std::result::Result<f64, String> {
+        match self {
+            Self::VerifiedSilence => Ok(0.0),
+            Self::Finite { lower_linear_bits, .. } => {
+                let value = f64::from_bits(lower_linear_bits);
+                if value.is_finite() && value >= 0.0 {
+                    Ok(value)
+                } else {
+                    Err("Reference certified peak has an invalid finite lower endpoint".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// Complete evidence record for one Reference certified observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
-pub struct TruePeakMeasurement {
-    /// Plan-local identity.
+pub struct ReferenceCertifiedPeakObservation {
+    /// Plan-local observation identity.
     pub id: MeasurementId,
-    /// Scope required by the consuming deferred expression.
+    /// Singleton plan scope.
     pub scope: MeasurementScope,
-    /// Purpose required by the consuming operation.
+    /// Gain-authority or post-terminal-acceptance purpose.
     pub purpose: TruePeakPurpose,
-    /// Exact analyzer JSON object retained for provenance.
-    pub raw_json: String,
-    /// Analyzer-reported input true peak, or verified silence.
-    pub reported: TruePeakValue,
-    /// Frozen one-sided textual/reporting quantization allowance.
-    pub reporting_uncertainty: DbNano,
-    /// Frozen one-sided analyzer residual allowance.
-    pub analyzer_residual: DbNano,
-    /// Conservative upper bound used for all finite arithmetic.
-    pub conservative_upper: TruePeakValue,
+    /// Exact observed Reference boundary.
+    pub subject: ReferenceObservationSubject,
+    /// Certified observer implementation identity.
+    pub observer_identity: String,
+    /// Named finite reconstruction target.
+    pub reconstruction: String,
+    /// Edge policy.
+    pub edge_policy: String,
+    /// Search tier.
+    pub scan_tier: String,
+    /// Certificate endpoint with hard-ceiling authority.
+    pub authority_endpoint: String,
+    /// Independent carrier reader/decode authority.
+    pub reader_authority: String,
+    /// Exact sample rate observed.
+    pub sample_rate_hz: u32,
+    /// Exact channel count observed.
+    pub channels: u16,
+    /// Complete interleaved programme frame count.
+    pub sample_frames: u64,
+    /// SHA-256 of the exact validated Wave64 sample payload consumed by this reader.
+    pub programme_sha256: Sha256Digest,
+    /// True only after clean EOF and all structural/extent checks have succeeded.
+    pub complete_reader: bool,
+    /// Certified result.
+    pub result: ReferenceCertifiedPeakResult,
+    /// Digest of the canonical certificate/evidence payload produced by the adapter.
+    pub certificate_sha256: Sha256Digest,
 }
 
-/// Strict parser selected for a measurement command.
+impl ReferenceCertifiedPeakObservation {
+    /// Validate the immutable active observer/reader binding for this subject.
+    pub fn validate_active_contract(&self) -> std::result::Result<(), String> {
+        let expected_reader = match self.subject {
+            ReferenceObservationSubject::ProtectedR64 => REFERENCE_R64_READER_ID,
+            ReferenceObservationSubject::TerminalQpcm => REFERENCE_QPCM_READER_ID,
+        };
+        if self.scope != MeasurementScope::Plan
+            || self.observer_identity != REFERENCE_CERTIFIED_OBSERVER_ID
+            || self.reconstruction != REFERENCE_CERTIFIED_RECONSTRUCTION
+            || self.edge_policy != REFERENCE_CERTIFIED_EDGE_POLICY
+            || self.scan_tier != REFERENCE_CERTIFIED_SCAN_TIER
+            || self.authority_endpoint != REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT
+            || self.reader_authority != expected_reader
+            || !self.complete_reader
+            || self.sample_rate_hz == 0
+            || self.channels == 0
+            || self.sample_frames == 0
+        {
+            return Err("Reference certified observation does not match the active finite-target/reader contract".to_string());
+        }
+        if let ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits,
+            lower_linear_bits,
+            upper_linear_bits,
+            ..
+        } = self.result
+        {
+            let point = f64::from_bits(point_linear_bits);
+            let lower = f64::from_bits(lower_linear_bits);
+            let upper = f64::from_bits(upper_linear_bits);
+            if !point.is_finite()
+                || point < 0.0
+                || !lower.is_finite()
+                || lower < 0.0
+                || !upper.is_finite()
+                || upper <= 0.0
+                || lower > upper
+            {
+                return Err("Reference certified observation has an invalid finite interval".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Historical parser tag retained only to reproduce append-only v16 evidence
+/// normalization. It is not an active production observer contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum MeasurementParser {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+enum MeasurementParser {
     /// Historical direct-W64 FFmpeg loudnorm parser contract. Retained for append-only decoding only.
     FfmpegLoudnormInputTpV1,
     /// FFmpeg loudnorm final JSON over the exact f64 streamed-WAV analyzer carrier, using only `input_tp`.
@@ -1608,41 +1743,36 @@ pub enum MeasurementParser {
     SoxStatsPkLevDbV1,
 }
 
-/// One planned measurement step.
+/// Historical planned measurement shape used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
-pub struct PlannedMeasurement {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+struct PlannedMeasurement {
     /// Unique measurement ID.
-    pub id: MeasurementId,
+    id: MeasurementId,
     /// Singleton plan scope.
-    pub scope: MeasurementScope,
+    scope: MeasurementScope,
     /// Gain or acceptance purpose.
-    pub purpose: TruePeakPurpose,
+    purpose: TruePeakPurpose,
     /// Optional typed producer whose stdout is connected directly to the analyzer stdin.
     /// Historical v1 measurements omit this field and read their path-backed carrier directly.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub input_stage: Option<PlannedCommand>,
+    input_stage: Option<PlannedCommand>,
     /// Exact analyzer command.
-    pub command: PlannedCommand,
+    command: PlannedCommand,
     /// Strict parser.
-    pub parser: MeasurementParser,
+    parser: MeasurementParser,
 }
 
-impl PlannedMeasurement {
-    /// Return the durable path-backed carrier that the measurement observes.
-    #[must_use]
-    pub fn carrier_path(&self) -> Option<&Path> {
-        self.input_stage
-            .as_ref()
-            .and_then(|stage| stage.input.as_path())
-            .or_else(|| self.command.input.as_path())
-    }
-}
-
-/// Deferred command argument.
+/// Historical deferred argv token used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum PlannedArg {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+enum PlannedArg {
     /// Literal argv token.
     Literal(String),
     /// Gain resolved from one true-peak measurement and immutable policy.
@@ -1654,39 +1784,59 @@ pub enum PlannedArg {
     },
 }
 
-/// Command resolved only after a typed measurement exists.
+/// Historical deferred command shape used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
-pub struct PlannedDeferredCommand {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+struct PlannedDeferredCommand {
     /// Built-in tool.
-    pub tool: ToolIdentifier,
+    tool: ToolIdentifier,
     /// Literal and bound argv tokens.
-    pub args: Vec<PlannedArg>,
+    args: Vec<PlannedArg>,
     /// Logical input.
-    pub input: InputSource,
+    input: InputSource,
     /// Logical output.
-    pub output: OutputSink,
+    output: OutputSink,
     /// Environment inheritance policy.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub environment_policy: CommandEnvironmentPolicy,
+    environment_policy: CommandEnvironmentPolicy,
     /// Stable environment.
-    pub environment: BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
     /// User-facing description.
-    pub description: String,
+    description: String,
 }
 
-/// High-level P0 operation summary used by provenance and fingerprints.
+/// Historical v16 command/measurement vector retained only to validate
+/// append-only evidence normalization and old qualification fixtures. It is not
+/// part of [`ConversionPlan`] and cannot be executed by production.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+enum LegacyReferenceExecutionStep {
+    Command(PlannedCommand),
+    Pipeline(PlannedCommandPipeline),
+    Measurement(PlannedMeasurement),
+    DeferredCommand(PlannedDeferredCommand),
+}
+
+/// High-level Reference operation summary used by provenance and diagnostics.
+///
+/// These entries are derived from the authoritative common typed plan. They
+/// are not independently executable commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum DsdReferenceOperation {
-    /// Decode/extract to canonical uncompressed DSD.
+    /// Decode/extract to canonical uncompressed DSD while retaining original-source provenance.
     DsdLosslessDecodeMaterialize {
         /// Selected front-end.
         front_end: DsdInputFrontEnd,
         /// Output contract.
         output_contract: CanonicalDsdContract,
     },
-    /// SoX Reference reconstruction render.
+    /// Qualified protected reconstruction into the R64 proof carrier.
     DsdReferenceRender {
         /// Target rate.
         target_rate_hz: u32,
@@ -1695,24 +1845,39 @@ pub enum DsdReferenceOperation {
         /// Policy.
         policy: DsdReferencePolicyVersion,
     },
-    /// True-peak measurement.
-    MeasureTruePeak {
-        /// Measurement identity.
+    /// Validate the protected R64 structure, extent, lattice, and reader premises.
+    ValidateProtectedR64,
+    /// Observe one exact boundary with the certified finite-target meter.
+    ObserveCertifiedTruePeak {
+        /// Observation identity.
         measurement_id: MeasurementId,
-        /// Plan scope.
-        scope: MeasurementScope,
+        /// Exact observed boundary.
+        subject: ReferenceObservationSubject,
         /// Purpose.
         purpose: TruePeakPurpose,
+        /// Independent complete-reader authority.
+        reader_authority: String,
+        /// Certified observer implementation identity.
+        observer_identity: String,
     },
-    /// Terminal realization.
+    /// Resolve the qualified Reference gain from the pre-terminal certificate.
+    ResolveReferenceGain {
+        /// Qualified gain policy.
+        gain_policy: ResolvedGainPolicy,
+        /// Pre-terminal observation.
+        pre_terminal_measurement: MeasurementId,
+    },
+    /// One terminal gain/dither/format realization into QPCM.
     DsdReferenceFinalize {
         /// Final PCM contract.
         sample_contract: FinalPcmContract,
         /// Gain authority.
         gain_policy: ResolvedGainPolicy,
-        /// Pre-final measurement.
-        pre_final_measurement: MeasurementId,
+        /// Pre-terminal observation.
+        pre_terminal_measurement: MeasurementId,
     },
+    /// Validate QPCM structure, exact extent relation, and terminal lattice premises.
+    ValidateTerminalQpcm,
     /// Lossless packaging.
     PackageLossless {
         /// Exact target.
@@ -1720,16 +1885,24 @@ pub enum DsdReferenceOperation {
         /// Final PCM contract.
         sample_contract: FinalPcmContract,
     },
+    /// Verify format-specific packaged sample identity.
+    VerifyPackageIdentity,
+    /// Apply admitted native metadata/ReplayGain/artwork mutation.
+    MutateMetadata,
+    /// Revalidate structure and decoded sample identity after metadata mutation.
+    VerifyPostMetadataIdentity,
+    /// Production publication barrier, including matching release qualification.
+    PublicationBarrier,
 }
 
-/// Pure Reference plan facts retained alongside executable steps.
+/// Pure Reference plan facts retained alongside the common typed plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdReferencePlanSummary {
-    /// Immutable policy ID.
+    /// Immutable sealed Reference policy ID.
     pub policy: DsdReferencePolicyVersion,
-    /// Qualification artifact digest.
-    pub qualification_manifest_digest: Sha256Digest,
+    /// Source-controlled Phase-5 candidate manifest digest. This does not imply promotion.
+    pub qualification_candidate_manifest_digest: Sha256Digest,
     /// Exact product target.
     pub target: ResolvedOutputTarget,
     /// Resolved profile.
@@ -1742,9 +1915,6 @@ pub struct DsdReferencePlanSummary {
     pub gain_policy: ResolvedGainPolicy,
     /// Canonical byte-affecting package compression level, when applicable.
     pub package_compression_level: Option<u8>,
-    /// Workload-derived timeout bound shared by every true-peak analyzer process.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub analyzer_deadline: std::time::Duration,
     /// Planner-owned 64-bit floating reconstruction carrier.
     pub r64_path: PathBuf,
     /// Planner-owned one-and-only terminal PCM carrier.
@@ -1756,9 +1926,9 @@ pub struct DsdReferencePlanSummary {
     /// and ReplayGain mutation operate on this exact path.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delivered_path: PathBuf,
-    /// Semantic plan hash with path roles normalized.
+    /// Common semantic-plan fingerprint for this exact normalized request.
     pub semantic_plan_hash_v1: Sha256Digest,
-    /// Ordered operation summaries.
+    /// Ordered non-executable operation summary.
     pub operations: Vec<DsdReferenceOperation>,
 }
 
@@ -2308,22 +2478,10 @@ pub fn resolve_gain_policy(
                 terminal_bound: bound,
             })
         }
-        DsdSourceGainMode::NormalizePeak => {
-            if settings.fixed_gain_db.is_some() {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.fixed_gain_db",
-                    "fixed gain is invalid when dsd gain mode is normalize",
-                ));
-            }
-            let target = settings.normalize_peak_target_dbfs;
-            if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.normalize_peak_target_dbfs",
-                    "normalize target must be between -12.000000000 and 0.000000000 dBFS",
-                ));
-            }
-            Ok(ResolvedGainPolicy::NormalizePeak { target_dbfs: target })
-        }
+        DsdSourceGainMode::NormalizePeak => Err(PlanningError::invalid_settings(
+            "dsd.from_dsd.gain_mode",
+            "sample-peak NormalizePeak is not a qualified Reference gain policy; use general processing with an explicit Sample-peak normalize effect instead",
+        )),
     }
 }
 
@@ -2447,384 +2605,249 @@ pub fn extract_single_sox_stats_peak_report(
     }
 }
 
-/// Parse the strict SoX `stats` peak token and construct the conservative
-/// measurement authority used by both production execution and release qualification.
-pub fn parse_reference_sox_stats_true_peak_measurement(
-    id: MeasurementId,
-    scope: MeasurementScope,
-    purpose: TruePeakPurpose,
-    raw_peak_db: String,
-    reporting_uncertainty: DbNano,
-    analyzer_residual: DbNano,
-    verified_silence: bool,
-) -> std::result::Result<TruePeakMeasurement, String> {
-    let reported = if raw_peak_db == "-inf" {
-        if !verified_silence {
-            return Err(
-                "Reference SoX stats reported -inf without an independent signed-zero proof"
-                    .to_string(),
-            );
-        }
-        TruePeakValue::VerifiedSilence
-    } else {
-        if raw_peak_db.contains(',')
-            || raw_peak_db.contains('e')
-            || raw_peak_db.contains('E')
-            || raw_peak_db.starts_with('+')
-            || raw_peak_db == "inf"
-            || raw_peak_db == "+inf"
-            || raw_peak_db.eq_ignore_ascii_case("nan")
-        {
-            return Err("Reference SoX stats peak uses unsupported numeric syntax".to_string());
-        }
-        let value = raw_peak_db
-            .parse::<DbNano>()
-            .map_err(|err| format!("invalid Reference SoX stats peak: {err}"))?;
-        if !(DbNano(-1_000_000_000_000)..=DbNano(100_000_000_000)).contains(&value) {
-            return Err("Reference SoX stats peak is outside -1000 to +100 dBTP".to_string());
-        }
-        TruePeakValue::Finite(value)
-    };
-    let conservative_upper = match reported {
-        TruePeakValue::VerifiedSilence => TruePeakValue::VerifiedSilence,
-        TruePeakValue::Finite(value) => TruePeakValue::Finite(
-            value
-                .checked_add(reporting_uncertainty)
-                .and_then(|value| value.checked_add(analyzer_residual))
-                .ok_or_else(|| {
-                    "Reference true-peak uncertainty arithmetic overflow".to_string()
-                })?,
-        ),
-    };
-    let raw_json = format!(r#"{{"pk_lev_db":"{raw_peak_db}"}}"#);
-    Ok(TruePeakMeasurement {
-        id,
-        scope,
-        purpose,
-        raw_json,
-        reported,
-        reporting_uncertainty,
-        analyzer_residual,
-        conservative_upper,
-    })
+/// Common-model Reference gain authority derived from one certified finite-target observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct ReferenceCertifiedGainAuthority {
+    /// Requested Reference policy scalar before any compensated-mode reduction.
+    pub requested_gain: DbNano,
+    /// Scalar selected for the one terminal realization.
+    pub selected_gain: DbNano,
+    /// Active Reference policy ceiling.
+    pub ceiling: DbNano,
+    /// Physical terminal sample-error bound before reconstruction lifting.
+    pub terminal_sample_error_linear_bits: u64,
+    /// Same terminal error lifted into the certified reconstruction target.
+    pub terminal_reconstructed_error_linear_bits: u64,
+    /// Finite-programme ceiling-limited linear gain, absent for verified silence.
+    pub maximum_linear_gain_bits: Option<u64>,
+    /// True only when compensated Reference restoration was reduced for the ceiling.
+    pub reduced_for_ceiling: bool,
 }
 
-/// Parse the strict loudnorm report and construct the conservative measurement
-/// authority used by both production execution and release qualification.
-pub fn parse_reference_true_peak_measurement(
-    id: MeasurementId,
-    scope: MeasurementScope,
-    purpose: TruePeakPurpose,
-    raw_json: String,
-    reporting_uncertainty: DbNano,
-    analyzer_residual: DbNano,
-    verified_silence: bool,
-) -> std::result::Result<TruePeakMeasurement, String> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)] // fields exist so deny_unknown_fields validates the exact grammar
-    struct StrictLoudnormReport {
-        input_i: String,
-        input_tp: String,
-        input_lra: String,
-        input_thresh: String,
-        output_i: String,
-        output_tp: String,
-        output_lra: String,
-        output_thresh: String,
-        normalization_type: String,
-        target_offset: String,
-    }
-
-    let report: StrictLoudnormReport = serde_json::from_str(&raw_json)
-        .map_err(|err| format!("invalid Reference loudnorm JSON: {err}"))?;
-    let StrictLoudnormReport {
-        input_i: _,
-        input_tp,
-        input_lra: _,
-        input_thresh: _,
-        output_i: _,
-        output_tp: _,
-        output_lra: _,
-        output_thresh: _,
-        normalization_type: _,
-        target_offset: _,
-    } = report;
-    let reported = if input_tp == "-inf" {
-        if !verified_silence {
-            return Err(
-                "Reference loudnorm reported -inf without an independent signed-zero proof"
-                    .to_string(),
-            );
-        }
-        TruePeakValue::VerifiedSilence
-    } else {
-        if input_tp.contains(',')
-            || input_tp.contains('e')
-            || input_tp.contains('E')
-            || input_tp.starts_with('+')
-            || input_tp == "inf"
-            || input_tp == "+inf"
-            || input_tp.eq_ignore_ascii_case("nan")
-        {
-            return Err("Reference input_tp uses unsupported numeric syntax".to_string());
-        }
-        let value = input_tp
-            .parse::<DbNano>()
-            .map_err(|err| format!("invalid Reference input_tp: {err}"))?;
-        if !(DbNano(-1_000_000_000_000)..=DbNano(100_000_000_000)).contains(&value) {
-            return Err("Reference input_tp is outside -1000 to +100 dBTP".to_string());
-        }
-        TruePeakValue::Finite(value)
-    };
-    let conservative_upper = match reported {
-        TruePeakValue::VerifiedSilence => TruePeakValue::VerifiedSilence,
-        TruePeakValue::Finite(value) => TruePeakValue::Finite(
-            value
-                .checked_add(reporting_uncertainty)
-                .and_then(|value| value.checked_add(analyzer_residual))
-                .ok_or_else(|| {
-                    "Reference true-peak uncertainty arithmetic overflow".to_string()
-                })?,
-        ),
-    };
-    Ok(TruePeakMeasurement {
-        id,
-        scope,
-        purpose,
-        raw_json,
-        reported,
-        reporting_uncertainty,
-        analyzer_residual,
-        conservative_upper,
-    })
-}
-
-/// Build the exact independent signed-zero scan command used after a `-inf` report.
-///
-/// The opaque carrier binds both the planner-owned path and the immutable decode
-/// route. Float64 W64 is decoded only through the qualified SoX-ng raw-stream
-/// mechanism; direct FFmpeg remains authorized for the other route-table cells.
-#[must_use]
-pub fn build_reference_silence_scan_command(
-    carrier: &ReferenceDecodedCarrier,
-    output: &Path,
-) -> PlannedCommand {
-    let input = carrier.path();
-    let mut command = match carrier.authority().mechanism() {
-        ReferenceDecodeMechanism::DirectFfmpeg => PlannedCommand::new(
-            ToolIdentifier::Ffmpeg,
-            vec![
-                "-y".to_string(),
-                "-nostdin".to_string(),
-                "-hide_banner".to_string(),
-                "-loglevel".to_string(),
-                "error".to_string(),
-                "-i".to_string(),
-                input.display().to_string(),
-                "-map".to_string(),
-                "0:a:0".to_string(),
-                "-f".to_string(),
-                "f64le".to_string(),
-                "-acodec".to_string(),
-                "pcm_f64le".to_string(),
-                output.display().to_string(),
-            ],
-            InputSource::Path(input.to_path_buf()),
-            OutputSink::Path(output.to_path_buf()),
-            None,
-            "Verify Reference signed-zero silence through FFmpeg",
-        ),
-        ReferenceDecodeMechanism::SoxFloat64W64RawStream => PlannedCommand::new(
-            ToolIdentifier::Sox,
-            vec![
-                "-S".to_string(),
-                "-D".to_string(),
-                input.display().to_string(),
-                "-t".to_string(),
-                "raw".to_string(),
-                "-e".to_string(),
-                "floating-point".to_string(),
-                "-b".to_string(),
-                "64".to_string(),
-                "-L".to_string(),
-                output.display().to_string(),
-            ],
-            InputSource::Path(input.to_path_buf()),
-            OutputSink::Path(output.to_path_buf()),
-            None,
-            "Verify Reference signed-zero silence through SoX-ng",
-        ),
-    };
-    command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
-    command.environment.insert("LC_ALL".to_string(), "C".to_string());
-    command
-}
-
-/// Validate a decoded little-endian f64 stream as finite signed zero only.
-pub fn validate_signed_zero_f64le(bytes: &[u8]) -> std::result::Result<(), String> {
-    if bytes.is_empty() || bytes.len() % 8 != 0 {
-        return Err(
-            "Reference silence scan produced an empty or truncated f64 stream".to_string(),
-        );
-    }
-    for chunk in bytes.chunks_exact(8) {
-        let array: [u8; 8] = chunk
-            .try_into()
-            .map_err(|_| "invalid silence scan sample width".to_string())?;
-        let bits = u64::from_le_bytes(array);
-        if bits != 0 && bits != (1_u64 << 63) {
-            return Err(
-                "loudnorm reported -inf but the independent scan found a non-zero or non-finite sample"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Resolve one planned deferred command from typed production measurements.
-pub fn resolve_reference_deferred_command(
-    deferred: &PlannedDeferredCommand,
-    measurements: &BTreeMap<MeasurementId, TruePeakMeasurement>,
-) -> std::result::Result<PlannedCommand, String> {
-    let mut args = Vec::with_capacity(deferred.args.len());
-    for arg in &deferred.args {
-        match arg {
-            PlannedArg::Literal(value) => args.push(value.clone()),
-            PlannedArg::BoundGainDb { true_peak, policy } => {
-                let measurement = measurements.get(true_peak).ok_or_else(|| {
-                    format!(
-                        "missing Reference measurement id {} for deferred gain",
-                        true_peak.0
-                    )
-                })?;
-                if measurement.scope != MeasurementScope::Plan
-                    || measurement.purpose != TruePeakPurpose::GainAuthority
-                {
-                    return Err(format!(
-                        "Reference measurement id {} has the wrong scope or purpose",
-                        true_peak.0
-                    ));
-                }
-                let gain = resolve_bound_gain(measurement.conservative_upper, *policy)
-                    .map_err(|err| format!("Reference gain binding failed: {err}"))?;
-                args.push(gain.render(true));
-            }
-        }
-    }
-    let mut command = PlannedCommand::new(
-        deferred.tool.clone(),
-        args,
-        deferred.input.clone(),
-        deferred.output.clone(),
-        None,
-        deferred.description.clone(),
-    );
-    command.environment_policy = deferred.environment_policy;
-    command.environment = deferred.environment.clone();
-    Ok(command)
-}
-
-/// Resolve a deferred terminal gain from a conservative true-peak authority.
-pub fn resolve_bound_gain(
-    value: TruePeakValue,
+fn reference_policy_gain_parts(
     policy: ResolvedGainPolicy,
-) -> Result<DbNano> {
-    let requested = match policy {
-        ResolvedGainPolicy::ReferenceCompensated { requested_gain, .. } => requested_gain,
-        ResolvedGainPolicy::NativeLevelExact { gain, .. }
-        | ResolvedGainPolicy::FixedExact { gain, .. } => gain,
-        ResolvedGainPolicy::NormalizePeak { .. } => {
-            return Err(PlanningError::invalid_settings(
-                "dsd.reference.bound_gain",
-                "NormalizePeak uses a literal norm target and may not be bound as a gain expression",
-            ));
-        }
-    };
-
-    let (ceiling, bound, may_reduce) = match policy {
+) -> Result<(DbNano, DbNano, TerminalRealizationBound, bool)> {
+    match policy {
         ResolvedGainPolicy::ReferenceCompensated {
+            requested_gain,
             ceiling,
             terminal_bound,
-            ..
-        } => (ceiling, terminal_bound, true),
+        } => Ok((requested_gain, ceiling, terminal_bound, true)),
         ResolvedGainPolicy::NativeLevelExact {
+            gain,
             ceiling,
             terminal_bound,
-            ..
         }
         | ResolvedGainPolicy::FixedExact {
+            gain,
             ceiling,
             terminal_bound,
-            ..
-        } => (ceiling, terminal_bound, false),
-        ResolvedGainPolicy::NormalizePeak { .. } => unreachable!("guarded above"),
-    };
-    if bound.safe_pre_terminal_ceiling_dbtp > ceiling {
-        return Err(PlanningError::invalid_settings(
-            "dsd.reference.terminal_bound",
-            "qualified terminal bound exceeds the Reference ceiling",
-        ));
-    }
-
-    match value {
-        TruePeakValue::VerifiedSilence => Ok(requested),
-        TruePeakValue::Finite(true_peak_upper) => {
-            let maximum_safe = bound
-                .safe_pre_terminal_ceiling_dbtp
-                .checked_sub(true_peak_upper)
-                .ok_or_else(|| PlanningError::invalid_settings(
-                    "dsd.reference.true_peak",
-                    "true-peak safety arithmetic overflow",
-                ))?;
-            if requested <= maximum_safe {
-                Ok(requested)
-            } else if may_reduce {
-                Ok(maximum_safe)
-            } else {
-                Err(invalid_exact_gain("dsd.from_dsd.gain_mode", policy))
-            }
-        }
-    }
-}
-
-/// Validate the post-terminal true peak for qualified gain modes.
-pub fn validate_post_final_true_peak(
-    value: TruePeakValue,
-    policy: ResolvedGainPolicy,
-) -> Result<()> {
-    if matches!(policy, ResolvedGainPolicy::NormalizePeak { .. }) {
-        return Ok(());
-    }
-    match value {
-        TruePeakValue::VerifiedSilence => Ok(()),
-        TruePeakValue::Finite(upper) if upper <= DbNano::REFERENCE_CEILING => Ok(()),
-        TruePeakValue::Finite(_) => Err(PlanningError::invalid_settings(
-            "dsd.reference.post_final_true_peak",
-            "post-final true peak exceeds the Reference -1.000000000 dBTP ceiling",
+        } => Ok((gain, ceiling, terminal_bound, false)),
+        ResolvedGainPolicy::NormalizePeak { .. } => Err(PlanningError::invalid_settings(
+            "dsd.from_dsd.gain_mode",
+            "NormalizePeak is not a qualified Reference gain policy",
         )),
     }
 }
 
-/// Fixed oversampling factor used by policy v14+ true-peak measurement.
+/// Resolve the sealed Reference scalar from the certified pre-terminal upper
+/// endpoint using the common directed linear ceiling solver.
+///
+/// `reconstruction_linf_gain_upper` must be the exported operator bound of the
+/// exact certified reconstruction named by the observation (HQ1024V1 in the
+/// active closure). The historical cached dB safe threshold and 16x analyzer
+/// reserves deliberately do not participate.
+pub fn resolve_reference_certified_gain(
+    observation: &ReferenceCertifiedPeakObservation,
+    policy: ResolvedGainPolicy,
+    reconstruction_linf_gain_upper: f64,
+) -> Result<ReferenceCertifiedGainAuthority> {
+    observation
+        .validate_active_contract()
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
+    if observation.subject != ReferenceObservationSubject::ProtectedR64
+        || observation.purpose != TruePeakPurpose::GainAuthority
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.observer",
+            "Reference gain requires the protected-R64 gain-authority observation",
+        ));
+    }
+    if !reconstruction_linf_gain_upper.is_finite() || reconstruction_linf_gain_upper <= 0.0 {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.terminal_bound",
+            "certified reconstruction operator bound is invalid",
+        ));
+    }
+
+    let (requested_gain, ceiling, terminal_bound, may_reduce) =
+        reference_policy_gain_parts(policy)?;
+    let q63 = terminal_bound.max_added_peak_fs_q63_ceil;
+    if q63 == u64::MAX || q63 >= (1_u64 << 53) {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.terminal_bound",
+            "qualified Reference terminal has no usable physical error bound",
+        ));
+    }
+    // Every admitted q63 value is < 2^53 and therefore converts exactly to
+    // binary64 before exact division by 2^63.
+    let terminal_sample_error = (q63 as f64) / 9_223_372_036_854_775_808.0;
+    let terminal_reconstructed_error =
+        crate::dsd_album_gain::conservative_product_upper_nonnegative(
+            terminal_sample_error,
+            reconstruction_linf_gain_upper,
+        )
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.terminal_bound", reason))?;
+
+    let terminal = crate::dsd_album_gain::AlbumTerminalBound {
+        pre_gain_reconstructed_error_linear: 0.0,
+        stored_sample_error_linear: Some(terminal_sample_error),
+        post_gain_reconstructed_error_linear: terminal_reconstructed_error,
+        domain: crate::dsd_album_gain::AlbumCeilingDomain::LosslessStoredPcm,
+    };
+
+    let (selected_gain, maximum_linear_gain_bits, reduced_for_ceiling) = match observation.result {
+        ReferenceCertifiedPeakResult::VerifiedSilence => {
+            // Exact traversal proved a zero signal. The terminal error itself
+            // must still fit beneath the ceiling; the requested Reference scalar
+            // remains meaningful and need not collapse to the general all-silent 0 dB rule.
+            let ceiling_linear = crate::dsd_album_gain::conservative_linear_gain_lower(ceiling)
+                .map_err(|reason| PlanningError::invalid_settings("dsd.reference.ceiling", reason))?;
+            if terminal_reconstructed_error >= ceiling_linear {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.reference.terminal_bound",
+                    "Reference terminal error leaves no room beneath the policy ceiling",
+                ));
+            }
+            (requested_gain, None, false)
+        }
+        ReferenceCertifiedPeakResult::Finite { .. } => {
+            let upper = observation
+                .result
+                .conservative_upper_linear()
+                .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
+            let participant = crate::dsd_album_gain::AlbumPeakMeasurement::Finite {
+                // Reporting only; the common solver uses `signal_upper_linear`
+                // for hard-ceiling authority.
+                point_db: DbNano::ZERO,
+                signal_upper_linear: upper,
+            };
+            let authority = crate::dsd_album_gain::resolve_true_peak_gain_constraints(
+                ceiling,
+                &[(participant, terminal)],
+                true,
+            )
+            .map_err(|reason| PlanningError::invalid_settings("dsd.reference.true_peak", reason))?;
+            let requested_upper = crate::dsd_album_gain::conservative_linear_gain_upper(requested_gain)
+                .map_err(|reason| PlanningError::invalid_settings("dsd.reference.gain", reason))?;
+            if requested_upper <= authority.maximum_linear_gain {
+                (requested_gain, Some(authority.maximum_linear_gain.to_bits()), false)
+            } else if may_reduce {
+                (
+                    authority.gain_db,
+                    Some(authority.maximum_linear_gain.to_bits()),
+                    true,
+                )
+            } else {
+                return Err(invalid_exact_gain("dsd.from_dsd.gain_mode", policy));
+            }
+        }
+    };
+
+    Ok(ReferenceCertifiedGainAuthority {
+        requested_gain,
+        selected_gain,
+        ceiling,
+        terminal_sample_error_linear_bits: terminal_sample_error.to_bits(),
+        terminal_reconstructed_error_linear_bits: terminal_reconstructed_error.to_bits(),
+        maximum_linear_gain_bits,
+        reduced_for_ceiling,
+    })
+}
+
+/// Fail-closed result of independent post-terminal Reference acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferencePostTerminalAcceptanceError {
+    /// The conservative lower endpoint is proved above the Reference ceiling.
+    CeilingViolated,
+    /// The certified interval straddles the ceiling, so acceptance is unproved.
+    CeilingNotProven,
+}
+
+impl fmt::Display for ReferencePostTerminalAcceptanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CeilingViolated => f.write_str("post-terminal certified lower endpoint exceeds the Reference ceiling"),
+            Self::CeilingNotProven => f.write_str("post-terminal certified interval does not prove the Reference ceiling"),
+        }
+    }
+}
+
+/// Independently accept the actual terminal QPCM against the Reference ceiling.
+///
+/// An upper endpoint at/below the ceiling proves acceptance. A lower endpoint
+/// above the ceiling proves a violation. A straddling interval is uncertainty,
+/// not a measured violation, and fails closed as `CeilingNotProven`.
+pub fn validate_reference_post_terminal_certified_peak(
+    observation: &ReferenceCertifiedPeakObservation,
+    policy: ResolvedGainPolicy,
+) -> std::result::Result<(), ReferencePostTerminalAcceptanceError> {
+    observation
+        .validate_active_contract()
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    if observation.subject != ReferenceObservationSubject::TerminalQpcm
+        || observation.purpose != TruePeakPurpose::PostFinalAcceptance
+    {
+        return Err(ReferencePostTerminalAcceptanceError::CeilingNotProven);
+    }
+    if matches!(observation.result, ReferenceCertifiedPeakResult::VerifiedSilence) {
+        return Ok(());
+    }
+    let (_, ceiling, _, _) =
+        reference_policy_gain_parts(policy).map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    let ceiling_lower = crate::dsd_album_gain::conservative_linear_gain_lower(ceiling)
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    let ceiling_upper = crate::dsd_album_gain::conservative_linear_gain_upper(ceiling)
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    let upper = observation
+        .result
+        .conservative_upper_linear()
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    let lower = observation
+        .result
+        .conservative_lower_linear()
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    if upper <= ceiling_lower {
+        Ok(())
+    } else if lower > ceiling_upper {
+        Err(ReferencePostTerminalAcceptanceError::CeilingViolated)
+    } else {
+        Err(ReferencePostTerminalAcceptanceError::CeilingNotProven)
+    }
+}
+
+// Historical policy-v14-v16 analyzer constants retained only because the
+// inherited qualification/certification artifacts bind their exact values.
+// Phase 5 does not use these values for gain solving or post-terminal
+// acceptance; the certified HQ1024 observer is the sole active authority.
+/// Historical fixed 16x oversampling factor.
 pub const REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR: u32 = 16;
-/// Conservative analytic grid under-read bound for 16x sampling of a signal
-/// bandlimited to the original Nyquist frequency, rounded upward to nanodecibels.
+/// Historical conservative analytic grid under-read bound.
 pub const REFERENCE_TRUE_PEAK_GRID_BOUND: DbNano = DbNano(41_925_957);
-/// Empirically qualified residual allowance for the exact pinned SoX-ng resampler.
+/// Historical pinned-resampler residual allowance.
 pub const REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT: DbNano = DbNano(58_074_043);
-/// Complete analyzer residual: ideal grid plus pinned-resampler components.
+/// Historical complete 16x analyzer residual.
 pub const REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL: DbNano = DbNano(100_000_000);
-/// Analyzer residual plus the existing one-sided reporting-quantization reserve.
+/// Historical analyzer residual plus reporting-quantization reserve.
 pub const REFERENCE_TRUE_PEAK_ONE_SIDED_AUTHORITY: DbNano = DbNano(110_000_000);
-/// Fixed startup reserve for one policy-v15 true-peak analyzer invocation.
+/// Historical policy-v15 analyzer startup reserve.
 pub const REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS: u64 = 120;
-/// Conservative qualified throughput floor used by the policy-v15 deadline model.
+/// Historical policy-v15 analyzer throughput floor.
 pub const REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND: u64 = 1_000_000;
-/// Largest admitted analyzer workload after the streamed-WAV capacity gate.
+/// Historical maximum analyzer workload after the streamed-WAV capacity gate.
 pub const REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES: u64 = 8_589_934_480;
-/// Largest policy-v15 analyzer deadline for any admitted Reference programme.
+/// Historical policy-v15 maximum analyzer deadline.
 pub const REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS: u64 = 8_710;
 
 /// Largest RIFF chunk-size field value representable by the streamed WAV carrier.
@@ -2846,113 +2869,9 @@ pub const REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE: u64 = 8;
 /// One output frame reserved for nanosecond duration quantization and resampler endpoint rounding.
 pub const REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES: u64 = 1;
 
-fn validate_reference_streamed_wav_capacity(
-    duration: Option<std::time::Duration>,
-    contract: FinalPcmContract,
-) -> Result<()> {
-    let duration = duration.ok_or_else(|| {
-        invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-    })?;
-    let sample_frames = duration
-        .as_nanos()
-        .checked_mul(u128::from(contract.sample_rate_hz))
-        .and_then(|value| value.checked_add(999_999_999))
-        .map(|value| value / 1_000_000_000)
-        .and_then(|value| {
-            value.checked_add(u128::from(
-                REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES,
-            ))
-        })
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    let audio_payload_bytes = sample_frames
-        .checked_mul(u128::from(contract.channels))
-        .and_then(|value| {
-            value.checked_mul(u128::from(REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE))
-        })
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    if audio_payload_bytes > u128::from(REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES) {
-        return Err(invalid_reference(
-            "source.duration",
-            ReferenceErrorCode::StreamedWavCapacity,
-        ));
-    }
-    Ok(())
-}
-
-/// Derive the policy-v15 true-peak analyzer deadline from admitted workload.
-///
-/// The workload is the guarded source-frame count multiplied by channels and
-/// the frozen 16x measurement factor. One second is reserved for every started
-/// block of one million oversampled sample values, in addition to a fixed
-/// process-startup reserve. The same value is bound to both processes in the
-/// Float32 FFmpeg-to-SoX route so the pipeline cannot fall back to the generic
-/// one-hour command timeout.
-pub fn reference_true_peak_measurement_deadline(
-    duration: Option<std::time::Duration>,
-    sample_rate_hz: u32,
-    channels: u16,
-) -> Result<std::time::Duration> {
-    let duration = duration.ok_or_else(|| {
-        invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-    })?;
-    let guarded_frames = duration
-        .as_nanos()
-        .checked_mul(u128::from(sample_rate_hz))
-        .and_then(|value| value.checked_add(999_999_999))
-        .map(|value| value / 1_000_000_000)
-        .and_then(|value| {
-            value.checked_add(u128::from(
-                REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES,
-            ))
-        })
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    let workload_sample_values = guarded_frames
-        .checked_mul(u128::from(channels))
-        .and_then(|value| {
-            value.checked_mul(u128::from(REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR))
-        })
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    if workload_sample_values
-        > u128::from(REFERENCE_TRUE_PEAK_MAX_ADMITTED_WORKLOAD_SAMPLE_VALUES)
-    {
-        return Err(invalid_reference(
-            "source.duration",
-            ReferenceErrorCode::StreamedWavCapacity,
-        ));
-    }
-    let throughput = u128::from(
-        REFERENCE_TRUE_PEAK_MIN_OVERSAMPLED_SAMPLE_VALUES_PER_SECOND,
-    );
-    let workload_seconds = workload_sample_values
-        .checked_add(throughput - 1)
-        .map(|value| value / throughput)
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    let deadline_seconds = workload_seconds
-        .checked_add(u128::from(REFERENCE_TRUE_PEAK_DEADLINE_STARTUP_SECONDS))
-        .ok_or_else(|| {
-            invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-        })?;
-    if deadline_seconds > u128::from(REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS) {
-        return Err(invalid_reference(
-            "source.duration",
-            ReferenceErrorCode::StreamedWavCapacity,
-        ));
-    }
-    let deadline_seconds = u64::try_from(deadline_seconds).map_err(|_| {
-        invalid_reference("source.duration", ReferenceErrorCode::StreamedWavCapacity)
-    })?;
-    Ok(std::time::Duration::from_secs(deadline_seconds))
-}
+// Historical streamed-WAV/16x analyzer constants above remain public only because
+// inherited v12-v16 evidence validators bind their exact values. Phase 5 has no
+// executable streamed-analyzer capacity/deadline policy.
 
 /// Largest total byte size admitted for ordinary disk-backed RIFF under policy v6.
 pub const REFERENCE_RIFF_MAX_FILE_BYTES: u64 = u32::MAX as u64;
@@ -3076,13 +2995,41 @@ pub fn reference_scratch_paths(request: &PlanRequest) -> Result<ReferenceScratch
     Ok(ReferenceScratchPaths::for_source_kind(&work_dir, source_kind))
 }
 
-/// Build a deterministic P0 Reference plan.
-pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
+/// Pure static admission/resolution result shared by the common typed planner
+/// and the retained qualified Reference executor.  This contains no paths,
+/// commands, process state, source reads, or qualification promotion.
+#[derive(Debug, Clone)]
+pub(crate) struct ReferenceStaticAdmission {
+    pub source_rate: DsdRate,
+    pub channels: u16,
+    pub target: ResolvedOutputTarget,
+    pub depth: PcmBitDepth,
+    pub target_rate_hz: u32,
+    pub profile: ResolvedDsdProfile,
+    pub front_end: DsdInputFrontEnd,
+    pub gain_policy: ResolvedGainPolicy,
+    pub final_pcm: FinalPcmContract,
+}
+
+/// Resolve every static premise that gates qualified Reference delivery.
+///
+/// This is intentionally the single matrix authority for both
+/// [`plan_reference_dsd`] and the Phase-2 common typed planner.  Missing source
+/// facts are still reported as ordinary planning errors here; the common
+/// planner converts facts that its caller may legitimately provide later into
+/// `NeedFacts` before calling this function.
+pub(crate) fn resolve_reference_static_admission(
+    request: &PlanRequest,
+) -> Result<ReferenceStaticAdmission> {
     let settings = request.settings.dsd.from_dsd;
-    if settings.pathway == DsdSourcePathway::Manual {
+    if settings.pathway != DsdSourcePathway::Reference {
         return Err(invalid_reference(
             "dsd.from_dsd.pathway",
-            ReferenceErrorCode::ManualUnavailable,
+            if settings.pathway == DsdSourcePathway::Manual {
+                ReferenceErrorCode::ManualUnavailable
+            } else {
+                ReferenceErrorCode::CanonicalTarget
+            },
         ));
     }
     if settings.reference_policy != DsdReferencePolicyVersion::SoxNg14801V16 {
@@ -3158,13 +3105,17 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
         invalid_reference("resolved_output_target", ReferenceErrorCode::CanonicalTarget)
     })?;
     if target.is_lossy() {
-        return Err(invalid_reference("resolved_output_target", ReferenceErrorCode::LossyUnavailable));
+        return Err(invalid_reference(
+            "resolved_output_target",
+            ReferenceErrorCode::LossyUnavailable,
+        ));
     }
     let depth = resolve_reference_depth(request.settings.target_bit_depth)?;
     if !target.is_p0_reference_lossless() {
         return Err(invalid_target_depth("resolved_output_target", target, depth));
     }
-    let target_rate_hz = resolve_reference_target_rate(source_rate, request.settings.target_sample_rate)?;
+    let target_rate_hz =
+        resolve_reference_target_rate(source_rate, request.settings.target_sample_rate)?;
     let profile = resolve_reference_profile(source_rate, target_rate_hz, settings.profile)?;
     validate_reference_target_depth(target, depth)?;
     if target == ResolvedOutputTarget::FlacNative && request.settings.flac.compression_level > 8 {
@@ -3179,9 +3130,7 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
             ReferenceErrorCode::CanonicalTarget,
         ));
     }
-    if target == ResolvedOutputTarget::WavPackNative
-        && request.settings.wavpack.correction_file
-    {
+    if target == ResolvedOutputTarget::WavPackNative && request.settings.wavpack.correction_file {
         return Err(invalid_reference(
             "wavpack.correction_file",
             ReferenceErrorCode::CanonicalTarget,
@@ -3215,28 +3164,84 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
             request.planned_riff_non_audio_upper_bound_bytes,
         )?;
     }
-    validate_reference_streamed_wav_capacity(request.source.duration, final_pcm)?;
-    let analyzer_rate_hz = target_rate_hz
-        .checked_mul(REFERENCE_TRUE_PEAK_OVERSAMPLE_FACTOR)
-        .ok_or_else(|| {
-            PlanningError::invalid_settings(
-                "target_sample_rate",
-                "Reference true-peak oversampling rate exceeds the planner's integer range",
-            )
-        })?;
-    let analyzer_deadline = reference_true_peak_measurement_deadline(
-        request.source.duration,
-        target_rate_hz,
+    // The retired 16x streamed-WAV analyzer no longer participates in active
+    // Reference observation, so its RIFF-capacity and workload-deadline model
+    // must not reject an otherwise admitted common-model route. Carrier-specific
+    // R64/QPCM/package capacity checks remain at their actual boundaries.
+    Ok(ReferenceStaticAdmission {
+        source_rate,
         channels,
-    )?;
+        target,
+        depth,
+        target_rate_hz,
+        profile,
+        front_end,
+        gain_policy,
+        final_pcm,
+    })
+}
 
+/// Build the sealed Reference plan summary and staging namespace from the
+/// authoritative common typed plan. The returned plan contains no independently
+/// executable Reference command/step list; the runtime lowers the common graph.
+pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
+    // Preserve the sealed Reference policy's established public admission
+    // precedence and diagnostics. The common planner consumes the same
+    // authority after this preflight for valid routes.
+    resolve_reference_static_admission(request)?;
+    let typed = match crate::semantic_plan::plan_typed(request) {
+        Ok(crate::semantic_plan::PlanningOutcome::Ready(plan)) => plan,
+        Ok(crate::semantic_plan::PlanningOutcome::NeedFacts(facts)) => {
+            let reason = facts
+                .into_iter()
+                .map(|fact| format!("{}: {}", fact.key, fact.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(PlanningError::invalid_source(
+                "semantic_plan",
+                format!("planning requires authoritative source facts: {reason}"),
+            ));
+        }
+        Ok(crate::semantic_plan::PlanningOutcome::Refused(refusal)) => {
+            return Err(PlanningError::invalid_settings(
+                "semantic_plan",
+                format!("{}: {}", refusal.code, refusal.reason),
+            ));
+        }
+        Err(limit) => {
+            return Err(PlanningError::PlanningResourceLimit {
+                resource: limit.resource,
+                requested: limit.requested,
+                limit: limit.limit,
+            });
+        }
+    };
+    crate::semantic_plan::require_current_executor(&typed)?;
+    let semantic_plan_hash_v1 =
+        crate::fingerprint::common_semantic_plan_fingerprint_v1(request, &typed).0;
+    plan_reference_dsd_with_common_hash(request, semantic_plan_hash_v1)
+}
+
+/// Build the Reference staging plan when the caller has already resolved the
+/// authoritative common semantic fingerprint.
+pub(crate) fn plan_reference_dsd_with_common_hash(
+    request: &PlanRequest,
+    semantic_plan_hash_v1: Sha256Digest,
+) -> Result<ConversionPlan> {
+    let admission = resolve_reference_static_admission(request)?;
+    let ReferenceStaticAdmission {
+        source_rate,
+        channels,
+        target,
+        depth: _,
+        target_rate_hz,
+        profile,
+        front_end,
+        gain_policy,
+        final_pcm,
+    } = admission;
+    let settings = request.settings.dsd.from_dsd;
     let context = request.context();
-    // The pure planner consumes immutable source facts and a private-path
-    // placeholder without reading source bytes. The executor attests the
-    // toolchain, materializes a verified private source (decoding DST/SACD when
-    // required), rebinds this path, and proves that the semantic plan is
-    // unchanged before any DSP command runs.
-    let canonical_input = request.input_path.clone();
     let r64 = context.intermediate_path(1, "w64");
     let final_work = context.final_work_path();
     let qpcm = if target == ResolvedOutputTarget::WavW64 {
@@ -3245,7 +3250,8 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
         context.intermediate_path(2, "w64")
     };
 
-    let mut steps = Vec::new();
+    let pre_id = MeasurementId(1);
+    let post_id = MeasurementId(2);
     let mut operations = Vec::new();
     if !matches!(front_end, DsdInputFrontEnd::NativeUncompressed) {
         operations.push(DsdReferenceOperation::DsdLosslessDecodeMaterialize {
@@ -3256,86 +3262,54 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
             },
         });
     }
-
-    let render = build_render_command(
-        &canonical_input,
-        &r64,
-        target_rate_hz,
-        profile,
-        request.source.duration,
-    );
-    steps.push(PlannedExecutionStep::Command(render));
-    operations.push(DsdReferenceOperation::DsdReferenceRender {
-        target_rate_hz,
-        profile,
-        policy: settings.reference_policy,
-    });
-
-    let pre_id = MeasurementId(1);
-    let post_id = MeasurementId(2);
-    steps.push(PlannedExecutionStep::Measurement(build_true_peak_measurement(
-        pre_id,
-        TruePeakPurpose::GainAuthority,
-        &r64,
-        target_rate_hz,
-        channels,
-        analyzer_rate_hz,
-        analyzer_deadline,
-        AnalyzerCarrierRoute::SoxPathOversampledStats,
-    )));
-    operations.push(DsdReferenceOperation::MeasureTruePeak {
-        measurement_id: pre_id,
-        scope: MeasurementScope::Plan,
-        purpose: TruePeakPurpose::GainAuthority,
-    });
-
-    steps.push(PlannedExecutionStep::DeferredCommand(build_terminal_command(
-        &r64,
-        &qpcm,
-        final_pcm,
-        gain_policy,
-        pre_id,
-    )?));
-    operations.push(DsdReferenceOperation::DsdReferenceFinalize {
-        sample_contract: final_pcm,
-        gain_policy,
-        pre_final_measurement: pre_id,
-    });
-
-    let post_measurement_route = if final_pcm.bit_depth == PcmBitDepth::Float32 {
-        AnalyzerCarrierRoute::Float32FfmpegRawToSoxOversampledStats
-    } else {
-        AnalyzerCarrierRoute::SoxPathOversampledStats
-    };
-    steps.push(PlannedExecutionStep::Measurement(build_true_peak_measurement(
-        post_id,
-        TruePeakPurpose::PostFinalAcceptance,
-        &qpcm,
-        target_rate_hz,
-        channels,
-        analyzer_rate_hz,
-        analyzer_deadline,
-        post_measurement_route,
-    )));
-    operations.push(DsdReferenceOperation::MeasureTruePeak {
-        measurement_id: post_id,
-        scope: MeasurementScope::Plan,
-        purpose: TruePeakPurpose::PostFinalAcceptance,
-    });
-
+    operations.extend([
+        DsdReferenceOperation::DsdReferenceRender {
+            target_rate_hz,
+            profile,
+            policy: settings.reference_policy,
+        },
+        DsdReferenceOperation::ValidateProtectedR64,
+        DsdReferenceOperation::ObserveCertifiedTruePeak {
+            measurement_id: pre_id,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            purpose: TruePeakPurpose::GainAuthority,
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+        },
+        DsdReferenceOperation::ResolveReferenceGain {
+            gain_policy,
+            pre_terminal_measurement: pre_id,
+        },
+        DsdReferenceOperation::DsdReferenceFinalize {
+            sample_contract: final_pcm,
+            gain_policy,
+            pre_terminal_measurement: pre_id,
+        },
+        DsdReferenceOperation::ValidateTerminalQpcm,
+        DsdReferenceOperation::ObserveCertifiedTruePeak {
+            measurement_id: post_id,
+            subject: ReferenceObservationSubject::TerminalQpcm,
+            purpose: TruePeakPurpose::PostFinalAcceptance,
+            reader_authority: REFERENCE_QPCM_READER_ID.to_string(),
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+        },
+    ]);
     if target != ResolvedOutputTarget::WavW64 {
-        steps.push(build_package_step(
-            &qpcm,
-            &final_work,
-            target,
-            final_pcm,
-            &request.settings,
-        )?);
         operations.push(DsdReferenceOperation::PackageLossless {
             target,
             sample_contract: final_pcm,
         });
     }
+    operations.push(DsdReferenceOperation::VerifyPackageIdentity);
+    let metadata_mutation_requested = request.settings.metadata.transfer_tags
+        || request.settings.metadata.preserve_artwork
+        || request.settings.metadata.store_source_audio_md5
+        || request.settings.replay_gain.mode.is_some();
+    if metadata_mutation_requested {
+        operations.push(DsdReferenceOperation::MutateMetadata);
+        operations.push(DsdReferenceOperation::VerifyPostMetadataIdentity);
+    }
+    operations.push(DsdReferenceOperation::PublicationBarrier);
 
     let finalization = Some(Finalization::AtomicRename {
         from: final_work.clone(),
@@ -3343,31 +3317,13 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
     });
     let scratch_paths = reference_scratch_paths(request)?;
     let mut cleanup_paths = vec![r64.clone(), qpcm.clone()];
-    cleanup_paths.extend(
-        scratch_paths
-            .all()
-            .into_iter()
-            .map(Path::to_path_buf),
-    );
+    cleanup_paths.extend(scratch_paths.all().into_iter().map(Path::to_path_buf));
     if final_work != request.output_path {
         cleanup_paths.push(final_work.clone());
     }
     cleanup_paths.sort();
     cleanup_paths.dedup();
 
-    let qualification_manifest_digest = qualification_manifest_digest();
-    let semantic_plan_hash_v1 = semantic_plan_hash(
-        settings.reference_policy,
-        source_rate,
-        channels,
-        target,
-        target_rate_hz,
-        profile,
-        final_pcm,
-        gain_policy,
-        front_end,
-        &steps,
-    );
     let package_compression_level = match target {
         ResolvedOutputTarget::FlacNative => Some(request.settings.flac.compression_level),
         ResolvedOutputTarget::WavPackNative => {
@@ -3377,14 +3333,13 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
     };
     let summary = DsdReferencePlanSummary {
         policy: settings.reference_policy,
-        qualification_manifest_digest,
+        qualification_candidate_manifest_digest: qualification_candidate_manifest_digest(),
         target,
         profile,
         front_end,
         final_pcm,
         gain_policy,
         package_compression_level,
-        analyzer_deadline,
         r64_path: r64,
         qpcm_path: qpcm,
         packaged_path: final_work,
@@ -3392,12 +3347,26 @@ pub fn plan_reference_dsd(request: &PlanRequest) -> Result<ConversionPlan> {
         semantic_plan_hash_v1,
         operations,
     };
-    Ok(ConversionPlan::execute_steps_with_cleanup(
-        steps,
+    Ok(ConversionPlan::execute_reference_with_cleanup(
         cleanup_paths,
         finalization,
         summary,
     ))
+}
+
+/// Build the exact qualified protected-R64 reconstruction prefix for ordinary
+/// general processing. This reuses the Reference reconstruction command and
+/// profile contract, but it does not claim qualified Reference delivery for
+/// the later ordinary export/effects/gain/terminal suffix.
+#[must_use]
+pub fn build_reference_protected_reconstruction_command(
+    input: &Path,
+    output: &Path,
+    target_rate_hz: u32,
+    profile: ResolvedDsdProfile,
+    duration: Option<std::time::Duration>,
+) -> PlannedCommand {
+    build_render_command(input, output, target_rate_hz, profile, duration)
 }
 
 /// Build the exact production render transcript for a qualification-only profile fixture.
@@ -3463,191 +3432,63 @@ fn build_render_command(
     command
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnalyzerCarrierRoute {
-    /// SoX-ng reads the path-backed W64 carrier, creates the qualified 16x
-    /// measurement view, and reports its sample peak with `stats`.
-    SoxPathOversampledStats,
-    /// FFmpeg decodes Float32 W64 to headerless f64le because SoX-ng 14.8.0.1
-    /// mis-scales that carrier; SoX-ng then creates and measures the same 16x view.
-    Float32FfmpegRawToSoxOversampledStats,
-}
-
-fn build_true_peak_measurement(
-    id: MeasurementId,
-    purpose: TruePeakPurpose,
-    input: &Path,
-    sample_rate_hz: u32,
-    channels: u16,
-    oversampled_rate_hz: u32,
-    expected_duration: std::time::Duration,
-    route: AnalyzerCarrierRoute,
-) -> PlannedMeasurement {
-    let description = match purpose {
-        TruePeakPurpose::GainAuthority => "Measure pre-final true peak",
-        TruePeakPurpose::PostFinalAcceptance => "Measure post-final true peak",
-    };
-    let mut environment = BTreeMap::new();
-    environment.insert("LC_ALL".to_string(), "C".to_string());
-
-    let (input_stage, args, command_input) = match route {
-        AnalyzerCarrierRoute::SoxPathOversampledStats => (
-            None,
-            vec![
-                "-S".to_string(),
-                "-D".to_string(),
-                input.display().to_string(),
-                "-n".to_string(),
-                "rate".to_string(),
-                "-v".to_string(),
-                "-L".to_string(),
-                "-s".to_string(),
-                oversampled_rate_hz.to_string(),
-                "stats".to_string(),
-            ],
-            InputSource::Path(input.to_path_buf()),
-        ),
-        AnalyzerCarrierRoute::Float32FfmpegRawToSoxOversampledStats => {
-            let mut producer = PlannedCommand::new(
-                ToolIdentifier::Ffmpeg,
-                vec![
-                    "-nostdin".to_string(),
-                    "-hide_banner".to_string(),
-                    "-nostats".to_string(),
-                    "-loglevel".to_string(),
-                    "error".to_string(),
-                    "-i".to_string(),
-                    input.display().to_string(),
-                    "-map".to_string(),
-                    "0:a:0".to_string(),
-                    "-vn".to_string(),
-                    "-sn".to_string(),
-                    "-dn".to_string(),
-                    "-c:a".to_string(),
-                    "pcm_f64le".to_string(),
-                    "-f".to_string(),
-                    "f64le".to_string(),
-                    "pipe:1".to_string(),
-                ],
-                InputSource::Path(input.to_path_buf()),
-                OutputSink::Stdout,
-                Some(expected_duration),
-                "Decode Float32 W64 to exact f64le analyzer stream",
-            );
-            producer.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
-            producer.environment = environment.clone();
-            producer.timeout_budget = Some(expected_duration);
-            (
-                Some(producer),
-                vec![
-                    "-S".to_string(),
-                    "-D".to_string(),
-                    "-t".to_string(),
-                    "raw".to_string(),
-                    "-e".to_string(),
-                    "floating-point".to_string(),
-                    "-b".to_string(),
-                    "64".to_string(),
-                    "-L".to_string(),
-                    "-r".to_string(),
-                    sample_rate_hz.to_string(),
-                    "-c".to_string(),
-                    channels.to_string(),
-                    "-".to_string(),
-                    "-n".to_string(),
-                    "rate".to_string(),
-                    "-v".to_string(),
-                    "-L".to_string(),
-                    "-s".to_string(),
-                    oversampled_rate_hz.to_string(),
-                    "stats".to_string(),
-                ],
-                InputSource::Stdin,
-            )
-        }
-    };
-
-    let mut command = PlannedCommand::new(
-        ToolIdentifier::Sox,
-        args,
-        command_input,
-        OutputSink::Stdout,
-        Some(expected_duration),
-        description,
-    );
-    command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
-    command.environment = environment;
-    command.timeout_budget = Some(expected_duration);
-    PlannedMeasurement {
-        id,
-        scope: MeasurementScope::Plan,
-        purpose,
-        input_stage,
-        command,
-        parser: MeasurementParser::SoxStatsPkLevDbV1,
-    }
-}
-
-fn build_terminal_command(
+/// Lower the one admitted Reference terminal realization from protected R64
+/// to QPCM after the common gain decision has produced an exact scalar.
+pub fn lower_reference_terminal_command(
     input: &Path,
     output: &Path,
     contract: FinalPcmContract,
-    gain_policy: ResolvedGainPolicy,
-    pre_id: MeasurementId,
-) -> Result<PlannedDeferredCommand> {
+    selected_gain: DbNano,
+) -> Result<PlannedCommand> {
     let (encoding, bits) = match contract.bit_depth {
-        PcmBitDepth::Int16 => ("signed-integer", "16"),
         PcmBitDepth::Int24 => ("signed-integer", "24"),
         PcmBitDepth::Float32 => ("floating-point", "32"),
         PcmBitDepth::Float64 => ("floating-point", "64"),
+        PcmBitDepth::Int16 => {
+            return Err(invalid_reference(
+                "target_bit_depth",
+                ReferenceErrorCode::Int16TerminalUnqualified,
+            ));
+        }
         PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
             return Err(invalid_terminal_depth("target_bit_depth", contract.bit_depth));
         }
     };
     let mut args = vec![
-        PlannedArg::Literal("-S".to_string()),
-        PlannedArg::Literal("-D".to_string()),
-        PlannedArg::Literal(input.display().to_string()),
-        PlannedArg::Literal("-t".to_string()),
-        PlannedArg::Literal("w64".to_string()),
-        PlannedArg::Literal("-e".to_string()),
-        PlannedArg::Literal(encoding.to_string()),
-        PlannedArg::Literal("-b".to_string()),
-        PlannedArg::Literal(bits.to_string()),
-        PlannedArg::Literal(output.display().to_string()),
+        "-S".to_string(),
+        "-D".to_string(),
+        input.display().to_string(),
+        "-t".to_string(),
+        "w64".to_string(),
+        "-e".to_string(),
+        encoding.to_string(),
+        "-b".to_string(),
+        bits.to_string(),
+        output.display().to_string(),
+        "gain".to_string(),
+        selected_gain.render(true),
     ];
-    match gain_policy {
-        ResolvedGainPolicy::NormalizePeak { target_dbfs } => {
-            args.push(PlannedArg::Literal("norm".to_string()));
-            args.push(PlannedArg::Literal(target_dbfs.render(false)));
-        }
-        _ => {
-            args.push(PlannedArg::Literal("gain".to_string()));
-            args.push(PlannedArg::BoundGainDb {
-                true_peak: pre_id,
-                policy: gain_policy,
-            });
-        }
-    }
     match contract.dither {
         ReferenceDither::None => {}
-        ReferenceDither::Tpdf => args.push(PlannedArg::Literal("dither".to_string())),
+        ReferenceDither::Tpdf => args.push("dither".to_string()),
         ReferenceDither::Shibata => {
-            args.push(PlannedArg::Literal("dither".to_string()));
-            args.push(PlannedArg::Literal("-s".to_string()));
+            return Err(PlanningError::invalid_settings(
+                "target_bit_depth",
+                "Reference Shibata terminal realization is not admitted",
+            ));
         }
     }
-    let mut environment = BTreeMap::new();
-    environment.insert("LC_ALL".to_string(), "C".to_string());
-    Ok(PlannedDeferredCommand {
-        tool: ToolIdentifier::Sox,
+    let mut command = PlannedCommand::new(
+        ToolIdentifier::Sox,
         args,
-        input: InputSource::Path(input.to_path_buf()),
-        output: OutputSink::Path(output.to_path_buf()),
-        environment_policy: CommandEnvironmentPolicy::ClearAndSet,
-        environment,
-        description: "Apply one Reference terminal realization".to_string(),
-    })
+        InputSource::Path(input.to_path_buf()),
+        OutputSink::Path(output.to_path_buf()),
+        None,
+        "Apply one qualified Reference terminal realization",
+    );
+    command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
+    command.environment = reference_command_environment();
+    Ok(command)
 }
 
 fn reference_command_environment() -> BTreeMap<String, String> {
@@ -3867,19 +3708,37 @@ fn build_package_command(
     Ok(command)
 }
 
-fn build_package_step(
+/// Physical package lowering selected by the common Reference executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferencePackageLowering {
+    /// One path-backed command.
+    Command(PlannedCommand),
+    /// One shell-free producer/consumer pipeline.
+    Pipeline(PlannedCommandPipeline),
+}
+
+/// Lower admitted Reference packaging without creating a second executable plan.
+/// Direct Wave64 delivery returns `None` because QPCM is already the package.
+pub fn lower_reference_package(
     input: &Path,
     output: &Path,
     target: ResolvedOutputTarget,
     contract: FinalPcmContract,
     settings: &crate::settings::PipelineSettings,
-) -> Result<PlannedExecutionStep> {
-    if contract.bit_depth == PcmBitDepth::Float64 {
+) -> Result<Option<ReferencePackageLowering>> {
+    if target == ResolvedOutputTarget::WavW64 {
+        return Ok(None);
+    }
+    if contract.bit_depth == PcmBitDepth::Float64
+        && matches!(target, ResolvedOutputTarget::WavRiff | ResolvedOutputTarget::WavRf64)
+    {
         return build_float64_wav_package_pipeline(input, output, target, contract)
-            .map(PlannedExecutionStep::Pipeline);
+            .map(ReferencePackageLowering::Pipeline)
+            .map(Some);
     }
     build_package_command(input, output, target, contract, settings)
-        .map(PlannedExecutionStep::Command)
+        .map(ReferencePackageLowering::Command)
+        .map(Some)
 }
 
 fn wavpack_compression_level_value(mode: crate::enums::WavPackMode) -> u8 {
@@ -3896,6 +3755,18 @@ fn wavpack_compression_level(mode: crate::enums::WavPackMode) -> String {
     wavpack_compression_level_value(mode).to_string()
 }
 
+/// Canonical digest of the source-controlled Phase-5 candidate manifest.
+///
+/// Candidate status is intentionally non-promoting; production admission also
+/// requires a matching completed report and release certification.
+#[must_use]
+pub fn qualification_candidate_manifest_digest() -> Sha256Digest {
+    Sha256Digest::of_bytes(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/qualification/dsd_reference_common_v17_candidate.json"
+    )))
+}
+
 /// Canonical digest of the source-controlled v16 qualification artifact schema/content.
 #[must_use]
 pub fn qualification_manifest_digest() -> Sha256Digest {
@@ -3905,6 +3776,9 @@ pub fn qualification_manifest_digest() -> Sha256Digest {
     )))
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn semantic_plan_hash(
     policy: DsdReferencePolicyVersion,
     source_rate: DsdRate,
@@ -3915,13 +3789,13 @@ fn semantic_plan_hash(
     final_pcm: FinalPcmContract,
     gain_policy: ResolvedGainPolicy,
     front_end: DsdInputFrontEnd,
-    steps: &[PlannedExecutionStep],
+    steps: &[LegacyReferenceExecutionStep],
 ) -> Sha256Digest {
     let mut text = format!(
         "tonepoet-dsd-reference-semantic-plan/v1\nsource_rate={source_rate:?}\nchannels={channels}\ntarget={}\ntarget_rate={target_rate_hz}\nprofile={profile:?}\nfinal={final_pcm:?}\ngain={gain_policy:?}\nfront_end={front_end:?}\n",
         target.key()
     );
-    let normalize: fn(&PlannedExecutionStep) -> String = match policy {
+    let normalize: fn(&LegacyReferenceExecutionStep) -> String = match policy {
         DsdReferencePolicyVersion::SoxNg14801V1
         | DsdReferencePolicyVersion::SoxNg14801V2
         | DsdReferencePolicyVersion::SoxNg14801V3 => normalize_step_for_hash_legacy,
@@ -3961,21 +3835,24 @@ fn semantic_plan_hash(
 // Preserve the commissioned v1-v3 semantic-hash byte contract. Those policy
 // identifiers are decode-only, but historical plans and evidence must remain
 // independently verifiable after the append-only v4 correction.
-fn normalize_step_for_hash_legacy(step: &PlannedExecutionStep) -> String {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+fn normalize_step_for_hash_legacy(step: &LegacyReferenceExecutionStep) -> String {
     match step {
-        PlannedExecutionStep::Command(command) => format!(
+        LegacyReferenceExecutionStep::Command(command) => format!(
             "command:{}:{}",
             command.tool.program(),
             normalize_args(&command.args)
         ),
-        PlannedExecutionStep::Pipeline(pipeline) => format!(
+        LegacyReferenceExecutionStep::Pipeline(pipeline) => format!(
             "pipeline:{}:{}:{}:{}",
             pipeline.producer.tool.program(),
             normalize_args(&pipeline.producer.args),
             pipeline.consumer.tool.program(),
             normalize_args(&pipeline.consumer.args),
         ),
-        PlannedExecutionStep::Measurement(measurement) => {
+        LegacyReferenceExecutionStep::Measurement(measurement) => {
             let input_stage = measurement.input_stage.as_ref().map_or_else(
                 || "direct".to_string(),
                 |stage| {
@@ -4001,7 +3878,7 @@ fn normalize_step_for_hash_legacy(step: &PlannedExecutionStep) -> String {
                 normalize_environment(&measurement.command.environment),
             )
         }
-        PlannedExecutionStep::DeferredCommand(command) => {
+        LegacyReferenceExecutionStep::DeferredCommand(command) => {
             let args = command
                 .args
                 .iter()
@@ -4018,9 +3895,12 @@ fn normalize_step_for_hash_legacy(step: &PlannedExecutionStep) -> String {
     }
 }
 
-fn normalize_step_for_hash_v4(step: &PlannedExecutionStep) -> String {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+fn normalize_step_for_hash_v4(step: &LegacyReferenceExecutionStep) -> String {
     match step {
-        PlannedExecutionStep::Command(command) => format!(
+        LegacyReferenceExecutionStep::Command(command) => format!(
             "command:{}:{}:{}:{}:{}:{}",
             command.tool.program(),
             normalize_args(&command.args),
@@ -4029,7 +3909,7 @@ fn normalize_step_for_hash_v4(step: &PlannedExecutionStep) -> String {
             normalize_environment_policy(command.environment_policy),
             normalize_environment(&command.environment),
         ),
-        PlannedExecutionStep::Pipeline(pipeline) => format!(
+        LegacyReferenceExecutionStep::Pipeline(pipeline) => format!(
             "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             pipeline.producer.tool.program(),
             normalize_args(&pipeline.producer.args),
@@ -4044,7 +3924,7 @@ fn normalize_step_for_hash_v4(step: &PlannedExecutionStep) -> String {
             normalize_environment_policy(pipeline.consumer.environment_policy),
             normalize_environment(&pipeline.consumer.environment),
         ),
-        PlannedExecutionStep::Measurement(measurement) => {
+        LegacyReferenceExecutionStep::Measurement(measurement) => {
             let input_stage = measurement.input_stage.as_ref().map_or_else(
                 || "direct".to_string(),
                 |stage| {
@@ -4072,7 +3952,7 @@ fn normalize_step_for_hash_v4(step: &PlannedExecutionStep) -> String {
                 normalize_environment(&measurement.command.environment),
             )
         }
-        PlannedExecutionStep::DeferredCommand(command) => {
+        LegacyReferenceExecutionStep::DeferredCommand(command) => {
             let args = command
                 .args
                 .iter()
@@ -4097,17 +3977,20 @@ fn normalize_step_for_hash_v4(step: &PlannedExecutionStep) -> String {
     }
 }
 
-fn normalize_step_for_hash_v15(step: &PlannedExecutionStep) -> String {
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
+fn normalize_step_for_hash_v15(step: &LegacyReferenceExecutionStep) -> String {
     let deadline_identity = match step {
-        PlannedExecutionStep::Command(command) => {
+        LegacyReferenceExecutionStep::Command(command) => {
             normalize_expected_duration(command.expected_duration)
         }
-        PlannedExecutionStep::Pipeline(pipeline) => format!(
+        LegacyReferenceExecutionStep::Pipeline(pipeline) => format!(
             "producer={};consumer={}",
             normalize_expected_duration(pipeline.producer.expected_duration),
             normalize_expected_duration(pipeline.consumer.expected_duration),
         ),
-        PlannedExecutionStep::Measurement(measurement) => format!(
+        LegacyReferenceExecutionStep::Measurement(measurement) => format!(
             "producer={};consumer={}",
             measurement
                 .input_stage
@@ -4117,7 +4000,7 @@ fn normalize_step_for_hash_v15(step: &PlannedExecutionStep) -> String {
                 }),
             normalize_expected_duration(measurement.command.expected_duration),
         ),
-        PlannedExecutionStep::DeferredCommand(_) => "not_applicable".to_string(),
+        LegacyReferenceExecutionStep::DeferredCommand(_) => "not_applicable".to_string(),
     };
     format!(
         "{}:deadline={deadline_identity}",
@@ -4125,6 +4008,9 @@ fn normalize_step_for_hash_v15(step: &PlannedExecutionStep) -> String {
     )
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_expected_duration(duration: Option<std::time::Duration>) -> String {
     duration.map_or_else(
         || "none".to_string(),
@@ -4132,6 +4018,9 @@ fn normalize_expected_duration(duration: Option<std::time::Duration>) -> String 
     )
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_environment_policy(policy: CommandEnvironmentPolicy) -> &'static str {
     match policy {
         CommandEnvironmentPolicy::InheritAndSet => "inherit_and_set",
@@ -4139,6 +4028,9 @@ fn normalize_environment_policy(policy: CommandEnvironmentPolicy) -> &'static st
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_input_source(input: &InputSource) -> String {
     match input {
         InputSource::Path(path) => format!("path:{}", normalize_path_token(&path.display().to_string())),
@@ -4146,6 +4038,9 @@ fn normalize_input_source(input: &InputSource) -> String {
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_output_sink(output: &OutputSink) -> String {
     match output {
         OutputSink::Path(path) => {
@@ -4158,6 +4053,9 @@ fn normalize_output_sink(output: &OutputSink) -> String {
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_environment(environment: &std::collections::BTreeMap<String, String>) -> String {
     environment
         .iter()
@@ -4166,6 +4064,9 @@ fn normalize_environment(environment: &std::collections::BTreeMap<String, String
         .join("\u{1f}")
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_args(args: &[String]) -> String {
     args.iter()
         .map(|value| normalize_path_token(value))
@@ -4173,6 +4074,9 @@ fn normalize_args(args: &[String]) -> String {
         .join("\u{1f}")
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_path_token(value: &str) -> String {
     let path = Path::new(value);
     if path.is_absolute() || value.contains(".tonepoet-") {
@@ -4388,125 +4292,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_silence_scan_obeys_the_decode_route_table() {
-        for (depth, expected_mechanism, expected_tool) in [
-            (
-                PcmBitDepth::Int24,
-                ReferenceDecodeMechanism::DirectFfmpeg,
-                ToolIdentifier::Ffmpeg,
-            ),
-            (
-                PcmBitDepth::Float32,
-                ReferenceDecodeMechanism::DirectFfmpeg,
-                ToolIdentifier::Ffmpeg,
-            ),
-            (
-                PcmBitDepth::Float64,
-                ReferenceDecodeMechanism::SoxFloat64W64RawStream,
-                ToolIdentifier::Sox,
-            ),
-        ] {
-            let request = reference_request(
-                DsdRate::Dsd64,
-                88_200,
-                ResolvedOutputTarget::WavW64,
-                depth,
-                DsdReconstructionSelection::Reference,
-            );
-            let plan = plan_reference_dsd(&request).expect("Reference W64 plan");
-            let summary = plan.reference.as_ref().expect("Reference summary");
-            let carrier = summary
-                .decoded_carrier(ReferenceDecodedCarrierSelector::TerminalQpcm)
-                .expect("terminal QPCM carrier route");
-            assert_eq!(carrier.authority().mechanism(), expected_mechanism);
-            let output = PathBuf::from("silence-scan.f64le");
-            let command = build_reference_silence_scan_command(&carrier, &output);
-            assert_eq!(command.tool, expected_tool);
-            assert_eq!(command.input.as_path(), Some(carrier.path()));
-            assert_eq!(command.output.as_path(), Some(output.as_path()));
-            let input_arg = carrier.path().display().to_string();
-            let output_arg = output.display().to_string();
-            match expected_mechanism {
-                ReferenceDecodeMechanism::DirectFfmpeg => assert!(
-                    command.args.iter().map(String::as_str).eq([
-                        "-y",
-                        "-nostdin",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-i",
-                        input_arg.as_str(),
-                        "-map",
-                        "0:a:0",
-                        "-f",
-                        "f64le",
-                        "-acodec",
-                        "pcm_f64le",
-                        output_arg.as_str(),
-                    ])
-                ),
-                ReferenceDecodeMechanism::SoxFloat64W64RawStream => assert!(
-                    command.args.iter().map(String::as_str).eq([
-                        "-S",
-                        "-D",
-                        input_arg.as_str(),
-                        "-t",
-                        "raw",
-                        "-e",
-                        "floating-point",
-                        "-b",
-                        "64",
-                        "-L",
-                        output_arg.as_str(),
-                    ])
-                ),
-            }
-            assert_eq!(
-                command.environment_policy,
-                CommandEnvironmentPolicy::ClearAndSet
-            );
-            assert_eq!(command.environment.get("LC_ALL").map(String::as_str), Some("C"));
-        }
-
-        let request = reference_request(
-            DsdRate::Dsd64,
-            88_200,
-            ResolvedOutputTarget::WavW64,
-            PcmBitDepth::Int24,
-            DsdReconstructionSelection::Reference,
-        );
-        let plan = plan_reference_dsd(&request).expect("Reference W64 plan");
-        let summary = plan.reference.as_ref().expect("Reference summary");
-        let reconstruction = summary
-            .decoded_carrier(ReferenceDecodedCarrierSelector::ReconstructionR64)
-            .expect("reconstruction R64 carrier route");
-        assert_eq!(
-            reconstruction.authority().mechanism(),
-            ReferenceDecodeMechanism::SoxFloat64W64RawStream
-        );
-        let output = PathBuf::from("r64-silence-scan.f64le");
-        let command = build_reference_silence_scan_command(&reconstruction, &output);
-        assert_eq!(command.tool, ToolIdentifier::Sox);
-        assert_eq!(command.input.as_path(), Some(reconstruction.path()));
-        assert_eq!(command.output.as_path(), Some(output.as_path()));
-        let input_arg = reconstruction.path().display().to_string();
-        let output_arg = output.display().to_string();
-        assert!(command.args.iter().map(String::as_str).eq([
-            "-S",
-            "-D",
-            input_arg.as_str(),
-            "-t",
-            "raw",
-            "-e",
-            "floating-point",
-            "-b",
-            "64",
-            "-L",
-            output_arg.as_str(),
-        ]));
-    }
-
-    #[test]
     fn v7_carrier_binding_rejects_qpcm_path_with_riff_package_identity() {
         let request = reference_request(
             DsdRate::Dsd64,
@@ -4622,159 +4407,6 @@ mod tests {
             let parsed: DbNano = serde_json::from_str(&serialized).unwrap();
             assert_eq!(parsed, value);
         }
-    }
-
-    fn loudnorm_json(input_tp: &str, output_tp: &str) -> String {
-        format!(
-            r#"{{
-                "input_i":"-23.00","input_tp":"{input_tp}","input_lra":"0.10",
-                "input_thresh":"-33.00","output_i":"-23.00","output_tp":"{output_tp}",
-                "output_lra":"0.10","output_thresh":"-33.00",
-                "normalization_type":"linear","target_offset":"0.00"
-            }}"#
-        )
-    }
-
-    #[test]
-    fn shared_true_peak_authority_is_strict_and_uses_input_tp() {
-        let json = loudnorm_json("-3.000000000", "9.000000000");
-        assert_eq!(
-            extract_single_loudnorm_report(&format!("prefix\n{json}\nsuffix")).unwrap(),
-            json
-        );
-        assert!(extract_single_loudnorm_report("no report").is_err());
-        assert!(extract_single_loudnorm_report(&format!("{json}\n{json}")).is_err());
-        let duplicate_key = json.replacen(
-            "\"input_tp\":\"-3.000000000\"",
-            "\"input_tp\":\"-3.000000000\",\"input_tp\":\"-4.000000000\"",
-            1,
-        );
-        assert!(parse_reference_true_peak_measurement(
-            MeasurementId(6),
-            MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            duplicate_key,
-            DbNano::ZERO,
-            DbNano::ZERO,
-            false,
-        )
-        .is_err());
-
-        let parsed = parse_reference_true_peak_measurement(
-            MeasurementId(7),
-            MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            json,
-            DbNano(10_000_000),
-            DbNano(100_000_000),
-            false,
-        )
-        .unwrap();
-        assert_eq!(parsed.reported, TruePeakValue::Finite(DbNano(-3_000_000_000)));
-        assert_eq!(
-            parsed.conservative_upper,
-            TruePeakValue::Finite(DbNano(-2_890_000_000))
-        );
-
-        let silence = loudnorm_json("-inf", "0.0");
-        assert!(parse_reference_true_peak_measurement(
-            MeasurementId(8),
-            MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            silence.clone(),
-            DbNano::ZERO,
-            DbNano::ZERO,
-            false,
-        )
-        .is_err());
-        assert_eq!(
-            parse_reference_true_peak_measurement(
-                MeasurementId(8),
-                MeasurementScope::Plan,
-                TruePeakPurpose::GainAuthority,
-                silence,
-                DbNano::ZERO,
-                DbNano::ZERO,
-                true,
-            )
-            .unwrap()
-            .reported,
-            TruePeakValue::VerifiedSilence
-        );
-
-        let mut zeroes = Vec::new();
-        zeroes.extend_from_slice(&0_u64.to_le_bytes());
-        zeroes.extend_from_slice(&(1_u64 << 63).to_le_bytes());
-        validate_signed_zero_f64le(&zeroes).unwrap();
-        assert!(validate_signed_zero_f64le(&1_f64.to_le_bytes()).is_err());
-    }
-
-    #[test]
-    fn v14_sox_stats_authority_is_strict_and_conservative() {
-        let stderr = "DC offset   0.000000\nPk lev dB      -6.020599913\nRMS lev dB     -9.030899870\n";
-        assert_eq!(
-            extract_single_sox_stats_peak_report(stderr, 1).unwrap(),
-            "-6.020599913"
-        );
-        assert!(extract_single_sox_stats_peak_report("no peak", 1).is_err());
-        assert!(
-            extract_single_sox_stats_peak_report(&format!("{stderr}{stderr}"), 1).is_err()
-        );
-        assert!(
-            extract_single_sox_stats_peak_report("Pk lev dB -6.0 trailing", 1).is_err()
-        );
-        assert_eq!(
-            extract_single_sox_stats_peak_report(
-                "             Overall     Left      Right\nPk lev dB      -6.02     -6.02     -9.03\n",
-                2,
-            )
-            .unwrap(),
-            "-6.02"
-        );
-        assert!(
-            extract_single_sox_stats_peak_report("Pk lev dB -6.02 -6.02", 2).is_err()
-        );
-
-        let parsed = parse_reference_sox_stats_true_peak_measurement(
-            MeasurementId(9),
-            MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            "-6.020599913".to_string(),
-            DbNano(10_000_000),
-            DbNano(100_000_000),
-            false,
-        )
-        .unwrap();
-        assert_eq!(parsed.reported, TruePeakValue::Finite(DbNano(-6_020_599_913)));
-        assert_eq!(
-            parsed.conservative_upper,
-            TruePeakValue::Finite(DbNano(-5_910_599_913))
-        );
-        assert_eq!(parsed.raw_json, r#"{"pk_lev_db":"-6.020599913"}"#);
-        assert!(parse_reference_sox_stats_true_peak_measurement(
-            MeasurementId(10),
-            MeasurementScope::Plan,
-            TruePeakPurpose::GainAuthority,
-            "-inf".to_string(),
-            DbNano::ZERO,
-            DbNano::ZERO,
-            false,
-        )
-        .is_err());
-        assert_eq!(
-            parse_reference_sox_stats_true_peak_measurement(
-                MeasurementId(10),
-                MeasurementScope::Plan,
-                TruePeakPurpose::GainAuthority,
-                "-inf".to_string(),
-                DbNano::ZERO,
-                DbNano::ZERO,
-                true,
-            )
-            .unwrap()
-            .reported,
-            TruePeakValue::VerifiedSilence
-        );
     }
 
     #[cfg(feature = "serde")]
@@ -4989,7 +4621,7 @@ mod tests {
             _ => (AudioFormat::Flac, "bin"),
         };
         let mut settings = crate::settings::PipelineSettings::default();
-        settings.dsd = crate::settings::DsdSettings::native_v2();
+        settings.dsd = crate::settings::DsdSettings::reference();
         settings.target_format = format;
         settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
         settings.target_bit_depth = BitDepthTarget::Pcm(depth);
@@ -5007,10 +4639,12 @@ mod tests {
                 sample_kind: Some(SampleKind::Dsd),
                 channels: Some(2),
                 duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
                 dsd_source_kind: Some(DsdSourceKind::DsdiffUncompressed),
                 audio_md5: None,
             },
             settings,
+            plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
             resolved_output_target: Some(target),
@@ -5021,7 +4655,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_binding_uses_the_planner_step_and_historical_policies_cannot_execute_as_v4() {
+    fn common_reference_gain_binding_drives_one_terminal_and_historical_policies_remain_refused() {
         let request = reference_request(
             DsdRate::Dsd64,
             88_200,
@@ -5030,32 +4664,60 @@ mod tests {
             DsdReconstructionSelection::Reference,
         );
         let plan = plan_reference_dsd(&request).unwrap();
-        let deferred = plan
-            .steps()
-            .iter()
-            .find_map(|step| match step {
-                PlannedExecutionStep::DeferredCommand(command) => Some(command),
-                _ => None,
-            })
-            .expect("Reference plan has one deferred terminal command");
-        let mut measurements = BTreeMap::new();
-        measurements.insert(
-            MeasurementId(1),
-            TruePeakMeasurement {
-                id: MeasurementId(1),
-                scope: MeasurementScope::Plan,
-                purpose: TruePeakPurpose::GainAuthority,
-                raw_json: loudnorm_json("-20.000000000", "0.0"),
-                reported: TruePeakValue::Finite(DbNano(-20_000_000_000)),
-                reporting_uncertainty: DbNano::ZERO,
-                analyzer_residual: DbNano::ZERO,
-                conservative_upper: TruePeakValue::Finite(DbNano(-20_000_000_000)),
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let pre_observation = ReferenceCertifiedPeakObservation {
+            id: MeasurementId(1),
+            scope: MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            reconstruction: REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+            edge_policy: REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+            scan_tier: REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+            authority_endpoint: REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            sample_rate_hz: summary.final_pcm.sample_rate_hz,
+            channels: summary.final_pcm.channels,
+            sample_frames: 88_200,
+            programme_sha256: Sha256Digest::of_bytes(b"phase5-reference-gain-test"),
+            complete_reader: true,
+            result: ReferenceCertifiedPeakResult::Finite {
+                point_linear_bits: 0.099_f64.to_bits(),
+                lower_linear_bits: 0.099_f64.to_bits(),
+                upper_linear_bits: 0.1_f64.to_bits(),
+                status: ReferenceCertifiedSearchStatus::WorkLimited,
             },
-        );
-        let resolved = resolve_reference_deferred_command(deferred, &measurements).unwrap();
-        assert!(resolved.args.windows(2).any(|window| {
+            certificate_sha256: Sha256Digest::of_bytes(b"phase5-reference-gain-certificate"),
+        };
+        let authority = resolve_reference_certified_gain(
+            &pre_observation,
+            summary.gain_policy,
+            4.68,
+        )
+        .expect("complete-input certified observation resolves the sealed Reference gain");
+        assert_eq!(authority.requested_gain, DbNano(18_020_599_913));
+        assert_eq!(authority.selected_gain, authority.requested_gain);
+
+        let terminal = lower_reference_terminal_command(
+            &summary.r64_path,
+            &summary.qpcm_path,
+            summary.final_pcm,
+            authority.selected_gain,
+        )
+        .expect("common terminal lowerer accepts the admitted Reference contract");
+        assert_eq!(terminal.tool, ToolIdentifier::Sox);
+        assert!(terminal.args.windows(2).any(|window| {
             window[0] == "gain" && window[1] == "+18.020599913"
         }));
+        assert_eq!(
+            summary
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, DsdReferenceOperation::DsdReferenceFinalize { .. }))
+                .count(),
+            1,
+            "Reference has exactly one terminal realization",
+        );
 
         for historical in [
             DsdReferencePolicyVersion::SoxNg14801V1,
@@ -5452,181 +5114,94 @@ mod tests {
     }
 
     #[test]
-    fn v15_oversampled_measurement_routes_deadlines_and_hash_identity_are_frozen() {
-        let request = reference_request(
-            DsdRate::Dsd64,
-            88_200,
-            ResolvedOutputTarget::WavW64,
-            PcmBitDepth::Float64,
-            DsdReconstructionSelection::Reference,
-        );
-        let plan = plan_reference_dsd(&request).unwrap();
-        let summary = plan.reference.as_ref().expect("Reference summary");
-        assert_eq!(
-            summary.analyzer_deadline,
-            std::time::Duration::from_secs(290)
-        );
-        let measurements = plan
-            .steps()
-            .iter()
-            .filter_map(|step| match step {
-                PlannedExecutionStep::Measurement(measurement) => Some(measurement),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(measurements.len(), 2);
-        for measurement in &measurements {
-            assert!(measurement.input_stage.is_none());
-            assert_eq!(measurement.parser, MeasurementParser::SoxStatsPkLevDbV1);
-            let carrier = measurement
-                .carrier_path()
-                .expect("v15 direct SoX measurement carrier is path-backed")
-                .display()
-                .to_string();
-            assert_eq!(measurement.command.tool, ToolIdentifier::Sox);
-            assert_eq!(measurement.command.input.as_path(), measurement.carrier_path());
-            assert_eq!(measurement.command.output, OutputSink::Stdout);
+    fn phase5_certified_observation_routes_are_explicit_independent_and_finite_target_bound() {
+        for depth in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
+            let request = reference_request(
+                DsdRate::Dsd64,
+                88_200,
+                ResolvedOutputTarget::WavW64,
+                depth,
+                DsdReconstructionSelection::Reference,
+            );
+            let plan = plan_reference_dsd(&request).unwrap();
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            let observations = summary
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    DsdReferenceOperation::ObserveCertifiedTruePeak {
+                        measurement_id,
+                        subject,
+                        purpose,
+                        reader_authority,
+                        observer_identity,
+                    } => Some((
+                        *measurement_id,
+                        *subject,
+                        *purpose,
+                        reader_authority.as_str(),
+                        observer_identity.as_str(),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 2);
             assert_eq!(
-                measurement.command.args,
-                [
-                    "-S",
-                    "-D",
-                    carrier.as_str(),
-                    "-n",
-                    "rate",
-                    "-v",
-                    "-L",
-                    "-s",
-                    "1411200",
-                    "stats",
-                ]
-                .map(str::to_string)
-                .to_vec()
+                observations[0],
+                (
+                    MeasurementId(1),
+                    ReferenceObservationSubject::ProtectedR64,
+                    TruePeakPurpose::GainAuthority,
+                    REFERENCE_R64_READER_ID,
+                    REFERENCE_CERTIFIED_OBSERVER_ID,
+                )
             );
             assert_eq!(
-                measurement.command.environment_policy,
-                CommandEnvironmentPolicy::ClearAndSet
+                observations[1],
+                (
+                    MeasurementId(2),
+                    ReferenceObservationSubject::TerminalQpcm,
+                    TruePeakPurpose::PostFinalAcceptance,
+                    REFERENCE_QPCM_READER_ID,
+                    REFERENCE_CERTIFIED_OBSERVER_ID,
+                )
             );
-            assert_eq!(
-                measurement.command.environment,
-                BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
-            );
-            assert_eq!(
-                measurement.command.expected_duration,
-                Some(std::time::Duration::from_secs(290))
-            );
-            assert_eq!(
-                measurement.command.timeout_budget,
-                Some(std::time::Duration::from_secs(290))
-            );
+            assert_ne!(observations[0].3, observations[1].3);
         }
 
-        let measurement = measurements[0];
-        let baseline = normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(
-            measurement.clone(),
-        ));
-        let mut changed_rate = measurement.clone();
-        changed_rate.command.args[8] = "705600".to_string();
-        assert_ne!(
-            baseline,
-            normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_rate))
-        );
-        let mut changed_parser = measurement.clone();
-        changed_parser.parser = MeasurementParser::FfmpegLoudnormInputTpV3;
-        assert_ne!(
-            baseline,
-            normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_parser))
-        );
-        let mut changed_transport = measurement.clone();
-        changed_transport.command.input = InputSource::Stdin;
-        assert_ne!(
-            baseline,
-            normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_transport))
-        );
-        let mut changed_environment = measurement.clone();
-        changed_environment
-            .command
-            .environment
-            .insert("LC_ALL".to_string(), "en_US.UTF-8".to_string());
-        assert_ne!(
-            baseline,
-            normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_environment))
-        );
-        let mut changed_deadline = measurement.clone();
-        changed_deadline.command.expected_duration = Some(std::time::Duration::from_secs(291));
-        changed_deadline.command.timeout_budget = Some(std::time::Duration::from_secs(291));
-        assert_ne!(
-            baseline,
-            normalize_step_for_hash_v15(&PlannedExecutionStep::Measurement(changed_deadline))
-        );
-
-        let f32_request = reference_request(
-            DsdRate::Dsd64,
-            88_200,
-            ResolvedOutputTarget::WavW64,
-            PcmBitDepth::Float32,
-            DsdReconstructionSelection::Reference,
-        );
-        let f32_plan = plan_reference_dsd(&f32_request).unwrap();
-        let post = f32_plan
-            .steps()
-            .iter()
-            .filter_map(|step| match step {
-                PlannedExecutionStep::Measurement(measurement)
-                    if measurement.purpose == TruePeakPurpose::PostFinalAcceptance =>
-                {
-                    Some(measurement)
-                }
-                _ => None,
-            })
-            .next()
-            .expect("Float32 plan has a post-terminal measurement");
-        let producer = post
-            .input_stage
-            .as_ref()
-            .expect("Float32 post measurement has a typed FFmpeg producer");
-        assert_eq!(post.parser, MeasurementParser::SoxStatsPkLevDbV1);
-        let carrier = post
-            .carrier_path()
-            .expect("Float32 measurement carrier is path-backed")
-            .display()
-            .to_string();
-        assert_eq!(producer.tool, ToolIdentifier::Ffmpeg);
-        assert_eq!(producer.input.as_path(), post.carrier_path());
-        assert_eq!(producer.output, OutputSink::Stdout);
+        let work_limited = ReferenceCertifiedPeakObservation {
+            id: MeasurementId(1),
+            scope: MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            reconstruction: REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+            edge_policy: REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+            scan_tier: REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+            authority_endpoint: REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            sample_rate_hz: 88_200,
+            channels: 2,
+            sample_frames: 1,
+            programme_sha256: Sha256Digest::of_bytes(b"phase5-work-limited"),
+            complete_reader: true,
+            result: ReferenceCertifiedPeakResult::Finite {
+                point_linear_bits: 0.25_f64.to_bits(),
+                lower_linear_bits: 0.249_f64.to_bits(),
+                upper_linear_bits: 0.251_f64.to_bits(),
+                status: ReferenceCertifiedSearchStatus::WorkLimited,
+            },
+            certificate_sha256: Sha256Digest::of_bytes(b"phase5-work-limited-cert"),
+        };
+        work_limited
+            .validate_active_contract()
+            .expect("complete-input WorkLimited evidence remains conservative authority");
+        assert_eq!(work_limited.reconstruction, REFERENCE_CERTIFIED_RECONSTRUCTION);
+        assert_eq!(work_limited.edge_policy, REFERENCE_CERTIFIED_EDGE_POLICY);
+        assert_eq!(work_limited.scan_tier, REFERENCE_CERTIFIED_SCAN_TIER);
         assert_eq!(
-            producer.args,
-            [
-                "-nostdin", "-hide_banner", "-nostats", "-loglevel", "error", "-i",
-                carrier.as_str(), "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a",
-                "pcm_f64le", "-f", "f64le", "pipe:1",
-            ]
-            .map(str::to_string)
-            .to_vec()
-        );
-        assert_eq!(post.command.tool, ToolIdentifier::Sox);
-        assert_eq!(post.command.input, InputSource::Stdin);
-        assert_eq!(
-            post.command.args,
-            [
-                "-S", "-D", "-t", "raw", "-e", "floating-point", "-b", "64", "-L",
-                "-r", "88200", "-c", "2", "-", "-n", "rate", "-v", "-L", "-s",
-                "1411200", "stats",
-            ]
-            .map(str::to_string)
-            .to_vec()
-        );
-        assert_eq!(producer.environment_policy, CommandEnvironmentPolicy::ClearAndSet);
-        assert_eq!(post.command.environment_policy, CommandEnvironmentPolicy::ClearAndSet);
-        assert_eq!(
-            producer.environment,
-            BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
-        );
-        assert_eq!(post.command.environment, producer.environment);
-        assert_eq!(producer.expected_duration, post.command.expected_duration);
-        assert_eq!(
-            post.command.expected_duration,
-            Some(std::time::Duration::from_secs(290))
+            work_limited.authority_endpoint,
+            REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT
         );
     }
 
@@ -5644,14 +5219,18 @@ mod tests {
             let summary = plan.reference.as_ref().expect("Reference summary");
             assert_eq!(summary.policy, DsdReferencePolicyVersion::SoxNg14801V16);
             assert_eq!(summary.qpcm_path.extension().and_then(|value| value.to_str()), Some("w64"));
-            let pipeline = plan
-                .steps()
-                .iter()
-                .find_map(|step| match step {
-                    PlannedExecutionStep::Pipeline(value) => Some(value),
-                    _ => None,
-                })
-                .expect("Float64 RIFF/RF64 uses typed package pipeline");
+            let lowering = lower_reference_package(
+                &summary.qpcm_path,
+                &summary.packaged_path,
+                summary.target,
+                summary.final_pcm,
+                &request.settings,
+            )
+            .expect("Float64 package lowering succeeds")
+            .expect("RIFF/RF64 requires a package lowering");
+            let ReferencePackageLowering::Pipeline(pipeline) = lowering else {
+                panic!("Float64 RIFF/RF64 uses the shared typed package pipeline");
+            };
             assert_eq!(pipeline.producer.tool, ToolIdentifier::Sox);
             assert_eq!(pipeline.producer.input.as_path(), Some(summary.qpcm_path.as_path()));
             assert_eq!(pipeline.producer.output, OutputSink::Stdout);
@@ -5704,14 +5283,14 @@ mod tests {
                 target == ResolvedOutputTarget::WavRf64
             );
 
-            let baseline = normalize_step_for_hash_v4(&PlannedExecutionStep::Pipeline(
+            let baseline = normalize_step_for_hash_v4(&LegacyReferenceExecutionStep::Pipeline(
                 pipeline.clone(),
             ));
             let mut changed = pipeline.clone();
             changed.producer.environment_policy = CommandEnvironmentPolicy::InheritAndSet;
             assert_ne!(
                 baseline,
-                normalize_step_for_hash_v4(&PlannedExecutionStep::Pipeline(changed))
+                normalize_step_for_hash_v4(&LegacyReferenceExecutionStep::Pipeline(changed))
             );
         }
     }
@@ -5734,9 +5313,14 @@ mod tests {
                 selection,
             );
             let plan = plan_reference_dsd(&request).unwrap();
-            let PlannedExecutionStep::Command(render) = &plan.steps()[0] else {
-                panic!("first Reference step must be the SoX render command");
-            };
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            let render = build_reference_protected_reconstruction_command(
+                &request.input_path,
+                &summary.r64_path,
+                summary.final_pcm.sample_rate_hz,
+                summary.profile,
+                request.source.duration,
+            );
             assert_eq!(render.tool, ToolIdentifier::Sox);
             assert!(render.args.windows(2).any(|pair| pair == ["rate", "-u"]));
             match expected {
@@ -5782,15 +5366,40 @@ mod tests {
             "invalid settings for target_bit_depth: DSD-REF-P0-011: flac_native does not support Float32 under Reference policy sox_ng_14_8_0_1_v16. Choose a target/depth pair listed by the policy."
         );
 
+        let exact_gain_observation = ReferenceCertifiedPeakObservation {
+            id: MeasurementId(1),
+            scope: MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            reconstruction: REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+            edge_policy: REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+            scan_tier: REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+            authority_endpoint: REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            sample_frames: 1,
+            programme_sha256: Sha256Digest::of_bytes(b"phase5-exact-gain-refusal"),
+            complete_reader: true,
+            result: ReferenceCertifiedPeakResult::Finite {
+                point_linear_bits: 1.0_f64.to_bits(),
+                lower_linear_bits: 1.0_f64.to_bits(),
+                upper_linear_bits: 1.0_f64.to_bits(),
+                status: ReferenceCertifiedSearchStatus::Complete,
+            },
+            certificate_sha256: Sha256Digest::of_bytes(b"phase5-exact-gain-refusal-cert"),
+        };
+
         let mut source_settings = DsdSourceSettings::default();
         source_settings.gain_mode = DsdSourceGainMode::NativeLevel;
         let native_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
             .expect("native-level policy resolves");
         assert_eq!(
-            resolve_bound_gain(TruePeakValue::Finite(DbNano::ZERO), native_policy)
+            resolve_reference_certified_gain(&exact_gain_observation, native_policy, 4.68)
                 .unwrap_err()
                 .to_string(),
-            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested native-level gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
+            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested native-level gain cannot satisfy the Reference −1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
         );
 
         source_settings.gain_mode = DsdSourceGainMode::Fixed;
@@ -5798,151 +5407,11 @@ mod tests {
         let fixed_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
             .expect("fixed policy resolves");
         assert_eq!(
-            resolve_bound_gain(TruePeakValue::Finite(DbNano::ZERO), fixed_policy)
+            resolve_reference_certified_gain(&exact_gain_observation, fixed_policy, 4.68)
                 .unwrap_err()
                 .to_string(),
-            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested fixed gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
+            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested fixed gain cannot satisfy the Reference −1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
         );
-    }
-
-    #[test]
-    fn streamed_wav_capacity_is_fail_closed_and_boundary_exact() {
-        let contract = FinalPcmContract {
-            sample_rate_hz: 1,
-            channels: 1,
-            sample_kind: SampleKind::Float,
-            bit_depth: PcmBitDepth::Float64,
-            dither: ReferenceDither::None,
-        };
-        let largest_admitted_duration_frames =
-            REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES
-                / REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE
-                - REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES;
-        validate_reference_streamed_wav_capacity(
-            Some(std::time::Duration::from_secs(largest_admitted_duration_frames)),
-            contract,
-        )
-        .expect("the exact bounded carrier must remain admitted");
-        assert_eq!(
-            validate_reference_streamed_wav_capacity(
-                Some(std::time::Duration::from_secs(
-                    largest_admitted_duration_frames + 1,
-                )),
-                contract,
-            )
-            .unwrap_err()
-            .to_string(),
-            format!(
-                "invalid settings for source.duration: {}",
-                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-            )
-        );
-        assert_eq!(
-            validate_reference_streamed_wav_capacity(None, contract)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "invalid settings for source.duration: {}",
-                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-            )
-        );
-
-        let overflow_contract = FinalPcmContract {
-            sample_rate_hz: u32::MAX,
-            channels: u16::MAX,
-            ..contract
-        };
-        assert_eq!(
-            validate_reference_streamed_wav_capacity(
-                Some(std::time::Duration::MAX),
-                overflow_contract,
-            )
-            .unwrap_err()
-            .to_string(),
-            format!(
-                "invalid settings for source.duration: {}",
-                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-            )
-        );
-    }
-
-    #[test]
-    fn true_peak_deadline_is_workload_derived_and_bounded_by_admission() {
-        assert_eq!(
-            REFERENCE_TRUE_PEAK_GRID_BOUND
-                .checked_add(REFERENCE_TRUE_PEAK_RESAMPLER_COMPONENT_LIMIT),
-            Some(REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL)
-        );
-        assert_eq!(
-            REFERENCE_TRUE_PEAK_ANALYZER_RESIDUAL
-                .checked_add(DbNano::POST_FINAL_ACCEPTANCE_RESERVE),
-            Some(REFERENCE_TRUE_PEAK_ONE_SIDED_AUTHORITY)
-        );
-        assert_eq!(
-            reference_true_peak_measurement_deadline(
-                Some(std::time::Duration::from_secs(60)),
-                48_000,
-                2,
-            )
-            .expect("ordinary analyzer deadline resolves"),
-            std::time::Duration::from_secs(213)
-        );
-
-        let largest_admitted_mono_frames =
-            REFERENCE_STREAMED_WAV_MAX_AUDIO_PAYLOAD_BYTES
-                / REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE;
-        let admitted_duration_frames = largest_admitted_mono_frames
-            - REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES;
-        assert_eq!(
-            reference_true_peak_measurement_deadline(
-                Some(std::time::Duration::from_secs(admitted_duration_frames)),
-                1,
-                1,
-            )
-            .expect("maximum admitted analyzer deadline resolves"),
-            std::time::Duration::from_secs(
-                REFERENCE_TRUE_PEAK_MAX_DEADLINE_SECONDS,
-            )
-        );
-        assert_eq!(
-            reference_true_peak_measurement_deadline(None, 48_000, 2)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "invalid settings for source.duration: {}",
-                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-            )
-        );
-    }
-
-    #[test]
-    fn streamed_wav_capacity_applies_to_every_terminal_depth_and_delivery_container() {
-        for (target, depth) in [
-            (ResolvedOutputTarget::FlacNative, PcmBitDepth::Int24),
-            (ResolvedOutputTarget::WavRf64, PcmBitDepth::Float32),
-            (ResolvedOutputTarget::WavW64, PcmBitDepth::Float64),
-        ] {
-            let mut request = reference_request(
-                DsdRate::Dsd64,
-                768_000,
-                target,
-                depth,
-                DsdReconstructionSelection::Reference,
-            );
-            request.source.duration = Some(std::time::Duration::from_secs(5 * 60));
-            plan_reference_dsd(&request).unwrap_or_else(|error| {
-                panic!("valid sub-cap {target:?}/{depth:?} plan was rejected: {error}")
-            });
-
-            request.source.duration = Some(std::time::Duration::from_secs(6 * 60));
-            assert_eq!(
-                plan_reference_dsd(&request).unwrap_err().to_string(),
-                format!(
-                    "invalid settings for source.duration: {}",
-                    reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-                )
-            );
-        }
     }
 
     #[test]
@@ -6011,24 +5480,22 @@ mod tests {
             // exactly as the canonical-target validation test above does.
             request.settings.wavpack.correction_file = false;
             let plan = plan_reference_dsd(&request).unwrap();
-            let crate::plan::PlanAction::Execute { steps, .. } = plan.action else {
-                panic!("Reference plan was not executable");
-            };
-            steps
-                .into_iter()
-                .find_map(|step| match step {
-                    PlannedExecutionStep::Command(command) => {
-                        if command.description
-                            == "Package terminal PCM without sample changes"
-                        {
-                            Some(command.args)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-                .expect("WavPack package command")
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            let lowering = lower_reference_package(
+                &summary.qpcm_path,
+                &summary.packaged_path,
+                summary.target,
+                summary.final_pcm,
+                &request.settings,
+            )
+            .unwrap()
+            .expect("WavPack package lowering");
+            match lowering {
+                ReferencePackageLowering::Command(command) => command.args,
+                ReferencePackageLowering::Pipeline(_) => {
+                    panic!("WavPack package must be a single command")
+                }
+            }
         }
 
         let int24 = package_args(PcmBitDepth::Int24);
@@ -6082,12 +5549,8 @@ mod tests {
             )
         );
         request.resolved_output_target = Some(ResolvedOutputTarget::WavRf64);
-        assert_eq!(
-            plan_reference_dsd(&request).unwrap_err().to_string(),
-            format!(
-                "invalid settings for source.duration: {}",
-                reference_error_text(ReferenceErrorCode::StreamedWavCapacity)
-            )
+        plan_reference_dsd(&request).expect(
+            "RF64 no longer inherits the retired streamed-WAV carrier capacity bound",
         );
     }
 
@@ -6112,22 +5575,22 @@ mod tests {
                 "high-rate Float32 must retain a W64 QPCM carrier"
             );
             assert!(!summary.qpcm_path.to_string_lossy().ends_with(".wav"));
-            let package_commands = plan
-                .steps()
-                .iter()
-                .skip(1)
-                .filter_map(|step| match step {
-                    PlannedExecutionStep::Command(command) => Some(command),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let package_lowering = lower_reference_package(
+                &summary.qpcm_path,
+                &summary.packaged_path,
+                summary.target,
+                summary.final_pcm,
+                &request.settings,
+            )
+            .expect("Float32 package lowering succeeds");
             if target == ResolvedOutputTarget::WavW64 {
                 assert_eq!(summary.qpcm_path, summary.packaged_path);
-                assert!(package_commands.is_empty());
+                assert!(package_lowering.is_none());
             } else {
                 assert_ne!(summary.qpcm_path, summary.packaged_path);
-                assert_eq!(package_commands.len(), 1);
-                let package = package_commands[0];
+                let Some(ReferencePackageLowering::Command(package)) = package_lowering else {
+                    panic!("Float32 RF64 uses the shared single-command package lowering");
+                };
                 assert_eq!(package.input, InputSource::Path(summary.qpcm_path.clone()));
                 assert_eq!(package.output, OutputSink::Path(summary.packaged_path.clone()));
                 assert_eq!(
@@ -6191,28 +5654,22 @@ mod tests {
                 Some("w64")
             );
             assert!(!summary.qpcm_path.to_string_lossy().ends_with(".wav"));
-            let package_pipelines = plan
-                .steps()
-                .iter()
-                .filter_map(|step| match step {
-                    PlannedExecutionStep::Pipeline(pipeline) => Some(pipeline),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let package_commands = plan
-                .steps()
-                .iter()
-                .skip(1)
-                .filter(|step| matches!(step, PlannedExecutionStep::Command(_)))
-                .count();
-            assert_eq!(package_commands, 0);
+            let package_lowering = lower_reference_package(
+                &summary.qpcm_path,
+                &summary.packaged_path,
+                summary.target,
+                summary.final_pcm,
+                &request.settings,
+            )
+            .expect("Float64 package lowering succeeds");
             if target == ResolvedOutputTarget::WavW64 {
                 assert_eq!(summary.qpcm_path, summary.packaged_path);
-                assert!(package_pipelines.is_empty());
+                assert!(package_lowering.is_none());
             } else {
                 assert_ne!(summary.qpcm_path, summary.packaged_path);
-                assert_eq!(package_pipelines.len(), 1);
-                let pipeline = package_pipelines[0];
+                let Some(ReferencePackageLowering::Pipeline(pipeline)) = package_lowering else {
+                    panic!("Float64 RF64 uses the shared headerless package pipeline");
+                };
                 assert_eq!(
                     pipeline.producer.input.as_path(),
                     Some(summary.qpcm_path.as_path())

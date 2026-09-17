@@ -6,7 +6,7 @@ This sandbox did not include `cargo` or `rustc`, so compiler-backed checks must 
 - stale-pattern scan for `BuilderPending`, `DitherPolicy`, `EncodeOptions`, `MainConversionOptions`, `MainDitherType`, `write_id3v2`, and `metaflac --list`
 - duplicate named-field scan for enum variants
 - heuristic public-item doc scan across `src/*.rs`
-- manual inspection of the planner, plugin registry, metadata-disposition pruning, FFmpeg/SoX/SSRC/loudgain/metaflac/FLAC command builders, and regression tests
+- manual inspection of the planner, plugin registry, metadata-disposition pruning, FFmpeg/SoX/SSRC/metaflac/FLAC command builders and the native ReplayGain semantic owner, and regression tests
 
 Required compiler-backed checks before merge:
 

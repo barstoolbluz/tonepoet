@@ -151,8 +151,8 @@ Output: %album% {CBS Sony Japan} / %title%
 # ReplayGain scanning (sox)
 sox --replay-gain album *.flac
 
-# ReplayGain scanning (ffmpeg/loudgain)
-loudgain -a -k -s e *.flac
+# ReplayGain scanning
+# Production ReplayGain is computed in-process with NativeEbu2023 and the native ReportingPeakMeter; there is no external loudgain command.
 
 # Copy artwork and logs
 cp "$SOURCE_DIR"/*.jpg "$OUTPUT_DIR"/
@@ -357,9 +357,9 @@ all_rates = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000
 | **Resampler** | `sox_ng`, `soxr`, `swr`, `SSRC` | `soxr` | All | All* | Always† | See detailed sections |
 | **Resample Quality** | `Fast`, `Normal`, `High`, `Very High`, `Ultra`, `Sinc`, `FIR` | `High`‡ | All | sox_ng | `resampler == 'sox_ng'` | See sox section |
 | **Resample Quality** | `Normal`, `High`, `Very High`, `Ultra` | `High`‡ | All | ffmpeg | `resampler == 'soxr'` | Built into soxr |
-| **Filter Profile** | `Short`, `Normal`, `Long` | `Normal` | All | SSRC | `resampler == 'SSRC'` | `ssrc --profile {profile}` |
+| **Filter Profile** | `Insane`, `High`, `Long`, `Standard`, `Short`, `Fast`, `Lightning` | Derived from Resample Quality (`High` -> `Standard`) | All | SSRC | `resampler == 'SSRC'` | `ssrc --profile {profile}` |
 
-*sox_ng specific to sox_ng backend; soxr/swr specific to ffmpeg backend; SSRC available with any backend via transparent piping  
+*sox_ng is the SoX backend; soxr/swr are FFmpeg resamplers; SSRC is a separate PCM resampling backend selected only for an actual rate change.
 †Within the resampling section  
 ‡Default is `Very High` for Opus/WebM/WebA, `High` for others
 
@@ -400,196 +400,46 @@ all_rates = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000
 
 ### SSRC Resampling Options
 
-**Visibility:** `resampler == 'SSRC'`
+The current planner exposes SSRC only for an actual PCM sample-rate conversion. Setting `ssrc.force = true` when the source and target PCM rates are equal is a deterministic refusal; Tonepoet does not insert SSRC merely to obtain its dither stage. Qualified Reference routing remains sealed and is not broadened by explicit SSRC.
 
-| Field | Options | Default | Mode | Backend Commands |
-|-------|---------|---------|------|------------------|
-| **Filter Profile** | `Short`, `Normal`, `Long` | `Normal` | All | `--profile {profile}` |
-| **Two-pass** | Checkbox | `false` | Expert | `--twopass` |
-| **Normalize** | Checkbox | `false` | Expert | `--normalize` |
-| **Prevent Clipping** | `Off`, `Auto`, `Manual` | `Off` | Expert | See below |
-| **Attenuation** | 0 to -99.9 dB | -3 | Expert* | `--att {value}` |
+Current `SsrcSettings` are:
 
-*Visible only when Prevent Clipping = Manual
+- `force`
+- `insane_mode`
+- `profile`: `Insane`, `High`, `Long`, `Standard`, `Short`, `Fast`, or `Lightning`
+- `attenuation_db` -> `--att`
+- `min_phase` -> `--minPhase`
+- `dither_id` -> optional native `--dither` override
+- `pdf_type`: `Rectangular` (`--pdf 0`) or `Triangular` (`--pdf 1`)
 
-### SSRC Command Examples
+`insane_mode` wins over an explicit profile. With neither set, global resample quality maps to SSRC profiles as follows: `Insane -> Insane`, `Ultra -> High`, `VeryHigh -> Long`, `High -> Standard`, `Medium -> Short`, `Low -> Fast`. There is no `Normal` SSRC profile in the typed surface, and Tonepoet does not expose SSRC `Two-pass`, `Normalize`, or `Prevent Clipping` controls.
 
-```bash
-# Basic resampling with normal profile
-ssrc --rate 96000 --profile normal input.wav output.wav
+The command lowering emits `--rate`, `--profile`, optional `--bits`, optional `--att`, optional `--minPhase`, and the resolved `--dither`/`--pdf` pair when SSRC owns an integer terminal.
 
-# Two-pass with clipping prevention
-ssrc --rate 48000 --twopass --att -3 input.wav output.wav
+## SSRC dither and terminal ownership
 
-# With dither and noise shaping (see Dither section)
-ssrc --rate 44100 --bits 16 --dither 2 input.wav output.wav
-```
+Dither belongs to the final integer quantization, not to a `target_bit_depth < source_bit_depth` comparison. Same-depth integer resampling can therefore dither when the user explicitly requests it. Float SSRC output never dithers.
 
-## Dither & Noise Shaping (Conditional Section)
+With no SSRC-native override, global `None` emits neither `--dither` nor `--pdf`. Global `Tpdf` maps exactly to `--dither 99 --pdf 1`. Global families that SSRC cannot represent exactly are recorded as approximations: sloped TPDF becomes unshaped triangular PDF; Shibata-family choices map to rate-valid ATH Curve A intensities; other named shapers map to ATH Curve A intensity 0 with triangular PDF. Native `dither_id`/`pdf_type` overrides take precedence and are validated against the destination rate. See `docs/ssrc-dither-options.md` for the exact mapping and gate behavior.
 
-**Section Visibility:** `bit_depth == 'Custom' && target_bit_depth < source_bit_depth`
+If SSRC owns the final integer write, resampling and terminal quantization may be fused. If later gain/effects or another admitted terminal must follow, SSRC emits a nonterminal Float64 carrier and the later terminal owns dither/quantization. Active SSRC-native dither/PDF overrides cannot be silently moved across that split.
 
-### Default Dither/Noise Shaping Strategy
+The retained SSRC Int32 native-dither cell is not commissioned. Explicit global Int32 dither may use the admitted Float64 split-terminal route; an explicit SSRC-native Int32 dither/PDF override fails closed.
 
-| Target Bit Depth | Backend | Default Dither | Default Noise Shaping | Implementation |
-|-----------------|---------|----------------|---------------------|----------------|
-| ≤16-bit | sox_ng | Shibata | (built-in) | Direct sox_ng |
-| ≤16-bit | ffmpeg | Shibata* | (built-in)* | Auto hybrid: ffmpeg → sox_ng |
-| ≤16-bit | SSRC | TPDF | ATH-based (ID 2) | Direct SSRC |
-| >16-bit | sox_ng | TPDF | None | Direct sox_ng |
-| >16-bit | ffmpeg | Triangular | None | Direct ffmpeg |
-| >16-bit | SSRC | None | None | Pass-through |
+## SSRC processing-domain and protected authority
 
-*Transparently handled by sox_ng in the pipeline
+Ordinary Float64 SSRC output is `PcmFloating`. Float64 storage and the `High`/`Long`/`Insane` double-computation profiles do not automatically establish the strong Binary64 preservation contract.
 
-### Backend-Specific Dither Options
+Production strong-contract state remains Outcome C:
 
-#### Sox_ng Dither
-| Field | Options | Default | Mode | Context | Backend Commands |
-|-------|---------|---------|------|---------|------------------|
-| **Dither Method** | `None`, `TPDF`, `Sloped TPDF`, `Triangular`, `Shaped` | See defaults | All | Always* | `dither -f {method}` |
-| **Dither Method** | `Shibata`, `Low-Shibata`, `High-Shibata` | `Shibata`† | All | `target ≤ 16-bit` | `dither -f {method}` |
-| **Noise Shaping** | `None`, `F-weighted` | `None` | All | `dither_method == 'TPDF'` | `dither -s` |
-| **Noise Shaping** | Various filters‡ | - | Expert | `dither_method == 'TPDF' && target ≤ 16-bit` | `dither -s -t {filter}` |
+- `Standard`, `Short`, `Fast`, `Lightning`: `Refuted` for the strong Binary64 contract because the audited source uses the single-precision pipeline.
+- `High`, `Long`, `Insane`: `PendingEvidence`; no exact executable evidence cell is commissioned.
 
-†For ≤16-bit targets  
-‡Shibata, Low-Shibata, High-Shibata, E-weighted, Modified E-weighted, Improved E-weighted, Gesemann, Lipshitz
+A future `Established` cell also requires an independently admitted protected ingress. The retained ordinary-PCM ingress is source-rate Float64 classic RIFF/WAV and is admitted only when exact or bounded frame extent proves the physical carrier stays within the protected RIFF cell. Duration estimates do not authorize that capacity. An ordinary registered pre-effect or a DSD-produced Float64 boundary does not inherit protected-ingress authority.
 
-#### FFmpeg Dither
-| Field | Options | Default | Mode | Context | Backend Commands |
-|-------|---------|---------|------|---------|------------------|
-| **Dither Method** | `None`, `Rectangular`, `Triangular`, `Triangular HP` | `Triangular` | All | `target > 16-bit`§ | `-af adither=dither_method={method}` |
-| **Noise Shaping** | `Lipshitz`, `Shibata`, `F-weighted`, `Highpass` | `None` | Expert | `target == 16-bit`§ | `-af adither=noise_shaping={shape}` |
-| **Decode HDCD** | Checkbox | `false` | Expert | Always | `-af hdcd` |
+The latent protected SSRC route writes Float64 W64, validates exact W64 structure and PCM geometry, then copies the payload byte-for-byte to the raw certified-analysis carrier. This is latent commissioning machinery, not a currently commissioned strong SSRC cell.
 
-§FFmpeg dither only for >16-bit; ≤16-bit uses automatic sox_ng pipeline
-
-#### SSRC Dither & Noise Shaping
-| Field | Options | Default | Mode | Backend Commands |
-|-------|---------|---------|------|------------------|
-| **Dither Method** | `None`, `TPDF` | `TPDF` | All | `--dither 99` (for TPDF) |
-| **Noise Shaping** | `None`, `Low-Shibata`, `Normal`, `High-Shibata`, `Extreme/Saturated` | `Normal` | All | See matrix below |
-| **PDF Type** | `Rectangular`, `Triangular`, `Two-level` | `Triangular` | Expert | `--pdf {0\|1\|3}` |
-
-### SSRC Noise Shaping Matrix
-
-The available noise shaping options depend on the target sample rate:
-
-| Sample Rate | Available Curves | Recommended Mappings | SSRC Command |
-|------------|------------------|---------------------|--------------|
-| **44.1 kHz** | A: 0-6, B: 0-6, Legacy: Low/Mid/High | Low→1, Normal→3, High→6 | `--dither {id}` |
-| **48 kHz** | A: 0-6, B: 0-6, Legacy: Low/Mid | Low→1, Normal→3, High→6 | `--dither {id}` |
-| **88.2/96 kHz** | A: 0-2 | Low→1, Normal→1, High→2 | `--dither {id}` |
-| **192 kHz** | A: 0-2 | Low→1, Normal→1, High→2 | `--dither {id}` |
-| **≤22.05 kHz** | A: 0-1, Saturated: 9 | Low→1, Normal→1, High/Extreme→9 | `--dither {id}` |
-
-**Note**: Run `ssrc --dither help` to see all available noise shapers for the current configuration.
-
-### Noise Shaping Filter Sample Rate Restrictions (Sox)
-
-| Filter | Supported Sample Rates | Notes |
-|--------|----------------------|-------|
-| **Lipshitz** | 44.1 kHz only | Classic noise shaping |
-| **F-weighted** | 46 kHz | Perceptually weighted |
-| **E-weighted** | 46 kHz | Base E-weighted filter |
-| **Modified E-weighted** | 46 kHz | Modified variant |
-| **Improved E-weighted** | 46 kHz | Improved variant |
-| **Gesemann** | 44.1, 48 kHz | Limited to common rates |
-| **Shibata** | 8, 11.025, 16, 22.05, 32, 37.8, 44.1, 48 kHz | Wide range support |
-| **Low-Shibata** | 44.1, 48 kHz | Gentler shaping |
-| **High-Shibata** | 44.1 kHz only | Aggressive shaping |
-
-## Combined Command Examples
-
-```bash
-# Sox: High-quality resampling with Shibata dither
-sox input.wav -b 16 output.wav rate -v 96000 dither -f Shibata
-
-# Sox: Extreme quality Sinc with 32x upsampling
-sox input.wav output.wav sinc -n 67108864 -a 140 rate 96000
-
-# FFmpeg: Resample with soxr, automatic sox_ng dither for 16-bit
-ffmpeg -i input.wav -af "aresample=resampler=soxr:precision=33:cutoff=0.95:out_sample_fmt=dbl" -sample_fmt dbl -f wav - | sox - -b 16 output.wav dither -f Shibata
-
-# SSRC: Two-pass with ATH-based noise shaping
-ssrc --rate 44100 --bits 16 --twopass --dither 2 --profile long input.wav output.wav
-
-# Opus encoding with forced 48kHz and optimal dithering
-ffmpeg -i input.wav -af "aresample=resampler=soxr:cheby=1:out_sample_fmt=dbl" -sample_fmt dbl -ar 48000 -f wav - | sox - -b 16 - dither -f Shibata | ffmpeg -i - -c:a libopus -b:a 160k output.opus
-
-# MP3 VBR encoding with LAME V2
-ffmpeg -i input.wav -c:a libmp3lame -q:a 2 output.mp3
-
-# AAC-HE-v2 for low bitrate
-ffmpeg -i input.wav -c:a aac -profile:a aac_he_v2 -b:a 32k output.aac
-
-# FLAC with maximum compression
-ffmpeg -i input.wav -c:a flac -compression_level 12 output.flac
-```
-
-## Automatic Hybrid Processing Pipeline
-
-**This happens automatically when:**
-- Backend = ffmpeg
-- Target bit depth ≤ 16-bit
-- No user configuration required
-
-The system seamlessly executes:
-1. **FFmpeg processes in float64**: `-af "aresample=resampler=soxr:out_sample_fmt=dbl"`
-2. **Output as float64**: `-sample_fmt dbl -f wav -`
-3. **Sox reads float64 and applies dither**: `| sox - -b 16 output.wav dither -f Shibata`
-
-**Result**: Users get sox_ng's superior Shibata dither/noise shaping even when using ffmpeg backend, completely transparently.
-
-## Visibility Matrix
-
-```toml
-[visibility_rules]
-# Format-based visibility
-bit_depth_field = "format in lossless_formats && format != 'DSD'"
-bitrate_control = "format in lossy_formats"
-compression_level = "format == 'FLAC'"
-
-# Lossless formats
-lossless_formats = ["FLAC", "WAV", "RF64", "W64", "AIFF", "ALAC", "WavPack", "APE", "PCM"]
-lossy_formats = ["MP3", "AAC", "Opus", "Ogg Vorbis", "WebM", "WebA", "AC3", "DTS"]
-
-# Resampling visibility
-resampling_section = "(sample_rate == 'Custom' && target_rate != source_rate) || (format in ['Opus', 'WebM', 'WebA', 'AC3'] && source_rate != required_rate)"
-ssrc_options = "resampler == 'SSRC'"
-sox_quality_options = "resampler == 'sox_ng' && backend == 'sox_ng'"
-soxr_options = "resampler == 'soxr' && backend == 'ffmpeg'"
-swr_options = "resampler == 'swr' && backend == 'ffmpeg'"
-
-# Dither visibility
-dither_section = "bit_depth == 'Custom' && target_bit_depth < source_bit_depth"
-ssrc_noise_shaping = "resampler == 'SSRC' && dither_section"
-sox_dither_options = "backend == 'sox_ng' && dither_section"
-ffmpeg_dither_direct = "backend == 'ffmpeg' && target_bit_depth > 16 && dither_section"
-ffmpeg_auto_sox_dither = "backend == 'ffmpeg' && target_bit_depth <= 16 && dither_section"
-
-# Advanced options (Expert view mode)
-sinc_options = "view_mode == 'Expert' && backend == 'sox_ng' && resample_quality == 'Sinc'"
-fir_options = "view_mode == 'Expert' && backend == 'sox_ng' && resample_quality == 'FIR'"
-ssrc_advanced = "view_mode == 'Expert' && resampler == 'SSRC'"
-prevent_clipping_manual = "view_mode == 'Expert' && resampler == 'SSRC' && prevent_clipping == 'Manual'"
-
-# Expert-only sections
-gain_normalization_section = "view_mode == 'Expert'"
-fade_silence_section = "view_mode == 'Expert'"
-channel_operations_section = "view_mode == 'Expert'"
-
-# Sample rate dynamic hiding
-hide_format_if_rate_incompatible = "selected_rate > format_max_rate"
-auto_adjust_rate_on_format_change = "new_format_max_rate < current_rate"
-```
-
-## Future Backend Support (rox - Not Yet Available)
-
-When the rox backend becomes available, it will add:
-- **Precision**: `f32`, `f64`, `f80` options
-- **Stopband**: Extended to 252/300 dB with 80-bit precision
-- Additional resampling algorithms and optimizations
+For certified true-peak Guard/Normalize, the current admitted PCM rate-change fallback is the established FFmpeg/soxr hard-ceiling carrier. An ordinary `BeforePcmResample` registered effect cannot be inserted before that protected resampler because current registered effects do not carry an independent protected overload/Binary64 contract for their output. Existing ordinary non-certified `pre -> resample -> post` effect execution remains available.
 
 ---
 
@@ -782,29 +632,9 @@ ffmpeg -i fm_recording.wav -af "aemphasis=mode=reproduction:type=75fm" out.wav
 | **DSD512** | ≤192 kHz | Substantial clean bandwidth |
 | **DSD1024** | ≤384 kHz | Maximum usable bandwidth |
 
-### SSRC Brick-wall Options (DSD → PCM)
+### SSRC and DSD → PCM
 
-**Visibility:** `dsd_lowpass == 'SSRC Brick-wall'`
-
-| Field | Options | Default | Backend Commands |
-|-------|---------|---------|------------------|
-| **SSRC Profile** | `Long` | `Long` | `--profile long` |
-| **Two-pass** | Checkbox | `true` | `--twopass` |
-| **Pre-attenuation** | -3 to -12 dB | -6 dB | `--att {value}` |
-| **Transition Band** | 100-2000 Hz | 500 Hz | Determines output rate§ |
-
-**Key Point**: DSD is 1-bit. Converting to PCM produces 32-bit representation. SSRC filters this PCM to remove DSD ultrasonic noise.
-
-§SSRC command construction for DSD64→44.1kHz:
-```bash
-# First stage: Convert 1-bit DSD to 32-bit PCM at high rate
-sox input.dsf -t wav -b 32 - rate -v 352800 | \
-# Second stage: SSRC brick-wall filtering to remove DSD noise
-ssrc --rate 44100 --profile long --twopass --att -6 - output.wav
-# Output remains 32-bit PCM unless user explicitly requests bit depth reduction
-```
-
-**Note**: DSD is always 1-bit. The conversion to PCM creates a 32-bit intermediate. SSRC filters out ultrasonic DSD noise while maintaining 32-bit depth. Dithering only applies if subsequently reducing to 16/24-bit.
+SSRC is a PCM resampler, not an authority for the DSD reconstruction step. In ordinary general-processing routes it may be selected only after a DSD source has been reconstructed to PCM and only when there is an actual PCM rate change. The strong protected SSRC ingress authority described above is currently retained for ordinary PCM RIFF/WAV materialization; a DSD-produced Float64 boundary does not inherit it. Qualified Reference DSD delivery remains a separate sealed route.
 
 ### FIR Options (DSD → PCM)
 
@@ -840,21 +670,9 @@ ssrc --rate 44100 --profile long --twopass --att -6 - output.wav
 
 **If backend is ffmpeg, automatic pipeline: ffmpeg (float64) → sox_ng for DSD conversion
 
-### SSRC Options (PCM → DSD)
+### SSRC and PCM → DSD
 
-**Visibility:** `lowpass_method == 'SSRC'`
-
-| Field | Options | Default | Notes |
-|-------|---------|---------|-------|
-| **Profile** | `Normal`, `Long` | `Long` | Steep filtering preferred |
-| **Target Bandwidth** | Based on target DSD | Auto†† | Prevents aliasing |
-
-††Auto bandwidth by target DSD rate:
-- →DSD64: 22 kHz
-- →DSD128: 44 kHz
-- →DSD256: 88 kHz
-- →DSD512: 176 kHz
-- →DSD1024: 352 kHz
+Any SSRC use in a PCM-to-DSD workflow is an ordinary PCM rate-conversion step before the DSD conversion. It uses the same current SSRC profile/control surface documented above; there is no separate DSD-specific SSRC mode or special target-bandwidth authority in `SsrcSettings`.
 
 ## DoP (DSD-over-PCM) Encoding
 
@@ -882,49 +700,15 @@ ssrc --rate 44100 --profile long --twopass --att -6 - output.wav
 | **Bandwidth** | 53-100% | 95% | `quality != 'FIR' && quality != 'SSRC'` | `-b {bw}` |
 | **Transition** | 95-99.77% of Nyquist | 95% | `quality != 'FIR' && quality != 'SSRC'` | Rolloff |
 
-### DSD Rate Change with SSRC
+### DSD rate change and SSRC
 
-When using SSRC for DSD rate changes (e.g., DSD256→DSD64):
+A DSD rate-change workflow may contain an ordinary PCM SSRC step only after DSD has been reconstructed to PCM. That does not make the route part of the strong Binary64 SSRC contract, and it does not override Reference policy. Command construction uses the same `SsrcSettings` surface described above; legacy two-pass examples were not Tonepoet settings.
 
-```bash
-# Stage 1: DSD to high-rate PCM
-sox input_dsd256.dsf -t wav -b 32 - rate -v 2822400 | \
-# Stage 2: SSRC brick-wall (96kHz for DSD256→24kHz for DSD64)
-ssrc --rate 352800 --profile long --twopass --att -6 - - | \
-# Stage 3: Convert back to DSD64
-sox - output_dsd64.dsf
-```
+## Processing Pipeline Notes
 
-## Processing Pipeline Examples
+For DSD/PCM mixed workflows, rely on the typed planner rather than composing the old hand-written SSRC pipelines that previously appeared here. Dither remains owned by the final integer terminal, and any SSRC step must correspond to an actual PCM sample-rate conversion. Reference delivery, certified hard-ceiling processing, and strong SSRC Binary64 preservation each retain their own admission rules.
 
-### DSD64 → 16-bit/44.1kHz PCM (Optimal Quality)
-
-```bash
-# DSD is 1-bit; conversion to PCM creates 32-bit intermediate
-# Stage 1: Convert 1-bit DSD to 32-bit PCM at high rate
-sox input.dsf -t wav -b 32 -r 352800 - | \
-# Stage 2: SSRC brick-wall filtering removes DSD ultrasonic noise
-ssrc --rate 44100 --profile long --twopass --att -6 - - | \
-# Stage 3: Only if user wants 16-bit output, apply dithering
-sox - -b 16 output.wav dither -f Shibata
-```
-
-### 24-bit/96kHz PCM → DSD128 (With Pre-filtering)
-
-```bash
-# Using SSRC for PCM lowpass
-ssrc --rate 96000 --profile long --att -3 input.wav - | \
-sox - -r 5644800 output.dsf
-```
-
-### DSD256 → DSD64 (Rate Conversion)
-
-```bash
-# Multi-stage with SSRC brick-wall
-sox input_dsd256.dsf -t wav -b 32 - rate -v 2822400 | \
-ssrc --rate 352800 --profile long --twopass - - | \
-sox - output_dsd64.dsf
-```
+---
 
 ---
 

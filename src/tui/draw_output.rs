@@ -13,7 +13,7 @@ use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
 ///
-/// When native-v2 is the release default, DSD-to-PCM targets expose the P0
+/// For qualified Reference DSD-to-PCM, DSD-to-PCM targets expose the P0
 /// Reference control surface and omit generic resampler/dither rows owned by
 /// that policy. Pre-promotion releases render the ordinary legacy PCM controls.
 pub fn draw_format_pane(
@@ -158,14 +158,9 @@ pub fn draw_format_pane(
                         format_state.pcm_true_peak_target_is_capped(),
                         theme,
                     )),
-                    FormatField::PcmTruePeakScope => lines.push(pill_row(
+                    FormatField::TruePeakScope => lines.push(pill_row(
                         border_color, w, "TP scope   ", "",
                         &render_pill_spans(&format_state.pcm_true_peak_scope, row_focused, theme),
-                        row_focused, theme,
-                    )),
-                    FormatField::PcmTruePeakBoost => lines.push(pill_row(
-                        border_color, w, "TP boost   ", "",
-                        &render_pill_spans(&format_state.pcm_true_peak_boost, row_focused, theme),
                         row_focused, theme,
                     )),
                     FormatField::PcmTruePeakScan => lines.push(pill_row(
@@ -240,19 +235,19 @@ pub fn draw_format_pane(
                         row_focused,
                         theme,
                     )),
-                    FormatField::DsdGainScope => lines.push(pill_row(
+                    FormatField::DsdTruePeakScope => lines.push(pill_row(
                         border_color,
                         w,
-                        "gain scope ",
+                        "TP scope   ",
                         "",
-                        &render_pill_spans(&format_state.dsd_auto_gain_scope, row_focused, theme),
+                        &render_pill_spans(&format_state.dsd_true_peak_scope, row_focused, theme),
                         row_focused,
                         theme,
                     )),
                     FormatField::DsdTruePeakScan => lines.push(pill_row(
                         border_color,
                         w,
-                        "TP underread",
+                        "TP scan    ",
                         "",
                         &render_pill_spans(&format_state.dsd_true_peak_scan_mode, row_focused, theme),
                         row_focused,
@@ -268,23 +263,26 @@ pub fn draw_format_pane(
                         "",
                         theme,
                     )),
-                    FormatField::DsdNormalizeTarget => {
-                        let (label, value) = if format_state.dsd_reference_controls_available() {
-                            ("normalize  ", format_state.dsd_normalize_target_dbfs)
-                        } else {
-                            ("auto margin", format_state.dsd_auto_gain_margin_db)
-                        };
-                        lines.push(dsd_db_value_row(
-                            border_color,
-                            w,
-                            label,
-                            value,
-                            true,
-                            row_focused,
-                            "",
-                            theme,
-                        ));
-                    }
+                    FormatField::DsdTruePeakTarget => lines.push(dsd_db_value_row(
+                        border_color,
+                        w,
+                        "TP target  ",
+                        format_state.dsd_true_peak_target_dbtp,
+                        true,
+                        row_focused,
+                        "",
+                        theme,
+                    )),
+                    FormatField::DsdSamplePeakTarget => lines.push(dsd_db_value_row(
+                        border_color,
+                        w,
+                        "sample peak",
+                        format_state.dsd_sample_peak_target_dbfs,
+                        true,
+                        row_focused,
+                        "",
+                        theme,
+                    )),
                     FormatField::Container => {
                         let containers = format_state.format.selected_value().available_containers();
                         let spans: Vec<Span> = containers

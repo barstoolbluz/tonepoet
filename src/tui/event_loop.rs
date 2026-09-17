@@ -962,7 +962,7 @@ fn metadata_editor_upsert_per_file_entry(
     } else {
         values.first().cloned().unwrap_or_default()
     };
-    // loudgain rewrites each ReplayGain key as at most one text carrier per
+    // the authoritative ReplayGain writer keeps at most one text carrier per
     // file. Refresh the carrier counts with the values instead of retaining
     // stale duplicate-frame counts from the pre-scan editor snapshot.
     let stored_value_counts = values
@@ -9010,7 +9010,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 app.set_status("metadata editor: Details analysis finished after editor closed");
             }
         }
-        AppMessage::MetadataEditorReplayGainComplete { session_id, generation, mode, paths, result } => {
+        AppMessage::MetadataEditorReplayGainComplete { session_id, generation, mode: _, paths, result } => {
             if let Some(mut taken) = take_metadata_editor_with_restore_slot(app) {
                 if !taken.state.complete_replaygain_scan(session_id, generation) {
                     app.set_status(format!(
@@ -9018,7 +9018,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     ));
                 } else {
                     match result {
-                        Ok(metadata) => {
+                        Ok((metadata, report_summary)) => {
                             if let Some(surface) = taken.state.surface_mut_for_session(session_id) {
                                 metadata_editor_apply_replaygain_metadata(surface, &paths, &metadata);
                                 taken.state.mark_archive_staging_dirty();
@@ -9049,15 +9049,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 }
                                 if let Err(err) = archive_persist_result {
                                     app.set_status(format!(
-                                        "metadata editor: ReplayGain {} wrote staged files, but archive recovery tracking failed: {err}",
-                                        mode.label()
+                                        "metadata editor: {}; archive recovery tracking failed: {err}",
+                                        report_summary
                                     ));
                                 } else {
                                     app.set_status(format!(
-                                        "metadata editor: ReplayGain {} scan wrote {} file{}",
-                                        mode.label(),
-                                        paths.len(),
-                                        if paths.len() == 1 { "" } else { "s" }
+                                        "metadata editor: {}",
+                                        report_summary
                                     ));
                                 }
                             } else {

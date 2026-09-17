@@ -22,6 +22,8 @@ target write lock. Build on these, don't revert them.
 
 ---
 
+> **Phase 4 status (2026-09-13):** This is a historical pre-planner-redesign audit brief. Its ReplayGain findings (P0-3, P1-1, and the ReplayGain portion of P1-2) are superseded by the native Phase 4 implementation: production ReplayGain no longer invokes loudgain; conversion, command-mode writing, the metadata editor, and scan-only analysis share the native NativeEbu2023/reporting-peak path and the authoritative metadata writer. The original text below is retained as audit history, not as current ownership documentation. See the repository-root `HANDOFF.md` for the current contract.
+
 # P0
 
 ## P0-1. Custom tags never reach m4a/ALAC outputs from single-file and archive sources

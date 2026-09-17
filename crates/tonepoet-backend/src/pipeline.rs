@@ -66,6 +66,11 @@ impl PipelineBuilder {
         output: &Path,
         settings: &ConversionSettings,
     ) -> Result<ConversionPipeline> {
+        if settings.replaygain_mode.is_some() {
+            return Err(ConversionError::InvalidSettings(
+                "ReplayGain is owned by Tonepoet's native common-plan executor; the legacy backend pipeline does not execute ReplayGain directly".to_string(),
+            ));
+        }
         // Analyze what operations are needed
         let operations = self.analyze_required_operations(settings)?;
 
@@ -99,9 +104,6 @@ impl PipelineBuilder {
         if ops.needs_dithering {
             ops.dither_complexity = self.determine_dither_complexity(settings.dither_type);
         }
-
-        // Check if post-processing needed
-        ops.needs_replaygain = settings.replaygain_mode.is_some();
 
         Ok(ops)
     }
@@ -277,11 +279,6 @@ impl PipelineBuilder {
             commands.push(self.build_merge_command(input, output, settings)?);
         }
 
-        // Add ReplayGain if enabled (missing from single-backend mode)
-        if settings.replaygain_mode.is_some() {
-            commands.push(self.build_replaygain_command(output, settings)?);
-        }
-
         // Add Lineage.txt metadata if provided
         if settings.lineage_file_path.is_some() {
             commands.push(self.build_lineage_metadata_command(output, settings)?);
@@ -449,12 +446,6 @@ impl PipelineBuilder {
             MetadataStrategy::None => {
                 // No metadata preservation needed
             }
-        }
-
-        // Step 6.5: Add ReplayGain AFTER metadata import
-        // This ensures ReplayGain tags are not wiped out by metadata import operations
-        if operations.needs_replaygain {
-            commands.push(self.build_replaygain_command(output, settings)?);
         }
 
         // Step 7: Add Lineage.txt metadata if provided
@@ -937,59 +928,6 @@ impl PipelineBuilder {
                 builder.build(input, output, settings)
             }
         }
-    }
-
-    /// Build ReplayGain command
-    fn build_replaygain_command(
-        &self,
-        output: &Path,
-        settings: &ConversionSettings,
-    ) -> Result<ConversionCommand> {
-        log::info!(
-            "🎯 Building ReplayGain command for format {:?} with mode {:?}",
-            settings.format,
-            settings.replaygain_mode
-        );
-
-        let (program, args, description) = match settings.format {
-            _ => {
-                // Use loudgain for all formats (including FLAC)
-                // NOTE: FLAC previously used metaflac, but it doesn't respect mode selection
-                // (always writes both tags with identical values, making Album mode broken)
-                let mut args = vec![];
-
-                // Mode selection for loudgain
-                match settings.replaygain_mode {
-                    Some(ReplayGainMode::Album) | Some(ReplayGainMode::Both) => {
-                        // Use track-only mode during per-file processing
-                        // Album gain will be calculated in post-processing batch phase
-                        args.push("-r".to_string());
-                    }
-                    Some(ReplayGainMode::Track) => args.push("-r".to_string()),
-                    _ => {
-                        return Err(ConversionError::InvalidSettings(
-                            "ReplayGain mode not specified".to_string(),
-                        ))
-                    }
-                }
-
-                // loudgain flags
-                args.push("-k".to_string()); // Keep existing tags (noclip)
-                args.push("-s".to_string()); // Tag mode
-                args.push("i".to_string()); // Write ReplayGain 2.0 tags
-                args.push(output.to_string_lossy().to_string());
-
-                ("loudgain".to_string(), args, "ReplayGain with loudgain")
-            }
-        };
-
-        Ok(ConversionCommand {
-            program,
-            arguments: args,
-            environment: HashMap::new(),
-            expected_duration: None,
-            description: description.to_string(),
-        })
     }
 
     /// Build command to set COMMENT tag from Lineage.txt
@@ -1659,7 +1597,6 @@ BEGIN {{ skip=0 }}
             "sox" => std::time::Duration::from_secs(30),  // Sox is medium
             "flac" => std::time::Duration::from_secs(20), // FLAC encoding is fast
             "metaflac" => std::time::Duration::from_secs(5), // Metadata operations are very fast
-            "loudgain" => std::time::Duration::from_secs(15), // ReplayGain analysis takes time
             "ffmpeg" => std::time::Duration::from_secs(30), // FFmpeg varies
             _ => std::time::Duration::from_secs(30),      // Generic fallback
         }
@@ -1675,10 +1612,6 @@ BEGIN {{ skip=0 }}
 
         if operations.dither_complexity == DitherComplexity::GesemmannOnly {
             parts.push("SoX Gesemann dither");
-        }
-
-        if operations.needs_replaygain {
-            parts.push("ReplayGain");
         }
 
         if parts.is_empty() {
@@ -1959,7 +1892,6 @@ struct RequiredOperations {
     resample_type: ResampleType,
     needs_dithering: bool,
     dither_complexity: DitherComplexity,
-    needs_replaygain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2189,7 +2121,6 @@ impl ConversionPipeline {
 
                 // Light operations
                 "metaflac" => 3.0, // Metadata operations
-                "loudgain" => 5.0, // ReplayGain analysis
                 "opustags" => 2.0, // Tag operations
 
                 // Unknown operations

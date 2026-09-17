@@ -4384,8 +4384,19 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
 
         // LUFS + true peak (if available).
         let mut extra: Vec<(&str, String, Color)> = Vec::new();
-        if let Some(lufs) = r.lufs {
-            extra.push(("Loudness", format!("{:.1} LUFS", lufs), theme.text_bright));
+        match &r.loudness_status {
+            super::analyze::LoudnessAnalysisStatus::Available => {
+                if let Some(lufs) = r.lufs {
+                    extra.push(("Loudness", format!("{:.1} LUFS", lufs), theme.text_bright));
+                }
+            }
+            super::analyze::LoudnessAnalysisStatus::Unavailable(reason) => {
+                extra.push(("Loudness", format!("Unavailable — {reason}"), theme.amber));
+            }
+            super::analyze::LoudnessAnalysisStatus::Failed(error) => {
+                extra.push(("Loudness", format!("Failed — {error}"), theme.destructive));
+            }
+            super::analyze::LoudnessAnalysisStatus::NotScanned => {}
         }
         if let Some(tp) = r.true_peak_dbtp {
             extra.push(("True Peak", format!("{:.1} dBTP", tp), theme.text_bright));

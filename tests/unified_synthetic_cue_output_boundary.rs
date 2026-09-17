@@ -182,9 +182,12 @@ fn create_sine_flac(path: &Path, duration_secs: f32) {
 
 fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> PipelineRequest {
     PipelineRequest {
+        registered_effects: Vec::new(),
         actions: ActionPipeline::default(),
         job_id: "unified-cue-boundary".to_string(),
         item_id: "merged-folder".to_string(),
+        submission_id: None,
+        submission_size: None,
         container,
         source: SourceOptions {
             sidecar_cue_track_metadata: None,

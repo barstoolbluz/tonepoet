@@ -4,11 +4,17 @@ resolver = "2"
 
 [package]
 name = "tonepoet"
-version = "0.4.10"
+version = "0.5.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.93"
 description = "Standalone CLI + TUI audio conversion toolkit"
 license = "GPL-3.0-or-later"
+
+# tonepoet-true-peak is qualified with a single release codegen unit. Cargo
+# ignores profile settings declared in workspace member manifests, so keep the
+# integrated override here rather than widening the setting to every package.
+[profile.release.package.tonepoet-true-peak]
+codegen-units = 1
 
 [dependencies]
 tonepoet-pipeline = { path = "tonepoet-pipeline", features = ["serde"] }
@@ -79,3 +85,6 @@ syn = { version = "2", features = ["full", "visit"] }
 # behind the `test-util` feature and aren't in `features = ["full"]`.
 # Used by the MB rate limiter sequencing test.
 tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+sha2 = "0.10"

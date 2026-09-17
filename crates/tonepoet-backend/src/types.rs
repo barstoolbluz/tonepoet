@@ -247,7 +247,7 @@ impl ConversionCommand {
         // Set timeout - default to appropriate time for each tool type
         let timeout = timeout_secs.unwrap_or(match self.program.as_str() {
             "ssrc" => 1200, // 20 minutes for SSRC brick wall resampling (very slow)
-            "flac" | "metaflac" | "loudgain" => 120, // 2 minutes for simple tools
+            "flac" | "metaflac" => 120, // 2 minutes for simple tools
             "7z" => 600,    // 10 minutes for archive extraction
             _ => 300,       // 5 minutes for other complex operations
         });
@@ -309,8 +309,7 @@ impl ConversionCommand {
             "sox" => self.execute_sox_with_progress(callback),
             "ssrc" => self.execute_with_proportion_progress(callback, "SSRC resampling"),
             "flac" => self.execute_with_proportion_progress(callback, "FLAC encoding"),
-            "metaflac" => self.execute_with_proportion_progress(callback, "ReplayGain analysis"),
-            "loudgain" => self.execute_with_proportion_progress(callback, "ReplayGain analysis"),
+            "metaflac" => self.execute_with_proportion_progress(callback, "FLAC metadata"),
             _ => self.execute_with_estimated_progress(callback),
         }
     }

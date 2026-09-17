@@ -311,8 +311,15 @@ impl super::stages::Materializer for ArchiveMaterializer {
             ));
         }
 
-        // 3. Probe each audio file and read metadata.
-        let mut tracks = Vec::with_capacity(audio_files.len());
+        // 3. Validate source-ordinal selection against the complete sorted inventory,
+        // then keep all-member source/security probes while deferring ordinary
+        // metadata work for unselected members. DSF metadata parsing is retained
+        // below because that path also carries fatal structural checks.
+        validate_archive_track_selection(audio_files.len(), &req.source.track_selection)?;
+        let mut tracks = Vec::with_capacity(selected_archive_track_count(
+            audio_files.len(),
+            &req.source.track_selection,
+        ));
         for (idx, path) in audio_files.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
@@ -342,6 +349,21 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 }
             }
             let ordinal = (idx + 1) as u32;
+            if !archive_ordinal_selected(ordinal, &req.source.track_selection) {
+                if path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dsf"))
+                {
+                    // Do not weaken the established DSF structural-failure
+                    // contract merely because this member's tags are not
+                    // requested. Informational metadata warnings are deliberately
+                    // not surfaced for an unselected track.
+                    let _ = read_track_metadata_with_warnings(path)?;
+                }
+                continue;
+            }
+
             let (mut metadata, metadata_warnings) = read_track_metadata_with_warnings(path)?;
             super::materializer_single::report_metadata_warnings(
                 reporter,
@@ -377,8 +399,8 @@ impl super::stages::Materializer for ArchiveMaterializer {
             });
         }
 
-        // 4. Apply track selection filter.
-        let tracks = apply_track_selection(tracks, &req.source.track_selection)?;
+        // 4. Selection was applied by source ordinal before metadata demand.
+        // The selected vector remains in the same complete-inventory order.
 
         // 5. Derive album-level metadata from the tracks.
         let album_metadata = derive_album_metadata(&tracks);
@@ -4879,28 +4901,29 @@ fn read_track_metadata_with_warnings(
     Ok((metadata, warnings))
 }
 
-fn apply_track_selection(
-    tracks: Vec<PreparedTrack>,
+fn validate_archive_track_selection(
+    track_count: usize,
     selection: &TrackSelection,
-) -> Result<Vec<PreparedTrack>, MaterializeError> {
+) -> Result<(), MaterializeError> {
+    let max_ordinal = u32::try_from(track_count).map_err(|_| {
+        MaterializeError::InvalidTrackSelection(
+            "archive contains more source tracks than can be represented by source ordinals".into(),
+        )
+    })?;
     match selection {
-        TrackSelection::All => Ok(tracks),
+        TrackSelection::All => Ok(()),
         TrackSelection::Range { start, end } => {
             if *start == 0 || *end == 0 || start > end {
                 return Err(MaterializeError::InvalidTrackSelection(format!(
                     "invalid range {start}-{end}"
                 )));
             }
-            let max_ordinal = tracks.len() as u32;
             if *start > max_ordinal {
                 return Err(MaterializeError::InvalidTrackSelection(format!(
                     "range start {start} exceeds track count {max_ordinal}"
                 )));
             }
-            Ok(tracks
-                .into_iter()
-                .filter(|t| t.id.source_ordinal >= *start && t.id.source_ordinal <= *end)
-                .collect())
+            Ok(())
         }
         TrackSelection::Set(indices) => {
             if indices.is_empty() {
@@ -4908,20 +4931,34 @@ fn apply_track_selection(
                     "empty track set".into(),
                 ));
             }
-            let max_ordinal = tracks.len() as u32;
-            for &idx in indices {
-                if idx == 0 || idx > max_ordinal {
+            for &index in indices {
+                if index == 0 || index > max_ordinal {
                     return Err(MaterializeError::InvalidTrackSelection(format!(
-                        "track {idx} outside valid range 1-{max_ordinal}"
+                        "track {index} outside valid range 1-{max_ordinal}"
                     )));
                 }
             }
-            Ok(tracks
-                .into_iter()
-                .filter(|t| indices.contains(&t.id.source_ordinal))
-                .collect())
+            Ok(())
         }
     }
+}
+
+fn archive_ordinal_selected(ordinal: u32, selection: &TrackSelection) -> bool {
+    match selection {
+        TrackSelection::All => true,
+        TrackSelection::Range { start, end } => (*start..=*end).contains(&ordinal),
+        TrackSelection::Set(indices) => indices.contains(&ordinal),
+    }
+}
+
+fn selected_archive_track_count(track_count: usize, selection: &TrackSelection) -> usize {
+    (1..=track_count)
+        .filter(|index| {
+            u32::try_from(*index)
+                .ok()
+                .is_some_and(|ordinal| archive_ordinal_selected(ordinal, selection))
+        })
+        .count()
 }
 
 // =========================================================================
@@ -5656,9 +5693,12 @@ mod tests {
         let container = root.join(archive_name);
         fs::write(&container, b"archive fixture").expect("archive fixture");
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("job-{archive_name}"),
             item_id: format!("item-{archive_name}"),
+            submission_id: None,
+            submission_size: None,
             container,
             source: SourceOptions {
                 archive_password: None,

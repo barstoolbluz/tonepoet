@@ -5,7 +5,7 @@
 
 use crate::integration::*;
 use crate::types::*;
-use crate::{Backend, CommandBuilder, ConversionPipeline, PipelineBuilder, Result};
+use crate::{Backend, CommandBuilder, ConversionError, ConversionPipeline, PipelineBuilder, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -14,6 +14,16 @@ use tokio::sync::mpsc;
 pub struct ConversionBackend {
     preferred_backend: Backend,
     pipeline_builder: PipelineBuilder,
+}
+
+fn reject_direct_replaygain_request(item: &ConversionItem) -> Result<()> {
+    if item.options.calculate_replaygain {
+        return Err(ConversionError::InvalidSettings(
+            "ReplayGain requests must run through Tonepoet's native common-plan executor; the legacy backend API cannot own or silently drop ReplayGain"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl ConversionBackend {
@@ -34,6 +44,7 @@ impl ConversionBackend {
         output_path: &Path,
         progress_tx: &mpsc::Sender<ProgressUpdate>,
     ) -> Result<(std::path::PathBuf, ConversionPipeline)> {
+        reject_direct_replaygain_request(item)?;
         // Map main project types to backend settings
         let settings = map_conversion_item_to_settings(item);
 
@@ -120,7 +131,6 @@ impl ConversionBackend {
             "ssrc",     // Brick wall resampling
             "flac",     // FLAC encoding/decoding
             "metaflac", // FLAC metadata
-            "loudgain", // ReplayGain analysis
             "opusenc",  // Opus encoding
             "wavpack",  // WavPack encoding
         ];
@@ -174,7 +184,10 @@ impl ConversionBackend {
         FormatCapabilities {
             supports_float: format.supports_float(),
             supports_high_sample_rates: true, // All formats support high rates
-            supports_replaygain: true,        // All formats support ReplayGain
+            // ReplayGain is no longer a capability of this legacy backend.
+            // Production measurement and writer admission are resolved independently
+            // by Tonepoet's native common-plan ReplayGain owner.
+            supports_replaygain: false,
             optimal_backend: self.get_optimal_backend_for_format(format),
             specialized_tools: self.get_specialized_tools_for_format(format),
         }
@@ -281,6 +294,7 @@ pub async fn convert_with_backend(
     progress_tx: &mpsc::Sender<ProgressUpdate>,
     preferred_backend: Option<Backend>,
 ) -> Result<(std::path::PathBuf, ConversionPipeline)> {
+    reject_direct_replaygain_request(item)?;
     let backend = ConversionBackend::new(preferred_backend.unwrap_or(Backend::FFmpeg));
 
     // Map settings

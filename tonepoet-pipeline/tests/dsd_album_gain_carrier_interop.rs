@@ -12,10 +12,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonepoet_pipeline::{
-    build_album_gain_analysis_command, extract_single_sox_stats_peak_report, plan_conversion,
-    AudioCodec, AudioFormat, BitDepthTarget, DbNano, DsdAutoGainScope, DsdRate,
-    DsdToPcmGainMode, InputSource, OutputSink, PcmBitDepth, PipelineSettings,
-    PlanAction, PlanRequest, PreferredTool, RateTarget, SampleKind, SourceInfo,
+    build_dsd_true_peak_analysis_command, extract_single_sox_stats_peak_report, plan_conversion,
+    AudioCodec, AudioFormat, BitDepthTarget, DbNano, TruePeakScope, DsdRate,
+    InputSource, OutputSink, PcmBitDepth, PipelineSettings, SampleGainPolicy,
+    PlanAction, PlanRequest, PlanScope, PreferredTool, RateTarget, SampleKind, SourceInfo,
     SourceRepresentationKind, ToolIdentifier,
 };
 
@@ -84,11 +84,7 @@ fn album_settings(target_format: AudioFormat, target_depth: PcmBitDepth) -> Pipe
     settings.metadata.transfer_tags = false;
     settings.metadata.preserve_artwork = false;
     settings.metadata.store_source_audio_md5 = false;
-    settings
-        .dsd
-        .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-        .expect("legacy album auto gain");
-    settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+    settings.dsd.set_gain_policy(SampleGainPolicy::dsd_guard_default().with_scope(TruePeakScope::Album));
     settings
 }
 
@@ -104,6 +100,7 @@ fn dsd_source() -> SourceInfo {
         sample_kind: Some(SampleKind::Dsd),
         channels: Some(2),
         duration: None,
+        frame_extent: None,
         audio_md5: None,
     }
 }
@@ -128,7 +125,7 @@ fn carrier_writer_output_args(
     carrier: &Path,
 ) -> Vec<String> {
     let synthetic_input = Path::new("synthetic-album-input.dsf");
-    let planned = build_album_gain_analysis_command(
+    let planned = build_dsd_true_peak_analysis_command(
         settings,
         &dsd_source(),
         synthetic_input,
@@ -229,17 +226,18 @@ fn sox_written_album_carrier_survives_production_ffmpeg_consumer_at_known_level(
             sample_kind: Some(SampleKind::Float),
             channels: Some(2),
             duration: None,
+            frame_extent: None,
             audio_md5: None,
         },
         settings: consumer_settings,
+        plan_scope: PlanScope::submitted_batch("interop-submission", "interop-track", Some(2)),
         intermediate_dir: Some(root.0.clone()),
         container_ffmpeg_flags: Vec::new(),
     };
 
     let plan = plan_conversion(&request).expect("production album-carrier consumer plan");
     let command = match plan.action {
-        PlanAction::Execute { commands, steps, .. } => {
-            assert!(steps.is_empty(), "legacy album carrier must use static commands");
+        PlanAction::Execute { commands, .. } => {
             assert_eq!(commands.len(), 1, "unexpected consumer plan: {commands:?}");
             commands.into_iter().next().expect("consumer command")
         }

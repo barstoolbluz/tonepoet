@@ -141,7 +141,9 @@ pub(super) struct DvdAudioLpcmDecoder {
     stats: LpcmDecodeStats,
     channel_order_policy: DvdaChannelOrderPolicy,
     raw_group2_index: u32,
+    group1_samples: Vec<i32>,
     last_group2_samples: Vec<i32>,
+    output_channel_indices: Option<Vec<usize>>,
 }
 
 impl DvdAudioLpcmDecoder {
@@ -153,7 +155,9 @@ impl DvdAudioLpcmDecoder {
             stats: LpcmDecodeStats::default(),
             channel_order_policy: DvdaChannelOrderPolicy::DEFAULT,
             raw_group2_index: 0,
+            group1_samples: Vec::new(),
             last_group2_samples: Vec::new(),
+            output_channel_indices: None,
         }
     }
 
@@ -243,24 +247,20 @@ impl DvdAudioLpcmDecoder {
         out: &mut W,
     ) -> Result<(), LpcmDecodeError> {
         let mut cursor = 0usize;
-        let group2 = if params.group2_channels == 0 {
-            Vec::new()
-        } else if self.raw_group2_index == 0 {
+        if params.group2_channels != 0 && self.raw_group2_index == 0 {
             let end = cursor + params.raw_group2_size;
-            let samples = decode_group_samples(
+            decode_group_samples_into(
                 &step[cursor..end],
                 params.group2_channels,
                 params.group2_bits.unwrap_or(params.group1_bits),
                 LpcmGroup::Group2,
+                &mut self.last_group2_samples,
             )?;
             cursor = end;
-            self.last_group2_samples = samples.clone();
             self.stats.group2_blocks_read = self.stats.group2_blocks_read.saturating_add(1);
-            samples
-        } else {
+        } else if params.group2_channels != 0 {
             self.stats.group2_blocks_repeated = self.stats.group2_blocks_repeated.saturating_add(1);
-            self.last_group2_samples.clone()
-        };
+        }
 
         if params.group2_channels != 0 {
             self.raw_group2_index = self.raw_group2_index.saturating_add(1);
@@ -270,14 +270,27 @@ impl DvdAudioLpcmDecoder {
         }
 
         let group1_end = cursor + params.raw_group1_size;
-        let group1 = decode_group_samples(
+        decode_group_samples_into(
             &step[cursor..group1_end],
             params.group1_channels,
             params.group1_bits,
             LpcmGroup::Group1,
+            &mut self.group1_samples,
         )?;
 
-        write_reference_interleave(&group1, &group2, params, self.channel_order_policy, out)?;
+        let reorder = self.output_channel_indices.as_deref().ok_or_else(|| {
+            LpcmDecodeError::HeaderMismatch(
+                "LPCM output channel map was not initialized with the validated parameters"
+                    .to_string(),
+            )
+        })?;
+        write_reference_interleave(
+            &self.group1_samples,
+            &self.last_group2_samples,
+            params,
+            reorder,
+            out,
+        )?;
         Ok(())
     }
 
@@ -389,6 +402,7 @@ impl DvdAudioLpcmDecoder {
             group2_bits,
         )?;
         self.last_group2_samples = vec![0; (2 * group2_channels) as usize];
+        self.output_channel_indices = Some(params.output_channel_indices(self.channel_order_policy));
         self.params = Some(params);
         Ok(params)
     }
@@ -615,8 +629,23 @@ fn decode_group_samples(
     bits: u32,
     group: LpcmGroup,
 ) -> Result<Vec<i32>, LpcmDecodeError> {
+    let mut samples = Vec::new();
+    decode_group_samples_into(block, channels, bits, group, &mut samples)?;
+    Ok(samples)
+}
+
+fn decode_group_samples_into(
+    block: &[u8],
+    channels: u32,
+    bits: u32,
+    group: LpcmGroup,
+    samples: &mut Vec<i32>,
+) -> Result<(), LpcmDecodeError> {
     let sample_count = (2 * channels) as usize;
-    let mut samples = Vec::with_capacity(sample_count);
+    samples.clear();
+    if samples.capacity() < sample_count {
+        samples.reserve(sample_count - samples.capacity());
+    }
     match bits {
         16 => {
             for sample in block.chunks_exact(2).take(sample_count) {
@@ -648,43 +677,65 @@ fn decode_group_samples(
         }
         other => return Err(LpcmDecodeError::UnsupportedBitDepth(other)),
     }
-    Ok(samples)
+    if samples.len() != sample_count {
+        return Err(LpcmDecodeError::HeaderMismatch(format!(
+            "LPCM packed group decoded {} samples, expected {sample_count}",
+            samples.len(),
+        )));
+    }
+    Ok(())
 }
 
 fn write_reference_interleave<W: Write>(
     group1: &[i32],
     group2: &[i32],
     params: LpcmParams,
-    policy: DvdaChannelOrderPolicy,
+    source_to_output_indices: &[usize],
     out: &mut W,
 ) -> Result<(), LpcmDecodeError> {
     let g1 = params.group1_channels as usize;
     let g2 = params.group2_channels as usize;
-    let reorder = params.output_channel_indices(policy);
+    if group1.len() != 2 * g1 || group2.len() != 2 * g2 {
+        return Err(LpcmDecodeError::HeaderMismatch(format!(
+            "LPCM decoded frame geometry changed: group1={}/{} group2={}/{}",
+            group1.len(),
+            2 * g1,
+            group2.len(),
+            2 * g2,
+        )));
+    }
 
-    let mut first_frame = Vec::with_capacity((g1 + g2) as usize);
-    first_frame.extend_from_slice(&group1[..g1]);
-    first_frame.extend_from_slice(&group2[..g2]);
-    write_ordered_frame(&first_frame, &reorder, out)?;
-
-    let mut second_frame = Vec::with_capacity((g1 + g2) as usize);
-    second_frame.extend_from_slice(&group1[g1..2 * g1]);
-    second_frame.extend_from_slice(&group2[g2..2 * g2]);
-    write_ordered_frame(&second_frame, &reorder, out)?;
-
+    write_ordered_split_frame(
+        &group1[..g1],
+        &group2[..g2],
+        source_to_output_indices,
+        out,
+    )?;
+    write_ordered_split_frame(
+        &group1[g1..],
+        &group2[g2..],
+        source_to_output_indices,
+        out,
+    )?;
     Ok(())
 }
 
-fn write_ordered_frame<W: Write>(
-    source_order_frame: &[i32],
+fn write_ordered_split_frame<W: Write>(
+    group1_frame: &[i32],
+    group2_frame: &[i32],
     source_to_output_indices: &[usize],
     out: &mut W,
 ) -> Result<(), LpcmDecodeError> {
+    let total_channels = group1_frame.len() + group2_frame.len();
     for &source_index in source_to_output_indices {
-        let sample = source_order_frame.get(source_index).ok_or_else(|| {
+        let sample = if source_index < group1_frame.len() {
+            group1_frame.get(source_index)
+        } else {
+            group2_frame.get(source_index - group1_frame.len())
+        }
+        .ok_or_else(|| {
             LpcmDecodeError::HeaderMismatch(format!(
-                "LPCM channel reorder index {source_index} is outside decoded source frame with {} channels",
-                source_order_frame.len()
+                "LPCM channel reorder index {source_index} is outside decoded source frame with {total_channels} channels",
             ))
         })?;
         out.write_all(&sample.to_le_bytes())?;

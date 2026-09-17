@@ -138,7 +138,6 @@ conversion-backend = { path = "../hexloader-tui-conversion-backend-handover" }
 **Optional** (graceful degradation):
 - `sox`: Advanced audio processing
 - `metaflac`: FLAC metadata handling
-- `loudgain`: ReplayGain analysis
 
 ## 🎉 READY FOR INTEGRATION
 

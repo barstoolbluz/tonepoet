@@ -25,6 +25,22 @@ pub enum PlanningError {
         /// Human-readable reason.
         reason: String,
     },
+    /// Pure physical planning exhausted its bounded candidate-search resource.
+    PlanningResourceLimit {
+        /// Resource name.
+        resource: String,
+        /// Number of alternatives the request required.
+        requested: u64,
+        /// Configured planning bound.
+        limit: u64,
+    },
+    /// The semantic plan is valid but the current executor does not yet expose the required lowering.
+    CapabilityUnavailable {
+        /// Stable capability key.
+        capability: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
     /// No registered plugin can build the requested operation.
     NoPluginForOperation {
         /// Logical operation label.
@@ -72,6 +88,15 @@ impl PlanningError {
         }
     }
 
+    /// Construct a current-executor capability error.
+    #[must_use]
+    pub fn capability_unavailable(capability: &'static str, reason: impl Into<String>) -> Self {
+        Self::CapabilityUnavailable {
+            capability,
+            reason: reason.into(),
+        }
+    }
+
     /// Construct an unsupported-format error.
     #[must_use]
     pub fn unsupported_format(format: AudioFormat, reason: impl Into<String>) -> Self {
@@ -99,6 +124,12 @@ impl fmt::Display for PlanningError {
             }
             Self::InvalidSource { field, reason } => {
                 write!(f, "invalid source facts for {field}: {reason}")
+            }
+            Self::PlanningResourceLimit { resource, requested, limit } => {
+                write!(f, "planning resource limit for {resource}: requested {requested}, limit {limit}")
+            }
+            Self::CapabilityUnavailable { capability, reason } => {
+                write!(f, "executor capability {capability} is unavailable: {reason}")
             }
             Self::NoPluginForOperation {
                 operation,

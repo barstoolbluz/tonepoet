@@ -61,7 +61,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             quality: MainQualitySettings::Flac {
                 compression_level: 8,
             },
-            calculate_replaygain: true,
+            // ReplayGain is owned by the common native plan, not this legacy
+            // encoder API. A direct legacy request is rejected explicitly.
+            calculate_replaygain: false,
             overwrite: true,
             resample_quality: Some(2), // HQ
             replaygain_mode: None,

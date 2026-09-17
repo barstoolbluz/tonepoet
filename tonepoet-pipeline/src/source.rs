@@ -29,6 +29,23 @@ impl Default for SourceRepresentationKind {
     }
 }
 
+/// Authoritative source-domain frame extent available before pure planning.
+///
+/// Duration remains a separate timing/progress fact and must not be promoted
+/// into a capacity proof. Only an exact frame count or a separately proven
+/// upper bound belongs here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SourceFrameExtent {
+    /// Exact frame count established by source materialization/probing.
+    Exact(u64),
+    /// Proven upper bound; the actual frame count may be smaller.
+    Bounded {
+        /// Maximum source frame count admitted by the bound.
+        upper_frames: u64,
+    },
+}
+
 /// Read-only audio facts required for deterministic planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -58,8 +75,12 @@ pub struct SourceInfo {
     pub sample_kind: Option<SampleKind>,
     /// Channel count when known.
     pub channels: Option<u16>,
-    /// Duration when known.
+    /// Duration when known. This may be an estimate and is not a frame-capacity proof.
     pub duration: Option<Duration>,
+    /// Exact or conservatively bounded source-domain frame extent when an
+    /// authoritative producer has established one.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub frame_extent: Option<SourceFrameExtent>,
     /// Qualified DSD container/front-end facts when the source is DSD.
     #[cfg_attr(feature = "serde", serde(default))]
     pub dsd_source_kind: Option<DsdSourceKind>,

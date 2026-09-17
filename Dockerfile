@@ -111,7 +111,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       wavpack \
       atomicparsley \
       7zip \
-      loudgain \
       acl \
       libbluray2 libudfread0 libaacs0 libbdplus0 \
       libdbus-1-3 \

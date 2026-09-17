@@ -25,6 +25,7 @@ pub(crate) mod bluray_lpcm;
 pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
 pub mod actions;
+pub(crate) mod baseline;
 pub(crate) mod chapter_write;
 pub mod errors;
 pub mod label_resolver;
@@ -87,9 +88,12 @@ mod tests {
 
     fn sample_request() -> PipelineRequest {
         PipelineRequest {
+            registered_effects: Vec::new(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".into(),
             item_id: "item-1".into(),
+            submission_id: None,
+            submission_size: None,
             container: PathBuf::from("/tmp/in.flac"),
             source: SourceOptions {
                 archive_password: Some(SecretString::new("hunter2")),

@@ -1415,7 +1415,7 @@ impl AacMetadataExtractor {
                                 field_count += 1;
 
                                 // Map ReplayGain reverse DNS atoms to uppercase custom_fields
-                                // Handle both lowercase (proper format) and uppercase (loudgain format)
+                                // Handle both lowercase (proper format) and uppercase (legacy ReplayGain format)
                                 match field_name {
                                     "replaygain_track_gain" | "REPLAYGAIN_TRACK_GAIN" => {
                                         metadata
@@ -1564,14 +1564,14 @@ impl AacMetadataApplier {
 
         // Apply ReplayGain as reverse DNS atoms
         // Map from uppercase custom_fields to lowercase reverse DNS names
-        // First, remove any existing uppercase tags (from loudgain)
+        // First, remove any existing uppercase legacy ReplayGain tags
         let has_replaygain = metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_GAIN")
             || metadata.custom_fields.contains_key("REPLAYGAIN_TRACK_PEAK")
             || metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_GAIN")
             || metadata.custom_fields.contains_key("REPLAYGAIN_ALBUM_PEAK");
 
         if has_replaygain {
-            // Remove uppercase ReplayGain tags (from loudgain) by setting them to empty string
+            // Remove uppercase legacy ReplayGain tags by setting them to empty string
             cmd.arg("--rDNSatom")
                 .arg("")
                 .arg("name=REPLAYGAIN_TRACK_GAIN")

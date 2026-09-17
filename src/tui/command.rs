@@ -3796,9 +3796,9 @@ pub enum Command {
     },
     /// Write DR analysis report to each album directory.
     WriteDr,
-    /// Write ReplayGain track tags via loudgain.
+    /// Write ReplayGain track tags through the native common-plan path.
     WriteRgTrack,
-    /// Write ReplayGain album + track tags via loudgain.
+    /// Write ReplayGain album + track tags through the native common-plan path.
     WriteRgAlbum,
     /// Import metadata from a CUE sheet via external editor + review.
     ImportCue,
@@ -5556,7 +5556,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                             Some(dur)
                                         ),
                                     );
-                                    // LUFS: skip for seek-based (loudgain needs a real file per track).
+                                    // LUFS: skip for seek-based analysis; production loudness requires a complete admitted programme.
 
                                     let final_result = match pcm_result {
                                         Ok(Ok(mut result)) => {
@@ -5662,9 +5662,19 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                         let final_result = match pcm_result {
                                             Ok(Ok(mut result)) => {
                                                 result.path = display_path;
-                                                if let Some((lufs, tp)) = lufs_result {
-                                                    result.lufs = Some(lufs);
-                                                    result.true_peak_dbtp = Some(tp);
+                                                match lufs_result {
+                                                    Ok(scan) => {
+                                                        result.lufs = scan.integrated_lufs;
+                                                        result.true_peak_dbtp = scan.reporting_peak_dbtp;
+                                                        result.loudness_status = match scan.unavailable {
+                                                            Some(reason) => super::analyze::LoudnessAnalysisStatus::Unavailable(reason.into()),
+                                                            None => super::analyze::LoudnessAnalysisStatus::Available,
+                                                        };
+                                                    }
+                                                    Err(error) => {
+                                                        result.loudness_status =
+                                                            super::analyze::LoudnessAnalysisStatus::Failed(error);
+                                                    }
                                                 }
                                                 let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
                                                     original_path.clone(),
@@ -5812,7 +5822,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                             let lufs_path = path.clone();
                             let hdcd_path = path;
 
-                            // Run PCM analysis, loudgain, and HDCD detection in parallel.
+                            // Run PCM analysis, native loudness, and HDCD detection in parallel.
                             let (pcm_result, lufs_result, hdcd_result) = tokio::join!(
                                 tokio::task::spawn_blocking(move || {
                                     super::analyze::analyze_file(&pcm_path, None, None)
@@ -5824,9 +5834,19 @@ Host clipboard failures are reported instead of silently claiming that an intern
                             // Merge results and send (always send to decrement pending counter).
                             let final_result = match pcm_result {
                                 Ok(Ok(mut result)) => {
-                                    if let Some((lufs, tp)) = lufs_result {
-                                        result.lufs = Some(lufs);
-                                        result.true_peak_dbtp = Some(tp);
+                                    match lufs_result {
+                                        Ok(scan) => {
+                                            result.lufs = scan.integrated_lufs;
+                                            result.true_peak_dbtp = scan.reporting_peak_dbtp;
+                                            result.loudness_status = match scan.unavailable {
+                                                Some(reason) => super::analyze::LoudnessAnalysisStatus::Unavailable(reason.into()),
+                                                None => super::analyze::LoudnessAnalysisStatus::Available,
+                                            };
+                                        }
+                                        Err(error) => {
+                                            result.loudness_status =
+                                                super::analyze::LoudnessAnalysisStatus::Failed(error);
+                                        }
                                     }
 
                                     // Fast Phase 2-safe pre-emphasis detection (metadata/CUE PRE flag + catalog only; no spectral analysis).
@@ -7450,6 +7470,17 @@ Host clipboard failures are reported instead of silently claiming that an intern
         }
         Command::WriteRgTrack | Command::WriteRgAlbum => {
             let album = matches!(cmd, Command::WriteRgAlbum);
+            let prevent_clipping = match super::convert_actions::format_state_to_pipeline_settings(
+                &app.convert.format,
+            ) {
+                Ok(settings) => settings.replay_gain.prevent_clipping,
+                Err(error) => {
+                    app.set_status(format!(
+                        "Cannot resolve ReplayGain policy from Output Options: {error}"
+                    ));
+                    return;
+                }
+            };
             let paths: Vec<std::path::PathBuf> = app
                 .analysis_results
                 .iter()
@@ -7459,67 +7490,44 @@ Host clipboard failures are reported instead of silently claiming that an intern
                 app.set_status("No analysis results — run :analyze first");
             } else {
                 let tx = tx.clone();
-                let db_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                let _db_paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                 app.set_status(format!(
                     "Writing {} ReplayGain tags...",
                     if album { "album + track" } else { "track" },
                 ));
                 tokio::spawn(async move {
-                    use crate::convert::pipeline::tool::{RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
                     use crate::concurrency::{ClaimMode, ClaimScope, MutationClaimGuard, PathClaim};
-                    use tonepoet_pipeline::CommandEnvironmentPolicy;
-                    use tokio_util::sync::CancellationToken;
-
-                    // Resolve every target before entering the registry critical
-                    // section. The ephemeral descriptor is then handed to the
-                    // trusted tonepoet supervisor, so a TUI/process death cannot
-                    // leave loudgain mutating files after the WRITE claims vanish.
-                    let claims = paths.iter().map(|path| {
-                        PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact)
-                    }).collect::<Result<Vec<_>, _>>();
-                    let output = match claims.and_then(MutationClaimGuard::acquire_ephemeral) {
-                        Ok(claim) => {
-                            let admitted_paths = claim
-                                .claims()
-                                .iter()
-                                .map(|path_claim| path_claim.identity.resolved_io_path.clone())
-                                .collect::<Vec<_>>();
-                            let lifetime = claim.lease().duplicate_lifetime_file();
-                            match lifetime {
-                                Ok(lifetime) => {
-                                    let mut args = vec!["-s".to_string(), "i".to_string(), "-k".to_string()];
-                                    if album { args.push("-a".to_string()); } else { args.push("-r".to_string()); }
-                                    for path in &admitted_paths { args.push(path.to_string_lossy().to_string()); }
-                                    let command = ToolCommand {
-                                        binary: ToolBinary::Loudgain,
-                                        args,
-                                        secret_args: Vec::new(),
-                                        cwd: None,
-                                        environment_policy: CommandEnvironmentPolicy::ClearAndSet,
-                                        env: Vec::new(),
-                                        timeout: std::time::Duration::from_secs(60 * 60),
-                                    };
-                                    let runner = RealToolRunner::new(std::collections::HashMap::new());
-                                    let cancel = CancellationToken::new();
-                                    let result = crate::concurrency::with_additional_supervision_lifetime_files(
-                                        vec![lifetime],
-                                        runner.run(command, &cancel),
-                                    ).await;
-                                    drop(claim);
-                                    result.map_err(|error| error.to_string())
-                                }
-                                Err(error) => Err(error),
-                            }
-                        }
-                        Err(error) => Err(error),
-                    };
-                    let msg = match output {
-                        Ok(_) => format!(
-                            "ReplayGain tags written ({} file{})",
-                            db_paths.len(),
-                            if db_paths.len() == 1 { "" } else { "s" }
-                        ),
-                        Err(error) => format!("loudgain failed: {error}"),
+                    let result = tokio::task::spawn_blocking(move || {
+                        let claims = paths.iter().map(|path| {
+                            PathClaim::resolve(path, ClaimMode::Write, ClaimScope::Exact)
+                        }).collect::<Result<Vec<_>, _>>()?;
+                        let claim = MutationClaimGuard::acquire_ephemeral(claims)?;
+                        let admitted_paths = claim
+                            .claims()
+                            .iter()
+                            .map(|path_claim| path_claim.identity.resolved_io_path.clone())
+                            .collect::<Vec<_>>();
+                        let member_ids = admitted_paths.iter().enumerate()
+                            .map(|(index, path)| format!("command-replaygain:{index}:{}", path.display()))
+                            .collect::<Vec<_>>();
+                        let mode = if album {
+                            tonepoet_pipeline::ReplayGainMode::Album
+                        } else {
+                            tonepoet_pipeline::ReplayGainMode::Track
+                        };
+                        let result = crate::convert::replaygain::measure_and_write_paths(
+                            &admitted_paths,
+                            &member_ids,
+                            mode,
+                            prevent_clipping,
+                            false,
+                        ).map_err(|error| error.to_string());
+                        drop(claim);
+                        result
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    let msg = match result {
+                        Ok(report) => report.status_summary(),
+                        Err(error) => format!("ReplayGain write failed: {error}"),
                     };
                     let _ = tx.send(super::message::AppMessage::StatusMessage(msg)).await;
                 });
@@ -10018,6 +10026,8 @@ fn execute_commit_with_source_options_transform(
                 existing_req.container = item.input_path.clone();
                 existing_req.item_id = item.id.clone();
                 existing_req.job_id = format!("job-{}", item.id);
+                existing_req.submission_id = item.submission_id.clone();
+                existing_req.submission_size = item.submission_size;
                 existing_req.source = item_source;
                 existing_req.pre_extracted_staging = item.pre_extracted_staging.clone();
                 existing_req.archive_metadata_overrides = item.archive_metadata_overrides.clone();
@@ -10038,11 +10048,14 @@ fn execute_commit_with_source_options_transform(
                             .to_path_buf()
                     });
                 item.pipeline_request = Some(PipelineRequest {
+                    registered_effects: Vec::new(),
                     actions: options.actions.clone(),
                     worker_count: None,
                     scratch_staging: None,
                     job_id: format!("job-{}", item.id),
                     item_id: item.id.clone(),
+                    submission_id: item.submission_id.clone(),
+                    submission_size: item.submission_size,
                     container: item.input_path.clone(),
                     source: item_source,
                     settings: pipeline_settings.clone(),
@@ -15380,20 +15393,23 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-scope, dsd-gain-db, dsd-auto-margin, dsd-normalize-target, verification)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-sample-peak-target, verification)",
         );
         return;
     }
-    let dsd_reference_key = matches!(key, "dsd-path" | "dsd-profile" | "dsd-normalize-target");
+    let dsd_reference_key = matches!(key, "dsd-path" | "dsd-profile" | "dsd-sample-peak-target");
     if dsd_reference_key && !app.convert.format.dsd_reference_controls_available() {
-        app.set_status(
-            "That DSD Reference control is unavailable before policy promotion; use legacy dsd-gain, dsd-gain-db, or dsd-auto-margin",
-        );
+        app.set_status("DSD-source controls require a DSD source and a PCM output target");
         return;
     }
     let dsd_gain_key = matches!(
         key,
-        "dsd-gain" | "dsd-gain-scope" | "dsd-gain-db" | "dsd-auto-margin"
+        "dsd-gain"
+            | "dsd-true-peak-target"
+            | "dsd-true-peak-scope"
+            | "dsd-true-peak-scan"
+            | "dsd-gain-db"
+            | "dsd-sample-peak-target"
     );
     if dsd_gain_key && !app.convert.format.dsd_to_pcm_gain_available() {
         app.set_status("DSD gain controls require a DSD source and a PCM output target");
@@ -15437,6 +15453,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "dsd-path = {}",
                     match *app.convert.format.dsd_pathway.selected_value() {
+                        tonepoet_pipeline::DsdSourcePathway::General => "general",
                         tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
                         tonepoet_pipeline::DsdSourcePathway::Manual => "manual (not yet available)",
                     }
@@ -15457,10 +15474,10 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     app.convert.format.dsd_gain_mode.selected_label()
                 ));
             }
-            "dsd-gain-scope" => {
+            "dsd-true-peak-scope" => {
                 app.set_status(format!(
-                    "dsd-gain-scope = {}",
-                    app.convert.format.dsd_auto_gain_scope.selected_label()
+                    "dsd-true-peak-scope = {}",
+                    app.convert.format.dsd_true_peak_scope.selected_label()
                 ));
             }
             "dsd-gain-db" => {
@@ -15469,16 +15486,22 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     app.convert.format.dsd_gain_db.render(false)
                 ));
             }
-            "dsd-auto-margin" => {
+            "dsd-true-peak-scan" => {
                 app.set_status(format!(
-                    "dsd-auto-margin = {}",
-                    app.convert.format.dsd_auto_gain_margin_db.render(false)
+                    "dsd-true-peak-scan = {}",
+                    app.convert.format.dsd_true_peak_scan_mode.selected_label()
                 ));
             }
-            "dsd-normalize-target" => {
+            "dsd-true-peak-target" => {
                 app.set_status(format!(
-                    "dsd-normalize-target = {}",
-                    app.convert.format.dsd_normalize_target_dbfs.render(false)
+                    "dsd-true-peak-target = {} dBTP",
+                    app.convert.format.dsd_true_peak_target_dbtp.render(false)
+                ));
+            }
+            "dsd-sample-peak-target" => {
+                app.set_status(format!(
+                    "dsd-sample-peak-target = {} dBFS",
+                    app.convert.format.dsd_sample_peak_target_dbfs.render(false)
                 ));
             }
             "verification" => {
@@ -15709,27 +15732,31 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 ));
             }
         }
-        "dsd-path" => match value.to_ascii_lowercase().as_str() {
-            "reference" => {
-                if app
-                    .convert
-                    .format
-                    .dsd_pathway
-                    .select_value(&tonepoet_pipeline::DsdSourcePathway::Reference)
-                {
+        "dsd-path" => {
+            let pathway = match value.to_ascii_lowercase().as_str() {
+                "general" => Some(tonepoet_pipeline::DsdSourcePathway::General),
+                "reference" => Some(tonepoet_pipeline::DsdSourcePathway::Reference),
+                "manual" => {
+                    app.set_status(tonepoet_pipeline::reference_error_text(
+                        tonepoet_pipeline::ReferenceErrorCode::ManualUnavailable,
+                    ));
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(pathway) = pathway {
+                if app.convert.format.dsd_pathway.select_value(&pathway) {
+                    app.convert.format.dsd_gain_overridden = true;
+                    app.convert.format.apply_format_constraints();
                     app.preset.mark_modified();
-                    app.set_status("dsd-path = reference");
+                    app.set_status(format!("dsd-path = {}", value.to_ascii_lowercase()));
                 } else {
                     app.set_status("dsd-path is available only for a DSD source targeting PCM");
                 }
+            } else {
+                app.set_status("Unknown dsd-path. Try: general, reference");
             }
-            "manual" => {
-                app.set_status(tonepoet_pipeline::reference_error_text(
-                    tonepoet_pipeline::ReferenceErrorCode::ManualUnavailable,
-                ));
-            }
-            _ => app.set_status("Unknown dsd-path. Try: reference, manual"),
-        },
+        }
         "dsd-profile" => {
             let profile = match value.to_ascii_lowercase().as_str() {
                 "reference" => Some(tonepoet_pipeline::DsdReconstructionSelection::Reference),
@@ -15749,14 +15776,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         }
         "dsd-gain" => {
             let mode = match value.to_ascii_lowercase().as_str() {
-                "disabled" | "off" => Some(DsdGainMode::Disabled),
-                "auto" => Some(DsdGainMode::Auto),
+                "off" => Some(DsdGainMode::Off),
+                "true-peak-guard" | "true_peak_guard" => Some(DsdGainMode::TruePeakGuard),
+                "true-peak-normalize" | "true_peak_normalize" => Some(DsdGainMode::TruePeakNormalize),
+                "fixed-gain" | "fixed_gain" => Some(DsdGainMode::FixedGain),
                 "reference" => Some(DsdGainMode::Reference),
-                "native" | "native-level" | "native_level" => Some(DsdGainMode::NativeLevel),
-                "manual" | "fixed" => Some(DsdGainMode::Fixed),
-                "normalize" | "normalize-peak" | "normalize_peak" => {
-                    Some(DsdGainMode::NormalizePeak)
-                }
+                "native-level" | "native_level" => Some(DsdGainMode::NativeLevel),
+                "reference-fixed" | "reference_fixed" => Some(DsdGainMode::ReferenceFixed),
+                "sample-peak-normalize" | "sample_peak_normalize" => Some(DsdGainMode::SamplePeakNormalize),
+                // Deliberately reject retired ambiguous forms.
+                "auto" | "normalize" | "fixed" | "manual" | "disabled" | "native" => None,
                 _ => None,
             };
             if let Some(mode) = mode {
@@ -15768,101 +15797,89 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                         app.convert.format.dsd_gain_mode.selected_label()
                     ));
                 } else {
-                    app.set_status("That DSD gain mode is unavailable for the current settings origin");
+                    app.set_status("That DSD gain mode is unavailable for the selected DSD pathway");
                 }
             } else {
-                app.set_status("Unknown dsd-gain. Try: disabled, auto, manual, reference, native, fixed, normalize");
+                app.set_status("Unknown or retired dsd-gain. Try: off, true-peak-guard, true-peak-normalize, fixed-gain, reference, native-level, reference-fixed, sample-peak-normalize");
             }
         }
-        "dsd-gain-scope" => {
+        "dsd-true-peak-scope" => {
             let scope = match value.to_ascii_lowercase().as_str() {
-                "track" => Some(tonepoet_pipeline::DsdAutoGainScope::Track),
-                "album" => Some(tonepoet_pipeline::DsdAutoGainScope::Album),
+                "track" => Some(tonepoet_pipeline::TruePeakScope::Track),
+                "album" => Some(tonepoet_pipeline::TruePeakScope::Album),
                 _ => None,
             };
             if let Some(scope) = scope {
-                if app.convert.format.dsd_auto_gain_scope.select_value(&scope) {
+                if app.convert.format.dsd_true_peak_scope.select_value(&scope) {
                     app.convert.format.dsd_gain_overridden = true;
                     app.preset.mark_modified();
                     app.set_status(format!(
-                        "dsd-gain-scope = {}",
-                        app.convert.format.dsd_auto_gain_scope.selected_label()
+                        "dsd-true-peak-scope = {}",
+                        app.convert.format.dsd_true_peak_scope.selected_label()
                     ));
                 } else {
                     app.set_status("That DSD gain scope is unavailable for the current settings");
                 }
             } else {
-                app.set_status("Unknown dsd-gain-scope. Try: track, album");
+                app.set_status("Unknown dsd-true-peak-scope. Try: track, album");
+            }
+        }
+        "dsd-true-peak-scan" => {
+            let scan = match value.to_ascii_lowercase().as_str() {
+                "fast" | "fast066v2_fast" => Some(tonepoet_pipeline::TruePeakScanTier::Fast),
+                "standard" | "fast066v2_standard" => Some(tonepoet_pipeline::TruePeakScanTier::Standard),
+                "reference" | "fast066v2_reference" => Some(tonepoet_pipeline::TruePeakScanTier::Reference),
+                _ => None,
+            };
+            if let Some(scan) = scan {
+                if app.convert.format.dsd_true_peak_scan_mode.select_value(&scan) {
+                    app.convert.format.dsd_gain_overridden = true;
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-true-peak-scan = {}", app.convert.format.dsd_true_peak_scan_mode.selected_label()));
+                }
+            } else {
+                app.set_status("Unknown dsd-true-peak-scan. Try: fast, standard, reference");
             }
         }
         "dsd-gain-db" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) => {
-                if !(tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
-                    ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
-                    .contains(&parsed)
-                {
-                    app.set_status("dsd-gain-db must be between -24 and +24 dB");
+            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN).contains(&parsed) => {
+                app.convert.format.dsd_gain_db = parsed;
+                let mode = if *app.convert.format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Reference {
+                    DsdGainMode::ReferenceFixed
                 } else {
-                    app.convert.format.dsd_gain_db = parsed;
-                    app.convert
-                        .format
-                        .dsd_gain_mode
-                        .select_value(&DsdGainMode::Fixed);
-                    app.convert.format.dsd_gain_overridden = true;
-                    app.preset.mark_modified();
-                    app.set_status(format!("dsd-gain-db = {}", parsed.render(false)));
-                }
+                    DsdGainMode::FixedGain
+                };
+                app.convert.format.dsd_gain_mode.select_value(&mode);
+                app.convert.format.dsd_gain_overridden = true;
+                app.preset.mark_modified();
+                app.set_status(format!("dsd-gain-db = {}", parsed.render(false)));
             }
+            Ok(_) => app.set_status("dsd-gain-db must be between -24 and +24 dB"),
             Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
         },
-        "dsd-auto-margin" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) => {
-                if !(tonepoet_pipeline::DbNano::ZERO..=tonepoet_pipeline::DbNano(6_000_000_000))
-                    .contains(&parsed)
-                {
-                    app.set_status("dsd-auto-margin must be between 0 and 6 dB");
-                } else if app
-                    .convert
-                    .format
-                    .dsd_gain_mode
-                    .select_value(&DsdGainMode::Auto)
-                {
-                    app.convert.format.dsd_auto_gain_margin_db = parsed;
-                    app.convert.format.dsd_gain_overridden = true;
-                    app.preset.mark_modified();
-                    app.set_status(format!("dsd-auto-margin = {}", parsed.render(false)));
-                } else {
-                    app.set_status("Legacy Auto gain is unavailable for the current settings origin");
-                }
+        "dsd-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
+                app.convert.format.dsd_true_peak_target_dbtp = parsed;
+                app.convert.format.dsd_gain_overridden = true;
+                app.preset.mark_modified();
+                app.set_status(format!("dsd-true-peak-target = {} dBTP", parsed.render(false)));
             }
-            Err(error) => app.set_status(format!("Invalid dsd-auto-margin: {error}")),
+            Ok(_) => app.set_status("dsd-true-peak-target must be between -12 and 0 dBTP"),
+            Err(error) => app.set_status(format!("Invalid dsd-true-peak-target: {error}")),
         },
-        "dsd-normalize-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) => {
-                if !(tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
-                    ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
-                    .contains(&parsed)
-                {
-                    app.set_status("dsd-normalize-target must be between -12 and 0 dBFS");
-                } else {
-                    app.convert.format.dsd_normalize_target_dbfs = parsed;
-                    app.convert
-                        .format
-                        .dsd_gain_mode
-                        .select_value(&DsdGainMode::NormalizePeak);
-                    app.convert.format.dsd_gain_overridden = true;
-                    app.preset.mark_modified();
-                    app.set_status(format!(
-                        "dsd-normalize-target = {}",
-                        parsed.render(false)
-                    ));
-                }
+        "dsd-sample-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
+                app.convert.format.dsd_sample_peak_target_dbfs = parsed;
+                app.convert.format.dsd_gain_overridden = true;
+                app.preset.mark_modified();
+                app.set_status(format!("dsd-sample-peak-target = {} dBFS", parsed.render(false)));
             }
-            Err(error) => app.set_status(format!("Invalid dsd-normalize-target: {error}")),
+            Ok(_) => app.set_status("dsd-sample-peak-target must be between -12 and 0 dBFS"),
+            Err(error) => app.set_status(format!("Invalid dsd-sample-peak-target: {error}")),
         },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-gain-scope, dsd-gain-db, dsd-auto-margin, dsd-normalize-target",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-sample-peak-target",
                 key
             ));
         }

@@ -495,9 +495,21 @@ impl RequestMetadataOverrides {
 pub struct PipelineRequest {
     pub job_id: String,
     pub item_id: String,
+    /// Opaque identity of the exact queue submission that owns album-scoped decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
+    /// Persisted expected participant count for that exact submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_size: Option<u32>,
     pub container: PathBuf,
     pub source: SourceOptions,
     pub settings: PipelineSettings,
+    /// Ordered registered unary sample-domain effects supplied by the common
+    /// planner/executor boundary. Existing UI/settings surfaces leave this
+    /// empty; a later DSP screen can populate the same typed registry without
+    /// inventing command syntax or another route selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_effects: Vec<tonepoet_pipeline::EffectIntent>,
     /// Worker pool size for this job. None means cores-1.
     pub worker_count: Option<usize>,
     /// Optional RAM/scratch staging configuration injected by processor entry points.
@@ -969,6 +981,8 @@ pub struct RedactedPipelineRequest {
     pub container: PathBuf,
     pub source: RedactedSourceOptions,
     pub settings: PipelineSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_effects: Vec<tonepoet_pipeline::EffectIntent>,
     /// Worker pool size for this job. None means cores-1.
     pub worker_count: Option<usize>,
     pub merge: bool,
@@ -1059,6 +1073,7 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
                 track_selection: req.source.track_selection.clone(),
             },
             settings: req.settings.clone(),
+            registered_effects: req.registered_effects.clone(),
             worker_count: req.worker_count,
             merge: req.merge,
             output_root: req.output_root.clone(),
@@ -1087,6 +1102,42 @@ pub struct TrackId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedPhysicalCandidateBinding {
+    /// Stable candidate identity selected by the typed planner.
+    pub identity: String,
+    /// Concrete backend/tool bound to that admitted candidate.
+    pub tool: tonepoet_pipeline::ToolIdentifier,
+    /// Structured terminal truth when this binding names a selected terminal.
+    /// Resampler bindings intentionally leave this absent.
+    #[serde(default)]
+    pub terminal_realization: Option<tonepoet_pipeline::SelectedTerminalRealization>,
+    /// Frozen strong-preservation execution truth for a selected protected
+    /// SSRC resampler. Ordinary SSRC and non-resampler bindings leave this
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong_ssrc_resampler: Option<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>,
+}
+
+/// Physical representation of a Phase-3 registered-effect carrier.
+///
+/// Historical carriers are headerless Float64 PCM.  A rate-changing typed
+/// route may instead retain the selected resampler's WAV output so the common
+/// realizer does not decode/re-encode it merely to cross the Phase-3 boundary.
+/// In the terminal case the selected resampler has already performed the one
+/// final integer realization; downstream planning must therefore preserve the
+/// WAV sample payload rather than run another quantizer or dither stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RegisteredEffectCarrierRepresentation {
+    #[default]
+    RawFloat64,
+    Float64Wav,
+    TerminalPcmWav {
+        bit_depth: PcmBitDepth,
+        terminal_candidate: SelectedPhysicalCandidateBinding,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackSourceRef {
     StagedFile(PathBuf),
     /// Descriptive CUE segment that can be encoded from one shared image decode.
@@ -1112,16 +1163,27 @@ pub enum TrackSourceRef {
         /// Channel count required to build an unambiguous raw/graph stream.
         channels: u16,
     },
-    /// Audio-only headerless little-endian Float64 PCM produced by the
-    /// album-scoped DSD analysis pass.
-    /// The path is a retained post-reconstruction PCM carrier; `source_path`
-    /// remains the original source identity for provenance/metadata policy.
-    DsdAlbumGainCarrier {
+    /// Audio-only final-rate headerless little-endian Float64 PCM produced by
+    /// the certified general DSD-to-PCM pre-gain realization. The carrier is
+    /// after reconstruction, declared export level, ordinary pre-gain effects,
+    /// and final-rate work, but before the one certified Guard/Normalize scalar
+    /// and charged terminal suffix. `source_path` remains the original source
+    /// identity for provenance/metadata policy. Album scope leaves `gain_db`
+    /// unbound until the submitted participant barrier completes.
+    DsdTruePeakCarrier {
         path: PathBuf,
         source_path: PathBuf,
         sample_rate_hz: u32,
         channels: u16,
         duration: Option<std::time::Duration>,
+        gain_db: Option<tonepoet_pipeline::DbNano>,
+        point_dbtp: Option<tonepoet_pipeline::DbNano>,
+        effective_target_dbtp: tonepoet_pipeline::DbNano,
+        lossy_target_capped: bool,
+        /// Typed physical terminal candidate whose proof was charged by the gain decision.
+        /// Old transient serialized state may omit it, but certified execution then fails closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_candidate: Option<SelectedPhysicalCandidateBinding>,
     },
     /// Audio-only final-rate headerless little-endian Float64 PCM carrier
     /// measured before the one PCM true-peak gain step. `source_path` remains metadata/provenance
@@ -1137,6 +1199,32 @@ pub enum TrackSourceRef {
         point_dbtp: Option<tonepoet_pipeline::DbNano>,
         effective_target_dbtp: tonepoet_pipeline::DbNano,
         lossy_target_capped: bool,
+        /// Typed physical terminal candidate whose proof was charged by the gain decision.
+        /// Old transient serialized state may omit it, but certified execution then fails closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_candidate: Option<SelectedPhysicalCandidateBinding>,
+    },
+    /// Audio-only carrier produced by the Phase-3 common realizer after the
+    /// exact registered-effect/resampler chain. Historical serialized state
+    /// defaults to headerless little-endian Float64 PCM. A selected resampler
+    /// may instead retain a Float64 WAV continuation or an already-terminal
+    /// PCM WAV whose sample realization must not be repeated downstream.
+    /// It is not a measurement authority and carries no pre-bound gain. Fixed
+    /// gain, if requested, remains a later terminal-side policy.
+    RegisteredEffectCarrier {
+        path: PathBuf,
+        source_path: PathBuf,
+        sample_rate_hz: u32,
+        channels: u16,
+        duration: Option<std::time::Duration>,
+        source_was_dsd: bool,
+        /// True when the Phase-3 common realizer already executed the typed
+        /// `ResamplePcm` node. Downstream planning must not reinterpret the
+        /// original resampler preference/force and run another rate change.
+        #[serde(default)]
+        resampler_consumed: bool,
+        #[serde(default)]
+        representation: RegisteredEffectCarrierRepresentation,
     },
     CueSegmentCarrier {
         /// Validated, sample-bounded CUE segment carrier produced by the
@@ -2604,7 +2692,7 @@ pub struct TrackArtifact {
     /// Used by the manifest for rerun identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_command_hash: Option<String>,
-    /// Native-v2 Reference source, plan, measurement, and toolchain authority.
+    /// Qualified Reference source, plan, measurement, and toolchain authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_evidence: Option<super::track_executor::ReferenceExecutionEvidence>,
 }
@@ -2892,6 +2980,11 @@ pub enum PipelineStage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageOutcome {
     Ok,
+    /// The stage completed successfully and carries a durable human-readable
+    /// detail that must survive conversion-log assembly. ReplayGain uses this
+    /// for mathematically unavailable requested gain fields; it is still a
+    /// successful, publishable stage outcome.
+    OkWithDetail(String),
     /// The stage was not part of this request. This is distinct from a stage
     /// that was requested but could not or did not need to run.
     NotRequested,
@@ -2902,6 +2995,7 @@ pub enum StageOutcome {
     SkippedWithReason(String),
     Failed(String),
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageRecord {

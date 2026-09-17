@@ -163,3 +163,37 @@ fn test_opus_complexity_todo() {
     // TODO: Need to add opus_complexity field to backend ConversionSettings
     // Currently complexity=8 is lost in mapping
 }
+
+#[test]
+fn replaygain_request_is_not_delegated_back_to_legacy_backend() {
+    let item = ConversionItem {
+        id: "native-replaygain-owner".to_string(),
+        source_bit_depth: None,
+        source_sample_rate: None,
+        append_lineage: false,
+        output_format: MainAudioFormat::Flac,
+        options: MainConversionOptions {
+            quality: MainQualitySettings::Flac {
+                compression_level: 8,
+            },
+            calculate_replaygain: true,
+            overwrite: true,
+            resample_quality: None,
+            replaygain_mode: Some(MainReplayGainMode::Album),
+            nyquist_transition: None,
+            dither_type: None,
+            target_sample_rate: None,
+            target_bit_depth: None,
+            ssrc_insane_mode: None,
+            copy_auxiliary_files: false,
+            copy_subdirectories: false,
+            append_lineage_to_comment: false,
+        },
+    };
+
+    let settings = map_conversion_item_to_settings(&item);
+    assert_eq!(
+        settings.replaygain_mode, None,
+        "the common native ReplayGain owner must not be delegated back into the legacy encoder",
+    );
+}

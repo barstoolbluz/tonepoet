@@ -23,7 +23,7 @@ tonepoet is a music library workstation in your terminal: browse and manage your
 
 - **MusicBrainz** — disc-TOC-based release lookup (CD, SACD, DVD-Audio, DVD-Video, Blu-ray via synthetic TOC), interactive release picker, per-track title/artist/ISRC population
 - **GNUDB** — freedb/gnudb disc ID lookup with multi-disc support
-- **Per-track metadata editor** — four-tab editor (Metadata, Details, ReplayGain, Artwork) with inline tag editing, MusicBrainz integration, CUE preview, revert/restore, dropdown presentation selector for disc sources. Details tab shows technical info with HDCD and pre-emphasis detection status. ReplayGain tab displays per-track gain/peak values with in-editor scanning via loudgain. Artwork tab shows embedded picture inventory with add/replace/remove via built-in file picker
+- **Per-track metadata editor** — four-tab editor (Metadata, Details, ReplayGain, Artwork) with inline tag editing, MusicBrainz integration, CUE preview, revert/restore, dropdown presentation selector for disc sources. Details tab shows technical info with HDCD and pre-emphasis detection status. ReplayGain tab displays per-track gain/peak values with in-editor native NativeEbu2023 scanning. Artwork tab shows embedded picture inventory with add/replace/remove via built-in file picker
 - **Disc metadata sidecars** — persistent metadata sidecars for SACD ISOs (XML), DVD-Audio (foo_input_dvda-compatible XML), DVD-Video (TOML with multi-presentation support), and Blu-ray (TOML with multi-presentation support)
 - **CUE sheet parsing** — legacy encoding support (CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1252), embedded CUESHEET preferred over sidecar
 - **CUESHEET embedding** — regenerate and embed CUESHEET tags on metadata save
@@ -179,7 +179,7 @@ tonepoet/
 │       └── draw_*.rs       # Screen rendering
 ├── tonepoet-pipeline/      # Conversion planning crate
 │   ├── settings.rs         # PipelineSettings (69 fingerprinted fields)
-│   ├── plugins.rs          # Tool plugins (ffmpeg, sox, ssrc, loudgain)
+│   ├── plugins.rs          # Tool plugins (ffmpeg, sox, ssrc, metadata/verification tools)
 │   └── plan.rs             # Conversion planner
 └── crates/
     ├── sacd-rs/            # SACD ISO reader + DST decoder
@@ -202,7 +202,6 @@ All provided by the nix flake:
 | lame | MP3 encoding |
 | opusenc, opustags | Opus encoding, metadata |
 | wavpack, wvtag | WavPack encoding, metadata |
-| loudgain | ReplayGain analysis |
 | AtomicParsley | Required for authoritative non-native/custom tags in M4A/MP4 outputs; conversions fail closed rather than silently dropping those keys |
 | libbluray | Blu-ray disc reading + AACS integration |
 | libaacs | Blu-ray AACS decryption (requires user-provided KEYDB.cfg) |

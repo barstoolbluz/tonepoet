@@ -87,17 +87,10 @@ for outfile in "${OUTPUTS[@]}"; do
     fi
 done
 
-# --- Step 4: Check ReplayGain can be applied ---
+# --- Step 4: ReplayGain ownership note ---
 echo ""
-echo "--- Testing ReplayGain (loudgain) ---"
-RG_FILES=$(find "$NEW_OUT" -type f -name "*.$FORMAT" | head -3 | tr '\n' ' ')
-if [ -n "$RG_FILES" ]; then
-    if loudgain -a -k -s i $RG_FILES > /dev/null 2>&1; then
-        echo "  OK: loudgain succeeded on output files"
-    else
-        echo "  WARN: loudgain failed (may be format-dependent)"
-    fi
-fi
+echo "--- ReplayGain ownership ---"
+echo "Production ReplayGain is exercised by Tonepoet's native common-plan tests; this external-tool parity script no longer invokes a separate ReplayGain owner."
 
 # --- Step 5: Verify source tags are readable ---
 echo ""

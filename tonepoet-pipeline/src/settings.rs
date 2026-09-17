@@ -6,18 +6,17 @@
 
 use crate::enums::{
     AacProfile, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
-    DsdAutoGainScope, DsdNoiseShaper, DsdToPcmGainMode, DsdTruePeakScanMode, GainCompensation,
+    DsdNoiseShaper, GainCompensation,
     ModulatorOrder, Mp3Mode,
-    NyquistTransition, OpusContentType, PcmTruePeakScanMode, PcmTruePeakScope,
+    NyquistTransition, OpusContentType,
     PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode, ResampleQuality, SoxSincPhase,
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::dsd_reference::{
-    reference_error_text, DbNano, DsdReconstructionSelection, DsdReferencePolicyVersion,
+    reference_error_text, DbNano, DsdReferencePolicyVersion,
     DsdSourceGainMode, DsdSourcePathway, DsdSourceSettings, ReferenceErrorCode,
 };
 use crate::error::{PlanningError, Result};
-use crate::mapping;
 
 /// Single source of truth for all conversion parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,28 +114,13 @@ impl PipelineSettings {
         // realizes bounded integer PCM before native encoding, so configured
         // terminal dither is covered there. This rejection remains specific to
         // direct lossy encoder-input paths whose dither has no terminal bound.
-        if self.pcm_true_peak.enabled
+        if self.pcm_true_peak.is_true_peak()
             && self.target_format.is_lossy()
             && self.dither_type != DitherType::None
         {
             return Err(PlanningError::invalid_settings(
                 "dither_type",
-                "PCM true-peak gain with a lossy target requires dither off: the governed contract ends at encoder-input PCM, and the configured lossy dither/noise-shaping path has no proved terminal-error bound",
-            ));
-        }
-        if self.dsd.album_auto_gain_selected()
-            && self.pcm_true_peak.enabled
-            && self.pcm_true_peak.scope == PcmTruePeakScope::Album
-        {
-            return Err(PlanningError::invalid_settings(
-                "pcm_true_peak.scope",
-                "PCM album true-peak gain and DSD album auto-gain are separate submitted-batch authorities and cannot be active in the same request",
-            ));
-        }
-        if self.dsd.album_auto_gain_selected() && self.pcm_true_peak.fixed_gain_db.is_some() {
-            return Err(PlanningError::invalid_settings(
-                "pcm_true_peak.fixed_gain_db",
-                "PCM fixed gain and DSD album auto-gain are separate gain authorities and cannot be active in the same request",
+                "PCM certified true-peak gain with a lossy target requires dither off: the governed contract ends at encoder-input PCM, and the configured lossy dither/noise-shaping path has no proved terminal-error bound",
             ));
         }
 
@@ -431,10 +415,10 @@ fn validate_metadata(settings: &PipelineSettings) -> Result<()> {
 }
 
 fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
-    if settings.runtime_album_gain_db().is_some() && !settings.album_auto_gain_selected() {
+    if settings.runtime_album_gain_db().is_some() && !settings.album_true_peak_gain_selected() {
         return Err(PlanningError::invalid_settings(
             "dsd.runtime_album_gain_db",
-            "runtime album gain may be bound only for an active album-scoped automatic DSD gain mode",
+            "runtime album gain may be bound only for an active album-scoped certified DSD true-peak policy",
         ));
     }
     if settings.runtime_album_track_count().is_some() && settings.runtime_album_gain_db().is_none() {
@@ -465,80 +449,80 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
             "a finite album peak requires the measured DSD track count",
         ));
     }
-    if let Some(legacy) = settings.legacy_wire() {
-        validate_finite_f32(
-            "dsd.dsd_to_pcm_auto_gain_margin_db",
-            legacy.dsd_to_pcm_auto_gain_margin_db,
-        )?;
-        if !(0.0..=6.0).contains(&legacy.dsd_to_pcm_auto_gain_margin_db) {
+
+    validate_sample_gain_policy("dsd.general_from_dsd.gain", settings.general_from_dsd.gain)?;
+    if settings.general_from_dsd.reconstruction == DsdGeneralReconstruction::General
+        && settings.general_from_dsd.export_level == DsdGeneralExportLevel::ProtectedR64
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.general_from_dsd.export_level",
+            "protected_r64 export requires reference_protected reconstruction",
+        ));
+    }
+    if let DsdGeneralExportLevel::NativeWithOffset { offset_db } = settings.general_from_dsd.export_level {
+        if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&offset_db) {
             return Err(PlanningError::invalid_settings(
-                "dsd.dsd_to_pcm_auto_gain_margin_db",
-                "auto gain safety margin must be between 0 and 6 dB",
+                "dsd.general_from_dsd.export_level.offset_db",
+                "native export offset must be between -24.000000000 and +24.000000000 dB",
             ));
         }
-        if let Some(gain_db) = legacy.dsd_to_pcm_gain_db {
-            validate_finite_f32("dsd.dsd_to_pcm_gain_db", gain_db)?;
-            if !(-24.0..=24.0).contains(&gain_db) {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.dsd_to_pcm_gain_db",
-                    "gain must be between -24 and +24 dB",
-                ));
-            }
-        }
-        if legacy.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Manual
-            && legacy.dsd_to_pcm_gain_db.is_none()
-        {
-            return Err(PlanningError::invalid_settings(
-                "dsd.dsd_to_pcm_gain_db",
-                "manual DSD-to-PCM gain requires a dB value",
-            ));
-        }
-    } else {
-        if settings.from_dsd.pathway == DsdSourcePathway::Manual {
+    }
+
+    match settings.from_dsd.pathway {
+        DsdSourcePathway::General => {}
+        DsdSourcePathway::Manual => {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.pathway",
                 reference_error_text(ReferenceErrorCode::ManualUnavailable),
             ));
         }
-        if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V16 {
-            return Err(PlanningError::invalid_settings(
-                "dsd.from_dsd.reference_policy",
-                reference_error_text(ReferenceErrorCode::Toolchain),
-            ));
-        }
-        match settings.from_dsd.gain_mode {
-            DsdSourceGainMode::Fixed => {
-                let value = settings.from_dsd.fixed_gain_db.ok_or_else(|| {
-                    PlanningError::invalid_settings(
-                        "dsd.from_dsd.fixed_gain_db",
-                        "fixed DSD gain requires a dB value",
-                    )
-                })?;
-                if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&value) {
-                    return Err(PlanningError::invalid_settings(
-                        "dsd.from_dsd.fixed_gain_db",
-                        "fixed gain must be between -24.000000000 and +24.000000000 dB",
-                    ));
+        DsdSourcePathway::Reference => {
+            if settings.general_from_dsd.gain != SampleGainPolicy::Off {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.general_from_dsd.gain",
+                    "general DSD sample-domain gain is incompatible with explicit Reference delivery",
+                ));
+            }
+            if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V16 {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.from_dsd.reference_policy",
+                    reference_error_text(ReferenceErrorCode::Toolchain),
+                ));
+            }
+            match settings.from_dsd.gain_mode {
+                DsdSourceGainMode::Fixed => {
+                    let value = settings.from_dsd.fixed_gain_db.ok_or_else(|| {
+                        PlanningError::invalid_settings(
+                            "dsd.from_dsd.fixed_gain_db",
+                            "fixed Reference gain requires a dB value",
+                        )
+                    })?;
+                    if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&value) {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.from_dsd.fixed_gain_db",
+                            "fixed Reference gain must be between -24.000000000 and +24.000000000 dB",
+                        ));
+                    }
+                }
+                DsdSourceGainMode::Reference
+                | DsdSourceGainMode::NativeLevel
+                | DsdSourceGainMode::NormalizePeak => {
+                    if settings.from_dsd.fixed_gain_db.is_some() {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.from_dsd.fixed_gain_db",
+                            "fixed gain is valid only when Reference gain mode is fixed",
+                        ));
+                    }
                 }
             }
-            DsdSourceGainMode::Reference
-            | DsdSourceGainMode::NativeLevel
-            | DsdSourceGainMode::NormalizePeak => {
-                if settings.from_dsd.fixed_gain_db.is_some() {
-                    return Err(PlanningError::invalid_settings(
-                        "dsd.from_dsd.fixed_gain_db",
-                        "fixed gain is valid only when dsd gain mode is fixed",
-                    ));
-                }
+            if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
+                .contains(&settings.from_dsd.normalize_peak_target_dbfs)
+            {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.from_dsd.normalize_peak_target_dbfs",
+                    "sample-peak normalize target must be between -12.000000000 and 0.000000000 dBFS",
+                ));
             }
-        }
-        if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
-            .contains(&settings.from_dsd.normalize_peak_target_dbfs)
-        {
-            return Err(PlanningError::invalid_settings(
-                "dsd.from_dsd.normalize_peak_target_dbfs",
-                "normalize target must be between -12.000000000 and 0.000000000 dBFS",
-            ));
         }
     }
 
@@ -577,41 +561,84 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
             ));
         }
     }
-    let sinc = settings.pcm_to_dsd.sinc;
-    if sinc.oversample_factor == 0 || sinc.oversample_factor.count_ones() != 1 {
+    let to_dsd = settings.pcm_to_dsd.sinc;
+    if to_dsd.oversample_factor == 0 || to_dsd.oversample_factor.count_ones() != 1 {
         return Err(PlanningError::invalid_settings(
             "dsd.pcm_to_dsd.sinc.oversample_factor",
             "oversample factor must be a positive power of two",
         ));
     }
-    if sinc.taps < 1024 || sinc.taps.count_ones() != 1 {
+    validate_sinc_common(
+        "dsd.pcm_to_dsd.sinc",
+        to_dsd.taps,
+        to_dsd.passband_hz,
+        to_dsd.transition_hz,
+        to_dsd.kaiser_beta,
+    )?;
+    let from_dsd = settings.general_from_dsd.sinc;
+    validate_sinc_common(
+        "dsd.general_from_dsd.sinc",
+        from_dsd.taps,
+        from_dsd.passband_hz,
+        from_dsd.transition_hz,
+        from_dsd.kaiser_beta,
+    )?;
+    Ok(())
+}
+
+fn validate_sinc_common(
+    field: &'static str,
+    taps: u32,
+    passband_hz: f32,
+    transition_hz: f32,
+    kaiser_beta: f32,
+) -> Result<()> {
+    if taps < 1024 || taps.count_ones() != 1 {
         return Err(PlanningError::invalid_settings(
-            "dsd.pcm_to_dsd.sinc.taps",
+            field,
             "tap count must be a power of two and at least 1024",
         ));
     }
-    validate_finite_f32("dsd.pcm_to_dsd.sinc.passband_hz", sinc.passband_hz)?;
-    validate_finite_f32("dsd.pcm_to_dsd.sinc.transition_hz", sinc.transition_hz)?;
-    validate_finite_f32("dsd.pcm_to_dsd.sinc.kaiser_beta", sinc.kaiser_beta)?;
-    if !(0.0..=220_000.0).contains(&sinc.passband_hz) || sinc.passband_hz == 0.0 {
-        return Err(PlanningError::invalid_settings(
-            "dsd.pcm_to_dsd.sinc.passband_hz",
-            "passband must be greater than zero and no more than 220000 Hz",
-        ));
+    validate_finite_f32(field, passband_hz)?;
+    validate_finite_f32(field, transition_hz)?;
+    validate_finite_f32(field, kaiser_beta)?;
+    if !(0.0..=220_000.0).contains(&passband_hz) || passband_hz == 0.0 {
+        return Err(PlanningError::invalid_settings(field, "passband must be greater than zero and no more than 220000 Hz"));
     }
-    if !(1.0..=5_000.0).contains(&sinc.transition_hz) {
-        return Err(PlanningError::invalid_settings(
-            "dsd.pcm_to_dsd.sinc.transition_hz",
-            "transition must be between 1 and 5000 Hz",
-        ));
+    if !(1.0..=5_000.0).contains(&transition_hz) {
+        return Err(PlanningError::invalid_settings(field, "transition must be between 1 and 5000 Hz"));
     }
-    if !(0.0..=32.0).contains(&sinc.kaiser_beta) {
-        return Err(PlanningError::invalid_settings(
-            "dsd.pcm_to_dsd.sinc.kaiser_beta",
-            "kaiser beta must be between 0 and 32",
-        ));
+    if !(0.0..=32.0).contains(&kaiser_beta) {
+        return Err(PlanningError::invalid_settings(field, "kaiser beta must be between 0 and 32"));
     }
     Ok(())
+}
+
+fn validate_sample_gain_policy(field: &'static str, policy: SampleGainPolicy) -> Result<()> {
+    match policy {
+        SampleGainPolicy::Off => Ok(()),
+        SampleGainPolicy::FixedGain { gain_db } => {
+            if (DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&gain_db) {
+                Ok(())
+            } else {
+                Err(PlanningError::invalid_settings(
+                    field,
+                    "fixed gain must be between -24.000000000 and +24.000000000 dB",
+                ))
+            }
+        }
+        SampleGainPolicy::TruePeakGuard { target_dbtp, .. }
+        | SampleGainPolicy::TruePeakNormalize { target_dbtp, .. } => {
+            if (DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target_dbtp) {
+                Ok(())
+            } else {
+                Err(PlanningError::invalid_settings(
+                    field,
+                    "true-peak target must be between -12.000000000 and 0.000000000 dBTP",
+                ))
+            }
+        }
+    }
 }
 
 fn validate_finite_f32(field: &'static str, value: f32) -> Result<()> {
@@ -743,7 +770,7 @@ impl Default for WavPackSettings {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SsrcSettings {
-    /// Force SSRC when `nyquist_transition` is `BrickWall`.
+    /// Explicitly require SSRC to own an actual PCM rate change.
     pub force: bool,
     /// Force the highest SSRC profile.
     pub insane_mode: bool,
@@ -841,29 +868,308 @@ impl Default for SoxrResamplerSettings {
     }
 }
 
-/// DSD-specific conversion settings split by conversion direction.
+/// Mutually exclusive ordinary sample-domain gain policy.
+///
+/// This is the only persisted authority for Guard/Normalize/Fixed/Off. A
+/// private numerical adapter may derive `allow_boost` from the active variant,
+/// but no independent boost setting exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)
+)]
+pub enum SampleGainPolicy {
+    /// Apply no additional ordinary sample-domain gain.
+    Off,
+    /// Certified attenuation-only true-peak protection.
+    TruePeakGuard {
+        /// Requested true-peak ceiling in dBTP.
+        target_dbtp: DbNano,
+        /// Track-local or common-album gain authority.
+        scope: crate::enums::TruePeakScope,
+        /// Certified scan tier.
+        scan: crate::enums::TruePeakScanTier,
+    },
+    /// Certified true-peak normalization that may boost or attenuate.
+    TruePeakNormalize {
+        /// Requested true-peak target/ceiling in dBTP.
+        target_dbtp: DbNano,
+        /// Track-local or common-album gain authority.
+        scope: crate::enums::TruePeakScope,
+        /// Certified scan tier.
+        scan: crate::enums::TruePeakScanTier,
+    },
+    /// Apply the requested scalar without a clipping-prevention promise.
+    FixedGain {
+        /// User-requested scalar in dB.
+        gain_db: DbNano,
+    },
+}
+
+impl Default for SampleGainPolicy {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl SampleGainPolicy {
+    /// Construct PCM Guard with the raw PCM defaults.
+    #[must_use]
+    pub const fn pcm_guard_default() -> Self {
+        Self::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        }
+    }
+
+    /// Construct PCM true-peak normalization with the raw PCM defaults.
+    #[must_use]
+    pub const fn pcm_normalize_default() -> Self {
+        Self::TruePeakNormalize {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        }
+    }
+
+    /// Construct general DSD Guard with the configured DSD defaults.
+    #[must_use]
+    pub const fn dsd_guard_default() -> Self {
+        Self::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Reference,
+        }
+    }
+
+    /// Construct general DSD true-peak normalization with configured defaults.
+    #[must_use]
+    pub const fn dsd_normalize_default() -> Self {
+        Self::TruePeakNormalize {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Reference,
+        }
+    }
+
+    /// True for either certified true-peak policy.
+    #[must_use]
+    pub const fn is_true_peak(self) -> bool {
+        matches!(self, Self::TruePeakGuard { .. } | Self::TruePeakNormalize { .. })
+    }
+
+    /// True when any ordinary sample-domain gain policy is active.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// True when a certified true-peak policy uses common Album authority.
+    #[must_use]
+    pub const fn is_album_true_peak(self) -> bool {
+        matches!(
+            self,
+            Self::TruePeakGuard { scope: crate::enums::TruePeakScope::Album, .. }
+                | Self::TruePeakNormalize { scope: crate::enums::TruePeakScope::Album, .. }
+        )
+    }
+
+    /// True only when the policy may increase gain above its declared base.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn allow_boost(self) -> bool {
+        matches!(self, Self::TruePeakNormalize { .. })
+    }
+
+    /// Active true-peak target.
+    #[must_use]
+    pub const fn target_dbtp(self) -> Option<DbNano> {
+        match self {
+            Self::TruePeakGuard { target_dbtp, .. }
+            | Self::TruePeakNormalize { target_dbtp, .. } => Some(target_dbtp),
+            Self::Off | Self::FixedGain { .. } => None,
+        }
+    }
+
+    /// Active true-peak scope.
+    #[must_use]
+    pub const fn scope(self) -> Option<crate::enums::TruePeakScope> {
+        match self {
+            Self::TruePeakGuard { scope, .. } | Self::TruePeakNormalize { scope, .. } => Some(scope),
+            Self::Off | Self::FixedGain { .. } => None,
+        }
+    }
+
+    /// Active certified scan tier.
+    #[must_use]
+    pub const fn scan(self) -> Option<crate::enums::TruePeakScanTier> {
+        match self {
+            Self::TruePeakGuard { scan, .. } | Self::TruePeakNormalize { scan, .. } => Some(scan),
+            Self::Off | Self::FixedGain { .. } => None,
+        }
+    }
+
+    /// Active unguarded fixed gain.
+    #[must_use]
+    pub const fn fixed_gain_db(self) -> Option<DbNano> {
+        match self {
+            Self::FixedGain { gain_db } => Some(gain_db),
+            Self::Off | Self::TruePeakGuard { .. } | Self::TruePeakNormalize { .. } => None,
+        }
+    }
+
+    /// Change only scope while preserving mode, target and scan tier.
+    #[must_use]
+    pub const fn with_scope(self, scope: crate::enums::TruePeakScope) -> Self {
+        match self {
+            Self::TruePeakGuard { target_dbtp, scan, .. } => Self::TruePeakGuard { target_dbtp, scope, scan },
+            Self::TruePeakNormalize { target_dbtp, scan, .. } => Self::TruePeakNormalize { target_dbtp, scope, scan },
+            other => other,
+        }
+    }
+
+    /// Change only scan tier while preserving mode, target and scope.
+    #[must_use]
+    pub const fn with_scan(self, scan: crate::enums::TruePeakScanTier) -> Self {
+        match self {
+            Self::TruePeakGuard { target_dbtp, scope, .. } => Self::TruePeakGuard { target_dbtp, scope, scan },
+            Self::TruePeakNormalize { target_dbtp, scope, .. } => Self::TruePeakNormalize { target_dbtp, scope, scan },
+            other => other,
+        }
+    }
+
+    /// Change only true-peak target while preserving mode, scope and scan tier.
+    #[must_use]
+    pub const fn with_target(self, target_dbtp: DbNano) -> Self {
+        match self {
+            Self::TruePeakGuard { scope, scan, .. } => Self::TruePeakGuard { target_dbtp, scope, scan },
+            Self::TruePeakNormalize { scope, scan, .. } => Self::TruePeakNormalize { target_dbtp, scope, scan },
+            other => other,
+        }
+    }
+}
+
+/// Reconstruction authority for ordinary general DSD-to-PCM processing.
+///
+/// `General` starts at the renderer's native DSD reconstruction level.
+/// `ReferenceProtected` reuses the qualified Reference reconstruction prefix at
+/// its protected R64 level, but does not turn the request into Reference
+/// delivery; the explicit export-level boundary still precedes ordinary effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum DsdGeneralReconstruction {
+    /// Ordinary native-level general reconstruction.
+    #[default]
+    General,
+    /// Qualified Reference reconstruction prefix retained at protected R64.
+    ReferenceProtected,
+}
+
+/// Explicit level exported from a protected Reference reconstruction before
+/// ordinary general processing. This is distinct from the final ordinary gain
+/// policy and from qualified Reference delivery gain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(tag = "level", rename_all = "snake_case", deny_unknown_fields))]
+pub enum DsdGeneralExportLevel {
+    /// General processing begins at native reconstructed level. This is the default.
+    #[default]
+    Native,
+    /// Export the nominal compensated level (+18.020599913 dB from protected R64).
+    NominalCompensated,
+    /// Retain the protected R64 level as the ordinary processing base.
+    ProtectedR64,
+    /// Export native level plus an explicit user offset.
+    NativeWithOffset {
+        /// Additional offset after native restoration.
+        offset_db: DbNano,
+    },
+}
+
+/// Directional sinc parameters for general DSD-to-PCM reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct DsdToPcmSincSettings {
+    /// FIR tap count.
+    pub taps: u32,
+    /// Pass-band corner in Hz.
+    pub passband_hz: f32,
+    /// Transition-band width in Hz.
+    pub transition_hz: f32,
+    /// Kaiser beta.
+    pub kaiser_beta: f32,
+    /// Linear phase when true, minimum phase when false.
+    pub linear_phase: bool,
+    /// Allow aliasing for explicitly non-transparent workflows.
+    pub allow_aliasing: bool,
+}
+
+impl Default for DsdToPcmSincSettings {
+    fn default() -> Self {
+        Self {
+            taps: 262_144,
+            passband_hz: 25_000.0,
+            transition_hz: 500.0,
+            kaiser_beta: 16.0,
+            linear_phase: true,
+            allow_aliasing: false,
+        }
+    }
+}
+
+/// Ordinary general DSD-to-PCM controls. These settings are never Reference
+/// qualification evidence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+pub struct DsdToPcmSettings {
+    /// Reconstruction authority before the ordinary export-level boundary.
+    pub reconstruction: DsdGeneralReconstruction,
+    /// General reconstruction low-pass strategy.
+    pub lowpass: DsdLowpassMethod,
+    /// Directional sinc parameters, used only by `lowpass = Sinc`.
+    pub sinc: DsdToPcmSincSettings,
+    /// Explicit base level for ordinary processing after a protected reconstruction.
+    pub export_level: DsdGeneralExportLevel,
+    /// Ordinary mutually exclusive sample-domain gain policy.
+    pub gain: SampleGainPolicy,
+}
+
+impl Default for DsdToPcmSettings {
+    fn default() -> Self {
+        Self {
+            reconstruction: DsdGeneralReconstruction::General,
+            lowpass: DsdLowpassMethod::Auto,
+            sinc: DsdToPcmSincSettings::default(),
+            export_level: DsdGeneralExportLevel::Native,
+            gain: SampleGainPolicy::Off,
+        }
+    }
+}
+
+/// DSD-specific conversion settings split by direction and semantic authority.
+///
+/// There is one strict persisted representation. The former dual-origin DSD
+/// distinction is intentionally gone; obsolete flat/schema-versioned forms
+/// fail deserialization instead of being guessed or migrated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdSettings {
-    /// Existing PCM-to-DSD controls, behaviorally unchanged.
+    /// PCM-to-DSD controls.
     pub pcm_to_dsd: PcmToDsdSettings,
-    /// Native-v2 DSD-source Reference controls.
+    /// DSD-source pathway and qualified Reference controls.
     pub from_dsd: DsdSourceSettings,
-    /// Automatic DSD peak-normalization scope. Track is the compatibility default.
-    auto_gain_scope: DsdAutoGainScope,
-    /// Accuracy/speed tier for the in-process album true-peak scan. Reference
-    /// is the compatibility default and remains the point-scan gold standard.
-    true_peak_scan_mode: DsdTruePeakScanMode,
-    /// Runtime-only fixed album gain bound after submitted-batch analysis.
-    /// Never serialized. Once bound, it is included in the execution
-    /// fingerprint because it changes output bytes.
+    /// Ordinary general DSD-to-PCM controls.
+    pub general_from_dsd: DsdToPcmSettings,
+    /// Runtime-only common album gain after submitted-batch analysis.
+    #[cfg_attr(feature = "serde", serde(skip))]
     runtime_album_gain_db: Option<DbNano>,
-    /// Runtime-only loudest reported peak that authorized the shared gain.
+    /// Runtime-only loudest reported point that authorized the shared gain.
+    #[cfg_attr(feature = "serde", serde(skip))]
     runtime_album_loudest_peak_dbfs: Option<DbNano>,
     /// Runtime-only number of measured DSD tracks in the submitted scope.
+    #[cfg_attr(feature = "serde", serde(skip))]
     runtime_album_track_count: Option<usize>,
-    /// Private wire/behavior origin. Pre-promotion defaults and exact legacy
-    /// deserialization retain `LegacyFlatV1`; native v2 is explicit opt-in.
-    pub(crate) origin: DsdSettingsOrigin,
 }
 
 /// Existing PCM-to-DSD controls separated from DSD-source policy.
@@ -897,249 +1203,92 @@ impl Default for PcmToDsdSettings {
     }
 }
 
-/// Exact native-v2 DSD settings wire.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
-pub struct DsdSettingsWireV2 {
-    /// Wire version; exactly 2.
-    pub schema_version: u32,
-    /// PCM-to-DSD controls.
-    pub pcm_to_dsd: PcmToDsdSettings,
-    /// DSD-source controls.
-    pub from_dsd: DsdSourceSettings,
-}
-
-/// Frozen legacy flat settings wire.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
-pub(crate) struct LegacyDsdSettingsWireV1 {
-    /// Legacy PCM-to-DSD noise shaper.
-    pub noise_shaper: DsdNoiseShaper,
-    /// Legacy modulator order.
-    pub modulator_order: ModulatorOrder,
-    /// Legacy trellis settings.
-    pub trellis: Option<TrellisSettings>,
-    /// Legacy PCM-to-DSD filter.
-    pub pcm_to_dsd_filter: DsdFilterPreset,
-    /// Legacy DSD-to-PCM low-pass method.
-    pub dsd_to_pcm_lowpass: DsdLowpassMethod,
-    /// Legacy DSD-to-PCM gain mode.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub dsd_to_pcm_gain_mode: DsdToPcmGainMode,
-    /// Legacy auto-normalize margin.
-    #[cfg_attr(feature = "serde", serde(default = "default_dsd_to_pcm_auto_gain_margin_db"))]
-    pub dsd_to_pcm_auto_gain_margin_db: f32,
-    /// Legacy fixed gain.
-    pub dsd_to_pcm_gain_db: Option<f32>,
-    /// Legacy shared sinc settings.
-    pub sinc: PcmToDsdSincSettings,
-    /// Legacy PCM-to-DSD gain compensation.
-    pub gain_compensation: GainCompensation,
-}
-
-impl Default for LegacyDsdSettingsWireV1 {
-    fn default() -> Self {
-        Self {
-            noise_shaper: DsdNoiseShaper::Clans,
-            modulator_order: ModulatorOrder::Order8,
-            trellis: None,
-            pcm_to_dsd_filter: DsdFilterPreset::Auto,
-            dsd_to_pcm_lowpass: DsdLowpassMethod::Auto,
-            dsd_to_pcm_gain_mode: DsdToPcmGainMode::Disabled,
-            dsd_to_pcm_auto_gain_margin_db: default_dsd_to_pcm_auto_gain_margin_db(),
-            dsd_to_pcm_gain_db: None,
-            sinc: PcmToDsdSincSettings::default(),
-            gain_compensation: GainCompensation::Auto,
-        }
-    }
-}
-
-
-/// Read-only legacy behavior summary used by logging and compatibility policy.
-///
-/// This type cannot construct legacy settings. The pre-promotion default and
-/// exact legacy wire dispatch are the only authorities that create
-/// `DsdSettingsOrigin::LegacyFlatV1`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LegacyDsdBehavior {
-    /// Frozen legacy DSD-to-PCM low-pass method.
-    pub lowpass: DsdLowpassMethod,
-    /// Frozen legacy gain mode.
-    pub gain_mode: DsdToPcmGainMode,
-    /// Frozen legacy auto-normalize margin.
-    pub auto_gain_margin_db: f32,
-    /// Frozen legacy fixed gain.
-    pub gain_db: Option<f32>,
-}
-
-/// Private behavior origin for exact legacy preservation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum DsdSettingsOrigin {
-    /// Native directional settings.
-    NativeV2,
-    /// Exact legacy flat wire and semantics.
-    LegacyFlatV1(LegacyDsdSettingsWireV1),
-}
-
-fn default_dsd_to_pcm_auto_gain_margin_db() -> f32 {
-    0.15
-}
-
 impl Default for DsdSettings {
     fn default() -> Self {
-        // Reference remains fail-closed until its policy is promoted. Keep the
-        // application default on the exact frozen legacy wire so ordinary
-        // DSD-to-PCM conversions continue to work pre-promotion.
-        Self::from_legacy_wire(LegacyDsdSettingsWireV1::default())
+        Self {
+            pcm_to_dsd: PcmToDsdSettings::default(),
+            from_dsd: DsdSourceSettings::default(),
+            general_from_dsd: DsdToPcmSettings::default(),
+            runtime_album_gain_db: None,
+            runtime_album_loudest_peak_dbfs: None,
+            runtime_album_track_count: None,
+        }
     }
 }
 
 impl DsdSettings {
-    /// Construct native-v2 DSD settings explicitly.
+    /// Construct settings for an explicit qualified Reference delivery request.
     ///
-    /// Reference is deliberately opt-in until the embedded policy is promoted;
-    /// callers that select this constructor accept fail-closed attestation.
+    /// This is a semantic convenience constructor, not a schema-version marker.
+    /// The persisted DSD representation is the same strict representation used
+    /// by general DSD conversions.
     #[must_use]
-    pub fn native_v2() -> Self {
-        Self {
-            pcm_to_dsd: PcmToDsdSettings::default(),
-            from_dsd: DsdSourceSettings::default(),
-            auto_gain_scope: DsdAutoGainScope::Track,
-            true_peak_scan_mode: DsdTruePeakScanMode::Reference,
-            runtime_album_gain_db: None,
-            runtime_album_loudest_peak_dbfs: None,
-            runtime_album_track_count: None,
-            origin: DsdSettingsOrigin::NativeV2,
-        }
+    pub fn reference() -> Self {
+        let mut settings = Self::default();
+        settings.from_dsd.pathway = DsdSourcePathway::Reference;
+        settings
     }
 
-    /// Construct the exact frozen legacy settings representation.
+    /// True when qualified Reference delivery is explicitly requested.
     #[must_use]
-    pub(crate) fn from_legacy_wire(wire: LegacyDsdSettingsWireV1) -> Self {
-        Self {
-            pcm_to_dsd: legacy_pcm_to_dsd(wire),
-            from_dsd: legacy_from_dsd_mirror(wire),
-            auto_gain_scope: DsdAutoGainScope::Track,
-            true_peak_scan_mode: DsdTruePeakScanMode::Reference,
-            runtime_album_gain_db: None,
-            runtime_album_loudest_peak_dbfs: None,
-            runtime_album_track_count: None,
-            origin: DsdSettingsOrigin::LegacyFlatV1(wire),
-        }
+    pub const fn reference_delivery_selected(&self) -> bool {
+        matches!(self.from_dsd.pathway, DsdSourcePathway::Reference)
     }
 
-    /// True only for native directional settings.
+    /// Ordinary DSD gain policy.
     #[must_use]
-    pub const fn is_native_v2(&self) -> bool {
-        matches!(self.origin, DsdSettingsOrigin::NativeV2)
+    pub const fn gain_policy(&self) -> SampleGainPolicy {
+        self.general_from_dsd.gain
     }
 
-    /// Return the frozen legacy wire when this value came from exact v1 input.
-    #[must_use]
-    pub(crate) const fn legacy_wire(&self) -> Option<&LegacyDsdSettingsWireV1> {
-        match &self.origin {
-            DsdSettingsOrigin::LegacyFlatV1(wire) => Some(wire),
-            DsdSettingsOrigin::NativeV2 => None,
-        }
-    }
-
-    /// Explicitly migrate a legacy value to native-v2 defaults while preserving
-    /// behaviorally unrelated PCM-to-DSD controls.
-    #[must_use]
-    pub fn migrate_to_native_v2(self) -> Self {
-        match self.origin {
-            DsdSettingsOrigin::NativeV2 => self,
-            DsdSettingsOrigin::LegacyFlatV1(_) => Self {
-                pcm_to_dsd: self.pcm_to_dsd,
-                from_dsd: DsdSourceSettings::default(),
-                auto_gain_scope: self.auto_gain_scope,
-                true_peak_scan_mode: self.true_peak_scan_mode,
-                runtime_album_gain_db: None,
-                runtime_album_loudest_peak_dbfs: None,
-                runtime_album_track_count: None,
-                origin: DsdSettingsOrigin::NativeV2,
-            },
-        }
-    }
-
-    /// Return the configured automatic peak-normalization scope.
-    #[must_use]
-    pub const fn auto_gain_scope(&self) -> DsdAutoGainScope {
-        self.auto_gain_scope
-    }
-
-    /// Set the automatic DSD peak-normalization scope.
-    pub fn set_auto_gain_scope(&mut self, scope: DsdAutoGainScope) {
-        self.auto_gain_scope = scope;
-        if scope != DsdAutoGainScope::Album {
-            self.true_peak_scan_mode = DsdTruePeakScanMode::Reference;
-        }
+    /// Replace the ordinary DSD gain policy and invalidate stale runtime authority.
+    pub fn set_gain_policy(&mut self, policy: SampleGainPolicy) {
+        self.general_from_dsd.gain = policy;
         self.clear_runtime_album_gain();
     }
 
-    /// Return the selected submitted-batch true-peak scan tier.
+    /// Active true-peak scope for ordinary general DSD processing.
     #[must_use]
-    pub const fn true_peak_scan_mode(&self) -> DsdTruePeakScanMode {
-        self.true_peak_scan_mode
+    pub const fn true_peak_scope(&self) -> Option<crate::enums::TruePeakScope> {
+        self.general_from_dsd.gain.scope()
     }
 
-    /// Select the submitted-batch true-peak scan tier.
-    ///
-    /// Any already-bound runtime album authority is invalidated because its
-    /// point provenance and signal ceiling were measured under the old tier.
-    pub fn set_true_peak_scan_mode(&mut self, mode: DsdTruePeakScanMode) {
-        self.true_peak_scan_mode = if self.auto_gain_scope == DsdAutoGainScope::Album {
-            mode
+    /// Active certified scan tier for ordinary general DSD processing.
+    #[must_use]
+    pub const fn true_peak_scan_tier(&self) -> Option<crate::enums::TruePeakScanTier> {
+        self.general_from_dsd.gain.scan()
+    }
+
+    /// Change DSD true-peak scope without changing target or tier.
+    pub fn set_true_peak_scope(&mut self, scope: crate::enums::TruePeakScope) {
+        self.general_from_dsd.gain = self.general_from_dsd.gain.with_scope(scope);
+        self.clear_runtime_album_gain();
+    }
+
+    /// Change DSD true-peak scan tier without changing target or scope.
+    pub fn set_true_peak_scan_tier(&mut self, scan: crate::enums::TruePeakScanTier) {
+        self.general_from_dsd.gain = self.general_from_dsd.gain.with_scan(scan);
+        self.clear_runtime_album_gain();
+    }
+
+    /// True when an album-scoped certified ordinary DSD gain is active.
+    #[must_use]
+    pub const fn album_true_peak_gain_selected(&self) -> bool {
+        matches!(
+            self.general_from_dsd.gain,
+            SampleGainPolicy::TruePeakGuard { scope: crate::enums::TruePeakScope::Album, .. }
+                | SampleGainPolicy::TruePeakNormalize { scope: crate::enums::TruePeakScope::Album, .. }
+        )
+    }
+
+    /// Active album true-peak target.
+    #[must_use]
+    pub const fn album_true_peak_target_dbtp(&self) -> Option<DbNano> {
+        if self.album_true_peak_gain_selected() {
+            self.general_from_dsd.gain.target_dbtp()
         } else {
-            DsdTruePeakScanMode::Reference
-        };
-        self.clear_runtime_album_gain();
-    }
-
-    /// True when the selected DSD gain mode makes album scope effective.
-    #[must_use]
-    pub fn album_auto_gain_selected(&self) -> bool {
-        self.auto_gain_scope == DsdAutoGainScope::Album
-            && match self.origin {
-                DsdSettingsOrigin::LegacyFlatV1(wire) => {
-                    wire.dsd_to_pcm_gain_mode == DsdToPcmGainMode::Auto
-                }
-                DsdSettingsOrigin::NativeV2 => {
-                    self.from_dsd.gain_mode == DsdSourceGainMode::NormalizePeak
-                }
-            }
-    }
-
-    /// Target peak in exact nanodecibels when album auto-gain is active.
-    #[must_use]
-    pub fn album_auto_gain_target_dbfs(&self) -> Option<DbNano> {
-        if !self.album_auto_gain_selected() {
-            return None;
+            None
         }
-        match self.origin {
-            DsdSettingsOrigin::LegacyFlatV1(wire) => {
-                // Match the live legacy SoX command exactly: Auto has always
-                // rendered its margin to two decimal places (`norm -{:.2}`).
-                // Converting the binary f32 directly to nanodecibels would turn
-                // 0.15 into 0.150000006 and subtly change established semantics.
-                format!("-{:.2}", wire.dsd_to_pcm_auto_gain_margin_db)
-                    .parse::<DbNano>()
-                    .ok()
-            }
-            DsdSettingsOrigin::NativeV2 => Some(self.from_dsd.normalize_peak_target_dbfs),
-        }
-    }
-
-    /// Bind only the runtime fixed gain. This narrow setter exists for planner
-    /// tests and compatibility callers; production submitted-batch execution
-    /// should use [`Self::bind_runtime_album_gain`] so the durable conversion
-    /// summary can explain the aggregate authority. This setter always clears
-    /// aggregate context so a gain-only update can never retain stale peak or
-    /// track-count provenance from an earlier authority.
-    pub fn set_runtime_album_gain_db(&mut self, gain: Option<DbNano>) {
-        self.runtime_album_gain_db = gain;
-        self.runtime_album_loudest_peak_dbfs = None;
-        self.runtime_album_track_count = None;
     }
 
     /// Bind the complete runtime authority derived from one submitted batch.
@@ -1154,6 +1303,13 @@ impl DsdSettings {
         self.runtime_album_track_count = Some(track_count);
     }
 
+    /// Narrow test/bridge setter for the runtime common scalar.
+    pub fn set_runtime_album_gain_db(&mut self, gain: Option<DbNano>) {
+        self.runtime_album_gain_db = gain;
+        self.runtime_album_loudest_peak_dbfs = None;
+        self.runtime_album_track_count = None;
+    }
+
     /// Clear every runtime-only album-gain authority field.
     pub fn clear_runtime_album_gain(&mut self) {
         self.runtime_album_gain_db = None;
@@ -1161,13 +1317,13 @@ impl DsdSettings {
         self.runtime_album_track_count = None;
     }
 
-    /// Runtime fixed gain to apply to a decoded album carrier, if any.
+    /// Runtime fixed common album gain, if bound.
     #[must_use]
     pub const fn runtime_album_gain_db(&self) -> Option<DbNano> {
         self.runtime_album_gain_db
     }
 
-    /// Loudest reported peak in the submitted DSD measurement scope.
+    /// Loudest reported point in the submitted scope.
     #[must_use]
     pub const fn runtime_album_loudest_peak_dbfs(&self) -> Option<DbNano> {
         self.runtime_album_loudest_peak_dbfs
@@ -1177,393 +1333,6 @@ impl DsdSettings {
     #[must_use]
     pub const fn runtime_album_track_count(&self) -> Option<usize> {
         self.runtime_album_track_count
-    }
-
-    /// Materialize the exact flat compatibility view used by the frozen v1
-    /// fingerprint and legacy planner.
-    #[must_use]
-    pub(crate) fn legacy_compat_wire(&self) -> LegacyDsdSettingsWireV1 {
-        let (
-            dsd_to_pcm_lowpass,
-            dsd_to_pcm_gain_mode,
-            dsd_to_pcm_auto_gain_margin_db,
-            dsd_to_pcm_gain_db,
-        ) = match self.origin {
-            DsdSettingsOrigin::LegacyFlatV1(wire) => (
-                wire.dsd_to_pcm_lowpass,
-                wire.dsd_to_pcm_gain_mode,
-                wire.dsd_to_pcm_auto_gain_margin_db,
-                wire.dsd_to_pcm_gain_db,
-            ),
-            DsdSettingsOrigin::NativeV2 => (
-                DsdLowpassMethod::Auto,
-                DsdToPcmGainMode::Disabled,
-                default_dsd_to_pcm_auto_gain_margin_db(),
-                None,
-            ),
-        };
-        LegacyDsdSettingsWireV1 {
-            noise_shaper: self.pcm_to_dsd.noise_shaper,
-            modulator_order: self.pcm_to_dsd.modulator_order,
-            trellis: self.pcm_to_dsd.trellis,
-            pcm_to_dsd_filter: self.pcm_to_dsd.filter,
-            dsd_to_pcm_lowpass,
-            dsd_to_pcm_gain_mode,
-            dsd_to_pcm_auto_gain_margin_db,
-            dsd_to_pcm_gain_db,
-            sinc: self.pcm_to_dsd.sinc,
-            gain_compensation: self.pcm_to_dsd.gain_compensation,
-        }
-    }
-
-    /// Update the exact frozen legacy DSD-to-PCM gain wire without migrating
-    /// the settings object to native-v2 or creating a mixed-origin value.
-    ///
-    /// `auto_gain_margin_db` is authoritative only for [`DsdToPcmGainMode::Auto`],
-    /// and `gain_db` is authoritative only for [`DsdToPcmGainMode::Manual`].
-    /// Irrelevant fields are canonicalized so serialization and behavior remain
-    /// byte-for-byte compatible with the legacy planner contract.
-    pub fn set_legacy_dsd_to_pcm_gain(
-        &mut self,
-        mode: DsdToPcmGainMode,
-        auto_gain_margin_db: f32,
-        gain_db: Option<f32>,
-    ) -> Result<()> {
-        if self.is_native_v2() {
-            return Err(PlanningError::invalid_settings(
-                "dsd.dsd_to_pcm_gain_mode",
-                "legacy DSD-to-PCM gain cannot be applied to native-v2 settings",
-            ));
-        }
-        if mode == DsdToPcmGainMode::Auto
-            && (!auto_gain_margin_db.is_finite()
-                || !(0.0..=6.0).contains(&auto_gain_margin_db))
-        {
-            return Err(PlanningError::invalid_settings(
-                "dsd.dsd_to_pcm_auto_gain_margin_db",
-                "auto gain safety margin must be between 0 and 6 dB",
-            ));
-        }
-        if mode == DsdToPcmGainMode::Manual {
-            let value = gain_db.ok_or_else(|| {
-                PlanningError::invalid_settings(
-                    "dsd.dsd_to_pcm_gain_db",
-                    "manual DSD-to-PCM gain requires a dB value",
-                )
-            })?;
-            if !value.is_finite() || !(-24.0..=24.0).contains(&value) {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.dsd_to_pcm_gain_db",
-                    "gain must be between -24 and +24 dB",
-                ));
-            }
-        }
-
-        let scope = self.auto_gain_scope;
-        let true_peak_scan_mode = self.true_peak_scan_mode;
-        let mut wire = self.legacy_compat_wire();
-        wire.dsd_to_pcm_gain_mode = mode;
-        wire.dsd_to_pcm_auto_gain_margin_db = if mode == DsdToPcmGainMode::Auto {
-            auto_gain_margin_db
-        } else {
-            default_dsd_to_pcm_auto_gain_margin_db()
-        };
-        wire.dsd_to_pcm_gain_db = if mode == DsdToPcmGainMode::Manual {
-            gain_db
-        } else {
-            None
-        };
-        *self = Self::from_legacy_wire(wire);
-        self.auto_gain_scope = scope;
-        self.true_peak_scan_mode = true_peak_scan_mode;
-        Ok(())
-    }
-
-    /// Read-only compatibility behavior for legacy logging and inherited-tag policy.
-    #[must_use]
-    pub fn legacy_behavior(&self) -> Option<LegacyDsdBehavior> {
-        self.legacy_wire().map(|wire| LegacyDsdBehavior {
-            lowpass: wire.dsd_to_pcm_lowpass,
-            gain_mode: wire.dsd_to_pcm_gain_mode,
-            auto_gain_margin_db: wire.dsd_to_pcm_auto_gain_margin_db,
-            gain_db: wire.dsd_to_pcm_gain_db,
-        })
-    }
-
-    /// Legacy low-pass method for the private compatibility planner.
-    #[must_use]
-    pub(crate) fn legacy_dsd_to_pcm_lowpass(&self) -> DsdLowpassMethod {
-        self.legacy_compat_wire().dsd_to_pcm_lowpass
-    }
-
-    /// Legacy gain mode for the private compatibility planner.
-    #[must_use]
-    pub(crate) fn legacy_dsd_to_pcm_gain_mode(&self) -> DsdToPcmGainMode {
-        self.legacy_compat_wire().dsd_to_pcm_gain_mode
-    }
-
-    /// Legacy auto-gain margin for the private compatibility planner.
-    #[must_use]
-    pub(crate) fn legacy_dsd_to_pcm_auto_gain_margin_db(&self) -> f32 {
-        self.legacy_compat_wire().dsd_to_pcm_auto_gain_margin_db
-    }
-
-    /// Legacy fixed gain for the private compatibility planner.
-    #[must_use]
-    pub(crate) fn legacy_dsd_to_pcm_gain_db(&self) -> Option<f32> {
-        self.legacy_compat_wire().dsd_to_pcm_gain_db
-    }
-}
-
-fn legacy_pcm_to_dsd(wire: LegacyDsdSettingsWireV1) -> PcmToDsdSettings {
-    PcmToDsdSettings {
-        noise_shaper: wire.noise_shaper,
-        modulator_order: wire.modulator_order,
-        trellis: wire.trellis,
-        filter: wire.pcm_to_dsd_filter,
-        sinc: wire.sinc,
-        gain_compensation: wire.gain_compensation,
-    }
-}
-
-fn legacy_from_dsd_mirror(wire: LegacyDsdSettingsWireV1) -> DsdSourceSettings {
-    let gain_mode = match wire.dsd_to_pcm_gain_mode {
-        DsdToPcmGainMode::Disabled if wire.dsd_to_pcm_gain_db.is_some() => DsdSourceGainMode::Fixed,
-        DsdToPcmGainMode::Disabled => DsdSourceGainMode::NativeLevel,
-        DsdToPcmGainMode::Auto => DsdSourceGainMode::NormalizePeak,
-        DsdToPcmGainMode::Manual => DsdSourceGainMode::Fixed,
-    };
-    DsdSourceSettings {
-        pathway: DsdSourcePathway::Reference,
-        reference_policy: DsdReferencePolicyVersion::SoxNg14801V16,
-        profile: DsdReconstructionSelection::Reference,
-        gain_mode,
-        fixed_gain_db: wire
-            .dsd_to_pcm_gain_db
-            .and_then(|value| format!("{value:.9}").parse().ok()),
-        normalize_peak_target_dbfs: format!(
-            "-{:.9}",
-            wire.dsd_to_pcm_auto_gain_margin_db.abs()
-        )
-        .parse()
-        .unwrap_or(DbNano::DEFAULT_NORMALIZE_TARGET),
-    }
-}
-
-fn legacy_mirror_matches(settings: &DsdSettings, wire: LegacyDsdSettingsWireV1) -> bool {
-    settings.from_dsd == legacy_from_dsd_mirror(wire)
-}
-
-#[cfg(feature = "serde")]
-impl serde::Serialize for DsdSettings {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-
-        match self.origin {
-            DsdSettingsOrigin::NativeV2
-                if self.auto_gain_scope == DsdAutoGainScope::Track
-                    && self.true_peak_scan_mode == DsdTruePeakScanMode::Reference =>
-            {
-                DsdSettingsWireV2 {
-                    schema_version: 2,
-                    pcm_to_dsd: self.pcm_to_dsd,
-                    from_dsd: self.from_dsd,
-                }
-                .serialize(serializer)
-            }
-            DsdSettingsOrigin::NativeV2 => {
-                // Album scope always serializes the revision-tagged scan tier.
-                // Older schemas omitted their default Reference tier, so
-                // omission here would make that legacy value indistinguishable
-                // from Fast066V2 Reference during deserialization.
-                let include_scan_mode = self.auto_gain_scope == DsdAutoGainScope::Album;
-                let mut map = serializer.serialize_map(Some(if include_scan_mode { 5 } else { 4 }))?;
-                map.serialize_entry("schema_version", &2_u32)?;
-                map.serialize_entry("pcm_to_dsd", &self.pcm_to_dsd)?;
-                map.serialize_entry("from_dsd", &self.from_dsd)?;
-                map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
-                if include_scan_mode {
-                    map.serialize_entry("true_peak_scan_mode", &self.true_peak_scan_mode)?;
-                }
-                map.end()
-            }
-            DsdSettingsOrigin::LegacyFlatV1(wire) => {
-                if !legacy_mirror_matches(self, wire) {
-                    return Err(serde::ser::Error::custom(
-                        "native DSD-source settings were edited on a legacy value; explicitly migrate it to native v2 before serialization",
-                    ));
-                }
-                if self.auto_gain_scope == DsdAutoGainScope::Track
-                    && self.true_peak_scan_mode == DsdTruePeakScanMode::Reference
-                {
-                    return self.legacy_compat_wire().serialize(serializer);
-                }
-                let wire = self.legacy_compat_wire();
-                let include_scan_mode = self.auto_gain_scope == DsdAutoGainScope::Album;
-                let mut map =
-                    serializer.serialize_map(Some(if include_scan_mode { 12 } else { 11 }))?;
-                map.serialize_entry("noise_shaper", &wire.noise_shaper)?;
-                map.serialize_entry("modulator_order", &wire.modulator_order)?;
-                map.serialize_entry("trellis", &wire.trellis)?;
-                map.serialize_entry("pcm_to_dsd_filter", &wire.pcm_to_dsd_filter)?;
-                map.serialize_entry("dsd_to_pcm_lowpass", &wire.dsd_to_pcm_lowpass)?;
-                map.serialize_entry("dsd_to_pcm_gain_mode", &wire.dsd_to_pcm_gain_mode)?;
-                map.serialize_entry(
-                    "dsd_to_pcm_auto_gain_margin_db",
-                    &wire.dsd_to_pcm_auto_gain_margin_db,
-                )?;
-                map.serialize_entry("dsd_to_pcm_gain_db", &wire.dsd_to_pcm_gain_db)?;
-                map.serialize_entry("sinc", &wire.sinc)?;
-                map.serialize_entry("gain_compensation", &wire.gain_compensation)?;
-                map.serialize_entry("auto_gain_scope", &self.auto_gain_scope)?;
-                if include_scan_mode {
-                    map.serialize_entry("true_peak_scan_mode", &self.true_peak_scan_mode)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for DsdSettings {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{Error as _, MapAccess, Visitor};
-        use std::marker::PhantomData;
-
-        struct DsdSettingsVisitor(PhantomData<()>);
-        impl<'de> Visitor<'de> for DsdSettingsVisitor {
-            type Value = DsdSettings;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an exact native-v2 or legacy-v1 DSD settings map")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut schema_version = None;
-                let mut pcm_to_dsd = None;
-                let mut from_dsd = None;
-                let mut noise_shaper = None;
-                let mut modulator_order = None;
-                let mut trellis = None;
-                let mut trellis_seen = false;
-                let mut pcm_to_dsd_filter = None;
-                let mut dsd_to_pcm_lowpass = None;
-                let mut dsd_to_pcm_gain_mode = None;
-                let mut dsd_to_pcm_auto_gain_margin_db = None;
-                let mut dsd_to_pcm_gain_db = None;
-                let mut dsd_to_pcm_gain_db_seen = false;
-                let mut sinc = None;
-                let mut gain_compensation = None;
-                let mut auto_gain_scope = None;
-                let mut true_peak_scan_mode = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    macro_rules! unique {
-                        ($slot:expr, $value:expr) => {{
-                            if $slot.is_some() {
-                                return Err(A::Error::custom(format!("duplicate field `{key}`")));
-                            }
-                            $slot = Some($value);
-                        }};
-                    }
-                    match key.as_str() {
-                        "schema_version" => unique!(schema_version, map.next_value::<u32>()?),
-                        "pcm_to_dsd" => unique!(pcm_to_dsd, map.next_value::<PcmToDsdSettings>()?),
-                        "from_dsd" => unique!(from_dsd, map.next_value::<DsdSourceSettings>()?),
-                        "noise_shaper" => unique!(noise_shaper, map.next_value::<DsdNoiseShaper>()?),
-                        "modulator_order" => unique!(modulator_order, map.next_value::<ModulatorOrder>()?),
-                        "trellis" => {
-                            if trellis_seen { return Err(A::Error::duplicate_field("trellis")); }
-                            trellis_seen = true;
-                            trellis = map.next_value::<Option<TrellisSettings>>()?;
-                        }
-                        "pcm_to_dsd_filter" => unique!(pcm_to_dsd_filter, map.next_value::<DsdFilterPreset>()?),
-                        "dsd_to_pcm_lowpass" => unique!(dsd_to_pcm_lowpass, map.next_value::<DsdLowpassMethod>()?),
-                        "dsd_to_pcm_gain_mode" => unique!(dsd_to_pcm_gain_mode, map.next_value::<DsdToPcmGainMode>()?),
-                        "dsd_to_pcm_auto_gain_margin_db" => unique!(dsd_to_pcm_auto_gain_margin_db, map.next_value::<f32>()?),
-                        "dsd_to_pcm_gain_db" => {
-                            if dsd_to_pcm_gain_db_seen { return Err(A::Error::duplicate_field("dsd_to_pcm_gain_db")); }
-                            dsd_to_pcm_gain_db_seen = true;
-                            dsd_to_pcm_gain_db = map.next_value::<Option<f32>>()?;
-                        }
-                        "sinc" => unique!(sinc, map.next_value::<PcmToDsdSincSettings>()?),
-                        "gain_compensation" => unique!(gain_compensation, map.next_value::<GainCompensation>()?),
-                        "auto_gain_scope" => unique!(auto_gain_scope, map.next_value::<DsdAutoGainScope>()?),
-                        "true_peak_scan_mode" => unique!(true_peak_scan_mode, map.next_value::<DsdTruePeakScanMode>()?),
-                        _ => return Err(A::Error::unknown_field(&key, &[
-                            "schema_version", "pcm_to_dsd", "from_dsd", "noise_shaper",
-                            "modulator_order", "trellis", "pcm_to_dsd_filter",
-                            "dsd_to_pcm_lowpass", "dsd_to_pcm_gain_mode",
-                            "dsd_to_pcm_auto_gain_margin_db", "dsd_to_pcm_gain_db", "sinc",
-                            "gain_compensation", "auto_gain_scope", "true_peak_scan_mode",
-                        ])),
-                    }
-                }
-
-                if schema_version.is_some() || pcm_to_dsd.is_some() || from_dsd.is_some() {
-                    if noise_shaper.is_some() || modulator_order.is_some() || trellis_seen
-                        || pcm_to_dsd_filter.is_some() || dsd_to_pcm_lowpass.is_some()
-                        || dsd_to_pcm_gain_mode.is_some() || dsd_to_pcm_auto_gain_margin_db.is_some()
-                        || dsd_to_pcm_gain_db_seen || sinc.is_some() || gain_compensation.is_some()
-                    {
-                        return Err(A::Error::custom("native-v2 and legacy-v1 DSD keys may not be mixed"));
-                    }
-                    let version = schema_version.ok_or_else(|| A::Error::missing_field("schema_version"))?;
-                    if version != 2 {
-                        return Err(A::Error::custom("DSD settings schema_version must be exactly 2"));
-                    }
-                    let auto_gain_scope = auto_gain_scope.unwrap_or_default();
-                    let true_peak_scan_mode = if auto_gain_scope == DsdAutoGainScope::Album {
-                        true_peak_scan_mode.ok_or_else(|| A::Error::missing_field("true_peak_scan_mode"))?
-                    } else {
-                        DsdTruePeakScanMode::Reference
-                    };
-                    return Ok(DsdSettings {
-                        pcm_to_dsd: pcm_to_dsd.ok_or_else(|| A::Error::missing_field("pcm_to_dsd"))?,
-                        from_dsd: from_dsd.ok_or_else(|| A::Error::missing_field("from_dsd"))?,
-                        auto_gain_scope,
-                        true_peak_scan_mode,
-                        runtime_album_gain_db: None,
-                        runtime_album_loudest_peak_dbfs: None,
-                        runtime_album_track_count: None,
-                        origin: DsdSettingsOrigin::NativeV2,
-                    });
-                }
-
-                let wire = LegacyDsdSettingsWireV1 {
-                    noise_shaper: noise_shaper.ok_or_else(|| A::Error::missing_field("noise_shaper"))?,
-                    modulator_order: modulator_order.ok_or_else(|| A::Error::missing_field("modulator_order"))?,
-                    trellis: if trellis_seen { trellis } else { return Err(A::Error::missing_field("trellis")); },
-                    pcm_to_dsd_filter: pcm_to_dsd_filter.ok_or_else(|| A::Error::missing_field("pcm_to_dsd_filter"))?,
-                    dsd_to_pcm_lowpass: dsd_to_pcm_lowpass.ok_or_else(|| A::Error::missing_field("dsd_to_pcm_lowpass"))?,
-                    dsd_to_pcm_gain_mode: dsd_to_pcm_gain_mode.unwrap_or_default(),
-                    dsd_to_pcm_auto_gain_margin_db: dsd_to_pcm_auto_gain_margin_db.unwrap_or_else(default_dsd_to_pcm_auto_gain_margin_db),
-                    dsd_to_pcm_gain_db: if dsd_to_pcm_gain_db_seen { dsd_to_pcm_gain_db } else { None },
-                    sinc: sinc.ok_or_else(|| A::Error::missing_field("sinc"))?,
-                    gain_compensation: gain_compensation.ok_or_else(|| A::Error::missing_field("gain_compensation"))?,
-                };
-                let mut settings = DsdSettings::from_legacy_wire(wire);
-                settings.auto_gain_scope = auto_gain_scope.unwrap_or_default();
-                settings.true_peak_scan_mode = if settings.auto_gain_scope == DsdAutoGainScope::Album {
-                    true_peak_scan_mode.ok_or_else(|| A::Error::missing_field("true_peak_scan_mode"))?
-                } else {
-                    DsdTruePeakScanMode::Reference
-                };
-                Ok(settings)
-            }
-        }
-
-        deserializer.deserialize_map(DsdSettingsVisitor(PhantomData))
     }
 }
 
@@ -1641,6 +1410,10 @@ impl Default for MetadataSettings {
 
 
 fn validate_ssrc_dither_settings(settings: &PipelineSettings) -> Result<()> {
+    // Settings validation is intentionally structural. Destination-rate
+    // applicability is a terminal-realization question because a derived
+    // global family may legitimately split to a later terminal, and native
+    // overrides are inactive on floating/non-SSRC outputs.
     if let Some(dither_id) = settings.ssrc.dither_id {
         if dither_id > 99 {
             return Err(PlanningError::invalid_settings(
@@ -1649,69 +1422,9 @@ fn validate_ssrc_dither_settings(settings: &PipelineSettings) -> Result<()> {
             ));
         }
     }
-
-    if !settings_may_emit_ssrc_integer_dither(settings) {
-        return Ok(());
-    }
-
-    let RateTarget::PcmHz(requested_rate_hz) = settings.target_sample_rate else {
-        return Ok(());
-    };
-
-    // Rate-dependent processing must be validated against the rate the
-    // ordinary lossy planner will actually deliver, not an impossible
-    // requested rate that will be adapted before encoding. Conversely, a
-    // hard-ceiling album-gain request must remain a rate refusal; defer its
-    // unsupported-rate diagnostic to request planning instead of obscuring it
-    // with an SSRC dither error for a conversion that cannot be admitted.
-    let target_rate_hz = if settings.target_format.is_lossy() {
-        match mapping::ffmpeg_lossy_encoder_accepts_rate_directly(
-            &settings.target_format,
-            requested_rate_hz,
-        ) {
-            Some(true) => requested_rate_hz,
-            Some(false)
-                if settings.dsd.album_auto_gain_selected()
-                    || settings.dsd.runtime_album_gain_db().is_some() =>
-            {
-                return Ok(());
-            }
-            Some(false) => {
-                let Some(rate_hz) = mapping::ffmpeg_lossy_encoder_rate_for_request(
-                    &settings.target_format,
-                    requested_rate_hz,
-                ) else {
-                    return Ok(());
-                };
-                rate_hz
-            }
-            None => return Ok(()),
-        }
-    } else {
-        requested_rate_hz
-    };
-
-    if let Some(dither_id) = settings.ssrc.dither_id {
-        mapping::validate_ssrc_dither_id_for_rate(dither_id, target_rate_hz)
-    } else {
-        mapping::ssrc_dither_selection_for_rate(settings.dither_type, target_rate_hz).map(|_| ())
-    }
+    Ok(())
 }
 
-fn settings_may_emit_ssrc_integer_dither(settings: &PipelineSettings) -> bool {
-    let uses_ssrc = matches!(settings.preferred_tool, PreferredTool::Ssrc)
-        || settings.ssrc.force
-        || matches!(settings.nyquist_transition, NyquistTransition::BrickWall);
-    let ditherable_integer_or_unknown_output = matches!(
-        settings.target_bit_depth,
-        BitDepthTarget::Source
-            | BitDepthTarget::Pcm(
-                PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24,
-            )
-    );
-
-    uses_ssrc && ditherable_integer_or_unknown_output
-}
 
 /// Verification settings consumed after encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1771,25 +1484,37 @@ pub fn pcm_true_peak_lossy_floor_applies(
     format.is_lossy() || (format == &AudioFormat::WavPack && wavpack_hybrid)
 }
 
-/// True-peak measurement and one-linear-gain policy for PCM conversions.
+/// Effective certified true-peak target after the explicit lossy encoder-input cap.
+///
+/// Guard and True-peak normalize use the same physical target policy for ordinary
+/// PCM and general DSD-to-PCM. This helper keeps that policy single-sourced; it
+/// does not change the semantic/requested dBTP target recorded by the planner.
+#[must_use]
+pub fn effective_true_peak_target(
+    policy: SampleGainPolicy,
+    format: &AudioFormat,
+    wavpack_hybrid: bool,
+) -> Option<(DbNano, bool)> {
+    let target_dbtp = policy.target_dbtp()?;
+    if pcm_true_peak_lossy_floor_applies(format, wavpack_hybrid)
+        && target_dbtp > PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP
+    {
+        Some((PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true))
+    } else {
+        Some((target_dbtp, false))
+    }
+}
+
+/// Ordinary sample-domain gain settings for PCM conversions.
+///
+/// The active policy is a tagged enum, so Off/Guard/Normalize/Fixed cannot be
+/// active simultaneously. Runtime album authority is deliberately separate and
+/// never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct PcmTruePeakGainSettings {
-    /// Enable the measure-then-gain step.
-    pub enabled: bool,
-    /// User-selected true-peak target in dBTP.
-    pub target_dbtp: DbNano,
-    /// Permit positive gain when material is already below the target.
-    pub allow_boost: bool,
-    /// Per-track or submitted-batch scope.
-    pub scope: PcmTruePeakScope,
-    /// User-selected PCM true-peak accuracy/speed scan.
-    pub scan_mode: PcmTruePeakScanMode,
-    /// Optional user-supplied fixed amplitude gain. This is an alternative to
-    /// automatic true-peak gain and is applied exactly as supplied; clipping
-    /// is intentionally not prevented.
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub fixed_gain_db: Option<DbNano>,
+    /// Mutually exclusive ordinary sample-domain gain policy.
+    pub policy: SampleGainPolicy,
     /// Runtime-only submitted-batch authority. Never persisted in presets or config.
     #[cfg_attr(feature = "serde", serde(skip))]
     runtime_album_gain_db: Option<DbNano>,
@@ -1798,32 +1523,88 @@ pub struct PcmTruePeakGainSettings {
 impl Default for PcmTruePeakGainSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
-            allow_boost: false,
-            scope: PcmTruePeakScope::Track,
-            scan_mode: PcmTruePeakScanMode::Fast,
-            fixed_gain_db: None,
+            policy: SampleGainPolicy::Off,
             runtime_album_gain_db: None,
         }
     }
 }
 
 impl PcmTruePeakGainSettings {
+    /// True for Guard or true-peak normalize.
+    #[must_use]
+    pub const fn is_true_peak(self) -> bool {
+        self.policy.is_true_peak()
+    }
+
+    /// True when Off is not selected.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        self.policy.is_active()
+    }
+
+    /// True when a certified true-peak policy uses common Album authority.
+    #[must_use]
+    pub const fn album_true_peak_gain_selected(self) -> bool {
+        self.policy.is_album_true_peak()
+    }
+
+    /// Active true-peak target.
+    #[must_use]
+    pub const fn target_dbtp(self) -> Option<DbNano> {
+        self.policy.target_dbtp()
+    }
+
+    /// Active true-peak scope.
+    #[must_use]
+    pub const fn scope(self) -> Option<crate::enums::TruePeakScope> {
+        self.policy.scope()
+    }
+
+    /// Active certified scan tier.
+    #[must_use]
+    pub const fn scan_tier(self) -> Option<crate::enums::TruePeakScanTier> {
+        self.policy.scan()
+    }
+
+    /// Active unguarded fixed gain.
+    #[must_use]
+    pub const fn fixed_gain_db(self) -> Option<DbNano> {
+        self.policy.fixed_gain_db()
+    }
+
+    /// Replace the policy and clear stale submitted-batch authority.
+    pub fn set_policy(&mut self, policy: SampleGainPolicy) {
+        self.policy = policy;
+        self.clear_runtime_album_gain();
+    }
+
+    /// Change only scope while retaining policy mode, target, and scan tier.
+    pub fn set_scope(&mut self, scope: crate::enums::TruePeakScope) {
+        self.policy = self.policy.with_scope(scope);
+        self.clear_runtime_album_gain();
+    }
+
+    /// Change only scan tier while retaining policy mode, target, and scope.
+    pub fn set_scan_tier(&mut self, scan: crate::enums::TruePeakScanTier) {
+        self.policy = self.policy.with_scan(scan);
+        self.clear_runtime_album_gain();
+    }
+
     /// Effective ceiling after the explicit lossy encoder-input cap.
     #[must_use]
     pub fn effective_target(
         self,
         format: &AudioFormat,
         wavpack_hybrid: bool,
-    ) -> (DbNano, bool) {
-        if pcm_true_peak_lossy_floor_applies(format, wavpack_hybrid)
-            && self.target_dbtp > PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP
-        {
-            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true)
-        } else {
-            (self.target_dbtp, false)
-        }
+    ) -> Option<(DbNano, bool)> {
+        effective_true_peak_target(self.policy, format, wavpack_hybrid)
+    }
+
+    /// Narrow runtime-only setter used by planner/fingerprint tests and transition bridges.
+    /// Persisted policy remains the tagged `SampleGainPolicy`; changing this value does
+    /// not create another user authority.
+    pub fn set_runtime_album_gain_db(&mut self, gain_db: Option<DbNano>) {
+        self.runtime_album_gain_db = gain_db;
     }
 
     /// Bind the one gain derived from the complete submitted batch.
@@ -1847,46 +1628,25 @@ fn validate_pcm_true_peak_settings(
     settings: &PcmTruePeakGainSettings,
     target_format: &AudioFormat,
 ) -> Result<()> {
-    if settings.enabled && settings.fixed_gain_db.is_some() {
+    validate_sample_gain_policy("pcm_true_peak.policy", settings.policy)?;
+    if !matches!(settings.policy, SampleGainPolicy::Off) && target_format.is_dsd() {
         return Err(PlanningError::invalid_settings(
-            "pcm_true_peak.fixed_gain_db",
-            "PCM automatic true-peak gain and user-supplied fixed gain are mutually exclusive",
+            "pcm_true_peak.policy",
+            "ordinary PCM gain policy cannot be applied to a DSD target",
         ));
     }
-    if let Some(gain_db) = settings.fixed_gain_db {
-        if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&gain_db) {
-            return Err(PlanningError::invalid_settings(
-                "pcm_true_peak.fixed_gain_db",
-                "PCM fixed gain must be between -24.000000000 and +24.000000000 dB",
-            ));
-        }
-        if target_format.is_dsd() {
-            return Err(PlanningError::invalid_settings(
-                "pcm_true_peak.fixed_gain_db",
-                "PCM fixed gain cannot be used for a DSD target",
-            ));
-        }
+    if settings.is_true_peak() && !target_format.is_lossy() && !target_format.is_pcm_lossless() {
+        return Err(PlanningError::invalid_settings(
+            "pcm_true_peak.policy",
+            format!("PCM true-peak hard ceiling is not defined for {target_format} output"),
+        ));
     }
-    if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET)
-        .contains(&settings.target_dbtp)
+    if settings.runtime_album_gain_db().is_some()
+        && settings.scope() != Some(crate::enums::TruePeakScope::Album)
     {
         return Err(PlanningError::invalid_settings(
-            "pcm_true_peak.target_dbtp",
-            "PCM true-peak target must be between -12.000000000 and 0.000000000 dBTP",
-        ));
-    }
-    if settings.enabled && target_format.is_dsd() {
-        return Err(PlanningError::invalid_settings(
-            "pcm_true_peak.enabled",
-            "PCM true-peak gain cannot be enabled for a DSD target",
-        ));
-    }
-    if settings.enabled && !target_format.is_lossy() && !target_format.is_pcm_lossless() {
-        return Err(PlanningError::invalid_settings(
-            "pcm_true_peak.enabled",
-            format!(
-                "PCM true-peak hard ceiling is not defined for {target_format} output"
-            ),
+            "pcm_true_peak.runtime_album_gain_db",
+            "runtime album gain requires an active album-scoped certified true-peak policy",
         ));
     }
     Ok(())
@@ -1896,13 +1656,21 @@ fn validate_pcm_true_peak_settings(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReplayGainSettings {
-    /// Optional ReplayGain scanning mode.
+    /// ReplayGain mode owned by Tonepoet's native common-plan executor.
     pub mode: Option<ReplayGainMode>,
     /// Avoid clipping where the scanner supports it.
     pub prevent_clipping: bool,
     /// Whether complete existing ReplayGain tag sets may suppress rescanning.
     #[cfg_attr(feature = "serde", serde(default))]
     pub existing_tags: ReplayGainExistingTagPolicy,
+}
+
+impl ReplayGainSettings {
+    /// Logical ReplayGain request owned by the native common-plan executor.
+    #[must_use]
+    pub const fn logical_mode(self) -> Option<ReplayGainMode> {
+        self.mode
+    }
 }
 
 impl Default for ReplayGainSettings {
@@ -1970,26 +1738,26 @@ mod ssrc_rate_dependent_dither_validation_tests {
     use super::*;
 
     #[test]
-    fn validates_explicit_ssrc_dither_id_against_explicit_pcm_rate() {
+    fn defers_explicit_ssrc_dither_rate_validation_to_active_terminal_resolution() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.nyquist_transition = NyquistTransition::BrickWall;
         settings.target_sample_rate = RateTarget::PcmHz(96_000);
         settings.ssrc.dither_id = Some(16);
-        assert!(settings.validate().is_err());
+        assert!(settings.validate().is_ok());
 
         settings.ssrc.dither_id = Some(2);
         assert!(settings.validate().is_ok());
     }
 
     #[test]
-    fn rejects_low_rate_unavailable_ssrc_dither_id() {
+    fn defers_low_rate_native_id_validation_until_ssrc_terminal_is_active() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.nyquist_transition = NyquistTransition::BrickWall;
         settings.target_sample_rate = RateTarget::PcmHz(22_050);
         settings.ssrc.dither_id = Some(6);
-        assert!(settings.validate().is_err());
+        assert!(settings.validate().is_ok());
 
         settings.ssrc.dither_id = Some(1);
         assert!(settings.validate().is_ok());
@@ -2004,13 +1772,13 @@ mod ssrc_rate_dependent_dither_validation_tests {
     }
 
     #[test]
-    fn validates_derived_global_ssrc_dither_mapping_for_explicit_pcm_rate() {
+    fn derived_global_ssrc_mapping_unavailability_is_not_a_settings_error() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.target_sample_rate = RateTarget::PcmHz(176_400);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.dither_type = DitherType::HighShibata;
-        assert!(settings.validate().is_err());
+        assert!(settings.validate().is_ok());
 
         settings.dither_type = DitherType::Tpdf;
         assert!(settings.validate().is_ok());
@@ -2040,11 +1808,11 @@ mod ssrc_rate_dependent_dither_validation_tests {
         settings.target_sample_rate = RateTarget::PcmHz(176_400);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.dither_type = DitherType::HighShibata;
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy album hard-ceiling settings");
-        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
+        settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Album,
+            scan: crate::enums::TruePeakScanTier::Fast,
+        });
 
         settings
             .validate()
@@ -2052,14 +1820,14 @@ mod ssrc_rate_dependent_dither_validation_tests {
     }
 
     #[test]
-    fn validates_derived_ssrc_mapping_when_only_pdf_is_explicit() {
+    fn pdf_only_override_rate_resolution_is_deferred_to_active_terminal() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.target_sample_rate = RateTarget::PcmHz(176_400);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.dither_type = DitherType::Shibata;
         settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
-        assert!(settings.validate().is_err());
+        assert!(settings.validate().is_ok());
     }
 
     #[test]
@@ -2102,510 +1870,189 @@ mod ssrc_rate_dependent_dither_validation_tests {
     }
 
     #[test]
-    fn validates_derived_ssrc_mapping_for_brickwall_auto_tool_settings() {
+    fn brickwall_auto_derived_mapping_unavailability_is_not_a_settings_error() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Auto;
         settings.nyquist_transition = NyquistTransition::BrickWall;
         settings.target_sample_rate = RateTarget::PcmHz(176_400);
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.dither_type = DitherType::HighShibata;
-        assert!(settings.validate().is_err());
+        assert!(settings.validate().is_ok());
     }
 }
 
 #[cfg(test)]
-mod legacy_dsd_gain_mutation_tests {
+mod phase2_gain_policy_tests {
     use super::*;
+    use crate::enums::{TruePeakScanTier, TruePeakScope};
 
-    #[test]
-    fn exact_legacy_gain_mutation_canonicalizes_non_authoritative_fields() {
-        let mut settings = DsdSettings::default();
-        settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.50, Some(9.0))
-            .expect("legacy Auto should be accepted");
-        let behavior = settings.legacy_behavior().expect("legacy authority");
-        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Auto);
-        assert_eq!(behavior.auto_gain_margin_db, 0.50);
-        assert_eq!(behavior.gain_db, None);
-
-        settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 5.0, Some(2.25))
-            .expect("legacy Manual should be accepted");
-        let behavior = settings.legacy_behavior().expect("legacy authority");
-        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Manual);
-        assert_eq!(behavior.auto_gain_margin_db, default_dsd_to_pcm_auto_gain_margin_db());
-        assert_eq!(behavior.gain_db, Some(2.25));
-
-        settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Disabled, 6.0, Some(-3.0))
-            .expect("legacy Disabled should be accepted");
-        let behavior = settings.legacy_behavior().expect("legacy authority");
-        assert_eq!(behavior.gain_mode, DsdToPcmGainMode::Disabled);
-        assert_eq!(behavior.auto_gain_margin_db, default_dsd_to_pcm_auto_gain_margin_db());
-        assert_eq!(behavior.gain_db, None);
+    fn guard(scope: TruePeakScope, scan: TruePeakScanTier) -> SampleGainPolicy {
+        SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope,
+            scan,
+        }
     }
 
     #[test]
-    fn exact_legacy_gain_mutation_rejects_invalid_authority_without_mutation() {
-        let mut settings = DsdSettings::default();
-        let before = settings;
-        assert!(settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 6.01, None)
-            .is_err());
-        assert_eq!(settings, before);
-        assert!(settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, None)
-            .is_err());
-        assert_eq!(settings, before);
-        assert!(settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(24.01))
-            .is_err());
-        assert_eq!(settings, before);
+    fn raw_pcm_and_dsd_defaults_are_distinct_and_disabled() {
+        let settings = PipelineSettings::default();
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+        assert_eq!(settings.dsd.general_from_dsd.gain, SampleGainPolicy::Off);
+        assert_eq!(SampleGainPolicy::pcm_guard_default().scan(), Some(TruePeakScanTier::Fast));
+        assert_eq!(SampleGainPolicy::dsd_guard_default().scan(), Some(TruePeakScanTier::Reference));
     }
 
     #[test]
-    fn legacy_album_target_matches_existing_two_decimal_sox_norm_rendering() {
-        let mut settings = DsdSettings::default();
-        settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-        assert_eq!(
-            settings.album_auto_gain_target_dbfs(),
-            Some("-0.150000000".parse().unwrap())
-        );
+    fn guard_and_normalize_derive_boost_authority_from_the_variant() {
+        let guard = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: "-0.100000000".parse().unwrap(),
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        };
+        let normalize = SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-0.100000000".parse().unwrap(),
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        };
+        assert!(!guard.allow_boost());
+        assert!(normalize.allow_boost());
     }
 
     #[test]
-    fn runtime_album_gain_is_rejected_outside_active_album_automatic_mode() {
-        let mut pipeline = PipelineSettings::default();
-        pipeline
-            .dsd
-            .set_runtime_album_gain_db(Some("1.000000000".parse().unwrap()));
-        assert!(pipeline.validate().is_err());
+    fn pcm_and_general_dsd_share_track_album_and_all_scan_tiers() {
+        for scope in [TruePeakScope::Track, TruePeakScope::Album] {
+            for scan in [TruePeakScanTier::Fast, TruePeakScanTier::Standard, TruePeakScanTier::Reference] {
+                let mut pcm = PcmTruePeakGainSettings::default();
+                pcm.set_policy(guard(scope, scan));
+                assert_eq!(pcm.scope(), Some(scope));
+                assert_eq!(pcm.scan_tier(), Some(scan));
 
-        pipeline
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        pipeline.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
-        pipeline
-            .dsd
-            .set_runtime_album_gain_db(Some("1.000000000".parse().unwrap()));
-        assert!(pipeline.validate().is_ok());
+                let mut dsd = DsdSettings::default();
+                dsd.set_gain_policy(guard(scope, scan));
+                assert_eq!(dsd.true_peak_scope(), Some(scope));
+                assert_eq!(dsd.true_peak_scan_tier(), Some(scan));
+            }
+        }
     }
 
     #[test]
-    fn exact_legacy_gain_mutation_never_creates_a_mixed_native_origin() {
-        let mut settings = DsdSettings::native_v2();
-        assert!(settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Manual, 0.15, Some(1.0))
-            .is_err());
-        assert!(settings.is_native_v2());
+    fn fixed_gain_is_not_a_certified_true_peak_policy() {
+        let policy = SampleGainPolicy::FixedGain {
+            gain_db: "3.250000000".parse().unwrap(),
+        };
+        assert!(!policy.is_true_peak());
+        assert!(!policy.allow_boost());
+        assert_eq!(policy.fixed_gain_db(), Some("3.250000000".parse().unwrap()));
+        assert_eq!(policy.target_dbtp(), None);
+    }
+
+    #[test]
+    fn target_and_fixed_gain_ranges_are_enforced() {
+        for raw in ["-12.000000001", "0.000000001"] {
+            let policy = SampleGainPolicy::TruePeakGuard {
+                target_dbtp: raw.parse().unwrap(),
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Fast,
+            };
+            assert!(validate_sample_gain_policy("gain", policy).is_err());
+        }
+        for raw in ["-24.000000001", "24.000000001"] {
+            let policy = SampleGainPolicy::FixedGain { gain_db: raw.parse().unwrap() };
+            assert!(validate_sample_gain_policy("gain", policy).is_err());
+        }
+    }
+
+    #[test]
+    fn album_runtime_authority_requires_album_certified_policy() {
+        let mut pcm = PipelineSettings::default();
+        pcm.pcm_true_peak.bind_runtime_album_gain("-1.000000000".parse().unwrap());
+        assert!(pcm.validate().is_err());
+        pcm.pcm_true_peak.set_policy(guard(TruePeakScope::Album, TruePeakScanTier::Fast));
+        pcm.pcm_true_peak.bind_runtime_album_gain("-1.000000000".parse().unwrap());
+        assert!(pcm.validate().is_ok());
+
+        let mut dsd = PipelineSettings::default();
+        dsd.dsd.bind_runtime_album_gain("-1.000000000".parse().unwrap(), None, 2);
+        assert!(dsd.validate().is_err());
+        dsd.dsd.set_gain_policy(guard(TruePeakScope::Album, TruePeakScanTier::Standard));
+        dsd.dsd.bind_runtime_album_gain("-1.000000000".parse().unwrap(), None, 2);
+        assert!(dsd.validate().is_ok());
+    }
+
+    #[test]
+    fn lossy_floor_applies_only_to_certified_pcm_target() {
+        let mut settings = PcmTruePeakGainSettings::default();
+        settings.set_policy(SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: DbNano::ZERO,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        });
+        assert_eq!(settings.effective_target(&AudioFormat::Flac, false), Some((DbNano::ZERO, false)));
+        assert_eq!(settings.effective_target(&AudioFormat::Opus, false), Some((PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true)));
     }
 }
 
 #[cfg(all(test, feature = "serde"))]
-mod pipeline_settings_serde_compatibility_tests {
+mod phase2_gain_policy_serde_tests {
     use super::*;
+    use crate::enums::{TruePeakScanTier, TruePeakScope};
 
     #[test]
-    fn legacy_pipeline_settings_without_dither_explicit_default_to_automatic() {
-        let mut value = serde_json::to_value(PipelineSettings::default())
-            .expect("serialize current pipeline settings");
-        value
-            .as_object_mut()
-            .expect("pipeline settings serialize as a map")
-            .remove("dither_explicit");
-
-        let decoded: PipelineSettings =
-            serde_json::from_value(value).expect("deserialize legacy pipeline settings");
-        assert!(!decoded.dither_explicit);
-    }
-
-
-    #[test]
-    fn legacy_album_gain_scope_round_trips_without_serializing_runtime_authority() {
+    fn typed_policy_round_trips_without_runtime_album_authority() {
         let mut settings = PipelineSettings::default();
-        settings
-            .dsd
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        settings.dsd.set_auto_gain_scope(DsdAutoGainScope::Album);
-        settings.dsd.bind_runtime_album_gain(
-            "2.125000000".parse().unwrap(),
-            Some("-2.285000000".parse().unwrap()),
-            12,
-        );
+        settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-0.375000000".parse().unwrap(),
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Reference,
+        });
+        settings.pcm_true_peak.bind_runtime_album_gain("-1.125000000".parse().unwrap());
+        settings.dsd.set_gain_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: "-0.200000000".parse().unwrap(),
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
+        });
+        settings.dsd.bind_runtime_album_gain("-0.500000000".parse().unwrap(), None, 8);
 
-        let value = serde_json::to_value(&settings).expect("serialize album settings");
-        assert_eq!(value["dsd"]["auto_gain_scope"], "album");
-        assert!(value["dsd"].get("runtime_album_gain_db").is_none());
-        assert!(value["dsd"].get("runtime_album_loudest_peak_dbfs").is_none());
-        assert!(value["dsd"].get("runtime_album_track_count").is_none());
-
-        let decoded: PipelineSettings =
-            serde_json::from_value(value).expect("deserialize album settings");
-        assert_eq!(decoded.dsd.auto_gain_scope(), DsdAutoGainScope::Album);
-        assert_eq!(decoded.dsd.runtime_album_gain_db(), None);
-        assert_eq!(decoded.dsd.runtime_album_loudest_peak_dbfs(), None);
-        assert_eq!(decoded.dsd.runtime_album_track_count(), None);
-        assert!(decoded.dsd.album_auto_gain_selected());
-    }
-
-    #[test]
-    fn native_album_gain_scope_round_trips_and_track_wire_stays_unchanged() {
-        let track = DsdSettings::native_v2();
-        let track_value = serde_json::to_value(track).expect("serialize native track settings");
-        assert!(track_value.get("auto_gain_scope").is_none());
-        assert!(track_value.get("true_peak_scan_mode").is_none());
-
-        let mut album = DsdSettings::native_v2();
-        album.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
-        album.set_auto_gain_scope(DsdAutoGainScope::Album);
-        let value = serde_json::to_value(album).expect("serialize native album settings");
-        assert_eq!(value["auto_gain_scope"], "album");
-        assert_eq!(value["true_peak_scan_mode"], "fast066v2_reference");
-
-        let decoded: DsdSettings =
-            serde_json::from_value(value).expect("deserialize native album settings");
-        assert!(decoded.is_native_v2());
-        assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Album);
-        assert!(decoded.album_auto_gain_selected());
-        assert_eq!(decoded.runtime_album_gain_db(), None);
-    }
-
-    #[test]
-    fn true_peak_scan_mode_round_trips_additively_for_native_and_legacy_album_gain() {
-        for mut settings in [DsdSettings::native_v2(), DsdSettings::default()] {
-            if settings.is_native_v2() {
-                settings.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
-            } else {
-                settings
-                    .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-                    .expect("legacy auto gain");
-            }
-            settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-            settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Standard);
-
-            let value = serde_json::to_value(settings).expect("serialize scan mode");
-            assert_eq!(value["true_peak_scan_mode"], "fast066v2_standard");
-            let decoded: DsdSettings =
-                serde_json::from_value(value).expect("deserialize scan mode");
-            assert_eq!(decoded.true_peak_scan_mode(), DsdTruePeakScanMode::Standard);
-            assert_eq!(decoded.auto_gain_scope(), DsdAutoGainScope::Album);
-        }
-    }
-
-    #[test]
-    fn track_scope_canonicalizes_true_peak_scan_mode_to_reference() {
-        let mut settings = DsdSettings::native_v2();
-        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
-        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
-
-        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
-        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Fast);
-
-        settings.set_auto_gain_scope(DsdAutoGainScope::Track);
-        assert_eq!(settings.true_peak_scan_mode(), DsdTruePeakScanMode::Reference);
-        let value = serde_json::to_value(settings).expect("serialize canonical track settings");
-        assert!(value.get("auto_gain_scope").is_none());
-        assert!(value.get("true_peak_scan_mode").is_none());
-    }
-
-    #[test]
-    fn deserialization_rejects_retired_scan_schema_even_when_track_scoped() {
-        for mut value in [
-            serde_json::to_value(DsdSettings::native_v2()).expect("serialize native settings"),
-            serde_json::to_value(DsdSettings::default()).expect("serialize legacy settings"),
-        ] {
-            value
-                .as_object_mut()
-                .expect("DSD settings object")
-                .insert(
-                    "true_peak_scan_mode".to_owned(),
-                    serde_json::Value::String("fastest".to_owned()),
-                );
-            let err = serde_json::from_value::<DsdSettings>(value)
-                .expect_err("retired scan token must not be reinterpreted");
-            assert!(err.to_string().contains("fastest"), "{err}");
-        }
-    }
-
-    #[test]
-    fn pcm_true_peak_settings_round_trip_without_runtime_album_authority() {
-        let mut settings = PipelineSettings::default();
-        settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.target_dbtp = "-0.375000000".parse().unwrap();
-        settings.pcm_true_peak.allow_boost = true;
-        settings.pcm_true_peak.scope = PcmTruePeakScope::Album;
-        settings.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Reference;
-        settings
-            .pcm_true_peak
-            .bind_runtime_album_gain("-1.125000000".parse().unwrap());
-
-        let value = serde_json::to_value(&settings).expect("serialize PCM true-peak settings");
-        assert_eq!(value["pcm_true_peak"]["enabled"], true);
-        assert_eq!(value["pcm_true_peak"]["scope"], "album");
-        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast066v2_reference");
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["pcm_true_peak"]["policy"]["mode"], "true_peak_normalize");
+        assert_eq!(value["dsd"]["general_from_dsd"]["gain"]["mode"], "true_peak_guard");
         assert!(value["pcm_true_peak"].get("runtime_album_gain_db").is_none());
+        assert!(value["dsd"].get("runtime_album_gain_db").is_none());
 
-        let decoded: PipelineSettings =
-            serde_json::from_value(value).expect("deserialize PCM true-peak settings");
-        assert!(decoded.pcm_true_peak.enabled);
-        assert_eq!(decoded.pcm_true_peak.target_dbtp, "-0.375000000".parse().unwrap());
-        assert!(decoded.pcm_true_peak.allow_boost);
-        assert_eq!(decoded.pcm_true_peak.scope, PcmTruePeakScope::Album);
-        assert_eq!(decoded.pcm_true_peak.scan_mode, PcmTruePeakScanMode::Reference);
+        let decoded: PipelineSettings = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.pcm_true_peak.runtime_album_gain_db(), None);
+        assert_eq!(decoded.dsd.runtime_album_gain_db(), None);
+        assert_eq!(decoded.pcm_true_peak.scope(), Some(TruePeakScope::Album));
+        assert_eq!(decoded.dsd.true_peak_scan_tier(), Some(TruePeakScanTier::Standard));
     }
 
     #[test]
-    fn pcm_true_peak_fast_scan_mode_round_trips_with_schema_identity() {
+    fn obsolete_ambiguous_gain_forms_are_rejected_not_guessed() {
+        let mut value = serde_json::to_value(PipelineSettings::default()).unwrap();
+        value["pcm_true_peak"] = serde_json::json!({
+            "enabled": true,
+            "target_dbtp": "-0.100000000",
+            "allow_boost": true,
+            "scope": "track",
+            "scan_mode": "fast066v2_fast"
+        });
+        assert!(serde_json::from_value::<PipelineSettings>(value).is_err());
+
+        let mut dsd = serde_json::to_value(PipelineSettings::default()).unwrap();
+        dsd["dsd"]["gain_mode"] = serde_json::Value::String("auto".to_owned());
+        assert!(serde_json::from_value::<PipelineSettings>(dsd).is_err());
+    }
+
+    #[test]
+    fn replaygain_has_one_persisted_native_owner() {
         let mut settings = PipelineSettings::default();
-        settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.scan_mode = PcmTruePeakScanMode::Fast;
-
-        let value = serde_json::to_value(&settings).expect("serialize PCM Fast scan mode");
-        assert_eq!(value["pcm_true_peak"]["scan_mode"], "fast066v2_fast");
-
-        let decoded: PipelineSettings =
-            serde_json::from_value(value).expect("deserialize PCM Fast scan mode");
-        assert_eq!(decoded.pcm_true_peak.scan_mode, PcmTruePeakScanMode::Fast);
-    }
-
-    #[test]
-    fn pcm_true_peak_retired_scan_tokens_are_rejected_instead_of_reinterpreted() {
-        for retired in ["reference", "standard", "fast"] {
-            let mut value = serde_json::to_value(PipelineSettings::default())
-                .expect("serialize baseline settings");
-            value["pcm_true_peak"]["scan_mode"] =
-                serde_json::Value::String(retired.to_string());
-            let err = serde_json::from_value::<PipelineSettings>(value)
-                .expect_err("retired PCM scan token must not be reinterpreted");
-            assert!(err.to_string().contains(retired), "{err}");
-        }
-    }
-
-    #[test]
-    fn dsd_album_retired_scan_tokens_and_omitted_reference_are_rejected() {
-        for retired in ["reference", "fast", "fastest"] {
-            let mut settings = DsdSettings::native_v2();
-            settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-            let mut value = serde_json::to_value(settings).expect("serialize DSD album settings");
-            value["true_peak_scan_mode"] = serde_json::Value::String(retired.to_string());
-            let err = serde_json::from_value::<DsdSettings>(value)
-                .expect_err("retired DSD scan token must not be reinterpreted");
-            assert!(err.to_string().contains(retired), "{err}");
-        }
-
-        let mut settings = DsdSettings::native_v2();
-        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-        let mut value = serde_json::to_value(settings).expect("serialize DSD album settings");
-        value
-            .as_object_mut()
-            .expect("DSD settings object")
-            .remove("true_peak_scan_mode");
-        let err = serde_json::from_value::<DsdSettings>(value)
-            .expect_err("legacy omitted Reference scan must not silently acquire new semantics");
-        assert!(err.to_string().contains("true_peak_scan_mode"), "{err}");
-    }
-
-    #[test]
-    fn changing_true_peak_scan_mode_invalidates_bound_runtime_album_gain() {
-        let mut settings = DsdSettings::default();
-        settings
-            .set_legacy_dsd_to_pcm_gain(DsdToPcmGainMode::Auto, 0.15, None)
-            .expect("legacy auto gain");
-        settings.set_auto_gain_scope(DsdAutoGainScope::Album);
-        settings.bind_runtime_album_gain(
-            "1.250000000".parse().unwrap(),
-            Some("-1.400000000".parse().unwrap()),
-            9,
-        );
-        assert!(settings.runtime_album_gain_db().is_some());
-
-        settings.set_true_peak_scan_mode(DsdTruePeakScanMode::Fast);
-        assert_eq!(settings.runtime_album_gain_db(), None);
-        assert_eq!(settings.runtime_album_loudest_peak_dbfs(), None);
-        assert_eq!(settings.runtime_album_track_count(), None);
-    }
-
-}
-
-
-#[cfg(test)]
-mod pcm_true_peak_settings_tests {
-    use super::*;
-
-    #[test]
-    fn lossless_target_is_not_capped_but_lossy_encoder_input_is() {
-        let settings = PcmTruePeakGainSettings {
-            enabled: true,
-            target_dbtp: "0.000000000".parse().unwrap(),
-            ..PcmTruePeakGainSettings::default()
-        };
-        assert_eq!(
-            settings.effective_target(&AudioFormat::Flac, false),
-            ("0.000000000".parse().unwrap(), false),
-        );
-        for format in [
-            AudioFormat::Mp3,
-            AudioFormat::Aac,
-            AudioFormat::Opus,
-            AudioFormat::Dts,
-            AudioFormat::Ac3,
-        ] {
-            assert_eq!(
-                settings.effective_target(&format, false),
-                (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
-                "{format:?}",
-            );
-        }
-        assert_eq!(
-            settings.effective_target(&AudioFormat::WavPack, false),
-            ("0.000000000".parse().unwrap(), false),
-        );
-        assert_eq!(
-            settings.effective_target(&AudioFormat::WavPack, true),
-            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
-        );
-    }
-
-    #[test]
-    fn pcm_true_peak_accepts_zero_dbtp_for_lossless_pcm() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::Flac;
-        settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.target_dbtp = DbNano::ZERO;
-        settings.validate().expect("0 dBTP lossless target is admitted");
-    }
-
-    #[test]
-    fn pcm_true_peak_rejects_dsd_target_when_enabled() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::Dsf;
-        settings.target_sample_rate = RateTarget::Source;
-        settings.target_bit_depth = BitDepthTarget::Source;
-        settings.pcm_true_peak.enabled = true;
-        let error = settings.validate().expect_err("PCM true-peak gain must not target DSD");
-        assert!(error.to_string().contains("PCM true-peak gain cannot be enabled for a DSD target"));
-    }
-
-    #[test]
-    fn pcm_true_peak_rejects_unbounded_custom_terminal() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::Custom {
-            extension: "proofless".to_string(),
-            display_name: "Proofless".to_string(),
-        };
-        settings.pcm_true_peak.enabled = true;
-        let error = settings
-            .validate()
-            .expect_err("custom terminal has no hard-ceiling contract");
-        assert!(
-            error
-                .to_string()
-                .contains("PCM true-peak hard ceiling is not defined"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn pcm_true_peak_rejects_lossy_dither_without_a_terminal_error_bound() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::Mp3;
-        settings.dither_type = DitherType::Tpdf;
-        settings.pcm_true_peak.enabled = true;
-        let error = settings
-            .validate()
-            .expect_err("lossy dither is outside the encoder-input ceiling proof");
-        assert!(
-            error.to_string().contains("requires dither off"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn pcm_true_peak_accepts_wavpack_hybrid_and_applies_lossy_floor() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::WavPack;
-        settings.wavpack.hybrid = true;
-        settings.pcm_true_peak.enabled = true;
-        settings.pcm_true_peak.target_dbtp = DbNano::ZERO;
-
-        settings
-            .validate()
-            .expect("qualified WavPack hybrid terminal should be admitted");
-        assert_eq!(
-            settings
-                .pcm_true_peak
-                .effective_target(&settings.target_format, settings.wavpack.hybrid),
-            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, true),
-        );
-
-        settings.pcm_true_peak.target_dbtp = PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP;
-        assert_eq!(
-            settings
-                .pcm_true_peak
-                .effective_target(&settings.target_format, settings.wavpack.hybrid),
-            (PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP, false),
-        );
-
-        settings.pcm_true_peak.target_dbtp = "-1.500000000".parse().unwrap();
-        assert_eq!(
-            settings
-                .pcm_true_peak
-                .effective_target(&settings.target_format, settings.wavpack.hybrid),
-            ("-1.500000000".parse().unwrap(), false),
-        );
-    }
-
-    #[test]
-    fn pcm_fixed_gain_round_trips_and_is_mutually_exclusive_with_auto_gain() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::Flac;
-        settings.pcm_true_peak.fixed_gain_db = Some("3.250000000".parse().unwrap());
-        settings.validate().expect("fixed PCM gain should be admitted");
-
-        let json = serde_json::to_value(&settings).expect("serialize fixed gain");
-        assert_eq!(json["pcm_true_peak"]["fixed_gain_db"], "3.250000000");
-        let decoded: PipelineSettings = serde_json::from_value(json).expect("deserialize fixed gain");
-        assert_eq!(
-            decoded.pcm_true_peak.fixed_gain_db,
-            Some("3.250000000".parse().unwrap()),
-        );
-
-        settings.pcm_true_peak.enabled = true;
-        let error = settings
-            .validate()
-            .expect_err("automatic and fixed PCM gain must not stack");
-        assert!(error.to_string().contains("mutually exclusive"), "{error}");
-    }
-
-    #[test]
-    fn pcm_fixed_gain_rejects_values_outside_the_user_contract() {
-        for raw in ["-24.000000001", "24.000000001"] {
-            let mut settings = PipelineSettings::default();
-            settings.pcm_true_peak.fixed_gain_db = Some(raw.parse().unwrap());
-            let error = settings.validate().expect_err("fixed gain range must be enforced");
-            assert!(error.to_string().contains("-24.000000000"), "{error}");
-            assert!(error.to_string().contains("+24.000000000"), "{error}");
-        }
-    }
-
-    #[test]
-    fn pcm_true_peak_wavpack_hybrid_can_use_the_qualified_integer_dither_terminal() {
-        let mut settings = PipelineSettings::default();
-        settings.target_format = AudioFormat::WavPack;
-        settings.wavpack.hybrid = true;
-        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        settings.dither_type = DitherType::Tpdf;
-        settings.pcm_true_peak.enabled = true;
-
-        settings
-            .validate()
-            .expect("hybrid WavPack dither is bounded by its realized integer PCM terminal");
+        settings.replay_gain.mode = Some(ReplayGainMode::Both);
+        assert_eq!(settings.replay_gain.logical_mode(), Some(ReplayGainMode::Both));
+        assert!(settings.validate().is_ok());
+        let encoded = serde_json::to_value(&settings).unwrap();
+        assert_eq!(encoded["replay_gain"]["mode"], "both");
+        let decoded: PipelineSettings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.replay_gain.logical_mode(), Some(ReplayGainMode::Both));
     }
 }

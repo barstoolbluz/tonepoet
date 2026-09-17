@@ -75,11 +75,8 @@ pub fn handle_format_button(
         TuiButton::PcmTruePeakPill(index) => format.select_row_index(
             FormatField::PcmTruePeak, index, source_bits, source_rate,
         ),
-        TuiButton::PcmTruePeakScopePill(index) => format.select_row_index(
-            FormatField::PcmTruePeakScope, index, source_bits, source_rate,
-        ),
-        TuiButton::PcmTruePeakBoostPill(index) => format.select_row_index(
-            FormatField::PcmTruePeakBoost, index, source_bits, source_rate,
+        TuiButton::TruePeakScopePill(index) => format.select_row_index(
+            FormatField::TruePeakScope, index, source_bits, source_rate,
         ),
         TuiButton::PcmTruePeakScanPill(index) => format.select_row_index(
             FormatField::PcmTruePeakScan, index, source_bits, source_rate,
@@ -126,8 +123,8 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
-        TuiButton::DsdGainScopePill(index) => format.select_row_index(
-            FormatField::DsdGainScope,
+        TuiButton::DsdTruePeakScopePill(index) => format.select_row_index(
+            FormatField::DsdTruePeakScope,
             index,
             source_bits,
             source_rate,
@@ -144,8 +141,14 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
-        TuiButton::DsdNormalizeTargetField => format.select_row_index(
-            FormatField::DsdNormalizeTarget,
+        TuiButton::DsdTruePeakTargetField => format.select_row_index(
+            FormatField::DsdTruePeakTarget,
+            0,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdSamplePeakTargetField => format.select_row_index(
+            FormatField::DsdSamplePeakTarget,
             0,
             source_bits,
             source_rate,

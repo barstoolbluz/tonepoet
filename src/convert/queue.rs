@@ -161,7 +161,7 @@ pub struct ConversionItem {
     pub id: String,
     /// Opaque identity for the exact set admitted by one user submission.
     ///
-    /// Album-scoped DSD auto-gain uses this only as an execution barrier key;
+    /// Album-scoped DSD true-peak gain uses this only as an execution barrier key;
     /// album membership is never inferred from tags, folders, or disc layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
