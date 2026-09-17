@@ -58609,7 +58609,7 @@ mod conversion_log_tests {
         automatic_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
         let automatic_log = render(&source, &automatic_int32, automatic_record);
         assert!(automatic_log.contains(
-            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
         ));
         assert!(automatic_log.contains(
             "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"

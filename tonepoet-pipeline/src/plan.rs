@@ -4600,6 +4600,10 @@ mod source_float_source_depth_policy_tests {
         settings.target_bit_depth = BitDepthTarget::Source;
         settings.dither_type = DitherType::None;
         settings.dither_explicit = false;
+        // The built-in registry has no metadata-transfer plugin; sibling tests
+        // disable transfer so planning exercises the audio topology only.
+        settings.metadata.transfer_tags = false;
+        settings.metadata.preserve_artwork = false;
         PlanRequest {
             input_path: PathBuf::from(format!("input.{}", source_format.extension())),
             output_path: PathBuf::from(format!("output.{}", target_format.extension())),
