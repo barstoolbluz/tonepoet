@@ -770,6 +770,7 @@ async fn supported_pcm_depth_format_cells_publish_exact_requested_representation
         MatrixCase { format: AudioFormat::WavPack, depth: PcmBitDepth::Int16, extension: "wv", preferred_tool: PreferredTool::Auto, extra_tools: &["wvunpack"] },
         MatrixCase { format: AudioFormat::WavPack, depth: PcmBitDepth::Int24, extension: "wv", preferred_tool: PreferredTool::Sox, extra_tools: &["sox", "wvunpack"] },
         MatrixCase { format: AudioFormat::WavPack, depth: PcmBitDepth::Int32, extension: "wv", preferred_tool: PreferredTool::Ffmpeg, extra_tools: &["wvunpack"] },
+        MatrixCase { format: AudioFormat::WavPack, depth: PcmBitDepth::Float32, extension: "wv", preferred_tool: PreferredTool::Auto, extra_tools: &["wvunpack"] },
         MatrixCase { format: AudioFormat::Alac, depth: PcmBitDepth::Int16, extension: "m4a", preferred_tool: PreferredTool::Auto, extra_tools: &[] },
         MatrixCase { format: AudioFormat::Alac, depth: PcmBitDepth::Int24, extension: "m4a", preferred_tool: PreferredTool::Ffmpeg, extra_tools: &[] },
         MatrixCase { format: AudioFormat::Wav, depth: PcmBitDepth::Int16, extension: "wav", preferred_tool: PreferredTool::Auto, extra_tools: &[] },

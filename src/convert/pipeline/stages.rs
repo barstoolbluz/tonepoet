@@ -1466,7 +1466,7 @@ async fn realize_track_with_tool_limits_and_stats(
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
             let audio_policy = DvdaRealizationAudioPolicy::new(
                 bit_depth_target_label(req.settings.target_bit_depth).to_string(),
-                prepared_track.and_then(|track| resolved_target_bit_depth(track, req.settings.target_bit_depth)),
+                prepared_track.and_then(|track| resolved_target_bit_depth(track, &req.settings)),
                 *dvda_downmix_policy,
             );
             realize_dvda_track(
@@ -2268,13 +2268,13 @@ fn expected_post_encode_depth_for_track(
             if !settings.target_format.is_pcm_lossless() {
                 return None;
             }
-            super::plan_bridge::resolve_source_pcm_depth(track).map(|depth| {
+            resolved_target_pcm_depth(track, settings).map(|depth| {
                 PostEncodeDepthExpectation {
                     depth,
                     // Source resolution preserves integer-versus-float class
-                    // as well as width. Unknown source representation is rejected
-                    // by the bridge before planning; validation never invents a
-                    // target-format default and labels it as source-derived.
+                    // where the target supports it. Float Source into FLAC,
+                    // ALAC, or lossless WavPack resolves to the format-safe
+                    // integer landing depth used by the typed planner.
                     class_strict: true,
                 }
             })
@@ -14132,7 +14132,7 @@ fn inherited_replaygain_tag_policy(
         let depth_changed = source.map_or(true, |source| {
             source.tracks.iter().any(|track| {
                 let source_depth = super::plan_bridge::resolve_source_pcm_depth(track);
-                let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+                let target_depth = resolved_target_pcm_depth(track, settings)
                     .or_else(|| {
                         source_default_pcm_depth_for_track(track, settings)
                             .map(|(depth, _)| depth)
@@ -14157,12 +14157,6 @@ fn inherited_replaygain_tag_policy(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReplayGainFormatSupport {
-    Supported,
-    Unsupported { reason: String },
-}
-
 /// Canonical container extension spelling used when constructing staged paths.
 pub(super) fn normalized_container_extension(req: &PipelineRequest) -> String {
     req.container_extension
@@ -14172,21 +14166,9 @@ pub(super) fn normalized_container_extension(req: &PipelineRequest) -> String {
         .trim_start_matches('.')
         .to_ascii_lowercase()
 }
-
-fn replaygain_format_support(_req: &PipelineRequest) -> ReplayGainFormatSupport {
-    // Reader and writer admission are independent runtime capabilities in the
-    // native path. Do not infer either from a target extension or format enum.
-    // The output artifact is probed by the native reader and the authoritative
-    // metadata backend immediately before work.
-    ReplayGainFormatSupport::Supported
-}
-
 fn replaygain_request_policy_log_label(req: &PipelineRequest) -> String {
     if req.stages.replaygain == StageRequirement::Disabled {
         return "disabled by pipeline settings".to_string();
-    }
-    if let ReplayGainFormatSupport::Unsupported { reason } = replaygain_format_support(req) {
-        return format!("skip: {reason}; no ReplayGain tags will be written");
     }
     if req.settings.replay_gain.existing_tags
         == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
@@ -14207,27 +14189,6 @@ fn replaygain_policy_log_label(
         return "disabled by pipeline settings".to_string();
     }
 
-    if let ReplayGainFormatSupport::Unsupported { reason } = replaygain_format_support(req) {
-        return match stage_outcome {
-            Some(StageOutcome::SkippedWithReason(skip_reason)) => format!(
-                "skipped: {}; no ReplayGain tags were written",
-                escape_log_value(skip_reason)
-            ),
-            Some(StageOutcome::Skipped) => {
-                format!("skipped: {reason}; no ReplayGain tags were written")
-            }
-            Some(StageOutcome::NotRequested) => {
-                "not requested despite enabled ReplayGain settings".to_string()
-            }
-            Some(StageOutcome::Failed(error)) => format!(
-                "failed unexpectedly for unsupported target ({reason}): {error}"
-            ),
-            Some(StageOutcome::Ok) | Some(StageOutcome::OkWithDetail(_)) => format!(
-                "completed unexpectedly for unsupported target ({reason})"
-            ),
-            None => format!("outcome unavailable: {reason}"),
-        };
-    }
 
     let planned_policy = if req.settings.replay_gain.existing_tags
         == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
@@ -22280,7 +22241,7 @@ fn bit_depth_transition_log_label(
         .tracks
         .iter()
         .filter_map(|track| {
-            let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+            let target_depth = resolved_target_pcm_depth(track, settings)
                 .or_else(|| {
                     source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
                 })?;
@@ -22365,7 +22326,7 @@ fn command_records_prove_dither_for_track(
     record: &TrackRecord,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
-    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+    let target_depth = resolved_target_pcm_depth(track, settings)
         .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
     let reference_dsd = tonepoet_pipeline::selects_reference_dsd_to_pcm(
         settings,
@@ -22448,7 +22409,7 @@ fn applied_dither_tool_label(
     for (index, record) in tracks.iter().enumerate() {
         let prepared = source.tracks.get(index);
         let target_depth = prepared
-            .and_then(|track| resolved_target_pcm_depth(track, settings.target_bit_depth)
+            .and_then(|track| resolved_target_pcm_depth(track, settings)
                 .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)))
             .or_else(|| source_has_int32_target(source, settings)
                 .then_some(tonepoet_pipeline::PcmBitDepth::Int32));
@@ -22502,10 +22463,11 @@ fn applied_dither_description(
     tracks: &[&TrackRecord],
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> String {
-    let algorithm = if settings.dither_type == DitherType::None {
+    let effective_dither = effective_dither_for_source(source, settings);
+    let algorithm = if effective_dither == DitherType::None {
         "command-selected dither/noise shaping".to_string()
     } else {
-        dither_type_label(settings.dither_type).to_string()
+        dither_type_label(effective_dither).to_string()
     };
     let tools = applied_dither_tool_label(source, tracks, settings);
     let ssrc_settings = tracks
@@ -22516,7 +22478,7 @@ fn applied_dither_description(
     let mut description = format!("{algorithm} via {tools}");
     if !ssrc_settings.is_empty() {
         if let Some(note) =
-            tonepoet_pipeline::mapping::ssrc_dither_approximation_note(settings.dither_type)
+            tonepoet_pipeline::mapping::ssrc_dither_approximation_note(effective_dither)
         {
             description.push_str("; ");
             description.push_str(note);
@@ -22538,7 +22500,7 @@ fn bit_depth_processing_label(
     let mut has_float_target = false;
 
     for track in &source.tracks {
-        let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        let target_depth = resolved_target_pcm_depth(track, settings)
             .or_else(|| {
                 source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
             });
@@ -22613,7 +22575,7 @@ fn source_has_float_target(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
     source.tracks.iter().any(|track| {
-        resolved_target_pcm_depth(track, settings.target_bit_depth)
+        resolved_target_pcm_depth(track, settings)
             .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
             .is_some_and(PcmBitDepth::is_float)
     })
@@ -22624,7 +22586,7 @@ fn source_has_int32_target(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
     source.tracks.iter().any(|track| {
-        resolved_target_pcm_depth(track, settings.target_bit_depth)
+        resolved_target_pcm_depth(track, settings)
             .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
             == Some(PcmBitDepth::Int32)
     })
@@ -22634,7 +22596,7 @@ fn track_depth_reduction_requires_dither(
     track: &PreparedTrack,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
-    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+    let target_depth = resolved_target_pcm_depth(track, settings)
         .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
     let Some(target) = target_depth else {
         return false;
@@ -22681,10 +22643,12 @@ fn dither_log_line(
     if applies {
         return format!("yes ({})", applied_dither_description(source, tracks, settings));
     }
-    if settings.dither_type == DitherType::None {
+    let policy_tpdf = source_depth_policy_tpdf_for_source(source, settings);
+    let effective_dither = effective_dither_for_source(source, settings);
+    if effective_dither == DitherType::None {
         return "no (not requested)".to_string();
     }
-    let requested = dither_type_label(settings.dither_type);
+    let requested = dither_type_label(effective_dither);
     if settings.target_format.is_dsd() {
         return format!(
             "requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
@@ -22701,9 +22665,9 @@ fn dither_log_line(
         );
     }
     if source_has_int32_target(source, settings) {
-        if !settings.dither_explicit {
+        if !(settings.dither_explicit || policy_tpdf) {
             return format!(
-                "requested ({requested}) — not applied (32-bit default gate; selection was not explicit)"
+                "requested ({requested}) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
             );
         }
         let tool = processing_tool_label(tracks, settings);
@@ -22718,7 +22682,7 @@ fn dither_log_line(
             );
         }
         if tool == "ffmpeg aresample"
-            && tonepoet_pipeline::mapping::soxr_dither_method(settings.dither_type).is_none()
+            && tonepoet_pipeline::mapping::soxr_dither_method(effective_dither).is_none()
         {
             return format!(
                 "requested ({requested}) — not applied (not supported by the ffmpeg/soxr resampler)"
@@ -23312,7 +23276,9 @@ fn per_track_dither_disclosure(
     req: &PipelineRequest,
 ) -> Option<String> {
     let settings = &req.settings;
-    if settings.dither_type == DitherType::None
+    let policy_tpdf = source_depth_policy_tpdf_for_track(track, settings);
+    let effective_dither = effective_dither_for_track(track, settings);
+    if effective_dither == DitherType::None
         || tonepoet_pipeline::selects_reference_dsd_to_pcm(
             settings,
             track.source_audio.coding == Some(SourceAudioCoding::Dsd),
@@ -23321,13 +23287,13 @@ fn per_track_dither_disclosure(
         return None;
     }
 
-    let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+    let target_depth = resolved_target_pcm_depth(track, settings)
         .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
     if command_records_prove_dither_for_track(track, record, settings) {
         return None;
     }
 
-    let requested = dither_type_label(settings.dither_type);
+    let requested = dither_type_label(effective_dither);
     if settings.target_format.is_dsd() {
         return Some(format!(
             "Dither requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
@@ -23341,8 +23307,10 @@ fn per_track_dither_disclosure(
 
     let reason = match target_depth {
         Some(depth) if depth.is_float() => "float targets are not dithered",
-        Some(tonepoet_pipeline::PcmBitDepth::Int32) if !settings.dither_explicit => {
-            "32-bit default gate; selection was not explicit"
+        Some(tonepoet_pipeline::PcmBitDepth::Int32)
+            if !(settings.dither_explicit || policy_tpdf) =>
+        {
+            "32-bit default gate; selection was not explicit or Source-policy selected"
         }
         Some(tonepoet_pipeline::PcmBitDepth::Int32)
             if command_records_use_tool(&[record], ToolBinary::Ssrc) =>
@@ -23356,11 +23324,13 @@ fn per_track_dither_disclosure(
         }
         Some(tonepoet_pipeline::PcmBitDepth::Int32)
             if command_records_use_tool(&[record], ToolBinary::Ffmpeg)
-                && tonepoet_pipeline::mapping::soxr_dither_method(settings.dither_type).is_none() =>
+                && tonepoet_pipeline::mapping::soxr_dither_method(effective_dither).is_none() =>
         {
             "not supported by the ffmpeg/soxr resampler"
         }
-        Some(tonepoet_pipeline::PcmBitDepth::Int32) if settings.dither_explicit => {
+        Some(tonepoet_pipeline::PcmBitDepth::Int32)
+            if settings.dither_explicit || policy_tpdf =>
+        {
             "executed command did not emit a dither stage"
         }
         _ if track_depth_reduction_requires_dither(track, settings) => {
@@ -23391,7 +23361,7 @@ fn conversion_summary(
     let planned_target_pcm_depth = if req.settings.target_format.is_dsd() {
         None
     } else {
-        resolved_target_pcm_depth(track, req.settings.target_bit_depth)
+        resolved_target_pcm_depth(track, &req.settings)
             .or(defaulted_source_target.map(|(depth, _)| depth))
     };
     let planned_target_depth = planned_target_pcm_depth.map(tonepoet_pipeline::PcmBitDepth::bits);
@@ -23507,24 +23477,26 @@ fn conversion_summary(
             transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
         }
     }
+    let policy_tpdf = source_depth_policy_tpdf_for_track(track, &req.settings);
+    let effective_dither = effective_dither_for_track(track, &req.settings);
     let dither_applied = actual_dither_applied.unwrap_or_else(|| {
         dither_applies(
             super::plan_bridge::resolve_dither_source_pcm_depth(track),
             planned_target_pcm_depth,
-            req.settings.dither_type,
-            req.settings.dither_explicit,
+            effective_dither,
+            req.settings.dither_explicit || policy_tpdf,
             preferred_resampler_family(&req.settings),
         )
     });
     if dither_applied {
-        let label = if req.settings.dither_type == DitherType::None {
+        let label = if effective_dither == DitherType::None {
             "command-selected".to_string()
         } else {
-            dither_type_label(req.settings.dither_type).to_string()
+            dither_type_label(effective_dither).to_string()
         };
         transforms.push(format!("{label} dither"));
     } else if actual_dither_applied == Some(false)
-        && req.settings.dither_type != DitherType::None
+        && effective_dither != DitherType::None
         && !tonepoet_pipeline::selects_reference_dsd_to_pcm(
             &req.settings,
             track.source_audio.coding == Some(SourceAudioCoding::Dsd),
@@ -23612,7 +23584,7 @@ fn bit_depth_change_applies_for_source(
         return false;
     }
     source.tracks.iter().any(|track| {
-        let target_depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        let target_depth = resolved_target_pcm_depth(track, settings)
             .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
         let Some(target_depth) = target_depth else {
             return false;
@@ -23655,12 +23627,13 @@ fn dithering_applies_for_source(
         return !source_has_float_target(source, settings);
     }
     source.tracks.iter().any(|track| {
+        let policy_tpdf = source_depth_policy_tpdf_for_track(track, settings);
         dither_applies(
             super::plan_bridge::resolve_dither_source_pcm_depth(track),
-            resolved_target_pcm_depth(track, settings.target_bit_depth)
+            resolved_target_pcm_depth(track, settings)
                 .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
-            settings.dither_type,
-            settings.dither_explicit,
+            effective_dither_for_track(track, settings),
+            settings.dither_explicit || policy_tpdf,
             preferred_resampler_family(settings),
         )
     })
@@ -23868,7 +23841,7 @@ fn preconversion_disclosure_messages(
         if reserve_db < HARD_CEILING_HEADROOM_DISCLOSURE_THRESHOLD_DB {
             continue;
         }
-        let depth = resolved_target_pcm_depth(track, settings.target_bit_depth)
+        let depth = resolved_target_pcm_depth(track, settings)
             .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
         let depth = depth
             .map(pcm_bit_depth_label)
@@ -23912,16 +23885,85 @@ async fn emit_preconversion_disclosures(
 
 fn resolved_target_pcm_depth(
     track: &PreparedTrack,
-    target: BitDepthTarget,
+    settings: &tonepoet_pipeline::PipelineSettings,
 ) -> Option<tonepoet_pipeline::PcmBitDepth> {
-    match target {
-        BitDepthTarget::Source => super::plan_bridge::resolve_source_pcm_depth(track),
+    match settings.target_bit_depth {
+        BitDepthTarget::Source => super::plan_bridge::resolve_source_pcm_depth(track).map(
+            |source_depth| {
+                tonepoet_pipeline::source_pcm_depth_for_target(
+                    &settings.target_format,
+                    settings.wavpack.hybrid,
+                    source_depth,
+                )
+            },
+        ),
         BitDepthTarget::Pcm(depth) => Some(depth),
     }
 }
 
-fn resolved_target_bit_depth(track: &PreparedTrack, target: BitDepthTarget) -> Option<u32> {
-    resolved_target_pcm_depth(track, target).map(tonepoet_pipeline::PcmBitDepth::bits)
+fn resolved_target_bit_depth(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> Option<u32> {
+    resolved_target_pcm_depth(track, settings).map(tonepoet_pipeline::PcmBitDepth::bits)
+}
+
+fn source_depth_policy_tpdf_for_track(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    if settings.target_bit_depth != BitDepthTarget::Source
+        || settings.dither_explicit
+        || !matches!(
+            track.source_audio.coding,
+            Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
+        )
+    {
+        return false;
+    }
+    super::plan_bridge::resolve_source_pcm_depth(track).is_some_and(|source_depth| {
+        tonepoet_pipeline::source_depth_policy_requires_tpdf(
+            &settings.target_format,
+            settings.wavpack.hybrid,
+            source_depth,
+        )
+    })
+}
+
+fn effective_dither_for_track(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> DitherType {
+    if settings.dither_type != DitherType::None {
+        settings.dither_type
+    } else if source_depth_policy_tpdf_for_track(track, settings) {
+        DitherType::Tpdf
+    } else {
+        DitherType::None
+    }
+}
+
+fn source_depth_policy_tpdf_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    source
+        .tracks
+        .iter()
+        .any(|track| source_depth_policy_tpdf_for_track(track, settings))
+}
+
+fn effective_dither_for_source(
+    source: &PreparedSource,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> DitherType {
+    if settings.dither_type != DitherType::None {
+        settings.dither_type
+    } else if source_depth_policy_tpdf_for_source(source, settings) {
+        DitherType::Tpdf
+    } else {
+        DitherType::None
+    }
 }
 
 fn source_is_dsd(source: &PreparedSource) -> bool {
@@ -31175,6 +31217,7 @@ fn dsd_true_peak_tier(
     }
 }
 
+#[cfg(test)]
 fn scan_album_gain_true_peak_carrier_with_cancel_and_mode<F>(
     carrier: &Path,
     sample_rate_hz: u32,
@@ -31965,7 +32008,8 @@ fn album_gain_terminal_bound_with_effective_dither(
 
     let ffmpeg_output_error = match selected_realization {
         Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization))
-            if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) =>
+            if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization)
+                || tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization) =>
         {
             ffmpeg_int32_triangular_stored_error_component_sum()
         }
@@ -32029,7 +32073,10 @@ fn album_gain_terminal_bound_with_effective_dither(
         Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) => {
             use tonepoet_pipeline::PcmTerminalRealizationKind;
             match realization.kind {
-                PcmTerminalRealizationKind::FfmpegDirect => ffmpeg_output_error,
+                PcmTerminalRealizationKind::FfmpegDirect
+                | PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid => {
+                    ffmpeg_output_error
+                }
                 PcmTerminalRealizationKind::SoxDirect
                 | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
                 | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => sox_output_error,
@@ -33325,6 +33372,9 @@ mod album_true_peak_carrier_tests {
             | (tonepoet_pipeline::PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid, Some(_)) => {
                 tonepoet_pipeline::PcmTerminalDitherOwner::SoxPreterminal
             }
+            (tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid, Some(_)) => {
+                tonepoet_pipeline::PcmTerminalDitherOwner::FfmpegPreterminal
+            }
             (_, Some(_)) => tonepoet_pipeline::PcmTerminalDitherOwner::SelectedTerminal,
         };
         tonepoet_pipeline::SelectedTerminalRealization::Pcm(
@@ -33454,6 +33504,19 @@ mod album_true_peak_carrier_tests {
         let aiff_stored = aiff_bound.stored_sample_error_linear.unwrap();
         assert_eq!(aiff_bound.pre_gain_reconstructed_error_linear, 0.0);
         assert!(aiff_stored < 1.0e-14);
+
+        let wavpack = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Float32,
+            tonepoet_pipeline::DitherType::None,
+        );
+        let wavpack_bound = album_gain_terminal_bound(&wavpack, 48_000).unwrap();
+        let wavpack_stored = wavpack_bound.stored_sample_error_linear.unwrap();
+        assert_eq!(
+            wavpack_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+        assert_eq!(wavpack_stored, next_up_nonnegative(2.0_f64.powi(-24)));
     }
 
     fn hard_ceiling_settings(
@@ -33850,19 +33913,120 @@ mod album_true_peak_carrier_tests {
 
         let mut source = super::pipeline_test_helpers::log_test_source();
         let track = source.tracks.first_mut().expect("test track");
-        for (source_bits, expected) in [
-            (320, tonepoet_pipeline::PcmBitDepth::Int24),
-            (640, tonepoet_pipeline::PcmBitDepth::Int24),
-            (16, tonepoet_pipeline::PcmBitDepth::Int16),
-            (24, tonepoet_pipeline::PcmBitDepth::Int24),
-            (32, tonepoet_pipeline::PcmBitDepth::Int32),
+        for (source_bits, expected_depth, expected_dither) in [
+            (
+                320,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::None,
+            ),
+            (
+                640,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::Tpdf,
+            ),
+            (
+                16,
+                tonepoet_pipeline::PcmBitDepth::Int16,
+                tonepoet_pipeline::DitherType::None,
+            ),
+            (
+                24,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+                tonepoet_pipeline::DitherType::None,
+            ),
+            (
+                32,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::None,
+            ),
         ] {
             track.bit_depth = Some(source_bits);
             track.source_audio.bit_depth = Some(source_bits);
+            let terminal = pcm_true_peak_terminal_settings(&req, track);
             assert_eq!(
-                pcm_true_peak_terminal_settings(&req, track).target_bit_depth,
-                tonepoet_pipeline::BitDepthTarget::Pcm(expected),
+                terminal.target_bit_depth,
+                tonepoet_pipeline::BitDepthTarget::Pcm(expected_depth),
                 "terminal-bound settings must use the same hybrid Source depth as planning and validation",
+            );
+            assert_eq!(
+                terminal.dither_type,
+                expected_dither,
+                "hybrid Source dither must follow the same width-reduction rule as ordinary WavPack",
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_true_peak_terminal_settings_match_float_source_landing_and_tpdf_policy() {
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.settings.pcm_true_peak.policy =
+            tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+        req.settings.dither_explicit = false;
+
+        let mut source = super::pipeline_test_helpers::log_test_source();
+        let track = source.tracks.first_mut().expect("test track");
+        track.source_audio.coding = Some(SourceAudioCoding::Pcm);
+
+        for (format, source_bits, expected_depth, expected_dither) in [
+            (
+                tonepoet_pipeline::AudioFormat::Flac,
+                320,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::None,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::Flac,
+                640,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::Tpdf,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::Alac,
+                320,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+                tonepoet_pipeline::DitherType::Tpdf,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::Alac,
+                640,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+                tonepoet_pipeline::DitherType::Tpdf,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::WavPack,
+                320,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::None,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::WavPack,
+                640,
+                tonepoet_pipeline::PcmBitDepth::Int32,
+                tonepoet_pipeline::DitherType::Tpdf,
+            ),
+            (
+                tonepoet_pipeline::AudioFormat::Wav,
+                640,
+                tonepoet_pipeline::PcmBitDepth::Float64,
+                tonepoet_pipeline::DitherType::None,
+            ),
+        ] {
+            req.settings.target_format = format.clone();
+            req.settings.wavpack.hybrid = false;
+            track.bit_depth = Some(source_bits);
+            track.source_audio.bit_depth = Some(source_bits);
+            let terminal = pcm_true_peak_terminal_settings(&req, track);
+            assert_eq!(
+                terminal.target_bit_depth,
+                tonepoet_pipeline::BitDepthTarget::Pcm(expected_depth),
+                "{format} source_bits={source_bits}",
+            );
+            assert_eq!(
+                terminal.dither_type,
+                expected_dither,
+                "{format} source_bits={source_bits}",
             );
         }
     }
@@ -33937,23 +34101,47 @@ mod album_true_peak_carrier_tests {
     }
 
     #[test]
-    fn pcm_true_peak_lossless_wavpack_keeps_lossless_terminal_domain() {
-        let mut settings = terminal_settings(
+    fn pcm_true_peak_lossless_wavpack_keeps_lossless_terminal_domain_for_integer_and_float() {
+        let mut integer = terminal_settings(
             tonepoet_pipeline::AudioFormat::WavPack,
             tonepoet_pipeline::PcmBitDepth::Int24,
             tonepoet_pipeline::DitherType::None,
         );
-        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        integer.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
-        let realization = test_pcm_terminal_realization(
-            &settings,
+        let integer_realization = test_pcm_terminal_realization(
+            &integer,
             tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect,
             None,
         );
-        let bound = pcm_true_peak_terminal_bound(&settings, 96_000, &realization).unwrap();
+        let integer_bound =
+            pcm_true_peak_terminal_bound(&integer, 96_000, &integer_realization).unwrap();
         assert_eq!(
-            bound.domain,
+            integer_bound.domain,
             tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+
+        let mut float = terminal_settings(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            tonepoet_pipeline::PcmBitDepth::Float32,
+            tonepoet_pipeline::DitherType::None,
+        );
+        float.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+        let float_realization = test_pcm_terminal_realization(
+            &float,
+            tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegDirect,
+            None,
+        );
+        let float_bound =
+            pcm_true_peak_terminal_bound(&float, 96_000, &float_realization).unwrap();
+        assert_eq!(
+            float_bound.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm,
+        );
+        assert_eq!(
+            float_bound.stored_sample_error_linear,
+            Some(next_up_nonnegative(2.0_f64.powi(-24))),
+            "lossless WavPack Float32 must charge the FFmpeg float rounding bound, not an integer LSB",
         );
     }
 
@@ -34489,6 +34677,7 @@ fn scan_pcm_true_peak_f64le_identity(
     })
 }
 
+#[cfg(test)]
 fn scan_pcm_true_peak_f64le(
     carrier: &Path,
     sample_rate_hz: u32,
@@ -34512,23 +34701,38 @@ fn pcm_true_peak_terminal_settings(
 ) -> tonepoet_pipeline::PipelineSettings {
     let mut settings = req.settings.clone();
     if settings.target_bit_depth == BitDepthTarget::Source {
-        let depth = if settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
-            && settings.wavpack.hybrid
-        {
-            super::plan_bridge::resolve_wavpack_hybrid_source_working_depth(track)
+        let source_depth = if matches!(
+            track.source_audio.coding,
+            Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
+        ) {
+            super::plan_bridge::resolve_source_pcm_depth(track)
         } else {
-            let source_depth = if matches!(
-                track.source_audio.coding,
-                Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
-            ) {
-                resolved_target_pcm_depth(track, BitDepthTarget::Source)
-            } else {
-                None
-            };
-            source_depth.unwrap_or_else(|| {
-                tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format)
-            })
+            None
         };
+        let depth = source_depth
+            .map(|source_depth| {
+                if !settings.dither_explicit
+                    && settings.dither_type == DitherType::None
+                    && tonepoet_pipeline::source_depth_policy_requires_tpdf(
+                        &settings.target_format,
+                        settings.wavpack.hybrid,
+                        source_depth,
+                    )
+                {
+                    settings.dither_type = DitherType::Tpdf;
+                }
+                tonepoet_pipeline::source_pcm_depth_for_target(
+                    &settings.target_format,
+                    settings.wavpack.hybrid,
+                    source_depth,
+                )
+            })
+            .unwrap_or_else(|| {
+                tonepoet_pipeline::default_pcm_depth_for_format(&settings.target_format)
+            });
+        // This helper feeds terminal-bound validation after typed terminal
+        // selection, so it must describe the concrete physical landing depth
+        // rather than preserve the Source policy sentinel.
         settings.target_bit_depth = BitDepthTarget::Pcm(depth);
     }
     settings
@@ -34653,7 +34857,10 @@ fn validate_terminal_bound_realization_settings(
                 }
                 (PcmTerminalRealizationKind::FfmpegDirect, Some(_), PcmTerminalDitherOwner::SelectedTerminal)
                     if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) => {}
-                (PcmTerminalRealizationKind::FfmpegDirect, Some(dither), _) => {
+                (PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid, Some(_), PcmTerminalDitherOwner::FfmpegPreterminal)
+                    if tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization) => {}
+                (PcmTerminalRealizationKind::FfmpegDirect, Some(dither), _)
+                | (PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid, Some(dither), _) => {
                     return Err(format!(
                         "no qualified deterministic FFmpeg-direct {:?} dither terminal bound exists for the selected {:?} realization",
                         dither, realization,
@@ -39096,7 +39303,6 @@ fn cue_source_replaygain_eligible(source: &PreparedSource, req: &PipelineRequest
         || !req.settings.target_format.is_pcm_lossless()
         || matches!(req.settings.target_format, PlannerAudioFormat::WavPack)
             && req.settings.wavpack.hybrid
-        || !matches!(replaygain_format_support(req), ReplayGainFormatSupport::Supported)
         || !matches!(
             inherited_replaygain_tag_policy(Some(source), req),
             ReplayGainInheritedTagPolicy::Trust
@@ -50987,7 +51193,7 @@ impl TemplateRenderTarget for tonepoet_pipeline::PipelineSettings {
     }
 
     fn template_bit_depth(&self, _source: &PreparedSource, track: Option<&PreparedTrack>) -> Option<u32> {
-        track.and_then(|track| resolved_target_bit_depth(track, self.target_bit_depth))
+        track.and_then(|track| resolved_target_bit_depth(track, self))
     }
 }
 
@@ -58440,10 +58646,10 @@ mod conversion_log_tests {
         automatic_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
         let automatic_log = render(&source, &automatic_int32, automatic_record);
         assert!(automatic_log.contains(
-            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
         ));
         assert!(automatic_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
         ));
         assert!(automatic_log.contains("dither requested but not applied"));
 
@@ -72293,6 +72499,7 @@ mod validate_encoded_output_tests {
     fn expected_post_encode_depth_uses_track_source_depth_for_source_target() {
         let mut track = dvda_validation_test_track(Some(1_000));
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
 
         track.bit_depth = Some(24);
@@ -72335,8 +72542,8 @@ mod validate_encoded_output_tests {
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
 
         for (source_bits, expected) in [
-            (320, tonepoet_pipeline::PcmBitDepth::Int24),
-            (640, tonepoet_pipeline::PcmBitDepth::Int24),
+            (320, tonepoet_pipeline::PcmBitDepth::Int32),
+            (640, tonepoet_pipeline::PcmBitDepth::Int32),
             (16, tonepoet_pipeline::PcmBitDepth::Int16),
             (24, tonepoet_pipeline::PcmBitDepth::Int24),
             (32, tonepoet_pipeline::PcmBitDepth::Int32),
@@ -72350,15 +72557,16 @@ mod validate_encoded_output_tests {
             );
         }
 
-        settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::Off;
         settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::FixedGain { gain_db: "2.500000000".parse().unwrap() };
-        track.bit_depth = Some(320);
-        track.source_audio.bit_depth = Some(320);
-        assert_eq!(
-            expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
-            Some(tonepoet_pipeline::PcmBitDepth::Int24),
-            "fixed-gain hybrid Source must validate against the same integer working depth as planning",
-        );
+        for source_bits in [320, 640] {
+            track.bit_depth = Some(source_bits);
+            track.source_audio.bit_depth = Some(source_bits);
+            assert_eq!(
+                expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
+                Some(tonepoet_pipeline::PcmBitDepth::Int32),
+                "fixed-gain hybrid Float{source_bits} Source must validate against the same Int32 working depth as planning",
+            );
+        }
 
         settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::Off;
         settings.wavpack.hybrid = false;
@@ -72366,8 +72574,8 @@ mod validate_encoded_output_tests {
         track.source_audio.bit_depth = Some(320);
         assert_eq!(
             expected_post_encode_depth_for_track(&track, &settings).map(|value| value.depth),
-            Some(tonepoet_pipeline::PcmBitDepth::Float32),
-            "ordinary lossless WavPack Source semantics must remain unchanged",
+            Some(tonepoet_pipeline::PcmBitDepth::Int32),
+            "ordinary lossless WavPack Float32 Source validates against its Int32 landing depth",
         );
     }
 
@@ -72473,7 +72681,46 @@ mod validate_encoded_output_tests {
     }
 
     #[tokio::test]
-    async fn wavpack_hybrid_float_source_validation_accepts_int24_working_depth() {
+    async fn post_encode_depth_validation_accepts_wavpack_float32() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.wv");
+        std::fs::write(&out, b"fake-wv").expect("write");
+        let runner = stub_with_probe_and_wvunpack(
+            &ffprobe_exact_json_with_depth(
+                48_000,
+                1_000_000,
+                "wavpack",
+                "fltp",
+                32,
+            ),
+            "source:            32-bit floats at 48000 Hz\nduration:          0:00:20.83\n",
+        );
+        let cancel = CancellationToken::new();
+
+        let validation = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(PostEncodeSampleExpectation::same_rate(1_000_000, Some(48_000))),
+            Some(PostEncodeDepthExpectation {
+                depth: tonepoet_pipeline::PcmBitDepth::Float32,
+                class_strict: true,
+            }),
+            &tonepoet_pipeline::AudioFormat::WavPack,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await
+        .expect("Float32 WavPack must pass authoritative post-encode depth validation");
+
+        assert_eq!(
+            validation.measured_depth,
+            Some(tonepoet_pipeline::PcmBitDepth::Float32),
+        );
+        assert_eq!(runner.transcript().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn wavpack_hybrid_float_source_validation_accepts_int32_working_depth() {
         let temp = tempfile::tempdir().expect("temp dir");
         let out = temp.path().join("track.wv");
         std::fs::write(&out, b"fake-wv").expect("write");
@@ -72485,7 +72732,7 @@ mod validate_encoded_output_tests {
                 "s32p",
                 32,
             ),
-            "source:            24-bit ints at 48000 Hz\nduration:          0:00:20.83\n",
+            "source:            32-bit ints at 48000 Hz\nduration:          0:00:20.83\n",
         );
         let cancel = CancellationToken::new();
         let mut track = non_dvda_validation_test_track(Some(1_000_000), Some(48_000));
@@ -72500,7 +72747,7 @@ mod validate_encoded_output_tests {
         settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
         let expected_depth = expected_post_encode_depth_for_track(&track, &settings)
             .expect("hybrid Float32 Source must resolve a strict integer validation depth");
-        assert_eq!(expected_depth.depth, tonepoet_pipeline::PcmBitDepth::Int24);
+        assert_eq!(expected_depth.depth, tonepoet_pipeline::PcmBitDepth::Int32);
 
         let validation = validate_encoded_output_with_tool_limits(
             &out,
@@ -72512,11 +72759,11 @@ mod validate_encoded_output_tests {
             None,
         )
         .await
-        .expect("hybrid Float32 Source encoded from the admitted Int24 carrier must validate");
+        .expect("hybrid Float32 Source encoded from the required Int32 carrier must validate");
 
         assert_eq!(
             validation.measured_depth,
-            Some(tonepoet_pipeline::PcmBitDepth::Int24)
+            Some(tonepoet_pipeline::PcmBitDepth::Int32)
         );
         assert_eq!(runner.transcript().len(), 2);
     }

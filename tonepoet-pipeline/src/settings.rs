@@ -160,10 +160,18 @@ impl PipelineSettings {
                     "FLAC/ALAC floating-point output is not supported; choose 24-bit integer or WAV",
                 ));
             }
-            (AudioFormat::WavPack, BitDepthTarget::Pcm(PcmBitDepth::Float32 | PcmBitDepth::Float64)) => {
+            (AudioFormat::WavPack, BitDepthTarget::Pcm(PcmBitDepth::Float32))
+                if self.wavpack.hybrid =>
+            {
                 return Err(PlanningError::invalid_settings(
                     "target_bit_depth",
-                    "floating-point WavPack is not yet supported by the conversion carrier; choose 32-bit integer or WAV",
+                    "32-bit float WavPack output is lossless-only; hybrid WavPack uses integer encoder-input PCM",
+                ));
+            }
+            (AudioFormat::WavPack, BitDepthTarget::Pcm(PcmBitDepth::Float64)) => {
+                return Err(PlanningError::invalid_settings(
+                    "target_bit_depth",
+                    "WavPack supports native 32-bit float output, not 64-bit float; choose 32f or an integer depth",
                 ));
             }
             _ => {}
@@ -1683,6 +1691,49 @@ impl Default for ReplayGainSettings {
     }
 }
 
+/// Resolve `BitDepthTarget::Source` for an authoritative PCM source when the
+/// selected encoder cannot preserve the source sample class directly.
+///
+/// Integer Source depths retain their established semantics. WAV and AIFF also
+/// preserve floating-point Source depths. FLAC and WavPack land float Source
+/// at Int32; ALAC lands it at Int24, the widest depth available from the
+/// configured encoder. WavPack's Source policy deliberately remains Int32 for
+/// both lossless and hybrid output even though an explicit lossless Float32
+/// target is supported: changing Source semantics would violate the retained
+/// round-5 contract.
+#[must_use]
+pub fn source_pcm_depth_for_target(
+    format: &AudioFormat,
+    _wavpack_hybrid: bool,
+    source_depth: PcmBitDepth,
+) -> PcmBitDepth {
+    match (format, source_depth) {
+        (AudioFormat::Flac | AudioFormat::WavPack, PcmBitDepth::Float32 | PcmBitDepth::Float64) => {
+            PcmBitDepth::Int32
+        }
+        (AudioFormat::Alac, PcmBitDepth::Float32 | PcmBitDepth::Float64) => PcmBitDepth::Int24,
+        _ => source_depth,
+    }
+}
+
+/// Return whether Source-depth float-to-integer policy requires automatic TPDF.
+///
+/// This is a precision-reduction rule, not a generic float-to-integer rule.
+/// Float32 -> Int32 therefore does not enable dither, while Float64 -> Int32
+/// and Float32/64 -> ALAC Int24 do. Explicit dither policy remains authoritative
+/// at call sites; this helper describes only the automatic Source-depth default.
+#[must_use]
+pub fn source_depth_policy_requires_tpdf(
+    format: &AudioFormat,
+    wavpack_hybrid: bool,
+    source_depth: PcmBitDepth,
+) -> bool {
+    let target_depth = source_pcm_depth_for_target(format, wavpack_hybrid, source_depth);
+    source_depth.is_float()
+        && !target_depth.is_float()
+        && source_depth.bits() > target_depth.bits()
+}
+
 /// Returns the conservative default PCM depth for a target format.
 #[must_use]
 pub fn default_pcm_depth_for_format(format: &AudioFormat) -> PcmBitDepth {
@@ -1711,13 +1762,26 @@ mod depth_honesty_validation_tests {
     }
 
     #[test]
-    fn wavpack_float_targets_are_rejected() {
-        for depth in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
-            let mut settings = PipelineSettings::default();
-            settings.target_format = AudioFormat::WavPack;
-            settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-            settings.validate().expect_err("WavPack float must fail closed");
-        }
+    fn wavpack_float32_is_lossless_only_and_float64_is_rejected() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::WavPack;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        settings
+            .validate()
+            .expect("lossless WavPack must admit native Float32 output");
+
+        settings.wavpack.hybrid = true;
+        let err = settings
+            .validate()
+            .expect_err("hybrid WavPack Float32 must fail closed");
+        assert!(err.to_string().contains("lossless-only"), "{err}");
+
+        settings.wavpack.hybrid = false;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+        let err = settings
+            .validate()
+            .expect_err("WavPack Float64 must fail closed");
+        assert!(err.to_string().contains("not 64-bit float"), "{err}");
     }
 
     #[test]
@@ -1730,6 +1794,86 @@ mod depth_honesty_validation_tests {
         settings.target_format = AudioFormat::Aiff;
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
         settings.validate().expect("AIFF float is honored, not rejected");
+    }
+
+    #[test]
+    fn float_source_depth_maps_only_where_the_target_requires_integer_pcm() {
+        for source in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::Flac, false, source),
+                PcmBitDepth::Int32,
+            );
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::WavPack, false, source),
+                PcmBitDepth::Int32,
+            );
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::Alac, false, source),
+                PcmBitDepth::Int24,
+            );
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::Wav, false, source),
+                source,
+            );
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::Aiff, false, source),
+                source,
+            );
+            assert_eq!(
+                source_pcm_depth_for_target(&AudioFormat::WavPack, true, source),
+                PcmBitDepth::Int32,
+                "hybrid WavPack follows the same float Source -> Int32 policy as lossless WavPack",
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_source_tpdf_tracks_actual_precision_reduction() {
+        assert!(!source_depth_policy_requires_tpdf(
+            &AudioFormat::Flac,
+            false,
+            PcmBitDepth::Float32,
+        ));
+        assert!(source_depth_policy_requires_tpdf(
+            &AudioFormat::Flac,
+            false,
+            PcmBitDepth::Float64,
+        ));
+        assert!(!source_depth_policy_requires_tpdf(
+            &AudioFormat::WavPack,
+            false,
+            PcmBitDepth::Float32,
+        ));
+        assert!(source_depth_policy_requires_tpdf(
+            &AudioFormat::WavPack,
+            false,
+            PcmBitDepth::Float64,
+        ));
+        assert!(source_depth_policy_requires_tpdf(
+            &AudioFormat::Alac,
+            false,
+            PcmBitDepth::Float32,
+        ));
+        assert!(source_depth_policy_requires_tpdf(
+            &AudioFormat::Alac,
+            false,
+            PcmBitDepth::Float64,
+        ));
+        assert!(!source_depth_policy_requires_tpdf(
+            &AudioFormat::Wav,
+            false,
+            PcmBitDepth::Float64,
+        ));
+        assert!(!source_depth_policy_requires_tpdf(
+            &AudioFormat::WavPack,
+            true,
+            PcmBitDepth::Float32,
+        ));
+        assert!(source_depth_policy_requires_tpdf(
+            &AudioFormat::WavPack,
+            true,
+            PcmBitDepth::Float64,
+        ));
     }
 }
 

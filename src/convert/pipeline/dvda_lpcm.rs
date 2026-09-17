@@ -623,6 +623,7 @@ fn packed_nibble_offset_20bit(block: &[u8], channels: u32) -> usize {
     }
 }
 
+#[cfg(test)]
 fn decode_group_samples(
     block: &[u8],
     channels: u32,

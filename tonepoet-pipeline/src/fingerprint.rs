@@ -1058,6 +1058,9 @@ fn push_terminal_realization(
                     PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
                         "sox_preterminal_wavpack_hybrid"
                     }
+                    PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid => {
+                        "ffmpeg_preterminal_wavpack_hybrid"
+                    }
                     PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
                         "native_wavpack_hybrid_package"
                     }
@@ -1103,6 +1106,7 @@ fn push_terminal_realization(
                     PcmTerminalDitherOwner::None => "none",
                     PcmTerminalDitherOwner::SelectedTerminal => "selected_terminal",
                     PcmTerminalDitherOwner::SoxPreterminal => "sox_preterminal",
+                    PcmTerminalDitherOwner::FfmpegPreterminal => "ffmpeg_preterminal",
                     PcmTerminalDitherOwner::SsrcResampler => "ssrc_resampler",
                 },
             );
