@@ -58612,7 +58612,7 @@ mod conversion_log_tests {
             "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
         ));
         assert!(automatic_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit)"
+            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
         ));
         assert!(automatic_log.contains("dither requested but not applied"));
 
