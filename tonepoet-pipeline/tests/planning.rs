@@ -1193,12 +1193,12 @@ fn dsd_to_aiff_float32_routes_through_wav_then_ffmpeg() {
 
 #[test]
 fn dsd_to_wavpack_float32_routes_through_float_wav_then_ffmpeg() {
-    let plan = plan_conversion(&dsd_request_for(
-        AudioFormat::WavPack,
-        PcmBitDepth::Float32,
-        "wv",
-    ))
-    .expect("lossless WavPack Float32 should be plannable");
+    let mut request = dsd_request_for(AudioFormat::WavPack, PcmBitDepth::Float32, "wv");
+    // As in the AIFF sibling above: the built-in registry has no
+    // metadata-transfer plugin, so plan the audio topology only.
+    request.settings.metadata.transfer_tags = false;
+    request.settings.metadata.preserve_artwork = false;
+    let plan = plan_conversion(&request).expect("lossless WavPack Float32 should be plannable");
     let commands = plan.commands();
     assert!(
         commands.len() >= 2,
