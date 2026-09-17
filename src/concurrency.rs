@@ -2843,6 +2843,26 @@ pub fn current_scoped_mutation_claims() -> Vec<PathClaim> {
     })
 }
 
+/// Snapshot every mutation capability currently available to this execution.
+///
+/// Tokio task-local execution identity does not cross `spawn_blocking` or a
+/// manually-created worker thread. Callers that deliberately cross such a
+/// boundary can snapshot the live task-scoped execution claims here and install
+/// them in the worker with [`with_scoped_mutation_claims`]. This does not create
+/// or widen registry authority: the originating guard or durable execution
+/// lease must remain live for the complete worker operation.
+pub(crate) fn current_mutation_authority_claims() -> Result<Vec<PathClaim>, String> {
+    let mut claims = current_scoped_mutation_claims();
+    if let Some(item_id) = current_execution_item() {
+        for claim in runtime_execution_claims(&item_id)? {
+            if !claims.iter().any(|existing| existing == &claim) {
+                claims.push(claim);
+            }
+        }
+    }
+    Ok(claims)
+}
+
 /// Return whether a live capability already available to this execution
 /// covers `claim`. Scoped outer mutation batches are checked first, followed by
 /// the current conversion ExecutionClaim when this code runs in its task scope.
@@ -4302,6 +4322,79 @@ mod tests {
                         .unwrap();
                 });
             });
+        });
+    }
+
+    #[test]
+    fn runtime_execution_mutation_capability_can_be_transferred_to_blocking_worker() {
+        with_root(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("track.flac");
+            std::fs::write(&path, b"fixture").unwrap();
+            let claim = PathClaim::resolve_with_semantics(
+                &path,
+                ClaimMode::Write,
+                ClaimScope::Exact,
+                PathResolutionSemantics::NamespaceObject,
+            )
+            .unwrap();
+            let item_id = format!("blocking-authority-{}", Uuid::new_v4());
+            let execution_id = Uuid::new_v4();
+            let queue_lease = Arc::new(
+                PersistentLease::create(
+                    LeaseFamily::QueueExecution { execution_id },
+                    std::slice::from_ref(&claim),
+                )
+                .unwrap(),
+            );
+            let descriptor_path = queue_lease.descriptor_path().to_path_buf();
+            assert!(
+                runtime_execution_authorities()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        item_id.clone(),
+                        RuntimeExecutionAuthority {
+                            execution_id,
+                            queue_lease: Arc::clone(&queue_lease),
+                            supplemental_leases: Vec::new(),
+                            database_path: None,
+                            item_supervisor: None,
+                        },
+                    )
+                    .is_none(),
+                "test execution item must be unique"
+            );
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(with_runtime_execution_scope(item_id.clone(), async {
+                assert!(current_mutation_authority_covers(&claim).unwrap());
+                let inherited = current_mutation_authority_claims().unwrap();
+                let worker_claim = claim.clone();
+                tokio::task::spawn_blocking(move || {
+                    assert!(current_execution_item().is_none());
+                    assert!(!current_mutation_authority_covers(&worker_claim).unwrap());
+                    with_scoped_mutation_claims(&inherited, || {
+                        assert!(current_mutation_authority_covers(&worker_claim).unwrap());
+                    });
+                })
+                .await
+                .unwrap();
+            }));
+
+            let error = MutationClaimGuard::acquire_ephemeral(vec![claim.clone()])
+                .expect_err("foreign writer must still conflict with the live execution lease");
+            assert!(error.contains("live owner"), "unexpected conflict error: {error}");
+
+            runtime_execution_authorities()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&item_id);
+            drop(queue_lease);
+            let _ = std::fs::remove_file(descriptor_path);
         });
     }
 

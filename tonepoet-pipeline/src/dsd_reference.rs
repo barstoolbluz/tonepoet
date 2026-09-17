@@ -1728,6 +1728,9 @@ impl ReferenceCertifiedPeakObservation {
 /// normalization. It is not an active production observer contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 enum MeasurementParser {
     /// Historical direct-W64 FFmpeg loudnorm parser contract. Retained for append-only decoding only.
     FfmpegLoudnormInputTpV1,
@@ -1743,6 +1746,9 @@ enum MeasurementParser {
 /// Historical planned measurement shape used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 struct PlannedMeasurement {
     /// Unique measurement ID.
     id: MeasurementId,
@@ -1763,6 +1769,9 @@ struct PlannedMeasurement {
 /// Historical deferred argv token used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 enum PlannedArg {
     /// Literal argv token.
     Literal(String),
@@ -1778,6 +1787,9 @@ enum PlannedArg {
 /// Historical deferred command shape used only by v16 evidence normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 struct PlannedDeferredCommand {
     /// Built-in tool.
     tool: ToolIdentifier,
@@ -1800,6 +1812,9 @@ struct PlannedDeferredCommand {
 /// append-only evidence normalization and old qualification fixtures. It is not
 /// part of [`ConversionPlan`] and cannot be executed by production.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 enum LegacyReferenceExecutionStep {
     Command(PlannedCommand),
     Pipeline(PlannedCommandPipeline),
@@ -3761,6 +3776,9 @@ pub fn qualification_manifest_digest() -> Sha256Digest {
     )))
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn semantic_plan_hash(
     policy: DsdReferencePolicyVersion,
     source_rate: DsdRate,
@@ -3817,6 +3835,9 @@ fn semantic_plan_hash(
 // Preserve the commissioned v1-v3 semantic-hash byte contract. Those policy
 // identifiers are decode-only, but historical plans and evidence must remain
 // independently verifiable after the append-only v4 correction.
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_step_for_hash_legacy(step: &LegacyReferenceExecutionStep) -> String {
     match step {
         LegacyReferenceExecutionStep::Command(command) => format!(
@@ -3874,6 +3895,9 @@ fn normalize_step_for_hash_legacy(step: &LegacyReferenceExecutionStep) -> String
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_step_for_hash_v4(step: &LegacyReferenceExecutionStep) -> String {
     match step {
         LegacyReferenceExecutionStep::Command(command) => format!(
@@ -3953,6 +3977,9 @@ fn normalize_step_for_hash_v4(step: &LegacyReferenceExecutionStep) -> String {
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_step_for_hash_v15(step: &LegacyReferenceExecutionStep) -> String {
     let deadline_identity = match step {
         LegacyReferenceExecutionStep::Command(command) => {
@@ -3981,6 +4008,9 @@ fn normalize_step_for_hash_v15(step: &LegacyReferenceExecutionStep) -> String {
     )
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_expected_duration(duration: Option<std::time::Duration>) -> String {
     duration.map_or_else(
         || "none".to_string(),
@@ -3988,6 +4018,9 @@ fn normalize_expected_duration(duration: Option<std::time::Duration>) -> String 
     )
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_environment_policy(policy: CommandEnvironmentPolicy) -> &'static str {
     match policy {
         CommandEnvironmentPolicy::InheritAndSet => "inherit_and_set",
@@ -3995,6 +4028,9 @@ fn normalize_environment_policy(policy: CommandEnvironmentPolicy) -> &'static st
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_input_source(input: &InputSource) -> String {
     match input {
         InputSource::Path(path) => format!("path:{}", normalize_path_token(&path.display().to_string())),
@@ -4002,6 +4038,9 @@ fn normalize_input_source(input: &InputSource) -> String {
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_output_sink(output: &OutputSink) -> String {
     match output {
         OutputSink::Path(path) => {
@@ -4014,6 +4053,9 @@ fn normalize_output_sink(output: &OutputSink) -> String {
     }
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_environment(environment: &std::collections::BTreeMap<String, String>) -> String {
     environment
         .iter()
@@ -4022,6 +4064,9 @@ fn normalize_environment(environment: &std::collections::BTreeMap<String, String
         .join("\u{1f}")
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_args(args: &[String]) -> String {
     args.iter()
         .map(|value| normalize_path_token(value))
@@ -4029,6 +4074,9 @@ fn normalize_args(args: &[String]) -> String {
         .join("\u{1f}")
 }
 
+// Retained as append-only pre-common-planner hash machinery so historical
+// Reference evidence remains independently verifiable.
+#[allow(dead_code)]
 fn normalize_path_token(value: &str) -> String {
     let path = Path::new(value);
     if path.is_absolute() || value.contains(".tonepoet-") {

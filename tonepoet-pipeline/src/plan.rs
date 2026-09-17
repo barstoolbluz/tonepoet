@@ -23,12 +23,18 @@ use std::time::Duration;
 /// the owning participant identity and never infer album membership from tags.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct PlanScopeId(pub String);
+pub struct PlanScopeId(
+    /// Stable serialized scope identifier.
+    pub String,
+);
 
 /// Stable participant identity inside a planning scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct PlanParticipantId(pub String);
+pub struct PlanParticipantId(
+    /// Stable serialized participant identifier.
+    pub String,
+);
 
 /// Existing execution ownership projected into the pure planner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,13 +42,18 @@ pub struct PlanParticipantId(pub String);
 pub enum PlanScope {
     /// One independent track.
     Track {
+        /// Stable identifier for the owning planning scope.
         scope_id: PlanScopeId,
+        /// Stable participant identity within the owning scope.
         participant_id: PlanParticipantId,
     },
     /// One exact submitted queue cohort.
     SubmittedBatch {
+        /// Stable identifier for the owning planning scope.
         scope_id: PlanScopeId,
+        /// Stable participant identity within the owning scope.
         participant_id: PlanParticipantId,
+        /// Expected submitted-batch participant count, when known.
         expected_participants: Option<u32>,
     },
 }
@@ -2285,6 +2296,7 @@ fn validate_step_paths(
     Ok(())
 }
 
+/// Validate semantics that apply when the request forces the SSRC backend.
 pub(crate) fn validate_forced_ssrc_semantics(request: &PlanRequest) -> Result<()> {
     if request.settings.ssrc.force
         && (request.source.is_dsd()

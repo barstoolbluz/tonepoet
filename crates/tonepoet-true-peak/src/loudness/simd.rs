@@ -15,6 +15,10 @@ enum BackendKind {
     #[cfg(target_arch = "x86_64")]
     Sse2,
     #[cfg(target_arch = "x86_64")]
+    #[allow(
+        dead_code,
+        reason = "frozen test-only AVX candidate retained pending separate production commissioning"
+    )]
     Avx,
 }
 

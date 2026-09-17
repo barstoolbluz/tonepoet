@@ -50,25 +50,36 @@ pub enum Fact<T> {
 /// Stable identifier for a logical audio boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct SignalId(pub u32);
+pub struct SignalId(
+    /// Numeric signal identifier.
+    pub u32,
+);
 
 /// Stable identifier for a file/container artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ArtifactId(pub u32);
+pub struct ArtifactId(
+    /// Numeric artifact identifier.
+    pub u32,
+);
 
 /// Stable identifier for an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ObservationId(pub u32);
+pub struct ObservationId(
+    /// Numeric observation identifier.
+    pub u32,
+);
 
 /// Observation identity bound to the exact planning/submission owner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScopedObservationId {
+    /// Planning scope that owns this value.
     pub scope: PlanScopeId,
     /// Exact participant that owns the request-local observation id.
     pub participant: PlanParticipantId,
+    /// Observation dependency bound to this value.
     pub observation: ObservationId,
     /// Metric purpose; scope+local id alone must not let one observation class
     /// satisfy another decision slot.
@@ -78,7 +89,10 @@ pub struct ScopedObservationId {
 /// Stable identifier for a planner decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DecisionId(pub u32);
+pub struct DecisionId(
+    /// Numeric decision identifier.
+    pub u32,
+);
 
 /// Coding family of a named audio state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -135,7 +149,10 @@ pub enum FrameExtent {
     /// Exact frame count established by an authoritative source contract.
     Exact(u64),
     /// Proven upper bound used for admission, never equality.
-    Bounded { upper_frames: u64 },
+    Bounded {
+        /// Maximum frame count admitted by the bound.
+        upper_frames: u64,
+    },
     /// An estimate suitable for progress/non-authoritative planning only.
     /// It must never prove a bounded physical-cell capacity admission.
     EstimatedDurationNanos(u64),
@@ -279,8 +296,11 @@ pub enum RuntimeObligation {
     IndependentDecode(ArtifactId),
     /// Album gain may bind only after every declared participant in this exact submitted cohort arrives.
     AlbumParticipantBarrier {
+        /// Planning scope that owns this value.
         scope: PlanScopeId,
+        /// Participant identity within the owning scope.
         participant: PlanParticipantId,
+        /// Expected submitted-batch participant count, when known.
         expected_participants: Option<u32>,
     },
     /// Publication is conditional on all required observations/verification.
@@ -313,10 +333,15 @@ pub enum ObservationClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ObservationReadContract {
+    /// Registered authority identity.
     pub authority: String,
+    /// Processing domains accepted by this authority.
     pub accepted_processing_domains: BTreeSet<ProcessingDomain>,
+    /// Value domains accepted by this authority.
     pub accepted_value_domains: BTreeSet<ValueDomain>,
+    /// Whether the authority requires complete-reader semantics.
     pub complete_reader: bool,
+    /// Whether a production executor is connected for this authority.
     pub connected_executor: bool,
 }
 
@@ -347,7 +372,10 @@ pub struct Observation {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ObservationKind {
     /// Certified peak interval at the selected numerical tier.
-    CertifiedTruePeak { scan: TruePeakScanTier },
+    CertifiedTruePeak {
+        /// Certified true-peak scan tier selected for the observation.
+        scan: TruePeakScanTier,
+    },
     /// Native production ReplayGain/loudness observation.
     ReplayGain {
         /// Requested projection mode; kept in observation identity for compatibility auditing.
@@ -444,11 +472,17 @@ pub struct Decision {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GainDecisionBinding {
     /// Track-local scalar.
-    Track { scope: PlanScopeId },
+    Track {
+        /// Planning scope that owns the track-local decision.
+        scope: PlanScopeId,
+    },
     /// One common scalar reduced by the existing submitted-batch coordinator.
     SubmittedBatch {
+        /// Planning scope that owns this value.
         scope: PlanScopeId,
+        /// Participant identity within the owning scope.
         participant: PlanParticipantId,
+        /// Expected submitted-batch participant count, when known.
         expected_participants: Option<u32>,
     },
 }
@@ -462,10 +496,15 @@ pub enum GainDecisionBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AlbumGainParticipantInput {
+    /// Planning scope that owns this value.
     pub scope: PlanScopeId,
+    /// Participant identity within the owning scope.
     pub participant: PlanParticipantId,
+    /// Expected submitted-batch participant count, when known.
     pub expected_participants: Option<u32>,
+    /// Observation dependency bound to this value.
     pub observation: ScopedObservationId,
+    /// Terminal signal subject bound to this participant.
     pub terminal_subject: SignalId,
     /// Terminal proof selected for this participant's post-gain realization.
     /// Filled before a plan may be returned Ready.
@@ -545,11 +584,17 @@ impl ReplayGainProjectionPolicy {
 pub enum ReplayGainGroupBinding {
     /// Complete request-local group. For an ordinary one-file conversion this
     /// also represents singleton Album/Both ReplayGain semantics.
-    Track { scope: PlanScopeId },
+    Track {
+        /// Planning scope that owns the request-local ReplayGain group.
+        scope: PlanScopeId,
+    },
     /// Bind album fields to one exact coordinator-owned submitted participant batch.
     SubmittedBatch {
+        /// Planning scope that owns this value.
         scope: PlanScopeId,
+        /// Participant identity within the owning scope.
         participant: PlanParticipantId,
+        /// Expected submitted-batch participant count, when known.
         expected_participants: Option<u32>,
     },
 }
@@ -557,7 +602,10 @@ pub enum ReplayGainGroupBinding {
 /// Stable request-local identity for one registered unary effect instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct EffectInstanceId(pub u32);
+pub struct EffectInstanceId(
+    /// Numeric registered-effect instance identifier.
+    pub u32,
+);
 
 /// Closed Phase-2 registry of unary sample-domain effects.
 ///
@@ -567,15 +615,30 @@ pub struct EffectInstanceId(pub u32);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RegisteredUnaryEffect {
     /// SoX high-pass filter.
-    SoxHighPass { frequency_hz: u32 },
+    SoxHighPass {
+        /// High-pass cutoff frequency in hertz.
+        frequency_hz: u32,
+    },
     /// SoX low-pass filter.
-    SoxLowPass { frequency_hz: u32 },
+    SoxLowPass {
+        /// Low-pass cutoff frequency in hertz.
+        frequency_hz: u32,
+    },
     /// Explicit unprotected SoX sample-peak normalization effect.
-    SoxSamplePeakNormalize { target_dbfs: DbNano },
+    SoxSamplePeakNormalize {
+        /// Target sample-peak level in dBFS.
+        target_dbfs: DbNano,
+    },
     /// FFmpeg high-pass audio filter.
-    FfmpegHighPass { frequency_hz: u32 },
+    FfmpegHighPass {
+        /// High-pass cutoff frequency in hertz.
+        frequency_hz: u32,
+    },
     /// FFmpeg low-pass audio filter.
-    FfmpegLowPass { frequency_hz: u32 },
+    FfmpegLowPass {
+        /// Low-pass cutoff frequency in hertz.
+        frequency_hz: u32,
+    },
 }
 
 /// Placement of a registered effect relative to the one semantic PCM resampler.
@@ -665,8 +728,11 @@ pub enum InheritedLoudnessDisposition {
     DropInapplicable,
     /// A requested ReplayGain operation owns replacement/preservation under its explicit skip policy.
     Requested {
+        /// Requested ReplayGain projection mode.
         mode: ReplayGainMode,
+        /// Policy for pre-existing ReplayGain metadata.
         existing_tags: ReplayGainExistingTagPolicy,
+        /// Whether inherited loudness metadata remains applicable.
         inherited_applicable: bool,
     },
 }
@@ -837,19 +903,29 @@ pub enum PcmTerminalDitherOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectedPcmTerminalRealization {
+    /// Selected terminal-realization kind.
     pub kind: PcmTerminalRealizationKind,
+    /// Tool selected for this terminal realization.
     pub selected_tool: ToolIdentifier,
+    /// Input storage precision required by this realization.
     pub input_precision: StoragePrecision,
+    /// Input value domain required by this realization.
     pub input_value_domain: ValueDomain,
+    /// Output format realized by this terminal.
     pub target_format: AudioFormat,
+    /// Target sample rate in hertz, when explicitly resolved.
     pub target_rate_hz: Option<u32>,
+    /// Target PCM bit depth.
     pub target_bit_depth: PcmBitDepth,
+    /// Whether the selected WavPack realization uses hybrid mode.
     pub wavpack_hybrid: bool,
+    /// Dither mode active after precedence resolution.
     pub effective_dither: Option<DitherType>,
     /// Exact SSRC-native dither/PDF truth when the resampler owns the terminal.
     /// Older serialized terminal records omit this field.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ssrc_dither: Option<crate::plugins::ResolvedSsrcDither>,
+    /// Component that owns terminal dither for this realization.
     pub dither_owner: PcmTerminalDitherOwner,
 }
 
@@ -857,11 +933,15 @@ pub struct SelectedPcmTerminalRealization {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SelectedTerminalRealization {
+    /// PCM terminal realization with a fully selected contract.
     Pcm(SelectedPcmTerminalRealization),
     /// Hard-ceiling lossy delivery is governed at FFmpeg encoder-input PCM.
     LossyFfmpegEncoderInput {
+        /// Output format realized by this terminal.
         target_format: AudioFormat,
+        /// Target sample rate in hertz, when explicitly resolved.
         target_rate_hz: Option<u32>,
+        /// Whether FFmpeg processing is active at the lossy encoder boundary.
         apply_processing: bool,
     },
 }
@@ -879,6 +959,7 @@ pub const FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID: &str =
 /// harness has executed the pinned FFmpeg 7.1.3 closure on that architecture,
 /// the executable identity matched, and the focused Rust tests passed there.
 pub const FFMPEG_INT32_TRIANGULAR_X86_64_COMMISSIONED: bool = true;
+/// Whether the qualified FFmpeg Int32 triangular terminal is commissioned on AArch64.
 pub const FFMPEG_INT32_TRIANGULAR_AARCH64_COMMISSIONED: bool = false;
 
 /// Return whether `realization` matches the narrow source-derived FFmpeg model
@@ -933,7 +1014,9 @@ pub fn is_qualified_ffmpeg_int32_triangular_terminal(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TerminalProofAuthorityFamily {
+    /// Terminal proof authority for the PCM true-peak v2 contract.
     PcmTruePeakV2,
+    /// Terminal proof authority for the album-gain v2 contract.
     AlbumGainV2,
 }
 
@@ -1114,10 +1197,15 @@ impl TransformContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClaimKind {
+    /// Reference reconstruction claim family.
     ReferenceReconstruction,
+    /// Reference DSD-delivery claim family.
     ReferenceDsdDelivery,
+    /// Certified PCM ceiling claim family.
     CertifiedPcmCeiling,
+    /// Exact sample-identity claim family.
     SampleIdentity,
+    /// Satisfied metadata-effect claim family.
     MetadataEffectSatisfied,
 }
 
@@ -1151,27 +1239,40 @@ pub enum TypedPlanNode {
     Decide(Decision),
     /// Apply a resolved ordinary scalar to a named signal.
     ApplyGain {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: SignalId,
+        /// Gain policy applied by this node.
         policy: SampleGainPolicy,
+        /// Planner decision that authorizes this node.
         decision: Option<DecisionId>,
     },
     /// Decode a compressed source into a PCM processing subject.
     DecodeSourceForProcessing {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: SignalId,
     },
     /// Registered unary effect in the resolved deterministic order.
     ApplyEffect {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: SignalId,
+        /// Effect instance realized by this node.
         instance: EffectIntent,
+        /// Physical lowering selected for this effect.
         lowering: EffectLowering,
     },
     /// Explicit DSD reconstruction export-level boundary.
     ExportDsdLevel {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: SignalId,
+        /// DSD export-level policy applied by this node.
         level: DsdGeneralExportLevel,
         /// Exact scalar applied at this boundary.  It is separate from the
         /// later ordinary gain policy so Guard's unity remains relative to the
@@ -1183,31 +1284,45 @@ pub enum TypedPlanNode {
     /// preceding ReferenceGain decision and is applied exactly once together
     /// with the admitted dither/quantization/format realization.
     ReferenceTerminalRealization {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: SignalId,
+        /// Planner decision that authorizes this node.
         decision: DecisionId,
+        /// Final PCM sample contract for this Reference terminal.
         sample_contract: FinalPcmContract,
     },
     /// Package the current audio boundary as the exact requested product.
     PackageOutput {
+        /// Input signal or artifact identifier.
         input: SignalId,
+        /// Output signal or artifact identifier.
         output: ArtifactId,
+        /// Output-product identity emitted by this node.
         product: OutputProductIdentity,
     },
     /// Apply one authoritative metadata mutation to produce a new artifact state.
     MutateArtifact {
+        /// Input signal or artifact identifier.
         input: ArtifactId,
+        /// Output signal or artifact identifier.
         output: ArtifactId,
+        /// Metadata effect applied by this node.
         effect: MetadataEffect,
     },
     /// Decode a delivered artifact solely to establish the subject of an output observation.
     DecodeArtifactForObservation {
+        /// Input signal or artifact identifier.
         input: ArtifactId,
+        /// Output signal or artifact identifier.
         output: SignalId,
     },
     /// Verify one concrete artifact without changing its decoded signal.
     VerifyArtifact {
+        /// Artifact subject verified by this node.
         artifact: ArtifactId,
+        /// Observation dependency bound to this value.
         observation: ObservationId,
     },
 }
@@ -1216,7 +1331,9 @@ pub enum TypedPlanNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SsrcOutputRole {
+    /// SSRC output feeds a later processing stage.
     Nonterminal,
+    /// SSRC output is the terminal PCM realization.
     Terminal,
 }
 
@@ -1224,7 +1341,9 @@ pub enum SsrcOutputRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SsrcComputationPrecision {
+    /// Single-precision SSRC computation.
     Single,
+    /// Double-precision SSRC computation.
     Double,
 }
 
@@ -1232,7 +1351,9 @@ pub enum SsrcComputationPrecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SsrcAuthorityReason {
+    /// SSRC authority came from an explicit force request.
     ExplicitForce,
+    /// SSRC authority came from planner capability selection.
     CapabilitySelected,
 }
 
@@ -1245,59 +1366,116 @@ pub enum SsrcAuthorityReason {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResolvedOperationParameters {
+    /// No operation-specific resolved parameters.
     None,
+    /// Resolved parameters for an SSRC resample operation.
     ResampleSsrc {
+        /// User-requested settings before active precedence resolution.
         requested: SsrcSettings,
+        /// SSRC profile active after precedence resolution.
         effective_profile: SsrcProfile,
+        /// SSRC attenuation active after precedence resolution.
         effective_attenuation_db: Option<f32>,
+        /// SSRC output depth active after precedence resolution.
         effective_output_depth: PcmBitDepth,
+        /// Whether SSRC output is terminal or feeds another processing stage.
         output_role: SsrcOutputRole,
+        /// SSRC computation precision selected for this operation.
         computation_precision: SsrcComputationPrecision,
+        /// Processing domain emitted by the selected SSRC realization.
         emitted_processing_domain: ProcessingDomain,
+        /// Dither mode active after precedence resolution.
         effective_dither: crate::plugins::ResolvedSsrcDither,
+        /// Reason SSRC received authority for this operation.
         authority_reason: SsrcAuthorityReason,
     },
+    /// Resolved parameters for a SoX resample operation.
     ResampleSox {
+        /// User-requested settings before active precedence resolution.
         requested: SoxResamplerSettings,
+        /// SoX resampling quality selected for this operation.
         quality: ResampleQuality,
+        /// Effective SoX resampling bandwidth percentage.
         effective_bandwidth_pct: Option<f32>,
+        /// Effective SoX sinc passband in hertz, when configured.
         effective_sinc_passband_hz: Option<f32>,
+        /// Dither mode active after precedence resolution.
         effective_dither: Option<DitherType>,
     },
+    /// Resolved parameters for an FFmpeg/libsoxr resample operation.
     ResampleSoxr {
+        /// User-requested settings before active precedence resolution.
         requested: SoxrResamplerSettings,
+        /// Effective libsoxr precision setting.
         effective_precision: u8,
+        /// Effective libsoxr cutoff setting.
         effective_cutoff: f32,
+        /// Effective resampler phase setting, when configured.
         effective_phase: Option<u8>,
+        /// Dither mode active after precedence resolution.
         effective_dither: Option<DitherType>,
     },
+    /// Resolved parameters for DSD-to-PCM conversion.
     DsdToPcm {
+        /// User-requested settings before active precedence resolution.
         requested: DsdToPcmSettings,
+        /// Effective sinc-filter settings, when the selected route uses them.
         effective_sinc: Option<DsdToPcmSincSettings>,
+        /// Dither mode active after precedence resolution.
         effective_dither: Option<DitherType>,
     },
+    /// Resolved parameters for PCM-to-DSD conversion.
     PcmToDsd {
+        /// User-requested settings before active precedence resolution.
         requested: PcmToDsdSettings,
+        /// Effective sinc-filter settings, when the selected route uses them.
         effective_sinc: Option<PcmToDsdSincSettings>,
+        /// Effective PCM-to-DSD gain compensation.
         effective_gain_compensation: GainCompensation,
     },
+    /// Resolved parameters for a DSD-rate conversion round trip.
     DsdRateChange {
+        /// Resolved DSD-to-PCM settings for a DSD rate change.
         from_dsd: DsdToPcmSettings,
+        /// Effective DSD-to-PCM sinc settings for a DSD rate change.
         effective_from_sinc: Option<DsdToPcmSincSettings>,
+        /// Resolved PCM-to-DSD settings for a DSD rate change.
         to_dsd: PcmToDsdSettings,
     },
+    /// Resolved parameters for FLAC encoding.
     EncodeFlac {
+        /// User-requested settings before active precedence resolution.
         requested: FlacSettings,
+        /// Dither mode active after precedence resolution.
         effective_dither: Option<DitherType>,
     },
-    EncodeMp3 { requested: Mp3Settings },
-    EncodeAac { requested: AacSettings },
-    EncodeOpus { requested: OpusSettings },
+    /// Resolved parameters for MP3 encoding.
+    EncodeMp3 {
+        /// User-requested MP3 settings before active precedence resolution.
+        requested: Mp3Settings,
+    },
+    /// Resolved parameters for AAC encoding.
+    EncodeAac {
+        /// User-requested AAC settings before active precedence resolution.
+        requested: AacSettings,
+    },
+    /// Resolved parameters for Opus encoding.
+    EncodeOpus {
+        /// User-requested Opus settings before active precedence resolution.
+        requested: OpusSettings,
+    },
+    /// Resolved parameters for WavPack encoding.
     EncodeWavPack {
+        /// User-requested settings before active precedence resolution.
         requested: WavPackSettings,
+        /// Dither mode active after precedence resolution.
         effective_dither: Option<DitherType>,
     },
-    EncodePcm { effective_dither: Option<DitherType> },
+    /// Resolved parameters for a PCM terminal encode.
+    EncodePcm {
+        /// Dither mode active after precedence resolution.
+        effective_dither: Option<DitherType>,
+    },
 }
 
 /// Current executor capability for an otherwise valid semantic plan.
@@ -1402,8 +1580,11 @@ pub struct RequiredFact {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PlanningOutcome<T> {
+    /// Planning completed with an executable typed plan.
     Ready(T),
+    /// Planning requires additional authoritative source facts.
     NeedFacts(Vec<RequiredFact>),
+    /// Planning refused the request with a typed reason.
     Refused(PlanRefusal),
 }
 
@@ -1411,8 +1592,11 @@ pub enum PlanningOutcome<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlanningResourceLimit {
+    /// Name of the bounded planning resource.
     pub resource: String,
+    /// Requested amount of the bounded resource.
     pub requested: u64,
+    /// Configured limit for the bounded resource.
     pub limit: u64,
 }
 
@@ -1755,9 +1939,12 @@ fn append_registered_effect_segment(
     Ok(())
 }
 
+/// Immediate SSRC output contract resolved before terminal/package lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SsrcImmediateOutput {
+    /// Immediate SSRC output depth.
     pub(crate) depth: PcmBitDepth,
+    /// Immediate SSRC output role.
     pub(crate) role: SsrcOutputRole,
 }
 
@@ -1765,6 +1952,7 @@ fn ssrc_native_dither_override_active(request: &PlanRequest) -> bool {
     request.settings.ssrc.dither_id.is_some() || request.settings.ssrc.pdf_type.is_some()
 }
 
+/// Resolve the immediate SSRC output depth and terminal role for this request.
 pub(crate) fn resolve_ssrc_immediate_output(
     request: &PlanRequest,
     target_rate_hz: u32,
@@ -3077,7 +3265,6 @@ fn plan_typed_with_effects_and_policy(
         }));
 
         let decision = DecisionId(next_decision);
-        next_decision += 1;
         nodes.push(TypedPlanNode::Decide(Decision {
             id: decision,
             kind: DecisionKind::ReferenceGain {
@@ -3359,7 +3546,6 @@ fn plan_typed_with_effects_and_policy(
     let mut observation_signal = working_signal;
     if intent.replay_gain.is_some() && product.is_lossy_or_hybrid() {
         let delivered = SignalId(next_signal);
-        next_signal += 1;
         states.push(AudioState {
             id: delivered,
             coding: SignalCoding::Pcm,
@@ -4469,6 +4655,7 @@ fn candidate_mismatch_refusal(
     PlanRefusal { code: code.to_owned(), reason }
 }
 
+/// Select the first executable physical candidate that satisfies all typed requirements.
 pub fn select_candidate_for_requirements<'a>(
     candidates: &'a [PhysicalCandidate],
     preferred: Option<&ToolIdentifier>,
@@ -4929,24 +5116,6 @@ fn operation_changes_samples(operation: &PlanOperation) -> bool {
             | PlanOperation::StoreSourceAudioMd5 { .. }
             | PlanOperation::Verify { .. }
     )
-}
-
-fn resolved_reference_delivery_parameters(request: &PlanRequest) -> ResolvedOperationParameters {
-    let effective_dither = match request.settings.target_bit_depth {
-        BitDepthTarget::Pcm(PcmBitDepth::Int24) => Some(DitherType::Tpdf),
-        _ => None,
-    };
-    match request.settings.target_format {
-        AudioFormat::Flac => ResolvedOperationParameters::EncodeFlac {
-            requested: normalized_active_flac_settings(request.settings.flac, false),
-            effective_dither,
-        },
-        AudioFormat::WavPack => ResolvedOperationParameters::EncodeWavPack {
-            requested: normalized_active_wavpack_settings(request.settings.wavpack),
-            effective_dither,
-        },
-        _ => ResolvedOperationParameters::None,
-    }
 }
 
 fn output_product_identity(request: &PlanRequest) -> OutputProductIdentity {
@@ -5664,13 +5833,6 @@ fn lossy_codec_for_format(format: &AudioFormat) -> AudioCodec {
         AudioFormat::Dts => AudioCodec::Custom("dts".to_owned()),
         AudioFormat::Ac3 => AudioCodec::Custom("ac3".to_owned()),
         other => AudioCodec::Custom(format!("{}-encoded", other.extension())),
-    }
-}
-
-fn target_pcm_precision(request: &PlanRequest) -> StoragePrecision {
-    match target_pcm_depth_fact(request) {
-        Fact::Known(depth) => StoragePrecision::Pcm(depth),
-        Fact::Pending(_) | Fact::Unavailable(_) => StoragePrecision::Pending,
     }
 }
 

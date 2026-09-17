@@ -46,8 +46,11 @@ pub const SSRC_W64_EXACT_PAYLOAD_BRIDGE_V1: &str =
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProtectedFloat64IngressAuthority {
+    /// Registered authority identifier.
     pub authority_id: String,
+    /// Input container named by this qualification scope.
     pub input_container: String,
+    /// Input sample format named by this qualification scope.
     pub input_sample_format: String,
     /// Maximum physical classic-RIFF extent admitted by this authority.
     pub max_physical_bytes: u64,
@@ -56,6 +59,7 @@ pub struct ProtectedFloat64IngressAuthority {
 }
 
 impl ProtectedFloat64IngressAuthority {
+    /// Construct the retained protected Float64 RIFF/WAV ingress authority.
     #[must_use]
     pub fn retained_pcm_riff_wav() -> Self {
         Self {
@@ -74,15 +78,25 @@ impl ProtectedFloat64IngressAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectedBinary64ResamplePreservationBinding {
+    /// Binary64 preservation contract identifier.
     pub contract_id: String,
+    /// Registered authority identifier.
     pub authority_id: String,
+    /// Qualification evidence identifier.
     pub evidence_id: String,
+    /// SHA-256 digest of the qualification report.
     pub qualification_report_sha256: String,
+    /// Expected SHA-256 digest of the qualified SSRC executable.
     pub expected_executable_sha256: String,
+    /// Runtime architecture covered by the attestation.
     pub runtime_architecture: String,
+    /// SSRC source revision covered by the attestation.
     pub source_revision: String,
+    /// Build identity covered by the attestation.
     pub build_identity: String,
+    /// Qualified Binary64 evidence scope.
     pub evidence_scope: Binary64ResampleEvidenceScope,
+    /// Output container admitted by the protected Binary64 contract.
     pub protected_output_container: String,
 }
 
@@ -91,12 +105,19 @@ pub struct SelectedBinary64ResamplePreservationBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectedStrongSsrcResamplerParameters {
+    /// Source sample rate in hertz.
     pub source_rate_hz: u32,
+    /// Target sample rate in hertz.
     pub target_rate_hz: u32,
+    /// SSRC profile selected or qualified by this contract.
     pub profile: SsrcProfile,
+    /// SSRC attenuation in decibels.
     pub attenuation_db: Option<String>,
+    /// Whether minimum-phase SSRC processing is selected.
     pub min_phase: bool,
+    /// SSRC output depth.
     pub output_depth: PcmBitDepth,
+    /// Whether the qualified SSRC realization disables SSRC-owned dither.
     pub dither_none: bool,
 }
 
@@ -107,8 +128,11 @@ pub struct SelectedStrongSsrcResamplerParameters {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectedStrongSsrcResamplerBinding {
+    /// Selected Binary64 preservation authority.
     pub binary64_preservation: SelectedBinary64ResamplePreservationBinding,
+    /// Protected Float64 ingress authority.
     pub protected_ingress: ProtectedFloat64IngressAuthority,
+    /// Fully resolved SSRC parameters bound to the authority.
     pub resolved_resampler: SelectedStrongSsrcResamplerParameters,
 }
 
@@ -131,17 +155,25 @@ pub enum Binary64PreservationEvidenceReason {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Binary64ResampleEvidenceScope {
+    /// SSRC profile selected or qualified by this contract.
     pub profile: SsrcProfile,
     /// Exact source/current rate at the protected SSRC ingress.
     pub source_rate_hz: u32,
+    /// Target sample rate in hertz.
     pub target_rate_hz: u32,
     /// Canonical command rendering, not the original request's binary float bits.
     pub attenuation_db: Option<String>,
+    /// Whether minimum-phase SSRC processing is selected.
     pub min_phase: bool,
+    /// Architecture named by this qualification scope.
     pub architecture: String,
+    /// Input container named by this qualification scope.
     pub input_container: String,
+    /// Input sample format named by this qualification scope.
     pub input_sample_format: String,
+    /// Output container named by this qualification scope.
     pub output_container: String,
+    /// Output sample format named by this qualification scope.
     pub output_sample_format: String,
 }
 
@@ -149,9 +181,13 @@ pub struct Binary64ResampleEvidenceScope {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Binary64RuntimeAttestation {
+    /// Expected SHA-256 digest of the qualified SSRC executable.
     pub expected_executable_sha256: String,
+    /// Architecture named by this qualification scope.
     pub architecture: String,
+    /// SSRC source revision covered by the attestation.
     pub source_revision: String,
+    /// Build identity covered by the attestation.
     pub build_identity: String,
 }
 
@@ -163,24 +199,36 @@ pub enum Binary64ResamplePreservationEvidence {
     /// It participates in the same typed admission comparison but carries no
     /// SSRC qualification scope.
     EstablishedExistingAuthority {
+        /// Registered authority identifier.
         authority_id: String,
     },
+    /// Binary64 preservation is established by qualified evidence.
     Established {
+        /// Registered authority identifier.
         authority_id: String,
+        /// Qualification evidence identifier.
         evidence_id: String,
+        /// SHA-256 digest of the qualification report.
         qualification_report_sha256: String,
+        /// Runtime executable/build attestation for this evidence.
         runtime_attestation: Binary64RuntimeAttestation,
+        /// Planning scope that owns this value.
         scope: Binary64ResampleEvidenceScope,
     },
+    /// Binary64 preservation remains gated on missing evidence.
     PendingEvidence {
+        /// Reason the requested evidence is pending, unavailable, or refuted.
         reason: Binary64PreservationEvidenceReason,
     },
+    /// Binary64 preservation evidence has been explicitly refuted.
     Refuted {
+        /// Reason the requested evidence is pending, unavailable, or refuted.
         reason: Binary64PreservationEvidenceReason,
     },
 }
 
 impl Binary64ResamplePreservationEvidence {
+    /// Return whether this evidence state establishes Binary64 preservation.
     #[must_use]
     pub fn is_established(&self) -> bool {
         matches!(
@@ -189,6 +237,7 @@ impl Binary64ResamplePreservationEvidence {
         )
     }
 
+    /// Return the reason Binary64 preservation is unavailable, when applicable.
     #[must_use]
     pub fn unavailable_reason(&self) -> Option<&Binary64PreservationEvidenceReason> {
         match self {

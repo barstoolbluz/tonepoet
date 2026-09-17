@@ -61,6 +61,7 @@ use tonepoet_pipeline::{
 // the active common-model release report is schema v17.
 // append-only v15 checker source marker: "schema_version": 15
 // append-only v15 checker source marker: "silent_float64_w64_open_defect"
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 const _V15_APPEND_ONLY_REPORT_MARKER: &str = concat!(
     r#"\"schema_version\": 15"#,
     r#"\"silent_float64_w64_open_defect\""#,
@@ -89,6 +90,7 @@ const QUALIFICATION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
 const QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const W64_RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 const W64_FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 const W64_DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 
@@ -1393,6 +1395,7 @@ fn synth_r64_fixture_duration(
     run(sox, &args);
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn probe_direct_ffmpeg_f64_w64(ffmpeg: &Path, input: &Path) -> Output {
     let args = vec![
         "-nostdin".to_string(),
@@ -1416,6 +1419,7 @@ fn probe_direct_ffmpeg_f64_w64(ffmpeg: &Path, input: &Path) -> Output {
     run_unchecked(ffmpeg, &args)
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn encode_float64_w64_fixture(
     sox: &Path,
     root: &Path,
@@ -1464,6 +1468,7 @@ fn encode_float64_w64_fixture(
     output
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn exact_float64_w64_header(observation: W64HeaderObservation) -> bool {
     observation.riff_size_field == observation.file_bytes
         && observation.data_chunk_size_field
@@ -2326,6 +2331,7 @@ fn default_settings_dsd64_dsf_to_flac_live_smoke() {
     let _ = qualify_default_settings_dsd64_dsf_to_flac();
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn write_dff_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) {
     let file = File::create(path).expect("create DSDIFF qualification fixture");
     let mut writer = sacd_rs::dff_writer::DffWriter::new(
@@ -2344,6 +2350,7 @@ fn write_dff_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
     writer.finish().expect("finish DSDIFF qualification fixture");
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn collect_decoded_dsd(path: &Path) -> Vec<u8> {
     let file = File::open(path).expect("open decoded DSD fixture");
     let mut reader = sacd_rs::open_dsd_as_decoded_reader(file)
@@ -2359,6 +2366,7 @@ fn collect_decoded_dsd(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn assert_not_hard_linked(left: &Path, right: &Path) {
     use std::os::unix::fs::MetadataExt;
     let left = fs::metadata(left).expect("stat source materialization");
@@ -2371,6 +2379,7 @@ fn assert_not_hard_linked(left: &Path, right: &Path) {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn assert_not_hard_linked(left: &Path, right: &Path) {
     assert_ne!(
         fs::canonicalize(left).expect("canonical source"),
@@ -2379,11 +2388,13 @@ fn assert_not_hard_linked(left: &Path, right: &Path) {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 enum AnalyzerPeakPosition {
     Early,
     Late,
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 impl AnalyzerPeakPosition {
     const fn key(self) -> &'static str {
         match self {
@@ -2393,6 +2404,7 @@ impl AnalyzerPeakPosition {
     }
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn write_analytic_analyzer_fixture(
     sox: &Path,
     output: &Path,
@@ -2418,6 +2430,7 @@ fn write_analytic_analyzer_fixture(
     )
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn write_analytic_analyzer_fixture_with_depth(
     sox: &Path,
     output: &Path,
@@ -2500,6 +2513,7 @@ fn write_analytic_analyzer_fixture_with_depth(
     20.0 * sample_peak.log10()
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn write_analytic_multitone_fixture(
     sox: &Path,
     output: &Path,
@@ -2589,6 +2603,7 @@ fn write_analytic_multitone_fixture(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 enum AdversarialAnalyzerFixture {
     Impulse,
     NearBandEdgeBurst,
@@ -2597,6 +2612,7 @@ enum AdversarialAnalyzerFixture {
     BoundaryTransient,
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 impl AdversarialAnalyzerFixture {
     const ALL: [Self; 5] = [
         Self::Impulse,
@@ -2617,6 +2633,7 @@ impl AdversarialAnalyzerFixture {
     }
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn write_adversarial_analyzer_fixture(
     sox: &Path,
     output: &Path,
@@ -3059,6 +3076,7 @@ struct PlannedPipelineOutput {
     consumer: Output,
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 struct PlannedMeasurementOutput {
     producer: Option<Output>,
     consumer: Output,
@@ -3305,6 +3323,7 @@ fn run_planned_command_pipeline(
     output
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn loudnorm_input_tp(stderr: &[u8]) -> f64 {
     let stderr = String::from_utf8_lossy(stderr);
     let raw = extract_single_loudnorm_report(&stderr)
@@ -3318,6 +3337,7 @@ fn loudnorm_input_tp(stderr: &[u8]) -> f64 {
 }
 
 #[cfg(unix)]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn require_sparse_file_support(directory: &Path) {
     use std::os::unix::fs::MetadataExt;
 
@@ -3339,10 +3359,12 @@ fn require_sparse_file_support(directory: &Path) {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn require_sparse_file_support(_directory: &Path) {
     panic!("the mandatory >4 GiB analyzer-carrier qualification fixture requires Unix sparse-file accounting");
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn create_sparse_w64_capacity_fixture(
     seed: &Path,
     output: &Path,
@@ -3387,6 +3409,7 @@ fn create_sparse_w64_capacity_fixture(
     frame_count
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn duration_for_guarded_output_frames(sample_frames: u64, sample_rate_hz: u32) -> Duration {
     let unguarded_frames = sample_frames
         .checked_sub(tonepoet_pipeline::REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES)
@@ -3410,6 +3433,7 @@ fn duration_for_guarded_output_frames(sample_frames: u64, sample_rate_hz: u32) -
     duration
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn capacity_boundary_plan_result(
     root: &Path,
     input: &Path,
@@ -3453,6 +3477,7 @@ fn capacity_boundary_plan_result(
     plan_reference_dsd(&request)
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, u32, usize) {
     const HEADER_CAPTURE_BYTES: usize = 4096;
 
@@ -4553,6 +4578,7 @@ fn gain_arg(args: &[String]) -> Option<&str> {
         .map(|window| window[1].as_str())
 }
 
+#[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn gain_policy_evidence(policy: ResolvedGainPolicy, terminal_args: &[String]) -> Value {
     let applied_gain_db = gain_arg(terminal_args).map(str::to_owned);
     match policy {

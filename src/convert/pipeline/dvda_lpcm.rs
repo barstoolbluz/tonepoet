@@ -743,23 +743,6 @@ fn write_ordered_split_frame<W: Write>(
     Ok(())
 }
 
-fn write_ordered_frame<W: Write>(
-    source_order_frame: &[i32],
-    source_to_output_indices: &[usize],
-    out: &mut W,
-) -> Result<(), LpcmDecodeError> {
-    for &source_index in source_to_output_indices {
-        let sample = source_order_frame.get(source_index).ok_or_else(|| {
-            LpcmDecodeError::HeaderMismatch(format!(
-                "LPCM channel reorder index {source_index} is outside decoded source frame with {} channels",
-                source_order_frame.len()
-            ))
-        })?;
-        out.write_all(&sample.to_le_bytes())?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

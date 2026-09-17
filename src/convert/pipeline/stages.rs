@@ -7556,13 +7556,22 @@ async fn apply_dsf_authoritative_metadata(
 
     let write_path = path.to_path_buf();
     let write_cancel = cancel.clone();
+    let inherited_mutation_claims = crate::concurrency::current_mutation_authority_claims()
+        .map_err(|error| {
+            MetadataError::InProcessWrite(format!(
+                "snapshot conversion mutation authority for DSF metadata writer on '{}': {error}",
+                path.display()
+            ))
+        })?;
     let report = tokio::task::spawn_blocking(move || {
-        crate::dsf_tags::write_values_with_control_report(
-            &write_path,
-            &changes,
-            &|| write_cancel.is_cancelled(),
-            &|_| {},
-        )
+        crate::concurrency::with_scoped_mutation_claims(&inherited_mutation_claims, || {
+            crate::dsf_tags::write_values_with_control_report(
+                &write_path,
+                &changes,
+                &|| write_cancel.is_cancelled(),
+                &|_| {},
+            )
+        })
     })
     .await
     .map_err(|error| {
@@ -7639,30 +7648,39 @@ async fn apply_pipeline_multivalue_overlay(
     let worker_token = cancel.clone();
     let bridge_cancel = metadata_cancel.clone();
     let bridge_token = cancel.clone();
+    let inherited_mutation_claims = crate::concurrency::current_mutation_authority_claims()
+        .map_err(|error| {
+            MetadataError::InProcessWrite(format!(
+                "snapshot conversion mutation authority for final multi-value overlay on '{}': {error}",
+                path.display()
+            ))
+        })?;
     let cancellation_bridge = tokio::spawn(propagate_pipeline_overlay_cancellation(
         bridge_token,
         bridge_cancel,
     ));
     let report = tokio::task::spawn_blocking(move || {
-        // Close the scheduling gap between the async pre-check above and the
-        // bridge task becoming runnable. Later cancellation is propagated by
-        // the bridge through the same shared metadata-write flag.
-        if worker_token.is_cancelled() {
-            worker_cancel.cancel();
-        }
-        if let Some(authoritative_changes) = authoritative_id3v2_changes {
-            crate::tui::probe::write_all_tag_value_lists_to_id3v2_with_cancel(
-                &overlay_path,
-                &authoritative_changes,
-                Some(&worker_cancel),
-            )
-        } else {
-            crate::tui::probe::write_all_tag_value_lists_with_cancel(
-                &overlay_path,
-                &changes,
-                Some(&worker_cancel),
-            )
-        }
+        crate::concurrency::with_scoped_mutation_claims(&inherited_mutation_claims, || {
+            // Close the scheduling gap between the async pre-check above and the
+            // bridge task becoming runnable. Later cancellation is propagated by
+            // the bridge through the same shared metadata-write flag.
+            if worker_token.is_cancelled() {
+                worker_cancel.cancel();
+            }
+            if let Some(authoritative_changes) = authoritative_id3v2_changes {
+                crate::tui::probe::write_all_tag_value_lists_to_id3v2_with_cancel(
+                    &overlay_path,
+                    &authoritative_changes,
+                    Some(&worker_cancel),
+                )
+            } else {
+                crate::tui::probe::write_all_tag_value_lists_with_cancel(
+                    &overlay_path,
+                    &changes,
+                    Some(&worker_cancel),
+                )
+            }
+        })
     })
     .await;
     cancellation_bridge.abort();
@@ -14422,8 +14440,17 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     if req.stages.replaygain == StageRequirement::Disabled {
         if matches!(inherited_policy, ReplayGainInheritedTagPolicy::Recompute { .. }) {
             let cleanup_paths = paths.clone();
+            let inherited_mutation_claims = crate::concurrency::current_mutation_authority_claims()
+                .map_err(|error| {
+                    ReplayGainError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("snapshot conversion mutation authority for ReplayGain metadata cleanup: {error}"),
+                    ))
+                })?;
             let cleanup = tokio::task::spawn_blocking(move || {
-                crate::convert::replaygain::remove_inherited_measurement_fields(&cleanup_paths)
+                crate::concurrency::with_scoped_mutation_claims(&inherited_mutation_claims, || {
+                    crate::convert::replaygain::remove_inherited_measurement_fields(&cleanup_paths)
+                })
             })
             .await
             .map_err(|error| {
@@ -14494,17 +14521,28 @@ pub async fn apply_replaygain_with_source_and_tool_limits(
     let prevent_clipping = req.settings.replay_gain.prevent_clipping;
     let native_paths = paths.clone();
     let native_members = member_ids.clone();
+    let inherited_mutation_claims = crate::concurrency::current_mutation_authority_claims()
+        .map_err(|error| {
+            ReplayGainError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("snapshot conversion mutation authority for ReplayGain worker: {error}"),
+            ))
+        })?;
     // No production ReplayGain consumer requests LRA. This union is derived
     // before the meter is constructed, so normal ReplayGain pays only the
-    // integrated-only NativeEbu2023 cost.
+    // integrated-only NativeEbu2023 cost. The blocking worker receives only a
+    // snapshot of the already-live conversion capability; it does not acquire
+    // or widen registry authority.
     let native = tokio::task::spawn_blocking(move || {
-        crate::convert::replaygain::measure_and_write_paths(
-            &native_paths,
-            &native_members,
-            mode,
-            prevent_clipping,
-            false,
-        )
+        crate::concurrency::with_scoped_mutation_claims(&inherited_mutation_claims, || {
+            crate::convert::replaygain::measure_and_write_paths(
+                &native_paths,
+                &native_members,
+                mode,
+                prevent_clipping,
+                false,
+            )
+        })
     })
     .await
     .map_err(|error| {
@@ -31754,22 +31792,6 @@ fn scan_album_gain_true_peak_carrier_identity(
     cancel: &CancellationToken,
 ) -> Result<CertifiedCarrierScan, String> {
     scan_album_gain_true_peak_carrier_identity_with_cancel_and_mode(
-        carrier,
-        sample_rate_hz,
-        channels,
-        scan_mode,
-        || cancel.is_cancelled(),
-    )
-}
-
-fn scan_album_gain_true_peak_carrier(
-    carrier: &Path,
-    sample_rate_hz: u32,
-    channels: u16,
-    scan_mode: tonepoet_pipeline::TruePeakScanTier,
-    cancel: &CancellationToken,
-) -> Result<tonepoet_pipeline::AlbumPeakMeasurement, String> {
-    scan_album_gain_true_peak_carrier_with_cancel_and_mode(
         carrier,
         sample_rate_hz,
         channels,

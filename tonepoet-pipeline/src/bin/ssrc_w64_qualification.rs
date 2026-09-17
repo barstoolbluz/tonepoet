@@ -1,3 +1,8 @@
+//! Qualification probe for SSRC Float64 W64 behavior.
+//!
+//! This binary emits evidence consumed by the Binary64 qualification workflow;
+//! it is not part of normal conversion execution.
+
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;

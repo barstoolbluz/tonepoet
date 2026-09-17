@@ -534,21 +534,37 @@ impl ReferenceCertifiedObserverClosureV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceCommonPrimitiveClosureV1 {
+    /// Policy identity bound into the qualification closure.
     pub policy_identity: String,
+    /// Semantic-plan identity bound into the qualification closure.
     pub semantic_plan_identity: String,
+    /// Numerical implementation identity bound into the qualification closure.
     pub numerical_implementation: String,
+    /// Common implementation source bound into the qualification closure.
     pub common_implementation_source: String,
+    /// Certified reconstruction authority bound into the qualification closure.
     pub certified_reconstruction: String,
+    /// Edge-handling policy bound into the qualification closure.
     pub edge_policy: String,
+    /// Certified scan tier bound into the qualification closure.
     pub scan_tier: String,
+    /// Reader/decode implementation bound into the qualification closure.
     pub reader_decode_implementation: String,
+    /// Tool identity and version closure bound into the qualification.
     pub tool_identity_version_closure: String,
+    /// Reconstruction profile bound into the qualification closure.
     pub reconstruction_profile: String,
+    /// Terminal implementation identity bound into the qualification closure.
     pub terminal_implementation: String,
+    /// Dither and quantization policy bound into the qualification closure.
     pub dither_quantization_policy: String,
+    /// Metadata-writer route bound into the qualification closure.
     pub metadata_writer_route: String,
+    /// Post-mutation checks bound into the qualification closure.
     pub post_mutation_checks: String,
+    /// SIMD implementation identity bound into the qualification closure.
     pub simd_implementation: String,
+    /// Compiler/build closure bound into the qualification.
     pub compiler_build_closure: String,
 }
 
@@ -586,8 +602,11 @@ impl ReferenceCommonPrimitiveClosureV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceCandidateCharacterizationV1 {
+    /// Number of positive qualification cases.
     pub positive_case_count: u64,
+    /// Number of expected-negative qualification cases.
     pub expected_negative_case_count: u64,
+    /// SHA-256 digest of the qualified runtime closure.
     pub runtime_closure_fingerprint_sha256: String,
 }
 
@@ -596,13 +615,21 @@ pub struct ReferenceCandidateCharacterizationV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceCommonQualificationV1 {
+    /// Qualification schema version.
     pub schema_version: u32,
+    /// Execution-model identity for this qualification artifact.
     pub execution_model: String,
+    /// Recorded qualification or gate status.
     pub status: String,
+    /// SHA-256 digest of the accepted Phase 4 artifact.
     pub accepted_phase4_sha256: String,
+    /// SHA-256 digest of the design handoff artifact.
     pub design_handoff_sha256: String,
+    /// SHA-256 digest of the inherited v16 evidence.
     pub inherited_v16_evidence_sha256: String,
+    /// Certified observer identity recorded by the qualification.
     pub observer: ReferenceCertifiedObserverClosureV1,
+    /// Qualified primitive closure.
     pub closure: ReferenceCommonPrimitiveClosureV1,
 }
 
@@ -628,9 +655,12 @@ impl ReferenceCommonQualificationV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceReleaseGateResultV1 {
+    /// Release gate name.
     pub gate: String,
+    /// Recorded qualification or gate status.
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// SHA-256 digest of evidence attached to this gate.
     pub evidence_sha256: Option<String>,
 }
 
@@ -638,15 +668,24 @@ pub struct ReferenceReleaseGateResultV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceQualificationReportV1 {
+    /// Qualification schema version.
     pub schema_version: u32,
+    /// Execution-model identity for this qualification artifact.
     pub execution_model: String,
+    /// Recorded qualification or gate status.
     pub status: String,
+    /// SHA-256 digest of the qualified candidate manifest.
     pub candidate_manifest_sha256: String,
+    /// SHA-256 digest of the qualified runtime closure.
     pub runtime_closure_fingerprint_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// SHA-256 digest of the metadata-mutation closure.
     pub metadata_mutation_closure_fingerprint_sha256: Option<String>,
+    /// Number of positive qualification cases.
     pub positive_case_count: u64,
+    /// Number of expected-negative qualification cases.
     pub expected_negative_case_count: u64,
+    /// Recorded release-gate results.
     pub gates: Vec<ReferenceReleaseGateResultV1>,
 }
 
@@ -655,17 +694,28 @@ pub struct ReferenceQualificationReportV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceReleaseCertificationV1 {
+    /// Qualification schema version.
     pub schema_version: u32,
+    /// Execution-model identity for this qualification artifact.
     pub execution_model: String,
+    /// Recorded qualification or gate status.
     pub status: String,
+    /// Recorded release-certification outcome.
     pub outcome: String,
+    /// SHA-256 digest of the qualified candidate manifest.
     pub candidate_manifest_sha256: String,
+    /// SHA-256 digest of the qualification report.
     pub qualification_report_sha256: String,
+    /// SHA-256 digest of the qualified runtime closure.
     pub runtime_closure_fingerprint_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// SHA-256 digest of the metadata-mutation closure.
     pub metadata_mutation_closure_fingerprint_sha256: Option<String>,
+    /// Number of positive qualification cases.
     pub positive_case_count: u64,
+    /// Number of expected-negative qualification cases.
     pub expected_negative_case_count: u64,
+    /// Recorded release-gate results.
     pub gates: Vec<ReferenceReleaseGateResultV1>,
 }
 

@@ -4961,51 +4961,6 @@ fn selected_archive_track_count(track_count: usize, selection: &TrackSelection) 
         .count()
 }
 
-fn apply_track_selection(
-    tracks: Vec<PreparedTrack>,
-    selection: &TrackSelection,
-) -> Result<Vec<PreparedTrack>, MaterializeError> {
-    match selection {
-        TrackSelection::All => Ok(tracks),
-        TrackSelection::Range { start, end } => {
-            if *start == 0 || *end == 0 || start > end {
-                return Err(MaterializeError::InvalidTrackSelection(format!(
-                    "invalid range {start}-{end}"
-                )));
-            }
-            let max_ordinal = tracks.len() as u32;
-            if *start > max_ordinal {
-                return Err(MaterializeError::InvalidTrackSelection(format!(
-                    "range start {start} exceeds track count {max_ordinal}"
-                )));
-            }
-            Ok(tracks
-                .into_iter()
-                .filter(|t| t.id.source_ordinal >= *start && t.id.source_ordinal <= *end)
-                .collect())
-        }
-        TrackSelection::Set(indices) => {
-            if indices.is_empty() {
-                return Err(MaterializeError::InvalidTrackSelection(
-                    "empty track set".into(),
-                ));
-            }
-            let max_ordinal = tracks.len() as u32;
-            for &idx in indices {
-                if idx == 0 || idx > max_ordinal {
-                    return Err(MaterializeError::InvalidTrackSelection(format!(
-                        "track {idx} outside valid range 1-{max_ordinal}"
-                    )));
-                }
-            }
-            Ok(tracks
-                .into_iter()
-                .filter(|t| indices.contains(&t.id.source_ordinal))
-                .collect())
-        }
-    }
-}
-
 // =========================================================================
 // Album metadata derivation
 // =========================================================================

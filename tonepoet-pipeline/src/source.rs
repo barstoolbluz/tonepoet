@@ -40,7 +40,10 @@ pub enum SourceFrameExtent {
     /// Exact frame count established by source materialization/probing.
     Exact(u64),
     /// Proven upper bound; the actual frame count may be smaller.
-    Bounded { upper_frames: u64 },
+    Bounded {
+        /// Maximum source frame count admitted by the bound.
+        upper_frames: u64,
+    },
 }
 
 /// Read-only audio facts required for deterministic planning.

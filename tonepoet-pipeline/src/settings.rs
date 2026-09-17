@@ -977,6 +977,7 @@ impl SampleGainPolicy {
     }
 
     /// True only when the policy may increase gain above its declared base.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn allow_boost(self) -> bool {
         matches!(self, Self::TruePeakNormalize { .. })

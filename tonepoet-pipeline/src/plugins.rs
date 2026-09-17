@@ -27,7 +27,10 @@ pub enum SsrcDitherAvailability {
     /// A derived global family has no native SSRC mapping for this terminal cell.
     /// The semantic planner may split to a later terminal when no explicit native
     /// override requires SSRC ownership.
-    UnavailableForSsrcTerminal { reason: String },
+    UnavailableForSsrcTerminal {
+        /// Explanation of why the requested terminal cell has no native mapping.
+        reason: String,
+    },
 }
 
 /// Provenance of the effective SSRC dither selection.
@@ -48,10 +51,15 @@ pub enum SsrcDitherOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResolvedSsrcDither {
+    /// Global dither value requested by the pipeline settings.
     pub requested_global: DitherType,
+    /// Resolved SSRC dither identifier.
     pub dither_id: Option<u8>,
+    /// Resolved SSRC probability-density-function setting.
     pub pdf_type: Option<SsrcPdfType>,
+    /// Configuration source that supplied the resolved dither setting.
     pub origin: SsrcDitherOrigin,
+    /// Availability result for the resolved dither setting.
     pub availability: SsrcDitherAvailability,
 }
 
@@ -257,9 +265,13 @@ pub(crate) fn canonicalize_sox_gain_db(value: f32) -> f32 {
 /// Exact FFmpeg/SoXR rate options after quality and transition defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ResolvedSoxrRateOptions {
+    /// Resolved libsoxr precision value.
     pub precision: u8,
+    /// Resolved libsoxr cutoff value.
     pub cutoff: f32,
+    /// Whether Chebyshev passband behavior is enabled.
     pub chebyshev: bool,
+    /// Resolved libsoxr phase value, when configured.
     pub phase: Option<u8>,
 }
 
@@ -718,6 +730,7 @@ impl ToolPlugin for SsrcPlugin {
     }
 }
 
+/// Render the SSRC bit-depth argument for a resolved PCM depth.
 pub(crate) fn ssrc_bits_arg(depth: PcmBitDepth) -> String {
     match depth {
         PcmBitDepth::Float32 => "-32".into(),
@@ -2233,6 +2246,7 @@ fn effective_target_depth(
     })
 }
 
+/// Return whether the request explicitly assigns Int32 dither ownership.
 pub(crate) fn explicit_int32_dither_requested(
     settings: &crate::settings::PipelineSettings,
     target_depth: Option<PcmBitDepth>,

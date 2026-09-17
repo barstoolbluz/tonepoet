@@ -2478,6 +2478,10 @@ fn effective_metadata_satisfaction(
 
 // Append-only v15 checker markers. These strings identify immutable historical
 // evidence; runtime activation and all current includes are v16.
+#[allow(
+    dead_code,
+    reason = "append-only v15 checker markers remain source evidence for immutable historical qualification"
+)]
 const _V15_APPEND_ONLY_EXECUTOR_MARKERS: &str = concat!(
     "dsd_reference_sox_ng_14_8_0_1_v15.json",
     "manifest.schema_version != 15",
