@@ -4786,18 +4786,43 @@ impl FormatState {
         self.pcm_true_peak_lossy_floor_applies()
     }
 
+    fn source_float_depth(&self) -> Option<tonepoet_pipeline::PcmBitDepth> {
+        self.source_pcm_float_bits.map(|bits| {
+            if bits <= 32 {
+                tonepoet_pipeline::PcmBitDepth::Float32
+            } else {
+                tonepoet_pipeline::PcmBitDepth::Float64
+            }
+        })
+    }
+
+    fn source_depth_policy_target(&self) -> Option<tonepoet_pipeline::PcmBitDepth> {
+        let source_depth = self.source_float_depth()?;
+        let target_format =
+            crate::convert::pipeline::planner_format_from_main(*self.format.selected_value());
+        Some(tonepoet_pipeline::source_pcm_depth_for_target(
+            &target_format,
+            self.wavpack_hybrid,
+            source_depth,
+        ))
+    }
+
     fn auto_gain_target_is_integer_pcm(&self) -> bool {
         if self.is_dsd_selected() || self.auto_gain_target_is_lossy() {
             return false;
         }
         match *self.bit_depth.selected_value() {
             BitDepthChoice::Int16 | BitDepthChoice::Int24 | BitDepthChoice::Int32 => true,
-            // `Source` is an output sentinel. For ordinary PCM it preserves
-            // the authoritative source representation and therefore must not
-            // manufacture a float->integer safety trigger. A DSD source has no
-            // PCM word length to preserve, however: the planner resolves Source
-            // to the selected lossless format's documented integer default.
-            BitDepthChoice::Source => self.source_is_dsd,
+            // Source normally preserves the authoritative PCM representation.
+            // The format-safe Source policy is the exception: FLAC/ALAC/
+            // WavPack (lossless or hybrid) integerizes float sources, so the existing
+            // float->integer true-peak safety default must see that landing.
+            BitDepthChoice::Source => {
+                self.source_is_dsd
+                    || self
+                        .source_depth_policy_target()
+                        .is_some_and(|depth| !depth.is_float())
+            }
             BitDepthChoice::Float32 | BitDepthChoice::Float64 => false,
         }
     }
@@ -5243,21 +5268,36 @@ impl FormatState {
             return;
         }
 
+        let target = *self.bit_depth.selected_value();
+        if target.is_source() {
+            // Source-depth policy has its own authoritative float-depth fact.
+            // Do not require the generic source_bits argument as a second copy
+            // of that state; the probe may populate these fields on different
+            // UI update paths.
+            let desired = self
+                .source_float_depth()
+                .filter(|source_depth| {
+                    let target_format = crate::convert::pipeline::planner_format_from_main(
+                        *self.format.selected_value(),
+                    );
+                    tonepoet_pipeline::source_depth_policy_requires_tpdf(
+                        &target_format,
+                        self.wavpack_hybrid,
+                        *source_depth,
+                    )
+                })
+                .map(|_| DitherType::TPDF)
+                .unwrap_or(DitherType::None);
+            self.dither.select_value(&desired);
+            return;
+        }
+
         let Some(source_bits) = source_bits else {
             // Unknown source depth is not evidence of bit-depth reduction.
             // Prefer the non-destructive default until probing supplies a value.
             self.dither.select_value(&DitherType::None);
             return;
         };
-
-        let target = *self.bit_depth.selected_value();
-        if target.is_source() {
-            // Source-coupled depth does not prove a reduction at the TUI layer.
-            // The planner resolves the actual depth and owns any required
-            // conversion-specific dither decision.
-            self.dither.select_value(&DitherType::None);
-            return;
-        }
 
         // DSD and PCM are incommensurable encoding schemes — the conversion
         // is a reconstruction, not a truncation. Always dither at the PCM
@@ -17579,6 +17619,63 @@ mod pcm_gain_auto_default_tests {
         state.source_is_lossless = Some(true);
         state.apply_auto_gain_defaults();
         assert_eq!(state.pcm_gain_mode.selected_value(), &PcmGainMode::Off);
+    }
+
+    #[test]
+    fn source_depth_float_policy_updates_auto_dither_and_true_peak_safety_defaults() {
+        for (format, source_bits, expected_dither, expected_gain) in [
+            (AudioFormat::Flac, 32, DitherType::None, PcmGainMode::TruePeakGuard),
+            (AudioFormat::Flac, 64, DitherType::TPDF, PcmGainMode::TruePeakGuard),
+            (AudioFormat::Alac, 32, DitherType::TPDF, PcmGainMode::TruePeakGuard),
+            (AudioFormat::WavPack, 32, DitherType::None, PcmGainMode::TruePeakGuard),
+            (AudioFormat::Wav, 64, DitherType::None, PcmGainMode::Off),
+        ] {
+            let mut state = pcm_state(format, BitDepthChoice::Source);
+            state.source_pcm_float_bits = Some(source_bits);
+            state.source_is_lossless = Some(true);
+            state.apply_auto_dither(None);
+            state.apply_auto_gain_defaults();
+            assert_eq!(
+                state.dither.selected_value(),
+                &expected_dither,
+                "{format:?} Float{source_bits} Source dither",
+            );
+            assert_eq!(
+                state.pcm_gain_mode.selected_value(),
+                &expected_gain,
+                "{format:?} Float{source_bits} Source safety gain",
+            );
+        }
+    }
+
+    #[test]
+    fn wavpack_hybrid_source_float_policy_uses_int32_with_width_sensitive_auto_dither() {
+        for (source_bits, expected_dither) in [
+            (32, DitherType::None),
+            (64, DitherType::TPDF),
+        ] {
+            let mut state = pcm_state(AudioFormat::WavPack, BitDepthChoice::Source);
+            state.wavpack_hybrid = true;
+            state.source_pcm_float_bits = Some(source_bits);
+            state.source_is_lossless = Some(true);
+            state.apply_auto_dither(None);
+            state.apply_auto_gain_defaults();
+            assert_eq!(
+                state.source_depth_policy_target(),
+                Some(tonepoet_pipeline::PcmBitDepth::Int32),
+                "hybrid WavPack Float{source_bits} Source must land on Int32",
+            );
+            assert_eq!(
+                state.dither.selected_value(),
+                &expected_dither,
+                "hybrid WavPack Float{source_bits} Source dither",
+            );
+            assert_eq!(
+                state.pcm_gain_mode.selected_value(),
+                &PcmGainMode::TruePeakGuard,
+                "hybrid WavPack Float{source_bits} Source must retain the safety default",
+            );
+        }
     }
 
     #[test]

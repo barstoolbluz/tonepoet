@@ -417,27 +417,38 @@ fn plan_request_for_track_impl(
                 && !request.settings.target_format.is_dsd()
                 && request.settings.target_bit_depth == BitDepthTarget::Source
             {
-                let depth = if request.settings.target_format
-                    == tonepoet_pipeline::AudioFormat::WavPack
-                    && request.settings.wavpack.hybrid
-                {
-                    resolve_wavpack_hybrid_source_working_depth(track)
+                let source_depth = if matches!(
+                    track.source_audio.coding,
+                    Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
+                ) {
+                    resolve_source_pcm_depth(track)
                 } else {
-                    let source_depth = if matches!(
-                        track.source_audio.coding,
-                        Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
-                    ) {
-                        resolve_source_pcm_depth(track)
-                    } else {
-                        None
-                    };
-                    source_depth.unwrap_or_else(|| {
-                        tonepoet_pipeline::default_pcm_depth_for_format(
-                            &request.settings.target_format,
-                        )
-                    })
+                    None
                 };
-                settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+                match source_depth {
+                    Some(source_depth) => {
+                        let effective_depth = tonepoet_pipeline::source_pcm_depth_for_target(
+                            &request.settings.target_format,
+                            request.settings.wavpack.hybrid,
+                            source_depth,
+                        );
+                        // Keep Source as a policy sentinel only when the target
+                        // cannot represent the source depth directly. The typed
+                        // planner then owns both the concrete landing depth and
+                        // any automatic TPDF requirement, including WavPack
+                        // hybrid float Source.
+                        if effective_depth == source_depth {
+                            settings.target_bit_depth = BitDepthTarget::Pcm(source_depth);
+                        }
+                    }
+                    None => {
+                        settings.target_bit_depth = BitDepthTarget::Pcm(
+                            tonepoet_pipeline::default_pcm_depth_for_format(
+                                &request.settings.target_format,
+                            ),
+                        );
+                    }
+                }
             }
         }
     } else if settings.dsd.runtime_album_gain_db().is_some() {
@@ -547,8 +558,20 @@ fn plan_request_for_track_impl(
                 );
             }
             SourceAudioCoding::Pcm | SourceAudioCoding::DvdaUnknown => {
-                if let Some(resolved_source_depth) = resolve_source_pcm_depth(track) {
-                    settings.target_bit_depth = BitDepthTarget::Pcm(resolved_source_depth);
+                if let Some(source_depth) = resolve_source_pcm_depth(track) {
+                    let effective_depth = tonepoet_pipeline::source_pcm_depth_for_target(
+                        &settings.target_format,
+                        settings.wavpack.hybrid,
+                        source_depth,
+                    );
+                    // Integer Source and float-capable targets keep the old
+                    // eager resolution. For float Source into FLAC, ALAC, or
+                    // WavPack (lossless or hybrid), preserve Source so the typed planner
+                    // can distinguish policy-selected integer landing from an
+                    // explicit user depth and assign TPDF only when required.
+                    if effective_depth == source_depth {
+                        settings.target_bit_depth = BitDepthTarget::Pcm(source_depth);
+                    }
                 }
                 // Unknown measured depth remains Source here so same-format
                 // passthrough can still succeed. The planner fails closed only
@@ -2337,13 +2360,26 @@ pub fn source_info_for_realized_track(
         ..
     } = &track.source_ref
     {
+        // The retained carrier is physically Float64, but `Source` still means
+        // the original authoritative PCM representation. Preserve that fact
+        // separately so final planning can distinguish a Float32/Float64
+        // source from the Float64 analysis carrier. Do not manufacture PCM
+        // authority for lossy/DSD provenance merely because the carrier is PCM.
+        let true_source_depth = if matches!(
+            track.source_audio.coding,
+            Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
+        ) {
+            resolve_source_pcm_depth(track)
+        } else {
+            None
+        };
         return Ok(SourceInfo {
             dsd_source_kind: None,
             format: PlannerFormat::Wav,
             codec: PlannerCodec::PcmFloat,
             sample_rate_hz: Some(*sample_rate_hz),
             bit_depth: Some(PcmBitDepth::Float64),
-            true_source_depth: None,
+            true_source_depth,
             source_representation: SourceRepresentationKind::Pcm,
             sample_kind: Some(SampleKind::Float),
             channels: Some(*channels),
@@ -2590,13 +2626,15 @@ pub(super) fn resolve_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDe
         })
 }
 
-/// Resolve the integer PCM working depth used when WavPack hybrid is fed from
-/// a PCM true-peak carrier and the operator selected `BitDepthTarget::Source`.
+/// Resolve the integer PCM working depth used when WavPack hybrid consumes a
+/// `BitDepthTarget::Source` request, including retained true-peak/fixed-gain
+/// carriers.
 ///
-/// Hybrid WavPack is a lossy encode whose admitted hard-ceiling terminal is an
-/// integer PCM carrier. Preserve an authoritative integer source width; float
-/// or otherwise non-admitted source representations use WavPack's documented
-/// PCM working default. Keeping this rule in one place prevents planning,
+/// Hybrid WavPack is a lossy encode whose admitted terminal consumes integer
+/// PCM. Authoritative widths therefore reuse the common WavPack Source policy:
+/// integers retain their width and Float32/Float64 land on Int32. Sources
+/// without an authoritative admitted PCM width keep the documented Int24
+/// working default. Keeping the mapping centralized prevents planning,
 /// terminal-bound accounting, and post-encode validation from disagreeing.
 pub(crate) fn resolve_wavpack_hybrid_source_working_depth(
     track: &PreparedTrack,
@@ -2611,13 +2649,11 @@ pub(crate) fn resolve_wavpack_hybrid_source_working_depth(
     };
 
     source_depth
-        .filter(|depth| {
-            matches!(
-                *depth,
-                PcmBitDepth::Int8
-                    | PcmBitDepth::Int16
-                    | PcmBitDepth::Int24
-                    | PcmBitDepth::Int32
+        .map(|depth| {
+            tonepoet_pipeline::source_pcm_depth_for_target(
+                &PlannerFormat::WavPack,
+                true,
+                depth,
             )
         })
         .unwrap_or_else(|| default_pcm_depth_for_format(&PlannerFormat::WavPack))
@@ -3639,6 +3675,68 @@ mod tests {
     }
 
     #[test]
+    fn float32_cue_source_maps_source_depth_for_integer_only_lossless_targets() {
+        for (format, extension, expected_depth, expects_tpdf) in [
+            (PlannerFormat::Flac, "flac", tonepoet_pipeline::PcmBitDepth::Int32, false),
+            (PlannerFormat::Alac, "m4a", tonepoet_pipeline::PcmBitDepth::Int24, true),
+            (PlannerFormat::WavPack, "wv", tonepoet_pipeline::PcmBitDepth::Int32, false),
+        ] {
+            let temp = TempDir::new().expect("temp dir");
+            let input = temp.path().join("staging/cue-segments/track01-f32.wav");
+            std::fs::create_dir_all(input.parent().unwrap()).expect("cue staging dir");
+            std::fs::write(&input, b"placeholder float pcm wav")
+                .expect("placeholder staged WAV");
+            let output = temp.path().join(format!("out.{extension}"));
+            let mut req = request(temp.path());
+            req.settings.target_format = format.clone();
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+            let mut prepared = track(TrackSourceRef::CueSegmentCarrier {
+                path: input.clone(),
+                source_image: temp.path().join("album-f32.wv"),
+                start_sample: 0,
+                samples: 44_100,
+                carrier: CueSegmentCarrier::PcmF32LeWav,
+            });
+            prepared.source_audio.coding = Some(crate::convert::pipeline::SourceAudioCoding::Pcm);
+            prepared.sample_rate = Some(192_000);
+            prepared.bit_depth = Some(320);
+            prepared.source_audio.bit_depth = Some(320);
+
+            let planned = plan_request_for_track(
+                &req,
+                &prepared,
+                &input,
+                &output,
+                temp.path().join("work"),
+            )
+            .expect("Float32 CUE Source request must pass bridge validation");
+
+            assert_eq!(
+                planned.settings.target_bit_depth,
+                tonepoet_pipeline::BitDepthTarget::Source,
+                "{format}: mapped float Source must remain a policy sentinel at the bridge",
+            );
+            let topology = tonepoet_pipeline::plan_topology(&planned)
+                .expect("Float32 CUE Source topology builds");
+            let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+                panic!("{format}: mapped float Source must execute");
+            };
+            assert!(steps.iter().any(|step| matches!(
+                &step.operation,
+                tonepoet_pipeline::PlanOperation::EncodePcm {
+                    target_bit_depth,
+                    ..
+                } if *target_bit_depth == expected_depth
+            )), "{format}: expected terminal depth {expected_depth:?}");
+            let commands = planned_command_args(&planned);
+            let has_tpdf = commands.iter().flatten().any(|arg| {
+                arg.contains("dither_method=triangular")
+            });
+            assert_eq!(has_tpdf, expects_tpdf, "{format}: automatic TPDF disposition");
+        }
+    }
+
+    #[test]
     fn unknown_source_representation_fails_closed_for_pcm_lossless_target() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("source.wav");
@@ -4254,7 +4352,7 @@ mod tests {
     }
 
     #[test]
-    fn wavpack_hybrid_source_working_depth_preserves_integer_width_and_defaults_float() {
+    fn wavpack_hybrid_source_working_depth_preserves_integer_width_and_maps_float_to_int32() {
         let mut prepared = track(TrackSourceRef::StagedFile(PathBuf::from("source.wav")));
         prepared.source_audio.coding = Some(SourceAudioCoding::Pcm);
 
@@ -4263,8 +4361,8 @@ mod tests {
             (16, PcmBitDepth::Int16),
             (24, PcmBitDepth::Int24),
             (32, PcmBitDepth::Int32),
-            (320, PcmBitDepth::Int24),
-            (640, PcmBitDepth::Int24),
+            (320, PcmBitDepth::Int32),
+            (640, PcmBitDepth::Int32),
         ] {
             prepared.bit_depth = Some(source_bits);
             prepared.source_audio.bit_depth = Some(source_bits);
@@ -4282,6 +4380,119 @@ mod tests {
             PcmBitDepth::Int24,
             "otherwise non-admitted source representations use WavPack's working default",
         );
+    }
+
+    #[test]
+    fn pcm_true_peak_carrier_preserves_original_pcm_depth_separately_from_float64_carrier() {
+        let carrier = PathBuf::from("track.true-peak.f64le");
+        let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+            path: carrier.clone(),
+            source_path: PathBuf::from("source.wav"),
+            sample_rate_hz: 192_000,
+            channels: 2,
+            duration: None,
+            gain_db: Some("-0.250000000".parse().expect("gain")),
+            point_dbtp: Some("-0.750000000".parse().expect("point")),
+            effective_target_dbtp: "-1.000000000".parse().expect("target"),
+            lossy_target_capped: false,
+            terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+        });
+        prepared.bit_depth = Some(320);
+        prepared.source_audio.bit_depth = Some(320);
+        prepared.source_audio.coding = Some(SourceAudioCoding::Pcm);
+
+        let info = source_info_for_realized_track(&prepared, &carrier)
+            .expect("retained PCM carrier source facts");
+        assert_eq!(info.bit_depth, Some(PcmBitDepth::Float64));
+        assert_eq!(info.sample_kind, Some(tonepoet_pipeline::SampleKind::Float));
+        assert_eq!(info.source_representation, tonepoet_pipeline::SourceRepresentationKind::Pcm);
+        assert_eq!(info.true_source_depth, Some(PcmBitDepth::Float32));
+        assert_eq!(info.authoritative_pcm_depth(), Some(PcmBitDepth::Float32));
+
+        for coding in [SourceAudioCoding::Dsd, SourceAudioCoding::Lossy] {
+            prepared.source_audio.coding = Some(coding);
+            let non_pcm_info = source_info_for_realized_track(&prepared, &carrier)
+                .expect("retained carrier without authoritative PCM provenance");
+            assert_eq!(non_pcm_info.bit_depth, Some(PcmBitDepth::Float64));
+            assert_eq!(non_pcm_info.true_source_depth, None);
+            assert_eq!(non_pcm_info.authoritative_pcm_depth(), None);
+        }
+    }
+
+    #[test]
+    fn retained_pcm_true_peak_carrier_float_source_plans_format_safe_integer_landings() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("track.true-peak.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("carrier placeholder");
+        let original = temp.path().join("source.wav");
+        std::fs::write(&original, [0_u8; 16]).expect("source placeholder");
+
+        for (source_bits, format, extension, expected_depth) in [
+            (320, PlannerFormat::Flac, "flac", PcmBitDepth::Int32),
+            (640, PlannerFormat::Flac, "flac", PcmBitDepth::Int32),
+            (320, PlannerFormat::Alac, "m4a", PcmBitDepth::Int24),
+            (640, PlannerFormat::Alac, "m4a", PcmBitDepth::Int24),
+            (320, PlannerFormat::WavPack, "wv", PcmBitDepth::Int32),
+            (640, PlannerFormat::WavPack, "wv", PcmBitDepth::Int32),
+        ] {
+            let mut req = request(temp.path());
+            req.settings.target_format = format.clone();
+            req.settings.wavpack.hybrid = false;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(192_000);
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+            req.settings.metadata.transfer_tags = false;
+            req.settings.metadata.preserve_artwork = false;
+            req.settings.metadata.store_source_audio_md5 = false;
+            req.settings.pcm_true_peak.policy =
+                tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
+
+            let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+                path: carrier.clone(),
+                source_path: original.clone(),
+                sample_rate_hz: 192_000,
+                channels: 2,
+                duration: None,
+                gain_db: Some("-0.250000000".parse().expect("gain")),
+                point_dbtp: Some("-0.750000000".parse().expect("point")),
+                effective_target_dbtp: "-1.000000000".parse().expect("target"),
+                lossy_target_capped: false,
+                terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+            });
+            prepared.bit_depth = Some(source_bits);
+            prepared.source_audio.bit_depth = Some(source_bits);
+            prepared.source_audio.coding = Some(SourceAudioCoding::Pcm);
+
+            let output = temp.path().join(format!("out-{source_bits}.{extension}"));
+            let planned = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join(format!("work-{source_bits}-{extension}")),
+            )
+            .expect("retained PCM carrier plan request");
+            assert_eq!(planned.settings.target_bit_depth, tonepoet_pipeline::BitDepthTarget::Source);
+            assert_eq!(planned.source.bit_depth, Some(PcmBitDepth::Float64));
+            assert_eq!(
+                planned.source.authoritative_pcm_depth(),
+                super::pcm_bit_depth_from_source_bits(source_bits),
+                "original PCM Source depth must survive retained-carrier reconstruction",
+            );
+
+            let topology = tonepoet_pipeline::plan_topology(&planned)
+                .expect("retained PCM carrier topology");
+            let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+                panic!("float Source retained carrier must execute");
+            };
+            assert!(steps.iter().any(|step| matches!(
+                &step.operation,
+                tonepoet_pipeline::PlanOperation::EncodePcm {
+                    target_format,
+                    target_bit_depth,
+                    ..
+                } if target_format == &format && *target_bit_depth == expected_depth
+            )), "format={format} source_bits={source_bits}: {steps:#?}");
+        }
     }
 
     #[test]
@@ -4709,7 +4920,7 @@ mod tests {
     }
 
     #[test]
-    fn pcm_true_peak_wavpack_hybrid_source_depth_resolves_to_integer_working_default() {
+    fn pcm_true_peak_wavpack_hybrid_source_depth_uses_int32_source_policy() {
         let temp = TempDir::new().expect("temp dir");
         let original_pcm = temp.path().join("source.wav");
         std::fs::write(&original_pcm, [0_u8; 16]).expect("source placeholder");
@@ -4754,9 +4965,30 @@ mod tests {
 
         assert_eq!(
             planned.settings.target_bit_depth,
-            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24),
-            "hybrid is lossy, so Source resolves to WavPack's admitted integer working default rather than the Float64 source representation",
+            tonepoet_pipeline::BitDepthTarget::Source,
+            "float hybrid Source must remain a policy sentinel so the typed planner owns Int32 landing and automatic TPDF",
         );
+        let source_info = source_info_for_realized_track(&prepared_track, &carrier)
+            .expect("retained carrier source facts");
+        assert_eq!(source_info.bit_depth, Some(tonepoet_pipeline::PcmBitDepth::Float64));
+        assert_eq!(
+            source_info.authoritative_pcm_depth(),
+            Some(tonepoet_pipeline::PcmBitDepth::Float64),
+            "retained carrier must preserve the original authoritative PCM depth separately from its physical Float64 width",
+        );
+        let topology = tonepoet_pipeline::plan_topology(&planned)
+            .expect("Float64 hybrid Source topology builds");
+        let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("Float64 hybrid Source must realize an Int32 encoder-input carrier");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            tonepoet_pipeline::PlanOperation::EncodePcm {
+                target_format: PlannerFormat::Wav,
+                target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int32,
+                ..
+            }
+        )));
 
         prepared_track.bit_depth = Some(32);
         prepared_track.source_audio.bit_depth = Some(32);
@@ -4799,19 +5031,32 @@ mod tests {
         req.settings.wavpack.hybrid = false;
         prepared_track.bit_depth = Some(320);
         prepared_track.source_audio.bit_depth = Some(320);
-        let error = plan_request_for_track(
+        let planned_lossless = plan_request_for_track(
             &req,
             &prepared_track,
             &carrier,
             &output,
             temp.path().join("work-lossless-float"),
         )
-        .expect_err(
-            "ordinary lossless WavPack Source must reject floating-point output during bridge validation",
+        .expect("ordinary lossless WavPack Source maps Float32 to Int32");
+        assert_eq!(
+            planned_lossless.settings.target_bit_depth,
+            tonepoet_pipeline::BitDepthTarget::Source,
+            "bridge must preserve Source so the typed planner owns format-safe landing policy",
         );
-        let message = error.to_string();
-        assert!(message.contains("WavPack"), "{message}");
-        assert!(message.to_ascii_lowercase().contains("float"), "{message}");
+        let topology = tonepoet_pipeline::plan_topology(&planned_lossless)
+            .expect("lossless WavPack Float32 Source topology builds");
+        let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("float WavPack Source must re-encode to the integer landing depth");
+        };
+        assert!(steps.iter().any(|step| matches!(
+            &step.operation,
+            tonepoet_pipeline::PlanOperation::EncodePcm {
+                target_format: PlannerFormat::WavPack,
+                target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int32,
+                ..
+            }
+        )));
     }
 
     #[test]

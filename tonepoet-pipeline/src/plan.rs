@@ -1720,6 +1720,7 @@ fn validate_direct_terminal_dither(
         PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
         | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
         | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid
+        | PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid
         | PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
             return Err(PlanningError::invalid_settings(
                 "terminal_realization",
@@ -1954,6 +1955,97 @@ fn validate_selected_terminal_lowering(
                     ));
                 }
                 _ => {}
+            }
+        }
+        PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid => {
+            if direct_indices.len() != 1 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected FFmpeg-preterminal WavPack hybrid terminal has {} matching package operations instead of one",
+                        direct_indices.len(),
+                    ),
+                ));
+            }
+            let package_index = direct_indices[0];
+            let package = &commands[package_index];
+            if package.tool != ToolIdentifier::Custom("wavpack".to_owned()) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected FFmpeg-preterminal WavPack hybrid package lowered with {} instead of wavpack",
+                        package.tool,
+                    ),
+                ));
+            }
+            if realization.effective_dither != Some(DitherType::Tpdf)
+                || realization.dither_owner
+                    != crate::semantic_plan::PcmTerminalDitherOwner::FfmpegPreterminal
+            {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "FFmpeg-preterminal WavPack hybrid realization must assign exactly TPDF to the FFmpeg preterminal",
+                ));
+            }
+            let expected = mapping::soxr_dither_method(DitherType::Tpdf)
+                .expect("TPDF has a canonical FFmpeg/SoXR mapping");
+            let expected = format!("dither_method={expected}");
+            let ffmpeg_preterminals = commands
+                .iter()
+                .enumerate()
+                .filter(|(index, command)| {
+                    *index != package_index
+                        && command.tool == ToolIdentifier::Ffmpeg
+                        && command_ffmpeg_dither_method_count(command) == 1
+                        && command.args.iter().any(|arg| arg.contains(&expected))
+                })
+                .collect::<Vec<_>>();
+            if ffmpeg_preterminals.len() != 1 {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected FFmpeg-preterminal WavPack hybrid terminal requires exactly one FFmpeg triangular-dither preterminal; observed {}",
+                        ffmpeg_preterminals.len(),
+                    ),
+                ));
+            }
+            let (preterminal_index, preterminal) = ffmpeg_preterminals[0];
+            if preterminal_index >= package_index {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "FFmpeg WavPack-hybrid preterminal must precede native packaging",
+                ));
+            }
+            if !matches!(
+                &steps[preterminal_index].operation,
+                PlanOperation::EncodePcm {
+                    target_format: AudioFormat::Wav,
+                    target_bit_depth: PcmBitDepth::Int32,
+                    apply_processing: true,
+                    ..
+                }
+            ) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "qualified FFmpeg WavPack-hybrid dither owner is not the expected processing WAV/Int32 preterminal step",
+                ));
+            }
+            if preterminal.output.as_path() != package.input.as_path() {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "native WavPack hybrid package is not consuming the FFmpeg preterminal artifact",
+                ));
+            }
+            if commands.iter().enumerate().any(|(index, command)| {
+                index != preterminal_index
+                    && index != package_index
+                    && (command_ffmpeg_dither_method_count(command) != 0
+                        || command.args.iter().any(|arg| arg == "dither" || arg == "--dither"))
+            }) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "FFmpeg-preterminal WavPack hybrid lowering contains duplicate downstream dither ownership",
+                ));
             }
         }
         PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
@@ -2370,11 +2462,17 @@ fn audio_content_matches_requested(request: &PlanRequest) -> bool {
     // when source and target PCM lattices already match. Resolve Source to
     // the authoritative PCM depth so passthrough cannot swallow that request.
     let requested_pcm_depth = match settings.target_bit_depth {
-        BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+        BitDepthTarget::Source => request.source.authoritative_pcm_depth().map(|source_depth| {
+            crate::settings::source_pcm_depth_for_target(
+                &settings.target_format,
+                settings.wavpack.hybrid,
+                source_depth,
+            )
+        }),
         BitDepthTarget::Pcm(depth) => Some(depth),
     };
     if settings.target_format.is_pcm_lossless()
-        && crate::plugins::explicit_int32_dither_requested(settings, requested_pcm_depth)
+        && crate::plugins::int32_dither_requested(request, requested_pcm_depth)
     {
         return false;
     }
@@ -2406,6 +2504,23 @@ fn requested_rate_matches_source(request: &PlanRequest) -> bool {
 
 fn requested_depth_matches_source(request: &PlanRequest) -> bool {
     match request.settings.target_bit_depth {
+        BitDepthTarget::Source
+            if request.settings.target_format.is_pcm_lossless()
+                && request.source.representation_kind() == SourceRepresentationKind::Pcm =>
+        {
+            let Some(source_depth) = request.source.authoritative_pcm_depth() else {
+                return false;
+            };
+            let target_depth = crate::settings::source_pcm_depth_for_target(
+                &request.settings.target_format,
+                request.settings.wavpack.hybrid,
+                source_depth,
+            );
+            // Preserve established Source passthrough for representable source
+            // depths. Only the new format-safe remap (for example WavPack
+            // Float32 -> Int32) makes Source itself a content change.
+            target_depth == source_depth || request.source.bit_depth == Some(target_depth)
+        }
         BitDepthTarget::Source => true,
         BitDepthTarget::Pcm(depth) => request.source.bit_depth == Some(depth),
     }
@@ -2637,11 +2752,19 @@ fn plan_from_pcm(
     let target_depth = resolve_target_bit_depth(request)?;
     reject_unsupported_resolved_depth(&request.settings.target_format, target_depth)?;
 
+    let wavpack_hybrid = request.settings.target_format == AudioFormat::WavPack
+        && request.settings.wavpack.hybrid;
+    let hybrid_float_source_integer_landing = wavpack_hybrid
+        && request.settings.target_bit_depth == BitDepthTarget::Source
+        && request
+            .source
+            .authoritative_pcm_depth()
+            .is_some_and(PcmBitDepth::is_float)
+        && target_depth == PcmBitDepth::Int32;
     let pcm_gain_wavpack_hybrid = (request.settings.pcm_true_peak.is_true_peak()
         || request.settings.pcm_true_peak.fixed_gain_db().is_some())
-        && request.settings.target_format == AudioFormat::WavPack
-        && request.settings.wavpack.hybrid;
-    if pcm_gain_wavpack_hybrid {
+        && wavpack_hybrid;
+    if pcm_gain_wavpack_hybrid || hybrid_float_source_integer_landing {
         if request.settings.pcm_true_peak.is_true_peak() && processing_rate.is_some() {
             return Err(PlanningError::invalid_source(
                 "sample_rate_hz",
@@ -2654,9 +2777,9 @@ fn plan_from_pcm(
             PlanOperation::EncodePcm {
                 target_format: AudioFormat::Wav,
                 // Automatic true-peak gain has already proved that no rate
-                // change remains. Fixed gain carries no ceiling proof, so it
-                // may share this single realization step with an ordinary
-                // requested resample.
+                // change remains. Fixed gain and ordinary float-Source hybrid
+                // conversion may share this single encoder-input realization
+                // step with an ordinary requested resample.
                 target_rate_hz: processing_rate,
                 target_bit_depth: target_depth,
                 apply_processing: true,
@@ -2678,17 +2801,18 @@ fn plan_from_pcm(
         return Ok(());
     }
     let depth_change = match request.settings.target_bit_depth {
-        BitDepthTarget::Source => false,
-        BitDepthTarget::Pcm(depth) => request.source.bit_depth != Some(depth),
+        BitDepthTarget::Source => request
+            .source
+            .authoritative_pcm_depth()
+            .is_some_and(|source_depth| source_depth != target_depth),
+        BitDepthTarget::Pcm(_) => request.source.bit_depth != Some(target_depth),
     };
-    let explicit_int32_dither = request.settings.target_format.is_pcm_lossless()
-        && crate::plugins::explicit_int32_dither_requested(
-            &request.settings,
-            Some(target_depth),
-        );
+    let effective_dither = crate::plugins::effective_pcm_dither(request, Some(target_depth));
+    let int32_dither = request.settings.target_format.is_pcm_lossless()
+        && crate::plugins::int32_dither_requested(request, Some(target_depth));
     let needs_processing = processing_rate.is_some()
         || depth_change
-        || explicit_int32_dither
+        || int32_dither
         || request.settings.dsd.runtime_album_gain_db().is_some()
         || request.settings.pcm_true_peak.fixed_gain_db().is_some();
     let needs_ssrc = processing_rate.is_some()
@@ -2761,8 +2885,8 @@ fn plan_from_pcm(
             lossy_encoder_rate,
             target_depth,
             request.settings.pcm_true_peak.fixed_gain_db().is_some()
-                || explicit_int32_dither
-                || request.settings.dither_type != DitherType::None,
+                || int32_dither
+                || effective_dither != DitherType::None,
         )?;
         return Ok(());
     }
@@ -2774,13 +2898,13 @@ fn plan_from_pcm(
         .is_some()
         || request.settings.pcm_true_peak.is_true_peak())
         && request.settings.target_format.is_pcm_lossless()
-        && request.settings.dither_type != DitherType::None
+        && effective_dither != DitherType::None
         && matches!(
             target_depth,
             PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
         );
-    let needs_sox_preprocess = request.settings.dither_type != DitherType::None
-        && (mapping::requires_sox_dither(request.settings.dither_type)
+    let needs_sox_preprocess = effective_dither != DitherType::None
+        && (mapping::requires_sox_dither(effective_dither)
             || hard_ceiling_needs_proved_dither_terminal)
         && !request.settings.target_format.sox_encodable()
         && request.settings.target_format.ffmpeg_encodable();
@@ -3056,6 +3180,13 @@ fn resolve_target_bit_depth(request: &PlanRequest) -> Result<PcmBitDepth> {
             SourceRepresentationKind::Pcm => request
                 .source
                 .authoritative_pcm_depth()
+                .map(|source_depth| {
+                    crate::settings::source_pcm_depth_for_target(
+                        &request.settings.target_format,
+                        request.settings.wavpack.hybrid,
+                        source_depth,
+                    )
+                })
                 .ok_or_else(|| {
                     PlanningError::invalid_source(
                         "bit_depth",
@@ -4447,3 +4578,316 @@ mod stage_a_lowering_selection_diagnostics {
     }
 }
 
+
+#[cfg(test)]
+mod source_float_source_depth_policy_tests {
+    use super::*;
+    use crate::enums::{
+        AudioCodec, AudioFormat, BitDepthTarget, DitherType, PcmBitDepth, RateTarget, SampleKind,
+    };
+    use crate::settings::PipelineSettings;
+    use crate::source::{SourceInfo, SourceRepresentationKind};
+    use std::path::PathBuf;
+
+    fn request(
+        source_format: AudioFormat,
+        source_depth: PcmBitDepth,
+        target_format: AudioFormat,
+    ) -> PlanRequest {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = target_format.clone();
+        settings.target_sample_rate = RateTarget::Source;
+        settings.target_bit_depth = BitDepthTarget::Source;
+        settings.dither_type = DitherType::None;
+        settings.dither_explicit = false;
+        PlanRequest {
+            input_path: PathBuf::from(format!("input.{}", source_format.extension())),
+            output_path: PathBuf::from(format!("output.{}", target_format.extension())),
+            source: SourceInfo {
+                format: source_format.clone(),
+                codec: if source_format == AudioFormat::WavPack {
+                    AudioCodec::WavPack
+                } else {
+                    AudioCodec::PcmFloat
+                },
+                sample_rate_hz: Some(192_000),
+                bit_depth: Some(source_depth),
+                true_source_depth: Some(source_depth),
+                source_representation: SourceRepresentationKind::Pcm,
+                sample_kind: Some(SampleKind::Float),
+                channels: Some(2),
+                duration: None,
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: PlanScope::track("source-float-source-depth"),
+            intermediate_dir: Some(PathBuf::from("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+        }
+    }
+
+    fn planned_pcm_depth(request: &PlanRequest) -> PcmBitDepth {
+        let topology = plan_topology(request).expect("Source float topology must plan");
+        let TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("float Source mapping must execute rather than passthrough");
+        };
+        steps
+            .iter()
+            .rev()
+            .find_map(|step| match &step.operation {
+                PlanOperation::EncodePcm {
+                    target_bit_depth, ..
+                } => Some(*target_bit_depth),
+                _ => None,
+            })
+            .expect("PCM target must include an encode operation")
+    }
+
+    fn emitted_triangular_dither(request: &PlanRequest) -> bool {
+        let plan = plan_conversion(request).expect("Source float command plan must lower");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("float Source mapping must execute rather than passthrough");
+        };
+        commands.iter().any(|command| {
+            command
+                .args
+                .iter()
+                .any(|arg| arg.contains("dither_method=triangular"))
+        })
+    }
+
+    #[test]
+    fn float32_source_lands_at_format_safe_integer_depths() {
+        let flac = request(AudioFormat::Wav, PcmBitDepth::Float32, AudioFormat::Flac);
+        assert_eq!(planned_pcm_depth(&flac), PcmBitDepth::Int32);
+        assert!(!emitted_triangular_dither(&flac));
+
+        let alac = request(AudioFormat::Wav, PcmBitDepth::Float32, AudioFormat::Alac);
+        assert_eq!(planned_pcm_depth(&alac), PcmBitDepth::Int24);
+        assert!(emitted_triangular_dither(&alac));
+
+        let wavpack = request(
+            AudioFormat::Wav,
+            PcmBitDepth::Float32,
+            AudioFormat::WavPack,
+        );
+        assert_eq!(planned_pcm_depth(&wavpack), PcmBitDepth::Int32);
+        assert!(!emitted_triangular_dither(&wavpack));
+    }
+
+    #[test]
+    fn float64_source_uses_tpdf_for_each_integer_landing() {
+        for (format, expected_depth) in [
+            (AudioFormat::Flac, PcmBitDepth::Int32),
+            (AudioFormat::Alac, PcmBitDepth::Int24),
+            (AudioFormat::WavPack, PcmBitDepth::Int32),
+        ] {
+            let request = request(AudioFormat::Wav, PcmBitDepth::Float64, format.clone());
+            assert_eq!(planned_pcm_depth(&request), expected_depth, "{format}");
+            assert!(emitted_triangular_dither(&request), "{format}");
+        }
+    }
+
+    #[test]
+    fn same_format_float_wavpack_source_cannot_passthrough_the_integer_policy() {
+        let request = request(
+            AudioFormat::WavPack,
+            PcmBitDepth::Float32,
+            AudioFormat::WavPack,
+        );
+        assert_eq!(planned_pcm_depth(&request), PcmBitDepth::Int32);
+        let plan = plan_conversion(&request).expect("lossless WavPack Source must re-encode");
+        assert!(matches!(plan.action, PlanAction::Execute { .. }));
+    }
+
+    fn hybrid_request(source_depth: PcmBitDepth) -> PlanRequest {
+        let mut request = request(AudioFormat::Wav, source_depth, AudioFormat::WavPack);
+        request.settings.wavpack.hybrid = true;
+        request
+    }
+
+    #[test]
+    fn wavpack_hybrid_float32_source_realizes_int32_without_automatic_dither() {
+        let request = hybrid_request(PcmBitDepth::Float32);
+        assert_eq!(planned_pcm_depth(&request), PcmBitDepth::Int32);
+        assert!(!emitted_triangular_dither(&request));
+
+        let plan = plan_conversion(&request).expect("Float32 hybrid Source command plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("Float32 hybrid Source must execute");
+        };
+        let wavpack_index = commands
+            .iter()
+            .position(|command| command.tool == ToolIdentifier::Custom("wavpack".to_owned()))
+            .expect("native WavPack package command");
+        let sox_index = commands
+            .iter()
+            .position(|command| command.tool == ToolIdentifier::Sox)
+            .expect("undithered Int32 SoX preterminal");
+        assert!(sox_index < wavpack_index);
+        assert_eq!(commands[sox_index].output.as_path(), commands[wavpack_index].input.as_path());
+        assert!(commands.iter().all(|command| {
+            !command.args.iter().any(|arg| {
+                arg.contains("dither_method=") || arg == "dither" || arg == "--dither"
+            })
+        }));
+    }
+
+    #[test]
+    fn wavpack_hybrid_float32_source_keeps_sox_preterminal_under_ffmpeg_preference() {
+        let mut request = hybrid_request(PcmBitDepth::Float32);
+        request.settings.preferred_tool = crate::enums::PreferredTool::Ffmpeg;
+
+        let plan = plan_conversion(&request)
+            .expect("Float32 hybrid Source must keep a truthful SoX preterminal");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("Float32 hybrid Source must execute");
+        };
+        let wavpack_index = commands
+            .iter()
+            .position(|command| command.tool == ToolIdentifier::Custom("wavpack".to_owned()))
+            .expect("native WavPack package command");
+        let package_input = commands[wavpack_index].input.as_path();
+        let (producer_index, producer) = commands
+            .iter()
+            .enumerate()
+            .find(|(index, command)| {
+                *index < wavpack_index && command.output.as_path() == package_input
+            })
+            .expect("a preterminal command must feed native WavPack directly");
+        assert!(producer_index < wavpack_index);
+        assert_eq!(
+            producer.tool,
+            ToolIdentifier::Sox,
+            "FFmpeg preference must not change the semantic/physical owner of the undithered Float32 Source preterminal: {commands:#?}",
+        );
+        assert!(commands.iter().all(|command| {
+            !command.args.iter().any(|arg| {
+                arg.contains("dither_method=") || arg == "dither" || arg == "--dither"
+            })
+        }));
+    }
+
+    #[test]
+    fn wavpack_hybrid_float32_source_explicit_tpdf_uses_exactly_one_ffmpeg_soxr_preterminal() {
+        let mut request = hybrid_request(PcmBitDepth::Float32);
+        request.settings.dither_type = DitherType::Tpdf;
+        request.settings.dither_explicit = true;
+        assert_eq!(planned_pcm_depth(&request), PcmBitDepth::Int32);
+
+        let plan = plan_conversion(&request)
+            .expect("Float32 hybrid Source explicit TPDF command plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("Float32 hybrid Source explicit TPDF must execute");
+        };
+        let wavpack_index = commands
+            .iter()
+            .position(|command| command.tool == ToolIdentifier::Custom("wavpack".to_owned()))
+            .expect("native WavPack package command");
+        let package_input = commands[wavpack_index].input.as_path();
+        let (producer_index, producer) = commands
+            .iter()
+            .enumerate()
+            .find(|(index, command)| {
+                *index < wavpack_index && command.output.as_path() == package_input
+            })
+            .expect("FFmpeg preterminal must feed native WavPack directly");
+        assert!(producer_index < wavpack_index, "{commands:#?}");
+        assert_eq!(producer.tool, ToolIdentifier::Ffmpeg, "{commands:#?}");
+        assert_eq!(
+            producer
+                .args
+                .iter()
+                .filter(|arg| arg.contains("dither_method=triangular"))
+                .count(),
+            1,
+            "{commands:#?}",
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .flat_map(|command| command.args.iter())
+                .filter(|arg| arg.contains("dither_method=triangular"))
+                .count(),
+            1,
+            "explicit TPDF must have exactly one physical owner",
+        );
+        assert!(commands.iter().all(|command| {
+            command.tool != ToolIdentifier::Sox
+                || !command.args.iter().any(|arg| arg == "dither" || arg == "--dither")
+        }));
+    }
+
+    #[test]
+    fn wavpack_hybrid_float64_source_uses_exactly_one_ffmpeg_soxr_tpdf_preterminal() {
+        for explicit_tpdf in [false, true] {
+            let mut request = hybrid_request(PcmBitDepth::Float64);
+            if explicit_tpdf {
+                request.settings.dither_type = DitherType::Tpdf;
+                request.settings.dither_explicit = true;
+            }
+            assert_eq!(planned_pcm_depth(&request), PcmBitDepth::Int32);
+
+            let plan = plan_conversion(&request).expect("Float64 hybrid Source command plan");
+            let PlanAction::Execute { commands, .. } = plan.action else {
+                panic!("Float64 hybrid Source must execute");
+            };
+            let wavpack_index = commands
+                .iter()
+                .position(|command| command.tool == ToolIdentifier::Custom("wavpack".to_owned()))
+                .expect("native WavPack package command");
+            let ffmpeg_dither = commands
+                .iter()
+                .enumerate()
+                .filter(|(_, command)| {
+                    command.tool == ToolIdentifier::Ffmpeg
+                        && command
+                            .args
+                            .iter()
+                            .filter(|arg| arg.contains("dither_method=triangular"))
+                            .count()
+                            == 1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ffmpeg_dither.len(), 1, "explicit={explicit_tpdf}: {commands:#?}");
+            let (ffmpeg_index, ffmpeg) = ffmpeg_dither[0];
+            assert!(ffmpeg_index < wavpack_index, "explicit={explicit_tpdf}: {commands:#?}");
+            assert_eq!(ffmpeg.output.as_path(), commands[wavpack_index].input.as_path());
+            assert_eq!(
+                commands
+                    .iter()
+                    .flat_map(|command| command.args.iter())
+                    .filter(|arg| arg.contains("dither_method=triangular"))
+                    .count(),
+                1,
+                "automatic and explicit TPDF must each have exactly one physical owner",
+            );
+        }
+    }
+
+    #[test]
+    fn wavpack_hybrid_integer_source_retains_each_authoritative_width() {
+        for depth in [PcmBitDepth::Int16, PcmBitDepth::Int24, PcmBitDepth::Int32] {
+            let mut request = hybrid_request(depth);
+            request.source.codec = AudioCodec::PcmSigned;
+            request.source.sample_kind = Some(SampleKind::SignedInteger);
+            request.source.bit_depth = Some(depth);
+            request.source.true_source_depth = Some(depth);
+            assert_eq!(planned_pcm_depth(&request), depth, "{depth:?}");
+            assert!(!emitted_triangular_dither(&request), "{depth:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_dither_none_suppresses_automatic_source_tpdf() {
+        let mut request = request(AudioFormat::Wav, PcmBitDepth::Float64, AudioFormat::Flac);
+        request.settings.dither_explicit = true;
+        assert_eq!(planned_pcm_depth(&request), PcmBitDepth::Int32);
+        assert!(!emitted_triangular_dither(&request));
+    }
+}

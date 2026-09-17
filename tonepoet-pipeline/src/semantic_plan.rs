@@ -876,6 +876,8 @@ pub enum PcmTerminalRealizationKind {
     SoxPreterminalFfmpegPackage,
     /// SoX realizes the proved integer PCM supplied to native WavPack hybrid packaging.
     SoxPreterminalWavPackHybrid,
+    /// FFmpeg/SoXR realizes qualified Int32 TPDF PCM before native WavPack hybrid packaging.
+    FfmpegPreterminalWavPackHybrid,
     /// The selected registry candidate delegates directly to native WavPack hybrid packaging.
     NativeWavPackHybridPackage,
 }
@@ -890,6 +892,8 @@ pub enum PcmTerminalDitherOwner {
     SelectedTerminal,
     /// A proved SoX preterminal owns the dither before sample-preserving packaging.
     SoxPreterminal,
+    /// A qualified FFmpeg/SoXR preterminal owns dither before sample-preserving packaging.
+    FfmpegPreterminal,
     /// The selected SSRC resampler owns the final integer dither/quantizer.
     SsrcResampler,
 }
@@ -987,6 +991,40 @@ pub fn matches_ffmpeg_int32_triangular_terminal_model(
         && realization.dither_owner == PcmTerminalDitherOwner::SelectedTerminal
 }
 
+/// Return whether `realization` is the narrow WavPack-hybrid composition that
+/// reuses the commissioned FFmpeg Float64 -> Int32 plain-triangular sample
+/// realization as a WAV preterminal, followed only by native WavPack hybrid
+/// packaging. The native package owns no dither or sample conversion.
+#[must_use]
+pub fn matches_ffmpeg_int32_triangular_wavpack_hybrid_preterminal_model(
+    realization: &SelectedPcmTerminalRealization,
+) -> bool {
+    realization.kind == PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid
+        && realization.selected_tool == ToolIdentifier::Ffmpeg
+        && realization.input_precision == StoragePrecision::Pcm(PcmBitDepth::Float64)
+        && matches!(
+            &realization.input_value_domain,
+            ValueDomain::FiniteFloating | ValueDomain::Q1_31DerivedBinary64
+        )
+        && realization.target_bit_depth == PcmBitDepth::Int32
+        && realization.target_format == AudioFormat::WavPack
+        && realization.wavpack_hybrid
+        && realization.effective_dither == Some(DitherType::Tpdf)
+        && realization.dither_owner == PcmTerminalDitherOwner::FfmpegPreterminal
+}
+
+/// Return whether the current architecture may issue the existing commissioned
+/// FFmpeg Int32 triangular authority for the WavPack-hybrid preterminal
+/// composition. This does not commission native WavPack dither; the package is
+/// sample-preserving with respect to the already-realized integer PCM input.
+#[must_use]
+pub fn is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(
+    realization: &SelectedPcmTerminalRealization,
+) -> bool {
+    ffmpeg_int32_triangular_terminal_commissioned_for_current_arch()
+        && matches_ffmpeg_int32_triangular_wavpack_hybrid_preterminal_model(realization)
+}
+
 /// Return whether the current build architecture has completed the exact
 /// closure conformance commissioning required before production may issue the
 /// FFmpeg Int32 triangular terminal authority.
@@ -1051,6 +1089,9 @@ pub fn terminal_proof_authority(
                 PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
                     "sox-preterminal+wavpack"
                 }
+                PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid => {
+                    "ffmpeg-preterminal+wavpack"
+                }
                 PcmTerminalRealizationKind::NativeWavPackHybridPackage => {
                     "wavpack-hybrid-native"
                 }
@@ -1078,7 +1119,8 @@ pub fn terminal_proof_authority(
     };
     let implementation = match realization {
         SelectedTerminalRealization::Pcm(realization)
-            if is_qualified_ffmpeg_int32_triangular_terminal(realization) =>
+            if is_qualified_ffmpeg_int32_triangular_terminal(realization)
+                || is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization) =>
         {
             format!(
                 ";implementation={FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID}"
@@ -1980,8 +2022,8 @@ pub(crate) fn resolve_ssrc_immediate_output(
     }
 
     if let Some(PcmBitDepth::Int32) = final_depth {
-        let explicit_global_int32 = crate::plugins::explicit_int32_dither_requested(
-            &request.settings,
+        let int32_dither = crate::plugins::int32_dither_requested(
+            request,
             Some(PcmBitDepth::Int32),
         );
         if native_override {
@@ -1990,7 +2032,7 @@ pub(crate) fn resolve_ssrc_immediate_output(
                 reason: "SSRC Int32 dither/noise-shaping ownership is not commissioned; the explicit native override cannot be silently reassigned to the retained FFmpeg terminal".to_owned(),
             });
         }
-        if explicit_global_int32 {
+        if int32_dither {
             return Ok(SsrcImmediateOutput {
                 depth: PcmBitDepth::Float64,
                 role: SsrcOutputRole::Nonterminal,
@@ -2574,7 +2616,16 @@ fn plan_typed_with_effects_and_policy(
                 });
                 let proposed_final_depth = match request.settings.target_bit_depth {
                     BitDepthTarget::Pcm(depth) => Some(depth),
-                    BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+                    BitDepthTarget::Source => request
+                        .source
+                        .authoritative_pcm_depth()
+                        .map(|source_depth| {
+                            crate::settings::source_pcm_depth_for_target(
+                                &request.settings.target_format,
+                                request.settings.wavpack.hybrid,
+                                source_depth,
+                            )
+                        }),
                 }.or_else(|| match &operation {
                     PlanOperation::ResamplePcm { target_bit_depth, .. } => *target_bit_depth,
                     _ => None,
@@ -3429,14 +3480,20 @@ fn plan_typed_with_effects_and_policy(
                     .required_runtime_obligations
                     .insert("certified_true_peak_observation".to_owned());
             }
-            let ssrc_split_ffmpeg_terminal = matches!(&operation, PlanOperation::EncodePcm { .. })
+            let terminal_target_depth = match &operation {
+                PlanOperation::EncodePcm { target_bit_depth, .. } => Some(*target_bit_depth),
+                _ => None,
+            };
+            let terminal_dither =
+                crate::plugins::effective_pcm_dither(request, terminal_target_depth);
+            let ssrc_split_ffmpeg_terminal = terminal_target_depth.is_some()
                 && lowering_bridge_operations.iter().any(|bridge| matches!(
                     bridge,
                     PlanOperation::ResamplePcm { brick_wall: true, .. }
                 ))
-                && request.settings.dither_type != DitherType::None
-                && !mapping::requires_sox_dither(request.settings.dither_type)
-                && mapping::soxr_dither_method(request.settings.dither_type).is_some();
+                && terminal_dither != DitherType::None
+                && !mapping::requires_sox_dither(terminal_dither)
+                && mapping::soxr_dither_method(terminal_dither).is_some();
             // Preserve the retained SSRC split cell: after a Float64 SSRC
             // output, FFmpeg owns terminal dither families that it can realize
             // exactly. The command lowerer binds this already-selected tool
@@ -3630,7 +3687,6 @@ fn plan_typed_with_effects_and_policy(
             ),
         }));
         let decision = DecisionId(next_decision);
-        next_decision += 1;
         nodes.push(TypedPlanNode::Decide(Decision {
             id: decision,
             kind: DecisionKind::ReplayGainProjection { policy, group },
@@ -4043,35 +4099,38 @@ fn resolve_ffmpeg_resample_effective_dither(
 ) -> Result<Option<DitherType>, PlanRefusal> {
     let effective_depth = target_depth.or_else(|| match request.settings.target_bit_depth {
         crate::enums::BitDepthTarget::Pcm(depth) => Some(depth),
-        crate::enums::BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+        crate::enums::BitDepthTarget::Source => request
+            .source
+            .authoritative_pcm_depth()
+            .map(|source_depth| {
+                crate::settings::source_pcm_depth_for_target(
+                    &request.settings.target_format,
+                    request.settings.wavpack.hybrid,
+                    source_depth,
+                )
+            }),
     });
-    let needs_dither = match target_depth {
+    let effective_dither = crate::plugins::effective_pcm_dither(request, effective_depth);
+    let needs_dither = match effective_depth {
+        Some(depth) if depth == PcmBitDepth::Int32 => {
+            crate::plugins::int32_dither_requested(request, Some(depth))
+        }
         Some(depth) => crate::plugins::pcm_conversion_reduces_depth(
             request.source.authoritative_pcm_depth(),
             depth,
         ),
-        None => match request.settings.target_bit_depth {
-            crate::enums::BitDepthTarget::Source => false,
-            crate::enums::BitDepthTarget::Pcm(depth) => crate::plugins::pcm_conversion_reduces_depth(
-                request.source.authoritative_pcm_depth(),
-                depth,
-            ),
-        },
+        None => false,
     };
-    let explicit_int32 = crate::plugins::explicit_int32_dither_requested(
-        &request.settings,
-        effective_depth,
-    );
-    if request.settings.dither_type == DitherType::None || (!needs_dither && !explicit_int32) {
+    if effective_dither == DitherType::None || !needs_dither {
         return Ok(None);
     }
-    if mapping::soxr_dither_method(request.settings.dither_type).is_none() {
+    if mapping::soxr_dither_method(effective_dither).is_none() {
         return Err(PlanRefusal {
             code: "soxr_parameter_resolution".to_owned(),
             reason: "selected dither has no FFmpeg/SoXR mapping for this active bit-depth reduction".to_owned(),
         });
     }
-    Ok(Some(request.settings.dither_type))
+    Ok(Some(effective_dither))
 }
 
 fn terminal_input_reduces_precision(
@@ -4119,27 +4178,44 @@ fn resolve_selected_pcm_terminal_realization(
         });
     }
 
-    let dither = request.settings.dither_type;
+    let dither = crate::plugins::effective_pcm_dither(request, Some(*target_bit_depth));
     let dither_requested = dither != DitherType::None;
     let reduces_precision = terminal_input_reduces_precision(input_state, *target_bit_depth);
     let automatic_low_depth_dither = dither_requested
         && crate::plugins::target_depth_needs_dither(*target_bit_depth)
         && reduces_precision;
-    let explicit_int32_requested = crate::plugins::explicit_int32_dither_requested(
+    let explicit_int32 = crate::plugins::explicit_int32_dither_requested(
         &request.settings,
         Some(*target_bit_depth),
     );
-    // FFmpeg lowering treats an explicit Int32 dither request as an explicit
-    // physical aresample/dither_method realization even when the incoming PCM
-    // is already Int32. Keep the selected-terminal truth aligned with that
-    // command behavior; whether a particular same-lattice input changes bytes
-    // is not a reason to erase the explicitly selected terminal realization.
-    let explicit_int32 = explicit_int32_requested;
+    let source_policy_int32 = *target_bit_depth == PcmBitDepth::Int32
+        && crate::plugins::source_depth_policy_tpdf_requested(
+            request,
+            Some(*target_bit_depth),
+        );
+    let hybrid_float_source_int32_tpdf =
+        crate::plugins::wavpack_hybrid_float_source_int32_tpdf_requested(
+            request,
+            Some(*target_bit_depth),
+        );
+    // Direct FFmpeg terminals retain the established combined Int32-dither
+    // rule. WavPack hybrid has one separately qualified float-Source Int32
+    // preterminal cell that accepts either automatic Source-policy TPDF or an
+    // explicit user TPDF override without broadening arbitrary Int32 hybrid dither.
+    let int32_dither_requested = explicit_int32 || source_policy_int32;
     let hard_ceiling = gain_policy.is_true_peak();
     let fixed_gain = matches!(gain_policy, SampleGainPolicy::FixedGain { .. });
     let wavpack_hybrid = *target_format == AudioFormat::WavPack
         && request.settings.wavpack.hybrid;
-    let compound_wavpack = wavpack_hybrid && (hard_ceiling || fixed_gain);
+    let hybrid_float_source_landing = wavpack_hybrid
+        && request.settings.target_bit_depth == BitDepthTarget::Source
+        && request
+            .source
+            .authoritative_pcm_depth()
+            .is_some_and(PcmBitDepth::is_float)
+        && *target_bit_depth == PcmBitDepth::Int32;
+    let compound_wavpack =
+        wavpack_hybrid && (hard_ceiling || fixed_gain || hybrid_float_source_landing);
     let compound_sox_preterminal = dither_requested
         && (mapping::requires_sox_dither(dither)
             || (hard_ceiling && automatic_low_depth_dither))
@@ -4153,10 +4229,10 @@ fn resolve_selected_pcm_terminal_realization(
                 reason: "native WavPack hybrid packaging is owned by the FFmpeg registry candidate".to_owned(),
             });
         }
-        if automatic_low_depth_dither || explicit_int32 {
+        if automatic_low_depth_dither || int32_dither_requested {
             return Err(PlanRefusal {
                 code: "terminal_dither_not_realized".to_owned(),
-                reason: "native WavPack hybrid packaging cannot satisfy the requested effective terminal dither without a SoX preterminal".to_owned(),
+                reason: "native WavPack hybrid packaging cannot satisfy the requested effective terminal dither without a proved preterminal".to_owned(),
             });
         }
         return Ok(SelectedPcmTerminalRealization {
@@ -4178,13 +4254,33 @@ fn resolve_selected_pcm_terminal_realization(
         if tool != &ToolIdentifier::Ffmpeg {
             return Err(PlanRefusal {
                 code: "terminal_realization_backend".to_owned(),
-                reason: "the admitted compound terminal is owned by the FFmpeg candidate with a SoX preterminal".to_owned(),
+                reason: "the admitted compound terminal is owned by the FFmpeg candidate with a proved preterminal".to_owned(),
+            });
+        }
+        if hybrid_float_source_int32_tpdf && compound_wavpack {
+            if dither != DitherType::Tpdf || mapping::soxr_dither_method(dither).is_none() {
+                return Err(PlanRefusal {
+                    code: "terminal_dither_parameter_resolution".to_owned(),
+                    reason: "WavPack hybrid float Source TPDF requires the qualified FFmpeg/SoXR plain-triangular Int32 preterminal".to_owned(),
+                });
+            }
+            return Ok(SelectedPcmTerminalRealization {
+                kind: PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid,
+                selected_tool: tool.clone(),
+                input_precision: input_state.precision.clone(),
+                input_value_domain: input_state.value_domain.clone(),
+                target_format: target_format.clone(),
+                target_rate_hz: *target_rate_hz,
+                target_bit_depth: *target_bit_depth,
+                wavpack_hybrid: true,
+                effective_dither: Some(DitherType::Tpdf),
+                ssrc_dither: None,
+                dither_owner: PcmTerminalDitherOwner::FfmpegPreterminal,
             });
         }
         if explicit_int32 {
-            // SoX's ordinary Int32 path does not realize meaningful dither. A
-            // compound route therefore cannot satisfy an explicit Int32 dither
-            // request merely because the final package candidate is FFmpeg.
+            // Preserve the pre-existing refusal for explicit Int32 dither outside
+            // the qualified WavPack-hybrid float-Source Int32 TPDF cell above.
             return Err(PlanRefusal {
                 code: "terminal_dither_not_realized".to_owned(),
                 reason: "explicit Int32 dither cannot be assigned to an ordinary SoX preterminal".to_owned(),
@@ -4221,16 +4317,16 @@ fn resolve_selected_pcm_terminal_realization(
 
     let effective_dither = match tool {
         ToolIdentifier::Sox => {
-            if explicit_int32 {
+            if int32_dither_requested {
                 return Err(PlanRefusal {
                     code: "terminal_dither_not_realized".to_owned(),
-                    reason: "ordinary SoX Int32 output cannot satisfy an explicit Int32 dither request".to_owned(),
+                    reason: "ordinary SoX Int32 output cannot satisfy the requested Int32 dither realization".to_owned(),
                 });
             }
             automatic_low_depth_dither.then_some(dither)
         }
         ToolIdentifier::Ffmpeg => {
-            let applies = automatic_low_depth_dither || explicit_int32;
+            let applies = automatic_low_depth_dither || int32_dither_requested;
             if applies && mapping::soxr_dither_method(dither).is_none() {
                 return Err(PlanRefusal {
                     code: "terminal_dither_parameter_resolution".to_owned(),
@@ -4442,7 +4538,13 @@ fn resolved_operation_parameters(
             Some(ToolIdentifier::Ssrc) => {
                 let effective_depth = (*target_bit_depth).or_else(|| match request.settings.target_bit_depth {
                     BitDepthTarget::Pcm(depth) => Some(depth),
-                    BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+                    BitDepthTarget::Source => request.source.authoritative_pcm_depth().map(|source_depth| {
+                        crate::settings::source_pcm_depth_for_target(
+                            &request.settings.target_format,
+                            request.settings.wavpack.hybrid,
+                            source_depth,
+                        )
+                    }),
                 });
                 let resolved_dither = crate::plugins::resolve_ssrc_dither_for_rate(
                     &request.settings,
@@ -4496,15 +4598,22 @@ fn resolved_operation_parameters(
             Some(ToolIdentifier::Sox) | None => {
                 let effective_depth = (*target_bit_depth).or_else(|| match request.settings.target_bit_depth {
                     BitDepthTarget::Pcm(depth) => Some(depth),
-                    BitDepthTarget::Source => request.source.authoritative_pcm_depth(),
+                    BitDepthTarget::Source => request.source.authoritative_pcm_depth().map(|source_depth| {
+                        crate::settings::source_pcm_depth_for_target(
+                            &request.settings.target_format,
+                            request.settings.wavpack.hybrid,
+                            source_depth,
+                        )
+                    }),
                 });
                 let effective_dither = effective_depth.and_then(|depth| {
-                    (request.settings.dither_type != DitherType::None
+                    let dither = crate::plugins::effective_pcm_dither(request, Some(depth));
+                    (dither != DitherType::None
                         && crate::plugins::pcm_conversion_reduces_depth(
                             request.source.authoritative_pcm_depth(),
                             depth,
                         ))
-                    .then_some(request.settings.dither_type)
+                    .then_some(dither)
                 });
                 let effective_bandwidth_pct = if request.settings.sox_resampler.chebyshev {
                     None
@@ -5345,9 +5454,23 @@ fn terminal_contract_for_candidate(
             }
             PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage => true,
             PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
-                // Preserve the retained qualified hybrid shape: its proved
-                // preterminal owns the requested dithered integer realization.
+                // Preserve the retained qualified hybrid shape. Dithered low-depth
+                // realizations remain proved by the SoX preterminal. The one
+                // undithered Int32 case is the required Float32 Source -> Int32
+                // landing: no dither is requested or owned, but the SoX
+                // preterminal still physically realizes the integer carrier before
+                // native WavPack packaging.
                 realization.effective_dither.is_some()
+                    || (request.settings.target_bit_depth == BitDepthTarget::Source
+                        && request.source.authoritative_pcm_depth() == Some(PcmBitDepth::Float32)
+                        && realization.target_format == AudioFormat::WavPack
+                        && realization.wavpack_hybrid
+                        && realization.target_bit_depth == PcmBitDepth::Int32
+                        && realization.effective_dither.is_none()
+                        && realization.dither_owner == PcmTerminalDitherOwner::None)
+            }
+            PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid => {
+                is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization)
             }
             PcmTerminalRealizationKind::SsrcDirectWav
             | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => false,
@@ -5382,6 +5505,7 @@ fn terminal_contract_for_candidate(
         realization,
         SelectedTerminalRealization::Pcm(realization)
             if is_qualified_ffmpeg_int32_triangular_terminal(realization)
+                || is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization)
     ) {
         contract
             .runtime_obligations
@@ -5571,7 +5695,13 @@ fn target_pcm_depth_fact(request: &PlanRequest) -> Fact<PcmBitDepth> {
             SourceRepresentationKind::Pcm => request
                 .source
                 .authoritative_pcm_depth()
-                .map(Fact::Known)
+                .map(|source_depth| {
+                    Fact::Known(crate::settings::source_pcm_depth_for_target(
+                        &request.settings.target_format,
+                        request.settings.wavpack.hybrid,
+                        source_depth,
+                    ))
+                })
                 .unwrap_or_else(|| Fact::Pending("source.authoritative_pcm_depth".to_owned())),
             SourceRepresentationKind::Unknown | SourceRepresentationKind::Unspecified => {
                 Fact::Pending("source.representation_kind".to_owned())
@@ -6589,6 +6719,174 @@ mod tests {
     }
 
     #[test]
+    fn direct_float64_source_int32_keeps_ffmpeg_tpdf_terminal_ownership() {
+        let mut request = float64_pcm_request(SampleGainPolicy::Off);
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.target_bit_depth = BitDepthTarget::Source;
+        request.output_path = PathBuf::from("out-source-f64.flac");
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("Float64 Source -> FLAC Int32 plan should remain admitted");
+        };
+        let (candidate, _) = selected_pcm_terminal(&plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            candidate.contract.terminal_realization.as_ref()
+        else {
+            panic!("Float64 Source -> FLAC must carry a structured PCM realization");
+        };
+        assert_eq!(realization.kind, PcmTerminalRealizationKind::FfmpegDirect);
+        assert_eq!(realization.target_bit_depth, PcmBitDepth::Int32);
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+        assert_eq!(
+            realization.dither_owner,
+            PcmTerminalDitherOwner::SelectedTerminal,
+        );
+    }
+
+    #[test]
+    fn true_peak_wavpack_hybrid_float_source_uses_int32_preterminal_with_width_sensitive_dither() {
+        let policy = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+
+        let mut float32 = float64_pcm_request(policy);
+        float32.source.bit_depth = Some(PcmBitDepth::Float64);
+        float32.source.true_source_depth = Some(PcmBitDepth::Float32);
+        float32.settings.target_format = AudioFormat::WavPack;
+        float32.settings.wavpack.hybrid = true;
+        float32.settings.target_bit_depth = BitDepthTarget::Source;
+        float32.output_path = PathBuf::from("out-f32-hybrid.wv");
+        let Ok(PlanningOutcome::Ready(float32_plan)) = plan_typed(&float32) else {
+            panic!("Float32 Source hybrid true-peak plan should be admitted");
+        };
+        let (candidate, _) = selected_pcm_terminal(&float32_plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            candidate.contract.terminal_realization.as_ref()
+        else {
+            panic!("Float32 hybrid must carry a structured PCM realization");
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid,
+        );
+        assert_eq!(realization.target_bit_depth, PcmBitDepth::Int32);
+        assert_eq!(realization.effective_dither, None);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::None);
+
+        let mut float64 = float64_pcm_request(policy);
+        float64.settings.target_format = AudioFormat::WavPack;
+        float64.settings.wavpack.hybrid = true;
+        float64.settings.target_bit_depth = BitDepthTarget::Source;
+        float64.output_path = PathBuf::from("out-f64-hybrid.wv");
+        match plan_typed(&float64) {
+            Ok(PlanningOutcome::Ready(float64_plan))
+                if ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() =>
+            {
+                let (candidate, _) = selected_pcm_terminal(&float64_plan);
+                let Some(SelectedTerminalRealization::Pcm(realization)) =
+                    candidate.contract.terminal_realization.as_ref()
+                else {
+                    panic!("Float64 hybrid must carry a structured PCM realization");
+                };
+                assert_eq!(
+                    realization.kind,
+                    PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid,
+                );
+                assert_eq!(realization.target_bit_depth, PcmBitDepth::Int32);
+                assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+                assert_eq!(
+                    realization.dither_owner,
+                    PcmTerminalDitherOwner::FfmpegPreterminal,
+                );
+                assert!(
+                    is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization)
+                );
+            }
+            Ok(PlanningOutcome::Refused(refusal))
+                if !ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() =>
+            {
+                assert_eq!(refusal.code, "no_admitted_candidate");
+            }
+            outcome => panic!(
+                "Float64 Source hybrid true-peak admission must follow FFmpeg Int32 commissioning: {outcome:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn wavpack_hybrid_float_source_explicit_tpdf_uses_the_qualified_ffmpeg_preterminal() {
+        let policy = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+
+        for source_depth in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
+            let mut request = float64_pcm_request(policy);
+            // Model the retained true-peak carrier: physical precision remains
+            // Float64 while Source semantics retain the original PCM width.
+            request.source.true_source_depth = Some(source_depth);
+            request.settings.target_format = AudioFormat::WavPack;
+            request.settings.wavpack.hybrid = true;
+            request.settings.target_bit_depth = BitDepthTarget::Source;
+            request.settings.dither_type = DitherType::Tpdf;
+            request.settings.dither_explicit = true;
+            request.output_path = PathBuf::from(format!("out-{source_depth:?}-explicit-tpdf.wv"));
+
+            match plan_typed(&request) {
+                Ok(PlanningOutcome::Ready(plan))
+                    if ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() =>
+                {
+                    let (candidate, _) = selected_pcm_terminal(&plan);
+                    let Some(SelectedTerminalRealization::Pcm(realization)) =
+                        candidate.contract.terminal_realization.as_ref()
+                    else {
+                        panic!("float Source hybrid must carry a structured PCM realization");
+                    };
+                    assert_eq!(
+                        realization.kind,
+                        PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid,
+                        "{source_depth:?}",
+                    );
+                    assert_eq!(realization.target_bit_depth, PcmBitDepth::Int32);
+                    assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+                    assert_eq!(
+                        realization.dither_owner,
+                        PcmTerminalDitherOwner::FfmpegPreterminal,
+                    );
+                    assert!(
+                        is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization),
+                        "{source_depth:?}",
+                    );
+                }
+                Ok(PlanningOutcome::Refused(refusal))
+                    if !ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() =>
+                {
+                    assert_eq!(refusal.code, "no_admitted_candidate", "{source_depth:?}");
+                }
+                outcome => panic!(
+                    "explicit float-Source hybrid TPDF admission must follow FFmpeg Int32 commissioning for {source_depth:?}: {outcome:?}"
+                ),
+            }
+        }
+
+        let mut unrelated_explicit_int32 = float64_pcm_request(policy);
+        unrelated_explicit_int32.settings.target_format = AudioFormat::WavPack;
+        unrelated_explicit_int32.settings.wavpack.hybrid = true;
+        unrelated_explicit_int32.settings.target_bit_depth =
+            BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        unrelated_explicit_int32.settings.dither_type = DitherType::Tpdf;
+        unrelated_explicit_int32.settings.dither_explicit = true;
+        unrelated_explicit_int32.output_path = PathBuf::from("out-explicit-int32-hybrid.wv");
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&unrelated_explicit_int32) else {
+            panic!("explicit Int32 hybrid dither outside float Source must remain refused");
+        };
+        assert_eq!(refusal.code, "no_admitted_candidate");
+    }
+
+    #[test]
     fn forced_ffmpeg_certified_int32_explicit_triangular_dither_follows_arch_commissioning() {
         let mut request = float64_pcm_request(SampleGainPolicy::TruePeakGuard {
             target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
@@ -6643,6 +6941,17 @@ mod tests {
         realization.target_format = AudioFormat::WavPack;
         realization.wavpack_hybrid = true;
         assert!(!matches_ffmpeg_int32_triangular_terminal_model(&realization));
+
+        realization.kind = PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid;
+        realization.dither_owner = PcmTerminalDitherOwner::FfmpegPreterminal;
+        assert!(matches_ffmpeg_int32_triangular_wavpack_hybrid_preterminal_model(
+            &realization,
+        ));
+        assert_eq!(
+            is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(&realization),
+            ffmpeg_int32_triangular_terminal_commissioned_for_current_arch(),
+            "hybrid preterminal reuses exactly the commissioned FFmpeg Float64 -> Int32 triangular cell",
+        );
     }
 
     #[test]

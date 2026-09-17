@@ -1515,7 +1515,13 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     terminal: &PlannedCommand,
     realization: &tonepoet_pipeline::SelectedPcmTerminalRealization,
 ) -> Result<(), String> {
-    if !tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(realization) {
+    let direct_terminal =
+        tonepoet_pipeline::matches_ffmpeg_int32_triangular_terminal_model(realization);
+    let wavpack_hybrid_preterminal =
+        tonepoet_pipeline::matches_ffmpeg_int32_triangular_wavpack_hybrid_preterminal_model(
+            realization,
+        );
+    if !direct_terminal && !wavpack_hybrid_preterminal {
         return Err("selected terminal realization is outside the retained FFmpeg Int32 triangular model".to_string());
     }
     if terminal.tool != ToolIdentifier::Ffmpeg {
@@ -1707,12 +1713,17 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
         }
     }
 
-    let expected_codec = match &realization.target_format {
+    let physical_target_format = if wavpack_hybrid_preterminal {
+        tonepoet_pipeline::AudioFormat::Wav
+    } else {
+        realization.target_format.clone()
+    };
+    let expected_codec = match &physical_target_format {
         tonepoet_pipeline::AudioFormat::Flac => "flac",
         tonepoet_pipeline::AudioFormat::Wav => "pcm_s32le",
         tonepoet_pipeline::AudioFormat::Aiff => "pcm_s32be",
         tonepoet_pipeline::AudioFormat::WavPack => "wavpack",
-        ref other => {
+        other => {
             return Err(format!(
                 "qualified FFmpeg Int32 triangular authority does not cover {other}"
             ));
@@ -1720,8 +1731,8 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     };
     if unique_planned_arg_value(&terminal.args, "-c:a")? != expected_codec {
         return Err(format!(
-            "qualified FFmpeg terminal codec does not match selected {} realization",
-            realization.target_format,
+            "qualified FFmpeg terminal codec does not match physical {} realization",
+            physical_target_format,
         ));
     }
     let codec_index = terminal
@@ -1732,7 +1743,7 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     if codec_index <= input_index {
         return Err("qualified FFmpeg terminal requires -c:a after the input".to_string());
     }
-    if realization.target_format == tonepoet_pipeline::AudioFormat::Flac
+    if physical_target_format == tonepoet_pipeline::AudioFormat::Flac
         && !terminal
             .args
             .windows(2)
@@ -1819,7 +1830,7 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     }
     if terminal.args.windows(2).any(|pair| {
         pair[0] == "-strict"
-            && (realization.target_format != tonepoet_pipeline::AudioFormat::Flac
+            && (physical_target_format != tonepoet_pipeline::AudioFormat::Flac
                 || pair[1] != "experimental")
     }) {
         return Err("qualified FFmpeg terminal has an unqualified strictness option".to_string());
@@ -1827,7 +1838,7 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     if terminal.args.windows(2).any(|pair| {
         pair[0] == "-compression_level"
             && (!matches!(
-                &realization.target_format,
+                &physical_target_format,
                 tonepoet_pipeline::AudioFormat::Flac | tonepoet_pipeline::AudioFormat::WavPack
             ) || pair[1].parse::<i32>().is_err())
     }) {
@@ -1835,14 +1846,14 @@ fn validate_qualified_ffmpeg_int32_terminal_command_shape(
     }
     if terminal.args.windows(2).any(|pair| {
         pair[0] == "-rf64"
-            && (realization.target_format != tonepoet_pipeline::AudioFormat::Wav
+            && (physical_target_format != tonepoet_pipeline::AudioFormat::Wav
                 || pair[1] != "auto")
     }) {
         return Err("qualified FFmpeg terminal has an unqualified RF64 option".to_string());
     }
     if terminal.args.windows(2).any(|pair| {
         pair[0] == "-flags"
-            && (realization.target_format != tonepoet_pipeline::AudioFormat::Flac
+            && (physical_target_format != tonepoet_pipeline::AudioFormat::Flac
                 || pair[1] != "-md5")
     }) {
         return Err("qualified FFmpeg terminal has an unqualified codec flag".to_string());
@@ -1883,7 +1894,13 @@ async fn qualified_ffmpeg_int32_dither_terminal_executable(
     else {
         return Ok(None);
     };
-    if !tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization) {
+    let qualified_direct =
+        tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_terminal(realization);
+    let qualified_wavpack_preterminal =
+        tonepoet_pipeline::is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(
+            realization,
+        );
+    if !qualified_direct && !qualified_wavpack_preterminal {
         return Ok(None);
     }
 
@@ -1904,22 +1921,61 @@ async fn qualified_ffmpeg_int32_dither_terminal_executable(
             "selected certified terminal did not lower to an executable command",
         ));
     };
-    let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
-        .map_err(qualified_ffmpeg_int32_dither_error)?;
-    let command_index = commands
+    let final_artifact_command =
+        finalized_artifact_producing_command(commands, finalization.as_ref())
+            .map_err(qualified_ffmpeg_int32_dither_error)?;
+    let final_artifact_index = commands
         .iter()
-        .position(|command| std::ptr::eq(command, terminal))
+        .position(|command| std::ptr::eq(command, final_artifact_command))
         .ok_or_else(|| {
             qualified_ffmpeg_int32_dither_error(
                 "final artifact-producing command lost its command-chain identity",
             )
         })?;
-    if terminal.tool != ToolIdentifier::Ffmpeg {
-        return Err(qualified_ffmpeg_int32_dither_error(format!(
-            "selected realization requires FFmpeg but the final artifact is produced by {}",
-            terminal.tool,
-        )));
-    }
+
+    let (command_index, terminal) = if qualified_wavpack_preterminal {
+        if final_artifact_command.tool != ToolIdentifier::Custom("wavpack".to_owned()) {
+            return Err(qualified_ffmpeg_int32_dither_error(format!(
+                "qualified WavPack-hybrid composition ends in {} instead of native wavpack",
+                final_artifact_command.tool,
+            )));
+        }
+        let mut candidates = commands
+            .iter()
+            .enumerate()
+            .filter(|(index, command)| {
+                *index < final_artifact_index
+                    && command.tool == ToolIdentifier::Ffmpeg
+                    && command
+                        .args
+                        .iter()
+                        .any(|arg| arg.contains("dither_method=triangular"))
+            });
+        let candidate = candidates.next().ok_or_else(|| {
+            qualified_ffmpeg_int32_dither_error(
+                "qualified WavPack-hybrid composition has no FFmpeg triangular-dither preterminal",
+            )
+        })?;
+        if candidates.next().is_some() {
+            return Err(qualified_ffmpeg_int32_dither_error(
+                "qualified WavPack-hybrid composition has multiple FFmpeg triangular-dither preterminals",
+            ));
+        }
+        if candidate.1.output.as_path() != final_artifact_command.input.as_path() {
+            return Err(qualified_ffmpeg_int32_dither_error(
+                "native WavPack hybrid package does not consume the qualified FFmpeg preterminal artifact",
+            ));
+        }
+        candidate
+    } else {
+        if final_artifact_command.tool != ToolIdentifier::Ffmpeg {
+            return Err(qualified_ffmpeg_int32_dither_error(format!(
+                "selected realization requires FFmpeg but the final artifact is produced by {}",
+                final_artifact_command.tool,
+            )));
+        }
+        (final_artifact_index, final_artifact_command)
+    };
     validate_qualified_ffmpeg_int32_terminal_command_shape(terminal, realization)
         .map_err(qualified_ffmpeg_int32_dither_error)?;
 
@@ -10761,50 +10817,6 @@ impl Drop for TrackExecutionBlockingWorkerLease {
     }
 }
 
-struct TemporaryFileCleanupGuard {
-    path: PathBuf,
-    cleaned: bool,
-}
-
-impl TemporaryFileCleanupGuard {
-    fn new(path: PathBuf) -> io::Result<Self> {
-        remove_cleanup_path(&path)?;
-        Ok(Self {
-            path,
-            cleaned: false,
-        })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn cleanup_now(&mut self) -> io::Result<()> {
-        if self.cleaned {
-            return Ok(());
-        }
-        remove_cleanup_path(&self.path)?;
-        if cleanup_path_is_present(&self.path)? {
-            return Err(io::Error::other(format!(
-                "temporary cleanup path remains: {}",
-                self.path.display()
-            )));
-        }
-        self.cleaned = true;
-        Ok(())
-    }
-}
-
-impl Drop for TemporaryFileCleanupGuard {
-    fn drop(&mut self) {
-        if let Err(error) = self.cleanup_now() {
-            log::warn!(
-                "best-effort temporary cleanup failed for {}: {error}",
-                self.path.display()
-            );
-        }
-    }
-}
 
 fn reset_track_work_dir(work_dir: &Path) -> Result<(), ConvertError> {
     if work_dir.exists() {
@@ -11118,6 +11130,26 @@ mod tests {
         }
     }
 
+    fn qualified_ffmpeg_int32_wavpack_hybrid_preterminal_realization(
+        target_rate_hz: Option<u32>,
+    ) -> tonepoet_pipeline::SelectedPcmTerminalRealization {
+        tonepoet_pipeline::SelectedPcmTerminalRealization {
+            kind: tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid,
+            selected_tool: ToolIdentifier::Ffmpeg,
+            input_precision: tonepoet_pipeline::StoragePrecision::Pcm(
+                tonepoet_pipeline::PcmBitDepth::Float64,
+            ),
+            input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
+            target_format: AudioFormat::WavPack,
+            target_rate_hz,
+            target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int32,
+            wavpack_hybrid: true,
+            effective_dither: Some(tonepoet_pipeline::DitherType::Tpdf),
+            ssrc_dither: None,
+            dither_owner: tonepoet_pipeline::PcmTerminalDitherOwner::FfmpegPreterminal,
+        }
+    }
+
     fn qualified_ffmpeg_int32_command(filter: &str) -> PlannedCommand {
         PlannedCommand::new(
             ToolIdentifier::Ffmpeg,
@@ -11189,6 +11221,16 @@ mod tests {
         );
         validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &realization)
             .expect("canonical same-rate raw-f64le terminal must be covered");
+    }
+
+    #[test]
+    fn qualified_ffmpeg_int32_wavpack_hybrid_preterminal_accepts_the_same_wav_sample_realization() {
+        let realization = qualified_ffmpeg_int32_wavpack_hybrid_preterminal_realization(Some(48_000));
+        let command = qualified_ffmpeg_int32_command(
+            "aresample=resampler=soxr:out_sample_rate=48000:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        );
+        validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &realization)
+            .expect("hybrid preterminal must reuse the qualified WAV Int32 triangular command shape");
     }
 
     #[test]

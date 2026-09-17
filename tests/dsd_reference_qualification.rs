@@ -614,7 +614,6 @@ fn optional_json_u64(value: Option<&Value>, field: &str) -> u64 {
 struct W64HeaderObservation {
     file_bytes: u64,
     riff_size_field: u64,
-    data_chunk_offset: usize,
     data_chunk_size_field: u64,
     payload_offset: usize,
     payload_bytes_present: u64,
@@ -658,7 +657,6 @@ fn inspect_w64_header(input: &Path) -> W64HeaderObservation {
     W64HeaderObservation {
         file_bytes,
         riff_size_field: read_le_u64(&bytes[16..24], "W64 RIFF size"),
-        data_chunk_offset,
         data_chunk_size_field: read_le_u64(
             &bytes[data_chunk_offset + 16..data_chunk_offset + 24],
             "W64 data-chunk size",
