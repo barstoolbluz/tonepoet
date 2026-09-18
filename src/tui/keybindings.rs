@@ -30000,7 +30000,7 @@ pub(super) fn build_metadata_editor_for_cue_surfaces_with_mb_release(
     release: &super::musicbrainz::MbRelease,
 ) -> Result<Option<Box<super::app::MetadataEditorState>>, String> {
     let MetadataCueAdmission {
-        surfaces: mut surfaces,
+        mut surfaces,
         metadata_sidecar_surfaces,
         ordinary_paths,
         warnings,
@@ -90664,7 +90664,7 @@ mod single_image_metadata_editor_regression_tests {
             }
             recalc_dirty(&mut state);
             let (_state, results, _status) =
-                super::metadata_cue_source_coverage_tests::save_through_production_path(
+                super::untaggable_carrier_sidecar_regression_tests::save_through_production_path(
                     &mut app,
                     state,
                 )
