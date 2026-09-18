@@ -5474,7 +5474,7 @@ mod limited_queue_expansion_tests {
         std::fs::write(path, bytes).expect("minimal WAV fixture");
     }
 
-    fn transferred_source(cue: &Path, file_reference: &str) -> SidecarCueTrackMetadataSource {
+    pub(super) fn transferred_source(cue: &Path, file_reference: &str) -> SidecarCueTrackMetadataSource {
         SidecarCueTrackMetadataSource {
             cue_path: cue.to_path_buf(),
             track_index: 0,
@@ -5705,6 +5705,7 @@ mod limited_queue_expansion_tests {
 
 #[cfg(test)]
 mod planner_embedded_authority_tests {
+    use super::limited_queue_expansion_tests::transferred_source;
     use super::*;
     use lofty::config::WriteOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
