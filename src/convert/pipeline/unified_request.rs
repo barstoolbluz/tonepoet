@@ -734,12 +734,9 @@ fn preferred_tool_from_option(value: Option<tonepoet_backend::Backend>) -> Prefe
 
 fn cue_policy_for_input_path(path: &Path) -> CueSidecarPolicy {
     if has_extension(path, "cue") {
-        // A queued `.cue` is the authoritative control file for STRUCTURE and
-        // image resolution. Metadata authority is subtler: the metadata editor
-        // writes corrections to the referenced image (flat tags + regenerated
-        // embedded CUESHEET), so sidecar resolution upgrades to the image's
-        // embedded sheet when it structurally matches — see
-        // try_upgrade_sidecar_to_embedded_image_cue in the CUE materializer.
+        // Default for a queued `.cue`; queue admission may replace this with
+        // EmbeddedOnly when aggregate metadata authority selects the embedded
+        // CUESHEET on the referenced single image.
         CueSidecarPolicy::SidecarOnly
     } else if is_cue_capable_path(path) {
         CueSidecarPolicy::PreferEmbedded

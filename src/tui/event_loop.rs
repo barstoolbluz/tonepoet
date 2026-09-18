@@ -780,10 +780,19 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
         if app.convert.source.batch_probe_pending.as_ref() != Some(&path) {
             app.convert.source.batch_probe_pending = Some(path.clone());
             let generation = app.probe_generation;
+            let preview_authority = super::app::resolve_convert_preview_authority(
+                &path,
+                &app.convert.source.cue_artifact_audio,
+                &app.convert.source.cue_artifact_metadata,
+                &app.config.conversion.aggregate_metadata_target_priority,
+            );
+            let cue_policy = preview_authority.cue_sidecar_override;
             let baseline = super::app::ConvertProbeBaseline::capture(&app.convert);
             super::app::spawn_convert_batch_cursor_probe(
                 generation,
                 path,
+                cue_policy,
+                preview_authority.sidecar_cue_track_metadata,
                 baseline,
                 tx.clone(),
             );

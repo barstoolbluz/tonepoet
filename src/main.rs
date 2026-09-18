@@ -2203,9 +2203,10 @@ fn plan_cli_convert_queue_with_grouping_decisions_and_metadata_priority(
         expansion_inputs.push(path.clone());
     }
 
-    let expansion = tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata_using_grouping_decisions(
+    let expansion = tonepoet::convert::queue_expansion::expand_paths_to_audio_with_metadata_using_grouping_decisions_and_metadata_priority(
         &expansion_inputs,
         grouping_decisions,
+        metadata_target_priority,
     );
     let mut errors = Vec::new();
     if let Some(prompt) = expansion.cue_selection_prompt.as_ref() {

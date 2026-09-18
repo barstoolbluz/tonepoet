@@ -854,7 +854,7 @@ fn resolve_batch_album_identity_from_probes(
 fn batch_identity_probe_for_request(req: &PipelineRequest, source_kind: SourceKind) -> BatchIdentityProbe {
     let mut probe = match source_kind {
         SourceKind::SingleFile => single_file_batch_identity_probe(&req.container).unwrap_or_default(),
-        SourceKind::CueImage => cue_batch_identity_probe(&req.container).unwrap_or_default(),
+        SourceKind::CueImage => cue_batch_identity_probe(req).unwrap_or_default(),
         _ => BatchIdentityProbe::default(),
     };
     probe.path_key = filesystem_identity_key(&req.container);
@@ -920,10 +920,7 @@ fn dispatch_track_metadata_for_output_planning(
             }
         }
         SourceKind::CueImage => {
-            let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(
-                &req.container,
-            )
-            .or_else(|| crate::convert::cue_parser::parse_cue_file(&req.container).ok())?;
+            let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_cue_request(req)?;
             let first = cue.tracks.first();
             let mut extra = BTreeMap::new();
             if let Some(album) = cue.title.as_ref().filter(|value| !value.trim().is_empty()) {
@@ -952,6 +949,14 @@ fn dispatch_track_metadata_for_output_planning(
         }
         _ => None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_track_metadata_for_authority_matrix_test(
+    req: &PipelineRequest,
+    source_kind: SourceKind,
+) -> Option<TrackMetadata> {
+    dispatch_track_metadata_for_output_planning(req, source_kind)
 }
 
 /// Return an authoritative batch album directory only when every request can
@@ -1026,18 +1031,17 @@ fn batch_identity_probe_from_track_metadata(metadata: &TrackMetadata) -> Option<
     }
 }
 
-fn cue_batch_identity_probe(path: &Path) -> Option<BatchIdentityProbe> {
-    // Same freshness precedence as the CUE materializer: the metadata editor
-    // writes corrections to the referenced image's embedded CUESHEET, and the
-    // identity that names the album folder must match what conversion emits.
-    let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_sidecar_cue(path)
-        .or_else(|| crate::convert::cue_parser::parse_cue_file(path).ok())?;
+fn cue_batch_identity_probe(req: &PipelineRequest) -> Option<BatchIdentityProbe> {
+    // Batch identity consumes the exact same queue-selected CUE authority as
+    // materialization so folder planning cannot reintroduce a private
+    // sidecar/embedded precedence.
+    let cue = crate::convert::pipeline::dispatch_metadata_sheet_for_cue_request(req)?;
     Some(BatchIdentityProbe {
         album: cue.title,
         album_artist: cue.performer,
         artist: None,
         date: cue.date,
-        disc_number: disc_number_from_dispatch_path(path),
+        disc_number: disc_number_from_dispatch_path(&req.container),
         total_discs: None,
         track_number: cue.tracks.first().map(|track| track.number),
         scheduler_track_number: cue
@@ -9620,6 +9624,58 @@ FILE "track.flac" WAVE
         bytes.push((block.len() & 0xff) as u8);
         bytes.extend_from_slice(&block);
         bytes
+    }
+
+    #[test]
+    fn cue_dispatch_metadata_tracks_queue_selected_authority() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let cue_path = temp.path().join("album.cue");
+        let embedded = "PERFORMER \"Embedded Artist\"\nTITLE \"Embedded Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Embedded One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Embedded Two\"\n    INDEX 01 00:00:30\n";
+        let sidecar = "PERFORMER \"Sidecar Artist\"\nTITLE \"Sidecar Album\"\nFILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Sidecar One\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Sidecar Two\"\n    INDEX 01 00:00:20\n";
+        std::fs::write(
+            &image,
+            fake_flac_with_vorbis_comments(&[("CUESHEET", embedded)]),
+        )
+        .expect("embedded CUESHEET fixture");
+        std::fs::write(&cue_path, sidecar).expect("sidecar CUE fixture");
+
+        for (policy, expected_album, expected_title) in [
+            (
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+                "Sidecar Album",
+                "Sidecar One",
+            ),
+            (
+                crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly,
+                "Embedded Album",
+                "Embedded One",
+            ),
+        ] {
+            let mut req = processor_dispatch_request_for_path(
+                temp.path(),
+                "cue-authority-item",
+                "cue-authority-job",
+                cue_path.clone(),
+            );
+            req.source.cue_sidecar = policy;
+
+            let probe = batch_identity_probe_for_request(&req, SourceKind::CueImage);
+            assert_eq!(
+                probe.album.as_deref(),
+                Some(expected_album),
+                "queue/batch identity must use the selected CUE representation",
+            );
+
+            let metadata = dispatch_track_metadata_for_output_planning(&req, SourceKind::CueImage)
+                .expect("selected CUE metadata should resolve for output planning");
+            assert_eq!(metadata.title.as_deref(), Some(expected_title));
+            assert_eq!(
+                metadata.extra.get("album").map(String::as_str),
+                Some(expected_album),
+                "queue/output planning metadata must match the selected CUE representation",
+            );
+        }
     }
 
     fn synchsafe_bytes(size: usize) -> [u8; 4] {
