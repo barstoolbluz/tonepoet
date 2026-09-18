@@ -757,6 +757,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
         cancel,
         grouping_decisions,
         QueueCueSelectionOverrides::new(),
+        &[],
     )
 }
 
@@ -766,6 +767,7 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
     cancel: tokio_util::sync::CancellationToken,
     mut grouping_decisions: QueueSplitCueAlbumGroupingDecisions,
     cue_selection_overrides: QueueCueSelectionOverrides,
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
 ) -> BrowseConvertExpansion {
     // Preserve the caller's established collect order. The canonical queue
     // planner below already deduplicates by queue identity while retaining the
@@ -817,13 +819,14 @@ pub(crate) fn expand_regular_filesystem_audio_folders_for_convert_blocking_with_
         return BrowseConvertExpansion::cancelled(0);
     }
 
-    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions_and_cue_selections(
+    match crate::convert::queue_expansion::expand_paths_to_audio_with_preserved_disc_roots_limited_using_grouping_decisions_and_cue_selections_and_metadata_priority(
         &queue_selection,
         &preserved_roots,
         BROWSE_CONVERT_FOLDER_EXPANSION_MAX_VISITED,
         || cancel.is_cancelled(),
         &grouping_decisions,
         &cue_selection_overrides,
+        metadata_target_priority,
     ) {
         Ok((queue, visited)) => {
             let empty_audio_folders = regular_folders
@@ -966,6 +969,7 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
     // actually discovers an archive path that needs authentication.
     let configured_archive_password = app.config.conversion.archive_password.clone();
     let configured_archive_password_ref = app.config.conversion.archive_password_ref.clone();
+    let metadata_target_priority = app.config.conversion.aggregate_metadata_target_priority.clone();
     let loaded_archive_passwords = app.keychain.loaded.then(|| app.keychain.passwords.clone());
     let session_archive_passwords = app.archive_passwords.clone();
     let archive_listing_timeout = match app.config.performance.browsing.archive_listing_timeout {
@@ -987,6 +991,7 @@ pub(crate) fn start_browse_convert_folder_expansion_request(
                 cancel_for_worker,
                 grouping_decisions,
                 cue_selection_overrides,
+                &metadata_target_priority,
             )
         })
         .await
@@ -4988,13 +4993,27 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 p.clone(),
                 probe_notice.clone(),
             ));
+            let preview_authority = resolve_convert_preview_authority(
+                &p,
+                &app.convert.source.cue_artifact_audio,
+                &app.convert.source.cue_artifact_metadata,
+                &app.config.conversion.aggregate_metadata_target_priority,
+            );
+            let cue_policy = preview_authority.cue_sidecar_override;
             app.convert.apply_source_defaults();
             let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
             app.current_screen = AppScreen::Convert;
             app.recent.record_use_with_db(&p, &app.db);
 
             if probe_notice.is_some() {
-                spawn_convert_source_probe(generation, p.clone(), probe_baseline, tx.clone());
+                spawn_convert_source_probe(
+                    generation,
+                    p.clone(),
+                    cue_policy,
+                    preview_authority.sidecar_cue_track_metadata,
+                    probe_baseline,
+                    tx.clone(),
+                );
                 app.set_status(format!(
                     "Probing: {}",
                     p.file_name().unwrap_or_default().to_string_lossy()
@@ -9148,12 +9167,26 @@ pub(crate) fn install_browse_convert_source_paths(
             crate::convert::queue_expansion::cleanup_synthetic_cue_artifact(artifact);
         }
     }
+    let preview_authority = resolve_convert_preview_authority(
+        &first,
+        &app.convert.source.cue_artifact_audio,
+        &app.convert.source.cue_artifact_metadata,
+        &app.config.conversion.aggregate_metadata_target_priority,
+    );
+    let cue_policy = preview_authority.cue_sidecar_override;
     app.convert.apply_source_defaults();
     let probe_baseline = ConvertProbeBaseline::capture(&app.convert);
     app.recent.record_use_with_db(&first, &app.db);
 
     if probe_notice.is_some() {
-        spawn_convert_source_probe(generation, first.clone(), probe_baseline, tx.clone());
+        spawn_convert_source_probe(
+            generation,
+            first.clone(),
+            cue_policy,
+            preview_authority.sidecar_cue_track_metadata,
+            probe_baseline,
+            tx.clone(),
+        );
     }
 
     let batch_paths = app.convert.source.mode.all_paths();
@@ -19894,6 +19927,7 @@ mod execute_queue_state_consistency_tests {
             tokio_util::sync::CancellationToken::new(),
             grouping,
             crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
+            &[],
         );
 
         assert!(!actual.cancelled);

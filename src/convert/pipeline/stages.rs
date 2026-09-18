@@ -7795,6 +7795,25 @@ async fn tag_audio_file(
     Ok(Some(primary_mutator))
 }
 
+#[cfg(test)]
+pub(crate) async fn write_authority_matrix_tags_for_test(
+    path: &Path,
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+) -> Result<(), MetadataError> {
+    let runner = RealToolRunner::new(HashMap::new());
+    tag_audio_file(
+        path,
+        meta,
+        album,
+        &runner,
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn apply_production_metadata_to_file(
     path: &Path,
     meta: &TrackMetadata,

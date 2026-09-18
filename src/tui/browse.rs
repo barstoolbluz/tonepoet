@@ -11260,8 +11260,14 @@ pub fn spawn_cue_proxy_audio_probe(
     tokio::spawn(async move {
         let path_for_task = path.clone();
         let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
-            let result = crate::tui::app::probe_cue_proxy_source(&path_for_task)
-                .map_err(|err| format!("CUE proxy probe failed: {}; set format manually", err))?;
+            // Filesystem probing of an explicit `.cue` caches physical-source
+            // facts for Browse; configured Convert authority is resolved again
+            // at Convert admission and never inherited from this cache.
+            let result = crate::tui::app::probe_cue_proxy_source(
+                &path_for_task,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .map_err(|err| format!("CUE proxy probe failed: {}; set format manually", err))?;
 
             match result.info {
                 Some(source) => Ok(CachedInfo::new(source, result.metadata)),

@@ -1015,6 +1015,20 @@ pub fn metadata_persistence_route_for_path(path: &Path) -> MetadataPersistenceRo
     }
 }
 
+/// Whether the existing metadata persistence stack can safely rewrite an
+/// embedded CUESHEET on this carrier. Automatic aggregate-metadata authority
+/// uses this neutral persistence fact in every surface; explicit read-only
+/// embedded-CUE operations may still consume a readable CUESHEET separately.
+pub(crate) fn embedded_cue_metadata_target_is_writable(path: &Path) -> bool {
+    matches!(
+        metadata_persistence_route_for_path(path),
+        MetadataPersistenceRoute::NativeFlacVorbis
+            | MetadataPersistenceRoute::NativeDsfId3
+            | MetadataPersistenceRoute::WavPackApeDispatch
+            | MetadataPersistenceRoute::Lofty
+    )
+}
+
 /// Map the actual primary Lofty tag type to the backend that serializes
 /// numbering fields. Non-primary and future tag types remain fail-closed.
 pub fn metadata_backend_for_lofty_tag_type(tag_type: TagType) -> MetadataPersistenceBackend {

@@ -458,23 +458,6 @@ fn source_path_is_dsd(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Read an embedded CUESHEET tag from a FLAC file for Convert-screen preview.
-/// Returns None if the file has no embedded cue or lofty can't read it.
-fn read_embedded_cuesheet_for_preview(path: &Path) -> Option<crate::tui::cue_parser::CueSheet> {
-    use lofty::prelude::*;
-    crate::tui::probe::recover_flac_metadata_before_read(path).ok()?;
-    let tagged = lofty::read_from_path(path).ok()?;
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-    let cue_text = tag.items()
-        .find(|item| {
-            matches!(item.key(), lofty::tag::ItemKey::Unknown(key) if key.eq_ignore_ascii_case("CUESHEET"))
-        })
-        .and_then(|item| item.value().text().map(|s| s.to_string()))?;
-    let sheet = crate::tui::cue_parser::parse_cue(&cue_text);
-    if sheet.tracks.len() >= 2 { Some(sheet) } else { None }
-}
-
-
 pub(crate) fn is_cue_sheet_path_for_preview(path: &Path) -> bool {
     crate::convert::classify::is_cue_sheet_path(path)
 }
@@ -602,18 +585,63 @@ fn with_cue_proxy_probe_test_hook<T>(
 /// codec/container/rate/depth/channel properties are uniform. Mixed,
 /// unresolved, ambiguous, or unprobeable references return `info: None` plus a
 /// notice so defaults are not silently derived from a guessed 16/44.1 source.
-pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeResult, String> {
+pub(crate) fn probe_cue_proxy_source(
+    cue_path: &Path,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) -> Result<CueProxyProbeResult, String> {
     let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| format!("failed to parse CUE: {err}"))?;
-    let mut metadata = cue_sheet_metadata(&sheet, SourceMetadata::default());
 
+    // Empty CUE geometry is a more specific source defect than authority
+    // viability.  Report it before exact-authority validation so CLI/direct
+    // preview keeps the established actionable diagnostic instead of turning
+    // an empty sheet into a generic "authority is no longer valid" error.
     if sheet.tracks.is_empty() {
         return Ok(CueProxyProbeResult {
             info: None,
-            metadata,
+            metadata: SourceMetadata::default(),
             probe_notice: Some("CUE sheet has no audio tracks".to_string()),
         });
     }
+
+    let selected_sheet = match cue_policy {
+        crate::convert::pipeline::CueSidecarPolicy::IgnoreCue => None,
+        crate::convert::pipeline::CueSidecarPolicy::SidecarOnly => Some(
+            crate::convert::pipeline::materializer_cue::validated_cue_sheet_for_exact_policy(
+                cue_path,
+                cue_policy,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "selected sidecar CUE authority is no longer valid for {}",
+                    cue_path.display()
+                )
+            })?,
+        ),
+        crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly => Some(
+            crate::convert::pipeline::materializer_cue::validated_cue_sheet_for_exact_policy(
+                cue_path,
+                cue_policy,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "selected embedded CUE authority is no longer valid for {}",
+                    cue_path.display()
+                )
+            })?,
+        ),
+        crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded
+        | crate::convert::pipeline::CueSidecarPolicy::PreferSidecar => {
+            return Err(format!(
+                "Convert preview requires an exact CUE authority, got {:?}",
+                cue_policy
+            ));
+        }
+    };
+    let mut metadata = selected_sheet
+        .as_ref()
+        .map(|selected| cue_sheet_metadata(selected, SourceMetadata::default()))
+        .unwrap_or_default();
 
     let parent = cue_path
         .parent()
@@ -737,7 +765,10 @@ pub(crate) fn probe_cue_proxy_source(cue_path: &Path) -> Result<CueProxyProbeRes
     // pane. Probe every image for uniformity, but avoid redundant tag reads for
     // multi-file CUEs and skip image-tag reads entirely when the CUE is mixed.
     let first_metadata = cue_proxy_read_metadata_for_preview(&probed[0].0);
-    metadata = cue_sheet_metadata(&sheet, first_metadata);
+    metadata = selected_sheet
+        .as_ref()
+        .map(|selected| cue_sheet_metadata(selected, first_metadata.clone()))
+        .unwrap_or(first_metadata);
 
     if probed.len() > 1 {
         first_info.duration_secs = probed.iter().map(|(_, info)| info.duration_secs).sum();
@@ -923,11 +954,116 @@ pub(crate) fn clear_source_metadata_in_convert(convert: &mut ConvertState) {
     apply_source_metadata_to_convert(convert, &SourceMetadata::default());
 }
 
-fn probe_convert_source_for_message(
+pub(crate) fn resolve_convert_preview_authority(
     path: &Path,
+    cue_artifact_audio: &std::collections::HashSet<PathBuf>,
+    cue_artifact_metadata: &std::collections::BTreeMap<
+        PathBuf,
+        crate::convert::pipeline::SidecarCueTrackMetadataSource,
+    >,
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+) -> crate::convert::queue_expansion::CueArtifactCommitDecision {
+    crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
+        path,
+        cue_artifact_audio,
+        cue_artifact_metadata,
+        metadata_target_priority,
+        crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+    )
+}
+
+pub(crate) fn unresolved_cue_authority_notice(path: &Path) -> String {
+    format!(
+        "CUE authority is ambiguous or unresolved for {}; select the intended .cue file before editing or conversion",
+        path.display(),
+    )
+}
+
+fn unresolved_audio_cue_authority(
+    path: &Path,
+    cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
+) -> bool {
+    cue_policy.is_none()
+        && matches!(
+            crate::convert::source_admission::direct_source_kind(path),
+            Some(crate::convert::source_admission::DirectSourceKind::Audio)
+        )
+}
+
+fn transferred_sidecar_metadata_for_preview(
+    source: &crate::convert::pipeline::SidecarCueTrackMetadataSource,
+    mut metadata: SourceMetadata,
+) -> Result<SourceMetadata, String> {
+    let (track, album) =
+        crate::convert::pipeline::materializer_cue::metadata_for_transferred_sidecar_cue_track(
+            source,
+        )
+        .map_err(|error| error.to_string())?;
+
+    if track.title.is_some() {
+        metadata.title = track.title;
+    }
+    if let Some(value) = track.artist.as_ref() {
+        metadata.artist = Some(value.clone());
+    }
+    if album.album.is_some() {
+        metadata.album = album.album;
+    }
+    if let Some(value) = track.genre.as_ref().or_else(|| album.genre.as_ref()) {
+        metadata.genre = Some(value.clone());
+    }
+    if track.date.is_some() {
+        metadata.year = track.date;
+    } else if album.date.is_some() {
+        metadata.year = album.date;
+    }
+    if track.track_number.is_some() {
+        metadata.track_number = track.track_number;
+    }
+    if track.isrc.is_some() {
+        metadata.isrc = track.isrc;
+    }
+    if let Some(catalog) = album
+        .extra
+        .get("catalognumber")
+        .or_else(|| album.extra.get("catalog"))
+    {
+        metadata.catalog_number = Some(catalog.clone());
+    }
+    Ok(metadata)
+}
+
+pub(crate) fn probe_convert_source_for_message(
+    path: &Path,
+    cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
+    sidecar_cue_track_metadata: Option<&crate::convert::pipeline::SidecarCueTrackMetadataSource>,
 ) -> (Option<SourceInfo>, SourceMetadata, Option<String>) {
+    if unresolved_audio_cue_authority(path, cue_policy) {
+        return match crate::tui::probe::probe_audio(path) {
+            Ok(info) => (
+                Some(info),
+                SourceMetadata::default(),
+                Some(unresolved_cue_authority_notice(path)),
+            ),
+            Err(err) => (
+                None,
+                SourceMetadata::default(),
+                Some(format!(
+                    "{}; technical audio probe also failed: {}",
+                    unresolved_cue_authority_notice(path),
+                    err,
+                )),
+            ),
+        };
+    }
+
+    // `None` is meaningful only for directly admitted audio, where it denotes
+    // unresolved CUE authority. Other source families do not participate in
+    // CUE authority selection and retain their existing non-CUE probe path.
+    let cue_policy = cue_policy.unwrap_or(crate::convert::pipeline::CueSidecarPolicy::IgnoreCue);
+
     if is_cue_sheet_path_for_preview(path) {
-        return match probe_cue_proxy_source(path) {
+        return match probe_cue_proxy_source(path, cue_policy) {
             Ok(result) => (result.info, result.metadata, result.probe_notice),
             Err(err) => (
                 None,
@@ -942,7 +1078,52 @@ fn probe_convert_source_for_message(
 
     match crate::tui::probe::probe_audio(path) {
         Ok(info) => {
-            let metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
+            let carrier_metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
+            if let Some(source) = sidecar_cue_track_metadata {
+                return match transferred_sidecar_metadata_for_preview(source, carrier_metadata) {
+                    Ok(metadata) => (Some(info), metadata, None),
+                    Err(error) => (
+                        Some(info),
+                        SourceMetadata::default(),
+                        Some(format!(
+                            "Selected sidecar CUE metadata preview failed: {}; conversion will fail closed if the admitted mapping changed",
+                            error
+                        )),
+                    ),
+                };
+            }
+            let metadata = match cue_policy {
+                crate::convert::pipeline::CueSidecarPolicy::IgnoreCue => carrier_metadata,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly
+                | crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly => {
+                    let Some(sheet) = crate::convert::pipeline::materializer_cue::validated_cue_sheet_for_exact_policy(
+                        path,
+                        cue_policy,
+                    ) else {
+                        return (
+                            Some(info),
+                            SourceMetadata::default(),
+                            Some(format!(
+                                "Selected {:?} CUE authority is no longer valid for {}; conversion will fail closed if the admitted source changed",
+                                cue_policy,
+                                path.display(),
+                            )),
+                        );
+                    };
+                    cue_sheet_metadata(&sheet, carrier_metadata)
+                }
+                crate::convert::pipeline::CueSidecarPolicy::PreferEmbedded
+                | crate::convert::pipeline::CueSidecarPolicy::PreferSidecar => {
+                    return (
+                        Some(info),
+                        SourceMetadata::default(),
+                        Some(format!(
+                            "Convert preview requires an exact CUE authority, got {:?}",
+                            cue_policy,
+                        )),
+                    );
+                }
+            };
             (Some(info), metadata, None)
         }
         Err(err) => (
@@ -956,6 +1137,8 @@ fn probe_convert_source_for_message(
 pub(crate) fn spawn_convert_source_probe(
     generation: u64,
     path: PathBuf,
+    cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
+    sidecar_cue_track_metadata: Option<crate::convert::pipeline::SidecarCueTrackMetadataSource>,
     baseline: ConvertProbeBaseline,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
@@ -966,8 +1149,18 @@ pub(crate) fn spawn_convert_source_probe(
     tokio::spawn(async move {
         let result_path = path.clone();
         let source_mode = tokio::task::spawn_blocking(move || {
-            let (info, metadata, probe_notice) = probe_convert_source_for_message(&path);
-            SourceMode::from_single_with_probe_notice(path, info, metadata, probe_notice)
+            let (info, metadata, probe_notice) = probe_convert_source_for_message(
+                &path,
+                cue_policy,
+                sidecar_cue_track_metadata.as_ref(),
+            );
+            source_mode_from_convert_preview(
+                path,
+                info,
+                metadata,
+                probe_notice,
+                cue_policy,
+            )
         })
         .await
         .unwrap_or_else(|err| {
@@ -991,6 +1184,34 @@ pub(crate) fn spawn_convert_source_probe(
             })
             .await;
     });
+}
+
+pub(crate) fn source_mode_from_convert_preview(
+    path: PathBuf,
+    info: Option<SourceInfo>,
+    metadata: SourceMetadata,
+    probe_notice: Option<String>,
+    cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
+) -> SourceMode {
+    if unresolved_audio_cue_authority(&path, cue_policy) {
+        let probe_notice = Some(
+            probe_notice.unwrap_or_else(|| unresolved_cue_authority_notice(&path)),
+        );
+        return SourceMode::Single {
+            path,
+            info,
+            metadata: SourceMetadata::default(),
+            probe_notice,
+        };
+    }
+
+    SourceMode::from_single_with_probe_notice(
+        path,
+        info,
+        metadata,
+        probe_notice,
+        cue_policy.unwrap_or(crate::convert::pipeline::CueSidecarPolicy::IgnoreCue),
+    )
 }
 
 pub(crate) fn source_mode_from_archive_preview(preview: ArchivePreview) -> SourceMode {
@@ -1749,6 +1970,8 @@ pub(crate) fn spawn_archive_preview(
 pub(crate) fn spawn_convert_batch_cursor_probe(
     generation: u64,
     path: PathBuf,
+    cue_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
+    sidecar_cue_track_metadata: Option<crate::convert::pipeline::SidecarCueTrackMetadataSource>,
     baseline: ConvertProbeBaseline,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
@@ -1759,7 +1982,11 @@ pub(crate) fn spawn_convert_batch_cursor_probe(
     tokio::spawn(async move {
         let result_path = path.clone();
         let (info, metadata, probe_notice) = tokio::task::spawn_blocking(move || {
-            probe_convert_source_for_message(&path)
+            probe_convert_source_for_message(
+                &path,
+                cue_policy,
+                sidecar_cue_track_metadata.as_ref(),
+            )
         })
         .await
         .unwrap_or_else(|err| {
@@ -1787,20 +2014,33 @@ fn cue_sheet_metadata(
     sheet: &crate::tui::cue_parser::CueSheet,
     mut metadata: SourceMetadata,
 ) -> SourceMetadata {
-    if metadata.album.is_none() {
+    // The selected CUE representation is authoritative for fields it
+    // explicitly supplies. Carrier tags remain fallback/enrichment only for
+    // fields omitted by that CUE.
+    if sheet.title.is_some() {
         metadata.album = sheet.title.clone();
     }
-    if metadata.artist.is_none() {
+    if sheet.performer.is_some() {
         metadata.artist = sheet.performer.clone();
     }
-    if metadata.genre.is_none() {
+    if sheet.genre.is_some() {
         metadata.genre = sheet.genre.clone();
     }
-    if metadata.year.is_none() {
+    if sheet.date.is_some() {
         metadata.year = sheet.date.clone();
     }
-    if metadata.catalog_number.is_none() {
+    if sheet.catalog.is_some() {
         metadata.catalog_number = sheet.catalog.clone();
+    }
+    if sheet.tracks.len() == 1 {
+        if let Some(track) = sheet.tracks.first() {
+            if track.title.is_some() {
+                metadata.title = track.title.clone();
+            }
+            if track.performer.is_some() {
+                metadata.artist = track.performer.clone();
+            }
+        }
     }
     metadata
 }
@@ -2841,7 +3081,13 @@ impl SourceMode {
     /// intentionally heavyweight; event-loop code should install
     /// `from_single_pending_probe` and run this on a blocking worker.
     pub fn from_single(path: PathBuf, info: Option<SourceInfo>, metadata: SourceMetadata) -> Self {
-        Self::from_single_with_probe_notice(path, info, metadata, None)
+        Self::from_single_with_probe_notice(
+            path,
+            info,
+            metadata,
+            None,
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
+        )
     }
 
     /// Build a SourceMode for a single path, optionally carrying a CUE
@@ -2851,6 +3097,7 @@ impl SourceMode {
         info: Option<SourceInfo>,
         metadata: SourceMetadata,
         probe_notice: Option<String>,
+        cue_policy: crate::convert::pipeline::CueSidecarPolicy,
     ) -> Self {
         // DVD-Audio ISO/directory detection. The default path uses stream 0
         // and preserves the presentation id for conversion option mapping.
@@ -3018,16 +3265,18 @@ impl SourceMode {
             }
         }
 
-        // CUE detection: parse a queued `.cue` directly. For audio images,
-        // prefer embedded CUESHEET metadata, then fall back to a sidecar.
+        // CUE display consumes the exact authority already selected at source
+        // admission. No sidecar-vs-embedded precedence is re-applied here.
         let source_is_cue_path = is_cue_sheet_path_for_preview(&path);
-        let cue_sheet = if source_is_cue_path {
-            crate::tui::cue_parser::parse_cue_file(&path).ok()
+        let cue_sheet =
+            crate::convert::pipeline::materializer_cue::validated_cue_sheet_for_exact_policy(
+                &path,
+                cue_policy,
+            );
+        let metadata = if let Some(sheet) = cue_sheet.as_ref() {
+            cue_sheet_metadata(sheet, metadata)
         } else {
-            read_embedded_cuesheet_for_preview(&path).or_else(|| {
-                crate::tui::cue_parser::find_sidecar_cue(&path)
-                    .and_then(|p| crate::tui::cue_parser::parse_cue_file(&p).ok())
-            })
+            metadata
         };
         if let Some(sheet) = cue_sheet {
             if should_render_cue_sheet_as_multitrack(source_is_cue_path, &sheet) {
@@ -3042,19 +3291,11 @@ impl SourceMode {
                     })
                     .collect();
 
-                let mut meta = metadata;
-                if meta.album.is_none() {
-                    meta.album = sheet.title.clone();
-                }
-                if meta.artist.is_none() {
-                    meta.artist = sheet.performer.clone();
-                }
-
                 let track_count = tracks.len();
                 return Self::MultiTrack {
                     path,
                     info,
-                    metadata: meta,
+                    metadata,
                     tracks,
                     area_label: None,
                     album_title: sheet.title,
@@ -3672,9 +3913,10 @@ pub struct SourceState {
     /// part of the Convert source payload, not process-global state: the user
     /// reviews this exact payload and `:commit` consumes it for these paths.
     ///
-    /// Commit maps these paths to `CueSidecarPolicy::EmbeddedOnly` on the
-    /// resulting `ConversionItem`, so downstream detection skips sidecar CUE
-    /// discovery while still honoring embedded CUESHEET tags.
+    /// Commit combines this structural evidence with exact admitted sidecar
+    /// metadata, configured aggregate authority, and CUE policy. Invalid or
+    /// unmapped artifacts still suppress sibling-sidecar discovery; valid
+    /// mappings may instead transfer the selected sidecar track metadata.
     pub cue_artifact_audio: std::collections::HashSet<PathBuf>,
     /// Exact admitted metadata-artifact CUE track mappings retained across the
     /// Convert review screen. Keys are the queued carriers; values are copied
@@ -15997,36 +16239,18 @@ impl AppState {
         }
         let valid_count = valid.len();
         let first = valid[0].clone();
-        let (info, metadata, probe_notice) = if is_cue_sheet_path_for_preview(&first) {
-            match probe_cue_proxy_source(&first) {
-                Ok(result) => (result.info, result.metadata, result.probe_notice),
-                Err(error) => {
-                    log::warn!(
-                        "cli: CUE proxy probe failed for {}: {}",
-                        first.display(),
-                        error
-                    );
-                    (
-                        None,
-                        crate::tui::probe::SourceMetadata::default(),
-                        Some(format!(
-                            "CUE proxy probe failed: {}; set format manually",
-                            error
-                        )),
-                    )
-                }
-            }
-        } else {
-            let info = match crate::tui::probe::probe_audio(&first) {
-                Ok(info) => Some(info),
-                Err(error) => {
-                    log::warn!("cli: probe failed for {}: {}", first.display(), error);
-                    None
-                }
-            };
-            let metadata = crate::tui::probe::read_metadata(&first).unwrap_or_default();
-            (info, metadata, None)
-        };
+        let preview_authority = resolve_convert_preview_authority(
+            &first,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &self.config.conversion.aggregate_metadata_target_priority,
+        );
+        let cue_policy = preview_authority.cue_sidecar_override;
+        let (info, metadata, probe_notice) = probe_convert_source_for_message(
+            &first,
+            cue_policy,
+            preview_authority.sidecar_cue_track_metadata.as_ref(),
+        );
 
         // Populate the editable metadata pane from the first file's tags.
         self.convert.metadata.title = metadata.title.clone();
@@ -16038,11 +16262,12 @@ impl AppState {
         // Build the mode (Single for one direct source, Batch for an all-audio
         // set) and populate first-file probe/metadata in the correct variant.
         let mut mode = if valid_count == 1 {
-            SourceMode::from_single_with_probe_notice(
+            source_mode_from_convert_preview(
                 first.clone(),
                 None,
                 SourceMetadata::default(),
                 probe_notice.clone(),
+                cue_policy,
             )
         } else {
             debug_assert!(valid.iter().all(|path| {
@@ -16106,7 +16331,26 @@ impl AppState {
         };
         let source_probe_notice = self.convert.source.mode.persistent_probe_notice();
         let status = if let Some(notice) = source_probe_notice {
-            format!("loaded CUE from cli with warning: {}", notice)
+            if valid_count == 1 {
+                let source_label = if direct_source_kind(&first) == Some(DirectSourceKind::Cue) {
+                    "CUE".to_string()
+                } else {
+                    first
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                format!(
+                    "loaded {} from cli with warning: {}{}",
+                    source_label, notice, skipped_suffix
+                )
+            } else {
+                format!(
+                    "loaded batch of {} files from cli with warning: {}{}",
+                    valid_count, notice, skipped_suffix
+                )
+            }
         } else if valid_count == 1 {
             format!(
                 "loaded {}{} from cli — review, then :commit or :Commit",
@@ -18740,23 +18984,260 @@ mod cue_proxy_probe_tests {
     }
 
     #[test]
-    fn cue_sheet_metadata_fills_only_missing_fields() {
+    fn cue_sheet_metadata_overrides_supplied_fields_and_preserves_tag_fallbacks() {
         let mut sheet = crate::tui::cue_parser::CueSheet::default();
         sheet.title = Some("Cue Album".to_string());
         sheet.performer = Some("Cue Artist".to_string());
         sheet.genre = Some("Cue Genre".to_string());
-        sheet.date = Some("1984".to_string());
         sheet.catalog = Some("0123456789012".to_string());
 
         let mut metadata = SourceMetadata::default();
         metadata.album = Some("Tagged Album".to_string());
+        metadata.artist = Some("Tagged Artist".to_string());
+        metadata.genre = Some("Tagged Genre".to_string());
+        metadata.year = Some("Tagged Year".to_string());
+        metadata.catalog_number = Some("Tagged Catalog".to_string());
 
         let merged = cue_sheet_metadata(&sheet, metadata);
-        assert_eq!(merged.album.as_deref(), Some("Tagged Album"));
+        assert_eq!(merged.album.as_deref(), Some("Cue Album"));
         assert_eq!(merged.artist.as_deref(), Some("Cue Artist"));
         assert_eq!(merged.genre.as_deref(), Some("Cue Genre"));
-        assert_eq!(merged.year.as_deref(), Some("1984"));
+        assert_eq!(merged.year.as_deref(), Some("Tagged Year"));
         assert_eq!(merged.catalog_number.as_deref(), Some("0123456789012"));
+    }
+
+    #[test]
+    fn direct_cue_preview_consumes_embedded_exact_authority_and_overrides_carrier_album() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        use crate::convert::pipeline::CueSidecarPolicy;
+
+        let dir = temp_test_dir("direct_cue_embedded_authority");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("album.flac");
+        std::fs::write(
+            &image_path,
+            include_bytes!("../../tests/fixtures/silence.flac"),
+        )
+        .expect("copy FLAC fixture");
+        write_test_file(
+            &cue_path,
+            r#"PERFORMER "Sidecar Artist"
+TITLE "Sidecar Album"
+FILE "album.flac" FLAC
+  TRACK 01 AUDIO
+    TITLE "Sidecar One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Sidecar Two"
+    INDEX 01 00:00:01
+"#,
+        );
+        let embedded = r#"PERFORMER "Embedded Artist"
+TITLE "Embedded Album"
+FILE "album.flac" FLAC
+  TRACK 01 AUDIO
+    TITLE "Embedded One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Embedded Two"
+    INDEX 01 00:00:01
+"#;
+        crate::tui::probe::write_all_tags(
+            &image_path,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded.to_string()),
+            )],
+        )
+        .expect("write embedded CUESHEET");
+
+        let authority = resolve_convert_preview_authority(
+            &cue_path,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &[EmbeddedCue, SidecarCue, IndividualFiles],
+        );
+        let policy = authority
+            .cue_sidecar_override
+            .expect("Convert preview authority must be exact");
+        assert_eq!(policy, CueSidecarPolicy::EmbeddedOnly);
+
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(image_path.clone(), Ok(source_info(44_100, Some(16), 2)));
+        let mut carrier_metadata = SourceMetadata::default();
+        carrier_metadata.album = Some("Carrier Album".to_string());
+        hook.metadata_results
+            .insert(image_path.clone(), carrier_metadata);
+        let (result, _hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&cue_path, policy).expect("embedded-authority CUE proxy")
+        });
+        assert_eq!(result.metadata.album.as_deref(), Some("Embedded Album"));
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            cue_path.clone(),
+            result.info,
+            result.metadata,
+            result.probe_notice,
+            policy,
+        );
+        assert_eq!(
+            mode.current_metadata().album.as_deref(),
+            Some("Embedded Album")
+        );
+        let SourceMode::MultiTrack { tracks, .. } = mode else {
+            panic!("embedded-authority direct CUE must render logical tracks");
+        };
+        assert_eq!(
+            tracks.first().and_then(|track| track.title.as_deref()),
+            Some("Embedded One")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transferred_metadata_sidecar_preview_consumes_same_admitted_track_mapping_as_conversion() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        use crate::convert::pipeline::{CueSidecarPolicy, SidecarCueTrackMetadataSource};
+
+        let dir = temp_test_dir("transferred_sidecar_preview");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("track.flac");
+        std::fs::write(
+            &image_path,
+            include_bytes!("../../tests/fixtures/silence.flac"),
+        )
+        .expect("copy FLAC fixture");
+        crate::tui::probe::write_all_tags(
+            &image_path,
+            &[
+                (
+                    lofty::tag::ItemKey::AlbumTitle,
+                    Some("Carrier Album".to_string()),
+                ),
+                (
+                    lofty::tag::ItemKey::TrackTitle,
+                    Some("Carrier Track".to_string()),
+                ),
+            ],
+        )
+        .expect("write carrier metadata sentinels");
+        write_test_file(
+            &cue_path,
+            r#"PERFORMER "Sidecar Artist"
+TITLE "Sidecar Album"
+FILE "track.flac" FLAC
+  TRACK 01 AUDIO
+    TITLE "Sidecar Track"
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let source = SidecarCueTrackMetadataSource {
+            cue_path: cue_path.clone(),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("track.flac".to_string()),
+        };
+        let artifact_audio = std::collections::HashSet::from([image_path.clone()]);
+        let artifact_metadata =
+            std::collections::BTreeMap::from([(image_path.clone(), source.clone())]);
+        let authority = resolve_convert_preview_authority(
+            &image_path,
+            &artifact_audio,
+            &artifact_metadata,
+            &[SidecarCue, IndividualFiles, EmbeddedCue],
+        );
+        assert_eq!(
+            authority.cue_sidecar_override,
+            Some(CueSidecarPolicy::IgnoreCue),
+            "transferred metadata sidecars stay on the SingleFile structural path"
+        );
+        assert_eq!(authority.sidecar_cue_track_metadata, Some(source.clone()));
+
+        let (info, metadata, notice) = probe_convert_source_for_message(
+            &image_path,
+            Some(CueSidecarPolicy::IgnoreCue),
+            Some(&source),
+        );
+        assert!(info.is_some(), "fixture carrier must remain probeable");
+        assert!(notice.is_none(), "admitted sidecar mapping should preview cleanly");
+        assert_eq!(metadata.album.as_deref(), Some("Sidecar Album"));
+        assert_eq!(metadata.title.as_deref(), Some("Sidecar Track"));
+        assert_eq!(metadata.artist.as_deref(), Some("Sidecar Artist"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_embedded_preview_falls_back_to_same_valid_sidecar_as_queue_admission() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        use crate::convert::pipeline::CueSidecarPolicy;
+
+        let dir = temp_test_dir("malformed_embedded_preview");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("album.flac");
+        std::fs::write(
+            &image_path,
+            include_bytes!("../../tests/fixtures/silence.flac"),
+        )
+        .expect("copy FLAC fixture");
+        write_test_file(
+            &cue_path,
+            r#"PERFORMER "Sidecar Artist"
+TITLE "Sidecar Album"
+FILE "album.flac" FLAC
+  TRACK 01 AUDIO
+    TITLE "Sidecar One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Sidecar Two"
+    INDEX 01 00:00:01
+"#,
+        );
+        crate::tui::probe::write_all_tags(
+            &image_path,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some("THIS IS NOT A VALID CUE SHEET".to_string()),
+            )],
+        )
+        .expect("write malformed embedded CUESHEET");
+
+        let authority = resolve_convert_preview_authority(
+            &image_path,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &[EmbeddedCue, SidecarCue, IndividualFiles],
+        );
+        let policy = authority
+            .cue_sidecar_override
+            .expect("Convert preview authority must be exact");
+        assert_eq!(policy, CueSidecarPolicy::SidecarOnly);
+
+        let mut carrier_metadata = SourceMetadata::default();
+        carrier_metadata.album = Some("Carrier Album".to_string());
+        let mode = SourceMode::from_single_with_probe_notice(
+            image_path.clone(),
+            None,
+            carrier_metadata,
+            None,
+            policy,
+        );
+        assert_eq!(
+            mode.current_metadata().album.as_deref(),
+            Some("Sidecar Album")
+        );
+        let SourceMode::MultiTrack { tracks, .. } = mode else {
+            panic!("valid sidecar image must render logical tracks");
+        };
+        assert_eq!(
+            tracks.first().and_then(|track| track.title.as_deref()),
+            Some("Sidecar One")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn temp_test_dir(prefix: &str) -> PathBuf {
@@ -18836,6 +19317,7 @@ mod cue_proxy_probe_tests {
             None,
             SourceMetadata::default(),
             Some(notice.clone()),
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
         );
 
         match &mode {
@@ -18876,6 +19358,7 @@ FILE "image.flac" WAVE
             None,
             SourceMetadata::default(),
             Some("CUE proxy warning".to_string()),
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
         );
 
         match mode {
@@ -18928,7 +19411,11 @@ FILE "image.flac" WAVE
         hook.probe_results
             .insert(image_path.clone(), Ok(source_info(96_000, Some(24), 2)));
         let (result, hook) = with_cue_proxy_probe_test_hook(hook, || {
-            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should succeed")
+            probe_cue_proxy_source(
+                &cue_path,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .expect("CUE proxy probe should succeed")
         });
 
         let info = result.info.expect("single-image CUE should expose proxied SourceInfo");
@@ -18975,7 +19462,11 @@ FILE "02.flac" WAVE
         hook.probe_results.insert(second.clone(), Ok(second_info));
 
         let (result, hook) = with_cue_proxy_probe_test_hook(hook, || {
-            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should succeed")
+            probe_cue_proxy_source(
+                &cue_path,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .expect("CUE proxy probe should succeed")
         });
 
         let info = result.info.expect("uniform multi-file CUE should expose SourceInfo");
@@ -19013,7 +19504,11 @@ FILE "02.flac" WAVE
         hook.probe_results
             .insert(second, Ok(source_info(44_100, Some(16), 2)));
         let (result, _hook) = with_cue_proxy_probe_test_hook(hook, || {
-            probe_cue_proxy_source(&cue_path).expect("CUE proxy probe should return a warning result")
+            probe_cue_proxy_source(
+                &cue_path,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .expect("CUE proxy probe should return a warning result")
         });
 
         assert!(result.info.is_none());
@@ -19025,6 +19520,7 @@ FILE "02.flac" WAVE
             result.info,
             result.metadata,
             result.probe_notice,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
         );
         match &mode {
             SourceMode::MultiTrack { probe_notice, .. } => {
@@ -19066,7 +19562,11 @@ FILE "02.flac" WAVE
     INDEX 01 00:00:00
 "#,
         );
-        let missing = probe_cue_proxy_source(&missing_cue).expect("missing reference should be a warning result");
+        let missing = probe_cue_proxy_source(
+            &missing_cue,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("missing reference should be a warning result");
         assert!(missing.info.is_none());
         assert!(missing.probe_notice.unwrap().contains("was not found"));
 
@@ -19080,7 +19580,11 @@ FILE "02.flac" WAVE
     INDEX 01 00:00:00
 "#,
         );
-        let ambiguous = probe_cue_proxy_source(&ambiguous_cue).expect("ambiguous reference should be a warning result");
+        let ambiguous = probe_cue_proxy_source(
+            &ambiguous_cue,
+            crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+        )
+        .expect("ambiguous reference should be a warning result");
         assert!(ambiguous.info.is_none());
         assert!(ambiguous.probe_notice.unwrap().contains("was ambiguous"));
 
@@ -19096,7 +19600,11 @@ FILE "02.flac" WAVE
         );
         let hook = CueProxyProbeTestHook::default();
         let (non_audio_result, hook) = with_cue_proxy_probe_test_hook(hook, || {
-            probe_cue_proxy_source(&non_audio_cue).expect("non-audio reference should be a warning result")
+            probe_cue_proxy_source(
+                &non_audio_cue,
+                crate::convert::pipeline::CueSidecarPolicy::SidecarOnly,
+            )
+            .expect("non-audio reference should be a warning result")
         });
         assert!(non_audio_result.info.is_none());
         // The unified FILE-ref resolver rejects non-audio references at
@@ -19161,8 +19669,11 @@ PERFORMER "Nobody"
 "#,
         );
 
-        let result = probe_cue_proxy_source(&cue_path)
-            .expect("empty but parseable CUE should return a warning result");
+        let result = probe_cue_proxy_source(
+            &cue_path,
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
+        )
+        .expect("empty but parseable CUE should return a warning result");
         assert!(result.info.is_none());
         let notice = result
             .probe_notice
@@ -19175,6 +19686,7 @@ PERFORMER "Nobody"
             result.info,
             result.metadata,
             result.probe_notice,
+            crate::convert::pipeline::CueSidecarPolicy::IgnoreCue,
         );
         match &mode {
             SourceMode::Single {

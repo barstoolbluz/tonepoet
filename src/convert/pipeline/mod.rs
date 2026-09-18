@@ -33,7 +33,7 @@ pub mod manifest;
 pub mod manifest_builder;
 pub mod materializer_archive;
 pub mod materializer_cue;
-pub(crate) use materializer_cue::dispatch_metadata_sheet_for_sidecar_cue;
+pub(crate) use materializer_cue::dispatch_metadata_sheet_for_cue_request;
 pub mod materializer_dvda;
 pub mod materializer_dvdv;
 pub mod materializer_bluray;

@@ -261,3 +261,23 @@ run must supply the exact expected real path and executable SHA-256 and must mat
 version 7.1.3. `--allow-unqualified-identity` exists only for explicitly non-qualifying
 implementation-model checks on another executable. Empirical results can expose a
 mistaken implementation model; they do not define or tighten the bound.
+
+## Re-attested on operator hardware — 2026-09-17
+
+Run on the operator's machine (x86_64, Intel Xeon E5-1680 v2, Rust 1.93.1 dev shell) against
+the exact executable this record names, with no identity override:
+
+- executable: `/nix/store/5iawqc7p20fpg5k04m9srjkwxv3kyh1m-ffmpeg-full-7.1.3-bin/bin/ffmpeg`
+- sha256: `8bc4cbb02479983b40efe57c014f8041b62f941635364c02c3adc5bf64cd8d53`
+- `ffmpeg -version`: 7.1.3
+
+`tonepoet-pipeline/qualification/verify_ffmpeg_int32_triangular_terminal_bound.py`: status
+`pass`, stored_error_upper_fs 9.313227966600836e-10 (2.0000004768371586 LSB).
+
+`scripts/validate_ffmpeg_int32_triangular_terminal_bound.py --ffmpeg <path> --expected-version
+7.1.3 --expected-realpath <path> --expected-sha256 <sha>`: version, path, digest and identity all
+matched; samples 589947; theoretical bound 9.313227966600836475e-10 FS (2.000000476837 LSB);
+observed max 4.656613983300417203e-10 FS (1.000000238419 LSB) at index 11; violations 0.
+
+Conclusion: the x86_64 commissioning constant stands on evidence gathered on the operator's own
+pinned executable, not only on the model-container run of 2026-09-14. AArch64 remains closed.

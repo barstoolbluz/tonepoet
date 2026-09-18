@@ -2533,3 +2533,40 @@ image, never an output target), which is correct and not in question here.
 - Whether the conversion was a deliberate passthrough triggered by settings, or a fallback
   after a failed decode. No conversion log was found in the output directory.
 - The mechanism of the artwork corruption in Defect B.
+
+## 34. `:analyze` Loudness fails with "audio decoder failed: Invalid data found when processing input" on ID3-prefixed FLACs with an ID3v1 trailer
+
+**Status:** open, filed 2026-09-17 from a field report. Diagnosed to the decode wrapper, not the
+loudness crate.
+
+### Field artifact — do not delete
+
+`~/library/a/Asia - Asia (1982) [FLAC] {Audio Fidelity}/` — nine 16-bit/44.1 kHz FLACs. Every file
+starts with an ID3v2.3 header (`49 44 33 03 ...`) before the `fLaC` marker and ends with a 128-byte
+ID3v1 `TAG` trailer. This is the class recorded in the FLAC ID3-prefix backlog.
+
+### What is observed
+
+- The reference decoder accepts every file: `flac -t` ends in `FLAC__STREAM_DECODER_END_OF_STREAM`.
+- The `ffmpeg` CLI decodes the full declared duration (3:52 for track 1, 10 232 376 samples at
+  44.1 kHz) and then reports, once, at the end of the stream: `invalid sync code`, `invalid frame
+  header`, `decode_frame() failed`, `Decoding error: Invalid data found when processing input`.
+  That is the ID3v1 trailer being read as a FLAC frame after the last real frame.
+- tonepoet's in-process decode for the native loudness path treats any decoder error as fatal
+  (`src/convert/replaygain.rs:768`, `audio decoder failed: {error}`), so `:analyze` reports the
+  whole track as Failed although every audio sample was decoded.
+- Before the checkpoint, `:analyze` shelled out to loudgain, which reads the same libavformat
+  stream and tolerates the trailing error; that is why this album analyzed before and fails now.
+
+### Why the true-peak crate is not the cause
+
+The crate never sees the file. The failure is raised by the decode wrapper that feeds it, on the
+trailer that follows the last audio frame. The same wrapper feeds ReplayGain writing in
+conversion, so conversions of these files with ReplayGain enabled are expected to fail the same way
+(not yet reproduced).
+
+### Related
+
+- Backlog: FLAC ID3-prefix scanner and repair tool (deferred 2026-07-27).
+- Round-5 (2026-07) taught the native tag *writer* a bounded prefix skip; the native *decoder*
+  path added by the checkpoint has no equivalent tolerance for a trailer.

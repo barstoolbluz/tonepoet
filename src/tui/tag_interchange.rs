@@ -119,35 +119,10 @@ pub enum TransferCarrier {
     Aggregate { carriers: Vec<TransferCarrier> },
 }
 
-/// Availability facts consumed by ordered aggregate-target resolution.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AggregateMetadataAvailability {
-    pub individual_files: bool,
-    pub sidecar_cue: bool,
-    pub embedded_cue: bool,
-}
-
-/// Resolve the first configured target accepted by a caller-supplied probe.
-pub fn resolve_aggregate_metadata_target_by(
-    priority: &[crate::config::AggregateMetadataTarget],
-    mut is_available: impl FnMut(crate::config::AggregateMetadataTarget) -> bool,
-) -> Option<crate::config::AggregateMetadataTarget> {
-    crate::config::normalized_aggregate_metadata_target_priority(priority)
-        .into_iter()
-        .find(|target| is_available(*target))
-}
-
-/// Resolve the first available target in normalized configured order.
-pub fn resolve_aggregate_metadata_target(
-    priority: &[crate::config::AggregateMetadataTarget],
-    availability: AggregateMetadataAvailability,
-) -> Option<crate::config::AggregateMetadataTarget> {
-    resolve_aggregate_metadata_target_by(priority, |target| match target {
-        crate::config::AggregateMetadataTarget::IndividualFiles => availability.individual_files,
-        crate::config::AggregateMetadataTarget::SidecarCue => availability.sidecar_cue,
-        crate::config::AggregateMetadataTarget::EmbeddedCue => availability.embedded_cue,
-    })
-}
+pub use crate::metadata_authority::{
+    resolve_aggregate_metadata_target, resolve_aggregate_metadata_target_by,
+    AggregateMetadataAvailability,
+};
 
 impl TransferCarrier {
     fn metadata_mutation_paths(&self, out: &mut Vec<std::path::PathBuf>) {
@@ -2428,22 +2403,22 @@ mod tests {
 
     #[test]
     fn embedded_cue_metadata_target_applicability_matches_existing_writer_routes() {
-        assert!(embedded_cue_metadata_target_is_writable(
+        assert!(crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.flac")
         ));
-        assert!(embedded_cue_metadata_target_is_writable(
+        assert!(crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.wv")
         ));
-        assert!(embedded_cue_metadata_target_is_writable(
+        assert!(crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.ogg")
         ));
-        assert!(embedded_cue_metadata_target_is_writable(
+        assert!(crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.ape")
         ));
-        assert!(!embedded_cue_metadata_target_is_writable(
+        assert!(!crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.mpc")
         ));
-        assert!(!embedded_cue_metadata_target_is_writable(
+        assert!(!crate::metadata_persistence::embedded_cue_metadata_target_is_writable(
             std::path::Path::new("disc.dff")
         ));
     }
@@ -5333,19 +5308,6 @@ fn preflight_sidecar_transfer_snapshot(
     validate_sidecar_transfer_snapshot(cue_path, &current, track_audio_paths, sheet)
 }
 
-/// Whether the carrier has an existing metadata writer that can persist an
-/// embedded CUESHEET. Aggregate transfer and editor resolution share this gate
-/// so a representation cannot win priority and then fail categorically on save.
-pub(crate) fn embedded_cue_metadata_target_is_writable(path: &std::path::Path) -> bool {
-    matches!(
-        crate::metadata_persistence::metadata_persistence_route_for_path(path),
-        crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
-            | crate::metadata_persistence::MetadataPersistenceRoute::NativeDsfId3
-            | crate::metadata_persistence::MetadataPersistenceRoute::WavPackApeDispatch
-            | crate::metadata_persistence::MetadataPersistenceRoute::Lofty
-    )
-}
-
 fn validate_embedded_cue_transfer_target(
     carrier: &EmbeddedCueCarrier,
 ) -> Result<(), String> {
@@ -5355,7 +5317,7 @@ fn validate_embedded_cue_transfer_target(
                 .to_string(),
         );
     }
-    if !embedded_cue_metadata_target_is_writable(&carrier.image_path) {
+    if !crate::metadata_persistence::embedded_cue_metadata_target_is_writable(&carrier.image_path) {
         return Err("embedded CUE write is not supported for this audio carrier".to_string());
     }
     Ok(())
