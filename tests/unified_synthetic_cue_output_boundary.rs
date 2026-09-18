@@ -509,8 +509,8 @@ FILE "side_a.flac" WAVE
 }
 
 #[tokio::test]
-async fn embedded_unified_album_metadata_drives_folder_template_and_real_output_tags() {
-    if !require_or_skip_metadata_boundary_tools("embedded_unified_album_metadata_drives_folder_template_and_real_output_tags") {
+async fn writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only() {
+    if !require_or_skip_metadata_boundary_tools("writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only") {
         return;
     }
 
@@ -524,8 +524,10 @@ async fn embedded_unified_album_metadata_drives_folder_template_and_real_output_
     create_sine_flac(&side_a, 4.0);
     create_sine_flac(&side_b, 4.0);
 
-    let side_a_cue = r#"PERFORMER "Pink Floyd"
-TITLE "The Dark Side Of The Moon Side A"
+    let full_album = "The Dark Side of the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192)";
+    let embedded_album = "Read-only Embedded Sentinel";
+    let side_a_cue = format!(r#"PERFORMER "Pink Floyd"
+TITLE "{full_album} Side A"
 FILE "side_a.flac" WAVE
   TRACK 01 AUDIO
     TITLE "A1"
@@ -533,9 +535,9 @@ FILE "side_a.flac" WAVE
   TRACK 02 AUDIO
     TITLE "A2"
     INDEX 01 00:02:00
-"#;
-    let side_b_cue = r#"PERFORMER "Pink Floyd"
-TITLE "The Dark Side Of The Moon Side B"
+"#);
+    let side_b_cue = format!(r#"PERFORMER "Pink Floyd"
+TITLE "{full_album} Side B"
 FILE "side_b.flac" WAVE
   TRACK 01 AUDIO
     TITLE "B1"
@@ -543,13 +545,12 @@ FILE "side_b.flac" WAVE
   TRACK 02 AUDIO
     TITLE "B2"
     INDEX 01 00:02:00
-"#;
-    fs::write(source_dir.join("side_a.cue"), side_a_cue).expect("side A cue");
-    fs::write(source_dir.join("side_b.cue"), side_b_cue).expect("side B cue");
+"#);
+    fs::write(source_dir.join("side_a.cue"), &side_a_cue).expect("side A cue");
+    fs::write(source_dir.join("side_b.cue"), &side_b_cue).expect("side B cue");
 
-    let full_album = "The Dark Side of the Moon (Japan Toshiba Harvest-Odeon EOP-80778 LP / 24-192)";
     let embedded = format!(
-        "CATALOG EOP-80778\nPERFORMER \"Pink Floyd\"\nTITLE \"{full_album}\"\nREM DATE 1973\nREM GENRE \"Rock\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:02:00\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:02:00\n"
+        "CATALOG EOP-80778\nPERFORMER \"Pink Floyd\"\nTITLE \"{embedded_album}\"\nREM DATE 1973\nREM GENRE \"Rock\"\nFILE \"side_a.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:02:00\nFILE \"side_b.flac\" WAVE\n  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:02:00\n"
     );
     for image in [&side_a, &side_b] {
         set_flac_tags(
@@ -574,7 +575,8 @@ FILE "side_b.flac" WAVE
     assert_eq!(expansion.expansion_errors, Vec::<String>::new());
     assert_eq!(expansion.paths.len(), 1);
     let synthetic = fs::read_to_string(&expansion.paths[0]).expect("synthetic CUE text");
-    assert!(synthetic.contains(&format!("TITLE \"{full_album}\"")), "conversion planner must feed the saved embedded album title into the pipeline: {synthetic}");
+    assert!(synthetic.contains(&format!("TITLE \"{full_album}\"")), "conversion planner must use the writable sidecar authority: {synthetic}");
+    assert!(!synthetic.contains(embedded_album), "read-only native multi-FILE embedded metadata must not override automatic writable authority: {synthetic}");
 
     let mut req = base_request(expansion.paths[0].clone(), output_root.clone(), log_root.clone());
     req.stages.metadata = StageRequirement::Enabled;
@@ -593,7 +595,7 @@ FILE "side_b.flac" WAVE
     let dirs = visible_dirs(&output_root);
     assert_eq!(dirs.len(), 1, "one merged album directory expected: {dirs:?}");
     let album_dir = &dirs[0];
-    assert!(album_dir.starts_with("Pink Floyd - The Dark Side of the Moon (1973) [FLAC] {Japan Toshiba Harvest-Odeon EOP-80778 LP"), "folder template must split base album and title extra from the full embedded title: {album_dir}");
+    assert!(album_dir.starts_with("Pink Floyd - The Dark Side of the Moon (1973) [FLAC] {Japan Toshiba Harvest-Odeon EOP-80778 LP"), "folder template must split base album and title extra from the selected full album title: {album_dir}");
     assert!(album_dir.contains("24-192}"), "folder template must retain the pressing title extra: {album_dir}");
     assert_eq!(published.album_dir, output_root.join(album_dir));
 

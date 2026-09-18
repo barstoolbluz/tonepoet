@@ -1574,6 +1574,7 @@ fn first_resolved_member_audio_path_with_quote(parts: &[SyntheticCueAlbumPart]) 
     None
 }
 
+#[cfg(test)]
 fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Option<String> {
     use lofty::prelude::*;
 
@@ -1625,6 +1626,7 @@ fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+#[cfg(test)]
 fn resolved_file_order_for_parsed_cue(
     parent: &Path,
     parsed: &crate::convert::cue_parser::CueSheet,
@@ -1648,6 +1650,7 @@ fn resolved_file_order_for_parsed_cue(
     Some(resolved)
 }
 
+#[cfg(test)]
 fn rewrite_embedded_cue_file_lines_to_absolute_paths(
     text: &str,
     file_order: &[PathBuf],
@@ -1690,6 +1693,7 @@ fn rewrite_embedded_cue_file_lines_to_absolute_paths(
 /// Return a structurally coherent embedded-CUE candidate for a synthetic
 /// album. This establishes viability only; callers must still apply configured
 /// aggregate metadata priority before using the candidate's fields.
+#[cfg(test)]
 fn coherent_embedded_cuesheet_for_member_audio(
     member_audio: &[PathBuf],
     base_dir: &Path,
@@ -1774,6 +1778,7 @@ pub(crate) fn planner_coherent_embedded_cuesheet_accepts_for_test(
     coherent_embedded_cuesheet_for_member_audio(member_audio, base_dir).is_some()
 }
 
+#[cfg(test)]
 fn coherent_embedded_cuesheet_for_member_audio_with_base_dirs(
     member_audio: &[PathBuf],
     base_dirs: &[PathBuf],
@@ -1786,6 +1791,7 @@ fn coherent_embedded_cuesheet_for_member_audio_with_base_dirs(
     None
 }
 
+#[cfg(test)]
 fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result<String, String> {
     generate_queue_synthetic_cue_album_with_metadata_priority(parts, &[])
 }
@@ -2488,6 +2494,7 @@ pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
     }
 }
 
+#[cfg(test)]
 fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
     let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
     for (track_number, path, index01) in resolved_tracks {
@@ -2771,13 +2778,21 @@ pub fn cue_artifact_commit_decision_for_path(
             .map(|(_, source)| source.clone())
     });
 
-    // Invalid/nonviable CUE artifacts carry suppression evidence but no
-    // transferred sidecar mapping. Treat that as SidecarCue unavailable and
-    // let the shared authority selector choose between any still-viable
-    // IndividualFiles or embedded representation. If no representation remains
-    // viable, the fail-closed fallback below preserves sidecar suppression.
-    let sidecar_cue = metadata_source.is_some()
-        && matches!(
+    // `cue_artifact_audio` without an exact transferred mapping is the
+    // suppression-only form of the queue-expansion contract. This covers
+    // rejected/nonviable sibling CUEs and metadata artifacts whose mapping
+    // could not be admitted. Do not reclassify such a carrier as ordinary
+    // IndividualFiles metadata: preserve the historical EmbeddedOnly sentinel
+    // so downstream source detection cannot rediscover the sidecar that queue
+    // admission deliberately suppressed.
+    if metadata_source.is_none() {
+        return CueArtifactCommitDecision {
+            cue_sidecar_override: Some(CueSidecarPolicy::EmbeddedOnly),
+            sidecar_cue_track_metadata: None,
+        };
+    }
+
+    let sidecar_cue = matches!(
             cue_source_policy,
             CueSidecarPolicy::PreferEmbedded
                 | CueSidecarPolicy::PreferSidecar
@@ -5999,9 +6014,9 @@ mod planner_embedded_authority_tests {
     }
 
     #[test]
-    fn metadata_artifact_malformed_embedded_falls_back_to_individual_files() {
+    fn direct_audio_malformed_embedded_falls_back_to_individual_files() {
         if !require_flac_fixture_tool(
-            "metadata_artifact_malformed_embedded_falls_back_to_individual_files",
+            "direct_audio_malformed_embedded_falls_back_to_individual_files",
         ) {
             return;
         }
@@ -6012,10 +6027,9 @@ mod planner_embedded_authority_tests {
         create_flac(&image);
         set_embedded_cuesheet(&image, "malformed embedded cue");
 
-        let artifact_audio = [image.clone()].into_iter().collect::<HashSet<_>>();
         let decision = cue_artifact_commit_decision_for_path(
             &image,
-            &artifact_audio,
+            &HashSet::new(),
             &BTreeMap::new(),
             &[EmbeddedCue, IndividualFiles, SidecarCue],
             CueSidecarPolicy::PreferSidecar,

@@ -591,6 +591,19 @@ pub(crate) fn probe_cue_proxy_source(
 ) -> Result<CueProxyProbeResult, String> {
     let sheet = crate::tui::cue_parser::parse_cue_file(cue_path)
         .map_err(|err| format!("failed to parse CUE: {err}"))?;
+
+    // Empty CUE geometry is a more specific source defect than authority
+    // viability.  Report it before exact-authority validation so CLI/direct
+    // preview keeps the established actionable diagnostic instead of turning
+    // an empty sheet into a generic "authority is no longer valid" error.
+    if sheet.tracks.is_empty() {
+        return Ok(CueProxyProbeResult {
+            info: None,
+            metadata: SourceMetadata::default(),
+            probe_notice: Some("CUE sheet has no audio tracks".to_string()),
+        });
+    }
+
     let selected_sheet = match cue_policy {
         crate::convert::pipeline::CueSidecarPolicy::IgnoreCue => None,
         crate::convert::pipeline::CueSidecarPolicy::SidecarOnly => Some(
@@ -629,14 +642,6 @@ pub(crate) fn probe_cue_proxy_source(
         .as_ref()
         .map(|selected| cue_sheet_metadata(selected, SourceMetadata::default()))
         .unwrap_or_default();
-
-    if sheet.tracks.is_empty() {
-        return Ok(CueProxyProbeResult {
-            info: None,
-            metadata,
-            probe_notice: Some("CUE sheet has no audio tracks".to_string()),
-        });
-    }
 
     let parent = cue_path
         .parent()
@@ -16326,7 +16331,26 @@ impl AppState {
         };
         let source_probe_notice = self.convert.source.mode.persistent_probe_notice();
         let status = if let Some(notice) = source_probe_notice {
-            format!("loaded CUE from cli with warning: {}", notice)
+            if valid_count == 1 {
+                let source_label = if direct_source_kind(&first) == Some(DirectSourceKind::Cue) {
+                    "CUE".to_string()
+                } else {
+                    first
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                format!(
+                    "loaded {} from cli with warning: {}{}",
+                    source_label, notice, skipped_suffix
+                )
+            } else {
+                format!(
+                    "loaded batch of {} files from cli with warning: {}{}",
+                    valid_count, notice, skipped_suffix
+                )
+            }
         } else if valid_count == 1 {
             format!(
                 "loaded {}{} from cli — review, then :commit or :Commit",

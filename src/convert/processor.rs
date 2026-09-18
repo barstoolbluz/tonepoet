@@ -9618,6 +9618,23 @@ FILE "track.flac" WAVE
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"fLaC");
+
+        // FLAC requires STREAMINFO to be the first metadata block.  The
+        // previous synthetic fixture began with VORBIS_COMMENT, which is not a
+        // valid FLAC stream and newer/stricter Lofty read paths correctly
+        // reject it before the embedded-CUESHEET dispatcher can be exercised.
+        // A minimal spec-valid 34-byte STREAMINFO block is sufficient for
+        // metadata-only unit fixtures; the following VORBIS_COMMENT block
+        // remains last.
+        let mut streaminfo = [0u8; 34];
+        streaminfo[0..2].copy_from_slice(&4096u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        let packed_stream_fields =
+            (44_100u64 << 44) | (1u64 << 41) | (15u64 << 36);
+        streaminfo[10..18].copy_from_slice(&packed_stream_fields.to_be_bytes());
+        bytes.push(0x00);
+        bytes.extend_from_slice(&[0x00, 0x00, 34]);
+        bytes.extend_from_slice(&streaminfo);
         bytes.push(0x84);
         bytes.push(((block.len() >> 16) & 0xff) as u8);
         bytes.push(((block.len() >> 8) & 0xff) as u8);
