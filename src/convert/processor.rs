@@ -9604,7 +9604,7 @@ FILE "track.flac" WAVE
         assert_eq!(strict_track_number_from_dispatch_path(std::path::Path::new("2024 Remaster.flac")), None);
     }
 
-    fn fake_flac_with_vorbis_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+    fn fake_vorbis_comment_block(comments: &[(&str, &str)]) -> Vec<u8> {
         let mut block = Vec::new();
         let vendor = b"tonepoet-test";
         block.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
@@ -9615,6 +9615,11 @@ FILE "track.flac" WAVE
             block.extend_from_slice(&(comment.len() as u32).to_le_bytes());
             block.extend_from_slice(comment.as_bytes());
         }
+        block
+    }
+
+    fn fake_flac_with_vorbis_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+        let block = fake_vorbis_comment_block(comments);
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"fLaC");
@@ -10259,11 +10264,10 @@ FILE "disc2.flac" WAVE
 
     #[test]
     fn flac_metadata_reader_streams_metadata_blocks_without_audio_payload() {
-        let vorbis_file = fake_flac_with_vorbis_comments(&[
+        let vorbis_block = fake_vorbis_comment_block(&[
             ("DISCNUMBER", "2/3"),
             ("TRACKNUMBER", "07/12"),
         ]);
-        let vorbis_block = &vorbis_file[8..];
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"fLaC");
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
@@ -10272,7 +10276,7 @@ FILE "disc2.flac" WAVE
         bytes.push(((vorbis_block.len() >> 16) & 0xff) as u8);
         bytes.push(((vorbis_block.len() >> 8) & 0xff) as u8);
         bytes.push((vorbis_block.len() & 0xff) as u8);
-        bytes.extend_from_slice(vorbis_block);
+        bytes.extend_from_slice(&vorbis_block);
         bytes.extend_from_slice(&[0xff; 1024]);
 
         let mut cursor = std::io::Cursor::new(bytes);
