@@ -26,14 +26,20 @@ impl Backend {
     }
 
     /// Select only a backend with completed differential and performance
-    /// qualification for this production target.
-    pub(super) fn production() -> Self {
+    /// qualification for this production target and channel count.
+    ///
+    /// One-lane meters stay scalar: with a single channel there is nothing to
+    /// pack, and the vector path measured slower than scalar on mono in the
+    /// 2026-09-19 re-attestation (see `qualification/`).
+    pub(super) fn production(channels: usize) -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("sse2") {
+            if channels >= 2 && std::is_x86_feature_detected!("sse2") {
                 return Self(BackendKind::Sse2);
             }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = channels;
         Self::scalar()
     }
 

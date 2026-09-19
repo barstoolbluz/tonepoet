@@ -9,8 +9,8 @@ Writes a JSON report and prints a Markdown table.
 import argparse, json, statistics, subprocess, sys, platform
 from pathlib import Path
 
-FIXTURES = [(1, 600), (2, 600), (6, 120), (8, 120)]
-BACKENDS = ["scalar", "sse2", "avx"]
+FIXTURES = [(1, 600), (2, 600), (4, 120), (5, 120), (6, 120), (8, 120)]
+BACKENDS = ["scalar", "sse2", "avx", "production"]
 
 def run(binary, backend, channels, seconds):
     out = subprocess.run([binary, backend, str(channels), str(seconds)], check=True,
@@ -23,7 +23,9 @@ def main():
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--warmups", type=int, default=2)
     ap.add_argument("--rounds", type=int, default=9)
+    ap.add_argument("--channels", type=int, nargs="*", help="restrict to these channel counts")
     args = ap.parse_args()
+    fixtures = [f for f in FIXTURES if not args.channels or f[0] in args.channels]
 
     report = {"host": platform.uname()._asdict(), "fixtures": []}
     cpu = ""
@@ -36,14 +38,14 @@ def main():
     report["cpu"] = cpu
 
     rows = []
-    for channels, seconds in FIXTURES:
+    for channels, seconds in fixtures:
         for _ in range(args.warmups):
             for b in BACKENDS:
                 run(args.binary, b, channels, seconds)
         samples = {b: [] for b in BACKENDS}
         bits = {b: set() for b in BACKENDS}
         for r in range(args.rounds):
-            order = BACKENDS[r % 3:] + BACKENDS[:r % 3]
+            k = r % len(BACKENDS); order = BACKENDS[k:] + BACKENDS[:k]
             for b in order:
                 res = run(args.binary, b, channels, seconds)
                 samples[b].append(res["nanos"])
@@ -61,11 +63,11 @@ def main():
         rows.append(fx)
 
     args.output.write_text(json.dumps(report, indent=2))
-    print("| Channels | Programme seconds | Scalar median | SSE2 median | SSE2 vs scalar | Paired wins | AVX median | AVX vs scalar | AVX paired wins | Bit-identical |")
-    print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
+    print("| Channels | Programme seconds | Scalar median | SSE2 median | SSE2 vs scalar | Paired wins | AVX median | AVX vs scalar | AVX paired wins | Production median | Production vs scalar | Production wins | Bit-identical |")
+    print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
     for fx in rows:
         m = fx["median_ns"]; v = fx["vs_scalar_pct"]; w = fx["paired_wins"]
-        print(f"| {fx['channels']} | {fx['programme_seconds']} | {m['scalar']:,.0f} ns | {m['sse2']:,.0f} ns | {v['sse2']:+.3f}% | {w['sse2']}/{args.rounds} | {m['avx']:,.0f} ns | {v['avx']:+.3f}% | {w['avx']}/{args.rounds} | {'yes' if fx['bit_identical'] else 'NO'} |")
+        print(f"| {fx['channels']} | {fx['programme_seconds']} | {m['scalar']:,.0f} ns | {m['sse2']:,.0f} ns | {v['sse2']:+.3f}% | {w['sse2']}/{args.rounds} | {m['avx']:,.0f} ns | {v['avx']:+.3f}% | {w['avx']}/{args.rounds} | {m['production']:,.0f} ns | {v['production']:+.3f}% | {w['production']}/{args.rounds} | {'yes' if fx['bit_identical'] else 'NO'} |")
 
 if __name__ == "__main__":
     main()

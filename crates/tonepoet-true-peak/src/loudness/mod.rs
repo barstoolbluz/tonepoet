@@ -562,7 +562,7 @@ impl LoudnessMeter {
         }
 
         let simd_backend = match profile {
-            LoudnessProfile::NativeEbu2023 => simd::Backend::production(),
+            LoudnessProfile::NativeEbu2023 => simd::Backend::production(channels),
             LoudnessProfile::Libebur128126 => simd::Backend::scalar(),
         };
 
@@ -2359,7 +2359,15 @@ mod tests {
         )
         .unwrap();
 
+        let native_mono = LoudnessMeter::with_roles(
+            48_000,
+            &[ChannelRole::Mono],
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+
         assert_eq!(native.simd_backend.is_scalar(), !sse2_available);
+        assert!(native_mono.simd_backend.is_scalar());
         assert!(compatibility_default.simd_backend.is_scalar());
         assert!(compatibility_roles.simd_backend.is_scalar());
         assert_eq!(

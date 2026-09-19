@@ -5,7 +5,9 @@
 // bits, so paired scalar/SSE2/AVX rounds can be compared for speed and
 // bit identity. Not shipped; validation only.
 //
-//   loudness_simd_timing <scalar|sse2|avx> <channels> <programme_seconds> [sample_rate_hz] [seed]
+//   loudness_simd_timing <scalar|sse2|avx|production> <channels> <programme_seconds> [sample_rate_hz] [seed]
+//
+// `production` leaves the meter's own dispatch untouched.
 use std::env;
 use std::time::Instant;
 
@@ -18,6 +20,8 @@ fn roles(channels: usize) -> Result<Vec<ChannelRole>, String> {
     Ok(match channels {
         1 => vec![Mono],
         2 => vec![Left, Right],
+        4 => vec![Left, Right, LeftSurround, RightSurround],
+        5 => vec![Left, Right, Center, LeftSurround, RightSurround],
         6 => vec![Left, Right, Center, Lfe, LeftSurround, RightSurround],
         8 => vec![
             Left,
@@ -31,7 +35,7 @@ fn roles(channels: usize) -> Result<Vec<ChannelRole>, String> {
         ],
         other => {
             return Err(format!(
-                "unsupported channel count {other}; use 1, 2, 6, or 8"
+                "unsupported channel count {other}; use 1, 2, 4, 5, 6, or 8"
             ))
         }
     })
@@ -56,14 +60,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 6 {
         return Err(
-            "usage: loudness_simd_timing <scalar|sse2|avx> <channels> <programme_seconds> [sample_rate_hz] [seed]"
+            "usage: loudness_simd_timing <scalar|sse2|avx|production> <channels> <programme_seconds> [sample_rate_hz] [seed]"
                 .into(),
         );
     }
     let backend = match args[1].as_str() {
-        "scalar" => LoudnessSimdBackend::Scalar,
-        "sse2" => LoudnessSimdBackend::Sse2,
-        "avx" => LoudnessSimdBackend::Avx,
+        "scalar" => Some(LoudnessSimdBackend::Scalar),
+        "sse2" => Some(LoudnessSimdBackend::Sse2),
+        "avx" => Some(LoudnessSimdBackend::Avx),
+        "production" => None,
         other => return Err(format!("unknown backend: {other}").into()),
     };
     let channels: usize = args[2].parse()?;
@@ -81,7 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let roles = roles(channels)?;
     let mut meter = LoudnessMeter::with_roles(sample_rate, &roles, LoudnessProfile::NativeEbu2023)?;
-    meter.force_simd_backend_for_qualification(backend)?;
+    if let Some(backend) = backend {
+        meter.force_simd_backend_for_qualification(backend)?;
+    }
 
     // Programme: per-channel tone at a distinct frequency plus noise, with a
     // slow amplitude envelope so gating admits and rejects blocks.
