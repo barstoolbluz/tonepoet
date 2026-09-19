@@ -2606,3 +2606,26 @@ is enough), and tests that (1) the native loudness/true-peak decode yields the d
 count from it and (2) `:analyze`-shaped measurement and a ReplayGain-enabled conversion of it
 succeed. To be delivered with the #34 fix, and to stay as the regression guard for the scanner and
 repair tool that follows.
+
+### 35c. Native multi-FILE cross-surface authority parity
+
+Both defects found in the 2026-09-18/19 CUE-authority rounds were seams where individually sound
+components disagreed about the authoritative representation. The 42-row matrix
+`configured_metadata_authority_agrees_across_editor_queue_conversion_and_save_matrix` guards that
+seam for a single physical image only; `sole_structural_multifile_sidecar_and_embedded_obey_all_priority_orders`
+covers the six priority orders for the native multi-FILE structural path but, for an Embedded-winning
+order, stops at the staged synthetic CUE text and never carries the queued item across dispatch and
+conversion-output metadata.
+
+Required: one test on a two-carrier structural album (`side-a.flac`, `side-b.flac`, `album.cue`, one
+coherent native multi-FILE Embedded copy) for two priority orders,
+`[IndividualFiles, EmbeddedCue, SidecarCue]` and `[IndividualFiles, SidecarCue, EmbeddedCue]`, asserting the
+same album sentinel at four points: metadata-editor selected authority, folder queue expansion, the
+metadata sheet dispatched from the actual queued item, and conversion-output metadata through the
+writer seam the 42-row matrix already uses. IndividualFiles first proves the physical images are ruled
+nonviable before the two CUE authorities are compared. No audio encode; no further permutations.
+
+Three cheaper guardrails in the same area go into the next brief for this branch rather than here:
+the `PerCueDistinctTocHits` complement where the *later* scope is the Embedded winner; an explicit
+`album.cue` selection with a higher-priority Embedded peer beside it staying explicit; and a
+malformed-present-peer phase on `sole_structural_multifile_sidecar_survives_conflicting_embedded_copies`.
