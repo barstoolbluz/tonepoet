@@ -11,7 +11,7 @@
     "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
   },
   "source_review": {
-    "passed": false,
+    "passed": true,
     "files": [
       "src/cli/cli.cpp",
       "src/libshibatchdsp/dr_wav.hpp",
@@ -30,26 +30,39 @@
       "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode."
     ],
     "sleef_dft_type_path_audit": {
-      "passed": false,
-      "files": [],
-      "conclusions": [],
-      "unresolved_items": [
-        "The required SLEEF DFT construction/type-path audit has not yet been represented and bound to the exact SSRC build."
-      ]
+      "passed": true,
+      "audited_on": "2026-09-19",
+      "files": [
+        "src/libshibatchdsp/ObjectCache.hpp",
+        "src/libshibatchdsp/DFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilterMT.hpp",
+        "src/cli/cli.cpp",
+        "CMakeLists.txt",
+        "flake.nix"
+      ],
+      "conclusions": [
+        "ObjectCache.hpp:46-58: constructSleefDFT<T> is SFINAE-restricted to T=double or T=float and calls SleefDFT_double_init1d for double (line 48) and SleefDFT_float_init1d for float (line 53); no other DFT constructor exists in the audited tree.",
+        "DFTFilter.hpp:42-43, PartDFTFilter.hpp:82-83, PartDFTFilterMT.hpp:82-83: every DFT plan is constructed via constructSleefDFT<REAL> with the enclosing filter's own REAL template parameter; buffers are REAL (DFTFilter.hpp:32,45) and executed with SleefDFT_execute on those buffers, so a Pipeline<double> never constructs or executes a float DFT.",
+        "cli.cpp:803-812: profile.doublePrecision selects Pipeline<double>; the built-in high, long, and insane profiles carry doublePrecision=true, standard/short/fast/lightning carry false. Ad-hoc numeric profiles ending in 'd' also select double but are outside the qualified scope.",
+        "CMakeLists.txt:106-137: SLEEF is built from submodules/sleef via ExternalProject with -DSLEEF_BUILD_DFT=True -DSLEEF_ENFORCE_DFT=True and linked as static sleefdft/sleef/tlfloat; SLEEF_GIT_TAG is 0c063a8f0e01c22fa1e473effd2e7a0c69b4963a (line 109).",
+        "flake.nix:14-20 declares sleefSrc = fetchFromGitHub shibatch/sleef rev 0c063a8f0e01c22fa1e473effd2e7a0c69b4963a sha256-BM88tQAImtQuKKBSPT0hE659cfe6FVzxKSF3TSrbknk= fetchSubmodules=true; the commissioned derivation's preConfigure copies that fetched source into submodules/sleef before configure, so the ExternalProject path (CMakeLists.txt:128) is the one taken.",
+        "The commissioned executable has no dynamic SLEEF dependency (ldd lists only glibc libm/libc) and embeds sleef_internal and SleefDFT symbols, consistent with the static submodule build; the nixpkgs sleef-4.0.0 in buildInputs is not what the executable links."
+      ],
+      "unresolved_items": []
     },
-    "unresolved_items": [
-      "Source-level Pipeline<double> dispatch is documented, but the required SLEEF DFT construction/type-path audit remains incomplete."
-    ]
+    "unresolved_items": []
   },
   "build_audit": {
-    "passed": false,
-    "build_closure": null,
-    "compiler_configuration": null,
-    "executable_sha256": null,
-    "unresolved_items": [
-      "No exact production SSRC executable/build closure is present in this implementation environment.",
-      "Compiler/build flags for a commissioned executable have not been bound to an executable digest.",
-      "Architecture-specific executable characterization has not been completed."
-    ]
+    "passed": true,
+    "audited_on": "2026-09-19",
+    "build_closure": "/nix/store/839i5bjn28x8p4pcfcy0ps990g5z7s8n-ssrc-2.4.2.drv",
+    "build_output": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2",
+    "compiler_configuration": "gcc 15.2.0 (nixpkgs stdenv); cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_CLI=ON -DCMAKE_C_VISIBILITY_PRESET=default -DCMAKE_CXX_VISIBILITY_PRESET=default; no NIX_CFLAGS_COMPILE/CFLAGS/CXXFLAGS overrides; SLEEF static via ExternalProject at CMAKE_BUILD_TYPE=Release",
+    "executable_sha256": "dc401841d580a7b322038b38551f309fc63fac2af36bf3647f031177c19bef19",
+    "executable_path": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2/bin/ssrc",
+    "source_store_path": "/nix/store/s230gjvqwl86rnxdxh655s4a06w88pir-rvdhhd6yli4alqi3lk173ifk8dhal0ls-source",
+    "architecture": "x86_64-linux",
+    "unresolved_items": []
   }
 }

@@ -1,0 +1,431 @@
+{
+  "activation_path": {
+    "protected_ingress_authority_id": "tonepoet:protected-pcm-f64le-riff-ingress/v1",
+    "protected_ingress_boundary_contract": "source-rate/channel-preserving IEEE Float64 RIFF WAV; no gain/dither/mix/resample"
+  },
+  "audit_identity_consistency": {
+    "mismatches": [],
+    "passed": true
+  },
+  "commissioning": {
+    "decision": "outcome_c_evidence_unavailable",
+    "reason": [
+      "one or more Tonepoet protected physical-cell checks failed",
+      "one or more finite characterization cells failed"
+    ]
+  },
+  "container_validation": {
+    "independent_payload_identity": "exact SHA-256 copy check per characterized cell",
+    "independent_w64_structure": "exact parser executed per characterized cell",
+    "tonepoet_exact_w64_physical_cell": {
+      "all_characterized_cells_passed": false,
+      "helper": {
+        "path": "/home/daedalus/dev/tonepoet/target/release/ssrc_w64_qualification",
+        "sha256": "a4260ad7193d283abd38513cf9a914bdd32d3af46f92e0feae4c4ca5af0ac2b5"
+      },
+      "implementation": "tonepoet-pipeline::copy_exact_w64_pcm_payload",
+      "required": true
+    }
+  },
+  "contract_id": "TonepoetBinary64OverloadPreservingResampleV1",
+  "dependency_identity": {
+    "build_closure": "/nix/store/839i5bjn28x8p4pcfcy0ps990g5z7s8n-ssrc-2.4.2.drv",
+    "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
+  },
+  "evidence_identity": {
+    "note": "The concrete EvidenceIdentity is emitted after the report is finalized to avoid self-reference.",
+    "scheme": "sha256",
+    "subject": "finalized qualification report bytes"
+  },
+  "executable": {
+    "build_info": "gcc 15.2.0 (nixpkgs stdenv); cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_CLI=ON -DCMAKE_C_VISIBILITY_PRESET=default -DCMAKE_CXX_VISIBILITY_PRESET=default; no NIX_CFLAGS_COMPILE/CFLAGS/CXXFLAGS overrides; SLEEF static via ExternalProject at CMAKE_BUILD_TYPE=Release",
+    "qualification_path": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2/bin/ssrc",
+    "sha256": "dc401841d580a7b322038b38551f309fc63fac2af36bf3647f031177c19bef19",
+    "version": "Shibatch Sample Rate Converter  Version 2.4.2"
+  },
+  "harness": {
+    "fixtures": "deterministic settling-aware Float64 overload/narrowing/multichannel corpus",
+    "results": [
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "high",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "long",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 48000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 96000,
+        "target_rate_hz": 44100
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 44100,
+        "target_rate_hz": 96000
+      },
+      {
+        "channels": 1,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      },
+      {
+        "channels": 2,
+        "error": "Float64 Wave64 fact chunk does not match payload frame count",
+        "passed": false,
+        "profile": "insane",
+        "source_rate_hz": 88200,
+        "target_rate_hz": 48000
+      }
+    ],
+    "source_digest": "6ef97ae3993c0d11c2f36408688405a5ada0d7731f3af76ebdb6da4c2ffab148",
+    "tolerances": {
+      "binary32_narrowing": "exact payload inequality against binary32-rounded control",
+      "finite": "exact predicate",
+      "overload": "requires output extrema beyond +/-1.25 from +/-1.5 and +/-2.0 plateaus",
+      "payload_identity": "exact",
+      "settled_dc_gain": {
+        "absolute_gain_tolerance": 0.01,
+        "rationale": "central-plateau gain must match the declared attenuation closely enough to reject gross hidden normalization",
+        "settle_fraction_each_edge": 0.25
+      },
+      "w64_structure": "exact"
+    }
+  },
+  "outcome": "pending",
+  "platform": {
+    "arch": "x86_64",
+    "os": "Linux"
+  },
+  "schema_version": 1,
+  "source_identity": {
+    "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU=",
+    "owner": "barstoolbluz",
+    "repo": "ssrc",
+    "rev": "b769add0756157ea88d1bbf9023e06c437485a79"
+  },
+  "ssrc_scope": {
+    "architecture_scope": [
+      "x86_64"
+    ],
+    "attenuation": "0.0",
+    "input_container": "wav",
+    "input_format": "pcm_f64le",
+    "output_container": "w64",
+    "output_format": "pcm_f64le",
+    "phase_modes": [
+      "linear"
+    ],
+    "profiles": [
+      "high",
+      "long",
+      "insane"
+    ],
+    "rate_scope": [
+      [
+        44100,
+        48000
+      ],
+      [
+        48000,
+        44100
+      ],
+      [
+        96000,
+        44100
+      ],
+      [
+        44100,
+        96000
+      ],
+      [
+        88200,
+        48000
+      ]
+    ],
+    "single_precision_refuted_profiles": [
+      "standard",
+      "short",
+      "fast",
+      "lightning"
+    ]
+  },
+  "static_audit": {
+    "build_audit": {
+      "architecture": "x86_64-linux",
+      "audited_on": "2026-09-19",
+      "build_closure": "/nix/store/839i5bjn28x8p4pcfcy0ps990g5z7s8n-ssrc-2.4.2.drv",
+      "build_output": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2",
+      "compiler_configuration": "gcc 15.2.0 (nixpkgs stdenv); cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_CLI=ON -DCMAKE_C_VISIBILITY_PRESET=default -DCMAKE_CXX_VISIBILITY_PRESET=default; no NIX_CFLAGS_COMPILE/CFLAGS/CXXFLAGS overrides; SLEEF static via ExternalProject at CMAKE_BUILD_TYPE=Release",
+      "executable_path": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2/bin/ssrc",
+      "executable_sha256": "dc401841d580a7b322038b38551f309fc63fac2af36bf3647f031177c19bef19",
+      "passed": true,
+      "source_store_path": "/nix/store/s230gjvqwl86rnxdxh655s4a06w88pir-rvdhhd6yli4alqi3lk173ifk8dhal0ls-source",
+      "unresolved_items": []
+    },
+    "contract_id": "TonepoetBinary64OverloadPreservingResampleV1",
+    "dependency_identity": {
+      "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
+    },
+    "schema_version": 1,
+    "source_identity": {
+      "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU=",
+      "owner": "barstoolbluz",
+      "repo": "ssrc",
+      "rev": "b769add0756157ea88d1bbf9023e06c437485a79"
+    },
+    "source_review": {
+      "conclusions": [
+        "High, Long, and Insane dispatch to Pipeline<double> at the audited revision.",
+        "Standard, Short, Fast, and Lightning dispatch to Pipeline<float> and are refuted for the strong Binary64 contract only.",
+        "The audited double path reads and writes IEEE Float64 directly and keeps the inspected signal path templated on the same REAL type.",
+        "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode."
+      ],
+      "files": [
+        "src/cli/cli.cpp",
+        "src/libshibatchdsp/dr_wav.hpp",
+        "src/libshibatchdsp/SRC.hpp",
+        "src/libshibatchdsp/FastPP.hpp",
+        "src/libshibatchdsp/DFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilter.hpp",
+        "src/libshibatchdsp/PartDFTFilterMT.hpp",
+        "src/libshibatchdsp/Kaiser.hpp",
+        "src/libshibatchdsp/Minrceps.hpp"
+      ],
+      "passed": true,
+      "sleef_dft_type_path_audit": {
+        "audited_on": "2026-09-19",
+        "conclusions": [
+          "ObjectCache.hpp:46-58: constructSleefDFT<T> is SFINAE-restricted to T=double or T=float and calls SleefDFT_double_init1d for double (line 48) and SleefDFT_float_init1d for float (line 53); no other DFT constructor exists in the audited tree.",
+          "DFTFilter.hpp:42-43, PartDFTFilter.hpp:82-83, PartDFTFilterMT.hpp:82-83: every DFT plan is constructed via constructSleefDFT<REAL> with the enclosing filter's own REAL template parameter; buffers are REAL (DFTFilter.hpp:32,45) and executed with SleefDFT_execute on those buffers, so a Pipeline<double> never constructs or executes a float DFT.",
+          "cli.cpp:803-812: profile.doublePrecision selects Pipeline<double>; the built-in high, long, and insane profiles carry doublePrecision=true, standard/short/fast/lightning carry false. Ad-hoc numeric profiles ending in 'd' also select double but are outside the qualified scope.",
+          "CMakeLists.txt:106-137: SLEEF is built from submodules/sleef via ExternalProject with -DSLEEF_BUILD_DFT=True -DSLEEF_ENFORCE_DFT=True and linked as static sleefdft/sleef/tlfloat; SLEEF_GIT_TAG is 0c063a8f0e01c22fa1e473effd2e7a0c69b4963a (line 109).",
+          "flake.nix:14-20 declares sleefSrc = fetchFromGitHub shibatch/sleef rev 0c063a8f0e01c22fa1e473effd2e7a0c69b4963a sha256-BM88tQAImtQuKKBSPT0hE659cfe6FVzxKSF3TSrbknk= fetchSubmodules=true; the commissioned derivation's preConfigure copies that fetched source into submodules/sleef before configure, so the ExternalProject path (CMakeLists.txt:128) is the one taken.",
+          "The commissioned executable has no dynamic SLEEF dependency (ldd lists only glibc libm/libc) and embeds sleef_internal and SleefDFT symbols, consistent with the static submodule build; the nixpkgs sleef-4.0.0 in buildInputs is not what the executable links."
+        ],
+        "files": [
+          "src/libshibatchdsp/ObjectCache.hpp",
+          "src/libshibatchdsp/DFTFilter.hpp",
+          "src/libshibatchdsp/PartDFTFilter.hpp",
+          "src/libshibatchdsp/PartDFTFilterMT.hpp",
+          "src/cli/cli.cpp",
+          "CMakeLists.txt",
+          "flake.nix"
+        ],
+        "passed": true,
+        "unresolved_items": []
+      },
+      "unresolved_items": []
+    }
+  },
+  "tonepoet_source_identity": "git:4956734cc81889c2d92715c4274ed2905479c8d1"
+}
