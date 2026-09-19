@@ -3434,7 +3434,7 @@ mod bluray_queue_admission_tests {
     }
 
     #[test]
-    fn add_directory_rejects_ambiguous_folder_cues_instead_of_silently_queuing_nothing() {
+    fn add_directory_uses_deterministic_default_for_same_image_sidecars() {
         let temp = TempDir::new("add-directory-ambiguous-cues");
         let album = temp.path.join("album");
         fs::create_dir_all(&album).expect("album dir");
@@ -3449,20 +3449,15 @@ mod bluray_queue_admission_tests {
 
         let mut manager = ConversionManager::new(ConversionConfig::default());
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let err = rt
-            .block_on(manager.add_directory(&album, ConversionOptions::default()))
-            .expect_err("ambiguous noninteractive directory admission must fail explicitly");
-
-        match err {
-            ConversionError::ValidationError(message) => {
-                assert!(message.contains("require a selection"));
-                assert!(message.contains("album-main.cue"));
-                assert!(message.contains("album-alt.cue"));
-            }
-            other => panic!("expected validation failure, got {other:?}"),
-        }
+        rt.block_on(manager.add_directory(&album, ConversionOptions::default()))
+            .expect("same-image sidecar alternatives must have a deterministic aggregate default");
         let queue = manager.queue.try_read().expect("queue read lock");
-        assert_eq!(queue.total_items(), 0);
+        assert_eq!(queue.total_items(), 1);
+        assert_eq!(
+            queue.all_items()[0].input_path,
+            album.join("album-alt.cue"),
+            "stable path ordering must select the same aggregate sidecar as editor/conversion discovery",
+        );
     }
 
     #[test]

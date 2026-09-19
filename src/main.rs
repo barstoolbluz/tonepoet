@@ -4445,7 +4445,7 @@ FILE "side_b.flac" WAVE
     }
 
     #[test]
-    fn ambiguous_folder_cues_are_reported_instead_of_silently_planning_zero_items() {
+    fn same_image_folder_cues_use_deterministic_aggregate_default() {
         let temp = tempfile::tempdir().expect("tempdir");
         touch(&temp.path().join("album.flac"));
         for cue_name in ["album-main.cue", "album-alt.cue"] {
@@ -4458,11 +4458,8 @@ FILE "side_b.flac" WAVE
 
         let planned = plan_cli_convert_queue(&[temp.path().to_path_buf()]);
 
-        assert!(planned.items.is_empty());
-        assert_eq!(planned.errors.len(), 1);
-        assert!(planned.errors[0].contains("require a selection"));
-        assert!(planned.errors[0].contains("album-main.cue"));
-        assert!(planned.errors[0].contains("album-alt.cue"));
+        assert_eq!(planned_names(&planned), vec!["album-alt.cue"]);
+        assert!(planned.errors.is_empty());
     }
 
     /// Explicitly naming a CUE on the command line keeps explicit semantics

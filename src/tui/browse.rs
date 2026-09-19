@@ -7207,6 +7207,7 @@ impl BrowseState {
                         cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        explicit_cue_source_policy: None,
                         cue_selection_prompt: None,
                     };
                 }
@@ -7217,6 +7218,7 @@ impl BrowseState {
                         cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        explicit_cue_source_policy: None,
                         cue_selection_prompt: None,
                     };
                 }
@@ -7233,6 +7235,7 @@ impl BrowseState {
                         cue_artifact_metadata: std::collections::BTreeMap::new(),
                         synthetic_cue_artifacts: HashSet::new(),
                         expansion_errors: Vec::new(),
+                        explicit_cue_source_policy: None,
                         cue_selection_prompt: None,
                     };
                 }

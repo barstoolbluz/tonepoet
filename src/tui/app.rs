@@ -962,13 +962,15 @@ pub(crate) fn resolve_convert_preview_authority(
         crate::convert::pipeline::SidecarCueTrackMetadataSource,
     >,
     metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+    explicit_cue_source_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
 ) -> crate::convert::queue_expansion::CueArtifactCommitDecision {
     crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
         path,
         cue_artifact_audio,
         cue_artifact_metadata,
         metadata_target_priority,
-        crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+        explicit_cue_source_policy
+            .unwrap_or(crate::convert::pipeline::CueSidecarPolicy::PreferSidecar),
     )
 }
 
@@ -3925,6 +3927,10 @@ pub struct SourceState {
         PathBuf,
         crate::convert::pipeline::SidecarCueTrackMetadataSource,
     >,
+    /// Exact CUE read authority explicitly selected for the current Convert
+    /// operation. This is operation-scoped state; it never mutates the user's
+    /// aggregate metadata hierarchy.
+    pub explicit_cue_source_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
     /// Synthetic CUE queue inputs staged for a merged split-CUE album while the
     /// Convert screen is in review. Commit transfers these artifacts to the
     /// conversion manager; replacing or clearing the source removes them.
@@ -3978,6 +3984,7 @@ impl Clone for SourceState {
             batch_probe_debounce: self.batch_probe_debounce.clone(),
             cue_artifact_audio: self.cue_artifact_audio.clone(),
             cue_artifact_metadata: self.cue_artifact_metadata.clone(),
+            explicit_cue_source_policy: self.explicit_cue_source_policy,
             synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
     }
@@ -3998,6 +4005,7 @@ impl Default for SourceState {
             batch_probe_debounce: None,
             cue_artifact_audio: std::collections::HashSet::new(),
             cue_artifact_metadata: std::collections::BTreeMap::new(),
+            explicit_cue_source_policy: None,
             synthetic_cue_artifacts: std::collections::HashSet::new(),
         }
     }
@@ -6840,6 +6848,7 @@ impl ConvertState {
         self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
         self.source.batch_probe_pending = None;
         self.source.batch_probe_debounce = None;
+        self.source.explicit_cue_source_policy = None;
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
         self.refresh_source_constraints_preserving_format_selection();
@@ -9786,8 +9795,13 @@ impl std::ops::DerefMut for MetadataEditorState {
 }
 
 
-/// State for the metadata editor overlay.
-///
+/// Pending writes for independently editable metadata-source presentations.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataSourceSaveBatch {
+    pub remaining_tabs: Vec<usize>,
+    pub close_after: bool,
+}
+
 /// Metadata editor overlay state.
 ///
 /// This wrapper connects the authoritative `MetadataEditorModel` to the rest of
@@ -9828,6 +9842,16 @@ pub struct MetadataEditorState {
     /// Apply command deliberately sets this false so users can save from any
     /// tab without losing editor context.
     pub close_after_successful_save: bool,
+
+    /// These presentations are independently writable metadata sources for the
+    /// same selected content scope. Apply/OK therefore saves every dirty source
+    /// back to its own physical target rather than only the currently visible tab.
+    pub source_selector_presentations: bool,
+    pub(crate) source_save_batch: Option<MetadataSourceSaveBatch>,
+    /// Apply/OK encountered a validated newly-authored chapter map and started
+    /// the structural CUE write first. Resume the ordinary metadata save after
+    /// that structure commits so one user action remains one save operation.
+    pub(crate) resume_metadata_save_after_chapter: bool,
 
     /// Cooperative cancellation flag for the active tag-grid save or invalid-APE
     /// repair, if any. Both operations use the same worker completion protocol
@@ -9873,6 +9897,9 @@ impl MetadataEditorState {
             archive_edit_context: None,
             archive_staging_dirty: false,
             close_after_successful_save: true,
+            source_selector_presentations: false,
+            source_save_batch: None,
+            resume_metadata_save_after_chapter: false,
             metadata_write_cancel: None,
             invalid_ape_repair: None,
             artwork_write_cancel: None,
@@ -9883,6 +9910,42 @@ impl MetadataEditorState {
     pub fn mark_archive_staging_dirty(&mut self) {
         if self.archive_edit_context.is_some() {
             self.archive_staging_dirty = true;
+        }
+    }
+
+    pub(crate) fn dirty_source_presentation_indices(&self) -> Vec<usize> {
+        if !self.source_selector_presentations {
+            return Vec::new();
+        }
+        self.presentation_tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| presentation_tab_has_changes(tab).then_some(index))
+            .collect()
+    }
+
+    pub(crate) fn begin_source_save_batch_if_needed(&mut self) {
+        if !self.source_selector_presentations || self.source_save_batch.is_some() {
+            return;
+        }
+        let mut dirty = self.dirty_source_presentation_indices();
+        if dirty.is_empty() {
+            return;
+        }
+        if let Some(position) = dirty.iter().position(|index| *index == self.active_tab) {
+            dirty.swap(0, position);
+        }
+        let first = dirty.remove(0);
+        if first != self.active_tab {
+            self.switch_presentation_tab(first);
+        }
+        if !dirty.is_empty() {
+            let close_after = self.close_after_successful_save;
+            self.close_after_successful_save = false;
+            self.source_save_batch = Some(MetadataSourceSaveBatch {
+                remaining_tabs: dirty,
+                close_after,
+            });
         }
     }
 
@@ -16244,6 +16307,7 @@ impl AppState {
             &std::collections::HashSet::new(),
             &std::collections::BTreeMap::new(),
             &self.config.conversion.aggregate_metadata_target_priority,
+            None,
         );
         let cue_policy = preview_authority.cue_sidecar_override;
         let (info, metadata, probe_notice) = probe_convert_source_for_message(
@@ -19056,6 +19120,7 @@ FILE "album.flac" FLAC
             &std::collections::HashSet::new(),
             &std::collections::BTreeMap::new(),
             &[EmbeddedCue, SidecarCue, IndividualFiles],
+            None,
         );
         let policy = authority
             .cue_sidecar_override
@@ -19148,6 +19213,7 @@ FILE "track.flac" FLAC
             &artifact_audio,
             &artifact_metadata,
             &[SidecarCue, IndividualFiles, EmbeddedCue],
+            None,
         );
         assert_eq!(
             authority.cue_sidecar_override,
@@ -19210,6 +19276,7 @@ FILE "album.flac" FLAC
             &std::collections::HashSet::new(),
             &std::collections::BTreeMap::new(),
             &[EmbeddedCue, SidecarCue, IndividualFiles],
+            None,
         );
         let policy = authority
             .cue_sidecar_override

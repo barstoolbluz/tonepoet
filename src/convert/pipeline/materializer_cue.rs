@@ -920,26 +920,25 @@ fn validated_embedded_single_image_cuesheet(path: &Path) -> Option<CueSheet> {
     validate_embedded_single_image_layout(&sheet).is_ok().then_some(sheet)
 }
 
-/// Read viability for an explicitly requested embedded CUE. Automatic
-/// aggregate-metadata authority additionally requires a writable persistence
-/// target; exact EmbeddedOnly consumers may still read a supported read-only
-/// carrier.
+/// Read viability for an embedded CUE representation. Aggregate authority is
+/// a read/selection decision; representation-specific write capability is
+/// carried separately by the metadata editor and must not change priority.
 pub(crate) fn embedded_single_image_cuesheet_is_read_viable(path: &Path) -> bool {
     validated_embedded_single_image_cuesheet(path).is_some()
 }
 
-/// The one read/write viability predicate used when configured aggregate
-/// metadata priority is choosing an embedded authority automatically.
+/// Viability used when configured aggregate metadata priority is choosing an
+/// embedded authority automatically. A readable, structurally applicable
+/// CUESHEET remains eligible even when Tonepoet cannot rewrite that carrier.
 pub(crate) fn embedded_single_image_cuesheet_is_automatic_authority_viable(
     path: &Path,
 ) -> bool {
-    crate::metadata_persistence::embedded_cue_metadata_target_is_writable(path)
-        && embedded_single_image_cuesheet_is_read_viable(path)
+    embedded_single_image_cuesheet_is_read_viable(path)
 }
 
 /// Return the one physical image carrying a valid embedded-CUE peer for a
 /// queued sidecar CUE. This helper establishes read viability only; automatic
-/// authority selection applies the shared persistence gate below.
+/// authority selection must not add a persistence gate.
 pub(crate) fn embedded_cuesheet_peer_image_for_sidecar_cue(
     cue_path: &Path,
 ) -> Option<PathBuf> {
@@ -949,13 +948,11 @@ pub(crate) fn embedded_cuesheet_peer_image_for_sidecar_cue(
     embedded_single_image_cuesheet_is_read_viable(&image).then_some(image)
 }
 
-/// Whether a queued sidecar CUE has a viable embedded peer for automatic
-/// read/write metadata authority selection.
+/// Whether a queued sidecar CUE has a readable, structurally applicable
+/// embedded peer for automatic metadata authority selection. Write support is
+/// intentionally not part of this authority fact.
 pub(crate) fn embedded_cuesheet_is_viable_for_sidecar_cue(cue_path: &Path) -> bool {
-    embedded_cuesheet_peer_image_for_sidecar_cue(cue_path)
-        .is_some_and(|image| {
-            crate::metadata_persistence::embedded_cue_metadata_target_is_writable(&image)
-        })
+    embedded_cuesheet_peer_image_for_sidecar_cue(cue_path).is_some()
 }
 
 /// Read the CUE sheet selected by an already-resolved exact authority policy.
@@ -1043,10 +1040,7 @@ pub(crate) fn direct_audio_cue_viability(
     let embedded_sheet = embedded_allowed
         .then(|| validated_embedded_single_image_cuesheet(path))
         .flatten();
-    let embedded_read_viable = embedded_sheet.is_some();
-    let embedded_cue = embedded_read_viable
-        && (cue_source_policy == CueSidecarPolicy::EmbeddedOnly
-            || crate::metadata_persistence::embedded_cue_metadata_target_is_writable(path));
+    let embedded_cue = embedded_sheet.is_some();
     let embedded_image_evidence = embedded_sheet
         .as_ref()
         .is_some_and(|sheet| sheet.tracks.len() >= 2);
@@ -1102,35 +1096,39 @@ fn sidecar_cue_route_candidate(image: &Path) -> Result<Option<PathBuf>, SourceDe
 
     let candidates = sidecar_cue_candidates(image)?;
     let same_stem = same_stem_sidecars(image, &candidates);
-    match same_stem.len() {
-        0 => {}
-        1 => {
-            if sidecar_cue_is_usable_for_image(&same_stem[0], image)? {
-                return Ok(Some(same_stem[0].clone()));
-            }
-        }
-        _ => {
-            return Err(SourceDetectError::AmbiguousCue(format!(
-                "multiple same-stem CUE files found beside {}",
-                image.display()
-            )));
+    let mut eligible = Vec::new();
+    for candidate in &candidates {
+        let same_stem_candidate = same_stem.iter().any(|path| path == candidate);
+        let qualifies = if same_stem_candidate {
+            sidecar_cue_is_usable_for_image(candidate, image)?
+        } else {
+            sidecar_cue_subdivides_image(candidate, image)?
+        };
+        if qualifies {
+            eligible.push(candidate.clone());
         }
     }
 
-    let mut matching = Vec::new();
-    for cue_path in candidates {
-        if sidecar_cue_subdivides_image(&cue_path, image)? {
-            matching.push(cue_path);
-        }
-    }
-
-    match matching.len() {
+    match eligible.len() {
         0 => Ok(None),
-        1 => Ok(matching.into_iter().next()),
-        _ => Err(SourceDetectError::AmbiguousCue(format!(
-            "multiple matching CUE files found beside {}",
-            image.display()
-        ))),
+        1 => Ok(eligible.into_iter().next()),
+        _ => {
+            // Only same-image alternatives gain deterministic metadata-source
+            // ranking. A multi-FILE candidate still represents a materially
+            // different content interpretation and therefore remains
+            // fail-closed when it conflicts with another eligible CUE.
+            let ranked = crate::convert::split_cue_album::ranked_single_image_cue_candidates_for_audio(
+                &eligible,
+                image,
+            );
+            if ranked.len() == eligible.len() {
+                return Ok(ranked.first().map(|member| member.cue_path.clone()));
+            }
+            Err(SourceDetectError::AmbiguousCue(format!(
+                "multiple structurally distinct CUE files found beside {}",
+                image.display()
+            )))
+        }
     }
 }
 
@@ -1204,55 +1202,35 @@ fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, Mat
 
     let candidates = sidecar_cue_candidates(image).map_err(source_detect_to_materialize)?;
     let same_stem = same_stem_sidecars(image, &candidates);
-    match same_stem.len() {
-        0 => {}
-        1 => {
-            validate_sidecar_cue_matches_image(&same_stem[0], image)?;
-            return Ok(Some(same_stem[0].clone()));
-        }
-        _ => {
-            return Err(MaterializeError::Parse(format!(
-                "multiple same-stem CUE files found beside {}",
-                image.display()
-            )));
-        }
-    }
-
-    let mut matching = Vec::new();
-    for cue_path in candidates {
-        match sidecar_cue_subdivides_image_materialize(&cue_path, image) {
-            Ok(true) => matching.push(cue_path),
-            Ok(false) => {}
-            Err(_) => {
-                // A non-stem CUE may belong to another image in the directory.
-                // Only same-stem sidecars are treated as authoritative enough to
-                // convert parse/layout errors into MaterializeError::Parse.
-            }
+    let mut eligible = Vec::new();
+    for candidate in &candidates {
+        let same_stem_candidate = same_stem.iter().any(|path| path == candidate);
+        let qualifies = if same_stem_candidate {
+            sidecar_cue_matches_image(candidate, image)?
+        } else {
+            sidecar_cue_subdivides_image_materialize(candidate, image).unwrap_or(false)
+        };
+        if qualifies {
+            eligible.push(candidate.clone());
         }
     }
 
-    match matching.len() {
+    match eligible.len() {
         0 => Ok(None),
-        1 => Ok(matching.into_iter().next()),
-        _ => Err(MaterializeError::Parse(format!(
-            "multiple matching CUE files found beside {}",
-            image.display()
-        ))),
-    }
-}
-
-fn validate_sidecar_cue_matches_image(
-    cue_path: &Path,
-    image: &Path,
-) -> Result<(), MaterializeError> {
-    if sidecar_cue_matches_image(cue_path, image)? {
-        Ok(())
-    } else {
-        Err(MaterializeError::Parse(format!(
-            "CUE file {} does not reference input image {}",
-            cue_path.display(),
-            image.display()
-        )))
+        1 => Ok(eligible.into_iter().next()),
+        _ => {
+            let ranked = crate::convert::split_cue_album::ranked_single_image_cue_candidates_for_audio(
+                &eligible,
+                image,
+            );
+            if ranked.len() == eligible.len() {
+                return Ok(ranked.first().map(|member| member.cue_path.clone()));
+            }
+            Err(MaterializeError::Parse(format!(
+                "multiple structurally distinct CUE files found beside {}",
+                image.display()
+            )))
+        }
     }
 }
 
@@ -6947,6 +6925,51 @@ FILE "track2.flac" WAVE
             discovered, None,
             "a split track listed once in an album CUE must not adopt that CUE"
         );
+    }
+
+    #[test]
+    fn sidecar_discovery_prefers_exact_reference_over_repaired_same_image_candidate() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image = temp.path().join("album.flac");
+        let repaired_cue = temp.path().join("a-repaired.cue");
+        let exact_cue = temp.path().join("z-exact.cue");
+        std::fs::write(&image, b"fake-audio-data").expect("image fixture");
+        std::fs::write(
+            &repaired_cue,
+            br#"TITLE "Repaired Candidate"
+FILE "album.wav" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("repaired sidecar");
+        std::fs::write(
+            &exact_cue,
+            br#"TITLE "Exact Candidate"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 01 03:00:00
+"#,
+        )
+        .expect("exact sidecar");
+
+        let route = sidecar_cue_route_candidate(&image)
+            .expect("same-image alternatives should resolve deterministically")
+            .expect("one sidecar should win");
+        assert_eq!(route, exact_cue, "an exact FILE reference must outrank a repaired reference even when its filename sorts later");
+
+        let materializer = find_valid_sidecar_cue_for_image(&image)
+            .expect("materializer discovery should use the same ranking")
+            .expect("one sidecar should win");
+        assert_eq!(materializer, exact_cue);
+
+        let sheet = validated_cue_sheet_for_exact_policy(&image, CueSidecarPolicy::SidecarOnly)
+            .expect("exact Sidecar-only authority should load the ranked winner");
+        assert_eq!(sheet.title.as_deref(), Some("Exact Candidate"));
     }
 
     #[test]

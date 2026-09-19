@@ -4998,6 +4998,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
                 &app.convert.source.cue_artifact_audio,
                 &app.convert.source.cue_artifact_metadata,
                 &app.config.conversion.aggregate_metadata_target_priority,
+                app.convert.source.explicit_cue_source_policy,
             );
             let cue_policy = preview_authority.cue_sidecar_override;
             app.convert.apply_source_defaults();
@@ -8818,6 +8819,7 @@ fn queue_browse_convert_paths_for_processing(
         cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
+        explicit_cue_source_policy,
         ..
     } = queue;
     let cumulative_cue_warning =
@@ -8896,7 +8898,8 @@ fn queue_browse_convert_paths_for_processing(
                 &cue_artifact_audio,
                 &cue_artifact_metadata,
                 &app.config.conversion.aggregate_metadata_target_priority,
-                crate::convert::pipeline::CueSidecarPolicy::PreferSidecar,
+                explicit_cue_source_policy
+                    .unwrap_or(crate::convert::pipeline::CueSidecarPolicy::PreferSidecar),
             );
         let archive_reference = archive_password
             .as_deref()
@@ -9024,6 +9027,7 @@ pub(crate) fn install_browse_convert_source_paths(
         cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
+        explicit_cue_source_policy,
         ..
     } = queue;
     let cumulative_cue_warning =
@@ -9149,6 +9153,7 @@ pub(crate) fn install_browse_convert_source_paths(
     app.convert.set_source_mode(mode);
     app.convert.source.cue_artifact_audio = cue_artifact_audio;
     app.convert.source.cue_artifact_metadata = cue_artifact_metadata;
+    app.convert.source.explicit_cue_source_policy = explicit_cue_source_policy;
     app.convert.source.synthetic_cue_artifacts = synthetic_cue_artifacts;
     if !queue_paths_prepared_off_reducer {
         app.convert.source.cue_artifact_audio.retain(|path| {
@@ -9172,6 +9177,7 @@ pub(crate) fn install_browse_convert_source_paths(
         &app.convert.source.cue_artifact_audio,
         &app.convert.source.cue_artifact_metadata,
         &app.config.conversion.aggregate_metadata_target_priority,
+        app.convert.source.explicit_cue_source_policy,
     );
     let cue_policy = preview_authority.cue_sidecar_override;
     app.convert.apply_source_defaults();
@@ -9269,6 +9275,7 @@ fn finish_browse_queue_review_after_expansion(
         mut cue_artifact_metadata,
         synthetic_cue_artifacts,
         expansion_errors,
+        explicit_cue_source_policy,
         ..
     } = queue;
     if let Some(err) = expansion_errors.first() {
@@ -9335,6 +9342,7 @@ fn finish_browse_queue_review_after_expansion(
             cue_artifact_metadata,
             synthetic_cue_artifacts,
             expansion_errors,
+            explicit_cue_source_policy,
             cue_selection_prompt: None,
         },
         expanded_folder_count,
@@ -9376,6 +9384,7 @@ pub(crate) fn execute_queue_with_post_load_commit(
         preset,
         BrowseConvertPostLoad::Commit { start },
         None,
+        None,
     );
 }
 
@@ -9392,6 +9401,7 @@ pub(crate) fn execute_queue_with_post_load_commit_for_selection(
         preset,
         BrowseConvertPostLoad::Commit { start },
         Some(selection),
+        None,
     );
 }
 
@@ -9402,6 +9412,7 @@ fn execute_queue(app: &mut AppState, tx: &mpsc::Sender<AppMessage>, preset: Opti
         tx,
         preset,
         BrowseConvertPostLoad::ReviewOnly,
+        None,
         None,
     );
 }
@@ -9418,6 +9429,43 @@ pub(crate) fn execute_queue_for_selection(
         preset,
         BrowseConvertPostLoad::ReviewOnly,
         Some(selection),
+        None,
+    );
+}
+
+
+pub(crate) fn execute_queue_with_post_load_commit_for_explicit_source(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+    start: bool,
+    selection: Vec<PathBuf>,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) {
+    execute_queue_with_post_load(
+        app,
+        tx,
+        preset,
+        BrowseConvertPostLoad::Commit { start },
+        Some(selection),
+        Some(cue_policy),
+    );
+}
+
+pub(crate) fn execute_queue_for_explicit_source(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    preset: Option<String>,
+    selection: Vec<PathBuf>,
+    cue_policy: crate::convert::pipeline::CueSidecarPolicy,
+) {
+    execute_queue_with_post_load(
+        app,
+        tx,
+        preset,
+        BrowseConvertPostLoad::ReviewOnly,
+        Some(selection),
+        Some(cue_policy),
     );
 }
 
@@ -9500,6 +9548,7 @@ pub(crate) fn direct_queue_expansion_for_cached_browse_entry(
         cue_artifact_metadata: BTreeMap::new(),
         synthetic_cue_artifacts: HashSet::new(),
         expansion_errors: Vec::new(),
+        explicit_cue_source_policy: None,
         cue_selection_prompt: None,
     }
 }
@@ -9520,6 +9569,7 @@ fn execute_queue_with_post_load(
     preset: Option<String>,
     post_load: BrowseConvertPostLoad,
     explicit_context_selection: Option<Vec<PathBuf>>,
+    explicit_cue_source_policy: Option<crate::convert::pipeline::CueSidecarPolicy>,
 ) {
     match app.current_screen {
         AppScreen::Browse => {
@@ -9580,12 +9630,13 @@ fn execute_queue_with_post_load(
                 return;
             }
 
-            let selection = direct_queue_expansion_for_cached_browse_entry(
+            let mut selection = direct_queue_expansion_for_cached_browse_entry(
                 &raw_selection[0],
                 cached_single_kind
                     .as_ref()
                     .expect("non-worker single selection must have a cached BrowseEntry kind"),
             );
+            selection.explicit_cue_source_policy = explicit_cue_source_policy;
             if selection.paths.is_empty() {
                 app.set_status(status_with_stale_selection_notice(
                     dropped_stale_count,
@@ -19766,6 +19817,7 @@ mod execute_queue_state_consistency_tests {
             None,
             BrowseConvertPostLoad::ReviewOnly,
             None,
+            None,
         );
 
         let pending = app
@@ -19800,6 +19852,7 @@ mod execute_queue_state_consistency_tests {
             None,
             BrowseConvertPostLoad::ReviewOnly,
             Some(vec![unresolved.clone()]),
+            None,
         );
 
         let pending = app
@@ -19837,6 +19890,7 @@ mod execute_queue_state_consistency_tests {
             &tx,
             None,
             BrowseConvertPostLoad::ReviewOnly,
+            None,
             None,
         );
 
@@ -19891,6 +19945,7 @@ mod execute_queue_state_consistency_tests {
             &tx,
             None,
             BrowseConvertPostLoad::ReviewOnly,
+            None,
             None,
         );
 
@@ -20162,7 +20217,7 @@ mod execute_queue_state_consistency_tests {
         );
         let destructure = finish_body
             .find(
-                "let QueueExpansionResult {\n        paths,\n        mut cue_artifact_audio,\n        mut cue_artifact_metadata,\n        synthetic_cue_artifacts,\n        expansion_errors,\n        ..\n    } = queue;",
+                "let QueueExpansionResult {\n        paths,\n        mut cue_artifact_audio,\n        mut cue_artifact_metadata,\n        synthetic_cue_artifacts,\n        expansion_errors,\n        explicit_cue_source_policy,\n        ..\n    } = queue;",
             )
             .expect("CUE metadata should come from the expansion result");
         let retain = finish_body
@@ -20565,6 +20620,7 @@ FILE "{stem}.flac" WAVE
                     cue_artifact_metadata: std::collections::BTreeMap::new(),
                     synthetic_cue_artifacts: std::collections::HashSet::new(),
                     expansion_errors: Vec::new(),
+                    explicit_cue_source_policy: None,
                     cue_selection_prompt: None,
                 },
                 resolved_archive_passwords: BTreeMap::new(),
@@ -20651,6 +20707,7 @@ FILE "{stem}.flac" WAVE
                     cue_artifact_metadata: std::collections::BTreeMap::new(),
                     synthetic_cue_artifacts: std::collections::HashSet::new(),
                     expansion_errors: vec![ordinary_warning.clone(), warning],
+                    explicit_cue_source_policy: None,
                     cue_selection_prompt: None,
                 },
                 resolved_archive_passwords: BTreeMap::new(),
@@ -20739,6 +20796,7 @@ FILE "{stem}.flac" WAVE
                     cue_artifact_metadata: std::collections::BTreeMap::new(),
                     synthetic_cue_artifacts: std::collections::HashSet::new(),
                     expansion_errors: vec![warning],
+                    explicit_cue_source_policy: None,
                     cue_selection_prompt: None,
                 },
                 resolved_archive_passwords: BTreeMap::new(),

@@ -2929,6 +2929,27 @@ pub(crate) fn handle_tag_transfer_complete(
     }
 }
 
+fn explicit_convert_cue_policy_for_selection(
+    paths: &[std::path::PathBuf],
+) -> Option<crate::convert::pipeline::CueSidecarPolicy> {
+    let [path] = paths else {
+        return None;
+    };
+    if crate::convert::classify::is_cue_sheet_path(path) {
+        return crate::convert::split_cue_album::admit_split_cue_member(path)
+            .ok()
+            .map(|_| crate::convert::pipeline::CueSidecarPolicy::SidecarOnly);
+    }
+    if matches!(
+        crate::convert::source_admission::direct_source_kind(path),
+        Some(crate::convert::source_admission::DirectSourceKind::Audio)
+    ) && crate::convert::pipeline::materializer_cue::embedded_single_image_cuesheet_is_read_viable(path)
+    {
+        return Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly);
+    }
+    None
+}
+
 /// Execute a context action. Delegates to existing command/action
 /// functions where possible.
 pub fn execute_context_action(
@@ -2966,7 +2987,13 @@ pub fn execute_context_action(
             // From here on the Convert operation owns this snapshot; it must
             // never reconstruct its target from unrelated Browse marks.
             if let Some(selection) = app.browse_context_action_paths.clone() {
-                super::command::execute_queue_for_selection(app, tx, None, selection);
+                if let Some(cue_policy) = explicit_convert_cue_policy_for_selection(&selection) {
+                    super::command::execute_queue_for_explicit_source(
+                        app, tx, None, selection, cue_policy,
+                    );
+                } else {
+                    super::command::execute_queue_for_selection(app, tx, None, selection);
+                }
             } else {
                 let cmd = super::command::Command::Queue { preset: None };
                 super::command::execute_command(app, cmd, tx);
@@ -2975,13 +3002,15 @@ pub fn execute_context_action(
         ContextAction::ConvertLastUsed => {
             let start = resolve_convert_start(app, invert);
             if let Some(selection) = app.browse_context_action_paths.clone() {
-                super::command::execute_queue_with_post_load_commit_for_selection(
-                    app,
-                    tx,
-                    None,
-                    start,
-                    selection,
-                );
+                if let Some(cue_policy) = explicit_convert_cue_policy_for_selection(&selection) {
+                    super::command::execute_queue_with_post_load_commit_for_explicit_source(
+                        app, tx, None, start, selection, cue_policy,
+                    );
+                } else {
+                    super::command::execute_queue_with_post_load_commit_for_selection(
+                        app, tx, None, start, selection,
+                    );
+                }
             } else {
                 super::command::execute_queue_with_post_load_commit(app, tx, None, start);
             }
@@ -2989,13 +3018,15 @@ pub fn execute_context_action(
         ContextAction::ConvertWithPreset(name) => {
             let start = resolve_convert_start(app, invert);
             if let Some(selection) = app.browse_context_action_paths.clone() {
-                super::command::execute_queue_with_post_load_commit_for_selection(
-                    app,
-                    tx,
-                    Some(name),
-                    start,
-                    selection,
-                );
+                if let Some(cue_policy) = explicit_convert_cue_policy_for_selection(&selection) {
+                    super::command::execute_queue_with_post_load_commit_for_explicit_source(
+                        app, tx, Some(name), start, selection, cue_policy,
+                    );
+                } else {
+                    super::command::execute_queue_with_post_load_commit_for_selection(
+                        app, tx, Some(name), start, selection,
+                    );
+                }
             } else {
                 super::command::execute_queue_with_post_load_commit(app, tx, Some(name), start);
             }
@@ -5261,6 +5292,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_menu_explicit_cue_convert_carries_sidecar_only_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("album.flac");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(&image, include_bytes!("../../tests/fixtures/silence.flac"))
+            .expect("audio fixture");
+        std::fs::write(
+            &cue,
+            concat!(
+                "TITLE \"Explicit Sidecar\"\n",
+                "FILE \"album.flac\" FLAC\n",
+                "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n    INDEX 01 00:00:01\n",
+            ),
+        )
+        .expect("sidecar fixture");
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(concat!(
+                    "TITLE \"Embedded Aggregate Favorite\"\n",
+                    "FILE \"album.flac\" FLAC\n",
+                    "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                    "  TRACK 02 AUDIO\n    INDEX 01 00:00:02\n",
+                ).to_string()),
+            )],
+        )
+        .expect("embedded CUESHEET fixture");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority = vec![
+            crate::config::AggregateMetadataTarget::EmbeddedCue,
+            crate::config::AggregateMetadataTarget::SidecarCue,
+            crate::config::AggregateMetadataTarget::IndividualFiles,
+        ];
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            cue.clone(),
+            "album.cue".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse_context_action_paths = Some(vec![cue.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![cue.clone()]);
+        assert_eq!(
+            app.convert.source.explicit_cue_source_policy,
+            Some(crate::convert::pipeline::CueSidecarPolicy::SidecarOnly),
+        );
+        let decision = crate::tui::app::resolve_convert_preview_authority(
+            &cue,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &app.config.conversion.aggregate_metadata_target_priority,
+            app.convert.source.explicit_cue_source_policy,
+        );
+        assert_eq!(
+            decision.cue_sidecar_override,
+            Some(crate::convert::pipeline::CueSidecarPolicy::SidecarOnly),
+            "explicit .cue conversion must bypass the embedded-first aggregate hierarchy",
+        );
+        let (_info, metadata, notice) = crate::tui::app::probe_convert_source_for_message(
+            &cue,
+            decision.cue_sidecar_override,
+            None,
+        );
+        assert!(notice.is_none(), "explicit sidecar probe failed: {notice:?}");
+        assert_eq!(metadata.album.as_deref(), Some("Explicit Sidecar"));
+    }
+
+    #[tokio::test]
+    async fn context_menu_embedded_cue_carrier_convert_carries_embedded_only_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image = temp.path().join("album.flac");
+        let sidecar = temp.path().join("album.cue");
+        std::fs::write(&image, include_bytes!("../../tests/fixtures/silence.flac"))
+            .expect("audio fixture");
+        let embedded = concat!(
+            "TITLE \"Embedded Authority\"\n",
+            "FILE \"album.flac\" FLAC\n",
+            "  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    INDEX 01 00:00:01\n",
+        );
+        crate::tui::probe::write_all_tags(
+            &image,
+            &[(
+                lofty::tag::ItemKey::Unknown("CUESHEET".to_string()),
+                Some(embedded.to_string()),
+            )],
+        )
+        .expect("embedded CUESHEET");
+        std::fs::write(
+            &sidecar,
+            embedded.replace("Embedded Authority", "Neighboring Sidecar"),
+        )
+        .expect("neighboring sidecar");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            image.clone(),
+            "album.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse_context_action_paths = Some(vec![image.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![image.clone()]);
+        assert_eq!(
+            app.convert.source.explicit_cue_source_policy,
+            Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly),
+            "explicit carrier Convert must bypass the sidecar-first aggregate default",
+        );
+        let decision = crate::tui::app::resolve_convert_preview_authority(
+            &image,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &app.config.conversion.aggregate_metadata_target_priority,
+            app.convert.source.explicit_cue_source_policy,
+        );
+        assert_eq!(
+            decision.cue_sidecar_override,
+            Some(crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly),
+        );
+        let (_info, metadata, notice) = crate::tui::app::probe_convert_source_for_message(
+            &image,
+            decision.cue_sidecar_override,
+            None,
+        );
+        assert!(notice.is_none(), "explicit embedded probe failed: {notice:?}");
+        assert_eq!(metadata.album.as_deref(), Some("Embedded Authority"));
+    }
+
+    #[tokio::test]
+    async fn context_menu_audio_without_embedded_cue_keeps_ordinary_convert_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("ordinary.flac");
+        std::fs::write(&audio, include_bytes!("../../tests/fixtures/silence.flac"))
+            .expect("audio fixture");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            audio.clone(),
+            "ordinary.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse_context_action_paths = Some(vec![audio.clone()]);
+
+        execute_context_action(&mut app, ContextAction::ConvertCustom, &tx, false);
+
+        assert_eq!(app.current_screen, AppScreen::Convert);
+        assert_eq!(app.convert.source.mode.all_paths(), vec![audio.clone()]);
+        assert_eq!(app.convert.source.explicit_cue_source_policy, None);
+        let decision = crate::tui::app::resolve_convert_preview_authority(
+            &audio,
+            &std::collections::HashSet::new(),
+            &std::collections::BTreeMap::new(),
+            &app.config.conversion.aggregate_metadata_target_priority,
+            app.convert.source.explicit_cue_source_policy,
+        );
+        assert_eq!(
+            decision.cue_sidecar_override,
+            Some(crate::convert::pipeline::CueSidecarPolicy::IgnoreCue),
+        );
+    }
+
+    #[tokio::test]
     async fn context_menu_convert_folder_keeps_operation_target_after_menu_closes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("a.flac");
@@ -5333,7 +5553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_menu_convert_cue_choice_continuation_keeps_operation_target() {
+    async fn context_menu_convert_same_image_sidecars_choose_stably_and_keep_operation_target() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("a.flac");
         let second = temp.path().join("b.flac");
@@ -5395,32 +5615,9 @@ mod tests {
             expansion,
         );
 
-        assert!(matches!(app.active_overlay, ActiveOverlay::CueSelect(_)));
-        crate::tui::keybindings::handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            &tx,
-        );
-
-        let pending = app
-            .pending_browse_convert_expansion
-            .as_ref()
-            .expect("accepting the CUE choice should resume folder expansion");
-        assert_eq!(pending.request.selection_snapshot, vec![album.clone()]);
-        assert!(pending.request.selection_owned_by_context_menu);
-
-        let (generation, request, expansion) = next_browse_convert_expansion(&mut rx).await;
-        assert_eq!(request.selection_snapshot, vec![album.clone()]);
-        assert!(request.selection_owned_by_context_menu);
-        crate::tui::command::handle_browse_convert_expansion_complete(
-            &mut app,
-            &tx,
-            generation,
-            request,
-            expansion,
+        assert!(
+            !matches!(app.active_overlay, ActiveOverlay::CueSelect(_)),
+            "same-image CUE alternatives must not require a user choice",
         );
         assert_eq!(app.current_screen, AppScreen::Convert);
         assert!(
@@ -5430,7 +5627,7 @@ mod tests {
                 .all_paths()
                 .iter()
                 .all(|path| path.starts_with(&album)),
-            "CUE continuation must publish only the context-target album",
+            "deterministic CUE selection must publish only the context-target album",
         );
     }
 

@@ -75,6 +75,40 @@ pub struct CueTrack {
     pub directives: Vec<String>,
 }
 
+/// Compare parsed CUE representations using Tonepoet's metadata/coherence
+/// semantics. FILE references compare by case-folded stem so a valid
+/// extension-repaired reference remains equivalent to the resolved carrier.
+pub(crate) fn cue_sheets_have_equivalent_metadata(left: &CueSheet, right: &CueSheet) -> bool {
+    fn normalized_file_reference(value: Option<&str>) -> Option<String> {
+        value.map(|value| {
+            let normalized = value.replace('\\', "/");
+            let path = Path::new(&normalized);
+            path.file_stem()
+                .or_else(|| path.file_name())
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| normalized.to_ascii_lowercase())
+        })
+    }
+
+    left.title == right.title
+        && left.performer == right.performer
+        && left.date == right.date
+        && left.genre == right.genre
+        && left.catalog == right.catalog
+        && left.tracks.len() == right.tracks.len()
+        && left.tracks.iter().zip(&right.tracks).all(|(left, right)| {
+            left.number == right.number
+                && left.title == right.title
+                && left.performer == right.performer
+                && normalized_file_reference(left.file.as_deref())
+                    == normalized_file_reference(right.file.as_deref())
+                && left.index00_frames == right.index00_frames
+                && left.index01_frames == right.index01_frames
+                && left.isrc == right.isrc
+                && left.directives == right.directives
+        })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ParsedTonepoetMetadata {
     present: bool,
