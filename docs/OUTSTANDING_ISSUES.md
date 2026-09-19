@@ -2629,3 +2629,45 @@ Three cheaper guardrails in the same area go into the next brief for this branch
 the `PerCueDistinctTocHits` complement where the *later* scope is the Embedded winner; an explicit
 `album.cue` selection with a higher-priority Embedded peer beside it staying explicit; and a
 malformed-present-peer phase on `sole_structural_multifile_sidecar_survives_conflicting_embedded_copies`.
+
+## 36. Album ReplayGain on per-track albums reduces to track gain
+
+Found by the Stage A profile, 2026-09-19 (`docs/STAGE_A_PROFILE_2026-09-19.md`). Converting a
+folder of ten FLAC tracks with `--replaygain album` produced ten different
+`REPLAYGAIN_ALBUM_GAIN` values, each equal to that track's `REPLAYGAIN_TRACK_GAIN`. The observer
+shows every item measuring one path in Album mode.
+
+### Why, as read
+
+A per-track album is queued as one execution item per track. The request carries an `album_batch`
+context with the expected track count, but the ReplayGain stage
+(`apply_replaygain_with_source_and_tool_limits`, stages.rs) measures only
+`artifact_audio_paths(artifacts)` of its own item, and nothing reduces across the batch's items.
+The TUI dispatches through the same `process_queue_with_progress`, so both surfaces are affected.
+Single-image CUE albums and other multi-track sources are one item and are correct, which is why
+the Asia and Journey field checks after the claim-conflict fix passed.
+
+### Required
+
+Album mode on a per-track album writes one album gain and one album peak, computed over all
+members of the batch, to every member, on CLI and TUI alike. This is the defect the missing test
+in #35a exists to catch; deliver that test with the fix.
+
+## 37. Every external tool call costs 0.7 to 1.2 s of launch overhead
+
+Found by the same profile. Run directly on the same files, metaflac, opustags, and AtomicParsley
+take 5 to 7 ms and ffprobe 284 ms; under tonepoet they take 723 ms to 1.2 s (medians over 30 to 60
+runs). tonepoet's own process start is 318 ms. Every tool run goes through the script-supervisor
+path (`RealToolRunner::run_supervised_with_stdio` in tool.rs), which re-execs tonepoet as
+`__action-script-supervisor` and again as `__action-script-launcher`.
+
+A per-track item makes three or four tool calls (ffprobe twice, the encoder, a tag writer), so 2 to
+3 s of a 5 to 8 s item is launch overhead; on Opus and AAC the whole Metadata stage is this cost.
+The supervisor exists for fd hygiene and containment (concurrency round 7), so the fix is to make
+its launch cheap or amortised per item, not to remove it.
+
+### Required
+
+An external tool call adds no more than a small fixed cost over the tool itself, at most tens of
+milliseconds, with the containment guarantees unchanged. The Stage A profile re-run after the change
+shows the Metadata stage on Opus and AAC within a few percent of the tag writers' direct time.
