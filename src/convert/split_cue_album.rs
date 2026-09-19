@@ -939,6 +939,13 @@ pub enum SplitCueFolderSelection {
 /// poison a viable winner.
 #[derive(Debug, Clone, Copy)]
 pub enum SplitCueFolderPreference<'a> {
+    /// Interactive queue/editor admission. Preserve deterministic selection
+    /// for structural CUE descriptions, but require an operation-scoped
+    /// choice when several equally ranked one-track metadata sidecars describe
+    /// the same carrier. Those sidecars are alternate field authorities, not
+    /// distinct content structures, and the user's current operation owns the
+    /// choice between them.
+    PromptMetadataSidecarAlternatives,
     /// Preserve the established operation-scoped chooser semantics: only
     /// break a tie after the normal exact/disjoint auto-selection rungs have
     /// had a chance to resolve the folder.
@@ -1391,22 +1398,6 @@ pub fn select_split_cue_folder_members_with_preference(
         );
     }
 
-    // Multiple valid CUEs that all resolve to one identifiable image are
-    // alternative metadata representations of the same content, not an
-    // unresolved content choice. Aggregate authority therefore picks one
-    // deterministically: exact FILE references first, then the existing stable
-    // path ordering. Callers that need source access can obtain the full ranked
-    // set with `ranked_single_image_cue_candidates_for_audio`.
-    if let Some(ranked) = ranked_same_single_image_members(&members) {
-        return selected_split_cue_folder_members(
-            &members,
-            vec![ranked[0].clone()],
-            rejected_audio,
-            rejected,
-            selection_album_group,
-        );
-    }
-
     let exact_members: Vec<SplitCueAdmissionMember> = members
         .iter()
         .filter(|member| member.all_file_references_exact)
@@ -1464,6 +1455,35 @@ pub fn select_split_cue_folder_members_with_preference(
                 rejected,
                 selection_album_group,
             );
+        }
+    }
+
+    // Multiple valid CUEs that all resolve to one identifiable image are
+    // alternative descriptions of the same content, not an unresolved
+    // content choice. Structural image CUEs therefore pick one
+    // deterministically: exact FILE references first, then stable path order.
+    // One-track metadata sidecars are the exception for interactive
+    // queue/editor admission: equally ranked field authorities require the
+    // operation-scoped chooser instead of silently selecting one.
+    let stale_cue_preference = matches!(preference, Some(SplitCueFolderPreference::Cue(_)));
+    if !stale_cue_preference {
+        if let Some(ranked) = ranked_same_single_image_members(&candidates) {
+            let prompt_metadata_alternatives = matches!(
+                preference,
+                Some(SplitCueFolderPreference::PromptMetadataSidecarAlternatives)
+            ) && ranked.len() > 1
+                && ranked
+                    .iter()
+                    .all(|member| member.role == SplitCueMemberRole::MetadataSidecar);
+            if !prompt_metadata_alternatives {
+                return selected_split_cue_folder_members(
+                    &members,
+                    vec![ranked[0].clone()],
+                    rejected_audio,
+                    rejected,
+                    selection_album_group,
+                );
+            }
         }
     }
 

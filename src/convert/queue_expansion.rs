@@ -886,32 +886,12 @@ impl QueueExpansionPlan {
             };
             match decision {
                 Ok(CueQueueDecision::SplitSource { referenced_audio }) => {
-                    // A discovered single-image CUE is one metadata
-                    // representation of the carrier. If File tags win the
-                    // configured aggregate hierarchy, retain the raw carrier
-                    // in the queue instead of suppressing it in favor of CUE
-                    // track structure. Explicit .cue selection remains an
-                    // exact source operation and bypasses this aggregate rung.
-                    let file_tags_authoritative = !cue.explicit
-                        && cue.admitted_member.as_ref().is_some_and(|member| {
-                            if member.referenced_audio.len() != 1 {
-                                return false;
-                            }
-                            let audio = &member.referenced_audio[0];
-                            let individual_files = crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(audio);
-                            let embedded_cue = crate::convert::pipeline::materializer_cue::embedded_single_image_cuesheet_is_automatic_authority_viable(audio);
-                            crate::metadata_authority::resolve_aggregate_metadata_target(
-                                metadata_target_priority,
-                                crate::metadata_authority::AggregateMetadataAvailability {
-                                    individual_files,
-                                    sidecar_cue: true,
-                                    embedded_cue,
-                                },
-                            ) == Some(crate::config::AggregateMetadataTarget::IndividualFiles)
-                        });
-                    if file_tags_authoritative {
-                        continue;
-                    }
+                    // A split-source CUE proves that at least one physical
+                    // carrier contains multiple logical tracks. Individual
+                    // file tags therefore cannot be the track-level authority
+                    // for this scope. A sole multi-carrier sidecar already had
+                    // any coherent Embedded peer resolved before suppression;
+                    // single-image CUE peers remain resolvable at commit time.
                     push_unique_path_with_keys(&mut result, &mut result_keys, cue.path);
                     for path in referenced_audio {
                         suppressed_audio_keys.insert(queue_path_key(&path));
@@ -1006,6 +986,7 @@ impl QueueExpansionPlan {
             discover_native_multi_file_embedded_groups_for_queue(
                 &queueable_non_cue,
                 &explicit_non_cue_keys,
+                &suppressed_audio_keys,
             );
         for failure in embedded_failures {
             let member_keys = failure
@@ -1186,11 +1167,14 @@ fn select_folder_cue_candidates_for_queue(
             .or_else(|| cue_selections.iter().find_map(|(key, value)| {
                 (queue_path_key(key) == parent).then_some(value)
             }));
-        let preference = selected.map(|choice| match choice {
-            QueueCueSelectionOverride::AutomaticWholeAlbum => {
+        let preference = Some(match selected {
+            Some(QueueCueSelectionOverride::AutomaticWholeAlbum) => {
                 SplitCueFolderPreference::AutomaticWholeAlbum
             }
-            QueueCueSelectionOverride::Cue(path) => SplitCueFolderPreference::Cue(path.as_path()),
+            Some(QueueCueSelectionOverride::Cue(path)) => {
+                SplitCueFolderPreference::Cue(path.as_path())
+            }
+            None => SplitCueFolderPreference::PromptMetadataSidecarAlternatives,
         });
         match select_split_cue_folder_members_with_preference(&cue_paths, preference) {
             SplitCueFolderSelection::Selected {
@@ -1470,6 +1454,36 @@ struct SyntheticCueAlbumPart {
     referenced_audio: Vec<PathBuf>,
 }
 
+fn embedded_cue_outranks_sidecar_for_structural_scope(
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+) -> bool {
+    crate::metadata_authority::resolve_aggregate_metadata_target(
+        metadata_target_priority,
+        crate::metadata_authority::AggregateMetadataAvailability {
+            individual_files: false,
+            sidecar_cue: true,
+            embedded_cue: true,
+        },
+    ) == Some(crate::config::AggregateMetadataTarget::EmbeddedCue)
+}
+
+fn stage_embedded_authority_for_single_structural_scope(
+    parts: &[SyntheticCueAlbumPart],
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+) -> Result<Option<PathBuf>, String> {
+    if parts.len() != 1
+        || parts[0].referenced_audio.len() <= 1
+        || !embedded_cue_outranks_sidecar_for_structural_scope(metadata_target_priority)
+    {
+        return Ok(None);
+    }
+
+    let Some(embedded_text) = coherent_embedded_cuesheet_for_synthetic_parts(parts) else {
+        return Ok(None);
+    };
+    write_queue_synthetic_cue_album(parts, &embedded_text).map(Some)
+}
+
 fn push_synthetic_cue_album_groups_for_queue(
     cue_sheets: &[CueQueueCandidate],
     disc_root_keys: &HashSet<PathBuf>,
@@ -1499,7 +1513,30 @@ fn push_synthetic_cue_album_groups_for_queue(
             && candidates
                 .first()
                 .is_some_and(|candidate| candidate.materialize_selected_multi_file_as_synthetic);
-        if candidates.len() < 2 && !materialize_selected_multi_file_as_synthetic {
+        // A single structural content scope may coexist with unrelated
+        // metadata-sidecar CUEs in the same directory. Use admitted structural
+        // members, not total directory CUE count, for the cheap precheck that
+        // decides whether this otherwise-singleton folder needs synthetic
+        // arbitration. The actual scope is rebuilt below from retained parts.
+        let single_structural_candidate_needs_embedded_probe =
+            !materialize_selected_multi_file_as_synthetic
+                && embedded_cue_outranks_sidecar_for_structural_scope(metadata_target_priority)
+                && {
+                    let mut structural_members = candidates.iter().filter_map(|candidate| {
+                        candidate
+                            .admitted_member
+                            .as_ref()
+                            .filter(|member| member.contributes_synthetic_album_part())
+                    });
+                    structural_members
+                        .next()
+                        .is_some_and(|member| member.referenced_audio.len() > 1)
+                        && structural_members.next().is_none()
+                };
+        if candidates.len() < 2
+            && !materialize_selected_multi_file_as_synthetic
+            && !single_structural_candidate_needs_embedded_probe
+        {
             continue;
         }
         candidates.sort_by(|a, b| deterministic_path_sort_key(&a.path).cmp(&deterministic_path_sort_key(&b.path)));
@@ -1548,8 +1585,15 @@ fn push_synthetic_cue_album_groups_for_queue(
             }
             continue;
         }
+        let arbitrate_single_structural_sidecar_with_embedded =
+            !materialize_selected_multi_file_as_synthetic
+                && parts.len() == 1
+                && parts[0].referenced_audio.len() > 1
+                && embedded_cue_outranks_sidecar_for_structural_scope(metadata_target_priority);
         if parts.is_empty()
-            || (parts.len() < 2 && !materialize_selected_multi_file_as_synthetic)
+            || (parts.len() < 2
+                && !materialize_selected_multi_file_as_synthetic
+                && !arbitrate_single_structural_sidecar_with_embedded)
         {
             continue;
         }
@@ -1572,6 +1616,41 @@ fn push_synthetic_cue_album_groups_for_queue(
         }
 
         parts.sort_by(|a, b| deterministic_path_sort_key(&a.cue_path).cmp(&deterministic_path_sort_key(&b.cue_path)));
+
+        if arbitrate_single_structural_sidecar_with_embedded {
+            debug_assert_eq!(parts.len(), 1);
+            // Only Embedded can displace this valid sidecar under the current
+            // priority. Probe this structural scope once, using the shared
+            // coherence validator and synthetic staging path. If Embedded is
+            // absent, malformed, conflicting, or covers a different carrier
+            // set, preserve the ordinary physical sidecar unchanged.
+            let path = match stage_embedded_authority_for_single_structural_scope(
+                &parts,
+                metadata_target_priority,
+            ) {
+                Ok(Some(path)) => path,
+                Ok(None) => continue,
+                Err(err) => {
+                    fatal_errors.push(format!(
+                        "Cannot queue embedded authority for structural CUE album {}: failed to stage the synthetic CUE: {}. Nothing was staged for this group.",
+                        parent.display(),
+                        err
+                    ));
+                    block_failed_synthetic_group(&parts, &mut grouped, suppressed_audio_keys);
+                    continue;
+                }
+            };
+            synthetic_cue_artifacts.insert(path.clone());
+            push_unique_path_with_keys(result, result_keys, path);
+            for part in &parts {
+                grouped.insert(part.cue_key.clone());
+                for audio in &part.referenced_audio {
+                    suppressed_audio_keys.insert(queue_path_key(audio));
+                }
+            }
+            continue;
+        }
+
         let cue_paths: Vec<PathBuf> = parts.iter().map(|part| part.cue_path.clone()).collect();
         let titles: Vec<String> = parts
             .iter()
@@ -1594,6 +1673,54 @@ fn push_synthetic_cue_album_groups_for_queue(
             decision
         };
         if matches!(decision.reason, SplitCueAlbumGroupingReason::PerCueDistinctTocHits) {
+            // The authoritative grouping decision has already established
+            // independent structural content scopes. A singleton structural
+            // group still has to arbitrate against a coherent Embedded peer;
+            // another distinct CUE group in the directory must not affect its
+            // source authority.
+            for group in decision.groups {
+                let group_keys: HashSet<PathBuf> = group.into_iter().collect();
+                let mut group_parts: Vec<SyntheticCueAlbumPart> = parts
+                    .iter()
+                    .filter(|part| group_keys.contains(&part.cue_key))
+                    .cloned()
+                    .collect();
+                group_parts.sort_by(|a, b| {
+                    deterministic_path_sort_key(&a.cue_path)
+                        .cmp(&deterministic_path_sort_key(&b.cue_path))
+                });
+                let path = match stage_embedded_authority_for_single_structural_scope(
+                    &group_parts,
+                    metadata_target_priority,
+                ) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        fatal_errors.push(format!(
+                            "Cannot queue embedded authority for structural CUE scope {}: failed to stage the synthetic CUE: {}. Nothing was staged for this group.",
+                            group_parts
+                                .first()
+                                .map(|part| part.cue_path.display().to_string())
+                                .unwrap_or_else(|| parent.display().to_string()),
+                            err
+                        ));
+                        block_failed_synthetic_group(
+                            &group_parts,
+                            &mut grouped,
+                            suppressed_audio_keys,
+                        );
+                        continue;
+                    }
+                };
+                synthetic_cue_artifacts.insert(path.clone());
+                push_unique_path_with_keys(result, result_keys, path);
+                for part in &group_parts {
+                    grouped.insert(part.cue_key.clone());
+                    for audio in &part.referenced_audio {
+                        suppressed_audio_keys.insert(queue_path_key(audio));
+                    }
+                }
+            }
             continue;
         }
 
@@ -1979,9 +2106,12 @@ struct NativeMultiFileEmbeddedQueueFailure {
 /// found by directory expansion. Explicitly named audio files are excluded:
 /// selecting those files is an explicit File-tags/content operation and must
 /// not be converted into an implicit aggregate embedded-CUE selection.
+/// Structurally suppressed carriers are excluded before tag reads because a
+/// queue representation has already claimed that content scope.
 fn discover_native_multi_file_embedded_groups_for_queue(
     queueable_non_cue: &[PathBuf],
     explicit_non_cue_keys: &HashSet<PathBuf>,
+    suppressed_audio_keys: &HashSet<PathBuf>,
 ) -> (
     Vec<NativeMultiFileEmbeddedQueueGroup>,
     Vec<NativeMultiFileEmbeddedQueueFailure>,
@@ -1989,7 +2119,10 @@ fn discover_native_multi_file_embedded_groups_for_queue(
     let mut by_parent = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
     for path in queueable_non_cue {
         let key = queue_path_key(path);
-        if explicit_non_cue_keys.contains(&key) || !is_audio_file_path(path) {
+        if suppressed_audio_keys.contains(&key)
+            || explicit_non_cue_keys.contains(&key)
+            || !is_audio_file_path(path)
+        {
             continue;
         }
         let Some(parent) = path.parent().map(queue_path_key) else {
@@ -2128,10 +2261,9 @@ fn generate_queue_synthetic_cue_album(parts: &[SyntheticCueAlbumPart]) -> Result
     generate_queue_synthetic_cue_album_with_metadata_priority(parts, &[])
 }
 
-fn generate_queue_synthetic_cue_album_with_metadata_priority(
+fn coherent_embedded_cuesheet_for_synthetic_parts(
     parts: &[SyntheticCueAlbumPart],
-    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
-) -> Result<String, String> {
+) -> Option<String> {
     let mut member_audio = Vec::new();
     let mut seen_audio = HashSet::new();
     for part in parts {
@@ -2152,10 +2284,14 @@ fn generate_queue_synthetic_cue_album_with_metadata_priority(
             base_dirs.push(parent.to_path_buf());
         }
     }
-    let embedded_text = coherent_embedded_cuesheet_for_member_audio_with_base_dirs(
-        &member_audio,
-        &base_dirs,
-    );
+    coherent_embedded_cuesheet_for_member_audio_with_base_dirs(&member_audio, &base_dirs)
+}
+
+fn generate_queue_synthetic_cue_album_with_metadata_priority(
+    parts: &[SyntheticCueAlbumPart],
+    metadata_target_priority: &[crate::config::AggregateMetadataTarget],
+) -> Result<String, String> {
+    let embedded_text = coherent_embedded_cuesheet_for_synthetic_parts(parts);
 
     // A coherent native multi-FILE embedded sheet is a readable aggregate
     // representation even though Tonepoet cannot rewrite it in place. Keep
@@ -3044,28 +3180,14 @@ pub fn cue_artifact_commit_decision_for_path(
                 return CueArtifactCommitDecision::default();
             };
 
-            // Prefer* is automatic aggregate authority. A neighboring CUE is
-            // relevant to a direct audio click only when existing admission has
-            // proved single-wave image structure. A one-track same-stem CUE is
-            // still a valid explicit sidecar, but it must not turn an
-            // independent file click into implicit Sidecar authority.
-            if matches!(
-                cue_source_policy,
-                CueSidecarPolicy::PreferEmbedded | CueSidecarPolicy::PreferSidecar
-            ) && !cue_viability.image_evidence
-            {
-                return CueArtifactCommitDecision {
-                    cue_sidecar_override: Some(CueSidecarPolicy::IgnoreCue),
-                    sidecar_cue_track_metadata: None,
-                };
-            }
-
             if cue_viability.sidecar_cue || cue_viability.embedded_cue {
-                // A CUE-proven single-wave image still has an independently
-                // inspectable file-tag representation. Image evidence affects
-                // content shape, not whether File tags participate in aggregate
-                // metadata authority.
-                let individual_files = crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(path);
+                // File tags remain inspectable, but a physical image carrying
+                // multiple logical tracks cannot serve as the track-level
+                // IndividualFiles authority for this content scope.
+                let individual_files = !cue_viability.image_evidence
+                    && crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(
+                        path,
+                    );
                 let selected = crate::metadata_authority::resolve_aggregate_metadata_target(
                     metadata_target_priority,
                     crate::metadata_authority::AggregateMetadataAvailability {
@@ -3155,8 +3277,12 @@ pub fn cue_artifact_commit_decision_for_path(
         cue_source_policy,
         CueSidecarPolicy::PreferEmbedded | CueSidecarPolicy::PreferSidecar
     ) && crate::convert::pipeline::materializer_cue::embedded_single_image_cuesheet_is_automatic_authority_viable(path);
-    let individual_files =
-        crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(
+    // A metadata-artifact sidecar is one-track-per-carrier by construction,
+    // so it does not itself make File tags nonviable. A valid embedded image
+    // CUE does: the carrier then contains multiple logical tracks that ordinary
+    // tags cannot describe independently.
+    let individual_files = !embedded_cue
+        && crate::convert::pipeline::materializer_single::individual_file_metadata_source_is_viable(
             path,
         );
     match crate::metadata_authority::resolve_aggregate_metadata_target(
@@ -6156,11 +6282,380 @@ mod planner_embedded_authority_tests {
         )
     }
 
+    fn structural_two_image_cue(title: &str, first: &str, second: &str) -> String {
+        format!(
+            "TITLE \"{title}\"\nFILE \"{first}\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"A1\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"A2\"\n    INDEX 01 00:00:37\nFILE \"{second}\" WAVE\n  TRACK 03 AUDIO\n    TITLE \"B1\"\n    INDEX 01 00:00:00\n  TRACK 04 AUDIO\n    TITLE \"B2\"\n    INDEX 01 00:00:37\n"
+        )
+    }
+
     fn single_synthetic_text(expansion: &QueueExpansionResult) -> String {
         assert_eq!(expansion.expansion_errors, Vec::<String>::new());
         assert_eq!(expansion.paths.len(), 1, "expected one synthetic queue item");
         assert_eq!(expansion.synthetic_cue_artifacts.len(), 1);
         std::fs::read_to_string(&expansion.paths[0]).expect("synthetic cue text")
+    }
+
+    #[test]
+    fn sole_structural_multifile_sidecar_and_embedded_obey_all_priority_orders() {
+        if !require_flac_fixture_tool(
+            "sole_structural_multifile_sidecar_and_embedded_obey_all_priority_orders",
+        ) {
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        use crate::convert::pipeline::CueSidecarPolicy;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        create_flac(&side_a);
+        create_flac(&side_b);
+        let sidecar_path = td.path().join("album.cue");
+        std::fs::write(&sidecar_path, authoritative_album_cue("Sidecar Album"))
+            .expect("structural multi-FILE sidecar");
+
+        // A native multi-FILE CUESHEET commonly exists on only one member
+        // carrier. One coherent present copy is sufficient authority.
+        set_embedded_cuesheet(&side_a, &authoritative_album_cue("Embedded Album"));
+
+        let permutations = [
+            [IndividualFiles, SidecarCue, EmbeddedCue],
+            [IndividualFiles, EmbeddedCue, SidecarCue],
+            [SidecarCue, IndividualFiles, EmbeddedCue],
+            [SidecarCue, EmbeddedCue, IndividualFiles],
+            [EmbeddedCue, IndividualFiles, SidecarCue],
+            [EmbeddedCue, SidecarCue, IndividualFiles],
+        ];
+
+        for priority in permutations {
+            let expected = priority
+                .iter()
+                .copied()
+                .find(|target| matches!(*target, SidecarCue | EmbeddedCue))
+                .expect("complete priority includes a CUE authority");
+            let expansion =
+                expand_paths_to_audio_with_metadata_using_grouping_decisions_and_metadata_priority(
+                    &[td.path().to_path_buf()],
+                    &QueueSplitCueAlbumGroupingDecisions::new(),
+                    &priority,
+                );
+            assert!(
+                expansion.expansion_errors.is_empty(),
+                "priority={priority:?}: {:?}",
+                expansion.expansion_errors,
+            );
+            assert!(
+                expansion.paths.iter().all(|path| {
+                    !same_queue_identity(path, &side_a) && !same_queue_identity(path, &side_b)
+                }),
+                "image carriers must remain structurally suppressed for priority={priority:?}",
+            );
+
+            match expected {
+                EmbeddedCue => {
+                    let synthetic = single_synthetic_text(&expansion);
+                    assert!(
+                        synthetic.contains("TITLE \"Embedded Album\""),
+                        "Embedded must supply staged metadata for priority={priority:?}: {synthetic}",
+                    );
+                    assert!(
+                        !synthetic.contains("TITLE \"Sidecar Album\""),
+                        "Sidecar metadata must not leak into Embedded authority for priority={priority:?}: {synthetic}",
+                    );
+                    assert!(
+                        expansion.paths.iter().all(|path| !same_queue_identity(path, &sidecar_path)),
+                        "physical sidecar must not also be queued when Embedded wins: priority={priority:?}",
+                    );
+                }
+                SidecarCue => {
+                    assert!(
+                        expansion.synthetic_cue_artifacts.is_empty(),
+                        "Sidecar-first must preserve the no-staging fast path: priority={priority:?}",
+                    );
+                    assert_eq!(expansion.paths.len(), 1, "priority={priority:?}");
+                    assert!(
+                        same_queue_identity(&expansion.paths[0], &sidecar_path),
+                        "the physical sidecar must remain the queue item: priority={priority:?}",
+                    );
+                    let decision = cue_artifact_commit_decision_for_path(
+                        &sidecar_path,
+                        &expansion.cue_artifact_audio,
+                        &expansion.cue_artifact_metadata,
+                        &priority,
+                        CueSidecarPolicy::PreferSidecar,
+                    );
+                    assert_eq!(
+                        decision.cue_sidecar_override,
+                        Some(CueSidecarPolicy::SidecarOnly),
+                        "commit must retain Sidecar authority for priority={priority:?}",
+                    );
+                    let mut request =
+                        crate::convert::pipeline::materializer_cue::test_pipeline_request_for_authority(
+                            &sidecar_path,
+                        );
+                    request.source.cue_sidecar = decision
+                        .cue_sidecar_override
+                        .expect("sidecar authority must be frozen");
+                    let sheet =
+                        crate::convert::pipeline::dispatch_metadata_sheet_for_cue_request(&request)
+                            .expect("sidecar queue request must remain materializable");
+                    assert_eq!(sheet.title.as_deref(), Some("Sidecar Album"));
+                }
+                IndividualFiles => unreachable!(
+                    "multi-track-per-carrier structure makes IndividualFiles nonviable"
+                ),
+            }
+
+            cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
+        }
+    }
+
+    #[test]
+    fn sole_structural_multifile_sidecar_survives_conflicting_embedded_copies() {
+        if !require_flac_fixture_tool(
+            "sole_structural_multifile_sidecar_survives_conflicting_embedded_copies",
+        ) {
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        create_flac(&side_a);
+        create_flac(&side_b);
+        let sidecar_path = td.path().join("album.cue");
+        std::fs::write(&sidecar_path, authoritative_album_cue("Sidecar Album"))
+            .expect("structural multi-FILE sidecar");
+        set_embedded_cuesheet(&side_a, &authoritative_album_cue("Embedded A"));
+        set_embedded_cuesheet(&side_b, &authoritative_album_cue("Embedded B"));
+
+        let expansion =
+            expand_paths_to_audio_with_metadata_using_grouping_decisions_and_metadata_priority(
+                &[td.path().to_path_buf()],
+                &QueueSplitCueAlbumGroupingDecisions::new(),
+                &[EmbeddedCue, SidecarCue, IndividualFiles],
+            );
+
+        assert!(
+            expansion.expansion_errors.is_empty(),
+            "invalid/conflicting Embedded authority must fall back to the valid structural sidecar: {:?}",
+            expansion.expansion_errors,
+        );
+        assert!(expansion.synthetic_cue_artifacts.is_empty());
+        assert_eq!(expansion.paths.len(), 1);
+        assert!(same_queue_identity(&expansion.paths[0], &sidecar_path));
+        assert!(
+            expansion.paths.iter().all(|path| {
+                !same_queue_identity(path, &side_a) && !same_queue_identity(path, &side_b)
+            }),
+            "fallback sidecar must continue to suppress its image carriers",
+        );
+    }
+
+    #[test]
+    fn unrelated_metadata_sidecar_does_not_change_structural_album_authority() {
+        if !require_flac_fixture_tool(
+            "unrelated_metadata_sidecar_does_not_change_structural_album_authority",
+        ) {
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let side_a = td.path().join("side_a.flac");
+        let side_b = td.path().join("side_b.flac");
+        let interview = td.path().join("interview.flac");
+        create_flac(&side_a);
+        create_flac(&side_b);
+        create_flac(&interview);
+
+        let album_cue = td.path().join("album.cue");
+        std::fs::write(&album_cue, authoritative_album_cue("Sidecar Album"))
+            .expect("structural sidecar");
+        set_embedded_cuesheet(&side_a, &authoritative_album_cue("Embedded Album"));
+
+        let interview_cue = td.path().join("interview.cue");
+        std::fs::write(
+            &interview_cue,
+            "TITLE \"Interview\"\nFILE \"interview.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Interview\"\n    INDEX 01 00:00:00\n",
+        )
+        .expect("metadata sidecar");
+
+        for (priority, expect_embedded) in [
+            ([EmbeddedCue, SidecarCue, IndividualFiles], true),
+            ([SidecarCue, EmbeddedCue, IndividualFiles], false),
+        ] {
+            let expansion =
+                expand_paths_to_audio_with_metadata_using_grouping_decisions_and_metadata_priority(
+                    &[td.path().to_path_buf()],
+                    &QueueSplitCueAlbumGroupingDecisions::new(),
+                    &priority,
+                );
+            assert!(
+                expansion.expansion_errors.is_empty(),
+                "priority={priority:?}: {:?}",
+                expansion.expansion_errors,
+            );
+            assert!(
+                expansion.paths.iter().all(|path| {
+                    !same_queue_identity(path, &side_a) && !same_queue_identity(path, &side_b)
+                }),
+                "structural image carriers must remain suppressed: priority={priority:?}",
+            );
+            assert!(
+                expansion
+                    .paths
+                    .iter()
+                    .any(|path| same_queue_identity(path, &interview)),
+                "unrelated interview audio must remain independently queueable: priority={priority:?}",
+            );
+            assert_eq!(
+                expansion.cue_artifact_metadata.get(&interview),
+                Some(&transferred_source(&interview_cue, "interview.flac")),
+                "unrelated metadata-sidecar mapping must survive structural arbitration: priority={priority:?}",
+            );
+
+            if expect_embedded {
+                assert_eq!(expansion.synthetic_cue_artifacts.len(), 1);
+                assert!(
+                    expansion
+                        .paths
+                        .iter()
+                        .all(|path| !same_queue_identity(path, &album_cue)),
+                    "physical album sidecar must not also queue when Embedded wins",
+                );
+                assert!(
+                    expansion
+                        .paths
+                        .iter()
+                        .all(|path| !same_queue_identity(path, &interview_cue)),
+                    "metadata sidecar is an artifact mapping, not an independent queue item",
+                );
+                let synthetic_path = expansion
+                    .synthetic_cue_artifacts
+                    .iter()
+                    .next()
+                    .expect("synthetic album artifact");
+                let synthetic =
+                    std::fs::read_to_string(synthetic_path).expect("synthetic cue text");
+                assert!(synthetic.contains("TITLE \"Embedded Album\""));
+                assert!(!synthetic.contains("TITLE \"Sidecar Album\""));
+                assert!(!synthetic.contains("Interview"));
+            } else {
+                assert!(
+                    expansion.synthetic_cue_artifacts.is_empty(),
+                    "Sidecar-first must preserve the no-staging fast path",
+                );
+                assert!(
+                    expansion
+                        .paths
+                        .iter()
+                        .any(|path| same_queue_identity(path, &album_cue)),
+                    "physical album sidecar must remain queued when Sidecar wins",
+                );
+            }
+
+            cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
+        }
+    }
+
+    #[test]
+    fn per_cue_distinct_toc_singletons_arbitrate_embedded_independently() {
+        if !require_flac_fixture_tool(
+            "per_cue_distinct_toc_singletons_arbitrate_embedded_independently",
+        ) {
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let first_a = td.path().join("first-a.flac");
+        let first_b = td.path().join("first-b.flac");
+        let second_a = td.path().join("second-a.flac");
+        let second_b = td.path().join("second-b.flac");
+        for path in [&first_a, &first_b, &second_a, &second_b] {
+            create_flac(path);
+        }
+
+        let first_cue = td.path().join("first.cue");
+        let second_cue = td.path().join("second.cue");
+        std::fs::write(
+            &first_cue,
+            structural_two_image_cue("First Sidecar", "first-a.flac", "first-b.flac"),
+        )
+        .expect("first structural sidecar");
+        std::fs::write(
+            &second_cue,
+            structural_two_image_cue("Second Sidecar", "second-a.flac", "second-b.flac"),
+        )
+        .expect("second structural sidecar");
+        set_embedded_cuesheet(
+            &first_a,
+            &structural_two_image_cue("First Embedded", "first-a.flac", "first-b.flac"),
+        );
+
+        let cue_paths = vec![first_cue.clone(), second_cue.clone()];
+        let mut decisions = QueueSplitCueAlbumGroupingDecisions::new();
+        decisions.insert(
+            split_cue_album_grouping_key_for_queue(&cue_paths),
+            crate::convert::split_cue_album::split_each_decision(
+                &cue_paths,
+                SplitCueAlbumGroupingReason::PerCueDistinctTocHits,
+            ),
+        );
+
+        let expansion =
+            expand_paths_to_audio_with_metadata_using_grouping_decisions_and_metadata_priority(
+                &[td.path().to_path_buf()],
+                &decisions,
+                &[EmbeddedCue, SidecarCue, IndividualFiles],
+            );
+        assert!(
+            expansion.expansion_errors.is_empty(),
+            "distinct structural scopes must arbitrate independently: {:?}",
+            expansion.expansion_errors,
+        );
+        assert_eq!(
+            expansion.synthetic_cue_artifacts.len(),
+            1,
+            "only the structural scope with a coherent Embedded peer should stage",
+        );
+        assert!(
+            expansion
+                .paths
+                .iter()
+                .all(|path| !same_queue_identity(path, &first_cue)),
+            "first physical sidecar must be replaced by its Embedded authority",
+        );
+        assert!(
+            expansion
+                .paths
+                .iter()
+                .any(|path| same_queue_identity(path, &second_cue)),
+            "the unrelated second structural scope must remain its physical sidecar",
+        );
+        for carrier in [&first_a, &first_b, &second_a, &second_b] {
+            assert!(
+                expansion
+                    .paths
+                    .iter()
+                    .all(|path| !same_queue_identity(path, carrier)),
+                "structural carrier must not queue independently: {}",
+                carrier.display(),
+            );
+        }
+        let synthetic_path = expansion
+            .synthetic_cue_artifacts
+            .iter()
+            .next()
+            .expect("first embedded synthetic artifact");
+        let synthetic = std::fs::read_to_string(synthetic_path).expect("synthetic cue text");
+        assert!(synthetic.contains("TITLE \"First Embedded\""));
+        assert!(!synthetic.contains("First Sidecar"));
+        assert!(!synthetic.contains("Second Sidecar"));
+
+        cleanup_synthetic_cue_artifacts(&expansion.synthetic_cue_artifacts);
     }
 
     #[test]
@@ -6547,8 +7042,8 @@ mod planner_embedded_authority_tests {
         for (priority, expected_path, expected_policy) in [
             (
                 [IndividualFiles, SidecarCue, EmbeddedCue],
-                image.clone(),
-                CueSidecarPolicy::IgnoreCue,
+                cue.clone(),
+                CueSidecarPolicy::SidecarOnly,
             ),
             (
                 [SidecarCue, EmbeddedCue, IndividualFiles],
@@ -6744,8 +7239,8 @@ mod planner_embedded_authority_tests {
         );
         assert_eq!(
             file_tags_first.cue_sidecar_override,
-            Some(CueSidecarPolicy::IgnoreCue),
-            "File tags remain a valid representation of a directly selected single-image carrier",
+            Some(CueSidecarPolicy::SidecarOnly),
+            "a CUE-proven image cannot use physical File tags as track-level authority",
         );
 
         let sidecar_first = cue_artifact_commit_decision_for_path(
@@ -6774,9 +7269,9 @@ mod planner_embedded_authority_tests {
     }
 
     #[test]
-    fn directly_queued_independent_audio_ignores_neighboring_one_track_sidecar() {
+    fn directly_queued_audio_honors_applicable_one_track_sidecar_priority() {
         if !require_flac_fixture_tool(
-            "directly_queued_independent_audio_ignores_neighboring_one_track_sidecar",
+            "directly_queued_audio_honors_applicable_one_track_sidecar_priority",
         ) {
             return;
         }
@@ -6812,24 +7307,24 @@ mod planner_embedded_authority_tests {
         );
         assert_eq!(
             direct.cue_sidecar_override,
-            Some(CueSidecarPolicy::IgnoreCue),
-            "a one-track same-stem CUE does not prove that an independent audio-file click is an image-album source selection",
+            Some(CueSidecarPolicy::SidecarOnly),
+            "an applicable one-track sidecar remains semantically viable and must participate in configured authority",
         );
         let mut direct_request =
             crate::convert::pipeline::materializer_cue::test_pipeline_request_for_authority(
                 &selected,
             );
-        direct_request.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
-        let direct_metadata =
-            crate::convert::processor::dispatch_track_metadata_for_authority_matrix_test(
-                &direct_request,
-                crate::convert::pipeline::SourceKind::SingleFile,
-            )
-            .expect("ordinary direct-file metadata must remain readable");
+        direct_request.source.cue_sidecar = direct
+            .cue_sidecar_override
+            .expect("direct authority must be frozen");
+        let direct_sheet = crate::convert::pipeline::dispatch_metadata_sheet_for_cue_request(
+            &direct_request,
+        )
+        .expect("direct sidecar authority must remain readable");
         assert_eq!(
-            direct_metadata.extra.get("album").map(String::as_str),
-            Some("File Tags Sentinel"),
-            "direct conversion metadata must come from the selected file tags",
+            direct_sheet.title.as_deref(),
+            Some("Sidecar Sentinel"),
+            "direct conversion metadata must come from the configured sidecar authority",
         );
 
         let explicit_cue = cue_artifact_commit_decision_for_path(

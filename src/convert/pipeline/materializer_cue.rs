@@ -1234,21 +1234,6 @@ fn find_valid_sidecar_cue_for_image(image: &Path) -> Result<Option<PathBuf>, Mat
     }
 }
 
-fn validate_sidecar_cue_matches_image(
-    cue_path: &Path,
-    image: &Path,
-) -> Result<(), MaterializeError> {
-    if sidecar_cue_matches_image(cue_path, image)? {
-        Ok(())
-    } else {
-        Err(MaterializeError::Parse(format!(
-            "CUE file {} does not reference input image {}",
-            cue_path.display(),
-            image.display()
-        )))
-    }
-}
-
 fn sidecar_cue_track_count_for_image_materialize(
     cue_path: &Path,
     image: &Path,
