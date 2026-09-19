@@ -90,6 +90,16 @@ impl From<LoudnessMetricDemand> for LoudnessMetricCoverage {
     }
 }
 
+/// Qualification-harness selector for the private loudness SIMD backend.
+/// Hidden: it exists only so the timing example can pin a backend.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoudnessSimdBackend {
+    Scalar,
+    Sse2,
+    Avx,
+}
+
 /// Loudness role of one decoded channel, in decoded channel order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelRole {
@@ -579,6 +589,32 @@ impl LoudnessMeter {
             history_storage_bytes: 0,
             failed: false,
         })
+    }
+
+    /// Force the private SIMD backend for the qualification timing harness.
+    ///
+    /// Not part of the supported API: production selection stays with
+    /// `Backend::production()`. Fails when the host lacks the requested ISA
+    /// or when the meter has already consumed samples.
+    #[doc(hidden)]
+    pub fn force_simd_backend_for_qualification(
+        &mut self,
+        backend: LoudnessSimdBackend,
+    ) -> Result<(), LoudnessError> {
+        if self.frames_seen != 0 || self.failed {
+            return Err(LoudnessError::MeterFailed);
+        }
+        let selected = match backend {
+            LoudnessSimdBackend::Scalar => Some(simd::Backend::scalar()),
+            #[cfg(target_arch = "x86_64")]
+            LoudnessSimdBackend::Sse2 => simd::Backend::sse2_if_available(),
+            #[cfg(target_arch = "x86_64")]
+            LoudnessSimdBackend::Avx => simd::Backend::avx_if_available(),
+            #[cfg(not(target_arch = "x86_64"))]
+            LoudnessSimdBackend::Sse2 | LoudnessSimdBackend::Avx => None,
+        };
+        self.simd_backend = selected.ok_or(LoudnessError::MeterFailed)?;
+        Ok(())
     }
 
     #[must_use]

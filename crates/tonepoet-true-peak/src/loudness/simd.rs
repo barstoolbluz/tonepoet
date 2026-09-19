@@ -14,11 +14,9 @@ enum BackendKind {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Sse2,
+    /// Test-only and harness-only candidate pending separate production
+    /// commissioning; never returned by `production()`.
     #[cfg(target_arch = "x86_64")]
-    #[allow(
-        dead_code,
-        reason = "frozen test-only AVX candidate retained pending separate production commissioning"
-    )]
     Avx,
 }
 
@@ -43,12 +41,12 @@ impl Backend {
         matches!(self.0, BackendKind::Scalar)
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn sse2_if_available() -> Option<Self> {
         std::is_x86_feature_detected!("sse2").then_some(Self(BackendKind::Sse2))
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn avx_if_available() -> Option<Self> {
         std::is_x86_feature_detected!("avx").then_some(Self(BackendKind::Avx))
     }
