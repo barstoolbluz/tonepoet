@@ -49,3 +49,5 @@ SSE2 and AVX both pass the declared promotion gate. Their stereo medians differ 
 ## Promotion boundary
 
 For `NativeEbu2023`, production dispatch changes only from scalar to SSE2 on x86_64 hosts reporting SSE2. `Libebur128126` remains scalar because it is outside this commissioning scope. The scalar implementation remains the native fallback when SSE2 is unavailable. AVX remains test-only. Numerical contracts, public API, meter state, and result representation are unchanged.
+
+Superseded in part on 2026-09-19: mono returned to scalar and AVX promoted for four or more channels. See `LOUDNESS_SIMD_X86_64_REATTESTATION_IVYBRIDGE_2026-09-19.md`.

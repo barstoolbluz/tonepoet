@@ -90,6 +90,16 @@ impl From<LoudnessMetricDemand> for LoudnessMetricCoverage {
     }
 }
 
+/// Qualification-harness selector for the private loudness SIMD backend.
+/// Hidden: it exists only so the timing example can pin a backend.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoudnessSimdBackend {
+    Scalar,
+    Sse2,
+    Avx,
+}
+
 /// Loudness role of one decoded channel, in decoded channel order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelRole {
@@ -552,7 +562,7 @@ impl LoudnessMeter {
         }
 
         let simd_backend = match profile {
-            LoudnessProfile::NativeEbu2023 => simd::Backend::production(),
+            LoudnessProfile::NativeEbu2023 => simd::Backend::production(channels),
             LoudnessProfile::Libebur128126 => simd::Backend::scalar(),
         };
 
@@ -579,6 +589,32 @@ impl LoudnessMeter {
             history_storage_bytes: 0,
             failed: false,
         })
+    }
+
+    /// Force the private SIMD backend for the qualification timing harness.
+    ///
+    /// Not part of the supported API: production selection stays with
+    /// `Backend::production()`. Fails when the host lacks the requested ISA
+    /// or when the meter has already consumed samples.
+    #[doc(hidden)]
+    pub fn force_simd_backend_for_qualification(
+        &mut self,
+        backend: LoudnessSimdBackend,
+    ) -> Result<(), LoudnessError> {
+        if self.frames_seen != 0 || self.failed {
+            return Err(LoudnessError::MeterFailed);
+        }
+        let selected = match backend {
+            LoudnessSimdBackend::Scalar => Some(simd::Backend::scalar()),
+            #[cfg(target_arch = "x86_64")]
+            LoudnessSimdBackend::Sse2 => simd::Backend::sse2_if_available(),
+            #[cfg(target_arch = "x86_64")]
+            LoudnessSimdBackend::Avx => simd::Backend::avx_if_available(),
+            #[cfg(not(target_arch = "x86_64"))]
+            LoudnessSimdBackend::Sse2 | LoudnessSimdBackend::Avx => None,
+        };
+        self.simd_backend = selected.ok_or(LoudnessError::MeterFailed)?;
+        Ok(())
     }
 
     #[must_use]
@@ -2323,7 +2359,33 @@ mod tests {
         )
         .unwrap();
 
+        let native_mono = LoudnessMeter::with_roles(
+            48_000,
+            &[ChannelRole::Mono],
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+
+        let native_quad = LoudnessMeter::with_roles(
+            48_000,
+            &[
+                ChannelRole::Left,
+                ChannelRole::Right,
+                ChannelRole::LeftSurround,
+                ChannelRole::RightSurround,
+            ],
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+
         assert_eq!(native.simd_backend.is_scalar(), !sse2_available);
+        assert!(native_mono.simd_backend.is_scalar());
+        if let Some(avx) = simd::Backend::avx_if_available() {
+            assert_eq!(native_quad.simd_backend, avx);
+            assert_ne!(native.simd_backend, avx);
+        } else {
+            assert_eq!(native_quad.simd_backend.is_scalar(), !sse2_available);
+        }
         assert!(compatibility_default.simd_backend.is_scalar());
         assert!(compatibility_roles.simd_backend.is_scalar());
         assert_eq!(
