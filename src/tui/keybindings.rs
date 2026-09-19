@@ -15856,9 +15856,17 @@ fn metadata_album_view_plan_with_structure_policy(
                                     && match target {
                                         crate::config::AggregateMetadataTarget::IndividualFiles => true,
                                         crate::config::AggregateMetadataTarget::EmbeddedCue => {
-                                            !unified_cue_album_standard_per_track_key_is_persistable(
-                                                &entry.display_key,
-                                            )
+                                            // Chapter structural replacement owns positional CUE
+                                            // track numbers. The generator serializes them from the
+                                            // synthetic track order rather than as free-form metadata.
+                                            let structural_track_number = replace_cue_structure
+                                                && entry
+                                                    .display_key
+                                                    .eq_ignore_ascii_case("TRACKNUMBER");
+                                            !structural_track_number
+                                                && !unified_cue_album_standard_per_track_key_is_persistable(
+                                                    &entry.display_key,
+                                                )
                                         }
                                         crate::config::AggregateMetadataTarget::SidecarCue => {
                                             !unified_cue_album_sidecar_per_track_key_is_persistable(
