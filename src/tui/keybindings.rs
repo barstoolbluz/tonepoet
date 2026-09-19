@@ -32792,7 +32792,7 @@ fn open_metadata_editor_for_resolved_groups(
             let source_set = single_image_metadata_source_set(
                 app,
                 audio_path,
-                &app.config.conversion.aggregate_metadata_target_priority,
+                &app.config.conversion.aggregate_metadata_target_priority.clone(),
             )?;
             if !source_set.presentations.is_empty() {
                 let exact_source = match group.representation {
@@ -32939,7 +32939,7 @@ fn open_metadata_editor_for_resolved_groups(
             let source_set = single_image_metadata_source_set(
                 app,
                 audio_path,
-                &app.config.conversion.aggregate_metadata_target_priority,
+                &app.config.conversion.aggregate_metadata_target_priority.clone(),
             )?;
             if !source_set.presentations.is_empty() {
                 let exact_source = match group.representation {
@@ -41707,7 +41707,7 @@ fn open_metadata_editor_impl_for_selection(
             let source_set = match single_image_metadata_source_set(
                 app,
                 &audio_path,
-                &app.config.conversion.aggregate_metadata_target_priority,
+                &app.config.conversion.aggregate_metadata_target_priority.clone(),
             ) {
                 Ok(source_set) => source_set,
                 Err(error) => {
@@ -41832,7 +41832,7 @@ fn open_metadata_editor_impl_for_selection(
         let source_set = match single_image_metadata_source_set(
             app,
             &sel[0],
-            &app.config.conversion.aggregate_metadata_target_priority,
+            &app.config.conversion.aggregate_metadata_target_priority.clone(),
         ) {
             Ok(source_set) => source_set,
             Err(error) => {
@@ -87020,7 +87020,6 @@ mod staged_archive_metadata_path_tests {
 mod single_image_metadata_editor_regression_tests {
     use super::*;
     use crate::tui::app::{ActiveOverlay, AppState};
-    use crate::tui::probe::SourceMetadata;
     use crate::config::TonepoetConfig;
     use super::phase4_tests::single_image_unified_cue_state;
 
@@ -95360,10 +95359,10 @@ mod single_image_metadata_editor_regression_tests {
                 &image,
             );
         request.source.cue_sidecar = CueSidecarPolicy::SidecarOnly;
-        assert_eq!(
+        assert!(matches!(
             crate::convert::pipeline::materializer_cue::is_cue_image_candidate(&request),
-            Ok(true),
-        );
+            Ok(true)
+        ));
     }
 
     #[test]

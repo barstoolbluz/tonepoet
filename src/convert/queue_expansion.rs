@@ -1918,6 +1918,28 @@ fn coherent_embedded_cuesheet_for_member_audio(
     rewrite_embedded_cue_file_lines_to_absolute_paths(&first, &file_order)
 }
 
+// Restored: the round-2 cleanup removed this as unreachable; the 2026-09-19
+// delivery calls it again.
+fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
+    let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
+    for (track_number, path, index01) in resolved_tracks {
+        let key = queue_path_key(path);
+        if let Some((previous_track, previous_index)) = previous_by_file.get(&key) {
+            if index01 <= previous_index {
+                return Err(format!(
+                    "non-increasing INDEX 01 for track {} in {}; previous track {} was at frame {}",
+                    track_number,
+                    path.display(),
+                    previous_track,
+                    previous_index
+                ));
+            }
+        }
+        previous_by_file.insert(key, (*track_number, *index01));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn planner_coherent_embedded_cuesheet_accepts_for_test(
     member_audio: &[PathBuf],
@@ -2826,27 +2848,6 @@ pub(crate) fn cue_referenced_audio_paths_to_suppress_for_queue(
         CueQueueDecision::SplitSource { referenced_audio } => Ok(referenced_audio),
         CueQueueDecision::MetadataArtifact { .. } => Ok(Vec::new()),
     }
-}
-
-#[cfg(test)]
-fn validate_queue_cue_index_order(resolved_tracks: &[(u32, PathBuf, u32)]) -> Result<(), String> {
-    let mut previous_by_file: BTreeMap<PathBuf, (u32, u32)> = BTreeMap::new();
-    for (track_number, path, index01) in resolved_tracks {
-        let key = queue_path_key(path);
-        if let Some((previous_track, previous_index)) = previous_by_file.get(&key) {
-            if index01 <= previous_index {
-                return Err(format!(
-                    "non-increasing INDEX 01 for track {} in {}; previous track {} was at frame {}",
-                    track_number,
-                    path.display(),
-                    previous_track,
-                    previous_index
-                ));
-            }
-        }
-        previous_by_file.insert(key, (*track_number, *index01));
-    }
-    Ok(())
 }
 
 pub(crate) type CueReferenceResolution = SplitCueReferenceResolution;
