@@ -785,6 +785,7 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
                 &app.convert.source.cue_artifact_audio,
                 &app.convert.source.cue_artifact_metadata,
                 &app.config.conversion.aggregate_metadata_target_priority,
+                app.convert.source.explicit_cue_source_policy,
             );
             let cue_policy = preview_authority.cue_sidecar_override;
             let baseline = super::app::ConvertProbeBaseline::capture(&app.convert);
@@ -8869,6 +8870,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         })
                         .map(|_| outcome.split_on_conversion)
                 });
+                let automatic_resume = taken.state.resume_metadata_save_after_chapter;
                 let status = super::keybindings::complete_metadata_editor_chapter_save(
                     &mut taken.state,
                     session_id,
@@ -8884,6 +8886,71 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.convert.output_options.merge.select_value(&mode);
                 }
                 app.set_status(status);
+
+                if automatic_resume {
+                    taken.state.resume_metadata_save_after_chapter = false;
+                    let structural_save_succeeded = taken
+                        .state
+                        .surface_for_session(session_id)
+                        .is_some_and(|surface| {
+                            !surface.chapter_authoring.dirty && !surface.refresh_failed
+                        });
+                    if structural_save_succeeded {
+                        let active_still_dirty = crate::tui::app::presentation_tab_has_changes(
+                            taken.state.active_surface(),
+                        );
+                        if active_still_dirty {
+                            super::keybindings::metadata_editor_save(
+                                app,
+                                &mut taken.state,
+                                tx,
+                            );
+                            restore_taken_metadata_editor(app, taken);
+                            return;
+                        }
+
+                        let next_source_tab = taken
+                            .state
+                            .source_save_batch
+                            .as_mut()
+                            .and_then(|batch| {
+                                (!batch.remaining_tabs.is_empty())
+                                    .then(|| batch.remaining_tabs.remove(0))
+                            });
+                        let continue_source_batch = if let Some(next) = next_source_tab {
+                            taken.state.switch_presentation_tab(next);
+                            taken.state.close_after_successful_save = false;
+                            true
+                        } else {
+                            if let Some(batch) = taken.state.source_save_batch.take() {
+                                taken.state.close_after_successful_save = batch.close_after;
+                            }
+                            false
+                        };
+                        if continue_source_batch {
+                            super::keybindings::metadata_editor_save(
+                                app,
+                                &mut taken.state,
+                                tx,
+                            );
+                            restore_taken_metadata_editor(app, taken);
+                            return;
+                        }
+
+                        if taken.state.close_after_successful_save
+                            && !crate::tui::probe::metadata_editor_has_changes(&taken.state)
+                        {
+                            // OK requested close and the structural CUE write was
+                            // the final outstanding edit. The source itself is
+                            // already reconciled by the chapter completion.
+                            return;
+                        }
+                    } else {
+                        taken.state.source_save_batch = None;
+                        taken.state.close_after_successful_save = false;
+                    }
+                }
+
                 restore_taken_metadata_editor(app, taken);
             } else {
                 app.set_status("metadata editor: chapter save finished after editor closed");
@@ -9253,6 +9320,42 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             }
                         }
                     }
+                    let mut continue_source_save_batch = false;
+                    if summary.all_saved() && refresh_failure.is_none() {
+                        let next_source_tab = taken
+                            .state
+                            .source_save_batch
+                            .as_mut()
+                            .and_then(|batch| {
+                                (!batch.remaining_tabs.is_empty())
+                                    .then(|| batch.remaining_tabs.remove(0))
+                            });
+                        if let Some(next) = next_source_tab {
+                            taken.state.switch_presentation_tab(next);
+                            taken.state.phase = super::app::MetadataEditorPhase::Editing;
+                            taken.state.close_after_successful_save = false;
+                            close_editor = false;
+                            continue_source_save_batch = true;
+                        } else if let Some(batch) = taken.state.source_save_batch.take() {
+                            taken.state.close_after_successful_save = batch.close_after;
+                            close_editor = batch.close_after
+                                && taken.state.dirty_source_presentation_indices().is_empty();
+                        }
+                    } else if taken.state.source_save_batch.is_some() {
+                        // A failed/partial source write must not advance to another
+                        // physical representation. Leave the remaining tabs dirty
+                        // for an explicit retry and keep the editor open.
+                        taken.state.source_save_batch = None;
+                        taken.state.close_after_successful_save = false;
+                        close_editor = false;
+                    }
+
+                    if continue_source_save_batch {
+                        super::keybindings::metadata_editor_save(app, &mut taken.state, tx);
+                        restore_taken_metadata_editor(app, taken);
+                        return;
+                    }
+
                     if close_editor {
                         let archive_context = taken.state.archive_edit_context.clone();
                         restore_editor = false;

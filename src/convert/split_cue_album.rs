@@ -1217,6 +1217,71 @@ fn prepare_cross_file_cumulative_cue_repair(
     })
 }
 
+fn ranked_same_single_image_members(
+    members: &[SplitCueAdmissionMember],
+) -> Option<Vec<SplitCueAdmissionMember>> {
+    let first_audio = members.first()?.referenced_audio.first()?;
+    if members.iter().any(|member| {
+        member.referenced_audio.len() != 1
+            || cue_path_key(&member.referenced_audio[0]) != cue_path_key(first_audio)
+    }) {
+        return None;
+    }
+
+    let mut ranked = members.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .all_file_references_exact
+            .cmp(&left.all_file_references_exact)
+            .then_with(|| split_cue_path_cmp(&left.cue_path, &right.cue_path))
+    });
+    Some(ranked)
+}
+
+/// Return every valid CUE representation that resolves to `audio_path`, using
+/// the same parser, path-repair semantics, and stable ranking as aggregate
+/// folder selection. Exact FILE references precede repaired references; ties
+/// use the existing stable CUE-path ordering.
+#[must_use]
+pub fn viable_cue_candidates_covering_audio(
+    cue_paths: &[PathBuf],
+    audio_path: &Path,
+) -> Vec<SplitCueAdmissionMember> {
+    let audio_key = cue_path_key(audio_path);
+    inspect_split_cue_folder_members(cue_paths)
+        .viable
+        .into_iter()
+        .filter(|member| {
+            member
+                .referenced_audio
+                .iter()
+                .any(|candidate| cue_path_key(candidate) == audio_key)
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn ranked_single_image_cue_candidates_for_audio(
+    cue_paths: &[PathBuf],
+    audio_path: &Path,
+) -> Vec<SplitCueAdmissionMember> {
+    let audio_key = cue_path_key(audio_path);
+    let mut members = viable_cue_candidates_covering_audio(cue_paths, audio_path)
+        .into_iter()
+        .filter(|member| {
+            member.referenced_audio.len() == 1
+                && cue_path_key(&member.referenced_audio[0]) == audio_key
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        right
+            .all_file_references_exact
+            .cmp(&left.all_file_references_exact)
+            .then_with(|| split_cue_path_cmp(&left.cue_path, &right.cue_path))
+    });
+    members
+}
+
 fn ranked_split_cue_candidates_for_prompt(
     members: &[SplitCueAdmissionMember],
 ) -> Vec<SplitCueAdmissionMember> {
@@ -1320,6 +1385,22 @@ pub fn select_split_cue_folder_members_with_preference(
         return selected_split_cue_folder_members(
             &members,
             members.clone(),
+            rejected_audio,
+            rejected,
+            selection_album_group,
+        );
+    }
+
+    // Multiple valid CUEs that all resolve to one identifiable image are
+    // alternative metadata representations of the same content, not an
+    // unresolved content choice. Aggregate authority therefore picks one
+    // deterministically: exact FILE references first, then the existing stable
+    // path ordering. Callers that need source access can obtain the full ranked
+    // set with `ranked_single_image_cue_candidates_for_audio`.
+    if let Some(ranked) = ranked_same_single_image_members(&members) {
+        return selected_split_cue_folder_members(
+            &members,
+            vec![ranked[0].clone()],
             rejected_audio,
             rejected,
             selection_album_group,
@@ -2937,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn equally_ranked_metadata_sidecars_for_one_image_prompt_and_honor_the_choice() {
+    fn equally_ranked_metadata_sidecars_for_one_image_choose_stably_and_honor_explicit_choice() {
         let td = tempfile::tempdir().expect("tempdir");
         let image = td.path().join("album.wv");
         std::fs::write(&image, b"audio").expect("audio");
@@ -2951,24 +3032,20 @@ mod tests {
             .expect("metadata cue");
         }
 
-        let SplitCueFolderSelection::NeedsChoice { candidates, .. } =
-            select_split_cue_folder_members(&[first.clone(), second.clone()], None)
+        let SplitCueFolderSelection::Selected { members, .. } =
+            select_split_cue_folder_members(&[second.clone(), first.clone()], None)
         else {
-            panic!("equally ranked metadata alternatives must prompt");
+            panic!("same-image metadata alternatives must choose deterministically");
         };
-        assert_eq!(candidates.len(), 2);
-        assert!(candidates
-            .iter()
-            .all(|member| member.role == SplitCueMemberRole::MetadataSidecar));
+        assert_eq!(members.len(), 1);
+        assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&first));
+        assert_eq!(members[0].referenced_audio, vec![image.clone()]);
 
         let SplitCueFolderSelection::Selected {
             members,
             excluded_audio,
             ..
-        } = select_split_cue_folder_members(
-            &[first, second.clone()],
-            Some(&second),
-        )
+        } = select_split_cue_folder_members(&[first, second.clone()], Some(&second))
         else {
             panic!("the operation-scoped metadata-sidecar choice must be honored");
         };
@@ -2976,6 +3053,41 @@ mod tests {
         assert_eq!(cue_path_key(&members[0].cue_path), cue_path_key(&second));
         assert_eq!(members[0].referenced_audio, vec![image]);
         assert!(excluded_audio.is_empty());
+    }
+
+    #[test]
+    fn ranked_single_image_candidates_put_exact_before_repaired_and_drop_invalid() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let image = td.path().join("album.wv");
+        std::fs::write(&image, b"audio").expect("audio");
+        let repaired = td.path().join("a-repaired.cue");
+        let exact = td.path().join("z-exact.cue");
+        let invalid = td.path().join("0-invalid.cue");
+        std::fs::write(
+            &repaired,
+            "FILE \"album.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("repaired cue");
+        std::fs::write(
+            &exact,
+            "FILE \"album.wv\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("exact cue");
+        std::fs::write(
+            &invalid,
+            "FILE \"missing.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("invalid cue");
+
+        let ranked = ranked_single_image_cue_candidates_for_audio(
+            &[invalid, repaired.clone(), exact.clone()],
+            &image,
+        );
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(cue_path_key(&ranked[0].cue_path), cue_path_key(&exact));
+        assert!(ranked[0].all_file_references_exact);
+        assert_eq!(cue_path_key(&ranked[1].cue_path), cue_path_key(&repaired));
+        assert!(!ranked[1].all_file_references_exact);
     }
 
     #[test]
