@@ -2570,3 +2570,39 @@ conversion, so conversions of these files with ReplayGain enabled are expected t
 - Backlog: FLAC ID3-prefix scanner and repair tool (deferred 2026-07-27).
 - Round-5 (2026-07) taught the native tag *writer* a bounded prefix skip; the native *decoder*
   path added by the checkpoint has no equivalent tolerance for a trailer.
+
+## 35. Missing test coverage: two field failures the gate could not see
+
+**Status:** open, filed 2026-09-19. Not "nice to have": each item is a test whose absence let a
+user-visible failure ship past a green gate this month.
+
+### 35a. A conversion with ReplayGain enabled, run through the real queued execution path
+
+On 2026-09-16 every conversion with ReplayGain enabled failed at the ReplayGain stage (native tag
+writer refused by the claim registry as a foreign writer, OUTSTANDING lineage in
+`DELIVERY_NOTES_replaygain_claim_conflict_2026-09-16.md`) while the workspace gate stood at 6970
+passed / 0 failed. The real-tool matrix tests exercise the ReplayGain writer, but none registers a
+runtime execution and holds the job's staging lease the way a queued CLI or TUI conversion does, so
+the conflict between the job's own authority and the blocking-thread writer was invisible. The
+round-4 fix added a concurrency unit test for capability transfer into a blocking worker; that is a
+component test, not the shape that failed.
+
+Required: at least one test that runs a conversion with ReplayGain enabled through the same path a
+queued item takes in production — runtime execution registered, staging and output claims held —
+and asserts the ReplayGain tags in the published files. Both track and album modes, at least one
+format whose writer is in-process (FLAC) and one that goes through a subprocess.
+
+### 35b. Native decode of a FLAC with an ID3v2 prefix and an ID3v1 trailer
+
+Issue #34: `:analyze` Loudness and ReplayGain measurement fail on the many 2006-2009-era rips whose
+FLACs carry an ID3v2 header before `fLaC` and a 128-byte `TAG` trailer after the last frame, because
+the native decode wrapper treats the end-of-stream trailer error as fatal. There is no fixture of
+that shape anywhere under `tests/fixtures`, so nothing in the gate decodes such a file through the
+native path. The round-5 write-path fix of 2026-07 taught the tag writer a prefix skip; the decode
+path added by the 2026-09 checkpoint has never been exercised on one.
+
+Required: a fixture FLAC with both the ID3v2 prefix and the ID3v1 trailer (a few seconds of audio
+is enough), and tests that (1) the native loudness/true-peak decode yields the declared sample
+count from it and (2) `:analyze`-shaped measurement and a ReplayGain-enabled conversion of it
+succeed. To be delivered with the #34 fix, and to stay as the regression guard for the scanner and
+repair tool that follows.
