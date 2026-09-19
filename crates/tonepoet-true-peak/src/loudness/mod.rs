@@ -2366,8 +2366,26 @@ mod tests {
         )
         .unwrap();
 
+        let native_quad = LoudnessMeter::with_roles(
+            48_000,
+            &[
+                ChannelRole::Left,
+                ChannelRole::Right,
+                ChannelRole::LeftSurround,
+                ChannelRole::RightSurround,
+            ],
+            LoudnessProfile::NativeEbu2023,
+        )
+        .unwrap();
+
         assert_eq!(native.simd_backend.is_scalar(), !sse2_available);
         assert!(native_mono.simd_backend.is_scalar());
+        if let Some(avx) = simd::Backend::avx_if_available() {
+            assert_eq!(native_quad.simd_backend, avx);
+            assert_ne!(native.simd_backend, avx);
+        } else {
+            assert_eq!(native_quad.simd_backend.is_scalar(), !sse2_available);
+        }
         assert!(compatibility_default.simd_backend.is_scalar());
         assert!(compatibility_roles.simd_backend.is_scalar());
         assert_eq!(

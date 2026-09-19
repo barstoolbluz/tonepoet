@@ -79,3 +79,27 @@ default role layouts (L R Ls Rs; L R C Ls Rs), 120 programme-seconds. Raw sample
 AVX relative to SSE2 (median of medians) on this host: 4 ch +3.0%, 5 ch +5.1%,
 6 ch +6.9%, 8 ch +12.9%; stereo -15.5%. AVX remains test-only pending a separate
 promotion decision; if promoted, it would be per channel count, never for stereo or mono.
+
+## AVX promoted for four or more channels — same day
+
+Operator decision: AVX becomes production dispatch for four or more channels, falling back
+to SSE2 and then scalar when the host lacks the ISA. Stereo and three-channel stay SSE2
+(AVX measured 15.5% slower than SSE2 on stereo here and slower on the commissioning host
+too). Mono stays scalar. Quad clears the record's own 2% tie rule at +3.0% over SSE2, and
+the margin grows with channel count; the commissioning host (Xeon Platinum 8573C) showed
+larger AVX margins on six and eight channels than this first-generation AVX part, so the
+gain is expected to be larger on newer hardware, not smaller.
+
+Verification of the new dispatch, `production` mode, raw samples in
+`loudness_simd_x86_64_ivybridge_avx_dispatch_2026-09-19.json`:
+
+| Channels | Programme seconds | Scalar median | SSE2 median | SSE2 vs scalar | Paired wins | AVX median | AVX vs scalar | AVX paired wins | Production median | Production vs scalar | Production wins | Bit-identical |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| 4 | 120 | 882,833,735 ns | 547,625,289 ns | +37.970% | 9/9 | 535,705,205 ns | +39.320% | 9/9 | 536,154,809 ns | +39.269% | 9/9 | yes |
+| 5 | 120 | 1,213,189,633 ns | 829,718,260 ns | +31.609% | 9/9 | 787,977,355 ns | +35.049% | 9/9 | 788,415,135 ns | +35.013% | 9/9 | yes |
+| 6 | 120 | 1,337,040,526 ns | 913,445,544 ns | +31.682% | 9/9 | 857,412,072 ns | +35.872% | 9/9 | 857,067,646 ns | +35.898% | 9/9 | yes |
+| 8 | 120 | 2,290,924,215 ns | 1,413,953,433 ns | +38.280% | 9/9 | 1,243,255,134 ns | +45.731% | 9/9 | 1,241,522,204 ns | +45.807% | 9/9 | yes |
+
+Final production dispatch for `NativeEbu2023` on x86_64: 1 channel scalar; 2 to 3
+channels SSE2; 4 or more AVX. `Libebur128126` stays scalar. The selection test
+`simd01_runtime_selection_respects_profile_commissioning_boundary` encodes this.

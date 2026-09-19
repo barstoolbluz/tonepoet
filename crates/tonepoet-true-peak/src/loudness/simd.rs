@@ -1,8 +1,9 @@
 //! Private same-graph SIMD candidates for loudness arithmetic.
 //!
-//! x86_64 SSE2 production dispatch is commissioned after bitwise differential
-//! qualification and repeatable release-build net-benefit measurement. AVX
-//! remains a test-only candidate pending a separately justified promotion.
+//! x86_64 production dispatch is commissioned after bitwise differential
+//! qualification and repeatable release-build net-benefit measurement:
+//! scalar for one channel, SSE2 for two and three, AVX for four or more
+//! (each falling back to the narrower ISA when unavailable).
 
 use super::k_weighting::{FilterState, KWeightingCoefficients};
 
@@ -14,8 +15,8 @@ enum BackendKind {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Sse2,
-    /// Test-only and harness-only candidate pending separate production
-    /// commissioning; never returned by `production()`.
+    /// Production for four or more channels since the 2026-09-19
+    /// re-attestation; SSE2 remains production for two and three.
     #[cfg(target_arch = "x86_64")]
     Avx,
 }
@@ -28,12 +29,17 @@ impl Backend {
     /// Select only a backend with completed differential and performance
     /// qualification for this production target and channel count.
     ///
-    /// One-lane meters stay scalar: with a single channel there is nothing to
-    /// pack, and the vector path measured slower than scalar on mono in the
-    /// 2026-09-19 re-attestation (see `qualification/`).
+    /// Per the 2026-09-19 re-attestation (see `qualification/`): one-lane
+    /// meters stay scalar (nothing to pack; the vector path measured slower),
+    /// two and three channels use SSE2 (AVX measured slower on stereo), and
+    /// four or more channels use AVX, falling back to SSE2 and then scalar
+    /// when the host lacks the ISA.
     pub(super) fn production(channels: usize) -> Self {
         #[cfg(target_arch = "x86_64")]
         {
+            if channels >= 4 && std::is_x86_feature_detected!("avx") {
+                return Self(BackendKind::Avx);
+            }
             if channels >= 2 && std::is_x86_feature_detected!("sse2") {
                 return Self(BackendKind::Sse2);
             }
