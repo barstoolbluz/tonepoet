@@ -53,3 +53,14 @@ measured this way; the harness has to do the other 29.
   trimming for the strong SSRC path.
 
 Neither is the operator's to make. The evidence files are committed as `pending`.
+
+## Resolved 2026-09-20
+
+The fork's `vendor/tonepoet-finite-stream-patch` (merged to master as 6b0bbfe) fixes both
+causes: floating output carries a fact chunk equal to the data frames, and linear-phase
+conversion publishes the finite timeline round(N*Fd/Fs). tonepoet's flake was re-pinned,
+the executable it builds (sha256 `502af766…`) characterized 30/30 with the audits closed:
+`outcome_2026-09-20.json`, evidence `sha256:860be9d1…`, outcome `bounded_established`.
+The registry (`tonepoet-pipeline/src/ssrc_binary64.rs`) now returns Established for the
+five characterized rate pairs on x86_64 at linear phase and 0.0 dB; everything else stays
+pending.
