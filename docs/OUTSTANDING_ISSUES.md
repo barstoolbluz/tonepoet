@@ -2671,3 +2671,23 @@ its launch cheap or amortised per item, not to remove it.
 An external tool call adds no more than a small fixed cost over the tool itself, at most tens of
 milliseconds, with the containment guarantees unchanged. The Stage A profile re-run after the change
 shows the Metadata stage on Opus and AAC within a few percent of the tag writers' direct time.
+
+## 38. Analyze detects ID3-wrapped FLACs and offers to repair them
+
+Follows #34. Once the native decoder tolerates an ID3v2 prefix and an ID3v1 trailer, the
+wrappers are still a defect in the file: other tools trip on them, and every later native
+read pays for skipping them. The user has many such rips and wants them found and fixed
+from inside tonepoet rather than by an external scanner.
+
+### Required
+
+`:analyze` detects a FLAC whose stream is wrapped by an ID3v2 prefix, an ID3v1 trailer, or
+both, and reports it in the analysis view. When it does, a Repair pill becomes active in
+that view. Repair rewrites the file as a clean FLAC stream with its audio and its FLAC-native
+metadata intact, using the same in-place safety machinery the overflow rewrite already
+has (temp file, source revalidation before commit, mode, timestamps, xattrs and ACLs
+preserved, hardlinks and symlinks refused). Files without wrappers show no pill. This is
+the in-app form of the scanner-and-repair backlog item from 2026-07-27; a library-wide
+sweep can come later on top of it.
+
+Not part of the 2026-09-20 DSD and ID3 brief; scheduled after it.
