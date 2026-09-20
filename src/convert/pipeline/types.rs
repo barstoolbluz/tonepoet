@@ -1199,6 +1199,11 @@ pub enum TrackSourceRef {
         point_dbtp: Option<tonepoet_pipeline::DbNano>,
         effective_target_dbtp: tonepoet_pipeline::DbNano,
         lossy_target_capped: bool,
+        /// Already-executed commissioned SSRC binding that produced the measured carrier.
+        /// Reporting/provenance only: this is not pending resampler authority and must not
+        /// cause terminal planning to execute SSRC again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strong_ssrc_resampler: Option<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>,
         /// Typed physical terminal candidate whose proof was charged by the gain decision.
         /// Old transient serialized state may omit it, but certified execution then fails closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]

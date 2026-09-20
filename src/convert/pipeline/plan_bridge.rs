@@ -280,6 +280,10 @@ fn plan_request_for_track_impl(
         } => Some((*bit_depth, terminal_candidate)),
         _ => None,
     };
+    let pcm_true_peak_carrier = matches!(
+        &track.source_ref,
+        TrackSourceRef::PcmTruePeakCarrier { .. }
+    );
     let registered_effect_resampler_consumed = matches!(
         &track.source_ref,
         TrackSourceRef::RegisteredEffectCarrier {
@@ -349,6 +353,15 @@ fn plan_request_for_track_impl(
             // one selected by the legacy command lowerer.
             if !settings.target_format.is_dsd() {
                 settings.target_sample_rate = RateTarget::PcmHz(sample_rate_hz);
+            }
+            if pcm_true_peak_carrier {
+                // A PCM true-peak carrier exists only after all selected
+                // pre-observation rate work has completed. Any surviving
+                // forced-SSRC bit therefore describes upstream authority that
+                // has already been consumed. Clear only that force bit: the
+                // preferred tool may have just been rebound above to the
+                // certified charged terminal and must remain authoritative.
+                settings.ssrc.force = false;
             }
             if registered_effect_resampler_consumed {
                 // The common realizer has already executed the frozen typed
@@ -4266,6 +4279,119 @@ mod tests {
     }
 
     #[test]
+    fn pcm_true_peak_carrier_consumes_forced_ssrc_before_terminal_replanning() {
+        let temp = TempDir::new().expect("temp dir");
+        let original_pcm = temp.path().join("source.flac");
+        write_minimal_flac_with_md5(&original_pcm);
+        let carrier = temp.path().join("source.true-peak.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let output = temp.path().join("out.flac");
+
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        req.settings.ssrc.force = true;
+        req.settings.ssrc.profile = Some(tonepoet_pipeline::SsrcProfile::High);
+        req.settings.metadata.transfer_tags = false;
+        req.settings.metadata.preserve_artwork = false;
+        req.settings.metadata.store_source_audio_md5 = false;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: "-1.000000000".parse().expect("true-peak ceiling"),
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
+
+        let selected_terminal = selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        let mut prepared_track = track(TrackSourceRef::PcmTruePeakCarrier {
+            path: carrier.clone(),
+            source_path: original_pcm,
+            sample_rate_hz: 44_100,
+            channels: 2,
+            duration: None,
+            gain_db: Some("-0.222000000".parse().expect("carrier gain")),
+            point_dbtp: Some("0.063000000".parse().expect("measured point")),
+            effective_target_dbtp: "-1.000000000".parse().expect("effective target"),
+            lossy_target_capped: false,
+            strong_ssrc_resampler: None,
+            terminal_candidate: Some(selected_terminal.clone()),
+        });
+        prepared_track.sample_rate = Some(96_000);
+        prepared_track.bit_depth = Some(320);
+        prepared_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(96_000),
+            Some(320),
+            Some(SourceAudioCoding::Pcm),
+        );
+
+        let planned = plan_request_for_track(
+            &req,
+            &prepared_track,
+            &carrier,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("post-observation PCM carrier plan request builds");
+
+        assert!(
+            req.settings.ssrc.force,
+            "terminal replanning must not mutate the caller's forced-SSRC intent",
+        );
+        assert_eq!(
+            planned.settings.target_sample_rate,
+            tonepoet_pipeline::RateTarget::PcmHz(44_100),
+            "the final encoder must remain pinned to the measured carrier rate",
+        );
+        assert!(
+            !planned.settings.ssrc.force,
+            "forced SSRC has already been consumed by the pre-observation resample",
+        );
+        assert_eq!(
+            planned.settings.ssrc.profile,
+            Some(tonepoet_pipeline::SsrcProfile::High),
+            "terminal replanning should consume only force authority, not rewrite the configured SSRC profile",
+        );
+        assert_eq!(
+            planned.settings.preferred_tool,
+            PreferredTool::Ffmpeg,
+            "the charged terminal binding must survive consumption of upstream SSRC force authority",
+        );
+
+        let typed = match tonepoet_pipeline::plan_typed(&planned)
+            .expect("typed terminal plan stays within planner resource limits")
+        {
+            tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("post-observation carrier must produce a ready typed plan: {other:?}"),
+        };
+        assert!(
+            typed.nodes.iter().all(|node| !matches!(
+                node,
+                tonepoet_pipeline::TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    ..
+                }
+            )),
+            "no PCM resampler may run after certified true-peak observation",
+        );
+
+        let tools = planned_command_tools(&planned);
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| *tool == tonepoet_pipeline::ToolIdentifier::Ssrc),
+            "the terminal command plan must not execute SSRC a second time: {tools:?}",
+        );
+        assert_eq!(
+            tools.last(),
+            Some(&selected_terminal.tool),
+            "terminal execution must stay bound to the certified charged terminal",
+        );
+    }
+
+    #[test]
     fn pcm_true_peak_carrier_keeps_policy_and_resolved_album_gain_in_final_plan_identity() {
         let temp = TempDir::new().expect("temp dir");
         let original_pcm = temp.path().join("source.flac");
@@ -4303,6 +4429,7 @@ mod tests {
             point_dbtp: Some("-0.080000000".parse().expect("measured point")),
             effective_target_dbtp: "-0.500000000".parse().expect("effective target"),
             lossy_target_capped: false,
+            strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
         });
 
@@ -4395,6 +4522,7 @@ mod tests {
             point_dbtp: Some("-0.750000000".parse().expect("point")),
             effective_target_dbtp: "-1.000000000".parse().expect("target"),
             lossy_target_capped: false,
+            strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
         });
         prepared.bit_depth = Some(320);
@@ -4456,6 +4584,7 @@ mod tests {
                 point_dbtp: Some("-0.750000000".parse().expect("point")),
                 effective_target_dbtp: "-1.000000000".parse().expect("target"),
                 lossy_target_capped: false,
+                strong_ssrc_resampler: None,
                 terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
             });
             prepared.bit_depth = Some(source_bits);
@@ -4714,6 +4843,7 @@ mod tests {
             point_dbtp: Some("-2.000000000".parse().expect("point")),
             effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             lossy_target_capped: false,
+            strong_ssrc_resampler: None,
             terminal_candidate: Some(execution.charged_terminal.clone()),
         });
         prepared.sample_rate = Some(48_000);
@@ -4804,6 +4934,7 @@ mod tests {
                 point_dbtp: Some("-2.000000000".parse().expect("point")),
                 effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
                 lossy_target_capped: true,
+                strong_ssrc_resampler: None,
                 terminal_candidate: Some(execution.charged_terminal.clone()),
             });
             prepared.sample_rate = Some(48_000);
@@ -4948,6 +5079,7 @@ mod tests {
             point_dbtp: Some("-0.080000000".parse().expect("measured point")),
             effective_target_dbtp: "-1.000000000".parse().expect("effective target"),
             lossy_target_capped: true,
+            strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
         });
         prepared_track.bit_depth = Some(640);

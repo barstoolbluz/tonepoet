@@ -35629,6 +35629,48 @@ mod protected_ssrc_runtime_tests {
         }
     }
 
+    #[test]
+    fn pcm_true_peak_track_record_serializes_executed_strong_ssrc_provenance() {
+        const EXECUTABLE_SHA256: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const EVIDENCE_ID: &str = "test:ssrc-runtime";
+
+        let record = TrackRecord {
+            track_id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            outcome: TrackOutcome::Ok,
+            source_ref: TrackSourceRef::PcmTruePeakCarrier {
+                path: PathBuf::from("carrier.f64le"),
+                source_path: PathBuf::from("source.wav"),
+                sample_rate_hz: 44_100,
+                channels: 2,
+                duration: None,
+                gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                point_dbtp: Some(tonepoet_pipeline::DbNano::ZERO),
+                effective_target_dbtp: tonepoet_pipeline::DbNano::ZERO,
+                lossy_target_capped: false,
+                strong_ssrc_resampler: Some(strong_binding(EXECUTABLE_SHA256.to_owned())),
+                terminal_candidate: None,
+            },
+            realized_input: None,
+            output_file: None,
+            commands: Vec::new(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+            verified_output_bit_depth: None,
+            dsd_dst_stats: None,
+        };
+
+        let json = serde_json::to_string(&record).expect("TrackRecord serializes");
+        assert!(json.contains("\"strong_ssrc_resampler\""));
+        assert!(json.contains(EXECUTABLE_SHA256));
+        assert!(json.contains(EVIDENCE_ID));
+    }
+
     fn push_w64_chunk(file: &mut Vec<u8>, guid: [u8; 16], payload: &[u8]) {
         file.extend_from_slice(&guid);
         file.extend_from_slice(&(24_u64 + payload.len() as u64).to_le_bytes());
@@ -36399,6 +36441,10 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             point_dbtp,
             effective_target_dbtp,
             lossy_target_capped,
+            strong_ssrc_resampler: execution
+                .pre_observation_resampler
+                .as_ref()
+                .and_then(|resampler| resampler.selected.strong_ssrc_resampler.clone()),
             terminal_candidate: Some(execution.charged_terminal.clone()),
         },
         measurement: CertifiedTruePeakPreparedMeasurement {
