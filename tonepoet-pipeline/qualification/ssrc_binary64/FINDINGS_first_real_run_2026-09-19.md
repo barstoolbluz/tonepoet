@@ -64,3 +64,8 @@ the executable it builds (sha256 `502af766…`) characterized 30/30 with the aud
 The registry (`tonepoet-pipeline/src/ssrc_binary64.rs`) now returns Established for the
 five characterized rate pairs on x86_64 at linear phase and 0.0 dB; everything else stays
 pending.
+
+Later the same day the rate scope was widened to the 42-pair grid (every ordered pair among
+44.1, 48, 88.2, 96, 176.4, 192 kHz, plus 352.8 and 384 kHz down to each): 252 cells, all
+passed, `outcome_grid42_2026-09-20.json`, evidence `sha256:6fd0d95e…`. The registry now
+carries that grid.
