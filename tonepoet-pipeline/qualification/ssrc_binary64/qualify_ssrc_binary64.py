@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any
 
 CONTRACT_ID = "TonepoetBinary64OverloadPreservingResampleV1"
-SSRC_REV = "b769add0756157ea88d1bbf9023e06c437485a79"
-SSRC_NAR = "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU="
+SSRC_REV = "6b0bbfe1fff79c0399347f4e1fb027c9931ef6ea"
+SSRC_NAR = "sha256-S1AODgERVoo8mKLEJN9gj4d+EW/ABfxkZqz1p14prPI="
 SLEEF_REV = "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
 INGRESS_AUTHORITY = "tonepoet:protected-pcm-f64le-riff-ingress/v1"
 DOUBLE_PROFILES = ("high", "long", "insane")

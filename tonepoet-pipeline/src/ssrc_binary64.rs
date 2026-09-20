@@ -11,10 +11,11 @@ use crate::enums::{PcmBitDepth, SsrcProfile};
 pub const TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1: &str =
     "TonepoetBinary64OverloadPreservingResampleV1";
 
-/// Exact Shibatch source revision audited by the rev4 design bundle.
-pub const PINNED_SSRC_SOURCE_REV: &str = "b769add0756157ea88d1bbf9023e06c437485a79";
-/// Nix archive identity from the normative rev4 planning bundle.
-pub const PINNED_SSRC_NAR_HASH: &str = "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU=";
+/// Exact Shibatch source revision commissioned on 2026-09-20: the rev4-audited
+/// base b769add0 plus the vendored finite-stream / floating-fact patch.
+pub const PINNED_SSRC_SOURCE_REV: &str = "6b0bbfe1fff79c0399347f4e1fb027c9931ef6ea";
+/// Nix archive identity of that revision as locked in `flake.lock`.
+pub const PINNED_SSRC_NAR_HASH: &str = "sha256-S1AODgERVoo8mKLEJN9gj4d+EW/ABfxkZqz1p14prPI=";
 /// SLEEF source revision pinned by the audited SSRC build closure.
 pub const PINNED_SLEEF_SOURCE_REV: &str = "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a";
 /// SSRC CLI version named by the audited source revision.
@@ -247,12 +248,39 @@ impl Binary64ResamplePreservationEvidence {
     }
 }
 
-/// Production registry for the supplied rev4 state.
+/// Commissioned x86_64 evidence, 2026-09-20.
+///
+/// Source: `tonepoet-pipeline/qualification/ssrc_binary64/outcome_2026-09-20.json`
+/// (identity file beside it), produced by `qualify_ssrc_binary64.py` against the
+/// executable tonepoet's flake builds from [`PINNED_SSRC_SOURCE_REV`].
+pub const COMMISSIONED_X86_64_EVIDENCE_ID: &str =
+    "sha256:860be9d133e04648db682512c17e8a3f70f76b1ab420af222f34632232aa35a5";
+/// SHA-256 of the qualification report bytes.
+pub const COMMISSIONED_X86_64_REPORT_SHA256: &str =
+    "860be9d133e04648db682512c17e8a3f70f76b1ab420af222f34632232aa35a5";
+/// SHA-256 of the commissioned SSRC executable.
+pub const COMMISSIONED_X86_64_EXECUTABLE_SHA256: &str =
+    "502af76669c554dcc8745a34c1032a6b789beb322755dd8ad827118f77d44adc";
+/// Nix build closure that produced the commissioned executable.
+pub const COMMISSIONED_X86_64_BUILD_IDENTITY: &str =
+    "/nix/store/v4gglyvf800bvzv1l0mjx77f3hi9yxkg-ssrc-2.4.2.drv";
+/// Rate pairs characterized by the commissioned run, as (source, target) hertz.
+pub const COMMISSIONED_X86_64_RATE_PAIRS: [(u32, u32); 5] = [
+    (44_100, 48_000),
+    (48_000, 44_100),
+    (96_000, 44_100),
+    (44_100, 96_000),
+    (88_200, 48_000),
+];
+
+/// Production registry.
 ///
 /// Single-precision profiles are source-refuted for this *strong* contract.
-/// Double-precision profiles remain PendingEvidence until an exact executable,
-/// build closure and qualification report are commissioned.  Ordinary SSRC is
-/// intentionally unaffected.
+/// Double-precision profiles are Established only for the exact cells the
+/// 2026-09-20 x86_64 commissioning characterized: linear phase, 0.0 dB
+/// attenuation, Float64 RIFF in, Float64 Wave64 out, and one of
+/// [`COMMISSIONED_X86_64_RATE_PAIRS`]. Every other double-precision cell stays
+/// PendingEvidence. Ordinary SSRC is intentionally unaffected.
 #[must_use]
 pub fn production_evidence_for_scope(
     scope: &Binary64ResampleEvidenceScope,
@@ -265,11 +293,39 @@ pub fn production_evidence_for_scope(
             reason: Binary64PreservationEvidenceReason::DocumentedSinglePrecisionPipeline,
         },
         SsrcProfile::High | SsrcProfile::Long | SsrcProfile::Insane => {
-            Binary64ResamplePreservationEvidence::PendingEvidence {
-                reason: Binary64PreservationEvidenceReason::NoCommissionedExactExecutableEvidence,
+            if commissioned_x86_64_cell_covers(scope) {
+                Binary64ResamplePreservationEvidence::Established {
+                    authority_id: TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1.to_owned(),
+                    evidence_id: COMMISSIONED_X86_64_EVIDENCE_ID.to_owned(),
+                    qualification_report_sha256: COMMISSIONED_X86_64_REPORT_SHA256.to_owned(),
+                    runtime_attestation: Binary64RuntimeAttestation {
+                        expected_executable_sha256: COMMISSIONED_X86_64_EXECUTABLE_SHA256
+                            .to_owned(),
+                        architecture: "x86_64".to_owned(),
+                        source_revision: PINNED_SSRC_SOURCE_REV.to_owned(),
+                        build_identity: COMMISSIONED_X86_64_BUILD_IDENTITY.to_owned(),
+                    },
+                    scope: scope.clone(),
+                }
+            } else {
+                Binary64ResamplePreservationEvidence::PendingEvidence {
+                    reason: Binary64PreservationEvidenceReason::NoMatchingCommissionedScope,
+                }
             }
         }
     }
+}
+
+fn commissioned_x86_64_cell_covers(scope: &Binary64ResampleEvidenceScope) -> bool {
+    scope.architecture == "x86_64"
+        && !scope.min_phase
+        && scope.attenuation_db.as_deref().map_or(true, |value| value == "0.0")
+        && scope.input_container == "wav"
+        && scope.input_sample_format == "pcm_f64le"
+        && scope.output_container == "w64"
+        && scope.output_sample_format == "pcm_f64le"
+        && COMMISSIONED_X86_64_RATE_PAIRS
+            .contains(&(scope.source_rate_hz, scope.target_rate_hz))
 }
 
 #[cfg(test)]
@@ -309,14 +365,63 @@ mod tests {
     }
 
     #[test]
-    fn double_precision_profiles_remain_pending_under_outcome_c() {
+    fn double_precision_profiles_are_established_for_commissioned_x86_64_cells() {
         for profile in [SsrcProfile::High, SsrcProfile::Long, SsrcProfile::Insane] {
-            assert_eq!(
-                production_evidence_for_scope(&scope(profile)),
-                Binary64ResamplePreservationEvidence::PendingEvidence {
-                    reason: Binary64PreservationEvidenceReason::NoCommissionedExactExecutableEvidence,
+            for (source_rate_hz, target_rate_hz) in COMMISSIONED_X86_64_RATE_PAIRS {
+                let mut cell = scope(profile);
+                cell.source_rate_hz = source_rate_hz;
+                cell.target_rate_hz = target_rate_hz;
+                match production_evidence_for_scope(&cell) {
+                    Binary64ResamplePreservationEvidence::Established {
+                        authority_id,
+                        evidence_id,
+                        qualification_report_sha256,
+                        runtime_attestation,
+                        scope: bound,
+                    } => {
+                        assert_eq!(authority_id, TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1);
+                        assert_eq!(evidence_id, COMMISSIONED_X86_64_EVIDENCE_ID);
+                        assert_eq!(
+                            evidence_id,
+                            format!("sha256:{qualification_report_sha256}")
+                        );
+                        assert_eq!(
+                            runtime_attestation.expected_executable_sha256,
+                            COMMISSIONED_X86_64_EXECUTABLE_SHA256
+                        );
+                        assert_eq!(runtime_attestation.architecture, "x86_64");
+                        assert_eq!(runtime_attestation.source_revision, PINNED_SSRC_SOURCE_REV);
+                        assert_eq!(bound, cell);
+                    }
+                    other => panic!("expected Established for {profile:?} {source_rate_hz}->{target_rate_hz}, got {other:?}"),
                 }
-            );
+            }
         }
+    }
+
+    #[test]
+    fn double_precision_profiles_stay_pending_outside_the_commissioned_cells() {
+        let pending = Binary64ResamplePreservationEvidence::PendingEvidence {
+            reason: Binary64PreservationEvidenceReason::NoMatchingCommissionedScope,
+        };
+        let mut uncharacterized_pair = scope(SsrcProfile::High);
+        uncharacterized_pair.target_rate_hz = 48_000;
+        assert_eq!(production_evidence_for_scope(&uncharacterized_pair), pending);
+
+        let mut min_phase = scope(SsrcProfile::Long);
+        min_phase.min_phase = true;
+        assert_eq!(production_evidence_for_scope(&min_phase), pending);
+
+        let mut attenuated = scope(SsrcProfile::Insane);
+        attenuated.attenuation_db = Some("1.0".to_owned());
+        assert_eq!(production_evidence_for_scope(&attenuated), pending);
+
+        let mut other_arch = scope(SsrcProfile::High);
+        other_arch.architecture = "aarch64".to_owned();
+        assert_eq!(production_evidence_for_scope(&other_arch), pending);
+
+        let mut riff_out = scope(SsrcProfile::High);
+        riff_out.output_container = "wav".to_owned();
+        assert_eq!(production_evidence_for_scope(&riff_out), pending);
     }
 }

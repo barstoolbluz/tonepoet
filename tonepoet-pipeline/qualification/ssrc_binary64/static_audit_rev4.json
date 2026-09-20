@@ -4,8 +4,8 @@
   "source_identity": {
     "owner": "barstoolbluz",
     "repo": "ssrc",
-    "rev": "b769add0756157ea88d1bbf9023e06c437485a79",
-    "nar_hash": "sha256-b+VYrfQ9nSRECcJR1RGOIPbqgit1giuCVdKt8GPUjZU="
+    "rev": "6b0bbfe1fff79c0399347f4e1fb027c9931ef6ea",
+    "nar_hash": "sha256-S1AODgERVoo8mKLEJN9gj4d+EW/ABfxkZqz1p14prPI="
   },
   "dependency_identity": {
     "sleef_rev": "0c063a8f0e01c22fa1e473effd2e7a0c69b4963a"
@@ -27,11 +27,12 @@
       "High, Long, and Insane dispatch to Pipeline<double> at the audited revision.",
       "Standard, Short, Fast, and Lightning dispatch to Pipeline<float> and are refuted for the strong Binary64 contract only.",
       "The audited double path reads and writes IEEE Float64 directly and keeps the inspected signal path templated on the same REAL type.",
-      "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode."
+      "The floating path bypasses integer dither/quantization; normalization is not an admitted CLI mode.",
+      "Revision 6b0bbfe1 keeps src/ at the audited base b769add0 and applies patches/ssrc-tonepoet-finite-stream.patch in patchPhase (flake.nix). The patch touches src/libshibatchdsp/FastPP.hpp, SRC.hpp, xdr_wav.h and the tester only: floating RIFF/Wave64/RF64 output gains a fact chunk backpatched at close, and linear-phase conversion publishes the finite timeline round(N*Fd/Fs) by discarding exactly latencyFrames derived on the integer LCM clock. Filter coefficients, DFT/SLEEF arithmetic, dither, and Pipeline<double> dispatch are unchanged, so the DFT type-path audit below carries over."
     ],
     "sleef_dft_type_path_audit": {
       "passed": true,
-      "audited_on": "2026-09-19",
+      "audited_on": "2026-09-20",
       "files": [
         "src/libshibatchdsp/ObjectCache.hpp",
         "src/libshibatchdsp/DFTFilter.hpp",
@@ -51,17 +52,18 @@
       ],
       "unresolved_items": []
     },
-    "unresolved_items": []
+    "unresolved_items": [],
+    "audited_on": "2026-09-20"
   },
   "build_audit": {
     "passed": true,
-    "audited_on": "2026-09-19",
-    "build_closure": "/nix/store/839i5bjn28x8p4pcfcy0ps990g5z7s8n-ssrc-2.4.2.drv",
-    "build_output": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2",
-    "compiler_configuration": "gcc 15.2.0 (nixpkgs stdenv); cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_CLI=ON -DCMAKE_C_VISIBILITY_PRESET=default -DCMAKE_CXX_VISIBILITY_PRESET=default; no NIX_CFLAGS_COMPILE/CFLAGS/CXXFLAGS overrides; SLEEF static via ExternalProject at CMAKE_BUILD_TYPE=Release",
-    "executable_sha256": "dc401841d580a7b322038b38551f309fc63fac2af36bf3647f031177c19bef19",
-    "executable_path": "/nix/store/070wdb4cv4qjscmz4s6lzzl0gv3770yz-ssrc-2.4.2/bin/ssrc",
-    "source_store_path": "/nix/store/s230gjvqwl86rnxdxh655s4a06w88pir-rvdhhd6yli4alqi3lk173ifk8dhal0ls-source",
+    "audited_on": "2026-09-20",
+    "build_closure": "/nix/store/v4gglyvf800bvzv1l0mjx77f3hi9yxkg-ssrc-2.4.2.drv",
+    "build_output": "/nix/store/70vxdqqkk63ar1sv6lhiyb8fsy9rc5jd-ssrc-2.4.2",
+    "compiler_configuration": "gcc 15.2.0 (nixpkgs stdenv via tonepoet flake.lock); cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_CLI=ON -DCMAKE_C_VISIBILITY_PRESET=default -DCMAKE_CXX_VISIBILITY_PRESET=default; patches/ssrc-tonepoet-finite-stream.patch applied in patchPhase; no NIX_CFLAGS_COMPILE/CFLAGS/CXXFLAGS overrides; SLEEF 0c063a8f static via ExternalProject at CMAKE_BUILD_TYPE=Release",
+    "executable_sha256": "502af76669c554dcc8745a34c1032a6b789beb322755dd8ad827118f77d44adc",
+    "executable_path": "/nix/store/70vxdqqkk63ar1sv6lhiyb8fsy9rc5jd-ssrc-2.4.2/bin/ssrc",
+    "source_store_path": "/nix/store/x9rmc2j2bl45jgqr0rv1sll6wvk0p7gz-source",
     "architecture": "x86_64-linux",
     "unresolved_items": []
   }
