@@ -6220,6 +6220,7 @@ mod tests {
                 },
                 effective_target_dbtp: target,
                 lossy_target_capped: false,
+                strong_ssrc_resampler: None,
                 terminal_candidate,
             }
         };

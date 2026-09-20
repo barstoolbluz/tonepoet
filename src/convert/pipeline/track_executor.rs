@@ -12258,6 +12258,7 @@ mod tests {
             point_dbtp: Some("-1.000000000".parse().expect("point")),
             effective_target_dbtp: "-1.000000000".parse().expect("target"),
             lossy_target_capped: false,
+            strong_ssrc_resampler: None,
             terminal_candidate: Some(SelectedPhysicalCandidateBinding {
                 identity: format!("test-terminal:{tool}"),
                 tool,
