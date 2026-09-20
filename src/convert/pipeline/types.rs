@@ -1203,7 +1203,10 @@ pub enum TrackSourceRef {
         /// Reporting/provenance only: this is not pending resampler authority and must not
         /// cause terminal planning to execute SSRC again.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        strong_ssrc_resampler: Option<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>,
+        /// Boxed: the binding is large and this enum is embedded in every
+        /// track and future on the pipeline path; an inline value overflowed the
+        /// default test-thread stack in `depth_format_matrix`.
+        strong_ssrc_resampler: Option<Box<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>>,
         /// Typed physical terminal candidate whose proof was charged by the gain decision.
         /// Old transient serialized state may omit it, but certified execution then fails closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]

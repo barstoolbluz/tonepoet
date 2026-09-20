@@ -35652,7 +35652,7 @@ mod protected_ssrc_runtime_tests {
                 point_dbtp: Some(tonepoet_pipeline::DbNano::ZERO),
                 effective_target_dbtp: tonepoet_pipeline::DbNano::ZERO,
                 lossy_target_capped: false,
-                strong_ssrc_resampler: Some(strong_binding(EXECUTABLE_SHA256.to_owned())),
+                strong_ssrc_resampler: Some(Box::new(strong_binding(EXECUTABLE_SHA256.to_owned()))),
                 terminal_candidate: None,
             },
             realized_input: None,
@@ -36444,7 +36444,8 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             strong_ssrc_resampler: execution
                 .pre_observation_resampler
                 .as_ref()
-                .and_then(|resampler| resampler.selected.strong_ssrc_resampler.clone()),
+                .and_then(|resampler| resampler.selected.strong_ssrc_resampler.clone())
+                .map(Box::new),
             terminal_candidate: Some(execution.charged_terminal.clone()),
         },
         measurement: CertifiedTruePeakPreparedMeasurement {
