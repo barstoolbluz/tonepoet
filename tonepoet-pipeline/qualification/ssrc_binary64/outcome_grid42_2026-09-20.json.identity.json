@@ -1,0 +1,6 @@
+{
+  "evidence_id": "sha256:6fd0d95e3f8c314d25c206c4cb42dc8f74ec570e61d0f86618384480bc6d0fd9",
+  "outcome": "bounded_established",
+  "qualification_report": "tonepoet-pipeline/qualification/ssrc_binary64/outcome_grid42_2026-09-20.json",
+  "qualification_report_sha256": "6fd0d95e3f8c314d25c206c4cb42dc8f74ec570e61d0f86618384480bc6d0fd9"
+}

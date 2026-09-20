@@ -7124,9 +7124,10 @@ mod tests {
             "the retained explicit-SoX bridge cannot silently execute the admitted FFmpeg alternate",
         );
 
-        // 96 kHz -> 48 kHz is outside the commissioned x86_64 rate pairs, so the
+        // 32 kHz -> 44.1 kHz is outside the commissioned x86_64 rate pairs, so the
         // strong-preservation cell is still pending there.
-        request.settings.target_sample_rate = RateTarget::PcmHz(48_000);
+        request.source.sample_rate_hz = Some(32_000);
+        request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
         request.settings.ssrc.force = true;
         let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&request) else {
             panic!("forcing SSRC must refuse while the exact strong-preservation cell remains uncommissioned")
@@ -7205,14 +7206,14 @@ mod tests {
             request
         }
 
-        // 176.4 kHz -> 44.1 kHz is outside the commissioned production cells, so only
-        // the injected fixture can admit it; 48 kHz -> 44.1 kHz and 96 kHz -> 44.1 kHz
-        // are commissioned and would be admitted by the production registry.
-        let exact_scope = scope(176_400);
+        // 32 kHz -> 44.1 kHz is outside the commissioned production cells, so only
+        // the injected fixture can admit it; the library PCM and DXD rates are all
+        // commissioned and would be admitted by the production registry.
+        let exact_scope = scope(32_000);
         let Ok(PlanningOutcome::Ready(plan)) =
-            plan_typed_with_effects_and_policy(&request(176_400), &[], &policy(exact_scope.clone()))
+            plan_typed_with_effects_and_policy(&request(32_000), &[], &policy(exact_scope.clone()))
         else {
-            panic!("exact 176.4 kHz -> 44.1 kHz Established fixture should admit the protected SSRC cell")
+            panic!("exact 32 kHz -> 44.1 kHz Established fixture should admit the protected SSRC cell")
         };
 
         let (output_signal, candidate, resolved) = plan
@@ -7277,7 +7278,7 @@ mod tests {
             placement: EffectPlacement::AfterPcmResample,
         };
         let Ok(PlanningOutcome::Refused(refusal)) = plan_typed_with_effects_and_policy(
-            &request(176_400),
+            &request(32_000),
             &[post_effect],
             &policy(exact_scope.clone()),
         ) else {
@@ -7292,7 +7293,7 @@ mod tests {
             placement: EffectPlacement::BeforePcmResample,
         };
         let Ok(PlanningOutcome::Refused(refusal)) = plan_typed_with_effects_and_policy(
-            &request(176_400),
+            &request(32_000),
             &[pre_effect],
             &policy(exact_scope.clone()),
         ) else {
@@ -7300,16 +7301,16 @@ mod tests {
         };
         assert_eq!(refusal.code, "protected_float64_ingress_unavailable");
 
-        // 88.2 kHz and 192 kHz -> 44.1 kHz are outside the commissioned production
+        // 22.05 kHz and 64 kHz -> 44.1 kHz are outside the commissioned production
         // cells as well, so only the injected evidence could admit them.
-        for source_rate_hz in [88_200, 192_000] {
+        for source_rate_hz in [22_050, 64_000] {
             let Ok(PlanningOutcome::Refused(refusal)) = plan_typed_with_effects_and_policy(
                 &request(source_rate_hz),
                 &[],
                 &policy(exact_scope.clone()),
             ) else {
                 panic!(
-                    "176.4 kHz evidence must not admit {source_rate_hz} Hz -> 44.1 kHz"
+                    "32 kHz evidence must not admit {source_rate_hz} Hz -> 44.1 kHz"
                 )
             };
             assert_eq!(refusal.code, "binary64_resample_preservation_pending");
@@ -7318,21 +7319,21 @@ mod tests {
         let mut wrong_target_scope = exact_scope.clone();
         wrong_target_scope.target_rate_hz = 48_000;
         let Ok(PlanningOutcome::Refused(refusal)) = plan_typed_with_effects_and_policy(
-            &request(176_400),
+            &request(32_000),
             &[],
             &policy(wrong_target_scope),
         ) else {
-            panic!("176.4 kHz -> 48 kHz evidence must not admit 176.4 kHz -> 44.1 kHz")
+            panic!("32 kHz -> 48 kHz evidence must not admit 32 kHz -> 44.1 kHz")
         };
         assert_eq!(refusal.code, "binary64_resample_preservation_pending");
 
-        let scope_48k = scope(352_800);
+        let scope_48k = scope(64_000);
         let Ok(PlanningOutcome::Ready(plan_48k)) = plan_typed_with_effects_and_policy(
-            &request(352_800),
+            &request(64_000),
             &[],
             &policy(scope_48k.clone()),
         ) else {
-            panic!("separately Established 352.8 kHz -> 44.1 kHz evidence should admit that pair")
+            panic!("separately Established 64 kHz -> 44.1 kHz evidence should admit that pair")
         };
         assert!(plan_48k.nodes.iter().any(|node| matches!(
             node,

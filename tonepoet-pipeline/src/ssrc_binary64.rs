@@ -248,29 +248,69 @@ impl Binary64ResamplePreservationEvidence {
     }
 }
 
-/// Commissioned x86_64 evidence, 2026-09-20.
+/// Commissioned x86_64 evidence, 2026-09-20 (42-pair grid run).
 ///
-/// Source: `tonepoet-pipeline/qualification/ssrc_binary64/outcome_2026-09-20.json`
+/// Source: `tonepoet-pipeline/qualification/ssrc_binary64/outcome_grid42_2026-09-20.json`
 /// (identity file beside it), produced by `qualify_ssrc_binary64.py` against the
-/// executable tonepoet's flake builds from [`PINNED_SSRC_SOURCE_REV`].
+/// executable tonepoet's flake builds from [`PINNED_SSRC_SOURCE_REV`]. The earlier
+/// five-pair run, `outcome_2026-09-20.json`, is kept as lineage.
 pub const COMMISSIONED_X86_64_EVIDENCE_ID: &str =
-    "sha256:860be9d133e04648db682512c17e8a3f70f76b1ab420af222f34632232aa35a5";
+    "sha256:6fd0d95e3f8c314d25c206c4cb42dc8f74ec570e61d0f86618384480bc6d0fd9";
 /// SHA-256 of the qualification report bytes.
 pub const COMMISSIONED_X86_64_REPORT_SHA256: &str =
-    "860be9d133e04648db682512c17e8a3f70f76b1ab420af222f34632232aa35a5";
+    "6fd0d95e3f8c314d25c206c4cb42dc8f74ec570e61d0f86618384480bc6d0fd9";
 /// SHA-256 of the commissioned SSRC executable.
 pub const COMMISSIONED_X86_64_EXECUTABLE_SHA256: &str =
     "502af76669c554dcc8745a34c1032a6b789beb322755dd8ad827118f77d44adc";
 /// Nix build closure that produced the commissioned executable.
 pub const COMMISSIONED_X86_64_BUILD_IDENTITY: &str =
     "/nix/store/v4gglyvf800bvzv1l0mjx77f3hi9yxkg-ssrc-2.4.2.drv";
-/// Rate pairs characterized by the commissioned run, as (source, target) hertz.
-pub const COMMISSIONED_X86_64_RATE_PAIRS: [(u32, u32); 5] = [
+/// Rate pairs characterized by the commissioned run, as (source, target) hertz:
+/// every ordered pair among the six library PCM rates, plus the two DXD rates
+/// down to each of them (42 pairs, 2026-09-20 grid run).
+pub const COMMISSIONED_X86_64_RATE_PAIRS: [(u32, u32); 42] = [
     (44_100, 48_000),
-    (48_000, 44_100),
-    (96_000, 44_100),
+    (44_100, 88_200),
     (44_100, 96_000),
+    (44_100, 176_400),
+    (44_100, 192_000),
+    (48_000, 44_100),
+    (48_000, 88_200),
+    (48_000, 96_000),
+    (48_000, 176_400),
+    (48_000, 192_000),
+    (88_200, 44_100),
     (88_200, 48_000),
+    (88_200, 96_000),
+    (88_200, 176_400),
+    (88_200, 192_000),
+    (96_000, 44_100),
+    (96_000, 48_000),
+    (96_000, 88_200),
+    (96_000, 176_400),
+    (96_000, 192_000),
+    (176_400, 44_100),
+    (176_400, 48_000),
+    (176_400, 88_200),
+    (176_400, 96_000),
+    (176_400, 192_000),
+    (192_000, 44_100),
+    (192_000, 48_000),
+    (192_000, 88_200),
+    (192_000, 96_000),
+    (192_000, 176_400),
+    (352_800, 44_100),
+    (352_800, 48_000),
+    (352_800, 88_200),
+    (352_800, 96_000),
+    (352_800, 176_400),
+    (352_800, 192_000),
+    (384_000, 44_100),
+    (384_000, 48_000),
+    (384_000, 88_200),
+    (384_000, 96_000),
+    (384_000, 176_400),
+    (384_000, 192_000),
 ];
 
 /// Production registry.
@@ -405,7 +445,7 @@ mod tests {
             reason: Binary64PreservationEvidenceReason::NoMatchingCommissionedScope,
         };
         let mut uncharacterized_pair = scope(SsrcProfile::High);
-        uncharacterized_pair.target_rate_hz = 48_000;
+        uncharacterized_pair.source_rate_hz = 32_000;
         assert_eq!(production_evidence_for_scope(&uncharacterized_pair), pending);
 
         let mut min_phase = scope(SsrcProfile::Long);
