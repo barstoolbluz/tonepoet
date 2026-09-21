@@ -4,7 +4,9 @@
 //! source materialization, tool attestation, measurement execution, publication,
 //! and qualification reporting live in the orchestrator crate.
 
-use crate::enums::{AudioFormat, BitDepthTarget, DsdRate, PcmBitDepth, RateTarget, SampleKind};
+use crate::enums::{
+    AudioFormat, BitDepthTarget, DsdRate, PcmBitDepth, RateTarget, SampleKind, TruePeakScope,
+};
 use crate::error::{PlanningError, Result};
 use crate::plan::{
     CommandEnvironmentPolicy, ConversionPlan, Finalization, InputSource, OutputSink, PlanRequest,
@@ -83,7 +85,11 @@ impl DbNano {
     pub const REFERENCE_CEILING: Self = Self(-1_000_000_000);
     /// One analyzer reporting quantum reserved between gain binding and post-final acceptance.
     pub const POST_FINAL_ACCEPTANCE_RESERVE: Self = Self(10_000_000);
-    /// Default NormalizePeak target.
+    /// Default Reference auto-gain margin below 0 dBTP.
+    pub const DEFAULT_REFERENCE_AUTO_MARGIN: Self = Self(1_000_000_000);
+    /// Largest accepted Reference auto-gain margin.
+    pub const MAX_REFERENCE_AUTO_MARGIN: Self = Self(24_000_000_000);
+    /// Historical default NormalizePeak target retained for non-Reference callers.
     pub const DEFAULT_NORMALIZE_TARGET: Self = Self(-150_000_000);
     /// Lowest accepted Fixed gain.
     pub const MIN_FIXED_GAIN: Self = Self(-24_000_000_000);
@@ -360,9 +366,9 @@ impl DsdReferencePolicyVersion {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum DsdSourcePathway {
-    /// Ordinary general DSD-to-PCM conversion. This is the raw settings default.
+    /// Ordinary user-configurable DSD-to-PCM conversion. This is the raw settings default.
     #[default]
-    General,
+    Custom,
     /// Qualified Reference delivery pathway. Admission remains deliberately narrow.
     Reference,
     /// Reserved future Manual pathway; current planners refuse it deterministically.
@@ -380,48 +386,88 @@ pub enum DsdReconstructionSelection {
     Wideband,
 }
 
-/// DSD-source output gain selection.
+/// Qualified Reference output-gain selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum DsdSourceGainMode {
-    /// Reference restoration plus 2x amplitude compensation, ceiling constrained.
+    /// Certified true-peak normalization using the Reference observer.
     #[default]
-    Reference,
-    /// Exact restoration of the explicit 12 dB headroom.
-    NativeLevel,
-    /// Exact headroom restoration plus a user fixed gain.
-    Fixed,
-    /// SoX peak normalization with modified/unqualified semantics.
-    NormalizePeak,
+    Auto,
+    /// Apply no gain after the protected Reference reconstruction.
+    Off,
+}
+
+/// Scope selection for Reference automatic gain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum DsdReferenceGainScope {
+    /// Album scope for an independent submitted album batch; Track otherwise.
+    #[default]
+    Auto,
+    /// Always resolve gain independently for each track.
+    Track,
 }
 
 /// Directional settings for DSD-source conversions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdSourceSettings {
-    /// Reference or reserved Manual pathway.
+    /// Custom, Reference, or reserved Manual pathway.
     pub pathway: DsdSourcePathway,
     /// Immutable Reference policy ID.
     pub reference_policy: DsdReferencePolicyVersion,
     /// Standard or explicit Wideband reconstruction selection.
     pub profile: DsdReconstructionSelection,
-    /// Output gain mode.
+    /// Qualified Reference gain mode.
     pub gain_mode: DsdSourceGainMode,
-    /// Fixed gain used only by `Fixed`.
-    pub fixed_gain_db: Option<DbNano>,
-    /// NormalizePeak target used only by `NormalizePeak`.
-    pub normalize_peak_target_dbfs: DbNano,
+    /// Positive margin below 0 dBTP used by Reference `Auto`.
+    pub auto_gain_margin_dbtp: DbNano,
+    /// Dynamic Album/Track selection or an explicit Track override.
+    pub auto_gain_scope: DsdReferenceGainScope,
 }
 
 impl Default for DsdSourceSettings {
     fn default() -> Self {
         Self {
-            pathway: DsdSourcePathway::General,
+            pathway: DsdSourcePathway::Custom,
             reference_policy: DsdReferencePolicyVersion::SoxNg14801V16,
             profile: DsdReconstructionSelection::Reference,
-            gain_mode: DsdSourceGainMode::Reference,
-            fixed_gain_db: None,
-            normalize_peak_target_dbfs: DbNano::DEFAULT_NORMALIZE_TARGET,
+            gain_mode: DsdSourceGainMode::Auto,
+            auto_gain_margin_dbtp: DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+            auto_gain_scope: DsdReferenceGainScope::Auto,
+        }
+    }
+}
+
+impl DsdSourceSettings {
+    /// Effective target below 0 dBTP for Reference automatic gain.
+    pub fn auto_gain_target_dbtp(self) -> Result<DbNano> {
+        if self.auto_gain_margin_dbtp < DbNano::ZERO
+            || self.auto_gain_margin_dbtp > DbNano::MAX_REFERENCE_AUTO_MARGIN
+        {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.auto_gain_margin_dbtp",
+                "Reference auto-gain margin must be between 0.000000000 and 24.000000000 dB",
+            ));
+        }
+        DbNano::ZERO
+            .checked_sub(self.auto_gain_margin_dbtp)
+            .ok_or_else(|| PlanningError::invalid_settings(
+                "dsd.from_dsd.auto_gain_margin_dbtp",
+                "Reference auto-gain margin overflow",
+            ))
+    }
+
+    /// Resolve dynamic Reference gain scope from the submitted programme shape.
+    #[must_use]
+    pub fn resolved_auto_gain_scope(self, programme: &ReferenceProgrammeScope) -> TruePeakScope {
+        match self.auto_gain_scope {
+            DsdReferenceGainScope::Track => TruePeakScope::Track,
+            DsdReferenceGainScope::Auto => match programme {
+                ReferenceProgrammeScope::IndependentAlbumBatch { .. } => TruePeakScope::Album,
+                ReferenceProgrammeScope::Singleton
+                | ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing => TruePeakScope::Track,
+            },
         }
     }
 }
@@ -1069,6 +1115,8 @@ impl ReferenceDecodeMechanism {
 pub enum ReferenceSampleHashEncoding {
     /// Signed 24-bit little-endian PCM.
     SignedInt24Le,
+    /// Signed 32-bit little-endian PCM.
+    SignedInt32Le,
     /// IEEE-754 binary32 little-endian PCM.
     Float32Le,
     /// IEEE-754 binary64 little-endian PCM.
@@ -1081,6 +1129,7 @@ impl ReferenceSampleHashEncoding {
     pub const fn ffmpeg_codec(self) -> &'static str {
         match self {
             Self::SignedInt24Le => "pcm_s24le",
+            Self::SignedInt32Le => "pcm_s32le",
             Self::Float32Le => "pcm_f32le",
             Self::Float64Le => "pcm_f64le",
         }
@@ -1091,6 +1140,7 @@ impl ReferenceSampleHashEncoding {
     pub const fn key(self) -> &'static str {
         match self {
             Self::SignedInt24Le => "int24_le",
+            Self::SignedInt32Le => "int32_le",
             Self::Float32Le => "float32_le",
             Self::Float64Le => "float64_le",
         }
@@ -1151,7 +1201,7 @@ impl ReferenceDecodeRouteRule {
 /// The rule table is deliberately exhaustive for every admitted terminal depth
 /// and every production or qualification carrier role. Float64 W64 never has a
 /// direct-FFmpeg rule.
-pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
+pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 21] = [
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::ReconstructionR64W64,
         PcmBitDepth::Float64,
@@ -1163,6 +1213,12 @@ pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
         PcmBitDepth::Int24,
         ReferenceDecodeMechanism::DirectFfmpeg,
         ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::TerminalQpcmW64,
+        PcmBitDepth::Int32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt32Le,
     ),
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::TerminalQpcmW64,
@@ -1181,6 +1237,12 @@ pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
         PcmBitDepth::Int24,
         ReferenceDecodeMechanism::DirectFfmpeg,
         ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedW64,
+        PcmBitDepth::Int32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt32Le,
     ),
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::PackagedW64,
@@ -1199,6 +1261,12 @@ pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
         PcmBitDepth::Int24,
         ReferenceDecodeMechanism::DirectFfmpeg,
         ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PackagedNonW64,
+        PcmBitDepth::Int32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt32Le,
     ),
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::PackagedNonW64,
@@ -1217,6 +1285,12 @@ pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
         PcmBitDepth::Int24,
         ReferenceDecodeMechanism::DirectFfmpeg,
         ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataW64,
+        PcmBitDepth::Int32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt32Le,
     ),
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::PostMetadataW64,
@@ -1235,6 +1309,12 @@ pub const REFERENCE_DECODE_ROUTE_RULES: [ReferenceDecodeRouteRule; 16] = [
         PcmBitDepth::Int24,
         ReferenceDecodeMechanism::DirectFfmpeg,
         ReferenceSampleHashEncoding::SignedInt24Le,
+    ),
+    ReferenceDecodeRouteRule::new(
+        ReferenceDecodeRoleClass::PostMetadataNonW64,
+        PcmBitDepth::Int32,
+        ReferenceDecodeMechanism::DirectFfmpeg,
+        ReferenceSampleHashEncoding::SignedInt32Le,
     ),
     ReferenceDecodeRouteRule::new(
         ReferenceDecodeRoleClass::PostMetadataNonW64,
@@ -1418,8 +1498,8 @@ pub fn reference_decode_authority(
     }
     let expected_dither = match contract.bit_depth {
         PcmBitDepth::Int24 => ReferenceDither::Tpdf,
-        PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
-        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int32 => {
+        PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 => {
             return Err(ReferenceDecodeAuthorityError::new(format!(
                 "Reference v7 has no decoded-sample route for {:?}",
                 contract.bit_depth,
@@ -1500,37 +1580,26 @@ pub struct TerminalRealizationBound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum ResolvedGainPolicy {
-    /// Requested Reference gain, allowed to reduce to the terminal-safe ceiling.
-    ReferenceCompensated {
-        /// Requested exact gain.
-        requested_gain: DbNano,
-        /// Reference post-final ceiling.
-        ceiling: DbNano,
-        /// Frozen terminal bound.
+    /// Certified true-peak normalization. Album scope remains unbound until
+    /// the submitted-batch barrier derives one common scalar.
+    Auto {
+        /// Requested post-terminal true-peak target.
+        target_dbtp: DbNano,
+        /// Track or submitted-album authority.
+        scope: TruePeakScope,
+        /// Runtime common scalar for Album scope; absent before the barrier and
+        /// for Track scope.
+        bound_gain: Option<DbNano>,
+        /// Frozen terminal error bound for the selected PCM depth.
         terminal_bound: TerminalRealizationBound,
     },
-    /// Exact native-level restoration.
-    NativeLevelExact {
-        /// Exact gain.
-        gain: DbNano,
-        /// Reference ceiling.
+    /// Unity post-reconstruction gain. The qualified Reference recipe still
+    /// enforces its fixed -1 dBTP post-terminal acceptance ceiling.
+    Off {
+        /// Fixed Reference acceptance ceiling.
         ceiling: DbNano,
-        /// Frozen terminal bound.
+        /// Frozen terminal error bound for the selected PCM depth.
         terminal_bound: TerminalRealizationBound,
-    },
-    /// Exact user fixed gain plus headroom restoration.
-    FixedExact {
-        /// Exact gain.
-        gain: DbNano,
-        /// Reference ceiling.
-        ceiling: DbNano,
-        /// Frozen terminal bound.
-        terminal_bound: TerminalRealizationBound,
-    },
-    /// Modified/unqualified SoX peak normalization.
-    NormalizePeak {
-        /// Literal SoX norm target.
-        target_dbfs: DbNano,
     },
 }
 
@@ -2030,20 +2099,14 @@ pub enum ReferenceErrorCode {
     B6Unavailable,
     /// Unsupported 8-bit terminal depth.
     TerminalInt8,
-    /// Unsupported 32-bit integer terminal depth.
-    TerminalInt32,
     /// Target/depth mismatch.
     TargetDepth,
-    /// Independent batch rejected.
-    SingletonBatch,
     /// Continuous programme rejected.
     ContinuousProgramme,
     /// DST/SACD front-end unattested.
     FrontEndUnattested,
     /// Toolchain mismatch.
     Toolchain,
-    /// Exact gain unsafe.
-    UnsafeExactGain,
     /// Unsupported target sample rate.
     UnsupportedTargetRate,
     /// RIFF size overflow.
@@ -2082,13 +2145,10 @@ pub fn reference_error_text(code: ReferenceErrorCode) -> &'static str {
         ReferenceErrorCode::WidebandDsd256Target => "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v16. Select Reference/B5.",
         ReferenceErrorCode::B6Unavailable => "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v16. Select Reference/B5 or wait for a later immutable policy.",
         ReferenceErrorCode::TerminalInt8 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v16 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
-        ReferenceErrorCode::TerminalInt32 => "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v16 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported.",
         ReferenceErrorCode::TargetDepth => "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v16. Choose a target/depth pair listed by the policy.",
-        ReferenceErrorCode::SingletonBatch => "DSD-REF-P0-012: Reference P0 supports singleton conversions only. Convert the selected files one at a time as independent singletons with independent gain, or wait for programme-wide Reference support.",
         ReferenceErrorCode::ContinuousProgramme => "DSD-REF-P0-013: Reference P0 cannot split a continuous DSD programme before reconstruction. This source must be processed as one programme before splitting; wait for programme-wide Reference support. Already independent files may be converted one at a time with independent gain.",
         ReferenceErrorCode::FrontEndUnattested => "DSD-REF-P0-014: Reference requires the qualified DST/SACD decode front-end for this source, but the decoder/extractor identity or qualification manifest does not match. Install the qualified toolchain or use an uncompressed DSF/DSDIFF source.",
         ReferenceErrorCode::Toolchain => "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v16 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder.",
-        ReferenceErrorCode::UnsafeExactGain => "DSD-REF-P0-016: The requested {native-level|fixed} gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics.",
         ReferenceErrorCode::UnsupportedTargetRate => "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v16 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy.",
         ReferenceErrorCode::RiffSize => "DSD-REF-P0-018: The predicted RIFF/WAV output exceeds the qualified RIFF size limit. Choose RF64, W64, or another supported lossless target.",
         ReferenceErrorCode::CanonicalTarget => "DSD-REF-P0-019: The selected output container does not match the canonical Reference target or contains unrecognized output flags. Re-select the target.",
@@ -2161,27 +2221,10 @@ fn invalid_target_depth(
     )
 }
 
-fn invalid_exact_gain(field: &'static str, policy: ResolvedGainPolicy) -> PlanningError {
-    let mode = match policy {
-        ResolvedGainPolicy::NativeLevelExact { .. } => "native-level",
-        ResolvedGainPolicy::FixedExact { .. } => "fixed",
-        ResolvedGainPolicy::ReferenceCompensated { .. }
-        | ResolvedGainPolicy::NormalizePeak { .. } => {
-            return invalid_reference(field, ReferenceErrorCode::UnsafeExactGain);
-        }
-    };
-    PlanningError::invalid_settings(
-        field,
-        format!(
-            "DSD-REF-P0-016: The requested {mode} gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
-        ),
-    )
-}
-
 fn invalid_terminal_depth(field: &'static str, depth: PcmBitDepth) -> PlanningError {
     let code = match depth {
         PcmBitDepth::Int8 => ReferenceErrorCode::TerminalInt8,
-        PcmBitDepth::Int32 => ReferenceErrorCode::TerminalInt32,
+        PcmBitDepth::Int32 => ReferenceErrorCode::TargetDepth,
         PcmBitDepth::Int16 => ReferenceErrorCode::Int16TerminalUnqualified,
         PcmBitDepth::Int24 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => {
             ReferenceErrorCode::TargetDepth
@@ -2307,12 +2350,7 @@ pub fn resolve_reference_depth(target: BitDepthTarget) -> Result<PcmBitDepth> {
                 ReferenceErrorCode::TerminalInt8,
             ));
         }
-        PcmBitDepth::Int32 => {
-            return Err(invalid_reference(
-                "target_bit_depth",
-                ReferenceErrorCode::TerminalInt32,
-            ));
-        }
+        PcmBitDepth::Int32 => {}
         PcmBitDepth::Int16 => {
             return Err(invalid_reference(
                 "target_bit_depth",
@@ -2340,12 +2378,18 @@ pub fn validate_reference_target_depth(
         | ResolvedOutputTarget::WavRiff
         | ResolvedOutputTarget::WavRf64 => matches!(
             depth,
-            PcmBitDepth::Int24 | PcmBitDepth::Float32 | PcmBitDepth::Float64
+            PcmBitDepth::Int24
+                | PcmBitDepth::Int32
+                | PcmBitDepth::Float32
+                | PcmBitDepth::Float64
         ),
-        ResolvedOutputTarget::FlacNative
-        | ResolvedOutputTarget::AiffNative
-        | ResolvedOutputTarget::WavPackNative
-        | ResolvedOutputTarget::AlacM4a => depth == PcmBitDepth::Int24,
+        ResolvedOutputTarget::AiffNative | ResolvedOutputTarget::WavPackNative => {
+            matches!(depth, PcmBitDepth::Int24 | PcmBitDepth::Int32)
+        }
+        ResolvedOutputTarget::FlacNative => {
+            matches!(depth, PcmBitDepth::Int24 | PcmBitDepth::Int32)
+        }
+        ResolvedOutputTarget::AlacM4a => depth == PcmBitDepth::Int24,
         _ => false,
     };
     if supported {
@@ -2395,12 +2439,17 @@ pub fn terminal_realization_bound(
         ),
         PcmBitDepth::Int24 => (2_199_023_255_552, -1_010_002_327, "int24-tpdf-2lsb"),
         PcmBitDepth::Float32 => (1_099_511_627_776, -1_010_001_164, "float32-2^-23"),
+        PcmBitDepth::Int32 => (
+            2_147_483_648,
+            -1_010_000_003,
+            "int32-sox-s32-effects-half-lsb",
+        ),
         PcmBitDepth::Float64 => (
             2_147_487_744,
             -1_010_000_003,
             "float64-sox-s32-effects-half-lsb-plus-f64-2^-51",
         ),
-        PcmBitDepth::Int8 | PcmBitDepth::Int32 => (u64::MAX, i64::MIN, "unsupported"),
+        PcmBitDepth::Int8 => (u64::MAX, i64::MIN, "unsupported"),
     };
     let derivation = format!(
         "tonepoet-reference-terminal-bound/v3\0policy={}\0rate={}\0depth={:?}\0realization={}\0q63={}\0post_final_acceptance_reserve_dbnano={}\0safe_dbnano={}",
@@ -2419,70 +2468,67 @@ pub fn terminal_realization_bound(
     }
 }
 
-/// Validate and resolve one gain policy.
+/// Validate and resolve one gain policy for a concrete programme shape.
+pub fn resolve_gain_policy_for_programme(
+    settings: DsdSourceSettings,
+    programme: &ReferenceProgrammeScope,
+    runtime_album_gain_db: Option<DbNano>,
+    target_rate_hz: u32,
+    depth: PcmBitDepth,
+) -> Result<ResolvedGainPolicy> {
+    let terminal_bound = terminal_realization_bound(target_rate_hz, depth);
+    match settings.gain_mode {
+        DsdSourceGainMode::Auto => {
+            let target_dbtp = settings.auto_gain_target_dbtp()?;
+            let scope = settings.resolved_auto_gain_scope(programme);
+            let bound_gain = match scope {
+                TruePeakScope::Track => {
+                    if runtime_album_gain_db.is_some() {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.runtime_album_gain_db",
+                            "Track-scoped Reference auto gain cannot consume submitted-album runtime authority",
+                        ));
+                    }
+                    None
+                }
+                TruePeakScope::Album => runtime_album_gain_db,
+            };
+            Ok(ResolvedGainPolicy::Auto {
+                target_dbtp,
+                scope,
+                bound_gain,
+                terminal_bound,
+            })
+        }
+        DsdSourceGainMode::Off => {
+            if runtime_album_gain_db.is_some() {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.runtime_album_gain_db",
+                    "Reference gain-off cannot consume submitted-album runtime authority",
+                ));
+            }
+            Ok(ResolvedGainPolicy::Off {
+                ceiling: DbNano::REFERENCE_CEILING,
+                terminal_bound,
+            })
+        }
+    }
+}
+
+/// Resolve a standalone Reference policy. This helper is used by qualification
+/// and unit tests that intentionally have no submitted-batch context.
 pub fn resolve_gain_policy(
     settings: DsdSourceSettings,
     target_rate_hz: u32,
     depth: PcmBitDepth,
 ) -> Result<ResolvedGainPolicy> {
-    let bound = terminal_realization_bound(target_rate_hz, depth);
-    match settings.gain_mode {
-        DsdSourceGainMode::Reference => {
-            if settings.fixed_gain_db.is_some() {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.fixed_gain_db",
-                    "fixed gain is valid only when dsd gain mode is fixed",
-                ));
-            }
-            let requested_gain = DbNano::HEADROOM_RESTORATION
-                .checked_add(DbNano::DSD_COMPENSATION)
-                .ok_or_else(|| PlanningError::invalid_settings("dsd gain", "gain overflow"))?;
-            Ok(ResolvedGainPolicy::ReferenceCompensated {
-                requested_gain,
-                ceiling: DbNano::REFERENCE_CEILING,
-                terminal_bound: bound,
-            })
-        }
-        DsdSourceGainMode::NativeLevel => {
-            if settings.fixed_gain_db.is_some() {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.fixed_gain_db",
-                    "fixed gain is valid only when dsd gain mode is fixed",
-                ));
-            }
-            Ok(ResolvedGainPolicy::NativeLevelExact {
-                gain: DbNano::HEADROOM_RESTORATION,
-                ceiling: DbNano::REFERENCE_CEILING,
-                terminal_bound: bound,
-            })
-        }
-        DsdSourceGainMode::Fixed => {
-            let fixed = settings.fixed_gain_db.ok_or_else(|| {
-                PlanningError::invalid_settings(
-                    "dsd.from_dsd.fixed_gain_db",
-                    "fixed gain mode requires a fixed gain value",
-                )
-            })?;
-            if !(DbNano::MIN_FIXED_GAIN..=DbNano::MAX_FIXED_GAIN).contains(&fixed) {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.fixed_gain_db",
-                    "fixed gain must be between -24.000000000 and +24.000000000 dB",
-                ));
-            }
-            let gain = DbNano::HEADROOM_RESTORATION
-                .checked_add(fixed)
-                .ok_or_else(|| PlanningError::invalid_settings("dsd gain", "gain overflow"))?;
-            Ok(ResolvedGainPolicy::FixedExact {
-                gain,
-                ceiling: DbNano::REFERENCE_CEILING,
-                terminal_bound: bound,
-            })
-        }
-        DsdSourceGainMode::NormalizePeak => Err(PlanningError::invalid_settings(
-            "dsd.from_dsd.gain_mode",
-            "sample-peak NormalizePeak is not a qualified Reference gain policy; use general processing with an explicit Sample-peak normalize effect instead",
-        )),
-    }
+    resolve_gain_policy_for_programme(
+        settings,
+        &ReferenceProgrammeScope::Singleton,
+        None,
+        target_rate_hz,
+        depth,
+    )
 }
 
 /// Extract exactly one final loudnorm JSON report carrying `input_tp`.
@@ -2625,30 +2671,108 @@ pub struct ReferenceCertifiedGainAuthority {
     pub reduced_for_ceiling: bool,
 }
 
-fn reference_policy_gain_parts(
+fn reference_policy_ceiling_and_bound(
     policy: ResolvedGainPolicy,
-) -> Result<(DbNano, DbNano, TerminalRealizationBound, bool)> {
+) -> (DbNano, TerminalRealizationBound) {
     match policy {
-        ResolvedGainPolicy::ReferenceCompensated {
-            requested_gain,
+        ResolvedGainPolicy::Auto {
+            target_dbtp,
+            terminal_bound,
+            ..
+        } => (target_dbtp, terminal_bound),
+        ResolvedGainPolicy::Off {
             ceiling,
             terminal_bound,
-        } => Ok((requested_gain, ceiling, terminal_bound, true)),
-        ResolvedGainPolicy::NativeLevelExact {
-            gain,
-            ceiling,
-            terminal_bound,
-        }
-        | ResolvedGainPolicy::FixedExact {
-            gain,
-            ceiling,
-            terminal_bound,
-        } => Ok((gain, ceiling, terminal_bound, false)),
-        ResolvedGainPolicy::NormalizePeak { .. } => Err(PlanningError::invalid_settings(
-            "dsd.from_dsd.gain_mode",
-            "NormalizePeak is not a qualified Reference gain policy",
-        )),
+        } => (ceiling, terminal_bound),
     }
+}
+
+fn reference_album_terminal_bound(
+    terminal_bound: TerminalRealizationBound,
+    reconstruction_linf_gain_upper: f64,
+) -> Result<crate::dsd_album_gain::AlbumTerminalBound> {
+    if !reconstruction_linf_gain_upper.is_finite() || reconstruction_linf_gain_upper <= 0.0 {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.terminal_bound",
+            "certified reconstruction operator bound is invalid",
+        ));
+    }
+    let q63 = terminal_bound.max_added_peak_fs_q63_ceil;
+    if q63 == u64::MAX || q63 >= (1_u64 << 53) {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.terminal_bound",
+            "qualified Reference terminal has no usable physical error bound",
+        ));
+    }
+    let terminal_sample_error = (q63 as f64) / 9_223_372_036_854_775_808.0;
+    let terminal_reconstructed_error =
+        crate::dsd_album_gain::conservative_product_upper_nonnegative(
+            terminal_sample_error,
+            reconstruction_linf_gain_upper,
+        )
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.terminal_bound", reason))?;
+    Ok(crate::dsd_album_gain::AlbumTerminalBound {
+        pre_gain_reconstructed_error_linear: 0.0,
+        stored_sample_error_linear: Some(terminal_sample_error),
+        post_gain_reconstructed_error_linear: terminal_reconstructed_error,
+        domain: crate::dsd_album_gain::AlbumCeilingDomain::LosslessStoredPcm,
+    })
+}
+
+/// Convert a protected-R64 certified observation into the exact constraint
+/// consumed by the submitted-album gain barrier. This is the same terminal
+/// error algebra used by `resolve_reference_certified_gain`; callers must not
+/// derive a second Reference ceiling model.
+pub fn reference_album_gain_constraint(
+    observation: &ReferenceCertifiedPeakObservation,
+    policy: ResolvedGainPolicy,
+    reconstruction_linf_gain_upper: f64,
+) -> Result<(crate::dsd_album_gain::AlbumPeakMeasurement, crate::dsd_album_gain::AlbumTerminalBound)> {
+    observation
+        .validate_active_contract()
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
+    if observation.subject != ReferenceObservationSubject::ProtectedR64
+        || observation.purpose != TruePeakPurpose::GainAuthority
+    {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.observer",
+            "Reference album gain requires the protected-R64 gain-authority observation",
+        ));
+    }
+    let (_, terminal_bound) = reference_policy_ceiling_and_bound(policy);
+    let terminal = reference_album_terminal_bound(
+        terminal_bound,
+        reconstruction_linf_gain_upper,
+    )?;
+    let measurement = match observation.result {
+        ReferenceCertifiedPeakResult::VerifiedSilence => crate::dsd_album_gain::AlbumPeakMeasurement::Silence,
+        ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits,
+            ..
+        } => {
+            let point = f64::from_bits(point_linear_bits);
+            let point_db = if point > 0.0 && point.is_finite() {
+                let raw = 20.0 * point.log10();
+                format!("{raw:.9}")
+                    .parse::<DbNano>()
+                    .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?
+            } else {
+                // A zero reporting point can occur only on a finite interval
+                // whose upper endpoint still proves non-silence. Preserve a
+                // finite sentinel for reporting; it never participates in the
+                // ceiling calculation.
+                DbNano(i64::MIN)
+            };
+            crate::dsd_album_gain::AlbumPeakMeasurement::Finite {
+                point_db,
+                signal_upper_linear: observation
+                    .result
+                    .conservative_upper_linear()
+                    .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?,
+            }
+        }
+    };
+    Ok((measurement, terminal))
 }
 
 /// Resolve the sealed Reference scalar from the certified pre-terminal upper
@@ -2656,8 +2780,9 @@ fn reference_policy_gain_parts(
 ///
 /// `reconstruction_linf_gain_upper` must be the exported operator bound of the
 /// exact certified reconstruction named by the observation (HQ1024V1 in the
-/// active closure). The historical cached dB safe threshold and 16x analyzer
-/// reserves deliberately do not participate.
+/// active closure). Album-scoped `Auto` may carry a scalar already bound by the
+/// submitted-batch barrier; this function independently proves that scalar is
+/// no larger than this participant permits.
 pub fn resolve_reference_certified_gain(
     observation: &ReferenceCertifiedPeakObservation,
     policy: ResolvedGainPolicy,
@@ -2674,53 +2799,41 @@ pub fn resolve_reference_certified_gain(
             "Reference gain requires the protected-R64 gain-authority observation",
         ));
     }
-    if !reconstruction_linf_gain_upper.is_finite() || reconstruction_linf_gain_upper <= 0.0 {
-        return Err(PlanningError::invalid_settings(
+    let (ceiling, terminal_bound) = reference_policy_ceiling_and_bound(policy);
+    let terminal = reference_album_terminal_bound(terminal_bound, reconstruction_linf_gain_upper)?;
+    let terminal_sample_error = terminal
+        .stored_sample_error_linear
+        .ok_or_else(|| PlanningError::invalid_settings(
             "dsd.reference.terminal_bound",
-            "certified reconstruction operator bound is invalid",
-        ));
-    }
+            "Reference lossless terminal omitted stored-sample error authority",
+        ))?;
+    let terminal_reconstructed_error = terminal.post_gain_reconstructed_error_linear;
 
-    let (requested_gain, ceiling, terminal_bound, may_reduce) =
-        reference_policy_gain_parts(policy)?;
-    let q63 = terminal_bound.max_added_peak_fs_q63_ceil;
-    if q63 == u64::MAX || q63 >= (1_u64 << 53) {
-        return Err(PlanningError::invalid_settings(
-            "dsd.reference.terminal_bound",
-            "qualified Reference terminal has no usable physical error bound",
-        ));
-    }
-    // Every admitted q63 value is < 2^53 and therefore converts exactly to
-    // binary64 before exact division by 2^63.
-    let terminal_sample_error = (q63 as f64) / 9_223_372_036_854_775_808.0;
-    let terminal_reconstructed_error =
-        crate::dsd_album_gain::conservative_product_upper_nonnegative(
-            terminal_sample_error,
-            reconstruction_linf_gain_upper,
-        )
-        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.terminal_bound", reason))?;
-
-    let terminal = crate::dsd_album_gain::AlbumTerminalBound {
-        pre_gain_reconstructed_error_linear: 0.0,
-        stored_sample_error_linear: Some(terminal_sample_error),
-        post_gain_reconstructed_error_linear: terminal_reconstructed_error,
-        domain: crate::dsd_album_gain::AlbumCeilingDomain::LosslessStoredPcm,
+    let fixed_gain = match policy {
+        ResolvedGainPolicy::Off { .. } => Some(DbNano::HEADROOM_RESTORATION),
+        ResolvedGainPolicy::Auto {
+            scope: TruePeakScope::Album,
+            bound_gain,
+            ..
+        } => bound_gain,
+        ResolvedGainPolicy::Auto {
+            scope: TruePeakScope::Track,
+            ..
+        } => None,
     };
 
-    let (selected_gain, maximum_linear_gain_bits, reduced_for_ceiling) = match observation.result {
+    let ceiling_linear = crate::dsd_album_gain::conservative_linear_gain_lower(ceiling)
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.ceiling", reason))?;
+    if terminal_reconstructed_error >= ceiling_linear {
+        return Err(PlanningError::invalid_settings(
+            "dsd.reference.terminal_bound",
+            "Reference terminal error leaves no room beneath the policy ceiling",
+        ));
+    }
+
+    let (selected_gain, maximum_linear_gain_bits) = match observation.result {
         ReferenceCertifiedPeakResult::VerifiedSilence => {
-            // Exact traversal proved a zero signal. The terminal error itself
-            // must still fit beneath the ceiling; the requested Reference scalar
-            // remains meaningful and need not collapse to the general all-silent 0 dB rule.
-            let ceiling_linear = crate::dsd_album_gain::conservative_linear_gain_lower(ceiling)
-                .map_err(|reason| PlanningError::invalid_settings("dsd.reference.ceiling", reason))?;
-            if terminal_reconstructed_error >= ceiling_linear {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.reference.terminal_bound",
-                    "Reference terminal error leaves no room beneath the policy ceiling",
-                ));
-            }
-            (requested_gain, None, false)
+            (fixed_gain.unwrap_or(DbNano::ZERO), None)
         }
         ReferenceCertifiedPeakResult::Finite { .. } => {
             let upper = observation
@@ -2728,8 +2841,6 @@ pub fn resolve_reference_certified_gain(
                 .conservative_upper_linear()
                 .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
             let participant = crate::dsd_album_gain::AlbumPeakMeasurement::Finite {
-                // Reporting only; the common solver uses `signal_upper_linear`
-                // for hard-ceiling authority.
                 point_db: DbNano::ZERO,
                 signal_upper_linear: upper,
             };
@@ -2739,30 +2850,36 @@ pub fn resolve_reference_certified_gain(
                 true,
             )
             .map_err(|reason| PlanningError::invalid_settings("dsd.reference.true_peak", reason))?;
-            let requested_upper = crate::dsd_album_gain::conservative_linear_gain_upper(requested_gain)
-                .map_err(|reason| PlanningError::invalid_settings("dsd.reference.gain", reason))?;
-            if requested_upper <= authority.maximum_linear_gain {
-                (requested_gain, Some(authority.maximum_linear_gain.to_bits()), false)
-            } else if may_reduce {
-                (
-                    authority.gain_db,
-                    Some(authority.maximum_linear_gain.to_bits()),
-                    true,
-                )
+            let selected = if let Some(gain) = fixed_gain {
+                let selected_upper = crate::dsd_album_gain::conservative_linear_gain_upper(gain)
+                    .map_err(|reason| PlanningError::invalid_settings("dsd.reference.gain", reason))?;
+                if selected_upper > authority.maximum_linear_gain {
+                    let message = match policy {
+                        ResolvedGainPolicy::Off { .. } => {
+                            "Reference gain-off cannot satisfy the fixed -1 dBTP acceptance ceiling without attenuation"
+                        }
+                        ResolvedGainPolicy::Auto { .. } => {
+                            "submitted-album Reference gain exceeds this participant's certified terminal-safe maximum"
+                        }
+                    };
+                    return Err(PlanningError::invalid_settings("dsd.from_dsd.gain_mode", message));
+                }
+                gain
             } else {
-                return Err(invalid_exact_gain("dsd.from_dsd.gain_mode", policy));
-            }
+                authority.gain_db
+            };
+            (selected, Some(authority.maximum_linear_gain.to_bits()))
         }
     };
 
     Ok(ReferenceCertifiedGainAuthority {
-        requested_gain,
+        requested_gain: selected_gain,
         selected_gain,
         ceiling,
         terminal_sample_error_linear_bits: terminal_sample_error.to_bits(),
         terminal_reconstructed_error_linear_bits: terminal_reconstructed_error.to_bits(),
         maximum_linear_gain_bits,
-        reduced_for_ceiling,
+        reduced_for_ceiling: false,
     })
 }
 
@@ -2804,8 +2921,7 @@ pub fn validate_reference_post_terminal_certified_peak(
     if matches!(observation.result, ReferenceCertifiedPeakResult::VerifiedSilence) {
         return Ok(());
     }
-    let (_, ceiling, _, _) =
-        reference_policy_gain_parts(policy).map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    let (ceiling, _) = reference_policy_ceiling_and_bound(policy);
     let ceiling_lower = crate::dsd_album_gain::conservative_linear_gain_lower(ceiling)
         .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
     let ceiling_upper = crate::dsd_album_gain::conservative_linear_gain_upper(ceiling)
@@ -2891,9 +3007,9 @@ fn validate_reference_riff_capacity(
     let bytes_per_sample = match contract.bit_depth {
         PcmBitDepth::Int16 => 2_u64,
         PcmBitDepth::Int24 => 3_u64,
-        PcmBitDepth::Float32 => 4_u64,
+        PcmBitDepth::Int32 | PcmBitDepth::Float32 => 4_u64,
         PcmBitDepth::Float64 => 8_u64,
-        PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+        PcmBitDepth::Int8 => {
             return Err(invalid_terminal_depth("target_bit_depth", contract.bit_depth));
         }
     };
@@ -3039,13 +3155,7 @@ pub(crate) fn resolve_reference_static_admission(
         ));
     }
     match &request.reference_programme_scope {
-        ReferenceProgrammeScope::Singleton => {}
-        ReferenceProgrammeScope::IndependentAlbumBatch { .. } => {
-            return Err(invalid_reference(
-                "reference_programme_scope",
-                ReferenceErrorCode::SingletonBatch,
-            ));
-        }
+        ReferenceProgrammeScope::Singleton | ReferenceProgrammeScope::IndependentAlbumBatch { .. } => {}
         ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing => {
             return Err(invalid_reference(
                 "reference_programme_scope",
@@ -3137,7 +3247,13 @@ pub(crate) fn resolve_reference_static_admission(
         ));
     }
     let front_end = resolve_reference_front_end(source_kind)?;
-    let gain_policy = resolve_gain_policy(settings, target_rate_hz, depth)?;
+    let gain_policy = resolve_gain_policy_for_programme(
+        settings,
+        &request.reference_programme_scope,
+        request.settings.dsd.runtime_album_gain_db(),
+        target_rate_hz,
+        depth,
+    )?;
     let final_pcm = FinalPcmContract {
         sample_rate_hz: target_rate_hz,
         channels,
@@ -3151,8 +3267,8 @@ pub(crate) fn resolve_reference_static_admission(
                 ));
             }
             PcmBitDepth::Int24 => ReferenceDither::Tpdf,
-            PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
-            PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+            PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
+            PcmBitDepth::Int8 => {
                 return Err(invalid_terminal_depth("target_bit_depth", depth));
             }
         },
@@ -3442,6 +3558,7 @@ pub fn lower_reference_terminal_command(
 ) -> Result<PlannedCommand> {
     let (encoding, bits) = match contract.bit_depth {
         PcmBitDepth::Int24 => ("signed-integer", "24"),
+        PcmBitDepth::Int32 => ("signed-integer", "32"),
         PcmBitDepth::Float32 => ("floating-point", "32"),
         PcmBitDepth::Float64 => ("floating-point", "64"),
         PcmBitDepth::Int16 => {
@@ -3450,7 +3567,7 @@ pub fn lower_reference_terminal_command(
                 ReferenceErrorCode::Int16TerminalUnqualified,
             ));
         }
-        PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+        PcmBitDepth::Int8 => {
             return Err(invalid_terminal_depth("target_bit_depth", contract.bit_depth));
         }
     };
@@ -3590,6 +3707,7 @@ fn build_package_command(
     let pcm_codec = match contract.bit_depth {
         PcmBitDepth::Int16 => "pcm_s16le",
         PcmBitDepth::Int24 => "pcm_s24le",
+        PcmBitDepth::Int32 => "pcm_s32le",
         PcmBitDepth::Float32 => "pcm_f32le",
         PcmBitDepth::Float64 => {
             return Err(PlanningError::invalid_settings(
@@ -3597,7 +3715,7 @@ fn build_package_command(
                 "Float64 RIFF/RF64 packaging must use the qualified typed stream",
             ));
         }
-        PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+        PcmBitDepth::Int8 => {
             return Err(invalid_terminal_depth("target_bit_depth", contract.bit_depth));
         }
     };
@@ -3630,18 +3748,24 @@ fn build_package_command(
             "-rf64".to_string(),
             "always".to_string(),
         ]),
-        ResolvedOutputTarget::FlacNative => args.extend([
-            "-c:a".to_string(),
-            "flac".to_string(),
-            "-compression_level".to_string(),
-            settings.flac.compression_level.to_string(),
-        ]),
+        ResolvedOutputTarget::FlacNative => {
+            args.extend(["-c:a".to_string(), "flac".to_string()]);
+            if contract.bit_depth == PcmBitDepth::Int32 {
+                // FFmpeg otherwise silently stores signed 32-bit PCM as 24-bit FLAC.
+                // Match the ordinary PCM path's explicit opt-in to true 32-bit FLAC.
+                args.extend(["-strict".to_string(), "experimental".to_string()]);
+            }
+            args.extend([
+                "-compression_level".to_string(),
+                settings.flac.compression_level.to_string(),
+            ]);
+        }
         ResolvedOutputTarget::AiffNative => {
             let codec = match contract.bit_depth {
                 PcmBitDepth::Int16 => "pcm_s16be",
                 PcmBitDepth::Int24 => "pcm_s24be",
+                PcmBitDepth::Int32 => "pcm_s32be",
                 PcmBitDepth::Int8
-                | PcmBitDepth::Int32
                 | PcmBitDepth::Float32
                 | PcmBitDepth::Float64 => {
                     return Err(invalid_target_depth(
@@ -4655,6 +4779,59 @@ mod tests {
     }
 
     #[test]
+    fn reference_auto_scope_uses_album_for_independent_batches_and_track_otherwise() {
+        let mut request = reference_request(
+            DsdRate::Dsd64,
+            88_200,
+            ResolvedOutputTarget::WavW64,
+            PcmBitDepth::Int24,
+            DsdReconstructionSelection::Reference,
+        );
+        request.reference_programme_scope = ReferenceProgrammeScope::IndependentAlbumBatch {
+            conversion_log_batch_id: "album-auto".to_string(),
+            expected_members: std::num::NonZeroUsize::new(2).unwrap(),
+            ordered_source_paths_digest: Sha256Digest::of_bytes(b"a.dff\0b.dff"),
+        };
+        let album = plan_reference_dsd(&request).expect("independent Reference album is admitted");
+        assert!(matches!(
+            album.reference.as_ref().expect("Reference summary").gain_policy,
+            ResolvedGainPolicy::Auto {
+                scope: TruePeakScope::Album,
+                bound_gain: None,
+                ..
+            }
+        ));
+
+        request.reference_programme_scope = ReferenceProgrammeScope::Singleton;
+        let track = plan_reference_dsd(&request).expect("Reference singleton is admitted");
+        assert!(matches!(
+            track.reference.as_ref().expect("Reference summary").gain_policy,
+            ResolvedGainPolicy::Auto {
+                scope: TruePeakScope::Track,
+                bound_gain: None,
+                ..
+            }
+        ));
+
+        request.settings.dsd.from_dsd.auto_gain_scope = DsdReferenceGainScope::Track;
+        request.reference_programme_scope = ReferenceProgrammeScope::IndependentAlbumBatch {
+            conversion_log_batch_id: "album-track".to_string(),
+            expected_members: std::num::NonZeroUsize::new(2).unwrap(),
+            ordered_source_paths_digest: Sha256Digest::of_bytes(b"a.dff\0b.dff"),
+        };
+        let forced_track =
+            plan_reference_dsd(&request).expect("explicit Reference track scope is admitted");
+        assert!(matches!(
+            forced_track.reference.as_ref().expect("Reference summary").gain_policy,
+            ResolvedGainPolicy::Auto {
+                scope: TruePeakScope::Track,
+                bound_gain: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn common_reference_gain_binding_drives_one_terminal_and_historical_policies_remain_refused() {
         let request = reference_request(
             DsdRate::Dsd64,
@@ -5082,6 +5259,7 @@ mod tests {
         let depths = [
             PcmBitDepth::Int16,
             PcmBitDepth::Int24,
+            PcmBitDepth::Int32,
             PcmBitDepth::Float32,
             PcmBitDepth::Float64,
         ];
@@ -5090,13 +5268,22 @@ mod tests {
                 let should_succeed = match depth {
                     PcmBitDepth::Int16 => false,
                     PcmBitDepth::Int24 => true,
+                    PcmBitDepth::Int32 => matches!(
+                        target,
+                        ResolvedOutputTarget::FlacNative
+                            | ResolvedOutputTarget::WavRiff
+                            | ResolvedOutputTarget::WavRf64
+                            | ResolvedOutputTarget::WavW64
+                            | ResolvedOutputTarget::AiffNative
+                            | ResolvedOutputTarget::WavPackNative
+                    ),
                     PcmBitDepth::Float32 | PcmBitDepth::Float64 => matches!(
                         target,
                         ResolvedOutputTarget::WavRiff
                             | ResolvedOutputTarget::WavRf64
                             | ResolvedOutputTarget::WavW64
                     ),
-                    PcmBitDepth::Int8 | PcmBitDepth::Int32 => false,
+                    PcmBitDepth::Int8 => false,
                 };
                 assert_eq!(
                     validate_reference_target_depth(target, depth).is_ok(),
@@ -5106,7 +5293,10 @@ mod tests {
             }
         }
         assert!(resolve_reference_depth(BitDepthTarget::Pcm(PcmBitDepth::Int8)).is_err());
-        assert!(resolve_reference_depth(BitDepthTarget::Pcm(PcmBitDepth::Int32)).is_err());
+        assert_eq!(
+            resolve_reference_depth(BitDepthTarget::Pcm(PcmBitDepth::Int32)).unwrap(),
+            PcmBitDepth::Int32
+        );
         assert_eq!(
             resolve_reference_depth(BitDepthTarget::Source).unwrap(),
             PcmBitDepth::Int24
@@ -5392,26 +5582,81 @@ mod tests {
         };
 
         let mut source_settings = DsdSourceSettings::default();
-        source_settings.gain_mode = DsdSourceGainMode::NativeLevel;
-        let native_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
-            .expect("native-level policy resolves");
+        source_settings.gain_mode = DsdSourceGainMode::Off;
+        let off_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
+            .expect("gain-off policy resolves");
         assert_eq!(
-            resolve_reference_certified_gain(&exact_gain_observation, native_policy, 4.68)
+            resolve_reference_certified_gain(&exact_gain_observation, off_policy, 4.68)
                 .unwrap_err()
                 .to_string(),
-            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested native-level gain cannot satisfy the Reference −1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
+            "invalid settings for dsd.from_dsd.gain_mode: Reference gain-off cannot satisfy the fixed -1 dBTP acceptance ceiling without attenuation"
         );
 
-        source_settings.gain_mode = DsdSourceGainMode::Fixed;
-        source_settings.fixed_gain_db = Some(DbNano::ZERO);
-        let fixed_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
-            .expect("fixed policy resolves");
-        assert_eq!(
-            resolve_reference_certified_gain(&exact_gain_observation, fixed_policy, 4.68)
-                .unwrap_err()
-                .to_string(),
-            "invalid settings for dsd.from_dsd.gain_mode: DSD-REF-P0-016: The requested fixed gain cannot satisfy the Reference −1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."
-        );
+        source_settings.gain_mode = DsdSourceGainMode::Auto;
+        source_settings.auto_gain_margin_dbtp = DbNano::DEFAULT_REFERENCE_AUTO_MARGIN;
+        let auto_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
+            .expect("automatic gain policy resolves");
+        let auto = resolve_reference_certified_gain(&exact_gain_observation, auto_policy, 4.68)
+            .expect("automatic gain attenuates to the certified target");
+        assert!(auto.selected_gain < DbNano::ZERO);
+    }
+
+    #[test]
+    fn reference_gain_off_restores_private_headroom_without_ceiling_reduction() {
+        let observation = ReferenceCertifiedPeakObservation {
+            id: MeasurementId(1),
+            scope: MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            reconstruction: REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+            edge_policy: REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+            scan_tier: REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+            authority_endpoint: REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            sample_frames: 1,
+            programme_sha256: Sha256Digest::of_bytes(b"reference-off-headroom-restoration"),
+            complete_reader: true,
+            result: ReferenceCertifiedPeakResult::Finite {
+                point_linear_bits: 0.099_f64.to_bits(),
+                lower_linear_bits: 0.099_f64.to_bits(),
+                upper_linear_bits: 0.1_f64.to_bits(),
+                status: ReferenceCertifiedSearchStatus::Complete,
+            },
+            certificate_sha256: Sha256Digest::of_bytes(
+                b"reference-off-headroom-restoration-cert",
+            ),
+        };
+        let mut source_settings = DsdSourceSettings::default();
+        source_settings.gain_mode = DsdSourceGainMode::Off;
+        let policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
+            .expect("gain-off policy resolves");
+        let authority = resolve_reference_certified_gain(&observation, policy, 4.68)
+            .expect("native-level restoration is safe beneath the fixed ceiling");
+
+        assert_eq!(authority.requested_gain, DbNano::HEADROOM_RESTORATION);
+        assert_eq!(authority.selected_gain, DbNano::HEADROOM_RESTORATION);
+        assert!(!authority.reduced_for_ceiling);
+
+        let terminal = lower_reference_terminal_command(
+            Path::new("protected.w64"),
+            Path::new("terminal.w64"),
+            FinalPcmContract {
+                sample_rate_hz: 176_400,
+                channels: 2,
+                sample_kind: PcmBitDepth::Int24.sample_kind(),
+                bit_depth: PcmBitDepth::Int24,
+                dither: ReferenceDither::Tpdf,
+            },
+            authority.selected_gain,
+        )
+        .expect("terminal lowering accepts restored native level");
+        assert!(terminal
+            .args
+            .windows(2)
+            .any(|pair| pair == ["gain", "+12.000000000"]));
     }
 
     #[test]
@@ -5464,6 +5709,35 @@ mod tests {
 
         request.settings.wavpack.correction_file = false;
         assert!(plan_reference_dsd(&request).is_ok());
+    }
+
+    #[test]
+    fn flac_int32_package_argv_opts_into_true_32_bit_encoding() {
+        let request = reference_request(
+            DsdRate::Dsd64,
+            88_200,
+            ResolvedOutputTarget::FlacNative,
+            PcmBitDepth::Int32,
+            DsdReconstructionSelection::Reference,
+        );
+        let plan = plan_reference_dsd(&request).expect("Reference FLAC Int32 is admitted");
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let lowering = lower_reference_package(
+            &summary.qpcm_path,
+            &summary.packaged_path,
+            summary.target,
+            summary.final_pcm,
+            &request.settings,
+        )
+        .expect("FLAC package lowering succeeds")
+        .expect("FLAC requires a package command");
+        let args = match lowering {
+            ReferencePackageLowering::Command(command) => command.args,
+            ReferencePackageLowering::Pipeline(_) => panic!("FLAC package must be one command"),
+        };
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-strict", "experimental"]));
     }
 
     #[test]
@@ -5803,13 +6077,10 @@ mod tests {
             (ReferenceErrorCode::WidebandDsd256Target, "DSD-REF-P0-008: DSD256 Wideband uses B6, whose 140 kHz stopband edge cannot fit this target; B6 is also unavailable under policy sox_ng_14_8_0_1_v16. Select Reference/B5."),
             (ReferenceErrorCode::B6Unavailable, "DSD-REF-P0-009: B6 is represented but unqualified and unavailable under policy sox_ng_14_8_0_1_v16. Select Reference/B5 or wait for a later immutable policy."),
             (ReferenceErrorCode::TerminalInt8, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v16 has no qualified 8-bit terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
-            (ReferenceErrorCode::TerminalInt32, "DSD-REF-P0-010: Reference policy sox_ng_14_8_0_1_v16 has no qualified 32-bit integer terminal realization. Choose 24-bit, Float32, or Float64 where supported."),
             (ReferenceErrorCode::TargetDepth, "DSD-REF-P0-011: {target} does not support {depth} under Reference policy sox_ng_14_8_0_1_v16. Choose a target/depth pair listed by the policy."),
-            (ReferenceErrorCode::SingletonBatch, "DSD-REF-P0-012: Reference P0 supports singleton conversions only. Convert the selected files one at a time as independent singletons with independent gain, or wait for programme-wide Reference support."),
             (ReferenceErrorCode::ContinuousProgramme, "DSD-REF-P0-013: Reference P0 cannot split a continuous DSD programme before reconstruction. This source must be processed as one programme before splitting; wait for programme-wide Reference support. Already independent files may be converted one at a time with independent gain."),
             (ReferenceErrorCode::FrontEndUnattested, "DSD-REF-P0-014: Reference requires the qualified DST/SACD decode front-end for this source, but the decoder/extractor identity or qualification manifest does not match. Install the qualified toolchain or use an uncompressed DSF/DSDIFF source."),
             (ReferenceErrorCode::Toolchain, "DSD-REF-P0-015: The installed Reference toolchain does not match policy sox_ng_14_8_0_1_v16 or failed its behavior probes. Activate/install the qualified toolchain; tonepoet will not substitute another decoder, analyzer, resampler, or encoder."),
-            (ReferenceErrorCode::UnsafeExactGain, "DSD-REF-P0-016: The requested {native-level|fixed} gain cannot satisfy the Reference \u{2212}1.000000000 dBTP ceiling for this measured source and terminal format. Reduce the fixed gain, choose Reference gain, or choose NormalizePeak with its modified/unqualified semantics."),
             (ReferenceErrorCode::UnsupportedTargetRate, "DSD-REF-P0-017: Reference policy sox_ng_14_8_0_1_v16 supports target sample rates 44.1, 48, 88.2, 96, 176.4, 192, 352.8, 384, 705.6, and 768 kHz only. Choose one of those rates or wait for a later immutable policy."),
             (ReferenceErrorCode::RiffSize, "DSD-REF-P0-018: The predicted RIFF/WAV output exceeds the qualified RIFF size limit. Choose RF64, W64, or another supported lossless target."),
             (ReferenceErrorCode::CanonicalTarget, "DSD-REF-P0-019: The selected output container does not match the canonical Reference target or contains unrecognized output flags. Re-select the target."),

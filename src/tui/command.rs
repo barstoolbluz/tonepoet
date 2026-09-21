@@ -15477,11 +15477,11 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-sample-peak-target, verification)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-reference-margin, dsd-reference-scope, verification)",
         );
         return;
     }
-    let dsd_reference_key = matches!(key, "dsd-path" | "dsd-profile" | "dsd-sample-peak-target");
+    let dsd_reference_key = matches!(key, "dsd-path" | "dsd-profile" | "dsd-reference-margin" | "dsd-reference-scope" | "dsd-reconstruction" | "dsd-lowpass" | "dsd-export-level");
     if dsd_reference_key && !app.convert.format.dsd_reference_controls_available() {
         app.set_status("DSD-source controls require a DSD source and a PCM output target");
         return;
@@ -15493,7 +15493,8 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             | "dsd-true-peak-scope"
             | "dsd-true-peak-scan"
             | "dsd-gain-db"
-            | "dsd-sample-peak-target"
+            | "dsd-reference-margin"
+            | "dsd-reference-scope"
     );
     if dsd_gain_key && !app.convert.format.dsd_to_pcm_gain_available() {
         app.set_status("DSD gain controls require a DSD source and a PCM output target");
@@ -15537,10 +15538,22 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "dsd-path = {}",
                     match *app.convert.format.dsd_pathway.selected_value() {
-                        tonepoet_pipeline::DsdSourcePathway::General => "general",
+                        tonepoet_pipeline::DsdSourcePathway::Custom => "custom",
                         tonepoet_pipeline::DsdSourcePathway::Reference => "reference",
                         tonepoet_pipeline::DsdSourcePathway::Manual => "manual (not yet available)",
                     }
+                ));
+            }
+            "dsd-reconstruction" => {
+                app.set_status(format!(
+                    "dsd-reconstruction = {}",
+                    app.convert.format.dsd_custom_reconstruction.selected_label()
+                ));
+            }
+            "dsd-lowpass" => {
+                app.set_status(format!(
+                    "dsd-lowpass = {}",
+                    app.convert.format.dsd_custom_lowpass.selected_label()
                 ));
             }
             "dsd-profile" => {
@@ -15550,6 +15563,12 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                         tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
                         tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
                     }
+                ));
+            }
+            "dsd-export-level" => {
+                app.set_status(format!(
+                    "dsd-export-level = {}",
+                    app.convert.format.dsd_custom_export_level.selected_label()
                 ));
             }
             "dsd-gain" => {
@@ -15582,10 +15601,16 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     app.convert.format.dsd_true_peak_target_dbtp.render(false)
                 ));
             }
-            "dsd-sample-peak-target" => {
+            "dsd-reference-margin" => {
                 app.set_status(format!(
-                    "dsd-sample-peak-target = {} dBFS",
-                    app.convert.format.dsd_sample_peak_target_dbfs.render(false)
+                    "dsd-reference-margin = {} dBTP",
+                    app.convert.format.dsd_reference_margin_dbtp.render(false)
+                ));
+            }
+            "dsd-reference-scope" => {
+                app.set_status(format!(
+                    "dsd-reference-scope = {}",
+                    app.convert.format.dsd_reference_scope.selected_label()
                 ));
             }
             "verification" => {
@@ -15818,7 +15843,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         }
         "dsd-path" => {
             let pathway = match value.to_ascii_lowercase().as_str() {
-                "general" => Some(tonepoet_pipeline::DsdSourcePathway::General),
+                "custom" => Some(tonepoet_pipeline::DsdSourcePathway::Custom),
                 "reference" => Some(tonepoet_pipeline::DsdSourcePathway::Reference),
                 "manual" => {
                     app.set_status(tonepoet_pipeline::reference_error_text(
@@ -15829,16 +15854,62 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 _ => None,
             };
             if let Some(pathway) = pathway {
+                let before_dsd_pathway = *app.convert.format.dsd_pathway.selected_value();
                 if app.convert.format.dsd_pathway.select_value(&pathway) {
                     app.convert.format.dsd_gain_overridden = true;
                     app.convert.format.apply_format_constraints();
+                    app.convert
+                        .format
+                        .apply_user_dsd_path_transition(before_dsd_pathway);
                     app.preset.mark_modified();
                     app.set_status(format!("dsd-path = {}", value.to_ascii_lowercase()));
                 } else {
                     app.set_status("dsd-path is available only for a DSD source targeting PCM");
                 }
             } else {
-                app.set_status("Unknown dsd-path. Try: general, reference");
+                app.set_status("Unknown dsd-path. Try: custom, reference");
+            }
+        }
+        "dsd-reconstruction" => {
+            if *app.convert.format.dsd_pathway.selected_value() != tonepoet_pipeline::DsdSourcePathway::Custom {
+                app.set_status("dsd-reconstruction applies only to the Custom DSD pathway");
+                return;
+            }
+            let reconstruction = match value.to_ascii_lowercase().as_str() {
+                "native" | "general" => Some(tonepoet_pipeline::DsdGeneralReconstruction::General),
+                "reference" | "reference-protected" | "protected" => Some(tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected),
+                _ => None,
+            };
+            if let Some(reconstruction) = reconstruction {
+                if app.convert.format.dsd_custom_reconstruction.select_value(&reconstruction) {
+                    app.convert.format.apply_format_constraints();
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-reconstruction = {}", app.convert.format.dsd_custom_reconstruction.selected_label()));
+                } else {
+                    app.set_status("That Custom DSD reconstruction mode is unavailable");
+                }
+            } else {
+                app.set_status("Unknown dsd-reconstruction. Try: native, reference");
+            }
+        }
+        "dsd-lowpass" => {
+            if *app.convert.format.dsd_pathway.selected_value() != tonepoet_pipeline::DsdSourcePathway::Custom {
+                app.set_status("dsd-lowpass applies only to the Custom DSD pathway");
+                return;
+            }
+            let lowpass = match value.to_ascii_lowercase().as_str() {
+                "auto" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Auto),
+                "sox-ultra" | "rate-u" | "ultra" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::SoxUltra),
+                "sinc" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Sinc),
+                _ => None,
+            };
+            if let Some(lowpass) = lowpass {
+                if app.convert.format.dsd_custom_lowpass.select_value(&lowpass) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-lowpass = {}", app.convert.format.dsd_custom_lowpass.selected_label()));
+                }
+            } else {
+                app.set_status("Unknown dsd-lowpass. Try: auto, sox-ultra, sinc");
             }
         }
         "dsd-profile" => {
@@ -15858,18 +15929,33 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status("Unknown dsd-profile. Try: reference, wideband");
             }
         }
+        "dsd-export-level" => {
+            if *app.convert.format.dsd_pathway.selected_value() != tonepoet_pipeline::DsdSourcePathway::Custom {
+                app.set_status("dsd-export-level applies only to the Custom DSD pathway");
+                return;
+            }
+            let export = match value.to_ascii_lowercase().as_str() {
+                "native" => Some(tonepoet_pipeline::DsdGeneralExportLevel::Native),
+                "compensated" | "nominal-compensated" => Some(tonepoet_pipeline::DsdGeneralExportLevel::NominalCompensated),
+                "protected" | "protected-r64" => Some(tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64),
+                _ => None,
+            };
+            if let Some(export) = export {
+                if app.convert.format.dsd_custom_export_level.select_value(&export) {
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-export-level = {}", app.convert.format.dsd_custom_export_level.selected_label()));
+                }
+            } else {
+                app.set_status("Unknown dsd-export-level. Try: native, compensated, protected");
+            }
+        }
         "dsd-gain" => {
             let mode = match value.to_ascii_lowercase().as_str() {
                 "off" => Some(DsdGainMode::Off),
                 "true-peak-guard" | "true_peak_guard" => Some(DsdGainMode::TruePeakGuard),
                 "true-peak-normalize" | "true_peak_normalize" => Some(DsdGainMode::TruePeakNormalize),
                 "fixed-gain" | "fixed_gain" => Some(DsdGainMode::FixedGain),
-                "reference" => Some(DsdGainMode::Reference),
-                "native-level" | "native_level" => Some(DsdGainMode::NativeLevel),
-                "reference-fixed" | "reference_fixed" => Some(DsdGainMode::ReferenceFixed),
-                "sample-peak-normalize" | "sample_peak_normalize" => Some(DsdGainMode::SamplePeakNormalize),
-                // Deliberately reject retired ambiguous forms.
-                "auto" | "normalize" | "fixed" | "manual" | "disabled" | "native" => None,
+                "auto" => Some(DsdGainMode::ReferenceAuto),
                 _ => None,
             };
             if let Some(mode) = mode {
@@ -15884,7 +15970,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     app.set_status("That DSD gain mode is unavailable for the selected DSD pathway");
                 }
             } else {
-                app.set_status("Unknown or retired dsd-gain. Try: off, true-peak-guard, true-peak-normalize, fixed-gain, reference, native-level, reference-fixed, sample-peak-normalize");
+                app.set_status("Unknown dsd-gain. Try: off, true-peak-guard, true-peak-normalize, fixed-gain, auto");
             }
         }
         "dsd-true-peak-scope" => {
@@ -15928,12 +16014,11 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         "dsd-gain-db" => match value.parse::<tonepoet_pipeline::DbNano>() {
             Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN).contains(&parsed) => {
                 app.convert.format.dsd_gain_db = parsed;
-                let mode = if *app.convert.format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Reference {
-                    DsdGainMode::ReferenceFixed
-                } else {
-                    DsdGainMode::FixedGain
-                };
-                app.convert.format.dsd_gain_mode.select_value(&mode);
+                if *app.convert.format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Reference {
+                    app.set_status("dsd-gain-db applies only to the Custom DSD pathway");
+                    return;
+                }
+                app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain);
                 app.convert.format.dsd_gain_overridden = true;
                 app.preset.mark_modified();
                 app.set_status(format!("dsd-gain-db = {}", parsed.render(false)));
@@ -15951,19 +16036,37 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             Ok(_) => app.set_status("dsd-true-peak-target must be between -12 and 0 dBTP"),
             Err(error) => app.set_status(format!("Invalid dsd-true-peak-target: {error}")),
         },
-        "dsd-sample-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
-                app.convert.format.dsd_sample_peak_target_dbfs = parsed;
+        "dsd-reference-margin" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) if (tonepoet_pipeline::DbNano::ZERO..=tonepoet_pipeline::DbNano::MAX_REFERENCE_AUTO_MARGIN).contains(&parsed) => {
+                app.convert.format.dsd_reference_margin_dbtp = parsed;
+                app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
                 app.convert.format.dsd_gain_overridden = true;
                 app.preset.mark_modified();
-                app.set_status(format!("dsd-sample-peak-target = {} dBFS", parsed.render(false)));
+                app.set_status(format!("dsd-reference-margin = {} dBTP", parsed.render(false)));
             }
-            Ok(_) => app.set_status("dsd-sample-peak-target must be between -12 and 0 dBFS"),
-            Err(error) => app.set_status(format!("Invalid dsd-sample-peak-target: {error}")),
+            Ok(_) => app.set_status("dsd-reference-margin must be between 0 and 24 dBTP"),
+            Err(error) => app.set_status(format!("Invalid dsd-reference-margin: {error}")),
+        },
+        "dsd-reference-scope" => {
+            let scope = match value.to_ascii_lowercase().as_str() {
+                "auto" => Some(tonepoet_pipeline::DsdReferenceGainScope::Auto),
+                "track" => Some(tonepoet_pipeline::DsdReferenceGainScope::Track),
+                _ => None,
+            };
+            if let Some(scope) = scope {
+                if app.convert.format.dsd_reference_scope.select_value(&scope) {
+                    app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
+                    app.convert.format.dsd_gain_overridden = true;
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-reference-scope = {}", app.convert.format.dsd_reference_scope.selected_label()));
+                }
+            } else {
+                app.set_status("Unknown dsd-reference-scope. Try: auto, track");
+            }
         },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-profile, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-sample-peak-target",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, dsd-reference-margin, dsd-reference-scope",
                 key
             ));
         }
@@ -23013,8 +23116,9 @@ mod convert_commit_synthetic_artifact_lifecycle_tests {
 mod source_relative_set_command_tests {
     use super::*;
     use crate::config::TonepoetConfig;
+    use crate::convert::formats::AudioFormat;
     use crate::convert::simple_wizard::DitherType;
-    use crate::tui::app::{BitDepthChoice, ResamplerChoice, SourceMode};
+    use crate::tui::app::{BitDepthChoice, DsdGainMode, ResamplerChoice, SourceMode};
     use crate::tui::probe::{SourceInfo, SourceMetadata};
 
     fn app_with_pcm_source() -> AppState {
@@ -23070,6 +23174,32 @@ mod source_relative_set_command_tests {
 
         assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
         assert_eq!(*app.convert.format.dither.selected_value(), DitherType::Shibata);
+    }
+
+    #[test]
+    fn set_dsd_path_reference_initializes_reference_auto() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.set_source_is_dsd(true);
+        app.convert.format.format.select_value(&AudioFormat::Wav);
+        app.convert.format.bit_depth.select_value(&BitDepthChoice::Float32);
+        app.convert.format.apply_format_constraints();
+        app.convert.format.apply_auto_gain_defaults();
+        assert_eq!(
+            *app.convert.format.dsd_pathway.selected_value(),
+            tonepoet_pipeline::DsdSourcePathway::Custom
+        );
+        assert_eq!(*app.convert.format.dsd_gain_mode.selected_value(), DsdGainMode::Off);
+
+        execute_set(&mut app, "dsd-path", "reference");
+
+        assert_eq!(
+            *app.convert.format.dsd_pathway.selected_value(),
+            tonepoet_pipeline::DsdSourcePathway::Reference
+        );
+        assert_eq!(
+            *app.convert.format.dsd_gain_mode.selected_value(),
+            DsdGainMode::ReferenceAuto
+        );
     }
 }
 

@@ -876,10 +876,12 @@ fn assert_exact_package_probe(
         ("flac_native", _) => "flac",
         ("wav_riff" | "wav_rf64", "int16") => "pcm_s16le",
         ("wav_riff" | "wav_rf64", "int24") => "pcm_s24le",
+        ("wav_riff" | "wav_rf64", "int32") => "pcm_s32le",
         ("wav_riff" | "wav_rf64", "float32") => "pcm_f32le",
         ("wav_riff" | "wav_rf64", "float64") => "pcm_f64le",
         ("aiff_native", "int16") => "pcm_s16be",
         ("aiff_native", "int24") => "pcm_s24be",
+        ("aiff_native", "int32") => "pcm_s32be",
         ("wavpack_native", _) => "wavpack",
         ("alac_m4a", _) => "alac",
         _ => panic!("unsupported probe cell {target}/{depth}"),
@@ -909,6 +911,7 @@ fn assert_exact_package_probe(
     let expected_bits = match depth {
         "int16" => 16,
         "int24" => 24,
+        "int32" => 32,
         "float32" => 32,
         "float64" => 64,
         _ => panic!("unknown depth {depth}"),
@@ -1110,9 +1113,8 @@ fn assert_qualification_decode_route_table() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavRiff,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Reference,
-        None,
-        DbNano::DEFAULT_NORMALIZE_TARGET,
+        DsdSourceGainMode::Auto,
+        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
         None,
     );
     let carrier_summary = carrier_plan.reference.as_ref().expect("Reference summary");
@@ -1499,6 +1501,7 @@ fn encode_w64_characterization_fixture(
     drop(raw_file);
     let (encoding, bits) = match depth {
         "int24" => ("signed-integer", "24"),
+        "int32" => ("signed-integer", "32"),
         "float32" => ("floating-point", "32"),
         "float64" => ("floating-point", "64"),
         _ => panic!("unsupported W64 characterization depth {depth}"),
@@ -1629,6 +1632,7 @@ fn exact_w64_characterization_result(
 ) -> Result<tonepoet_pipeline::W64ExactStructure, String> {
     let (bits_per_sample, encoding) = match depth {
         "int24" => (24, W64SampleEncoding::SignedInteger),
+        "int32" => (32, W64SampleEncoding::SignedInteger),
         "float32" => (32, W64SampleEncoding::FloatingPoint),
         "float64" => (64, W64SampleEncoding::FloatingPoint),
         _ => return Err(format!("unsupported depth {depth}")),
@@ -1656,7 +1660,7 @@ fn qualify_w64_exact_integrity_contract() -> Value {
         44_100_u32, 48_000, 88_200, 96_000, 176_400,
         192_000, 352_800, 384_000, 705_600, 768_000,
     ];
-    let depths = ["int24", "float32", "float64"];
+    let depths = ["int24", "int32", "float32", "float64"];
     let channels_set = [1_u16, 2_u16];
     let exponents = (-96_i32..=-1_i32).collect::<Vec<_>>();
     let mut rows = Vec::new();
@@ -2221,7 +2225,7 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
     let settings = PipelineSettings::default();
     assert_eq!(
         settings.dsd.from_dsd.pathway,
-        tonepoet_pipeline::DsdSourcePathway::General,
+        tonepoet_pipeline::DsdSourcePathway::Custom,
         "raw defaults must select ordinary general DSD processing"
     );
     let request = PlanRequest {
@@ -2957,8 +2961,7 @@ fn planned_reference_source_cell(
     target: ResolvedOutputTarget,
     profile: DsdReconstructionSelection,
     gain_mode: DsdSourceGainMode,
-    fixed_gain_db: Option<DbNano>,
-    normalize_target_dbfs: DbNano,
+    auto_gain_margin_dbtp: DbNano,
     compression_level: Option<u8>,
 ) -> ConversionPlan {
     let mut settings = PipelineSettings::default();
@@ -2969,8 +2972,7 @@ fn planned_reference_source_cell(
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain_mode = gain_mode;
-    settings.dsd.from_dsd.fixed_gain_db = fixed_gain_db;
-    settings.dsd.from_dsd.normalize_peak_target_dbfs = normalize_target_dbfs;
+    settings.dsd.from_dsd.auto_gain_margin_dbtp = auto_gain_margin_dbtp;
     settings.wavpack.hybrid = false;
     settings.wavpack.correction_file = false;
     if target == ResolvedOutputTarget::FlacNative {
@@ -3028,8 +3030,7 @@ fn planned_reference_cell(
     target: ResolvedOutputTarget,
     profile: DsdReconstructionSelection,
     gain_mode: DsdSourceGainMode,
-    fixed_gain_db: Option<DbNano>,
-    normalize_target_dbfs: DbNano,
+    auto_gain_margin_dbtp: DbNano,
     compression_level: Option<u8>,
 ) -> ConversionPlan {
     planned_reference_source_cell(
@@ -3044,8 +3045,7 @@ fn planned_reference_cell(
         target,
         profile,
         gain_mode,
-        fixed_gain_db,
-        normalize_target_dbfs,
+        auto_gain_margin_dbtp,
         compression_level,
     )
 }
@@ -3445,7 +3445,7 @@ fn capacity_boundary_plan_result(
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Reference;
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
     let request = PlanRequest {
         input_path: input.to_path_buf(),
         output_path: root.join(format!("capacity-{sample_frames}.w64")),
@@ -3591,9 +3591,8 @@ fn qualify_analyzer_carrier_contract() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Reference,
-        None,
-        DbNano::DEFAULT_NORMALIZE_TARGET,
+        DsdSourceGainMode::Auto,
+        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -3730,13 +3729,9 @@ fn decoded_f64_samples(
 
 fn terminal_bound_q63(policy: ResolvedGainPolicy) -> u64 {
     match policy {
-        ResolvedGainPolicy::ReferenceCompensated { terminal_bound, .. }
-        | ResolvedGainPolicy::NativeLevelExact { terminal_bound, .. }
-        | ResolvedGainPolicy::FixedExact { terminal_bound, .. } => {
+        ResolvedGainPolicy::Auto { terminal_bound, .. }
+        | ResolvedGainPolicy::Off { terminal_bound, .. } => {
             terminal_bound.max_added_peak_fs_q63_ceil
-        }
-        ResolvedGainPolicy::NormalizePeak { .. } => {
-            panic!("NormalizePeak has no Reference terminal-error authority")
         }
     }
 }
@@ -4016,6 +4011,7 @@ fn qualify_lossless_package_cells(
     ];
     let depths = [
         (PcmBitDepth::Int24, "int24"),
+        (PcmBitDepth::Int32, "int32"),
         (PcmBitDepth::Float32, "float32"),
         (PcmBitDepth::Float64, "float64"),
     ];
@@ -4029,6 +4025,21 @@ fn qualify_lossless_package_cells(
                             (ResolvedOutputTarget::WavRiff, vec![None]),
                             (ResolvedOutputTarget::WavRf64, vec![None]),
                             (ResolvedOutputTarget::WavW64, vec![None]),
+                        ]
+                    } else if depth == PcmBitDepth::Int32 {
+                        vec![
+                            (ResolvedOutputTarget::WavRiff, vec![None]),
+                            (ResolvedOutputTarget::WavRf64, vec![None]),
+                            (ResolvedOutputTarget::WavW64, vec![None]),
+                            (ResolvedOutputTarget::AiffNative, vec![None]),
+                            (
+                                ResolvedOutputTarget::FlacNative,
+                                (0_u8..=8).map(Some).collect(),
+                            ),
+                            (
+                                ResolvedOutputTarget::WavPackNative,
+                                (0_u8..=3).map(Some).collect(),
+                            ),
                         ]
                     } else {
                         vec![
@@ -4065,9 +4076,8 @@ fn qualify_lossless_package_cells(
                             depth,
                             target,
                             DsdReconstructionSelection::Reference,
-                            DsdSourceGainMode::Reference,
-                            None,
-                            DbNano::DEFAULT_NORMALIZE_TARGET,
+                            DsdSourceGainMode::Auto,
+                            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
                             level,
                         );
                         let summary = plan.reference.as_ref().expect("Reference summary");
@@ -4080,12 +4090,9 @@ fn qualify_lossless_package_cells(
                             false,
                         );
                         let selected_gain = match summary.gain_policy {
-                            ResolvedGainPolicy::ReferenceCompensated { requested_gain, .. } => requested_gain,
-                            ResolvedGainPolicy::NativeLevelExact { gain, .. }
-                            | ResolvedGainPolicy::FixedExact { gain, .. } => gain,
-                            ResolvedGainPolicy::NormalizePeak { .. } => {
-                                panic!("NormalizePeak is not admitted for Reference delivery")
-                            }
+                            ResolvedGainPolicy::Auto { bound_gain: Some(gain), .. } => gain,
+                            ResolvedGainPolicy::Auto { bound_gain: None, .. } => DbNano::ZERO,
+                            ResolvedGainPolicy::Off { .. } => DbNano::ZERO,
                         };
                         let terminal = tonepoet_pipeline::lower_reference_terminal_command(
                             &summary.r64_path,
@@ -4463,19 +4470,19 @@ fn qualify_lossless_package_cells(
             }
         }
     }
-    assert_eq!(case_count, 480);
-    assert_eq!(terminal_bound_cells.len(), 60);
-    assert_eq!(package_identity_comparison_count, 420);
-    assert_eq!(w64_direct_delivery_exact_validation_count, 60);
-    assert_eq!(post_metadata_identity_comparison_count, 420);
-    assert_eq!(w64_planner_entry_rejection_count, 60);
-    assert_eq!(w64_metadata_entry_rejection_count, 60);
+    assert_eq!(case_count, 820);
+    assert_eq!(terminal_bound_cells.len(), 80);
+    assert_eq!(package_identity_comparison_count, 740);
+    assert_eq!(w64_direct_delivery_exact_validation_count, 80);
+    assert_eq!(post_metadata_identity_comparison_count, 740);
+    assert_eq!(w64_planner_entry_rejection_count, 80);
+    assert_eq!(w64_metadata_entry_rejection_count, 80);
     assert_eq!(
         production_primary_mutator_case_counts,
         BTreeMap::from([
-            ("ffmpeg".to_string(), 160),
-            ("metaflac".to_string(), 180),
-            ("wvtag".to_string(), 80),
+            ("ffmpeg".to_string(), 220),
+            ("metaflac".to_string(), 360),
+            ("wvtag".to_string(), 160),
         ])
     );
     assert_eq!(production_m4a_freeform_case_count, 20);
@@ -4483,18 +4490,18 @@ fn qualify_lossless_package_cells(
     assert_eq!(
         terminal_route_counts,
         BTreeMap::from([
-            ("qpcm:ffmpeg_direct".to_string(), 40),
+            ("qpcm:ffmpeg_direct".to_string(), 60),
             ("qpcm:sox_f64le_raw_stream".to_string(), 20),
-            ("r64:sox_f64le_raw_stream".to_string(), 60),
+            ("r64:sox_f64le_raw_stream".to_string(), 80),
         ])
     );
     assert_eq!(
         route_counts,
         BTreeMap::from([
-            ("packaged:ffmpeg_direct".to_string(), 460),
+            ("packaged:ffmpeg_direct".to_string(), 800),
             ("packaged:sox_f64le_raw_stream".to_string(), 20),
-            ("post_metadata:ffmpeg_direct".to_string(), 420),
-            ("qpcm:ffmpeg_direct".to_string(), 420),
+            ("post_metadata:ffmpeg_direct".to_string(), 740),
+            ("qpcm:ffmpeg_direct".to_string(), 760),
             ("qpcm:sox_f64le_raw_stream".to_string(), 60),
         ])
     );
@@ -4504,18 +4511,21 @@ fn qualify_lossless_package_cells(
             ("packaged:float32_le".to_string(), 60),
             ("packaged:float64_le".to_string(), 60),
             ("packaged:int24_le".to_string(), 360),
+            ("packaged:int32_le".to_string(), 340),
             ("post_metadata:float32_le".to_string(), 40),
             ("post_metadata:float64_le".to_string(), 40),
             ("post_metadata:int24_le".to_string(), 340),
+            ("post_metadata:int32_le".to_string(), 320),
             ("qpcm:float32_le".to_string(), 60),
             ("qpcm:float64_le".to_string(), 60),
             ("qpcm:int24_le".to_string(), 360),
+            ("qpcm:int32_le".to_string(), 340),
         ])
     );
 
     assert_eq!(
         terminal_observed_max_error_by_depth.keys().cloned().collect::<Vec<_>>(),
-        vec!["float32".to_string(), "float64".to_string(), "int24".to_string()]
+        vec!["float32".to_string(), "float64".to_string(), "int24".to_string(), "int32".to_string()]
     );
 
     PackageQualificationEvidence {
@@ -4529,6 +4539,7 @@ fn qualify_lossless_package_cells(
             "hash_format": REFERENCE_SAMPLE_HASH_FORMAT,
             "hash_codecs": {
                 "int24": ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec(),
+                "int32": ReferenceSampleHashEncoding::SignedInt32Le.ffmpeg_codec(),
                 "float32": ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec(),
                 "float64": ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec(),
             },
@@ -4580,52 +4591,31 @@ fn gain_arg(args: &[String]) -> Option<&str> {
 fn gain_policy_evidence(policy: ResolvedGainPolicy, terminal_args: &[String]) -> Value {
     let applied_gain_db = gain_arg(terminal_args).map(str::to_owned);
     match policy {
-        ResolvedGainPolicy::ReferenceCompensated {
-            requested_gain,
-            ceiling,
+        ResolvedGainPolicy::Auto {
+            target_dbtp,
+            scope,
+            bound_gain,
             terminal_bound,
         } => serde_json::json!({
-            "mode": "reference_compensated",
-            "requested_gain_db": requested_gain.render(true),
+            "mode": "auto",
+            "target_dbtp": target_dbtp.render(false),
+            "scope": format!("{scope:?}").to_ascii_lowercase(),
+            "bound_gain_db": bound_gain.map(|gain| gain.render(true)),
+            "applied_gain_db": applied_gain_db,
+            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
+            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
+            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
+            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
+        }),
+        ResolvedGainPolicy::Off { ceiling, terminal_bound } => serde_json::json!({
+            "mode": "off",
+            "requested_gain_db": DbNano::ZERO.render(true),
             "applied_gain_db": applied_gain_db,
             "acceptance_ceiling_dbtp": ceiling.render(false),
             "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
             "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
             "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
             "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
-        }),
-        ResolvedGainPolicy::NativeLevelExact {
-            gain,
-            ceiling,
-            terminal_bound,
-        } => serde_json::json!({
-            "mode": "native_level_exact",
-            "requested_gain_db": gain.render(true),
-            "applied_gain_db": applied_gain_db,
-            "acceptance_ceiling_dbtp": ceiling.render(false),
-            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
-            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
-            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
-            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
-        }),
-        ResolvedGainPolicy::FixedExact {
-            gain,
-            ceiling,
-            terminal_bound,
-        } => serde_json::json!({
-            "mode": "fixed_exact",
-            "requested_gain_db": gain.render(true),
-            "applied_gain_db": applied_gain_db,
-            "acceptance_ceiling_dbtp": ceiling.render(false),
-            "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
-            "terminal_safe_pre_terminal_ceiling_dbtp": terminal_bound.safe_pre_terminal_ceiling_dbtp.render(false),
-            "terminal_derivation_digest": terminal_bound.derivation_digest.to_hex(),
-            "post_final_acceptance_reserve_db": DbNano::POST_FINAL_ACCEPTANCE_RESERVE.render(false),
-        }),
-        ResolvedGainPolicy::NormalizePeak { target_dbfs } => serde_json::json!({
-            "mode": "normalize_peak",
-            "target_dbfs": target_dbfs.render(false),
-            "applied_gain_db": applied_gain_db,
         }),
     }
 }
@@ -4671,9 +4661,8 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Reference,
-        None,
-        DbNano::DEFAULT_NORMALIZE_TARGET,
+        DsdSourceGainMode::Auto,
+        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
         None,
     );
     let policy = plan.reference.as_ref().expect("Reference summary").gain_policy;
@@ -4746,7 +4735,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     let root = TempDir::new().expect("common Reference gain-chain tempdir");
     let source = root.path().join("source-placeholder.dsf");
 
-    let make_plan = |mode: DsdSourceGainMode, offset: Option<DbNano>| {
+    let make_plan = |mode: DsdSourceGainMode| {
         planned_reference_cell(
             root.path(),
             &source,
@@ -4757,8 +4746,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
             ResolvedOutputTarget::WavW64,
             DsdReconstructionSelection::Reference,
             mode,
-            offset,
-            DbNano::DEFAULT_NORMALIZE_TARGET,
+            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
             None,
         )
     };
@@ -4787,57 +4775,51 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
         certificate_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(b"phase5-gain-certificate"),
     };
 
-    let compensated_plan = make_plan(DsdSourceGainMode::Reference, None);
-    let compensated_summary = compensated_plan.reference.as_ref().expect("compensated summary");
-    let compensated = tonepoet_pipeline::resolve_reference_certified_gain(
+    let auto_plan = make_plan(DsdSourceGainMode::Auto);
+    let auto_summary = auto_plan.reference.as_ref().expect("auto summary");
+    let auto = tonepoet_pipeline::resolve_reference_certified_gain(
         &make_pre(0.25),
-        compensated_summary.gain_policy,
+        auto_summary.gain_policy,
         tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
     )
-    .expect("compensated gain resolves");
-    assert_eq!(compensated.requested_gain, DbNano(18_020_599_913));
-    assert!(compensated.selected_gain <= compensated.requested_gain);
+    .expect("Reference Auto gain resolves");
+    assert!(auto.selected_gain <= auto.requested_gain);
 
-    let native_plan = make_plan(DsdSourceGainMode::NativeLevel, None);
-    let native_summary = native_plan.reference.as_ref().expect("native exact summary");
-    let native = tonepoet_pipeline::resolve_reference_certified_gain(
+    let off_plan = make_plan(DsdSourceGainMode::Off);
+    let off_summary = off_plan.reference.as_ref().expect("off summary");
+    let off = tonepoet_pipeline::resolve_reference_certified_gain(
         &make_pre(0.10),
-        native_summary.gain_policy,
+        off_summary.gain_policy,
         tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
     )
-    .expect("feasible NativeLevelExact resolves");
-    assert_eq!(native.requested_gain, DbNano(12_000_000_000));
-    assert_eq!(native.selected_gain, native.requested_gain);
+    .expect("Reference Off accepts a source already below the fixed ceiling");
+    assert_eq!(off.requested_gain, DbNano::HEADROOM_RESTORATION);
+    assert_eq!(off.selected_gain, DbNano::HEADROOM_RESTORATION);
+    assert!(!off.reduced_for_ceiling);
     assert!(tonepoet_pipeline::resolve_reference_certified_gain(
-        &make_pre(0.50),
-        native_summary.gain_policy,
+        &make_pre(0.95),
+        off_summary.gain_policy,
         tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
     )
-    .is_err(), "infeasible NativeLevelExact must refuse");
+    .is_err(), "Reference Off must refuse a programme that requires attenuation");
 
-    let fixed_offset = DbNano(1_500_000_000);
-    let fixed_plan = make_plan(DsdSourceGainMode::Fixed, Some(fixed_offset));
-    let fixed_summary = fixed_plan.reference.as_ref().expect("fixed exact summary");
-    let fixed = tonepoet_pipeline::resolve_reference_certified_gain(
-        &make_pre(0.08),
-        fixed_summary.gain_policy,
-        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    let off_terminal = tonepoet_pipeline::lower_reference_terminal_command(
+        &off_summary.r64_path,
+        &off_summary.qpcm_path,
+        off_summary.final_pcm,
+        off.selected_gain,
     )
-    .expect("feasible FixedExact resolves");
-    assert_eq!(fixed.requested_gain, DbNano(13_500_000_000));
-    assert_eq!(fixed.selected_gain, fixed.requested_gain);
-    assert!(tonepoet_pipeline::resolve_reference_certified_gain(
-        &make_pre(0.50),
-        fixed_summary.gain_policy,
-        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
-    )
-    .is_err(), "infeasible FixedExact must refuse");
+    .expect("Reference Off terminal lowers");
+    assert!(off_terminal
+        .args
+        .windows(2)
+        .any(|pair| pair == ["gain", "+12.000000000"]));
 
     let terminal = tonepoet_pipeline::lower_reference_terminal_command(
-        &fixed_summary.r64_path,
-        &fixed_summary.qpcm_path,
-        fixed_summary.final_pcm,
-        fixed.selected_gain,
+        &auto_summary.r64_path,
+        &auto_summary.qpcm_path,
+        auto_summary.final_pcm,
+        auto.selected_gain,
     )
     .expect("common Reference terminal lowers");
     assert_eq!(terminal.args.iter().filter(|arg| arg.as_str() == "gain").count(), 1);
@@ -4846,15 +4828,13 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     serde_json::json!({
         "status": "passed",
         "pre_terminal_authority": tonepoet_pipeline::REFERENCE_CERTIFIED_OBSERVER_ID,
-        "reference_compensated_requested_db": compensated.requested_gain.render(false),
-        "reference_compensated_selected_db": compensated.selected_gain.render(false),
-        "native_level_exact_db": native.selected_gain.render(false),
-        "fixed_exact_db": fixed.selected_gain.render(false),
-        "native_infeasible_refuses": true,
-        "fixed_infeasible_refuses": true,
+        "auto_requested_db": auto.requested_gain.render(false),
+        "auto_selected_db": auto.selected_gain.render(false),
+        "off_selected_db": off.selected_gain.render(false),
+        "off_infeasible_refuses": true,
         "terminal_realization_count": 1,
         "terminal_lowerer": tonepoet_pipeline::REFERENCE_TERMINAL_ID,
-        "legacy_deferred_command_authority": "retired",
+        "retired_reference_gain_modes_absent": true,
     })
 }
 
@@ -5293,9 +5273,8 @@ fn planned_render_command(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         selection,
-        DsdSourceGainMode::Reference,
-        None,
-        DbNano::DEFAULT_NORMALIZE_TARGET,
+        DsdSourceGainMode::Auto,
+        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -5414,9 +5393,8 @@ fn assert_planned_w64_bridge(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Reference,
-        None,
-        DbNano::DEFAULT_NORMALIZE_TARGET,
+        DsdSourceGainMode::Auto,
+        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");

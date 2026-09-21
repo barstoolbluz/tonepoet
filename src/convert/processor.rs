@@ -2802,10 +2802,21 @@ fn queued_item_pipeline_settings(item: &ConversionItem) -> Option<&PipelineSetti
         .or(item.options.pipeline_settings.as_ref())
 }
 
+fn queued_item_reference_auto_album_gain_selected(item: &ConversionItem) -> bool {
+    item.pipeline_request.as_ref().is_some_and(|request| {
+        request.settings.dsd.reference_auto_album_gain_possible()
+            && request
+                .album_batch
+                .as_ref()
+                .is_some_and(|batch| batch.expected_track_count > 1)
+    })
+}
+
 fn queued_item_album_true_peak_gain_selected(item: &ConversionItem) -> bool {
     queued_item_pipeline_settings(item)
         .map(|settings| {
-            settings.dsd.album_true_peak_gain_selected()
+            queued_item_reference_auto_album_gain_selected(item)
+                || settings.dsd.album_true_peak_gain_selected()
                 || (settings.pcm_true_peak.is_true_peak()
                     && settings.pcm_true_peak.scope() == Some(tonepoet_pipeline::TruePeakScope::Album))
         })
@@ -3346,7 +3357,9 @@ fn true_peak_album_track_is_dsd(track: &crate::convert::pipeline::PreparedTrack)
     matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
         || matches!(
             &track.source_ref,
-            TrackSourceRef::DsdTruePeakCarrier { .. } | TrackSourceRef::SacdTrack { .. }
+            TrackSourceRef::DsdTruePeakCarrier { .. }
+                | TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
+                | TrackSourceRef::SacdTrack { .. }
         )
 }
 
@@ -3679,6 +3692,117 @@ fn resolve_shared_pcm_dsd_true_peak_submission_albums(
     Ok(())
 }
 
+fn resolve_reference_auto_gain_submission_albums(
+    albums: &mut [ScheduledAlbum],
+) -> Result<(), String> {
+    let mut target = None;
+    let mut participants = Vec::new();
+    let mut carrier_count = 0usize;
+
+    for album in albums.iter() {
+        let carriers = album
+            .source
+            .tracks
+            .iter()
+            .filter_map(|track| match &track.source_ref {
+                TrackSourceRef::DsdReferenceAutoGainCarrier {
+                    gain_db,
+                    target_dbtp,
+                    ..
+                } => Some((track.id.clone(), (*gain_db, *target_dbtp))),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        carrier_count = carrier_count.saturating_add(carriers.len());
+
+        let mut measured_ids = BTreeSet::new();
+        for entry in &album.reference_auto_gain_measurements {
+            if !measured_ids.insert(entry.track_id.clone()) {
+                return Err(format!(
+                    "submitted-batch Reference item {} contains duplicate measured participant {:?}",
+                    album.item_id, entry.track_id,
+                ));
+            }
+            let Some((carrier_gain, carrier_target)) = carriers.get(&entry.track_id) else {
+                return Err(format!(
+                    "submitted-batch Reference item {} has a certified observation without its retained protected-R64 carrier for {:?}",
+                    album.item_id, entry.track_id,
+                ));
+            };
+            if carrier_gain.is_some() {
+                return Err(format!(
+                    "submitted-batch Reference item {} reached the Album barrier with a scalar already bound for {:?}",
+                    album.item_id, entry.track_id,
+                ));
+            }
+            if *carrier_target != entry.target_dbtp {
+                return Err(format!(
+                    "submitted-batch Reference item {} carrier target disagrees with its certified constraint for {:?}",
+                    album.item_id, entry.track_id,
+                ));
+            }
+            if target.is_some_and(|value| value != entry.target_dbtp) {
+                return Err(
+                    "submitted-batch Reference participants have different automatic-gain margins"
+                        .to_string(),
+                );
+            }
+            target.get_or_insert(entry.target_dbtp);
+            participants.push((entry.measurement, entry.terminal_bound));
+        }
+        let carrier_ids = carriers.keys().cloned().collect::<BTreeSet<_>>();
+        if measured_ids != carrier_ids {
+            return Err(format!(
+                "submitted-batch Reference item {} has {} certified observation(s) for {} retained carrier(s)",
+                album.item_id,
+                measured_ids.len(),
+                carrier_ids.len(),
+            ));
+        }
+    }
+
+    if participants.is_empty() {
+        if carrier_count == 0 {
+            return Ok(());
+        }
+        return Err(
+            "submitted-batch Reference barrier retained carriers without certified constraints"
+                .to_string(),
+        );
+    }
+    if participants.len() != carrier_count {
+        return Err(format!(
+            "submitted-batch Reference barrier collected {} certified constraint(s) for {} retained carrier(s)",
+            participants.len(), carrier_count,
+        ));
+    }
+
+    let target = target.ok_or_else(|| {
+        "submitted-batch Reference barrier has participants but no common target".to_string()
+    })?;
+    let authority = tonepoet_pipeline::resolve_album_gain_constraints(target, &participants)
+        .map_err(|error| format!("submitted-batch Reference auto gain failed: {error}"))?;
+
+    for album in albums.iter_mut() {
+        if album.reference_auto_gain_measurements.is_empty() {
+            continue;
+        }
+        album.req.settings.dsd.bind_runtime_album_gain(
+            authority.gain_db,
+            authority.loudest_peak_dbfs,
+            authority.track_count,
+        );
+        for track in &mut album.source.tracks {
+            if let TrackSourceRef::DsdReferenceAutoGainCarrier { gain_db, .. } =
+                &mut track.source_ref
+            {
+                *gain_db = Some(authority.gain_db);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn submission_album_gain_domains(albums: &[ScheduledAlbum]) -> (bool, bool) {
     let pcm_requested = albums.iter().any(|album| {
         album.req.settings.pcm_true_peak.is_true_peak()
@@ -3753,6 +3877,16 @@ fn resolve_completed_dsd_album_gain_submission(
                 .to_string(),
             state.ready_albums,
         )));
+    }
+
+    if state
+        .ready_albums
+        .iter()
+        .any(|album| !album.reference_auto_gain_measurements.is_empty())
+    {
+        if let Err(error) = resolve_reference_auto_gain_submission_albums(&mut state.ready_albums) {
+            return Some(Err((error, state.ready_albums)));
+        }
     }
 
     let (pcm_album_scope, dsd_album_scope) =
@@ -3971,7 +4105,9 @@ fn apply_dsd_album_gain_barrier_resolution(
         Ok(albums) => {
             for album in albums {
                 if album.req.publish.overwrite == OverwritePolicy::SkipIfManifestMatch
-                    && (album.req.settings.dsd.album_true_peak_gain_selected()
+                    && ((album.req.settings.dsd.reference_auto_album_gain_possible()
+                        && album.req.settings.dsd.runtime_album_gain_db().is_some())
+                        || album.req.settings.dsd.album_true_peak_gain_selected()
                         || (album.req.settings.pcm_true_peak.is_true_peak()
                             && album.req.settings.pcm_true_peak.scope()
                                 == Some(tonepoet_pipeline::TruePeakScope::Album)))
@@ -4734,6 +4870,7 @@ fn next_album_source_work(
         return Some(match &track.source_ref {
             TrackSourceRef::StagedFile(_)
             | TrackSourceRef::DsdTruePeakCarrier { .. }
+            | TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
             | TrackSourceRef::PcmTruePeakCarrier { .. }
             | TrackSourceRef::RegisteredEffectCarrier { .. } => {
                 let kind = if album.source.kind == SourceKind::SingleFile {
@@ -4878,6 +5015,7 @@ fn build_realize_work(
         TrackSourceRef::BluRayTrack { .. } => WorkKind::MaterializeItem,
         TrackSourceRef::StagedFile(_)
         | TrackSourceRef::DsdTruePeakCarrier { .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
         | TrackSourceRef::PcmTruePeakCarrier { .. }
         | TrackSourceRef::RegisteredEffectCarrier { .. } => {
             WorkKind::EncodeTrack { track_id: track_id.clone() }

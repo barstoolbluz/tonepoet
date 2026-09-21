@@ -906,7 +906,7 @@ pub fn plan_conversion_with_registry(
         && !request.settings.target_format.is_dsd()
         && !matches!(
             request.settings.dsd.from_dsd.pathway,
-            crate::dsd_reference::DsdSourcePathway::General
+            crate::dsd_reference::DsdSourcePathway::Custom
         )
     {
         // Preserve the sealed Reference/Manual pathway admission precedence and

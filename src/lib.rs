@@ -5,6 +5,7 @@ pub mod ctdb_rs;
 pub mod db;
 pub mod disc;
 pub mod dsf_tags;
+pub(crate) mod flac_envelope;
 pub(crate) mod metadata_authority;
 pub mod metadata_persistence;
 pub(crate) mod reexec;

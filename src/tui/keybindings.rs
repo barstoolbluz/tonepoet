@@ -3654,10 +3654,14 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::ConversionPreset => format.conversion_preset.selected_label().to_string(),
         FormatField::DsdPath => format.dsd_pathway.selected_label().to_string(),
         FormatField::DsdProfile => format.dsd_profile.selected_label().to_string(),
+        FormatField::DsdCustomReconstruction => format.dsd_custom_reconstruction.selected_label().to_string(),
+        FormatField::DsdCustomLowpass => format.dsd_custom_lowpass.selected_label().to_string(),
+        FormatField::DsdCustomExportLevel => format.dsd_custom_export_level.selected_label().to_string(),
         FormatField::DsdGain => format.dsd_gain_mode.selected_label().to_string(),
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
         FormatField::DsdTruePeakTarget => format.dsd_true_peak_target_dbtp.render(false),
-        FormatField::DsdSamplePeakTarget => format.dsd_sample_peak_target_dbfs.render(false),
+        FormatField::DsdReferenceMargin => format.dsd_reference_margin_dbtp.render(false),
+        FormatField::DsdReferenceScope => format.dsd_reference_scope.selected_label().to_string(),
         FormatField::DsdTruePeakScope => format.dsd_true_peak_scope.selected_label().to_string(),
         FormatField::DsdTruePeakScan => format.dsd_true_peak_scan_mode.selected_label().to_string(),
         FormatField::Container => format.selected_container().display_name.to_string(),
@@ -71536,12 +71540,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ConversionPresetPill(_)
             | TuiButton::DsdPathPill(_)
             | TuiButton::DsdProfilePill(_)
+            | TuiButton::DsdCustomReconstructionPill(_)
+            | TuiButton::DsdCustomLowpassPill(_)
+            | TuiButton::DsdCustomExportLevelPill(_)
             | TuiButton::DsdGainPill(_)
             | TuiButton::DsdTruePeakScopePill(_)
             | TuiButton::DsdTruePeakScanPill(_)
             | TuiButton::DsdGainDbField
             | TuiButton::DsdTruePeakTargetField
-            | TuiButton::DsdSamplePeakTargetField
+            | TuiButton::DsdReferenceMarginField
+            | TuiButton::DsdReferenceScopePill(_)
             | TuiButton::ContainerPill(_)
             | TuiButton::ResampleQualityPill(_) => {
                 app.convert.focus = ConvertFocus::Format;

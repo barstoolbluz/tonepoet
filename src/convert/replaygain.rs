@@ -565,6 +565,8 @@ fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Res
         return Err(invalid(format!("ReplayGain reader requires a regular file: '{}'", path.display())));
     }
     let before_len = before.len();
+    let wrapped_flac_extent = crate::flac_envelope::wrapped_flac_extent(path)
+        .map_err(|error| invalid(format!("inspect FLAC wrapper '{}': {error}", path.display())))?;
     let mut baseline_observation =
         crate::convert::pipeline::baseline::replaygain_observation_started(path, before_len);
     let subject_identity = artifact_subject_identity(path, &member_id, &before);
@@ -598,11 +600,22 @@ fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Res
     let mut frame_allocations = 0_u64;
     let mut frame_allocation_bytes = 0_u64;
 
+    let declared_wrapped_extent = wrapped_flac_extent.map(|extent| extent.sample_frames);
+    let mut accepted_wrapped_eof = false;
     loop {
         let mut packet = ffmpeg::Packet::empty();
         match packet.read(&mut ictx) {
             Ok(()) => {}
             Err(ffmpeg::Error::Eof) => break,
+            Err(error) if declared_wrapped_extent == Some(decoded_frames) => {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC demux EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    decoded_frames,
+                );
+                break;
+            }
             Err(error) => {
                 return Err(invalid(format!(
                     "demux ReplayGain input '{}': {error}",
@@ -613,10 +626,19 @@ fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Res
         if packet.stream() != stream_index {
             continue;
         }
-        decoder
-            .send_packet(&packet)
-            .map_err(|error| invalid(format!("send audio packet '{}': {error}", path.display())))?;
-        drain_decoder_frames(
+        if let Err(error) = decoder.send_packet(&packet) {
+            if declared_wrapped_extent == Some(decoded_frames) {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC packet EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    decoded_frames,
+                );
+                break;
+            }
+            return Err(invalid(format!("send audio packet '{}': {error}", path.display())));
+        }
+        match drain_decoder_frames(
             &mut decoder,
             &mut decoded,
             rate,
@@ -627,23 +649,59 @@ fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Res
             &mut frame_allocations,
             &mut frame_allocation_bytes,
             false,
-        )?;
+            declared_wrapped_extent,
+        )? {
+            DecoderDrainOutcome::ReadyForInput | DecoderDrainOutcome::CleanEof => {}
+            DecoderDrainOutcome::DeclaredWrappedFlacEof => {
+                accepted_wrapped_eof = true;
+                break;
+            }
+        }
     }
-    decoder
-        .send_eof()
-        .map_err(|error| invalid(format!("flush audio decoder '{}': {error}", path.display())))?;
-    drain_decoder_frames(
-        &mut decoder,
-        &mut decoded,
-        rate,
-        channels,
-        &roles,
-        &mut observer,
-        &mut decoded_frames,
-        &mut frame_allocations,
-        &mut frame_allocation_bytes,
-        true,
-    )?;
+    if !accepted_wrapped_eof {
+        if let Err(error) = decoder.send_eof() {
+            if declared_wrapped_extent == Some(decoded_frames) {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC flush EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    decoded_frames,
+                );
+            } else {
+                return Err(invalid(format!("flush audio decoder '{}': {error}", path.display())));
+            }
+        }
+    }
+    if !accepted_wrapped_eof {
+        match drain_decoder_frames(
+            &mut decoder,
+            &mut decoded,
+            rate,
+            channels,
+            &roles,
+            &mut observer,
+            &mut decoded_frames,
+            &mut frame_allocations,
+            &mut frame_allocation_bytes,
+            true,
+            declared_wrapped_extent,
+        )? {
+            DecoderDrainOutcome::CleanEof => {}
+            DecoderDrainOutcome::DeclaredWrappedFlacEof => accepted_wrapped_eof = true,
+            DecoderDrainOutcome::ReadyForInput => {
+                return Err(invalid("decoder flush ended without clean EOF"));
+            }
+        }
+    }
+
+    if let Some(expected) = declared_wrapped_extent {
+        if decoded_frames != expected {
+            return Err(invalid(format!(
+                "ID3-wrapped FLAC decoded extent mismatch for '{}': STREAMINFO declares {expected} frames, decoded {decoded_frames}",
+                path.display(),
+            )));
+        }
+    }
 
     if decoded_frames == 0 {
         return Err(invalid(format!("decoder produced no audio for '{}'", path.display())));
@@ -652,8 +710,13 @@ fn observe_file(path: &Path, member_id: String, demand: MetricDemand) -> io::Res
     if !same_artifact_generation(&before, &after) {
         return Err(invalid(format!("audio artifact changed while it was being observed: '{}'", path.display())));
     }
+    let decode_eof_detail = if declared_wrapped_extent.is_some() && accepted_wrapped_eof {
+        "verified ID3-wrapped FLAC declared-sample EOF"
+    } else {
+        "clean decoder EOF"
+    };
     let observation = observer.finish(format!(
-        "ffmpeg complete decode; clean decoder EOF; stable extent={} bytes",
+        "ffmpeg complete decode; {decode_eof_detail}; stable extent={} bytes",
         before_len
     ))?;
     if let Some(baseline) = baseline_observation.as_mut() {
@@ -722,6 +785,13 @@ fn same_artifact_generation(before: &std::fs::Metadata, after: &std::fs::Metadat
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderDrainOutcome {
+    ReadyForInput,
+    CleanEof,
+    DeclaredWrappedFlacEof,
+}
+
 fn drain_decoder_frames(
     decoder: &mut ffmpeg::decoder::Audio,
     frame: &mut ffmpeg::util::frame::Audio,
@@ -733,7 +803,8 @@ fn drain_decoder_frames(
     frame_allocations: &mut u64,
     frame_allocation_bytes: &mut u64,
     flushing: bool,
-) -> io::Result<()> {
+    declared_wrapped_extent: Option<u64>,
+) -> io::Result<DecoderDrainOutcome> {
     loop {
         match decoder.receive_frame(frame) {
             Ok(()) => {
@@ -746,6 +817,17 @@ fn drain_decoder_frames(
                 if roles != expected_roles {
                     return Err(invalid("decoder changed ordered channel roles mid-programme"));
                 }
+                let frame_samples = u64::try_from(frame.samples())
+                    .map_err(|_| invalid("frame sample count overflow"))?;
+                let next_frames = frames
+                    .checked_add(frame_samples)
+                    .ok_or_else(|| invalid("decoded frame count overflow"))?;
+                if declared_wrapped_extent.is_some_and(|expected| next_frames > expected) {
+                    return Err(invalid(format!(
+                        "ID3-wrapped FLAC decoder exceeded STREAMINFO extent: expected at most {} frames, decoded frame would reach {next_frames}",
+                        declared_wrapped_extent.expect("checked Some"),
+                    )));
+                }
                 let interleaved = frame_to_interleaved_f64(frame, channels)?;
                 *frame_allocations = frame_allocations.saturating_add(1);
                 *frame_allocation_bytes = frame_allocation_bytes.saturating_add(
@@ -754,16 +836,21 @@ fn drain_decoder_frames(
                         .saturating_mul(std::mem::size_of::<f64>() as u64),
                 );
                 observer.push_interleaved(&interleaved)?;
-                *frames = frames
-                    .checked_add(u64::try_from(frame.samples()).map_err(|_| invalid("frame sample count overflow"))?)
-                    .ok_or_else(|| invalid("decoded frame count overflow"))?;
+                *frames = next_frames;
             }
-            Err(ffmpeg::Error::Eof) => return Ok(()),
+            Err(ffmpeg::Error::Eof) => return Ok(DecoderDrainOutcome::CleanEof),
             Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => {
                 if flushing {
                     return Err(invalid("decoder flush ended without clean EOF"));
                 }
-                return Ok(());
+                return Ok(DecoderDrainOutcome::ReadyForInput);
+            }
+            Err(error) if declared_wrapped_extent == Some(*frames) => {
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC decoder EOF after declared extent: frames={}, error={error}",
+                    *frames,
+                );
+                return Ok(DecoderDrainOutcome::DeclaredWrappedFlacEof);
             }
             Err(error) => return Err(invalid(format!("audio decoder failed: {error}"))),
         }
@@ -1763,6 +1850,24 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id3_wrapped_flac_observes_declared_extent_and_succeeds() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let extent = crate::flac_envelope::wrapped_flac_extent(&path)
+            .expect("wrapper inspection")
+            .expect("fixture must be recognized as wrapped FLAC");
+        assert_eq!(extent.sample_frames, 48_000);
+
+        let observation = observe_file(
+            &path,
+            "id3-wrapped-flac".to_string(),
+            MetricDemand::IntegratedOnly,
+        )
+        .expect("native ReplayGain/loudness reader must accept the verified trailing ID3v1 wrapper");
+        assert_eq!(observation.summary.loudness.real_frames, 48_000);
+    }
 
     #[test]
     fn demand_is_derived_before_meter_construction() {

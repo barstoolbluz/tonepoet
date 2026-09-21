@@ -1185,6 +1185,40 @@ pub enum TrackSourceRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_candidate: Option<SelectedPhysicalCandidateBinding>,
     },
+    /// Protected Float64 Wave64 retained after the qualified Reference
+    /// reconstruction and certified pre-terminal observation for album-scoped
+    /// auto gain. The carrier remains ungained until the submitted-batch
+    /// barrier binds one common scalar; final Reference execution reuses this
+    /// exact carrier and still performs terminal realization plus the
+    /// independent post-terminal certified acceptance scan.
+    DsdReferenceAutoGainCarrier {
+        path: PathBuf,
+        /// Original user-visible DSD source used for provenance and metadata.
+        source_path: PathBuf,
+        /// Original DSD sample rate used to reconstruct the logical source
+        /// during final planning.
+        source_sample_rate_hz: u32,
+        /// Protected PCM carrier sample rate.
+        sample_rate_hz: u32,
+        channels: u16,
+        duration: Option<std::time::Duration>,
+        source_kind: tonepoet_pipeline::DsdSourceKind,
+        /// Common album scalar. `None` is valid only before the submitted-batch
+        /// barrier completes.
+        gain_db: Option<tonepoet_pipeline::DbNano>,
+        target_dbtp: tonepoet_pipeline::DbNano,
+        /// Semantic Reference plan identity before runtime album gain is bound.
+        /// Final execution re-derives this unbound plan rather than comparing
+        /// the intentionally changed bound plan hash.
+        unbound_semantic_plan_hash: tonepoet_pipeline::Sha256Digest,
+        source_content_sha256: tonepoet_pipeline::Sha256Digest,
+        canonical_materialization_sha256: tonepoet_pipeline::Sha256Digest,
+        /// Digest of the exact retained protected-R64 bytes observed by the
+        /// certified scanner. Final execution recomputes it once before reuse.
+        carrier_sha256: tonepoet_pipeline::Sha256Digest,
+        /// Complete certified observation of this exact protected-R64 payload.
+        observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation,
+    },
     /// Audio-only final-rate headerless little-endian Float64 PCM carrier
     /// measured before the one PCM true-peak gain step. `source_path` remains metadata/provenance
     /// authority. Album scope leaves `gain_db` unbound until the submitted

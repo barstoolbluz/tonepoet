@@ -337,6 +337,9 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::ConversionPreset => register_pill_row(buttons, &state.conversion_preset, y, label_col, TuiButton::ConversionPresetPill),
             FormatField::DsdPath => register_pill_row(buttons, &state.dsd_pathway, y, label_col, TuiButton::DsdPathPill),
             FormatField::DsdProfile => register_pill_row(buttons, &state.dsd_profile, y, label_col, TuiButton::DsdProfilePill),
+            FormatField::DsdCustomReconstruction => register_pill_row(buttons, &state.dsd_custom_reconstruction, y, label_col, TuiButton::DsdCustomReconstructionPill),
+            FormatField::DsdCustomLowpass => register_pill_row(buttons, &state.dsd_custom_lowpass, y, label_col, TuiButton::DsdCustomLowpassPill),
+            FormatField::DsdCustomExportLevel => register_pill_row(buttons, &state.dsd_custom_export_level, y, label_col, TuiButton::DsdCustomExportLevelPill),
             FormatField::DsdGain => register_enabled_pill_row(buttons, &state.dsd_gain_mode, y, label_col, TuiButton::DsdGainPill),
             FormatField::DsdTruePeakScope => register_pill_row(buttons, &state.dsd_true_peak_scope, y, label_col, TuiButton::DsdTruePeakScopePill),
             FormatField::DsdTruePeakScan => register_pill_row(buttons, &state.dsd_true_peak_scan_mode, y, label_col, TuiButton::DsdTruePeakScanPill),
@@ -348,9 +351,16 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 TuiButton::DsdTruePeakTargetField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
-            FormatField::DsdSamplePeakTarget => buttons.record_button(
-                TuiButton::DsdSamplePeakTargetField,
+            FormatField::DsdReferenceMargin => buttons.record_button(
+                TuiButton::DsdReferenceMarginField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
+            ),
+            FormatField::DsdReferenceScope => register_pill_row(
+                buttons,
+                &state.dsd_reference_scope,
+                y,
+                label_col,
+                TuiButton::DsdReferenceScopePill,
             ),
             FormatField::Container => {
                 let containers = state.format.selected_value().available_containers();

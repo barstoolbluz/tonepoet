@@ -135,14 +135,14 @@ fn rich_common_settings() -> PipelineSettings {
     settings.dsd.pcm_to_dsd.sinc.allow_aliasing = true;
     settings.dsd.pcm_to_dsd.gain_compensation = GainCompensation::Decibels(1.5);
 
-    // While General is selected, qualified-Reference controls are dormant but
+    // While Custom is selected, qualified-Reference controls are dormant but
     // still raw settings identity. Use them to prove the strict single schema
     // propagates every stored field without making them execution claims.
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
-    settings.dsd.from_dsd.normalize_peak_target_dbfs = db("-1.000000000");
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
+    settings.dsd.from_dsd.auto_gain_margin_dbtp = db("1.250000000");
+    settings.dsd.from_dsd.auto_gain_scope = tonepoet_pipeline::DsdReferenceGainScope::Track;
 
     settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
     settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
@@ -207,11 +207,13 @@ fn reference_sentinel() -> PipelineSettings {
     settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
-    // Explicit Reference delivery is mutually exclusive with the General DSD
-    // sample-domain gain policy. The General sentinels above cover those fields.
+    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
+    settings.dsd.from_dsd.auto_gain_margin_dbtp = db("1.250000000");
+    settings.dsd.from_dsd.auto_gain_scope = tonepoet_pipeline::DsdReferenceGainScope::Track;
+    // Explicit Reference delivery is mutually exclusive with the Custom DSD
+    // sample-domain gain policy. The Custom sentinels above cover those fields.
     settings.dsd.set_gain_policy(SampleGainPolicy::Off);
+    settings.dsd.clear_runtime_album_gain();
     settings.validate().expect("valid Reference-pathway sentinel");
     settings
 }
@@ -413,7 +415,7 @@ fn general_dsd_policy_carries_reconstruction_export_scope_and_tier_independently
 #[test]
 fn strict_dsd_settings_have_one_representation_for_general_and_reference_intent() {
     let general = DsdSettings::default();
-    assert_eq!(general.from_dsd.pathway, DsdSourcePathway::General);
+    assert_eq!(general.from_dsd.pathway, DsdSourcePathway::Custom);
     assert_eq!(general.gain_policy(), SampleGainPolicy::Off);
 
     let reference = DsdSettings::reference();

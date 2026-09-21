@@ -584,7 +584,7 @@ mod manifest_merge_gap_tests {
         let settings_for = |profile| {
             let mut settings = PipelineSettings::default();
             settings.dsd = DsdSettings::reference();
-            settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+            settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
             settings.dsd.from_dsd.profile = profile;
             settings.dsd.set_true_peak_scope(TruePeakScope::Album);
             settings.dsd.bind_runtime_album_gain(

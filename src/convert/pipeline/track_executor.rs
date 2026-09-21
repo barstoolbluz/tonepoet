@@ -56,7 +56,7 @@ use super::tool::{
     RetainedPcmScalarPump, ToolBinary, ToolCommand, ToolOutput, ToolRunner,
     ToolSegmentedPipelineError, ToolSegmentedPipelineOutput, ToolStreamSegment,
 };
-use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
+use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack, TrackSourceRef};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceToolIdentity {
@@ -2358,6 +2358,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                     let runtime = execute_reference_common_plan(
                         summary,
                         &plan_request,
+                        Some(&track.source_ref),
                         runner,
                         cancel,
                         tool_paths,
@@ -7549,10 +7550,10 @@ fn qualification_unavailable_error(detail: impl AsRef<str>) -> TrackExecutionErr
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceMaterialization {
-    path: PathBuf,
-    source_content_sha256: Sha256Digest,
-    canonical_materialization_sha256: Sha256Digest,
+pub(super) struct ReferenceMaterialization {
+    pub(super) path: PathBuf,
+    pub(super) source_content_sha256: Sha256Digest,
+    pub(super) canonical_materialization_sha256: Sha256Digest,
 }
 
 /// Release-qualification view of the exact production standalone source
@@ -7712,6 +7713,42 @@ fn validate_reference_scratch_cleanup_authority(
             Vec::new(),
         ))
     }
+}
+
+pub(super) async fn materialize_reference_source_for_album_gain(
+    plan_request: &PlanRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    scratch: &ReferenceScratchPaths,
+    cancel: &CancellationToken,
+) -> Result<ReferenceMaterialization, TrackExecutionError> {
+    let plan_request = plan_request.clone();
+    let track = track.clone();
+    let realized_input = realized_input.to_path_buf();
+    let scratch = scratch.clone();
+    let worker_cancel = cancel.child_token();
+    let cancel_on_drop = worker_cancel.clone().drop_guard();
+    let result = tokio::task::spawn_blocking(move || {
+        materialize_reference_source_blocking(
+            &plan_request,
+            &track,
+            &realized_input,
+            &scratch,
+            &worker_cancel,
+            None,
+        )
+    })
+    .await
+    .map_err(|err| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference album-gain source materialization task failed: {err}"
+            )),
+            Vec::new(),
+        )
+    })?;
+    drop(cancel_on_drop);
+    result
 }
 
 async fn materialize_reference_source(
@@ -8274,6 +8311,7 @@ fn reference_cancelled_error() -> TrackExecutionError {
 async fn execute_reference_common_plan(
     summary: &DsdReferencePlanSummary,
     plan_request: &PlanRequest,
+    source_ref: Option<&TrackSourceRef>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -8283,6 +8321,121 @@ async fn execute_reference_common_plan(
     end_fraction: f32,
     track_label: String,
 ) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
+    let retained_reference = match source_ref {
+        Some(TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            target_dbtp,
+            unbound_semantic_plan_hash,
+            carrier_sha256,
+            observation,
+            ..
+        }) => {
+            let bound_gain = gain_db.ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference album carrier reached execution before its common scalar was bound"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                )
+            })?;
+            match summary.gain_policy {
+                tonepoet_pipeline::ResolvedGainPolicy::Auto {
+                    target_dbtp: planned_target,
+                    scope: tonepoet_pipeline::TruePeakScope::Album,
+                    bound_gain: Some(planned_gain),
+                    ..
+                } if planned_target == *target_dbtp && planned_gain == bound_gain => {}
+                _ => {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "retained Reference album carrier disagrees with the bound final gain policy"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+            }
+            if *sample_rate_hz != summary.final_pcm.sample_rate_hz
+                || *channels != summary.final_pcm.channels
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album carrier geometry disagrees with the final typed plan"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            // Album binding intentionally changes the final semantic plan hash.
+            // Re-derive the same plan with only runtime album authority cleared
+            // and require it to match the prepass identity stored on the carrier.
+            let mut unbound_request = plan_request.clone();
+            unbound_request.settings.dsd.clear_runtime_album_gain();
+            let unbound_plan = plan_conversion(&unbound_request).map_err(|error| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "could not re-derive unbound Reference album plan identity: {error}"
+                    )),
+                    Vec::new(),
+                )
+            })?;
+            let rederived_hash = unbound_plan
+                .reference
+                .as_ref()
+                .map(|reference| reference.semantic_plan_hash_v1)
+                .ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "unbound Reference album plan lost qualified Reference authority"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    )
+                })?;
+            if rederived_hash != *unbound_semantic_plan_hash {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album carrier was produced by a different unbound semantic plan"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            let actual_digest = stable_file_sha256_cancel(path, cancel).map_err(|error| {
+                reference_materialization_error(
+                    format!(
+                        "could not verify retained Reference album carrier {}",
+                        path.display()
+                    ),
+                    error,
+                )
+            })?;
+            if actual_digest != *carrier_sha256 {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "retained Reference album carrier changed after certified observation: {}",
+                        path.display()
+                    )),
+                    Vec::new(),
+                ));
+            }
+            Some((path.clone(), observation.clone()))
+        }
+        _ => None,
+    };
+
+    let mut execution_summary = summary.clone();
+    if let Some((path, _)) = retained_reference.as_ref() {
+        execution_summary.r64_path = path.clone();
+    }
+    let summary = &execution_summary;
+
     let mut records = Vec::new();
     let mut measurements = BTreeMap::new();
     let total_width = (end_fraction - start_fraction).max(0.0);
@@ -8300,31 +8453,33 @@ async fn execute_reference_common_plan(
         return Err(cancelled());
     }
 
-    // 1. Qualified protected reconstruction. This is the same public lowerer
-    // used by general DSD when it explicitly selects the qualified protected
-    // reconstruction; Reference adds the closed admission and proof gates.
-    let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
-        &plan_request.input_path,
-        &summary.r64_path,
-        summary.final_pcm.sample_rate_hz,
-        summary.profile,
-        plan_request.source.duration,
-    );
-    let (w0s, w0e) = window(0, total_steps);
-    let mut render_records = execute_commands(
-        std::slice::from_ref(&render),
-        None,
-        runner,
-        cancel,
-        tool_paths,
-        tool_concurrency_limits.clone(),
-        progress,
-        w0s,
-        w0e,
-        track_label.clone(),
-    )
-    .await?;
-    records.append(&mut render_records);
+    // 1. Qualified protected reconstruction. Album-scoped Reference Auto
+    // retains the exact already-certified protected R64 from its submitted-
+    // batch prepass; all other Reference executions reconstruct normally.
+    if retained_reference.is_none() {
+        let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+            &plan_request.input_path,
+            &summary.r64_path,
+            summary.final_pcm.sample_rate_hz,
+            summary.profile,
+            plan_request.source.duration,
+        );
+        let (w0s, w0e) = window(0, total_steps);
+        let mut render_records = execute_commands(
+            std::slice::from_ref(&render),
+            None,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
+            progress,
+            w0s,
+            w0e,
+            track_label.clone(),
+        )
+        .await?;
+        records.append(&mut render_records);
+    }
 
     // 2. Independent structural/decoder validation of protected R64.
     let (w1s, w1e) = window(1, total_steps);
@@ -8357,21 +8512,25 @@ async fn execute_reference_common_plan(
     // 3. Complete full-input certified finite-target observation. Do not use
     // the ordinary general-DSD constant-prefix optimization here.
     let pre_id = MeasurementId(1);
-    let pre_observation = super::stages::scan_reference_w64_certified_peak(
-        &summary.r64_path,
-        r64_structure,
-        reference_w64_expectation(summary, r64_structure.sample_frames, 64, true),
-        pre_id,
-        TruePeakPurpose::GainAuthority,
-        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
-        cancel,
-    )
-    .map_err(|reason| {
-        TrackExecutionError::new(
-            ConvertError::Backend(format!("Reference protected-R64 certified observation failed: {reason}")),
-            records.clone(),
+    let pre_observation = if let Some((_, observation)) = retained_reference.as_ref() {
+        observation.clone()
+    } else {
+        super::stages::scan_reference_w64_certified_peak(
+            &summary.r64_path,
+            r64_structure,
+            reference_w64_expectation(summary, r64_structure.sample_frames, 64, true),
+            pre_id,
+            TruePeakPurpose::GainAuthority,
+            tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+            cancel,
         )
-    })?;
+        .map_err(|reason| {
+            TrackExecutionError::new(
+                ConvertError::Backend(format!("Reference protected-R64 certified observation failed: {reason}")),
+                records.clone(),
+            )
+        })?
+    };
     measurements.insert(pre_id, pre_observation.clone());
 
     // 4. Resolve the sealed Reference gain from the conservative HQ1024V1
@@ -8448,6 +8607,7 @@ async fn execute_reference_common_plan(
     })?;
     let (qpcm_bits, qpcm_float) = match summary.final_pcm.bit_depth {
         tonepoet_pipeline::PcmBitDepth::Int24 => (24, false),
+        tonepoet_pipeline::PcmBitDepth::Int32 => (32, false),
         tonepoet_pipeline::PcmBitDepth::Float32 => (32, true),
         tonepoet_pipeline::PcmBitDepth::Float64 => (64, true),
         other => {
@@ -8764,6 +8924,7 @@ pub async fn qualify_reference_common_candidate_execution(
     let runtime = execute_reference_common_plan(
         &summary,
         plan_request,
+        None,
         runner,
         cancel,
         tool_paths,
@@ -9540,9 +9701,10 @@ async fn verify_reference_qpcm_contract(
     let expected_bits = match summary.final_pcm.bit_depth {
         tonepoet_pipeline::PcmBitDepth::Int16 => 16,
         tonepoet_pipeline::PcmBitDepth::Int24 => 24,
+        tonepoet_pipeline::PcmBitDepth::Int32 => 32,
         tonepoet_pipeline::PcmBitDepth::Float32 => 32,
         tonepoet_pipeline::PcmBitDepth::Float64 => 64,
-        tonepoet_pipeline::PcmBitDepth::Int8 | tonepoet_pipeline::PcmBitDepth::Int32 => {
+        tonepoet_pipeline::PcmBitDepth::Int8 => {
             return Err(TrackExecutionError::new(
                 ConvertError::Backend(
                     "Reference verification received an unsupported terminal depth".to_string(),

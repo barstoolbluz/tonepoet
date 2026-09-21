@@ -760,7 +760,7 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
 
         let mut reference = PipelineSettings::default();
         reference.dsd = DsdSettings::reference();
-        reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::NormalizePeak;
+        reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
         reference.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
         reference.dsd.set_true_peak_scope(TruePeakScope::Album);
         reference.dsd.bind_runtime_album_gain(

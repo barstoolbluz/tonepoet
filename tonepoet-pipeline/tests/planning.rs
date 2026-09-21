@@ -331,7 +331,7 @@ fn flac_verify_uses_real_decode_test_not_metaflac_streaminfo_listing() {
 #[test]
 fn default_dsd_to_pcm_matches_explicit_strict_general_plan() {
     let mut settings = PipelineSettings::default();
-    assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::General);
+    assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Custom);
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
     let req = PlanRequest {
