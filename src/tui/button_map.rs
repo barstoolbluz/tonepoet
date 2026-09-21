@@ -66,8 +66,6 @@ pub enum TuiButton {
     DsdTruePeakScanPill(usize),
     DsdGainDbField,
     DsdTruePeakTargetField,
-    DsdReferenceMarginField,
-    DsdReferenceScopePill(usize),
     MergePill(usize),
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
@@ -617,8 +615,6 @@ impl TuiButton {
             | Self::DsdTruePeakScanPill(_)
             | Self::DsdGainDbField
             | Self::DsdTruePeakTargetField
-            | Self::DsdReferenceMarginField
-            | Self::DsdReferenceScopePill(_)
             | Self::MergePill(_)
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)

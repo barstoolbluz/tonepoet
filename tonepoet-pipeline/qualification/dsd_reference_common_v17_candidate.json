@@ -6,10 +6,10 @@
   "design_handoff_sha256": "cfda6bd32495e21124f73198a4d52a8ff304adb28cd16b16d3c389e6b567bbd5",
   "inherited_v16_evidence_sha256": "cbea231eb727598ac547dc7346c5ab9a0f6182aeaacdc3e205ec916517ae2b53",
   "observer": {
-    "implementation_identity": "tonepoet-true-peak:fast066v2_reference/certified_peak_meter/v1",
+    "implementation_identity": "tonepoet-true-peak:fast066v2_standard/certified_peak_meter/v1",
     "reconstruction": "hq1024_v1",
     "edge_policy": "repeat_endpoints",
-    "scan_tier": "reference",
+    "scan_tier": "standard",
     "authority_endpoint": "finite_interval_upper",
     "complete_reader_required": true,
     "constant_prefix_optimization_admitted": false
@@ -21,7 +21,7 @@
     "common_implementation_source": "build-bound:TONEPOET_REFERENCE_COMMON_SOURCE_SHA256/v1",
     "certified_reconstruction": "hq1024_v1",
     "edge_policy": "repeat_endpoints",
-    "scan_tier": "reference",
+    "scan_tier": "standard",
     "reader_decode_implementation": "tonepoet:reference_r64_exact_w64_complete_reader/v1+tonepoet:reference_qpcm_exact_complete_reader/v1",
     "tool_identity_version_closure": "sox-ng-14.8.0.1+ffmpeg-qualified-v16+phase4-native-metadata",
     "reconstruction_profile": "sealed-reference-profile-matrix-v16",

@@ -351,17 +351,6 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 TuiButton::DsdTruePeakTargetField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
-            FormatField::DsdReferenceMargin => buttons.record_button(
-                TuiButton::DsdReferenceMarginField,
-                ratatui::layout::Rect::new(area.x, y, area.width, 1),
-            ),
-            FormatField::DsdReferenceScope => register_pill_row(
-                buttons,
-                &state.dsd_reference_scope,
-                y,
-                label_col,
-                TuiButton::DsdReferenceScopePill,
-            ),
             FormatField::Container => {
                 let containers = state.format.selected_value().available_containers();
                 let mut x = label_col;

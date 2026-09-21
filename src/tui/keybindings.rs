@@ -3660,8 +3660,6 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::DsdGain => format.dsd_gain_mode.selected_label().to_string(),
         FormatField::DsdGainDb => format.dsd_gain_db.render(false),
         FormatField::DsdTruePeakTarget => format.dsd_true_peak_target_dbtp.render(false),
-        FormatField::DsdReferenceMargin => format.dsd_reference_margin_dbtp.render(false),
-        FormatField::DsdReferenceScope => format.dsd_reference_scope.selected_label().to_string(),
         FormatField::DsdTruePeakScope => format.dsd_true_peak_scope.selected_label().to_string(),
         FormatField::DsdTruePeakScan => format.dsd_true_peak_scan_mode.selected_label().to_string(),
         FormatField::Container => format.selected_container().display_name.to_string(),
@@ -71548,8 +71546,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DsdTruePeakScanPill(_)
             | TuiButton::DsdGainDbField
             | TuiButton::DsdTruePeakTargetField
-            | TuiButton::DsdReferenceMarginField
-            | TuiButton::DsdReferenceScopePill(_)
             | TuiButton::ContainerPill(_)
             | TuiButton::ResampleQualityPill(_) => {
                 app.convert.focus = ConvertFocus::Format;

@@ -763,10 +763,9 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
         reference.dsd = DsdSettings::reference();
         reference.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
             target_dbtp: "-1.000000000".parse().unwrap(),
-            scope: TruePeakScope::Track,
+            scope: TruePeakScope::Album,
             scan: TruePeakScanTier::Reference,
         };
-        reference.dsd.from_dsd.automatic_gain_scope = true;
         reference.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
         reference.dsd.bind_runtime_album_gain(
             "-0.750000000".parse().unwrap(),

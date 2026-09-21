@@ -51,6 +51,7 @@ fn fingerprint_field_inventory_is_unique_and_matches_constant() {
     for retired in [
         "dsd.dsd_to_pcm_gain_mode",
         "dsd.dsd_to_pcm_auto_gain_margin_db",
+        "dsd.from_dsd.automatic_gain_scope",
         "pcm_true_peak.enabled",
         "pcm_true_peak.allow_boost",
         "pcm_true_peak.fixed_gain_db",
@@ -71,7 +72,6 @@ fn phase2_gain_identity_paths_are_explicit() {
             "dsd.from_dsd.gain.target_dbtp",
             "dsd.from_dsd.gain.scope",
             "dsd.from_dsd.gain.scan",
-            "dsd.from_dsd.automatic_gain_scope",
             "dsd.general_from_dsd.gain.mode",
             "dsd.general_from_dsd.gain.target_dbtp",
             "dsd.general_from_dsd.gain.scope",

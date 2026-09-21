@@ -597,10 +597,9 @@ mod manifest_merge_gap_tests {
             settings.dsd = DsdSettings::reference();
             settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
                 target_dbtp: "-1.000000000".parse().unwrap(),
-                scope: TruePeakScope::Track,
+                scope: TruePeakScope::Album,
                 scan: TruePeakScanTier::Reference,
             };
-            settings.dsd.from_dsd.automatic_gain_scope = true;
             settings.dsd.from_dsd.profile = profile;
             settings.dsd.bind_runtime_album_gain(
                 "-0.750000000".parse().unwrap(),

@@ -375,14 +375,6 @@ impl DsdGainMode {
     }
 }
 
-/// UI selection for Reference normalization scope. This is presentation state;
-/// the pipeline stores `SampleGainPolicy` plus one automatic-scope flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DsdReferenceScopeChoice {
-    Auto,
-    Track,
-}
-
 /// User-editable manual gain range for DSD-to-PCM conversions.
 /// Matches `DsdSettings::validate()` so the TUI cannot stage an invalid value.
 pub const DSD_TO_PCM_GAIN_DB_MIN: f32 = -24.0;
@@ -4081,18 +4073,14 @@ pub enum FormatField {
     /// Export level after a protected Custom reconstruction.
     DsdCustomExportLevel,
     DsdGain,
-    /// Track or submitted-batch scope for certified ordinary DSD true-peak gain.
+    /// Track or submitted-batch scope for certified Custom/Reference DSD true-peak gain.
     DsdTruePeakScope,
-    /// Certified scan tier for ordinary DSD true-peak analysis.
+    /// Certified scan tier for Custom/Reference DSD true-peak analysis.
     DsdTruePeakScan,
-    /// Certified ordinary DSD true-peak target in dBTP.
+    /// Certified Custom/Reference DSD true-peak target in dBTP.
     DsdTruePeakTarget,
     /// Fixed ordinary DSD-to-PCM gain value.
     DsdGainDb,
-    /// Positive Reference automatic-gain margin below 0 dBTP.
-    DsdReferenceMargin,
-    /// Dynamic album/track selection or explicit track override for Reference auto gain.
-    DsdReferenceScope,
     /// Below-the-fold output container selector.
     Container,
     /// Below-the-fold resampler quality preset.
@@ -4317,18 +4305,14 @@ pub struct FormatState {
     /// Export-level boundary exposed by protected Custom reconstruction.
     pub dsd_custom_export_level: PillState<DsdGeneralExportLevel>,
     pub dsd_gain_mode: PillState<DsdGainMode>,
-    /// Scope for ordinary certified DSD true-peak gain.
+    /// Scope for certified Custom/Reference DSD true-peak gain.
     pub dsd_true_peak_scope: PillState<TruePeakScope>,
     /// Certified DSD true-peak scan tier.
     pub dsd_true_peak_scan_mode: PillState<TruePeakScanTier>,
-    /// Ordinary certified DSD true-peak target in dBTP.
+    /// Certified Custom/Reference DSD true-peak target in dBTP.
     pub dsd_true_peak_target_dbtp: DbNano,
     /// Fixed DSD-to-PCM gain in dB.
     pub dsd_gain_db: DbNano,
-    /// Positive margin below 0 dBTP used by Reference automatic gain.
-    pub dsd_reference_margin_dbtp: DbNano,
-    /// Dynamic album/track selection or explicit track override for Reference auto gain.
-    pub dsd_reference_scope: PillState<DsdReferenceScopeChoice>,
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
@@ -4615,10 +4599,6 @@ impl FormatState {
             (TruePeakScope::Track, "track"),
             (TruePeakScope::Album, "album"),
         ]);
-        let dsd_reference_scope = PillState::new(vec![
-            (DsdReferenceScopeChoice::Auto, "auto"),
-            (DsdReferenceScopeChoice::Track, "track"),
-        ]);
         let dsd_true_peak_scan_mode = PillState::new(vec![
             (TruePeakScanTier::Reference, "reference"),
             (TruePeakScanTier::Standard, "standard"),
@@ -4670,11 +4650,9 @@ impl FormatState {
             dsd_custom_export_level,
             dsd_gain_mode,
             dsd_true_peak_scope,
-            dsd_reference_scope,
             dsd_true_peak_scan_mode,
             dsd_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             dsd_gain_db: DbNano(0),
-            dsd_reference_margin_dbtp: DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
             source_is_dsd: false,
             source_pcm_float_bits: None,
             source_is_lossless: None,
@@ -5002,8 +4980,9 @@ impl FormatState {
                         rows.push(FormatPaneRow::Field(FormatField::DsdGainDb));
                     }
                     DsdGainMode::ReferenceAuto => rows.extend([
-                        FormatPaneRow::Field(FormatField::DsdReferenceMargin),
-                        FormatPaneRow::Field(FormatField::DsdReferenceScope),
+                        FormatPaneRow::Field(FormatField::DsdTruePeakTarget),
+                        FormatPaneRow::Field(FormatField::DsdTruePeakScope),
+                        FormatPaneRow::Field(FormatField::DsdTruePeakScan),
                     ]),
                     DsdGainMode::Off => {}
                 }
@@ -5469,7 +5448,9 @@ impl FormatState {
                 true
             }
             FormatField::DsdTruePeakTarget => {
-                if !matches!(
+                if self.dsd_reference_path_selected() {
+                    self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
+                } else if !matches!(
                     *self.dsd_gain_mode.selected_value(),
                     DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize
                 ) {
@@ -5478,24 +5459,6 @@ impl FormatState {
                 self.dsd_true_peak_target_dbtp =
                     clamp_pcm_true_peak_target(self.dsd_true_peak_target_dbtp);
                 true
-            }
-            FormatField::DsdReferenceMargin => {
-                if !self.dsd_reference_path_selected()
-                    || !self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto)
-                {
-                    return false;
-                }
-                self.dsd_reference_margin_dbtp =
-                    clamp_dsd_reference_margin_dbtp(self.dsd_reference_margin_dbtp);
-                true
-            }
-            FormatField::DsdReferenceScope => {
-                if !self.dsd_reference_path_selected()
-                    || !self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto)
-                {
-                    return false;
-                }
-                select_enabled_index(&mut self.dsd_reference_scope, index)
             }
             FormatField::Container => self.select_container_index(index),
             FormatField::ResampleQuality => self.select_resample_quality_index(index),
@@ -5509,13 +5472,21 @@ impl FormatState {
         accepted
     }
 
+    /// Restore the canonical user-facing Reference gain defaults. Call only after
+    /// pathway-dependent constraints have enabled `ReferenceAuto`.
+    pub(crate) fn apply_reference_gain_defaults(&mut self) {
+        self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
+        self.dsd_true_peak_target_dbtp = DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET;
+        self.dsd_true_peak_scope.select_value(&TruePeakScope::Album);
+        self.dsd_true_peak_scan_mode.select_value(&TruePeakScanTier::Standard);
+    }
+
     /// Apply the one-shot gain default for an actual user transition into Reference.
-    /// Call after pathway-dependent constraints have enabled `ReferenceAuto`.
     pub(crate) fn apply_user_dsd_path_transition(&mut self, before: DsdSourcePathway) {
         if before != *self.dsd_pathway.selected_value()
             && *self.dsd_pathway.selected_value() == DsdSourcePathway::Reference
         {
-            self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
+            self.apply_reference_gain_defaults();
         }
     }
 
@@ -5558,7 +5529,6 @@ impl FormatState {
                 | FormatField::DsdTruePeakScan
                 | FormatField::DsdGainDb
                 | FormatField::DsdTruePeakTarget
-                | FormatField::DsdReferenceMargin
         ) {
             self.dsd_gain_overridden = true;
         }
@@ -5938,7 +5908,6 @@ impl FormatState {
         }
         self.dsd_gain_mode
             .set_enabled(&DsdGainMode::ReferenceAuto, reference_selected);
-        self.dsd_reference_scope.set_all_enabled(reference_selected);
         if gain_available && !self.dsd_gain_mode.options[self.dsd_gain_mode.selected].enabled {
             let fallback = if reference_selected {
                 DsdGainMode::ReferenceAuto
@@ -6170,7 +6139,6 @@ impl FormatState {
         clamp_pill(&mut self.dsd_custom_lowpass);
         clamp_pill(&mut self.dsd_custom_export_level);
         clamp_pill(&mut self.dsd_true_peak_scope);
-        clamp_pill(&mut self.dsd_reference_scope);
         clamp_pill(&mut self.dsd_true_peak_scan_mode);
         // Fixed gain is explicit policy; retain it across temporary source-fact
         // loss rather than silently replacing it with another gain policy.
@@ -6180,8 +6148,6 @@ impl FormatState {
         self.dsd_gain_db = clamp_dsd_to_pcm_gain_db(self.dsd_gain_db);
         self.dsd_true_peak_target_dbtp =
             clamp_pcm_true_peak_target(self.dsd_true_peak_target_dbtp);
-        self.dsd_reference_margin_dbtp =
-            clamp_dsd_reference_margin_dbtp(self.dsd_reference_margin_dbtp);
     }
 
     pub fn focused_pill_mut(&mut self) -> FocusedPill<'_> {
@@ -6224,12 +6190,6 @@ impl FormatState {
             FormatField::DsdGainDb => FocusedPill::DsdGainDb {
                 gain_db: &mut self.dsd_gain_db,
             },
-            FormatField::DsdReferenceMargin => FocusedPill::DsdReferenceMargin {
-                margin_dbtp: &mut self.dsd_reference_margin_dbtp,
-                gain_mode: &mut self.dsd_gain_mode,
-            },
-            FormatField::DsdReferenceScope =>
-                FocusedPill::DsdReferenceScope(&mut self.dsd_reference_scope),
             FormatField::Container | FormatField::ResampleQuality => {
                 unreachable!("below-the-fold rows use dedicated selectors")
             }
@@ -6258,14 +6218,6 @@ fn clamp_dsd_to_pcm_gain_db(value: DbNano) -> DbNano {
 fn step_dsd_to_pcm_gain_db(value: &mut DbNano, delta_nano: i64) {
     *value = clamp_dsd_to_pcm_gain_db(DbNano(value.0.saturating_add(delta_nano)));
 }
-
-fn clamp_dsd_reference_margin_dbtp(value: DbNano) -> DbNano {
-    DbNano(value.0.clamp(
-        DbNano::ZERO.0,
-        DbNano::MAX_REFERENCE_AUTO_MARGIN.0,
-    ))
-}
-
 
 fn clamp_pill<T: Clone + PartialEq>(pill: &mut PillState<T>) {
     clamp_pill_excluding(pill, |_| false);
@@ -6415,11 +6367,6 @@ pub enum FocusedPill<'a> {
     DsdGainDb {
         gain_db: &'a mut DbNano,
     },
-    DsdReferenceMargin {
-        margin_dbtp: &'a mut DbNano,
-        gain_mode: &'a mut PillState<DsdGainMode>,
-    },
-    DsdReferenceScope(&'a mut PillState<DsdReferenceScopeChoice>),
 }
 
 fn preserve_pcm_true_peak_mode(mode: &mut PillState<PcmGainMode>) {
@@ -6434,7 +6381,7 @@ fn preserve_pcm_true_peak_mode(mode: &mut PillState<PcmGainMode>) {
 fn preserve_dsd_true_peak_mode(mode: &mut PillState<DsdGainMode>) {
     if !matches!(
         *mode.selected_value(),
-        DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize
+        DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize | DsdGainMode::ReferenceAuto
     ) {
         mode.select_value(&DsdGainMode::TruePeakGuard);
     }
@@ -6478,11 +6425,6 @@ impl FocusedPill<'_> {
             Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::DsdReferenceMargin { margin_dbtp, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::ReferenceAuto);
-                step_dsd_reference_margin_dbtp(*margin_dbtp, DSD_TO_PCM_GAIN_DB_STEP_NANO);
-            }
-            Self::DsdReferenceScope(p) => p.select_next(),
         }
     }
 
@@ -6523,17 +6465,8 @@ impl FocusedPill<'_> {
             Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
             }
-            Self::DsdReferenceMargin { margin_dbtp, gain_mode } => {
-                (*gain_mode).select_value(&DsdGainMode::ReferenceAuto);
-                step_dsd_reference_margin_dbtp(*margin_dbtp, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
-            }
-            Self::DsdReferenceScope(p) => p.select_prev(),
         }
     }
-}
-
-fn step_dsd_reference_margin_dbtp(value: &mut DbNano, delta_nano: i64) {
-    *value = clamp_dsd_reference_margin_dbtp(DbNano(value.0.saturating_add(delta_nano)));
 }
 
 /// Which single-file metadata field in the Convert metadata pane is focused
@@ -18865,15 +18798,12 @@ mod dsd_gain_format_state_tests {
         assert!(rows.contains(&FormatField::DsdProfile));
         assert!(rows.contains(&FormatField::DsdGain));
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::ReferenceAuto);
-        assert!(!rows.contains(&FormatField::DsdTruePeakTarget));
-        assert!(!rows.contains(&FormatField::DsdTruePeakScope));
-        assert!(!rows.contains(&FormatField::DsdTruePeakScan));
-        assert!(state
-            .dsd_gain_mode
-            .select_value(&DsdGainMode::ReferenceAuto));
-        assert!(state
-            .visible_fields(false)
-            .contains(&FormatField::DsdReferenceMargin));
+        assert!(rows.contains(&FormatField::DsdTruePeakTarget));
+        assert!(rows.contains(&FormatField::DsdTruePeakScope));
+        assert!(rows.contains(&FormatField::DsdTruePeakScan));
+        assert_eq!(state.dsd_true_peak_target_dbtp, DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
+        assert_eq!(*state.dsd_true_peak_scope.selected_value(), TruePeakScope::Album);
+        assert_eq!(*state.dsd_true_peak_scan_mode.selected_value(), TruePeakScanTier::Standard);
     }
 
     #[test]
@@ -18986,7 +18916,7 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn raw_dsd_gain_defaults_are_off_track_reference_tier_with_one_db_reference_margin() {
+    fn raw_dsd_gain_defaults_are_off_with_custom_true_peak_defaults() {
         let state = FormatState::new();
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::Off);
         assert_eq!(
@@ -18997,10 +18927,6 @@ mod dsd_gain_format_state_tests {
         assert_eq!(
             *state.dsd_true_peak_scan_mode.selected_value(),
             TruePeakScanTier::Reference
-        );
-        assert_eq!(
-            state.dsd_reference_margin_dbtp,
-            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN
         );
         assert_eq!(state.dsd_gain_db, DbNano::ZERO);
     }
@@ -19077,20 +19003,19 @@ mod dsd_gain_format_state_tests {
     }
 
     #[test]
-    fn reference_margin_is_separate_from_ordinary_true_peak_target() {
+    fn reference_uses_shared_true_peak_target_scope_and_scan_controls() {
         let mut state = FormatState::new();
         state.set_source_is_dsd(true);
-        state.dsd_pathway.select_value(&DsdSourcePathway::Reference);
-        state.apply_format_constraints();
-        state.field_focus = FormatField::DsdReferenceMargin;
-        state.select_focused_prev(None, None);
-
+        assert!(state.select_row_index(FormatField::DsdPath, 1, None, Some(2_822_400)));
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::ReferenceAuto);
-        assert_eq!(state.dsd_reference_margin_dbtp, "0.750000000".parse().unwrap());
-        assert_eq!(
-            state.dsd_true_peak_target_dbtp,
-            tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP
-        );
+        assert_eq!(state.dsd_true_peak_target_dbtp, DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
+        assert_eq!(*state.dsd_true_peak_scope.selected_value(), TruePeakScope::Album);
+        assert_eq!(*state.dsd_true_peak_scan_mode.selected_value(), TruePeakScanTier::Standard);
+
+        state.field_focus = FormatField::DsdTruePeakTarget;
+        state.select_focused_prev(None, None);
+        assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::ReferenceAuto);
+        assert_eq!(state.dsd_true_peak_target_dbtp, "-1.050000000".parse().unwrap());
     }
 
     #[test]

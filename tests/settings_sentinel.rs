@@ -145,7 +145,6 @@ fn rich_common_settings() -> PipelineSettings {
         scope: TruePeakScope::Album,
         scan: TruePeakScanTier::Standard,
     };
-    settings.dsd.from_dsd.automatic_gain_scope = false;
 
     settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
     settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
@@ -221,7 +220,6 @@ fn reference_sentinel() -> PipelineSettings {
         scope: TruePeakScope::Track,
         scan: TruePeakScanTier::Reference,
     };
-    settings.dsd.from_dsd.automatic_gain_scope = false;
     // Explicit Reference delivery is mutually exclusive with the Custom DSD
     // sample-domain gain policy. The Custom sentinels above cover those fields.
     settings.dsd.set_gain_policy(SampleGainPolicy::Off);
@@ -319,6 +317,7 @@ fn canonical_fingerprint_inventory_has_no_duplicates_or_retired_gain_paths() {
         "dsd.dsd_to_pcm_gain_mode",
         "dsd.dsd_to_pcm_auto_gain_margin_db",
         "dsd.dsd_to_pcm_gain_db",
+        "dsd.from_dsd.automatic_gain_scope",
         "pcm_true_peak.enabled",
         "pcm_true_peak.allow_boost",
     ] {

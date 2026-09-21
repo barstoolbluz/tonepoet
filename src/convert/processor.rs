@@ -3743,7 +3743,7 @@ fn resolve_reference_auto_gain_submission_albums(
             }
             if target.is_some_and(|value| value != entry.target_dbtp) {
                 return Err(
-                    "submitted-batch Reference participants have different automatic-gain margins"
+                    "submitted-batch Reference participants have different true-peak targets"
                         .to_string(),
                 );
             }

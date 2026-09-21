@@ -518,21 +518,9 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                         ));
                     }
                 }
-                SampleGainPolicy::TruePeakNormalize { scope, scan, .. } => {
-                    settings.from_dsd.reference_auto_gain_margin_dbtp()?;
-                    if scan != crate::enums::TruePeakScanTier::Reference {
-                        return Err(PlanningError::invalid_settings(
-                            "dsd.from_dsd.gain.scan",
-                            "Reference true-peak normalization requires the Reference certified scan tier",
-                        ));
-                    }
-                    if scope != crate::enums::TruePeakScope::Track {
-                        return Err(PlanningError::invalid_settings(
-                            "dsd.from_dsd.gain.scope",
-                            "Reference stores Track as its canonical scope; automatic album scope is selected by automatic_gain_scope",
-                        ));
-                    }
-                    if !settings.from_dsd.automatic_gain_scope
+                SampleGainPolicy::TruePeakNormalize { scope, .. } => {
+                    settings.from_dsd.reference_true_peak_target_dbtp()?;
+                    if scope == crate::enums::TruePeakScope::Track
                         && settings.runtime_album_gain_db().is_some()
                     {
                         return Err(PlanningError::invalid_settings(
@@ -1266,8 +1254,13 @@ impl DsdSettings {
     #[must_use]
     pub const fn reference_auto_album_gain_possible(&self) -> bool {
         matches!(self.from_dsd.pathway, DsdSourcePathway::Reference)
-            && matches!(self.from_dsd.gain, SampleGainPolicy::TruePeakNormalize { .. })
-            && self.from_dsd.automatic_gain_scope
+            && matches!(
+                self.from_dsd.gain,
+                SampleGainPolicy::TruePeakNormalize {
+                    scope: crate::enums::TruePeakScope::Album,
+                    ..
+                }
+            )
     }
 
     /// Ordinary DSD gain policy.

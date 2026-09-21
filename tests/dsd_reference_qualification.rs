@@ -94,13 +94,11 @@ const W64_RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00
 const W64_FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 const W64_DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 
-fn reference_auto_gain(margin_dbtp: DbNano) -> SampleGainPolicy {
+fn reference_auto_gain(target_dbtp: DbNano) -> SampleGainPolicy {
     SampleGainPolicy::TruePeakNormalize {
-        target_dbtp: DbNano::ZERO
-            .checked_sub(margin_dbtp)
-            .expect("Reference gain margin fixture must be representable"),
+        target_dbtp,
         scope: TruePeakScope::Track,
-        scan: TruePeakScanTier::Reference,
+        scan: TruePeakScanTier::Standard,
     }
 }
 
@@ -1159,7 +1157,7 @@ fn assert_qualification_decode_route_table() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavRiff,
         DsdReconstructionSelection::Reference,
-        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
         None,
     );
     let carrier_summary = carrier_plan.reference.as_ref().expect("Reference summary");
@@ -1962,7 +1960,12 @@ fn qualify_w64_exact_integrity_contract() -> Value {
     })
 }
 
-fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) -> Duration {
+fn write_dsf_reference_fixture_with_byte(
+    path: &Path,
+    channels: u16,
+    sample_rate_hz: u32,
+    payload_byte: u8,
+) -> Duration {
     let file = File::create(path).expect("create DSF qualification fixture");
     let mut writer = sacd_rs::dsf_writer::DsfWriter::new(
         file,
@@ -1971,7 +1974,7 @@ fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
     )
     .expect("create DSF qualification writer");
     let payload_bytes = usize::from(channels) * 32_768;
-    let payload = vec![0x69; payload_bytes];
+    let payload = vec![payload_byte; payload_bytes];
     writer
         .write_interleaved(&payload)
         .expect("write deterministic DSF payload");
@@ -1986,6 +1989,12 @@ fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
         .sample_count_per_channel
         .expect("DSF fixture declares per-channel sample count");
     Duration::from_secs_f64(sample_count as f64 / f64::from(sample_rate_hz))
+}
+
+fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) -> Duration {
+    // The commissioning 0x69 pattern reconstructs to exact PCM zero and is the
+    // regression fixture for the certified leading-silence termination defect.
+    write_dsf_reference_fixture_with_byte(path, channels, sample_rate_hz, 0x69)
 }
 
 fn qualify_common_reference_candidate_execution() -> Value {
@@ -2031,7 +2040,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
             dsd_source_kind: Some(source_kind.clone()),
             audio_md5: None,
         },
-        settings,
+        settings: settings.clone(),
         plan_scope: tonepoet_pipeline::PlanScope::track("phase5-q01-candidate"),
         intermediate_dir: Some(work),
         container_ffmpeg_flags: Vec::new(),
@@ -2070,6 +2079,103 @@ fn qualify_common_reference_candidate_execution() -> Value {
         observation.subject == tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm
             && observation.purpose == TruePeakPurpose::PostFinalAcceptance
     }));
+    assert!(candidate.measurements.values().all(|observation| {
+        matches!(
+            observation.result,
+            tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence
+        )
+    }), "0x69 Q01 fixture must retain its exact-silence regression contract");
+    assert!(candidate.measurements.values().all(|observation| {
+        observation.scan_tier
+            == tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                TruePeakScanTier::Standard,
+            )
+    }), "Reference Q01 defaults must use the Standard certified tier");
+
+    // Run the same candidate closure over a deterministic non-silent DSD
+    // programme. 0x00 is a legal one-bit stream with strong DC content, so it
+    // cannot collapse into the exact-zero shortcut under the Reference
+    // reconstruction. This guards against a qualification that proves only
+    // the silence fast path.
+    let non_silent_root = root.join("non-silent");
+    let non_silent_materialize_root = non_silent_root.join("materialized");
+    let non_silent_work = non_silent_root.join("work");
+    fs::create_dir_all(&non_silent_materialize_root)
+        .expect("create non-silent candidate materialization root");
+    fs::create_dir_all(&non_silent_work).expect("create non-silent candidate work root");
+    let non_silent_source = non_silent_root.join("source.dsf");
+    let non_silent_duration =
+        write_dsf_reference_fixture_with_byte(&non_silent_source, 2, 2_822_400, 0x00);
+    let non_silent_materialized = qualify_reference_source_materialization(
+        &source_kind,
+        &non_silent_source,
+        &non_silent_materialize_root,
+    )
+    .expect("non-silent Reference source materialization");
+    let non_silent_delivered = non_silent_root.join("candidate-delivered.w64");
+    let non_silent_request = PlanRequest {
+        input_path: non_silent_materialized.materialized_path.clone(),
+        output_path: non_silent_delivered.clone(),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: Some(non_silent_duration),
+            frame_extent: None,
+            dsd_source_kind: Some(source_kind),
+            audio_md5: None,
+        },
+        settings,
+        plan_scope: tonepoet_pipeline::PlanScope::track("phase5-q01-candidate-non-silent"),
+        intermediate_dir: Some(non_silent_work),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: Some(ResolvedOutputTarget::WavW64),
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: Some(0),
+    };
+    let non_silent_candidate = runtime
+        .block_on(qualify_reference_common_candidate_execution(
+            &non_silent_request,
+            &non_silent_root,
+            &runner,
+            &cancel,
+            &tool_paths,
+        ))
+        .expect("non-silent unpromoted candidate executes in the offline harness");
+    assert!(
+        !non_silent_delivered.exists(),
+        "non-silent candidate harness must not publish delivered output"
+    );
+    assert!(non_silent_candidate.staged_artifact_path.is_file());
+    assert_eq!(non_silent_candidate.measurements.len(), 2);
+    assert!(non_silent_candidate.measurements.values().all(|observation| {
+        matches!(
+            observation.result,
+            tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite { .. }
+        )
+    }), "0x00 Q01 fixture must exercise the ordinary non-silent certified path");
+    assert!(non_silent_candidate.measurements.values().all(|observation| {
+        observation.scan_tier
+            == tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                TruePeakScanTier::Standard,
+            )
+    }));
+    assert_eq!(
+        non_silent_candidate.plan.qualification_candidate_manifest_digest,
+        candidate.plan.qualification_candidate_manifest_digest,
+        "programme content must not change the source-controlled candidate closure",
+    );
+    assert_eq!(
+        non_silent_candidate.common_runtime_closure_fingerprint_sha256,
+        candidate.common_runtime_closure_fingerprint_sha256,
+        "silent and non-silent Q01 runs must execute the same runtime closure",
+    );
+
     let promotion_error = qualify_reference_production_promotion_gate(&candidate)
         .expect_err("candidate/not-run evidence must remain blocked in production");
     assert!(
@@ -2087,6 +2193,10 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "delivered_path_created": false,
         "staged_artifact": candidate.staged_artifact_path.display().to_string(),
         "measurement_count": candidate.measurements.len(),
+        "programmes_exercised": ["exact_silence_0x69", "non_silent_0x00"],
+        "silent_programme_verified_silence": true,
+        "non_silent_programme_verified_finite": true,
+        "non_silent_measurement_count": non_silent_candidate.measurements.len(),
         "common_runtime_closure_fingerprint_sha256": candidate.common_runtime_closure_fingerprint_sha256,
         "metadata_mutation_closure_fingerprint_sha256": candidate.metadata_mutation_closure_fingerprint_sha256,
         "candidate_manifest_sha256": candidate.plan.qualification_candidate_manifest_digest.to_hex(),
@@ -3496,7 +3606,7 @@ fn capacity_boundary_plan_result(
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
-    settings.dsd.from_dsd.gain = reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN);
+    settings.dsd.from_dsd.gain = reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
     let request = PlanRequest {
         input_path: input.to_path_buf(),
         output_path: root.join(format!("capacity-{sample_frames}.w64")),
@@ -3642,7 +3752,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -4126,7 +4236,7 @@ fn qualify_lossless_package_cells(
                             depth,
                             target,
                             DsdReconstructionSelection::Reference,
-                            reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+                            reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
                             level,
                         );
                         let summary = plan.reference.as_ref().expect("Reference summary");
@@ -4643,12 +4753,14 @@ fn gain_policy_evidence(policy: ResolvedGainPolicy, terminal_args: &[String]) ->
         ResolvedGainPolicy::TruePeakNormalize {
             target_dbtp,
             scope,
+            scan,
             bound_gain,
             terminal_bound,
         } => serde_json::json!({
             "mode": "auto",
             "target_dbtp": target_dbtp.render(false),
             "scope": format!("{scope:?}").to_ascii_lowercase(),
+            "scan": format!("{scan:?}").to_ascii_lowercase(),
             "bound_gain_db": bound_gain.map(|gain| gain.render(true)),
             "applied_gain_db": applied_gain_db,
             "terminal_max_added_peak_fs_q63_ceil": terminal_bound.max_added_peak_fs_q63_ceil,
@@ -4710,7 +4822,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
         None,
     );
     let policy = plan.reference.as_ref().expect("Reference summary").gain_policy;
@@ -4822,7 +4934,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
         certificate_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(b"phase5-gain-certificate"),
     };
 
-    let auto_plan = make_plan(reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN));
+    let auto_plan = make_plan(reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET));
     let auto_summary = auto_plan.reference.as_ref().expect("auto summary");
     let auto = tonepoet_pipeline::resolve_reference_certified_gain(
         &make_pre(0.25),
@@ -5320,7 +5432,7 @@ fn planned_render_command(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         selection,
-        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -5439,7 +5551,7 @@ fn assert_planned_w64_bridge(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");

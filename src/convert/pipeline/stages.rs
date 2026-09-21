@@ -23066,25 +23066,28 @@ fn append_dsd_settings(
             if reference.reference_auto_gain_selected() {
                 push_kv_line(
                     log,
-                    "DSD Reference margin",
+                    "DSD Reference true-peak target",
                     format!(
-                        "{} dB below 0 dBTP",
+                        "{} dBTP",
                         reference
-                            .reference_auto_gain_margin_dbtp()
-                            .unwrap_or(tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_AUTO_MARGIN)
+                            .reference_true_peak_target_dbtp()
+                            .unwrap_or(tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET)
                     ),
                 );
                 push_kv_line(
                     log,
                     "DSD Reference gain scope",
-                    if reference.automatic_gain_scope {
-                        "auto"
-                    } else {
-                        match reference.gain.scope() {
-                            Some(tonepoet_pipeline::TruePeakScope::Album) => "album",
-                            Some(tonepoet_pipeline::TruePeakScope::Track) | None => "track",
-                        }
+                    match reference.gain.scope().unwrap_or(tonepoet_pipeline::TruePeakScope::Track) {
+                        tonepoet_pipeline::TruePeakScope::Track => "track",
+                        tonepoet_pipeline::TruePeakScope::Album => "album",
                     },
+                );
+                push_kv_line(
+                    log,
+                    "DSD Reference scan tier",
+                    tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                        reference.reference_certified_scan_tier(),
+                    ),
                 );
             }
             push_kv_line(
@@ -31863,10 +31866,10 @@ where
 
 
 /// Full-input certified Reference observation over one independently validated
-/// Wave64 sample payload. Unlike the general-DSD Reference scan-tier adapter,
-/// this qualified-delivery reader never applies the constant-prefix shortcut:
-/// every declared terminal/programme sample is decoded and pushed to the
-/// certified HQ1024V1 meter.
+/// Wave64 sample payload. The reader never omits a constant prefix: every declared
+/// terminal/programme sample is decoded and pushed to the certified HQ1024V1 meter.
+/// The meter may internally prove exact-zero reconstruction support without further
+/// refinement, but that proof does not weaken this complete-reader contract.
 pub(super) fn scan_reference_w64_certified_peak(
     carrier: &Path,
     structure: tonepoet_pipeline::W64ExactStructure,
@@ -31874,6 +31877,7 @@ pub(super) fn scan_reference_w64_certified_peak(
     id: tonepoet_pipeline::MeasurementId,
     purpose: tonepoet_pipeline::TruePeakPurpose,
     subject: tonepoet_pipeline::ReferenceObservationSubject,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     cancel: &CancellationToken,
 ) -> Result<tonepoet_pipeline::ReferenceCertifiedPeakObservation, String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -31934,11 +31938,12 @@ pub(super) fn scan_reference_w64_certified_peak(
     file.seek(SeekFrom::Start(structure.data_payload_offset()))
         .map_err(|error| format!("could not seek Reference certified Wave64 payload: {error}"))?;
 
+    let peak_tier = dsd_true_peak_tier(scan_mode);
     let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
         expected.sample_rate_hz,
         usize::from(expected.channels),
         tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
-        tonepoet_true_peak::PeakTier::Reference,
+        peak_tier,
     )
     .map_err(|error| format!("could not initialize Reference certified peak meter: {error}"))?;
 
@@ -32023,7 +32028,7 @@ pub(super) fn scan_reference_w64_certified_peak(
         .finalize()
         .map_err(|error| format!("could not finalize Reference certified peak observation: {error}"))?;
     if certificate.reconstruction != tonepoet_true_peak::CertifiedReconstruction::Hq1024V1
-        || certificate.tier != tonepoet_true_peak::PeakTier::Reference
+        || certificate.tier != peak_tier
         || certificate.reported_point_estimate.frames != structure.sample_frames
     {
         return Err("Reference certified peak meter returned the wrong reconstruction/tier/extent".to_string());
@@ -32078,6 +32083,11 @@ pub(super) fn scan_reference_w64_certified_peak(
         tonepoet_pipeline::TruePeakPurpose::GainAuthority => 0,
         tonepoet_pipeline::TruePeakPurpose::PostFinalAcceptance => 1,
     }]);
+    evidence_hasher.update([match scan_mode {
+        tonepoet_pipeline::TruePeakScanTier::Reference => 0,
+        tonepoet_pipeline::TruePeakScanTier::Standard => 1,
+        tonepoet_pipeline::TruePeakScanTier::Fast => 2,
+    }]);
     match result {
         tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence => {
             evidence_hasher.update([0]);
@@ -32112,10 +32122,10 @@ pub(super) fn scan_reference_w64_certified_peak(
         scope: tonepoet_pipeline::MeasurementScope::Plan,
         purpose,
         subject,
-        observer_identity: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+        observer_identity: tonepoet_pipeline::qualification_schema::reference_certified_observer_id(scan_mode).to_string(),
         reconstruction: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
         edge_policy: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
-        scan_tier: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+        scan_tier: tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(scan_mode).to_string(),
         authority_endpoint: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
         reader_authority: reader_authority.to_string(),
         sample_rate_hz: expected.sample_rate_hz,
@@ -37288,6 +37298,7 @@ async fn prepare_reference_auto_gain_carrier_for_track(
         sample_frames: structure.sample_frames,
         encoding: tonepoet_pipeline::W64SampleEncoding::FloatingPoint,
     };
+    let scan_tier = summary.certified_scan_tier();
     let observation = tokio::task::spawn_blocking(move || {
         scan_reference_w64_certified_peak(
             &scan_path,
@@ -37296,6 +37307,7 @@ async fn prepare_reference_auto_gain_carrier_for_track(
             tonepoet_pipeline::MeasurementId(1),
             tonepoet_pipeline::TruePeakPurpose::GainAuthority,
             tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+            scan_tier,
             &scan_cancel,
         )
     })
@@ -37369,7 +37381,7 @@ async fn prepare_reference_auto_gain_carriers(
         .unwrap_or(1);
     if !req.settings.dsd.reference_delivery_selected()
         || !req.settings.dsd.from_dsd.reference_auto_gain_selected()
-        || !req.settings.dsd.from_dsd.automatic_gain_scope
+        || !req.settings.dsd.reference_auto_album_gain_possible()
         || album_members <= 1
     {
         return Ok(PreparedReferenceAutoGainCarriers::default());

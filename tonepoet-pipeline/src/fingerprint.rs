@@ -115,7 +115,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.pcm_to_dsd.sinc.allow_aliasing", "dsd.pcm_to_dsd.gain_compensation",
     "dsd.from_dsd.pathway", "dsd.from_dsd.reference_policy", "dsd.from_dsd.profile",
     "dsd.from_dsd.gain.mode", "dsd.from_dsd.gain.target_dbtp", "dsd.from_dsd.gain.scope",
-    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db", "dsd.from_dsd.automatic_gain_scope",
+    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db",
     "dsd.general_from_dsd.reconstruction", "dsd.general_from_dsd.lowpass",
     "dsd.general_from_dsd.sinc.taps", "dsd.general_from_dsd.sinc.passband_hz",
     "dsd.general_from_dsd.sinc.transition_hz", "dsd.general_from_dsd.sinc.kaiser_beta",
@@ -140,7 +140,6 @@ pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.from_dsd.gain.target_dbtp",
     "dsd.from_dsd.gain.scope",
     "dsd.from_dsd.gain.scan",
-    "dsd.from_dsd.automatic_gain_scope",
     "dsd.general_from_dsd.gain.mode",
     "dsd.general_from_dsd.gain.target_dbtp",
     "dsd.general_from_dsd.gain.scope",
@@ -168,7 +167,7 @@ pub const SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS: &[&str] = &[
     "dsd.pcm_to_dsd.sinc.allow_aliasing", "dsd.pcm_to_dsd.gain_compensation",
     "dsd.from_dsd.pathway", "dsd.from_dsd.reference_policy", "dsd.from_dsd.profile",
     "dsd.from_dsd.gain.mode", "dsd.from_dsd.gain.target_dbtp", "dsd.from_dsd.gain.scope",
-    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db", "dsd.from_dsd.automatic_gain_scope",
+    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db",
     "dsd.general_from_dsd.reconstruction", "dsd.general_from_dsd.lowpass",
     "dsd.general_from_dsd.sinc.taps", "dsd.general_from_dsd.sinc.passband_hz",
     "dsd.general_from_dsd.sinc.transition_hz", "dsd.general_from_dsd.sinc.kaiser_beta",
@@ -2563,10 +2562,11 @@ fn canonical_gain_policy(policy: crate::ResolvedGainPolicy) -> String {
         crate::ResolvedGainPolicy::TruePeakNormalize {
             target_dbtp,
             scope,
+            scan,
             bound_gain,
             terminal_bound,
         } => format!(
-            "auto:{}:{scope:?}:{}:{}:{}",
+            "auto:{}:{scope:?}:{scan:?}:{}:{}:{}",
             target_dbtp.render(false),
             option_db_nano(bound_gain),
             terminal_bound.max_added_peak_fs_q63_ceil,
@@ -2710,10 +2710,6 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         crate::DsdReconstructionSelection::Wideband => "wideband",
     });
     push_sample_gain_policy(writer, "dsd.from_dsd.gain", from.gain);
-    writer.field_static(
-        "dsd.from_dsd.automatic_gain_scope",
-        bool_value(from.automatic_gain_scope),
-    );
 
     let general = settings.general_from_dsd;
     writer.field_static("dsd.general_from_dsd.reconstruction", match general.reconstruction {

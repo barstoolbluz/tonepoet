@@ -307,7 +307,22 @@ impl ChannelRawSummary {
         }
 
         let d_count = raw_frames - 2;
-        let mut d_bins = Vec::with_capacity((d_count + D_SUMMARY_STARTS - 1) / D_SUMMARY_STARTS);
+        let d_bin_count = (d_count + D_SUMMARY_STARTS - 1) / D_SUMMARY_STARTS;
+        if magnitude_bits(x_max) == 0 {
+            // Every raw sample in the complete screen support is +0 or -0, so
+            // every exact second difference and every finite reconstruction
+            // value is exactly zero. Returning a zero enclosure here is not a
+            // heuristic: it is the exact linear result, and it avoids charging
+            // an absolute floating-point underflow allowance for arithmetic
+            // that does not need to run. A nonzero subnormal cannot enter this
+            // branch because x_max is reduced in IEEE magnitude encodings.
+            return Self {
+                d_bins: vec![0.0; d_bin_count],
+                e_d: 0.0,
+                qualified: true,
+            };
+        }
+        let mut d_bins = Vec::with_capacity(d_bin_count);
         let mut bin_max = 0.0;
         let use_scale = x_max > ORDINARY_DOT_MAX_INPUT;
         let mut first_index = first_sample;
@@ -1937,6 +1952,40 @@ mod tests {
         assert_eq!(raw_group_upper(0.0, 0.0).to_bits(), 0);
     }
 
+    #[test]
+    fn exact_zero_summary_has_no_roundoff_floor() {
+        let raw = test_raw(-RAW_HALO_FRAMES, 2 + RAW_HALO_FRAMES, |index| {
+            if index % 2 == 0 { 0.0 } else { -0.0 }
+        });
+        let summary = ChannelRawSummary::build(&raw, 0, 0, 2);
+        assert!(summary.qualified);
+        assert_eq!(summary.e_d.to_bits(), 0);
+        assert!(summary.d_bins.iter().all(|value| value.to_bits() == 0));
+        assert_eq!(summary.root_d_upper(0, 0, 2).to_bits(), 0);
+    }
+
+    #[test]
+    fn exact_zero_programme_finishes_without_fast_refinement() {
+        const FRAMES: usize = 8_192;
+        let mut samples = Vec::with_capacity(FRAMES * 2);
+        for frame in 0..FRAMES {
+            let zero = if frame % 2 == 0 { 0.0 } else { -0.0 };
+            samples.extend_from_slice(&[zero, -zero]);
+        }
+
+        let mut meter = FastPeakMeterImpl::new(88_200, 2, EdgePolicy::RepeatEndpoints).unwrap();
+        for chunk in samples.chunks(257 * 2) {
+            meter.push_interleaved(chunk).unwrap();
+        }
+        let certificate = meter.finalize().unwrap();
+
+        assert_eq!(certificate.tier, PeakTier::Fast);
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(certificate.finite_interval.is_silence());
+        assert_eq!(certificate.diagnostics.groups_expanded, 0);
+        assert_eq!(certificate.diagnostics.candidate_cells, 0);
+        assert_eq!(certificate.diagnostics.direct_rescore_evaluations, 0);
+    }
 
     fn test_raw<F>(first: i128, last: i128, mut sample: F) -> RawStore
     where

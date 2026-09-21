@@ -300,25 +300,6 @@ pub fn draw_format_pane(
                         "",
                         theme,
                     )),
-                    FormatField::DsdReferenceMargin => lines.push(dsd_db_value_row(
-                        border_color,
-                        w,
-                        "TP margin  ",
-                        format_state.dsd_reference_margin_dbtp,
-                        true,
-                        row_focused,
-                        "",
-                        theme,
-                    )),
-                    FormatField::DsdReferenceScope => lines.push(pill_row(
-                        border_color,
-                        w,
-                        "gain scope ",
-                        "",
-                        &render_pill_spans(&format_state.dsd_reference_scope, row_focused, theme),
-                        row_focused,
-                        theme,
-                    )),
                     FormatField::Container => {
                         let containers = format_state.format.selected_value().available_containers();
                         let spans: Vec<Span> = containers

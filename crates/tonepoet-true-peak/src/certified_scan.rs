@@ -968,6 +968,24 @@ impl RawBuffer {
         self.values[frame * self.channels + channel]
     }
 
+    /// True only when every sample in the complete requested raw support is
+    /// IEEE-754 positive or negative zero. This is intentionally bit based: a
+    /// subnormal source must never be collapsed into the zero fast path by a
+    /// host running with DAZ/FTZ enabled.
+    fn range_is_exact_zero(&self, start: i128, end_inclusive: i128) -> bool {
+        debug_assert!(self.contains(start, end_inclusive));
+        let buffer_start = self.start_index.expect("raw buffer is non-empty");
+        let first_frame = self.head_frames
+            + usize::try_from(start - buffer_start).expect("bounded raw zero-range start");
+        let frames = usize::try_from(end_inclusive - start + 1)
+            .expect("bounded raw zero-range length");
+        let first_sample = first_frame * self.channels;
+        let last_sample = first_sample + frames * self.channels;
+        self.values[first_sample..last_sample]
+            .iter()
+            .all(|sample| magnitude_bits(*sample) == 0)
+    }
+
     fn discard_before(&mut self, keep_index: i128) {
         let Some(start) = self.start_index else {
             return;
@@ -1886,7 +1904,7 @@ impl CertifiedScanner {
             && self.processing_elapsed_nanos() >= self.fast_allowed_processing_nanos()
     }
 
-    fn fast_tile_raw_support(&self, coarse_start: i128, coarse_end: i128) -> (i128, i128) {
+    fn tile_raw_support(&self, coarse_start: i128, coarse_end: i128) -> (i128, i128) {
         debug_assert!(coarse_end > coarse_start);
         let tail = self.spec.tail();
         let required_coarse_start = coarse_start + i128::from(tail.offset_min);
@@ -1909,7 +1927,7 @@ impl CertifiedScanner {
     ) {
         debug_assert_eq!(self.policy, SearchPolicy::RetiredClockFast1s);
         debug_assert!(channel < self.channels);
-        let (raw_start, raw_end) = self.fast_tile_raw_support(coarse_start, coarse_end);
+        let (raw_start, raw_end) = self.tile_raw_support(coarse_start, coarse_end);
         debug_assert!(self.raw.contains(raw_start, raw_end));
 
         let mut raw_peak = 0.0_f64;
@@ -3274,16 +3292,9 @@ impl CertifiedScanner {
     ) {
         debug_assert!(coarse_end >= coarse_start);
         self.diagnostics.tiles_processed = self.diagnostics.tiles_processed.saturating_add(1);
-        let tail = self.spec.tail();
-        let cache_start = coarse_start + i128::from(tail.offset_min);
-        let cache_end = if coarse_end == coarse_start {
-            coarse_start
-        } else {
-            coarse_end - 1 + i128::from(tail.offset_max)
-        };
-        self.strict_cache.reset(cache_start, cache_end);
 
         if coarse_end == coarse_start {
+            self.strict_cache.reset(coarse_start, coarse_start);
             for channel in 0..self.channels {
                 let evaluation = self.strict_coarse_evaluation(coarse_start, channel);
                 self.observe_target_evaluation(
@@ -3298,6 +3309,25 @@ impl CertifiedScanner {
             self.settle_tile_frontiers();
             return;
         }
+
+        // A finite linear reconstruction of an all-zero support is exactly
+        // zero at every target knot. Prove that property over the *complete*
+        // raw support before constructing numerical envelopes or candidate
+        // trees. Besides being exact, this prevents zero-valued roundoff
+        // envelopes from keeping every Reference9 node artificially live.
+        // Signed zero is admitted; every nonzero bit pattern, including a
+        // subnormal under DAZ/FTZ, takes the ordinary certified path.
+        let (raw_start, raw_end) = self.tile_raw_support(coarse_start, coarse_end);
+        debug_assert!(self.raw.contains(raw_start, raw_end));
+        if self.raw.range_is_exact_zero(raw_start, raw_end) {
+            self.settle_tile_frontiers();
+            return;
+        }
+
+        let tail = self.spec.tail();
+        let cache_start = coarse_start + i128::from(tail.offset_min);
+        let cache_end = coarse_end - 1 + i128::from(tail.offset_max);
+        self.strict_cache.reset(cache_start, cache_end);
 
         // Fast may reach its cumulative allowance while the prefix is being
         // produced. Do not spend additional time constructing a selective
@@ -3860,6 +3890,17 @@ mod tests {
     }
 
     #[test]
+    fn raw_zero_range_is_bit_exact_and_never_absorbs_subnormals() {
+        let mut raw = RawBuffer::new(1, 4);
+        raw.push(-1, &[0.0]);
+        raw.push(0, &[-0.0]);
+        raw.push(1, &[0.0]);
+        assert!(raw.range_is_exact_zero(-1, 1));
+        raw.push(2, &[f64::from_bits(1)]);
+        assert!(!raw.range_is_exact_zero(-1, 2));
+    }
+
+    #[test]
     fn frozen_geometry_and_curvature_metadata_match_the_design() {
         let legacy = legacy_tail_metadata();
         let hq = hq_tail_metadata();
@@ -3897,6 +3938,56 @@ mod tests {
             meter.push_interleaved(chunk).unwrap();
         }
         meter.finalize().unwrap()
+    }
+
+    #[test]
+    fn reference_exact_zero_programme_finishes_without_candidate_refinement() {
+        let frames = 1_024;
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let zero = if frame % 2 == 0 { 0.0 } else { -0.0 };
+            interleaved.extend_from_slice(&[zero, -zero]);
+        }
+        let certificate = scan_with_chunks(
+            ReconstructionId::Hq1024V1,
+            SearchPolicy::Reference9,
+            &interleaved,
+            2,
+            EdgePolicy::RepeatEndpoints,
+            137,
+        );
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(certificate.finite_interval.is_silence());
+        assert_eq!(certificate.diagnostics.candidate_cells, 0);
+        assert_eq!(certificate.diagnostics.phase_evaluations, 0);
+        assert_eq!(certificate.diagnostics.direct_rescore_evaluations, 0);
+    }
+
+    #[test]
+    fn reference_leading_silence_then_signal_terminates_with_finite_authority() {
+        const SILENT_FRAMES: usize = 8_192;
+        const SIGNAL_FRAMES: usize = 1_024;
+        let mut interleaved = vec![0.0_f64; SILENT_FRAMES * 2];
+        interleaved.reserve(SIGNAL_FRAMES * 2);
+        for frame in 0..SIGNAL_FRAMES {
+            let phase = std::f64::consts::TAU * frame as f64 / 97.0;
+            let sample = 0.25 * phase.sin();
+            interleaved.extend_from_slice(&[sample, -sample]);
+        }
+
+        let certificate = scan_with_chunks(
+            ReconstructionId::Hq1024V1,
+            SearchPolicy::Reference9,
+            &interleaved,
+            2,
+            EdgePolicy::RepeatEndpoints,
+            173,
+        );
+
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(!certificate.finite_interval.is_silence());
+        assert!(certificate.finite_interval.upper_linear > 0.0);
+        assert!(certificate.diagnostics.tiles_processed >= 3);
     }
 
     fn scan_with_chunk_pattern(
@@ -5170,7 +5261,7 @@ mod tests {
         );
         let coarse_start = 512_i128;
         let coarse_end = 640_i128;
-        let (raw_start, raw_end) = scanner.fast_tile_raw_support(coarse_start, coarse_end);
+        let (raw_start, raw_end) = scanner.tile_raw_support(coarse_start, coarse_end);
         for input_index in raw_start..=raw_end {
             scanner.raw.push(input_index, &[0.9, 0.2]);
         }

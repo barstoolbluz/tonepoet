@@ -446,22 +446,14 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                 dsd.general_from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::Off;
                 match *format.dsd_gain_mode.selected_value() {
                     DsdGainMode::ReferenceAuto => {
-                        let target_dbtp = tonepoet_pipeline::DbNano::ZERO
-                            .checked_sub(format.dsd_reference_margin_dbtp)
-                            .ok_or_else(|| "Reference gain margin overflow".to_string())?;
                         dsd.from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
-                            target_dbtp,
-                            scope: tonepoet_pipeline::TruePeakScope::Track,
-                            scan: tonepoet_pipeline::TruePeakScanTier::Reference,
+                            target_dbtp: format.dsd_true_peak_target_dbtp,
+                            scope: *format.dsd_true_peak_scope.selected_value(),
+                            scan: *format.dsd_true_peak_scan_mode.selected_value(),
                         };
-                        dsd.from_dsd.automatic_gain_scope = matches!(
-                            format.dsd_reference_scope.selected_value(),
-                            DsdReferenceScopeChoice::Auto
-                        );
                     }
                     DsdGainMode::Off => {
                         dsd.from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::Off;
-                        dsd.from_dsd.automatic_gain_scope = false;
                     }
                     DsdGainMode::TruePeakGuard
                     | DsdGainMode::TruePeakNormalize

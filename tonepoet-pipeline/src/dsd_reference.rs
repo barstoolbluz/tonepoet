@@ -15,8 +15,7 @@ use crate::plan::{
 };
 use crate::qualification_schema::{
     REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT, REFERENCE_CERTIFIED_EDGE_POLICY,
-    REFERENCE_CERTIFIED_OBSERVER_ID, REFERENCE_CERTIFIED_RECONSTRUCTION,
-    REFERENCE_CERTIFIED_SCAN_TIER, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
+    REFERENCE_CERTIFIED_RECONSTRUCTION, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
 };
 use crate::settings::SampleGainPolicy;
 use crate::tools::ToolIdentifier;
@@ -89,10 +88,8 @@ impl DbNano {
     pub const REFERENCE_CEILING: Self = Self(-1_000_000_000);
     /// One analyzer reporting quantum reserved between gain binding and post-final acceptance.
     pub const POST_FINAL_ACCEPTANCE_RESERVE: Self = Self(10_000_000);
-    /// Default Reference auto-gain margin below 0 dBTP.
-    pub const DEFAULT_REFERENCE_AUTO_MARGIN: Self = Self(1_000_000_000);
-    /// Largest accepted Reference auto-gain margin.
-    pub const MAX_REFERENCE_AUTO_MARGIN: Self = Self(24_000_000_000);
+    /// Default Reference true-peak target.
+    pub const DEFAULT_REFERENCE_TRUE_PEAK_TARGET: Self = Self(-1_000_000_000);
     /// Historical default NormalizePeak target retained for non-Reference callers.
     pub const DEFAULT_NORMALIZE_TARGET: Self = Self(-150_000_000);
     /// Lowest accepted Fixed gain.
@@ -398,10 +395,11 @@ pub enum DsdReconstructionSelection {
 ///
 /// Reference gain deliberately reuses [`SampleGainPolicy`], the same gain
 /// vocabulary as Custom DSD and ordinary PCM. Reference accepts only `Off` or
-/// `TruePeakNormalize`; its certified observer fixes the scan tier to
-/// [`TruePeakScanTier::Reference`]. `automatic_gain_scope` is programme-shape
-/// selection, not a second gain policy: when true, an independent submitted
-/// album resolves to Album scope and every other programme resolves to Track.
+/// `TruePeakNormalize`; normalization selects the same certified scan tiers as
+/// Custom and defaults to [`TruePeakScanTier::Standard`]. Reference stores the
+/// user-selected [`TruePeakScope`] directly in the shared gain policy. Album scope
+/// resolves to Album only for an independent submitted album; a singleton or a
+/// continuous image that requires pre-split processing resolves to Track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdSourceSettings {
@@ -414,9 +412,6 @@ pub struct DsdSourceSettings {
     /// Reference gain policy. Qualified Reference accepts only Off or
     /// TruePeakNormalize. Custom DSD gain remains in `general_from_dsd.gain`.
     pub gain: SampleGainPolicy,
-    /// Resolve Reference true-peak scope from submitted programme shape. When
-    /// false, the scope embedded in `gain` is authoritative.
-    pub automatic_gain_scope: bool,
 }
 
 impl Default for DsdSourceSettings {
@@ -426,46 +421,51 @@ impl Default for DsdSourceSettings {
             reference_policy: DsdReferencePolicyVersion::SoxNg14801V17,
             profile: DsdReconstructionSelection::Reference,
             gain: Self::reference_auto_gain_default(),
-            automatic_gain_scope: true,
         }
     }
 }
 
 impl DsdSourceSettings {
-    /// Default qualified Reference automatic gain. The stored Track scope is the
-    /// deterministic fallback; `automatic_gain_scope` may resolve it to Album
-    /// from submitted programme shape before planning.
+    /// Default qualified Reference normalization. Album is the user-facing
+    /// default; programme resolution falls back to Track when no independent
+    /// submitted album exists.
     #[must_use]
     pub const fn reference_auto_gain_default() -> SampleGainPolicy {
         SampleGainPolicy::TruePeakNormalize {
-            target_dbtp: DbNano(-DbNano::DEFAULT_REFERENCE_AUTO_MARGIN.0),
-            scope: TruePeakScope::Track,
-            scan: TruePeakScanTier::Reference,
+            target_dbtp: DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
         }
     }
 
-    /// Validate and return the positive user-facing margin below 0 dBTP for a
-    /// Reference normalization policy.
-    pub fn reference_auto_gain_margin_dbtp(self) -> Result<DbNano> {
+    /// Validate and return the signed Reference true-peak target. Reference uses
+    /// the same target domain as the Custom true-peak path.
+    pub fn reference_true_peak_target_dbtp(self) -> Result<DbNano> {
         let SampleGainPolicy::TruePeakNormalize { target_dbtp, .. } = self.gain else {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.gain",
                 "Reference automatic gain requires true-peak normalize",
             ));
         };
-        let margin = DbNano::ZERO
-            .checked_sub(target_dbtp)
-            .ok_or_else(|| PlanningError::invalid_settings(
-                "dsd.from_dsd.gain.target_dbtp",
-                "Reference auto-gain target overflow",
-            ))?;
-        if margin < DbNano::ZERO || margin > DbNano::MAX_REFERENCE_AUTO_MARGIN {
+        if target_dbtp < DbNano::MIN_NORMALIZE_TARGET
+            || target_dbtp > DbNano::MAX_NORMALIZE_TARGET
+        {
             return Err(PlanningError::invalid_settings(
                 "dsd.from_dsd.gain.target_dbtp",
-                "Reference auto-gain target must be between -24.000000000 and 0.000000000 dBTP",
+                "Reference true-peak target must be between -12.000000000 and 0.000000000 dBTP",
             ));
         }
-        Ok(margin)
+        Ok(target_dbtp)
+    }
+
+    /// Certified scan tier selected for the active Reference observer. Gain-off
+    /// has no embedded gain policy, so it uses the Reference default (Standard).
+    #[must_use]
+    pub const fn reference_certified_scan_tier(self) -> TruePeakScanTier {
+        match self.gain {
+            SampleGainPolicy::TruePeakNormalize { scan, .. } => scan,
+            _ => TruePeakScanTier::Standard,
+        }
     }
 
     /// Resolve Reference gain scope from submitted programme shape without
@@ -476,13 +476,12 @@ impl DsdSourceSettings {
         programme: &ReferenceProgrammeScope,
     ) -> Option<TruePeakScope> {
         let scope = self.gain.scope()?;
-        if !self.automatic_gain_scope {
-            return Some(scope);
-        }
-        Some(match programme {
-            ReferenceProgrammeScope::IndependentAlbumBatch { .. } => TruePeakScope::Album,
-            ReferenceProgrammeScope::Singleton
-            | ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing => TruePeakScope::Track,
+        Some(match (scope, programme) {
+            (
+                TruePeakScope::Album,
+                ReferenceProgrammeScope::IndependentAlbumBatch { .. },
+            ) => TruePeakScope::Album,
+            _ => TruePeakScope::Track,
         })
     }
 
@@ -1608,6 +1607,8 @@ pub enum ResolvedGainPolicy {
         target_dbtp: DbNano,
         /// Track or submitted-album authority.
         scope: TruePeakScope,
+        /// Certified scan tier used for gain authority and post-final acceptance.
+        scan: TruePeakScanTier,
         /// Runtime common scalar for Album scope; absent before the barrier and
         /// for Track scope.
         bound_gain: Option<DbNano>,
@@ -1775,11 +1776,16 @@ impl ReferenceCertifiedPeakObservation {
             ReferenceObservationSubject::ProtectedR64 => REFERENCE_R64_READER_ID,
             ReferenceObservationSubject::TerminalQpcm => REFERENCE_QPCM_READER_ID,
         };
+        let Some(scan_tier) = crate::qualification_schema::reference_certified_scan_tier(
+            self.scan_tier.as_str(),
+        ) else {
+            return Err("Reference certified observation uses an unknown scan tier".to_string());
+        };
         if self.scope != MeasurementScope::Plan
-            || self.observer_identity != REFERENCE_CERTIFIED_OBSERVER_ID
+            || self.observer_identity
+                != crate::qualification_schema::reference_certified_observer_id(scan_tier)
             || self.reconstruction != REFERENCE_CERTIFIED_RECONSTRUCTION
             || self.edge_policy != REFERENCE_CERTIFIED_EDGE_POLICY
-            || self.scan_tier != REFERENCE_CERTIFIED_SCAN_TIER
             || self.authority_endpoint != REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT
             || self.reader_authority != expected_reader
             || !self.complete_reader
@@ -2023,6 +2029,17 @@ pub struct DsdReferencePlanSummary {
 }
 
 impl DsdReferencePlanSummary {
+    /// Certified HQ1024 tier used by both Reference gain authority and
+    /// post-terminal acceptance. Gain-off has no embedded scan setting and
+    /// therefore uses the Reference default (Standard).
+    #[must_use]
+    pub const fn certified_scan_tier(&self) -> TruePeakScanTier {
+        match self.gain_policy {
+            ResolvedGainPolicy::TruePeakNormalize { scan, .. } => scan,
+            ResolvedGainPolicy::Off { .. } => TruePeakScanTier::Standard,
+        }
+    }
+
     fn decoded_carrier_spec(
         &self,
         selector: ReferenceDecodedCarrierSelector,
@@ -2500,13 +2517,7 @@ pub fn resolve_gain_policy_for_programme(
     let terminal_bound = terminal_realization_bound(target_rate_hz, depth);
     match settings.gain {
         SampleGainPolicy::TruePeakNormalize { target_dbtp, scan, .. } => {
-            settings.reference_auto_gain_margin_dbtp()?;
-            if scan != TruePeakScanTier::Reference {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.from_dsd.gain.scan",
-                    "Reference true-peak normalization requires the Reference certified scan tier",
-                ));
-            }
+            settings.reference_true_peak_target_dbtp()?;
             let scope = settings
                 .resolved_reference_gain_scope(programme)
                 .expect("true-peak normalize has a scope");
@@ -2525,6 +2536,7 @@ pub fn resolve_gain_policy_for_programme(
             Ok(ResolvedGainPolicy::TruePeakNormalize {
                 target_dbtp,
                 scope,
+                scan,
                 bound_gain,
                 terminal_bound,
             })
@@ -2722,6 +2734,31 @@ fn reference_policy_ceiling_and_bound(
     }
 }
 
+fn reference_policy_certified_scan_tier(policy: ResolvedGainPolicy) -> TruePeakScanTier {
+    match policy {
+        ResolvedGainPolicy::TruePeakNormalize { scan, .. } => scan,
+        // Gain-off still requires post-terminal Reference ceiling acceptance;
+        // use the pathway default observer for both required observations.
+        ResolvedGainPolicy::Off { .. } => TruePeakScanTier::Standard,
+    }
+}
+
+fn validate_reference_observation_policy_scan(
+    observation: &ReferenceCertifiedPeakObservation,
+    policy: ResolvedGainPolicy,
+) -> std::result::Result<(), String> {
+    let scan = reference_policy_certified_scan_tier(policy);
+    let expected_scan = crate::qualification_schema::reference_certified_scan_tier_name(scan);
+    let expected_observer = crate::qualification_schema::reference_certified_observer_id(scan);
+    if observation.scan_tier != expected_scan || observation.observer_identity != expected_observer {
+        return Err(
+            "Reference certified observation scan tier does not match the resolved Reference policy"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn reference_album_terminal_bound(
     terminal_bound: TerminalRealizationBound,
     reconstruction_linf_gain_upper: f64,
@@ -2765,6 +2802,8 @@ pub fn reference_album_gain_constraint(
 ) -> Result<(crate::dsd_album_gain::AlbumPeakMeasurement, crate::dsd_album_gain::AlbumTerminalBound)> {
     observation
         .validate_active_contract()
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
+    validate_reference_observation_policy_scan(observation, policy)
         .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
     if observation.subject != ReferenceObservationSubject::ProtectedR64
         || observation.purpose != TruePeakPurpose::GainAuthority
@@ -2825,6 +2864,8 @@ pub fn resolve_reference_certified_gain(
 ) -> Result<ReferenceCertifiedGainAuthority> {
     observation
         .validate_active_contract()
+        .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
+    validate_reference_observation_policy_scan(observation, policy)
         .map_err(|reason| PlanningError::invalid_settings("dsd.reference.observer", reason))?;
     if observation.subject != ReferenceObservationSubject::ProtectedR64
         || observation.purpose != TruePeakPurpose::GainAuthority
@@ -2947,6 +2988,8 @@ pub fn validate_reference_post_terminal_certified_peak(
 ) -> std::result::Result<(), ReferencePostTerminalAcceptanceError> {
     observation
         .validate_active_contract()
+        .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
+    validate_reference_observation_policy_scan(observation, policy)
         .map_err(|_| ReferencePostTerminalAcceptanceError::CeilingNotProven)?;
     if observation.subject != ReferenceObservationSubject::TerminalQpcm
         || observation.purpose != TruePeakPurpose::PostFinalAcceptance
@@ -3403,6 +3446,12 @@ pub(crate) fn plan_reference_dsd_with_common_hash(
 
     let pre_id = MeasurementId(1);
     let post_id = MeasurementId(2);
+    let certified_scan_tier = match gain_policy {
+        ResolvedGainPolicy::TruePeakNormalize { scan, .. } => scan,
+        ResolvedGainPolicy::Off { .. } => TruePeakScanTier::Standard,
+    };
+    let certified_observer_identity =
+        crate::qualification_schema::reference_certified_observer_id(certified_scan_tier);
     let mut operations = Vec::new();
     if !matches!(front_end, DsdInputFrontEnd::NativeUncompressed) {
         operations.push(DsdReferenceOperation::DsdLosslessDecodeMaterialize {
@@ -3425,7 +3474,7 @@ pub(crate) fn plan_reference_dsd_with_common_hash(
             subject: ReferenceObservationSubject::ProtectedR64,
             purpose: TruePeakPurpose::GainAuthority,
             reader_authority: REFERENCE_R64_READER_ID.to_string(),
-            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            observer_identity: certified_observer_identity.to_string(),
         },
         DsdReferenceOperation::ResolveReferenceGain {
             gain_policy,
@@ -3442,7 +3491,7 @@ pub(crate) fn plan_reference_dsd_with_common_hash(
             subject: ReferenceObservationSubject::TerminalQpcm,
             purpose: TruePeakPurpose::PostFinalAcceptance,
             reader_authority: REFERENCE_QPCM_READER_ID.to_string(),
-            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            observer_identity: certified_observer_identity.to_string(),
         },
     ]);
     if target != ResolvedOutputTarget::WavW64 {
@@ -4254,6 +4303,9 @@ fn normalize_path_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qualification_schema::{
+        REFERENCE_CERTIFIED_OBSERVER_ID, REFERENCE_CERTIFIED_SCAN_TIER,
+    };
 
     fn decode_contract(bit_depth: PcmBitDepth) -> FinalPcmContract {
         FinalPcmContract {
@@ -4888,7 +4940,6 @@ mod tests {
             }
         ));
 
-        request.settings.dsd.from_dsd.automatic_gain_scope = false;
         request.settings.dsd.from_dsd.gain = request
             .settings
             .dsd
@@ -5478,6 +5529,40 @@ mod tests {
     }
 
     #[test]
+    fn reference_scan_tier_selects_matching_observer_identity() {
+        for scan in [
+            TruePeakScanTier::Reference,
+            TruePeakScanTier::Standard,
+            TruePeakScanTier::Fast,
+        ] {
+            let mut request = reference_request(
+                DsdRate::Dsd64,
+                88_200,
+                ResolvedOutputTarget::WavW64,
+                PcmBitDepth::Float64,
+                DsdReconstructionSelection::Reference,
+            );
+            request.settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+                scope: TruePeakScope::Track,
+                scan,
+            };
+            let plan = plan_reference_dsd(&request).expect("Reference scan tier is admitted");
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            assert_eq!(summary.certified_scan_tier(), scan);
+            let expected = crate::qualification_schema::reference_certified_observer_id(scan);
+            for operation in &summary.operations {
+                if let DsdReferenceOperation::ObserveCertifiedTruePeak {
+                    observer_identity, ..
+                } = operation
+                {
+                    assert_eq!(observer_identity, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn v9_float64_riff_and_rf64_use_typed_streamed_packaging() {
         for target in [ResolvedOutputTarget::WavRiff, ResolvedOutputTarget::WavRf64] {
             let request = reference_request(
@@ -5680,6 +5765,72 @@ mod tests {
         let auto = resolve_reference_certified_gain(&exact_gain_observation, auto_policy, 4.68)
             .expect("automatic gain attenuates to the certified target");
         assert!(auto.selected_gain < DbNano::ZERO);
+    }
+
+    #[test]
+    fn certified_observation_tier_must_match_resolved_reference_policy() {
+        let pre = ReferenceCertifiedPeakObservation {
+            id: MeasurementId(1),
+            scope: MeasurementScope::Plan,
+            purpose: TruePeakPurpose::GainAuthority,
+            subject: ReferenceObservationSubject::ProtectedR64,
+            observer_identity: REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+            reconstruction: REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
+            edge_policy: REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
+            scan_tier: REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+            authority_endpoint: REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
+            reader_authority: REFERENCE_R64_READER_ID.to_string(),
+            sample_rate_hz: 176_400,
+            channels: 2,
+            sample_frames: 1,
+            programme_sha256: Sha256Digest::of_bytes(b"reference-scan-binding-pre"),
+            complete_reader: true,
+            result: ReferenceCertifiedPeakResult::Finite {
+                point_linear_bits: 0.1_f64.to_bits(),
+                lower_linear_bits: 0.099_f64.to_bits(),
+                upper_linear_bits: 0.101_f64.to_bits(),
+                status: ReferenceCertifiedSearchStatus::Complete,
+            },
+            certificate_sha256: Sha256Digest::of_bytes(b"reference-scan-binding-pre-cert"),
+        };
+        pre.validate_active_contract()
+            .expect("default Standard observation is internally valid");
+
+        let mut settings = DsdSourceSettings::default();
+        settings.gain = SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Reference,
+        };
+        let policy = resolve_gain_policy(settings, 176_400, PcmBitDepth::Int24)
+            .expect("Reference-tier policy resolves");
+        let mismatch =
+            "Reference certified observation scan tier does not match the resolved Reference policy";
+
+        assert_eq!(
+            resolve_reference_certified_gain(&pre, policy, 4.68)
+                .unwrap_err()
+                .to_string(),
+            format!("invalid settings for dsd.reference.observer: {mismatch}")
+        );
+        assert_eq!(
+            reference_album_gain_constraint(&pre, policy, 4.68)
+                .unwrap_err()
+                .to_string(),
+            format!("invalid settings for dsd.reference.observer: {mismatch}")
+        );
+
+        let mut post = pre;
+        post.id = MeasurementId(2);
+        post.purpose = TruePeakPurpose::PostFinalAcceptance;
+        post.subject = ReferenceObservationSubject::TerminalQpcm;
+        post.reader_authority = REFERENCE_QPCM_READER_ID.to_string();
+        post.programme_sha256 = Sha256Digest::of_bytes(b"reference-scan-binding-post");
+        post.certificate_sha256 = Sha256Digest::of_bytes(b"reference-scan-binding-post-cert");
+        assert_eq!(
+            validate_reference_post_terminal_certified_peak(&post, policy),
+            Err(ReferencePostTerminalAcceptanceError::CeilingNotProven)
+        );
     }
 
     #[test]

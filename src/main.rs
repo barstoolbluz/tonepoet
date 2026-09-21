@@ -162,23 +162,15 @@ enum Commands {
         #[arg(long = "dsd-gain-db", value_name = "DB")]
         dsd_gain_db: Option<String>,
 
-        /// Certified ordinary true-peak target in dBTP (-12.0 through 0.0).
+        /// Certified true-peak target in dBTP (-12.0 through 0.0) for Custom or Reference.
         #[arg(long = "dsd-true-peak-target-dbtp", value_name = "DBTP")]
         dsd_true_peak_target_dbtp: Option<String>,
 
-        /// Positive Reference automatic-gain margin below 0 dBTP (0.0 through 24.0).
-        #[arg(long = "dsd-reference-margin-dbtp", value_name = "DB")]
-        dsd_reference_margin_dbtp: Option<String>,
-
-        /// Reference automatic-gain scope: album when a submitted album exists, or explicit track scope.
-        #[arg(long = "dsd-reference-scope", value_name = "auto|track")]
-        dsd_reference_scope: Option<String>,
-
-        /// Ordinary certified true-peak gain scope.
+        /// Certified true-peak gain scope for Custom or Reference processing.
         #[arg(long = "dsd-true-peak-scope", value_name = "track|album")]
         dsd_true_peak_scope: Option<String>,
 
-        /// Ordinary certified true-peak scan tier; valid for Track and Album.
+        /// Certified true-peak scan tier for Custom or Reference; valid for Track and Album.
         #[arg(long = "dsd-true-peak-scan", value_name = "reference|standard|fast")]
         dsd_true_peak_scan: Option<String>,
 
@@ -627,8 +619,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dsd_gain,
             dsd_gain_db,
             dsd_true_peak_target_dbtp,
-            dsd_reference_margin_dbtp,
-            dsd_reference_scope,
             dsd_true_peak_scope,
             dsd_true_peak_scan,
             append_lineage,
@@ -668,8 +658,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dsd_gain,
                 dsd_gain_db,
                 dsd_true_peak_target_dbtp,
-                dsd_reference_margin_dbtp,
-                dsd_reference_scope,
                 dsd_true_peak_scope,
                 dsd_true_peak_scan,
                 append_lineage,
@@ -1120,8 +1108,6 @@ fn apply_cli_dsd_reference_settings(
     gain: Option<&str>,
     fixed_gain: Option<&str>,
     true_peak_target: Option<&str>,
-    reference_margin: Option<&str>,
-    reference_scope: Option<&str>,
     true_peak_scope: Option<&str>,
     true_peak_scan: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1136,8 +1122,6 @@ fn apply_cli_dsd_reference_settings(
         || gain.is_some()
         || fixed_gain.is_some()
         || true_peak_target.is_some()
-        || reference_margin.is_some()
-        || reference_scope.is_some()
         || true_peak_scope.is_some()
         || true_peak_scan.is_some();
 
@@ -1159,22 +1143,6 @@ fn apply_cli_dsd_reference_settings(
     let parsed_true_peak_target = true_peak_target
         .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
         .transpose()?;
-    let parsed_margin = reference_margin
-        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
-        .transpose()?;
-    if let Some(margin) = parsed_margin {
-        if !(DbNano::ZERO..=DbNano::MAX_REFERENCE_AUTO_MARGIN).contains(&margin) {
-            anyhow::bail!("--dsd-reference-margin-dbtp must be between 0 and 24 dB");
-        }
-    }
-    let parsed_reference_scope = match reference_scope.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if value == "auto" => Some(true),
-        Some(value) if value == "track" => Some(false),
-        Some(value) => anyhow::bail!(
-            "invalid --dsd-reference-scope '{value}'; expected auto or track"
-        ),
-        None => None,
-    };
     let parsed_scope = match true_peak_scope.map(|value| value.trim().to_ascii_lowercase()) {
         Some(value) if value == "track" => Some(TruePeakScope::Track),
         Some(value) if value == "album" => Some(TruePeakScope::Album),
@@ -1226,14 +1194,8 @@ fn apply_cli_dsd_reference_settings(
 
     let gain_token = gain.map(|value| value.trim().to_ascii_lowercase());
     if settings.dsd.from_dsd.pathway == DsdSourcePathway::Reference {
-        if parsed_fixed_gain.is_some()
-            || parsed_true_peak_target.is_some()
-            || parsed_scope.is_some()
-            || parsed_scan.is_some()
-        {
-            anyhow::bail!(
-                "Custom DSD gain/true-peak controls cannot be combined with --dsd-path reference"
-            );
+        if parsed_fixed_gain.is_some() {
+            anyhow::bail!("--dsd-gain-db is not available with --dsd-path reference");
         }
         if let Some(token) = gain_token.as_deref() {
             settings.dsd.from_dsd.gain = match token {
@@ -1244,30 +1206,30 @@ fn apply_cli_dsd_reference_settings(
                 ),
             };
         }
-        if let Some(margin) = parsed_margin {
-            if settings.dsd.from_dsd.reference_auto_gain_selected() {
-                let target = DbNano::ZERO
-                    .checked_sub(margin)
-                    .expect("validated Reference margin cannot overflow");
+        if settings.dsd.from_dsd.gain == SampleGainPolicy::Off {
+            if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+                anyhow::bail!(
+                    "Reference true-peak target/scope/scan controls require --dsd-gain auto"
+                );
+            }
+        } else {
+            if let Some(target) = parsed_true_peak_target {
+                if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
+                    anyhow::bail!("--dsd-true-peak-target-dbtp must be between -12 and 0 dBTP");
+                }
                 settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_target(target);
             }
-        }
-        if let Some(automatic) = parsed_reference_scope {
-            settings.dsd.from_dsd.automatic_gain_scope = automatic;
-            if !automatic {
-                settings.dsd.from_dsd.gain =
-                    settings.dsd.from_dsd.gain.with_scope(TruePeakScope::Track);
+            if let Some(scope) = parsed_scope {
+                settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_scope(scope);
+            }
+            if let Some(scan) = parsed_scan {
+                settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_scan(scan);
             }
         }
         settings.dsd.general_from_dsd.gain = SampleGainPolicy::Off;
         return Ok(());
     }
 
-    if parsed_margin.is_some() || parsed_reference_scope.is_some() {
-        anyhow::bail!(
-            "--dsd-reference-margin-dbtp/--dsd-reference-scope require --dsd-path reference"
-        );
-    }
     if gain_token.as_deref() == Some("auto") {
         anyhow::bail!("--dsd-gain auto requires --dsd-path reference");
     }
@@ -1351,8 +1313,6 @@ mod dsd_reference_cli_settings_tests {
         gain: Option<&str>,
         fixed: Option<&str>,
         target: Option<&str>,
-        reference_margin: Option<&str>,
-        reference_scope: Option<&str>,
         scope: Option<&str>,
         scan: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -1364,8 +1324,6 @@ mod dsd_reference_cli_settings_tests {
             gain,
             fixed,
             target,
-            reference_margin,
-            reference_scope,
             scope,
             scan,
         )
@@ -1374,7 +1332,7 @@ mod dsd_reference_cli_settings_tests {
     #[test]
     fn absent_dsd_flags_preserve_custom_off_default() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply(&mut settings, None, None, None, None, None, None, None, None).unwrap();
+        apply(&mut settings, None, None, None, None, None, None).unwrap();
         assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Custom);
         assert_eq!(settings.dsd.gain_policy(), SampleGainPolicy::Off);
     }
@@ -1388,8 +1346,6 @@ mod dsd_reference_cli_settings_tests {
             Some("true-peak-guard"),
             None,
             Some("-0.500000000"),
-            None,
-            None,
             Some("track"),
             Some("fast"),
         )
@@ -1405,46 +1361,32 @@ mod dsd_reference_cli_settings_tests {
     }
 
     #[test]
-    fn reference_defaults_to_auto_one_db_margin_and_auto_scope() {
+    fn reference_defaults_to_signed_target_album_scope_and_standard_scan() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply(
-            &mut settings,
-            Some("reference"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        apply(&mut settings, Some("reference"), None, None, None, None, None).unwrap();
         assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Reference);
         assert_eq!(
             settings.dsd.from_dsd.gain,
             SampleGainPolicy::TruePeakNormalize {
                 target_dbtp: "-1.000000000".parse().unwrap(),
-                scope: TruePeakScope::Track,
-                scan: TruePeakScanTier::Reference,
+                scope: TruePeakScope::Album,
+                scan: TruePeakScanTier::Standard,
             }
         );
-        assert!(settings.dsd.from_dsd.automatic_gain_scope);
         assert_eq!(settings.dsd.gain_policy(), SampleGainPolicy::Off);
     }
 
     #[test]
-    fn reference_auto_margin_and_track_scope_are_explicit() {
+    fn reference_uses_shared_true_peak_controls() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
         apply(
             &mut settings,
             Some("reference"),
             Some("auto"),
             None,
-            None,
-            Some("1.250000000"),
+            Some("-1.250000000"),
             Some("track"),
-            None,
-            None,
+            Some("reference"),
         )
         .unwrap();
         assert_eq!(
@@ -1455,58 +1397,47 @@ mod dsd_reference_cli_settings_tests {
                 scan: TruePeakScanTier::Reference,
             }
         );
-        assert!(!settings.dsd.from_dsd.automatic_gain_scope);
     }
 
     #[test]
-    fn reference_off_is_unity_gain_and_rejects_custom_gain_controls() {
+    fn reference_album_scope_is_the_default_and_is_explicitly_selectable() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
         apply(
             &mut settings,
             Some("reference"),
-            Some("off"),
+            Some("auto"),
             None,
-            None,
-            Some("2.000000000"),
-            Some("track"),
-            None,
-            None,
+            Some("-0.750000000"),
+            Some("album"),
+            Some("fast"),
         )
         .unwrap();
+        assert_eq!(settings.dsd.from_dsd.reference_certified_scan_tier(), TruePeakScanTier::Fast);
+        assert_eq!(settings.dsd.from_dsd.gain.scope(), Some(TruePeakScope::Album));
+        assert_eq!(
+            settings.dsd.from_dsd.reference_true_peak_target_dbtp().unwrap(),
+            "-0.750000000".parse().unwrap(),
+        );
+    }
+
+    #[test]
+    fn reference_off_rejects_true_peak_controls() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(&mut settings, Some("reference"), Some("off"), None, None, None, None).unwrap();
         assert_eq!(settings.dsd.from_dsd.gain, SampleGainPolicy::Off);
 
         let mut invalid = tonepoet_pipeline::PipelineSettings::default();
         let error = apply(
             &mut invalid,
             Some("reference"),
-            Some("true-peak-guard"),
+            Some("off"),
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect_err("Custom gain must not enter Reference delivery");
-        assert!(error.to_string().contains("expected auto or off"), "{error}");
-    }
-
-    #[test]
-    fn custom_rejects_reference_only_controls() {
-        let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        let error = apply(
-            &mut settings,
-            Some("custom"),
-            None,
-            None,
-            None,
-            Some("1.000000000"),
-            None,
+            Some("-1.000000000"),
             None,
             None,
         )
-        .expect_err("Reference margin is pathway-specific");
-        assert!(error.to_string().contains("require --dsd-path reference"), "{error}");
+        .expect_err("gain-off must not silently ignore Reference true-peak controls");
+        assert!(error.to_string().contains("require --dsd-gain auto"), "{error}");
     }
 
     #[test]
@@ -1524,13 +1455,12 @@ mod dsd_reference_cli_settings_tests {
             None,
             None,
             None,
-            None,
-            None,
         )
         .unwrap();
         assert!(!settings.wavpack.correction_file);
     }
 }
+
 
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
@@ -1552,8 +1482,6 @@ async fn run_convert(
     dsd_gain: Option<String>,
     dsd_gain_db: Option<String>,
     dsd_true_peak_target_dbtp: Option<String>,
-    dsd_reference_margin_dbtp: Option<String>,
-    dsd_reference_scope: Option<String>,
     dsd_true_peak_scope: Option<String>,
     dsd_true_peak_scan: Option<String>,
     append_lineage: bool,
@@ -1714,8 +1642,6 @@ async fn run_convert(
         dsd_gain.as_deref(),
         dsd_gain_db.as_deref(),
         dsd_true_peak_target_dbtp.as_deref(),
-        dsd_reference_margin_dbtp.as_deref(),
-        dsd_reference_scope.as_deref(),
         dsd_true_peak_scope.as_deref(),
         dsd_true_peak_scan.as_deref(),
     )?;

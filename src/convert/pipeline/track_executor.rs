@@ -8432,6 +8432,24 @@ async fn execute_reference_common_plan(
                     Vec::new(),
                 ));
             }
+            let expected_scan = summary.certified_scan_tier();
+            if observation.scan_tier
+                != tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                    expected_scan,
+                )
+                || observation.observer_identity
+                    != tonepoet_pipeline::qualification_schema::reference_certified_observer_id(
+                        expected_scan,
+                    )
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album observation uses a different certified scan tier"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
             Some((path.clone(), observation.clone()))
         }
         _ => None,
@@ -8529,6 +8547,7 @@ async fn execute_reference_common_plan(
             pre_id,
             TruePeakPurpose::GainAuthority,
             tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+            summary.certified_scan_tier(),
             cancel,
         )
         .map_err(|reason| {
@@ -8639,6 +8658,7 @@ async fn execute_reference_common_plan(
         post_id,
         TruePeakPurpose::PostFinalAcceptance,
         tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm,
+        summary.certified_scan_tier(),
         cancel,
     )
     .map_err(|reason| {

@@ -31,7 +31,7 @@ use crate::settings::{
 use crate::source::SourceRepresentationKind;
 use crate::tools::{ToolIdentifier, ToolRegistry};
 use crate::qualification_schema::{
-    REFERENCE_CERTIFIED_OBSERVER_ID, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
+    reference_certified_observer_id, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1804,15 +1804,15 @@ fn certified_true_peak_read_contract(
 fn reference_certified_read_contract(
     state: &AudioState,
     reader_authority: &'static str,
+    scan: TruePeakScanTier,
 ) -> Result<ObservationReadContract, PlanRefusal> {
-    let mut contract = certified_true_peak_read_contract(state, TruePeakScanTier::Reference, true)?;
+    let mut contract = certified_true_peak_read_contract(state, scan, true)?;
     // Reference qualification binds both the independent complete-reader route
-    // and the certified observer implementation.  Encoding both identities in
-    // the read authority prevents a later reader substitution from reusing an
-    // otherwise identical observation slot.
-    contract.authority = format!(
-        "reader={reader_authority};observer={REFERENCE_CERTIFIED_OBSERVER_ID}"
-    );
+    // and the selected certified observer implementation. Encoding both identities
+    // in the read authority prevents a later reader or tier substitution from
+    // reusing an otherwise identical observation slot.
+    let observer = reference_certified_observer_id(scan);
+    contract.authority = format!("reader={reader_authority};observer={observer}");
     Ok(contract)
 }
 
@@ -3292,6 +3292,10 @@ fn plan_typed_with_effects_and_policy(
             .find(|state| state.id == working_signal)
             .cloned()
             .expect("Reference protected R64 state must exist");
+        let reference_scan = match admission.gain_policy {
+            crate::ResolvedGainPolicy::TruePeakNormalize { scan, .. } => scan,
+            crate::ResolvedGainPolicy::Off { .. } => TruePeakScanTier::Standard,
+        };
 
         let pre_observation = ObservationId(next_observation);
         next_observation += 1;
@@ -3303,12 +3307,13 @@ fn plan_typed_with_effects_and_policy(
             subject: working_signal,
             artifact_subject: None,
             kind: ObservationKind::CertifiedTruePeak {
-                scan: TruePeakScanTier::Reference,
+                scan: reference_scan,
             },
             complete_reader_required: true,
             read_contract: match reference_certified_read_contract(
                 &protected_state,
                 REFERENCE_R64_READER_ID,
+                reference_scan,
             ) {
                 Ok(contract) => contract,
                 Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
@@ -3412,12 +3417,13 @@ fn plan_typed_with_effects_and_policy(
             subject: qpcm,
             artifact_subject: None,
             kind: ObservationKind::CertifiedTruePeak {
-                scan: TruePeakScanTier::Reference,
+                scan: reference_scan,
             },
             complete_reader_required: true,
             read_contract: match reference_certified_read_contract(
                 &qpcm_state,
                 REFERENCE_QPCM_READER_ID,
+                reference_scan,
             ) {
                 Ok(contract) => contract,
                 Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
@@ -6498,6 +6504,53 @@ mod tests {
         )
         .expect("valid current route must bypass alternative-search accounting");
         assert_eq!(selected.identity, "second-admitted");
+    }
+
+    #[test]
+    fn reference_delivery_semantic_observations_follow_selected_scan_tier() {
+        for scan in [
+            TruePeakScanTier::Reference,
+            TruePeakScanTier::Standard,
+            TruePeakScanTier::Fast,
+        ] {
+            let mut request = dsd_request(SampleGainPolicy::Off);
+            admit_reference(&mut request, ResolvedOutputTarget::WavW64);
+            request.settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: crate::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+                scope: TruePeakScope::Track,
+                scan,
+            };
+            let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+                panic!("Reference {scan:?} semantic plan should be ready")
+            };
+            let observations = plan
+                .nodes
+                .iter()
+                .filter_map(|node| match node {
+                    TypedPlanNode::Observe(observation @ Observation {
+                        kind: ObservationKind::CertifiedTruePeak { .. },
+                        ..
+                    }) => Some(observation),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 2);
+            let expected_observer = crate::qualification_schema::reference_certified_observer_id(scan);
+            for observation in observations {
+                assert!(matches!(
+                    &observation.kind,
+                    ObservationKind::CertifiedTruePeak { scan: actual } if *actual == scan
+                ));
+                assert!(
+                    observation
+                        .read_contract
+                        .authority
+                        .ends_with(&format!(";observer={expected_observer}")),
+                    "Reference read contract did not bind selected observer: {}",
+                    observation.read_contract.authority,
+                );
+            }
+        }
     }
 
     #[test]

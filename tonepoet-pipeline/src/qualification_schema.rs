@@ -448,14 +448,52 @@ pub const REFERENCE_ACCEPTED_PHASE4_SHA256: &str = "2f34c5e74af049f132b9bfd0eb27
 pub const REFERENCE_DESIGN_HANDOFF_SHA256: &str = "cfda6bd32495e21124f73198a4d52a8ff304adb28cd16b16d3c389e6b567bbd5";
 /// Digest of the inherited v16 evidence retained as historical context.
 pub const REFERENCE_INHERITED_V16_EVIDENCE_SHA256: &str = "cbea231eb727598ac547dc7346c5ab9a0f6182aeaacdc3e205ec916517ae2b53";
-/// Certified in-process peak-observer identity used by Reference gain and acceptance.
-pub const REFERENCE_CERTIFIED_OBSERVER_ID: &str = "tonepoet-true-peak:fast066v2_reference/certified_peak_meter/v1";
+/// Default certified in-process peak-observer identity used by Reference gain and acceptance.
+pub const REFERENCE_CERTIFIED_OBSERVER_ID: &str = "tonepoet-true-peak:fast066v2_standard/certified_peak_meter/v1";
 /// Named certified finite reconstruction target.
 pub const REFERENCE_CERTIFIED_RECONSTRUCTION: &str = "hq1024_v1";
 /// Certified finite-target endpoint policy.
 pub const REFERENCE_CERTIFIED_EDGE_POLICY: &str = "repeat_endpoints";
-/// Search tier admitted for qualified Reference observation.
-pub const REFERENCE_CERTIFIED_SCAN_TIER: &str = "reference";
+/// Default search tier for qualified Reference observation.
+pub const REFERENCE_CERTIFIED_SCAN_TIER: &str = "standard";
+
+/// Stable certified observer identity for one selected Reference scan tier.
+#[must_use]
+pub const fn reference_certified_observer_id(scan: crate::TruePeakScanTier) -> &'static str {
+    match scan {
+        crate::TruePeakScanTier::Reference => {
+            "tonepoet-true-peak:fast066v2_reference/certified_peak_meter/v1"
+        }
+        crate::TruePeakScanTier::Standard => {
+            "tonepoet-true-peak:fast066v2_standard/certified_peak_meter/v1"
+        }
+        crate::TruePeakScanTier::Fast => {
+            "tonepoet-true-peak:fast066v2_fast/certified_peak_meter/v1"
+        }
+    }
+}
+
+/// Stable evidence token for one selected Reference scan tier.
+#[must_use]
+pub const fn reference_certified_scan_tier_name(scan: crate::TruePeakScanTier) -> &'static str {
+    match scan {
+        crate::TruePeakScanTier::Reference => "reference",
+        crate::TruePeakScanTier::Standard => "standard",
+        crate::TruePeakScanTier::Fast => "fast",
+    }
+}
+
+/// Parse an admitted Reference scan-tier evidence token.
+#[must_use]
+pub fn reference_certified_scan_tier(value: &str) -> Option<crate::TruePeakScanTier> {
+    match value {
+        "reference" => Some(crate::TruePeakScanTier::Reference),
+        "standard" => Some(crate::TruePeakScanTier::Standard),
+        "fast" => Some(crate::TruePeakScanTier::Fast),
+        _ => None,
+    }
+}
+
 /// Certificate component that has ceiling authority.
 pub const REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT: &str = "finite_interval_upper";
 /// Stable common typed planner identity.
@@ -874,6 +912,27 @@ impl ReferenceReleaseCertificationV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_observer_identity_round_trips_every_admitted_scan_tier() {
+        assert_eq!(
+            reference_certified_observer_id(crate::TruePeakScanTier::Standard),
+            REFERENCE_CERTIFIED_OBSERVER_ID,
+        );
+        assert_eq!(
+            reference_certified_scan_tier_name(crate::TruePeakScanTier::Standard),
+            REFERENCE_CERTIFIED_SCAN_TIER,
+        );
+        for scan in [
+            crate::TruePeakScanTier::Reference,
+            crate::TruePeakScanTier::Standard,
+            crate::TruePeakScanTier::Fast,
+        ] {
+            let name = reference_certified_scan_tier_name(scan);
+            assert_eq!(reference_certified_scan_tier(name), Some(scan));
+            assert!(reference_certified_observer_id(scan).contains(name));
+        }
+    }
 
     fn synthetic_canonical_evidence() -> ReferenceStreamedWavCapacityEvidenceV2 {
         let accepted_payload =

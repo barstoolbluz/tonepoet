@@ -165,18 +165,6 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
-        TuiButton::DsdReferenceMarginField => format.select_row_index(
-            FormatField::DsdReferenceMargin,
-            0,
-            source_bits,
-            source_rate,
-        ),
-        TuiButton::DsdReferenceScopePill(index) => format.select_row_index(
-            FormatField::DsdReferenceScope,
-            index,
-            source_bits,
-            source_rate,
-        ),
         TuiButton::ContainerPill(index) => format.select_row_index(
             FormatField::Container,
             index,
