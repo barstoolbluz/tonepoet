@@ -1938,7 +1938,7 @@ fn qualify_w64_exact_integrity_contract() -> Value {
     serde_json::json!({
         "schema": "tonepoet-reference-w64-exact-integrity/v1",
         "status": "passed",
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY,
         "parser_authority": "independent_root_and_chunk_traversal_exact/v1",
         "carrier_contract_digest": "tonepoet-reference-carrier-probe/v2",
         "declared_riff_extent_equals_physical_extent": true,
@@ -3023,7 +3023,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain = gain;
     settings.wavpack.hybrid = false;
@@ -3494,7 +3494,7 @@ fn capacity_boundary_plan_result(
     settings.target_format = target_format(ResolvedOutputTarget::WavW64);
     settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
     settings.dsd.from_dsd.gain = reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN);
     let request = PlanRequest {
@@ -5540,22 +5540,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v16 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v17 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -5570,9 +5570,9 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v15 policy status: {other:?}"),
+        other => panic!("unexpected v17 policy status: {other:?}"),
     }
-    assert_eq!(qualification["sox_ng"]["revision"], "324b8cf873fd7836e8848bd87f7a90d8faa6f849");
+    assert_eq!(qualification["sox_ng"]["revision"], "9ed22fb3d813d6c02f67c254e57d162cee014a30");
     assert_eq!(
         qualification["in_process"]["sacd_rs_build_identity"],
         sacd_rs::REFERENCE_BUILD_ID

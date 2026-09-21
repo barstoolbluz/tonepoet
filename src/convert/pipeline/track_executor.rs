@@ -2534,7 +2534,7 @@ fn effective_metadata_satisfaction(
 
 
 // Append-only v15 checker markers. These strings identify immutable historical
-// evidence; runtime activation and all current includes are v16.
+// evidence; runtime activation and all current includes are v17.
 #[allow(
     dead_code,
     reason = "append-only v15 checker markers remain source evidence for immutable historical qualification"
@@ -2581,7 +2581,7 @@ struct EmbeddedReferenceQualificationVersionProbe {
 }
 
 /// Historical policy manifests use their generation's immutable wire shape.
-/// Keep those shapes parseable without weakening the strict active-v16 schema.
+/// Keep those shapes parseable without weakening the strict active-v17 schema.
 #[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2595,6 +2595,8 @@ struct HistoricalEmbeddedReferenceQualification {
     analyzer: serde_json::Value,
     #[serde(default)]
     packaging: Option<serde_json::Value>,
+    #[serde(default)]
+    w64_integrity: Option<serde_json::Value>,
     #[serde(default)]
     sample_identity: Option<serde_json::Value>,
     #[serde(default)]
@@ -2626,7 +2628,7 @@ fn parse_embedded_reference_qualification_wire(
     let probe: EmbeddedReferenceQualificationVersionProbe = serde_json::from_str(raw)
         .map_err(|error| format!("qualification manifest version probe failed: {error}"))?;
     match probe.schema_version {
-        1..=15 => serde_json::from_str(raw)
+        1..=16 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Historical)
             .map_err(|error| {
                 format!(
@@ -2634,11 +2636,11 @@ fn parse_embedded_reference_qualification_wire(
                     probe.schema_version
                 )
             }),
-        16 => serde_json::from_str(raw)
+        17 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Current)
-            .map_err(|error| format!("current qualification schema v16 is invalid: {error}")),
+            .map_err(|error| format!("current qualification schema v17 is invalid: {error}")),
         other => Err(format!(
-            "unsupported qualification schema version {other}; current runtime supports historical v1-v15 parsing and strict v16 activation"
+            "unsupported qualification schema version {other}; current runtime supports historical v1-v16 parsing and strict v17 activation"
         )),
     }
 }
@@ -3956,7 +3958,7 @@ fn validate_embedded_release_certification(
             != Some("tonepoet-reference-w64-exact-integrity/v1")
         || w64_integrity.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || w64_integrity.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY)
         || w64_integrity.get("parser_authority").and_then(serde_json::Value::as_str)
             != Some("independent_root_and_chunk_traversal_exact/v1")
         || w64_integrity.get("carrier_contract_digest").and_then(serde_json::Value::as_str)
@@ -5364,7 +5366,7 @@ fn validate_embedded_reference_policy_tables(
             != "identity continuity only; not independent packaging evidence"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v16 policy",
+            "embedded Float64 package contract disagrees with the compiled v17 policy",
         ));
     }
     let expected_w64_invariants = [
@@ -5409,7 +5411,7 @@ fn validate_embedded_reference_policy_tables(
             .same_path_qpcm_package_hash_is_independent_packaging_evidence
     {
         return Err(reference_toolchain_error(
-            "embedded exact Wave64 integrity contract disagrees with the compiled v16 policy",
+            "embedded exact Wave64 integrity contract disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5506,7 +5508,7 @@ fn validate_embedded_reference_policy_tables(
             != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v16 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v17 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -5560,7 +5562,7 @@ fn validate_embedded_reference_policy_tables(
             != "append_only_policy_with_corrected_sox_ng_pin_or_independently_qualified_transport"
     {
         return Err(reference_toolchain_error(
-            "embedded streamed-WAV capacity contract disagrees with the compiled v16 policy",
+            "embedded streamed-WAV capacity contract disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5621,7 +5623,7 @@ fn validate_embedded_reference_policy_tables(
         || carrier.analytic_grid_bound_db > manifest.analyzer.analyzer_residual_db
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v16 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v17 policy",
         ));
     }
     let residual = &manifest.analyzer.residual_authority;
@@ -5727,7 +5729,7 @@ fn validate_embedded_reference_policy_tables(
             != "pinned_toolchain_throughput_floor_and_maximum_admission_arithmetic"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v16 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5934,7 +5936,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -5969,7 +5971,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -6674,7 +6676,7 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
     ));
     let manifest = match parse_embedded_reference_qualification_wire(raw)
         .map_err(reference_toolchain_error)?
@@ -6682,17 +6684,17 @@ async fn attest_reference_toolchain(
         EmbeddedReferenceQualificationWire::Current(manifest) => manifest,
         EmbeddedReferenceQualificationWire::Historical(historical) => {
             return Err(reference_toolchain_error(format!(
-                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v16 runtime",
+                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v17 runtime",
                 historical.schema_version, historical.policy,
             )));
         }
     };
-    if manifest.schema_version != 16
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY
+    if manifest.schema_version != 17
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY
         || manifest.status != "qualification_candidate"
     {
         return Err(reference_toolchain_error(
-            "the embedded inherited-v16 policy artifact is not the expected historical candidate",
+            "the embedded v17 policy artifact is not the expected qualification candidate",
         ));
     }
     if manifest.qualification_basis.trim().is_empty()
@@ -6704,14 +6706,19 @@ async fn attest_reference_toolchain(
     }
     validate_embedded_reference_policy_tables(&manifest)?;
 
-    let inherited_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
-    if inherited_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
+    let current_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
+    if current_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
         return Err(reference_toolchain_error(
-            "compiled and packaged inherited-v16 evidence digests disagree",
+            "compiled and packaged current-v17 policy digests disagree",
         ));
     }
+    let inherited_v16_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+    ));
+    let inherited_v16_digest = Sha256Digest::of_bytes(inherited_v16_bytes);
     let (candidate_bytes, candidate) = embedded_reference_common_candidate()?;
-    if candidate.inherited_v16_evidence_sha256 != inherited_manifest_digest.to_hex() {
+    if candidate.inherited_v16_evidence_sha256 != inherited_v16_digest.to_hex() {
         return Err(reference_toolchain_error(
             "the Phase-5 candidate does not bind the exact embedded inherited-v16 evidence",
         ));
@@ -9375,7 +9382,11 @@ fn reference_carrier_probe_digest(
     probe: ReferenceCarrierProbe,
 ) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    if policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+    if matches!(
+        policy,
+        tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    ) {
         hasher.update(b"tonepoet-reference-carrier-probe/v2\0");
     } else {
         // Preserve the frozen v1 identity exactly for append-only historical policies.
@@ -9388,7 +9399,11 @@ fn reference_carrier_probe_digest(
     hasher.update(probe.bits_per_sample.to_be_bytes());
     hasher.update(probe.samples_per_channel.to_be_bytes());
     hasher.update([u8::from(probe.floating_point)]);
-    if policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+    if matches!(
+        policy,
+        tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    ) {
         match probe.w64_structure {
             Some(structure) => {
                 hasher.update([1]);
@@ -9961,7 +9976,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -9972,7 +9987,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v15 package pipeline is bound to an invalid plan cell"
+                "Reference policy v17 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -11705,7 +11720,7 @@ mod tests {
         paths.sort();
         assert_eq!(
             paths.len(),
-            31,
+            33,
             "qualification manifest inventory changed; update the permanent parse census intentionally"
         );
 
@@ -11716,15 +11731,15 @@ mod tests {
                 .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
             match parsed {
                 EmbeddedReferenceQualificationWire::Historical(manifest) => {
-                    assert!(manifest.schema_version <= 15);
+                    assert!(manifest.schema_version <= 16);
                     assert!(manifest.policy.starts_with("sox_ng_14_8_0_1_v"));
                     assert!(!manifest.status.trim().is_empty());
                 }
                 EmbeddedReferenceQualificationWire::Current(manifest) => {
-                    assert_eq!(manifest.schema_version, 16);
+                    assert_eq!(manifest.schema_version, 17);
                     assert_eq!(
                         manifest.policy,
-                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
+                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY,
                     );
                 }
             }
@@ -11800,7 +11815,7 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -11816,7 +11831,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -11833,7 +11848,7 @@ mod tests {
         let mut streamed_capacity_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for capacity drift test");
         streamed_capacity_drift.streamed_wav_capacity.max_audio_payload_bytes += 1;
@@ -11849,7 +11864,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -11947,6 +11962,19 @@ mod tests {
                 exact,
             ),
             "v16 carrier identity omitted exact Wave64 structure",
+        );
+        assert_ne!(
+            reference_carrier_probe_digest(
+                tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17,
+                "r64",
+                legacy,
+            ),
+            reference_carrier_probe_digest(
+                tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17,
+                "r64",
+                exact,
+            ),
+            "v17 carrier identity omitted exact Wave64 structure",
         );
     }
 

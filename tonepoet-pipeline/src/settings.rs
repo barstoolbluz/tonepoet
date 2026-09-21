@@ -503,7 +503,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                     "Custom DSD sample-domain gain is incompatible with explicit Reference delivery",
                 ));
             }
-            if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V16 {
+            if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V17 {
                 return Err(PlanningError::invalid_settings(
                     "dsd.from_dsd.reference_policy",
                     reference_error_text(ReferenceErrorCode::Toolchain),

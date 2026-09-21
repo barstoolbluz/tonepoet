@@ -231,6 +231,7 @@ fn build_reference_manifest_track(
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V14
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
         ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {
@@ -272,7 +273,11 @@ fn validate_reference_packaged_sample_identity_mode(
     target: tonepoet_pipeline::ResolvedOutputTarget,
     actual: ReferencePackagedSampleIdentityMode,
 ) -> Result<(), ManifestError> {
-    if policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+    if !matches!(
+        policy,
+        tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    ) {
         return Ok(());
     }
     let required = if target == tonepoet_pipeline::ResolvedOutputTarget::WavW64 {
@@ -282,7 +287,7 @@ fn validate_reference_packaged_sample_identity_mode(
     };
     if actual != required {
         return Err(ManifestError::InvalidAuthority(format!(
-            "Reference v16 package identity mode {:?} disagrees with required {:?} for {:?}",
+            "Reference v16+ package identity mode {:?} disagrees with required {:?} for {:?}",
             actual, required, target,
         )));
     }
@@ -449,33 +454,38 @@ mod manifest_merge_gap_tests {
     }
 
     #[test]
-    fn v16_package_identity_mode_distinguishes_direct_w64_from_independent_packaging() {
+    fn v16_plus_package_identity_mode_distinguishes_direct_w64_from_independent_packaging() {
         use tonepoet_pipeline::{DsdReferencePolicyVersion, ResolvedOutputTarget};
 
-        assert!(validate_reference_packaged_sample_identity_mode(
+        for policy in [
             DsdReferencePolicyVersion::SoxNg14801V16,
-            ResolvedOutputTarget::WavW64,
-            ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
-        )
-        .is_ok());
-        assert!(validate_reference_packaged_sample_identity_mode(
-            DsdReferencePolicyVersion::SoxNg14801V16,
-            ResolvedOutputTarget::WavW64,
-            ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
-        )
-        .is_err());
-        assert!(validate_reference_packaged_sample_identity_mode(
-            DsdReferencePolicyVersion::SoxNg14801V16,
-            ResolvedOutputTarget::WavRiff,
-            ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
-        )
-        .is_ok());
-        assert!(validate_reference_packaged_sample_identity_mode(
-            DsdReferencePolicyVersion::SoxNg14801V16,
-            ResolvedOutputTarget::WavRiff,
-            ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
-        )
-        .is_err());
+            DsdReferencePolicyVersion::SoxNg14801V17,
+        ] {
+            assert!(validate_reference_packaged_sample_identity_mode(
+                policy,
+                ResolvedOutputTarget::WavW64,
+                ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
+            )
+            .is_ok());
+            assert!(validate_reference_packaged_sample_identity_mode(
+                policy,
+                ResolvedOutputTarget::WavW64,
+                ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
+            )
+            .is_err());
+            assert!(validate_reference_packaged_sample_identity_mode(
+                policy,
+                ResolvedOutputTarget::WavRiff,
+                ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
+            )
+            .is_ok());
+            assert!(validate_reference_packaged_sample_identity_mode(
+                policy,
+                ResolvedOutputTarget::WavRiff,
+                ReferencePackagedSampleIdentityMode::DirectW64QpcmExactDelivery,
+            )
+            .is_err());
+        }
     }
 
     fn v7_verification_record(

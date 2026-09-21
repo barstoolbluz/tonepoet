@@ -4,7 +4,7 @@
 Developer qualification only. This file is not referenced by Cargo, build.rs,
 flake.nix, or runtime code. SoX coefficients are transcribed from the pinned
 SoX-ng 14.8.0.1 source revision
-324b8cf873fd7836e8848bd87f7a90d8faa6f849. The true-peak reconstruction is
+9ed22fb3d813d6c02f67c254e57d162cee014a30. The true-peak reconstruction is
 owned and independently qualified by the fixed ``tonepoet-true-peak``
 dependency; this audit checks only its public L-infinity integration constant.
 """
@@ -194,7 +194,7 @@ def main():
             raise RuntimeError(f"unexpected classic Shibata match at {rate}")
 
     report = {
-        "pinned_sox_ng_revision": "324b8cf873fd7836e8848bd87f7a90d8faa6f849",
+        "pinned_sox_ng_revision": "9ed22fb3d813d6c02f67c254e57d162cee014a30",
         "certified_reconstruction_linf": {
             "public_constant": CERTIFIED_RECONSTRUCTION_LINF_PUBLIC_NAME,
             "fixed_dependency_value": reconstruction_linf_upper,

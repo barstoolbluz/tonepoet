@@ -15,7 +15,7 @@
     "constant_prefix_optimization_admitted": false
   },
   "closure": {
-    "policy_identity": "sox_ng_14_8_0_1_v16+common-v17-candidate",
+    "policy_identity": "sox_ng_14_8_0_1_v17+common-v17-candidate",
     "semantic_plan_identity": "tonepoet-pipeline:semantic_plan/reference_common/v1",
     "numerical_implementation": "build-bound:TONEPOET_TRUE_PEAK_SOURCE_SHA256/v1",
     "common_implementation_source": "build-bound:TONEPOET_REFERENCE_COMMON_SOURCE_SHA256/v1",

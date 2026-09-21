@@ -214,7 +214,7 @@ fn custom_fixed_sentinel() -> PipelineSettings {
 fn reference_sentinel() -> PipelineSettings {
     let mut settings = rich_common_settings();
     settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
     settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
         target_dbtp: db("-1.250000000"),

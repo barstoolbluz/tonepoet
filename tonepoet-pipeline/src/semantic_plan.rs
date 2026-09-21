@@ -6040,7 +6040,7 @@ fn dsd_reconstruction_candidates(
 ) -> Vec<PhysicalCandidate> {
     if reference_reconstruction {
         vec![PhysicalCandidate {
-            identity: "reference-v16-qualified".to_owned(),
+            identity: "reference-v17-qualified".to_owned(),
             tool: Some(ToolIdentifier::Sox),
             contract: TransformContract {
                 representation: BoundaryRepresentationContract {

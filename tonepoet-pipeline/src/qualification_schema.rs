@@ -575,7 +575,7 @@ impl ReferenceCommonPrimitiveClosureV1 {
     #[must_use]
     pub fn current_declaration() -> Self {
         Self {
-            policy_identity: "sox_ng_14_8_0_1_v16+common-v17-candidate".to_string(),
+            policy_identity: "sox_ng_14_8_0_1_v17+common-v17-candidate".to_string(),
             semantic_plan_identity: REFERENCE_COMMON_PLANNER_ID.to_string(),
             numerical_implementation: REFERENCE_NUMERICAL_SOURCE_BINDING.to_string(),
             common_implementation_source: REFERENCE_COMMON_SOURCE_BINDING.to_string(),
