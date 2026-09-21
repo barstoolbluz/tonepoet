@@ -23181,8 +23181,9 @@ mod source_relative_set_command_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.convert.format.set_source_is_dsd(true);
         app.convert.format.format.select_value(&AudioFormat::Wav);
-        app.convert.format.bit_depth.select_value(&BitDepthChoice::Float32);
         app.convert.format.apply_format_constraints();
+        // Float32 is only enabled once the WAV constraints are applied.
+        assert!(app.convert.format.bit_depth.select_value(&BitDepthChoice::Float32));
         app.convert.format.apply_auto_gain_defaults();
         assert_eq!(
             *app.convert.format.dsd_pathway.selected_value(),

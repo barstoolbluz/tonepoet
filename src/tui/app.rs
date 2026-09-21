@@ -18881,8 +18881,11 @@ mod dsd_gain_format_state_tests {
         let mut state = FormatState::new();
         state.set_source_is_dsd(true);
         state.format.select_value(&AudioFormat::Wav);
-        state.bit_depth.select_value(&BitDepthChoice::Float32);
         state.apply_format_constraints();
+        // Float32 is only enabled once the WAV constraints are applied; selecting
+        // it earlier is refused and the depth stays integer, which would pull in
+        // the integer-target safety guard instead of Off.
+        assert!(state.bit_depth.select_value(&BitDepthChoice::Float32));
         state.apply_auto_gain_defaults();
         assert_eq!(*state.dsd_pathway.selected_value(), DsdSourcePathway::Custom);
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::Off);

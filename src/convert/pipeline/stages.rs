@@ -13648,6 +13648,9 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
         let mut req = request_for_case(&case_root, &source_path, &case);
         req.job_id = "id3-wrapped-flac-replaygain-rescan".to_string();
         req.item_id = req.job_id.clone();
+        // Publish into a per-album subdirectory of the pre-created output root,
+        // as the sibling real-output tests do; the root itself already exists.
+        req.naming.per_album_subdir = true;
         req.settings.metadata.preserve_artwork = false;
         req.stages.replaygain = StageRequirement::Enabled;
         req.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Track);
