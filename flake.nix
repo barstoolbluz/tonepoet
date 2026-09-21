@@ -25,7 +25,22 @@
   outputs = { self, nixpkgs, flake-utils, rust-overlay, sox_ng, opustags, ssrc }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
+        overlays = [
+          (import rust-overlay)
+          # nixpkgs builds AtomicParsley from a release tarball, so its CMake
+          # git probe finds nothing and the binary reports an empty version
+          # ("AtomicParsley version:   (utf8)"). The DSD Reference toolchain
+          # attestation requires a parseable version, so supply the package
+          # version to CMake directly.
+          (final: prev: {
+            atomicparsley = prev.atomicparsley.overrideAttrs (old: {
+              cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+                "-DPACKAGE_VERSION=${old.version}"
+                "-DBUILD_INFO=${old.version}"
+              ];
+            });
+          })
+        ];
         pkgs = import nixpkgs {
           inherit system overlays;
           config.allowUnfree = true;
