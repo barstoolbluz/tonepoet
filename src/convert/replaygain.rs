@@ -840,7 +840,13 @@ fn drain_decoder_frames(
                 );
                 return Ok(DecoderDrainOutcome::DeclaredWrappedFlacEof);
             }
-            Err(error) => return Err(invalid(format!("audio decoder failed: {error}"))),
+            Err(error) => {
+                return Err(invalid(format!(
+                    "audio decoder failed after {} decoded frames (declared wrapped extent {:?}): {error}",
+                    *frames,
+                    wrapped_flac.declared_sample_frames(),
+                )))
+            }
         }
     }
 }
