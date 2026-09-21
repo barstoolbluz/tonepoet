@@ -5,7 +5,8 @@
 //! and qualification reporting live in the orchestrator crate.
 
 use crate::enums::{
-    AudioFormat, BitDepthTarget, DsdRate, PcmBitDepth, RateTarget, SampleKind, TruePeakScope,
+    AudioFormat, BitDepthTarget, DsdRate, PcmBitDepth, RateTarget, SampleKind, TruePeakScanTier,
+    TruePeakScope,
 };
 use crate::error::{PlanningError, Result};
 use crate::plan::{
@@ -17,6 +18,7 @@ use crate::qualification_schema::{
     REFERENCE_CERTIFIED_OBSERVER_ID, REFERENCE_CERTIFIED_RECONSTRUCTION,
     REFERENCE_CERTIFIED_SCAN_TIER, REFERENCE_QPCM_READER_ID, REFERENCE_R64_READER_ID,
 };
+use crate::settings::SampleGainPolicy;
 use crate::tools::ToolIdentifier;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -386,29 +388,14 @@ pub enum DsdReconstructionSelection {
     Wideband,
 }
 
-/// Qualified Reference output-gain selection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum DsdSourceGainMode {
-    /// Certified true-peak normalization using the Reference observer.
-    #[default]
-    Auto,
-    /// Apply no gain after the protected Reference reconstruction.
-    Off,
-}
-
-/// Scope selection for Reference automatic gain.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
-pub enum DsdReferenceGainScope {
-    /// Album scope for an independent submitted album batch; Track otherwise.
-    #[default]
-    Auto,
-    /// Always resolve gain independently for each track.
-    Track,
-}
-
 /// Directional settings for DSD-source conversions.
+///
+/// Reference gain deliberately reuses [`SampleGainPolicy`], the same gain
+/// vocabulary as Custom DSD and ordinary PCM. Reference accepts only `Off` or
+/// `TruePeakNormalize`; its certified observer fixes the scan tier to
+/// [`TruePeakScanTier::Reference`]. `automatic_gain_scope` is programme-shape
+/// selection, not a second gain policy: when true, an independent submitted
+/// album resolves to Album scope and every other programme resolves to Track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct DsdSourceSettings {
@@ -418,12 +405,12 @@ pub struct DsdSourceSettings {
     pub reference_policy: DsdReferencePolicyVersion,
     /// Standard or explicit Wideband reconstruction selection.
     pub profile: DsdReconstructionSelection,
-    /// Qualified Reference gain mode.
-    pub gain_mode: DsdSourceGainMode,
-    /// Positive margin below 0 dBTP used by Reference `Auto`.
-    pub auto_gain_margin_dbtp: DbNano,
-    /// Dynamic Album/Track selection or an explicit Track override.
-    pub auto_gain_scope: DsdReferenceGainScope,
+    /// Reference gain policy. Qualified Reference accepts only Off or
+    /// TruePeakNormalize. Custom DSD gain remains in `general_from_dsd.gain`.
+    pub gain: SampleGainPolicy,
+    /// Resolve Reference true-peak scope from submitted programme shape. When
+    /// false, the scope embedded in `gain` is authoritative.
+    pub automatic_gain_scope: bool,
 }
 
 impl Default for DsdSourceSettings {
@@ -432,43 +419,71 @@ impl Default for DsdSourceSettings {
             pathway: DsdSourcePathway::Custom,
             reference_policy: DsdReferencePolicyVersion::SoxNg14801V16,
             profile: DsdReconstructionSelection::Reference,
-            gain_mode: DsdSourceGainMode::Auto,
-            auto_gain_margin_dbtp: DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
-            auto_gain_scope: DsdReferenceGainScope::Auto,
+            gain: Self::reference_auto_gain_default(),
+            automatic_gain_scope: true,
         }
     }
 }
 
 impl DsdSourceSettings {
-    /// Effective target below 0 dBTP for Reference automatic gain.
-    pub fn auto_gain_target_dbtp(self) -> Result<DbNano> {
-        if self.auto_gain_margin_dbtp < DbNano::ZERO
-            || self.auto_gain_margin_dbtp > DbNano::MAX_REFERENCE_AUTO_MARGIN
-        {
-            return Err(PlanningError::invalid_settings(
-                "dsd.from_dsd.auto_gain_margin_dbtp",
-                "Reference auto-gain margin must be between 0.000000000 and 24.000000000 dB",
-            ));
+    /// Default qualified Reference automatic gain. The stored Track scope is the
+    /// deterministic fallback; `automatic_gain_scope` may resolve it to Album
+    /// from submitted programme shape before planning.
+    #[must_use]
+    pub const fn reference_auto_gain_default() -> SampleGainPolicy {
+        SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: DbNano(-DbNano::DEFAULT_REFERENCE_AUTO_MARGIN.0),
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Reference,
         }
-        DbNano::ZERO
-            .checked_sub(self.auto_gain_margin_dbtp)
-            .ok_or_else(|| PlanningError::invalid_settings(
-                "dsd.from_dsd.auto_gain_margin_dbtp",
-                "Reference auto-gain margin overflow",
-            ))
     }
 
-    /// Resolve dynamic Reference gain scope from the submitted programme shape.
-    #[must_use]
-    pub fn resolved_auto_gain_scope(self, programme: &ReferenceProgrammeScope) -> TruePeakScope {
-        match self.auto_gain_scope {
-            DsdReferenceGainScope::Track => TruePeakScope::Track,
-            DsdReferenceGainScope::Auto => match programme {
-                ReferenceProgrammeScope::IndependentAlbumBatch { .. } => TruePeakScope::Album,
-                ReferenceProgrammeScope::Singleton
-                | ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing => TruePeakScope::Track,
-            },
+    /// Validate and return the positive user-facing margin below 0 dBTP for a
+    /// Reference normalization policy.
+    pub fn reference_auto_gain_margin_dbtp(self) -> Result<DbNano> {
+        let SampleGainPolicy::TruePeakNormalize { target_dbtp, .. } = self.gain else {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.gain",
+                "Reference automatic gain requires true-peak normalize",
+            ));
+        };
+        let margin = DbNano::ZERO
+            .checked_sub(target_dbtp)
+            .ok_or_else(|| PlanningError::invalid_settings(
+                "dsd.from_dsd.gain.target_dbtp",
+                "Reference auto-gain target overflow",
+            ))?;
+        if margin < DbNano::ZERO || margin > DbNano::MAX_REFERENCE_AUTO_MARGIN {
+            return Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.gain.target_dbtp",
+                "Reference auto-gain target must be between -24.000000000 and 0.000000000 dBTP",
+            ));
         }
+        Ok(margin)
+    }
+
+    /// Resolve Reference gain scope from submitted programme shape without
+    /// introducing a DSD-specific scope vocabulary.
+    #[must_use]
+    pub fn resolved_reference_gain_scope(
+        self,
+        programme: &ReferenceProgrammeScope,
+    ) -> Option<TruePeakScope> {
+        let scope = self.gain.scope()?;
+        if !self.automatic_gain_scope {
+            return Some(scope);
+        }
+        Some(match programme {
+            ReferenceProgrammeScope::IndependentAlbumBatch { .. } => TruePeakScope::Album,
+            ReferenceProgrammeScope::Singleton
+            | ReferenceProgrammeScope::ContinuousImageRequiresPreSplitProcessing => TruePeakScope::Track,
+        })
+    }
+
+    /// True when qualified Reference normalization is selected.
+    #[must_use]
+    pub const fn reference_auto_gain_selected(self) -> bool {
+        matches!(self.gain, SampleGainPolicy::TruePeakNormalize { .. })
     }
 }
 
@@ -1582,7 +1597,7 @@ pub struct TerminalRealizationBound {
 pub enum ResolvedGainPolicy {
     /// Certified true-peak normalization. Album scope remains unbound until
     /// the submitted-batch barrier derives one common scalar.
-    Auto {
+    TruePeakNormalize {
         /// Requested post-terminal true-peak target.
         target_dbtp: DbNano,
         /// Track or submitted-album authority.
@@ -2477,30 +2492,38 @@ pub fn resolve_gain_policy_for_programme(
     depth: PcmBitDepth,
 ) -> Result<ResolvedGainPolicy> {
     let terminal_bound = terminal_realization_bound(target_rate_hz, depth);
-    match settings.gain_mode {
-        DsdSourceGainMode::Auto => {
-            let target_dbtp = settings.auto_gain_target_dbtp()?;
-            let scope = settings.resolved_auto_gain_scope(programme);
+    match settings.gain {
+        SampleGainPolicy::TruePeakNormalize { target_dbtp, scan, .. } => {
+            settings.reference_auto_gain_margin_dbtp()?;
+            if scan != TruePeakScanTier::Reference {
+                return Err(PlanningError::invalid_settings(
+                    "dsd.from_dsd.gain.scan",
+                    "Reference true-peak normalization requires the Reference certified scan tier",
+                ));
+            }
+            let scope = settings
+                .resolved_reference_gain_scope(programme)
+                .expect("true-peak normalize has a scope");
             let bound_gain = match scope {
                 TruePeakScope::Track => {
                     if runtime_album_gain_db.is_some() {
                         return Err(PlanningError::invalid_settings(
                             "dsd.runtime_album_gain_db",
-                            "Track-scoped Reference auto gain cannot consume submitted-album runtime authority",
+                            "Track-scoped Reference true-peak normalization cannot consume submitted-album runtime authority",
                         ));
                     }
                     None
                 }
                 TruePeakScope::Album => runtime_album_gain_db,
             };
-            Ok(ResolvedGainPolicy::Auto {
+            Ok(ResolvedGainPolicy::TruePeakNormalize {
                 target_dbtp,
                 scope,
                 bound_gain,
                 terminal_bound,
             })
         }
-        DsdSourceGainMode::Off => {
+        SampleGainPolicy::Off => {
             if runtime_album_gain_db.is_some() {
                 return Err(PlanningError::invalid_settings(
                     "dsd.runtime_album_gain_db",
@@ -2511,6 +2534,12 @@ pub fn resolve_gain_policy_for_programme(
                 ceiling: DbNano::REFERENCE_CEILING,
                 terminal_bound,
             })
+        }
+        SampleGainPolicy::TruePeakGuard { .. } | SampleGainPolicy::FixedGain { .. } => {
+            Err(PlanningError::invalid_settings(
+                "dsd.from_dsd.gain",
+                "Reference delivery accepts only true-peak normalize or off",
+            ))
         }
     }
 }
@@ -2675,7 +2704,7 @@ fn reference_policy_ceiling_and_bound(
     policy: ResolvedGainPolicy,
 ) -> (DbNano, TerminalRealizationBound) {
     match policy {
-        ResolvedGainPolicy::Auto {
+        ResolvedGainPolicy::TruePeakNormalize {
             target_dbtp,
             terminal_bound,
             ..
@@ -2811,12 +2840,12 @@ pub fn resolve_reference_certified_gain(
 
     let fixed_gain = match policy {
         ResolvedGainPolicy::Off { .. } => Some(DbNano::HEADROOM_RESTORATION),
-        ResolvedGainPolicy::Auto {
+        ResolvedGainPolicy::TruePeakNormalize {
             scope: TruePeakScope::Album,
             bound_gain,
             ..
         } => bound_gain,
-        ResolvedGainPolicy::Auto {
+        ResolvedGainPolicy::TruePeakNormalize {
             scope: TruePeakScope::Track,
             ..
         } => None,
@@ -2858,11 +2887,11 @@ pub fn resolve_reference_certified_gain(
                         ResolvedGainPolicy::Off { .. } => {
                             "Reference gain-off cannot satisfy the fixed -1 dBTP acceptance ceiling without attenuation"
                         }
-                        ResolvedGainPolicy::Auto { .. } => {
+                        ResolvedGainPolicy::TruePeakNormalize { .. } => {
                             "submitted-album Reference gain exceeds this participant's certified terminal-safe maximum"
                         }
                     };
-                    return Err(PlanningError::invalid_settings("dsd.from_dsd.gain_mode", message));
+                    return Err(PlanningError::invalid_settings("dsd.from_dsd.gain", message));
                 }
                 gain
             } else {
@@ -4264,6 +4293,12 @@ mod tests {
             ),
             (
                 ReferenceDecodeRoleClass::TerminalQpcmW64,
+                PcmBitDepth::Int32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::TerminalQpcmW64,
                 PcmBitDepth::Float32,
                 ReferenceDecodeMechanism::DirectFfmpeg,
                 ReferenceSampleHashEncoding::Float32Le,
@@ -4282,6 +4317,12 @@ mod tests {
             ),
             (
                 ReferenceDecodeRoleClass::PackagedW64,
+                PcmBitDepth::Int32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedW64,
                 PcmBitDepth::Float32,
                 ReferenceDecodeMechanism::DirectFfmpeg,
                 ReferenceSampleHashEncoding::Float32Le,
@@ -4300,6 +4341,12 @@ mod tests {
             ),
             (
                 ReferenceDecodeRoleClass::PackagedNonW64,
+                PcmBitDepth::Int32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PackagedNonW64,
                 PcmBitDepth::Float32,
                 ReferenceDecodeMechanism::DirectFfmpeg,
                 ReferenceSampleHashEncoding::Float32Le,
@@ -4318,6 +4365,12 @@ mod tests {
             ),
             (
                 ReferenceDecodeRoleClass::PostMetadataW64,
+                PcmBitDepth::Int32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt32Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataW64,
                 PcmBitDepth::Float32,
                 ReferenceDecodeMechanism::DirectFfmpeg,
                 ReferenceSampleHashEncoding::Float32Le,
@@ -4333,6 +4386,12 @@ mod tests {
                 PcmBitDepth::Int24,
                 ReferenceDecodeMechanism::DirectFfmpeg,
                 ReferenceSampleHashEncoding::SignedInt24Le,
+            ),
+            (
+                ReferenceDecodeRoleClass::PostMetadataNonW64,
+                PcmBitDepth::Int32,
+                ReferenceDecodeMechanism::DirectFfmpeg,
+                ReferenceSampleHashEncoding::SignedInt32Le,
             ),
             (
                 ReferenceDecodeRoleClass::PostMetadataNonW64,
@@ -4795,7 +4854,7 @@ mod tests {
         let album = plan_reference_dsd(&request).expect("independent Reference album is admitted");
         assert!(matches!(
             album.reference.as_ref().expect("Reference summary").gain_policy,
-            ResolvedGainPolicy::Auto {
+            ResolvedGainPolicy::TruePeakNormalize {
                 scope: TruePeakScope::Album,
                 bound_gain: None,
                 ..
@@ -4806,14 +4865,20 @@ mod tests {
         let track = plan_reference_dsd(&request).expect("Reference singleton is admitted");
         assert!(matches!(
             track.reference.as_ref().expect("Reference summary").gain_policy,
-            ResolvedGainPolicy::Auto {
+            ResolvedGainPolicy::TruePeakNormalize {
                 scope: TruePeakScope::Track,
                 bound_gain: None,
                 ..
             }
         ));
 
-        request.settings.dsd.from_dsd.auto_gain_scope = DsdReferenceGainScope::Track;
+        request.settings.dsd.from_dsd.automatic_gain_scope = false;
+        request.settings.dsd.from_dsd.gain = request
+            .settings
+            .dsd
+            .from_dsd
+            .gain
+            .with_scope(TruePeakScope::Track);
         request.reference_programme_scope = ReferenceProgrammeScope::IndependentAlbumBatch {
             conversion_log_batch_id: "album-track".to_string(),
             expected_members: std::num::NonZeroUsize::new(2).unwrap(),
@@ -4823,7 +4888,7 @@ mod tests {
             plan_reference_dsd(&request).expect("explicit Reference track scope is admitted");
         assert!(matches!(
             forced_track.reference.as_ref().expect("Reference summary").gain_policy,
-            ResolvedGainPolicy::Auto {
+            ResolvedGainPolicy::TruePeakNormalize {
                 scope: TruePeakScope::Track,
                 bound_gain: None,
                 ..
@@ -4872,7 +4937,7 @@ mod tests {
             4.68,
         )
         .expect("complete-input certified observation resolves the sealed Reference gain");
-        assert_eq!(authority.requested_gain, DbNano(18_020_599_913));
+        assert_eq!(authority.requested_gain, DbNano(18_999_989_109));
         assert_eq!(authority.selected_gain, authority.requested_gain);
 
         let terminal = lower_reference_terminal_command(
@@ -4884,7 +4949,7 @@ mod tests {
         .expect("common terminal lowerer accepts the admitted Reference contract");
         assert_eq!(terminal.tool, ToolIdentifier::Sox);
         assert!(terminal.args.windows(2).any(|window| {
-            window[0] == "gain" && window[1] == "+18.020599913"
+            window[0] == "gain" && window[1] == "+18.999989109"
         }));
         assert_eq!(
             summary
@@ -5582,18 +5647,17 @@ mod tests {
         };
 
         let mut source_settings = DsdSourceSettings::default();
-        source_settings.gain_mode = DsdSourceGainMode::Off;
+        source_settings.gain = SampleGainPolicy::Off;
         let off_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
             .expect("gain-off policy resolves");
         assert_eq!(
             resolve_reference_certified_gain(&exact_gain_observation, off_policy, 4.68)
                 .unwrap_err()
                 .to_string(),
-            "invalid settings for dsd.from_dsd.gain_mode: Reference gain-off cannot satisfy the fixed -1 dBTP acceptance ceiling without attenuation"
+            "invalid settings for dsd.from_dsd.gain: Reference gain-off cannot satisfy the fixed -1 dBTP acceptance ceiling without attenuation"
         );
 
-        source_settings.gain_mode = DsdSourceGainMode::Auto;
-        source_settings.auto_gain_margin_dbtp = DbNano::DEFAULT_REFERENCE_AUTO_MARGIN;
+        source_settings.gain = DsdSourceSettings::reference_auto_gain_default();
         let auto_policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
             .expect("automatic gain policy resolves");
         let auto = resolve_reference_certified_gain(&exact_gain_observation, auto_policy, 4.68)
@@ -5630,7 +5694,7 @@ mod tests {
             ),
         };
         let mut source_settings = DsdSourceSettings::default();
-        source_settings.gain_mode = DsdSourceGainMode::Off;
+        source_settings.gain = SampleGainPolicy::Off;
         let policy = resolve_gain_policy(source_settings, 176_400, PcmBitDepth::Int24)
             .expect("gain-off policy resolves");
         let authority = resolve_reference_certified_gain(&observation, policy, 4.68)

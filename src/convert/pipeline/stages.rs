@@ -23027,23 +23027,38 @@ fn append_dsd_settings(
             push_kv_line(
                 log,
                 "DSD gain mode",
-                match reference.gain_mode {
-                    tonepoet_pipeline::DsdSourceGainMode::Auto => "certified true-peak auto",
-                    tonepoet_pipeline::DsdSourceGainMode::Off => "off",
+                match reference.gain {
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. } => {
+                        "certified true-peak normalize"
+                    }
+                    tonepoet_pipeline::SampleGainPolicy::Off => "off",
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakGuard { .. } => {
+                        "invalid true-peak guard"
+                    }
+                    tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => "invalid fixed gain",
                 },
             );
-            if reference.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Auto {
+            if reference.reference_auto_gain_selected() {
                 push_kv_line(
                     log,
                     "DSD Reference margin",
-                    format!("{} dB below 0 dBTP", reference.auto_gain_margin_dbtp),
+                    format!(
+                        "{} dB below 0 dBTP",
+                        reference
+                            .reference_auto_gain_margin_dbtp()
+                            .unwrap_or(tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_AUTO_MARGIN)
+                    ),
                 );
                 push_kv_line(
                     log,
                     "DSD Reference gain scope",
-                    match reference.auto_gain_scope {
-                        tonepoet_pipeline::DsdReferenceGainScope::Auto => "auto",
-                        tonepoet_pipeline::DsdReferenceGainScope::Track => "track",
+                    if reference.automatic_gain_scope {
+                        "auto"
+                    } else {
+                        match reference.gain.scope() {
+                            Some(tonepoet_pipeline::TruePeakScope::Album) => "album",
+                            Some(tonepoet_pipeline::TruePeakScope::Track) | None => "track",
+                        }
                     },
                 );
             }
@@ -37008,13 +37023,13 @@ async fn prepare_reference_auto_gain_carrier_for_track(
         )
     })?;
     let target_dbtp = match summary.gain_policy {
-        tonepoet_pipeline::ResolvedGainPolicy::Auto {
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
             target_dbtp,
             scope: tonepoet_pipeline::TruePeakScope::Album,
             bound_gain: None,
             ..
         } => target_dbtp,
-        tonepoet_pipeline::ResolvedGainPolicy::Auto {
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
             scope: tonepoet_pipeline::TruePeakScope::Album,
             bound_gain: Some(_),
             ..
@@ -37221,8 +37236,8 @@ async fn prepare_reference_auto_gain_carriers(
         .map(|batch| batch.expected_track_count)
         .unwrap_or(1);
     if !req.settings.dsd.reference_delivery_selected()
-        || req.settings.dsd.from_dsd.gain_mode != tonepoet_pipeline::DsdSourceGainMode::Auto
-        || req.settings.dsd.from_dsd.auto_gain_scope != tonepoet_pipeline::DsdReferenceGainScope::Auto
+        || !req.settings.dsd.from_dsd.reference_auto_gain_selected()
+        || !req.settings.dsd.from_dsd.automatic_gain_scope
         || album_members <= 1
     {
         return Ok(PreparedReferenceAutoGainCarriers::default());

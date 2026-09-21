@@ -8343,7 +8343,7 @@ async fn execute_reference_common_plan(
                 )
             })?;
             match summary.gain_policy {
-                tonepoet_pipeline::ResolvedGainPolicy::Auto {
+                tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
                     target_dbtp: planned_target,
                     scope: tonepoet_pipeline::TruePeakScope::Album,
                     bound_gain: Some(planned_gain),

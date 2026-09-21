@@ -747,7 +747,8 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
     #[test]
     fn native_album_profile_change_does_not_match_legacy_album_manifest() {
         use tonepoet_pipeline::{
-            TruePeakScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+            DsdReconstructionSelection, DsdSettings, SampleGainPolicy, TruePeakScanTier,
+            TruePeakScope,
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -760,9 +761,13 @@ mod chunk_2_1_3_manifest_failure_interaction_tests {
 
         let mut reference = PipelineSettings::default();
         reference.dsd = DsdSettings::reference();
-        reference.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
+        reference.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-1.000000000".parse().unwrap(),
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Reference,
+        };
+        reference.dsd.from_dsd.automatic_gain_scope = true;
         reference.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
-        reference.dsd.set_true_peak_scope(TruePeakScope::Album);
         reference.dsd.bind_runtime_album_gain(
             "-0.750000000".parse().unwrap(),
             Some("-0.490000000".parse().unwrap()),

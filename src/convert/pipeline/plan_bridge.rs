@@ -168,10 +168,10 @@ fn validate_certified_carrier_album_gain_authority(
             request.settings.dsd.runtime_album_gain_db(),
             *gain_db,
             request.settings.dsd.reference_delivery_selected()
-                && request.settings.dsd.from_dsd.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Auto
-                && request.settings.dsd.from_dsd.resolved_auto_gain_scope(
+                && request.settings.dsd.from_dsd.reference_auto_gain_selected()
+                && request.settings.dsd.from_dsd.resolved_reference_gain_scope(
                     &reference_programme_scope(request, track),
-                ) == tonepoet_pipeline::TruePeakScope::Album,
+                ) == Some(tonepoet_pipeline::TruePeakScope::Album),
             "Reference DSD",
         ),
         TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } => (

@@ -375,6 +375,14 @@ impl DsdGainMode {
     }
 }
 
+/// UI selection for Reference normalization scope. This is presentation state;
+/// the pipeline stores `SampleGainPolicy` plus one automatic-scope flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsdReferenceScopeChoice {
+    Auto,
+    Track,
+}
+
 /// User-editable manual gain range for DSD-to-PCM conversions.
 /// Matches `DsdSettings::validate()` so the TUI cannot stage an invalid value.
 pub const DSD_TO_PCM_GAIN_DB_MIN: f32 = -24.0;
@@ -4320,7 +4328,7 @@ pub struct FormatState {
     /// Positive margin below 0 dBTP used by Reference automatic gain.
     pub dsd_reference_margin_dbtp: DbNano,
     /// Dynamic album/track selection or explicit track override for Reference auto gain.
-    pub dsd_reference_scope: PillState<tonepoet_pipeline::DsdReferenceGainScope>,
+    pub dsd_reference_scope: PillState<DsdReferenceScopeChoice>,
     /// Whether the currently previewed source is DSD. Drives visibility and
     /// activation of DSD-to-PCM gain controls so they never appear for PCM sources.
     pub source_is_dsd: bool,
@@ -4608,8 +4616,8 @@ impl FormatState {
             (TruePeakScope::Album, "album"),
         ]);
         let dsd_reference_scope = PillState::new(vec![
-            (tonepoet_pipeline::DsdReferenceGainScope::Auto, "auto"),
-            (tonepoet_pipeline::DsdReferenceGainScope::Track, "track"),
+            (DsdReferenceScopeChoice::Auto, "auto"),
+            (DsdReferenceScopeChoice::Track, "track"),
         ]);
         let dsd_true_peak_scan_mode = PillState::new(vec![
             (TruePeakScanTier::Reference, "reference"),
@@ -5916,8 +5924,11 @@ impl FormatState {
         );
 
         self.dsd_gain_mode.set_all_enabled(false);
+        // Off is valid for both Custom and Reference. Set it once so the
+        // pathway-specific passes below cannot accidentally disable it again.
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::Off, gain_available);
         for mode in [
-            DsdGainMode::Off,
             DsdGainMode::TruePeakGuard,
             DsdGainMode::TruePeakNormalize,
             DsdGainMode::FixedGain,
@@ -5925,10 +5936,8 @@ impl FormatState {
             self.dsd_gain_mode
                 .set_enabled(&mode, gain_available && !reference_selected);
         }
-        for mode in [DsdGainMode::Off, DsdGainMode::ReferenceAuto] {
-            self.dsd_gain_mode
-                .set_enabled(&mode, reference_selected);
-        }
+        self.dsd_gain_mode
+            .set_enabled(&DsdGainMode::ReferenceAuto, reference_selected);
         self.dsd_reference_scope.set_all_enabled(reference_selected);
         if gain_available && !self.dsd_gain_mode.options[self.dsd_gain_mode.selected].enabled {
             let fallback = if reference_selected {
@@ -6410,7 +6419,7 @@ pub enum FocusedPill<'a> {
         margin_dbtp: &'a mut DbNano,
         gain_mode: &'a mut PillState<DsdGainMode>,
     },
-    DsdReferenceScope(&'a mut PillState<tonepoet_pipeline::DsdReferenceGainScope>),
+    DsdReferenceScope(&'a mut PillState<DsdReferenceScopeChoice>),
 }
 
 fn preserve_pcm_true_peak_mode(mode: &mut PillState<PcmGainMode>) {
@@ -19017,6 +19026,10 @@ mod dsd_gain_format_state_tests {
         state.field_focus = FormatField::ReplayGain;
         state.focus_next(false);
         assert_eq!(state.field_focus, FormatField::DsdPath);
+        state.focus_next(false);
+        assert_eq!(state.field_focus, FormatField::DsdCustomReconstruction);
+        state.focus_next(false);
+        assert_eq!(state.field_focus, FormatField::DsdCustomLowpass);
         state.focus_next(false);
         assert_eq!(state.field_focus, FormatField::DsdGain);
     }

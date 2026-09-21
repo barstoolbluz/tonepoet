@@ -391,13 +391,11 @@ pub fn analyze_file(
     // The legacy wrapper exception is intentionally whole-file only. A seeked
     // or bounded analysis does not establish that the decoder reached the
     // STREAMINFO terminal extent and therefore retains ordinary error handling.
-    let declared_wrapped_extent = if start_sample.is_none() && max_samples.is_none() {
-        crate::flac_envelope::wrapped_flac_extent(path)
-            .map_err(|error| format!("inspect FLAC wrapper: {error}"))?
-            .map(|extent| extent.sample_frames)
-    } else {
-        None
-    };
+    let wrapped_flac = crate::flac_envelope::WrappedFlacDecodeGuard::for_path(
+        path,
+        start_sample.is_none() && max_samples.is_none(),
+    )
+    .map_err(|error| format!("inspect FLAC wrapper: {error}"))?;
     let mut accepted_wrapped_eof = false;
     let mut reached_sample_limit = false;
 
@@ -406,7 +404,7 @@ pub fn analyze_file(
         match packet.read(&mut ictx) {
             Ok(()) => {}
             Err(ffmpeg::Error::Eof) => break,
-            Err(error) if declared_wrapped_extent == Some(total_decoded) => {
+            Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
                 accepted_wrapped_eof = true;
                 log::debug!(
                     "accepted legacy ID3-wrapped FLAC demux EOF after declared extent: path={}, frames={}, error={error}",
@@ -421,7 +419,7 @@ pub fn analyze_file(
             continue;
         }
         if let Err(error) = decoder.send_packet(&packet) {
-            if declared_wrapped_extent == Some(total_decoded) {
+            if wrapped_flac.accepts_post_extent_error(total_decoded) {
                 accepted_wrapped_eof = true;
                 log::debug!(
                     "accepted legacy ID3-wrapped FLAC packet EOF after declared extent: path={}, frames={}, error={error}",
@@ -437,15 +435,9 @@ pub fn analyze_file(
             match decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
                     let frame_samples = decoded.samples() as u64;
-                    let next_decoded = total_decoded
-                        .checked_add(frame_samples)
-                        .ok_or_else(|| "decoded sample-frame count overflow".to_string())?;
-                    if declared_wrapped_extent.is_some_and(|expected| next_decoded > expected) {
-                        return Err(format!(
-                            "ID3-wrapped FLAC decoder exceeded STREAMINFO extent: expected at most {} frames, decoded frame would reach {next_decoded}",
-                            declared_wrapped_extent.expect("checked Some"),
-                        ));
-                    }
+                    let next_decoded = wrapped_flac
+                        .checked_advance(total_decoded, frame_samples)
+                        .map_err(|error| error.to_string())?;
                     process_frame!();
                     total_decoded = next_decoded;
                     if total_decoded >= sample_limit {
@@ -456,7 +448,7 @@ pub fn analyze_file(
                 Err(ffmpeg::Error::Eof) => break,
                 Err(ffmpeg::Error::Other { errno })
                     if errno == ffmpeg::util::error::EAGAIN => break,
-                Err(error) if declared_wrapped_extent == Some(total_decoded) => {
+                Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
                     accepted_wrapped_eof = true;
                     log::debug!(
                         "accepted legacy ID3-wrapped FLAC decoder EOF after declared extent: path={}, frames={}, error={error}",
@@ -473,7 +465,7 @@ pub fn analyze_file(
     // Flush decoder — process remaining buffered frames.
     if !reached_sample_limit && !accepted_wrapped_eof {
         if let Err(error) = decoder.send_eof() {
-            if declared_wrapped_extent == Some(total_decoded) {
+            if wrapped_flac.accepts_post_extent_error(total_decoded) {
                 accepted_wrapped_eof = true;
                 log::debug!(
                     "accepted legacy ID3-wrapped FLAC flush EOF after declared extent: path={}, frames={}, error={error}",
@@ -490,15 +482,9 @@ pub fn analyze_file(
             match decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
                     let frame_samples = decoded.samples() as u64;
-                    let next_decoded = total_decoded
-                        .checked_add(frame_samples)
-                        .ok_or_else(|| "decoded sample-frame count overflow".to_string())?;
-                    if declared_wrapped_extent.is_some_and(|expected| next_decoded > expected) {
-                        return Err(format!(
-                            "ID3-wrapped FLAC decoder exceeded STREAMINFO extent: expected at most {} frames, decoded frame would reach {next_decoded}",
-                            declared_wrapped_extent.expect("checked Some"),
-                        ));
-                    }
+                    let next_decoded = wrapped_flac
+                        .checked_advance(total_decoded, frame_samples)
+                        .map_err(|error| error.to_string())?;
                     process_frame!();
                     total_decoded = next_decoded;
                 }
@@ -507,7 +493,7 @@ pub fn analyze_file(
                     if errno == ffmpeg::util::error::EAGAIN => {
                         return Err("decoder flush ended without clean EOF".to_string())
                     }
-                Err(error) if declared_wrapped_extent == Some(total_decoded) => {
+                Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
                     log::debug!(
                         "accepted legacy ID3-wrapped FLAC decoder EOF after declared extent: path={}, frames={}, error={error}",
                         path.display(),
@@ -520,13 +506,9 @@ pub fn analyze_file(
         }
     }
 
-    if let Some(expected) = declared_wrapped_extent {
-        if total_decoded != expected {
-            return Err(format!(
-                "ID3-wrapped FLAC decoded extent mismatch: STREAMINFO declares {expected} frames, decoded {total_decoded}"
-            ));
-        }
-    }
+    wrapped_flac
+        .validate_complete(total_decoded)
+        .map_err(|error| error.to_string())?;
 
     // Flush last partial block (reference: dr_rms divides by actual count).
     if block_sample_count > 0 {

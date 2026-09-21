@@ -82,7 +82,9 @@ The crate root re-exports the public items from these modules.
 - `DsdGeneralExportLevel`: `Native`, `NominalCompensated`, `ProtectedR64`, `NativeWithOffset { offset_db }`
 - `DsdToPcmSincSettings`: directional general DSD-to-PCM sinc parameters
 - `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
-- `DsdSourceSettings`: qualified Reference-delivery controls: `pathway`, `reference_policy`, `profile`, `gain_mode`, `auto_gain_margin_dbtp`, `auto_gain_scope`
+- `DsdSourceSettings`: qualified Reference-delivery controls: `pathway`, `reference_policy`, `profile`, `gain`, `automatic_gain_scope`
+  - Reference reuses `SampleGainPolicy` and admits only `Off` or `TruePeakNormalize`; the certified scan tier is `Reference`, and automatic album-vs-track selection is carried only by `automatic_gain_scope`.
+  - Methods: `reference_auto_gain_default`, `reference_auto_gain_margin_dbtp`, `resolved_reference_gain_scope`, `reference_auto_gain_selected`
 - `PcmTruePeakGainSettings`: `policy` plus runtime-only album gain authority
   - Methods: `is_true_peak`, `is_active`, `album_true_peak_gain_selected`, `target_dbtp`, `scope`, `scan_tier`, `fixed_gain_db`, policy/scope/tier setters, effective target and runtime album binding/clearing accessors
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`

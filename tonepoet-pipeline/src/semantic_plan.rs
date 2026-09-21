@@ -3338,6 +3338,12 @@ fn plan_typed_with_effects_and_policy(
                 ValueDomain::IntegerLattice(PcmBitDepth::Int24),
                 "wave64-pcm-s24le",
             ),
+            PcmBitDepth::Int32 => (
+                StoragePrecision::Pcm(PcmBitDepth::Int32),
+                ProcessingDomain::PcmInteger(PcmBitDepth::Int32),
+                ValueDomain::IntegerLattice(PcmBitDepth::Int32),
+                "wave64-pcm-s32le",
+            ),
             PcmBitDepth::Float32 => (
                 StoragePrecision::Pcm(PcmBitDepth::Float32),
                 ProcessingDomain::PcmFloating,

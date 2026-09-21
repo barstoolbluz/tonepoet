@@ -23,6 +23,103 @@ pub(crate) struct WrappedFlacExtent {
     pub(crate) sample_frames: u64,
 }
 
+/// Shared decode guard for the one legacy FLAC envelope whose trailing ID3v1
+/// bytes may make FFmpeg report a post-audio decoder error.
+///
+/// The compatibility rule is deliberately narrow: an error is accepted as EOF
+/// only after the independently verified STREAMINFO extent has been decoded.
+/// The same guard also prevents a decoder from producing samples beyond that
+/// extent and verifies exact completion before callers accept the decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WrappedFlacDecodeGuard {
+    declared_sample_frames: Option<u64>,
+}
+
+impl WrappedFlacDecodeGuard {
+    /// Inspect `path` only when the caller is performing a complete-file decode.
+    /// Seeked or bounded decodes must pass `whole_file = false`; they cannot prove
+    /// that an error occurred after the terminal STREAMINFO sample.
+    pub(crate) fn for_path(path: &Path, whole_file: bool) -> io::Result<Self> {
+        if !whole_file {
+            return Ok(Self::default());
+        }
+        Ok(Self {
+            declared_sample_frames: wrapped_flac_extent(path)?.map(|extent| extent.sample_frames),
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn declared_sample_frames(self) -> Option<u64> {
+        self.declared_sample_frames
+    }
+
+    /// Return true only for the exact post-extent error the compatibility path
+    /// authorizes. Callers use this for demux, packet-submit, flush, and receive
+    /// failures; ordinary FFmpeg EOF remains ordinary EOF.
+    #[must_use]
+    pub(crate) const fn accepts_post_extent_error(self, decoded_frames: u64) -> bool {
+        matches!(self.declared_sample_frames, Some(expected) if expected == decoded_frames)
+    }
+
+    /// Advance a decoded sample-frame count without allowing a verified wrapped
+    /// FLAC to exceed its STREAMINFO extent.
+    pub(crate) fn checked_advance(
+        self,
+        decoded_frames: u64,
+        frame_samples: u64,
+    ) -> Result<u64, WrappedFlacDecodeError> {
+        let next = decoded_frames
+            .checked_add(frame_samples)
+            .ok_or(WrappedFlacDecodeError::FrameCountOverflow)?;
+        if let Some(expected) = self.declared_sample_frames {
+            if next > expected {
+                return Err(WrappedFlacDecodeError::ExceededExtent { expected, next });
+            }
+        }
+        Ok(next)
+    }
+
+    /// Require exact completion for a verified wrapped FLAC. Ordinary inputs have
+    /// no declared extent here and therefore pass unchanged.
+    pub(crate) fn validate_complete(
+        self,
+        decoded_frames: u64,
+    ) -> Result<(), WrappedFlacDecodeError> {
+        if let Some(expected) = self.declared_sample_frames {
+            if decoded_frames != expected {
+                return Err(WrappedFlacDecodeError::IncompleteExtent {
+                    expected,
+                    decoded: decoded_frames,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrappedFlacDecodeError {
+    FrameCountOverflow,
+    ExceededExtent { expected: u64, next: u64 },
+    IncompleteExtent { expected: u64, decoded: u64 },
+}
+
+impl std::fmt::Display for WrappedFlacDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::FrameCountOverflow => f.write_str("decoded sample-frame count overflow"),
+            Self::ExceededExtent { expected, next } => write!(
+                f,
+                "ID3-wrapped FLAC decoder exceeded STREAMINFO extent: expected at most {expected} frames, decoded frame would reach {next}"
+            ),
+            Self::IncompleteExtent { expected, decoded } => write!(
+                f,
+                "ID3-wrapped FLAC decoded extent mismatch: STREAMINFO declares {expected} frames, decoded {decoded}"
+            ),
+        }
+    }
+}
+
 /// Return the declared FLAC extent only for the exact legacy envelope this
 /// compatibility path is intended to tolerate: ID3v2 prefix + native FLAC +
 /// ID3v1 trailer. Ordinary FLACs and ambiguous/malformed wrappers return
@@ -163,6 +260,53 @@ mod tests {
         file.seek(SeekFrom::Start(10 + 4 + 4 + 10)).unwrap();
         file.write_all(&value.to_be_bytes()).unwrap();
         assert_eq!(wrapped_flac_extent(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn decode_guard_accepts_errors_only_at_verified_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.flac");
+        File::create(&path)
+            .unwrap()
+            .write_all(&wrapped_fixture(48_000))
+            .unwrap();
+
+        let guard = WrappedFlacDecodeGuard::for_path(&path, true).unwrap();
+        assert_eq!(guard.declared_sample_frames(), Some(48_000));
+        assert!(!guard.accepts_post_extent_error(47_999));
+        assert!(guard.accepts_post_extent_error(48_000));
+        assert_eq!(guard.checked_advance(47_000, 1_000).unwrap(), 48_000);
+        assert!(matches!(
+            guard.checked_advance(48_000, 1),
+            Err(WrappedFlacDecodeError::ExceededExtent {
+                expected: 48_000,
+                next: 48_001
+            })
+        ));
+        assert!(guard.validate_complete(48_000).is_ok());
+        assert!(matches!(
+            guard.validate_complete(47_999),
+            Err(WrappedFlacDecodeError::IncompleteExtent {
+                expected: 48_000,
+                decoded: 47_999
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_guard_is_inert_for_non_whole_file_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.flac");
+        File::create(&path)
+            .unwrap()
+            .write_all(&wrapped_fixture(48_000))
+            .unwrap();
+
+        let guard = WrappedFlacDecodeGuard::for_path(&path, false).unwrap();
+        assert_eq!(guard.declared_sample_frames(), None);
+        assert!(!guard.accepts_post_extent_error(48_000));
+        assert_eq!(guard.checked_advance(48_000, 1).unwrap(), 48_001);
+        assert!(guard.validate_complete(0).is_ok());
     }
 
     #[test]

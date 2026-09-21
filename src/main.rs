@@ -1126,8 +1126,8 @@ fn apply_cli_dsd_reference_settings(
     true_peak_scan: Option<&str>,
 ) -> anyhow::Result<()> {
     use tonepoet_pipeline::{
-        DbNano, DsdReconstructionSelection, DsdReferenceGainScope, DsdSourceGainMode,
-        DsdSourcePathway, SampleGainPolicy, TruePeakScanTier, TruePeakScope,
+        DbNano, DsdReconstructionSelection, DsdSourcePathway, SampleGainPolicy,
+        TruePeakScanTier, TruePeakScope,
         PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
     };
 
@@ -1168,8 +1168,8 @@ fn apply_cli_dsd_reference_settings(
         }
     }
     let parsed_reference_scope = match reference_scope.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if value == "auto" => Some(DsdReferenceGainScope::Auto),
-        Some(value) if value == "track" => Some(DsdReferenceGainScope::Track),
+        Some(value) if value == "auto" => Some(true),
+        Some(value) if value == "track" => Some(false),
         Some(value) => anyhow::bail!(
             "invalid --dsd-reference-scope '{value}'; expected auto or track"
         ),
@@ -1236,19 +1236,28 @@ fn apply_cli_dsd_reference_settings(
             );
         }
         if let Some(token) = gain_token.as_deref() {
-            settings.dsd.from_dsd.gain_mode = match token {
-                "auto" => DsdSourceGainMode::Auto,
-                "off" => DsdSourceGainMode::Off,
+            settings.dsd.from_dsd.gain = match token {
+                "auto" => tonepoet_pipeline::DsdSourceSettings::reference_auto_gain_default(),
+                "off" => SampleGainPolicy::Off,
                 other => anyhow::bail!(
                     "invalid Reference --dsd-gain '{other}'; expected auto or off"
                 ),
             };
         }
         if let Some(margin) = parsed_margin {
-            settings.dsd.from_dsd.auto_gain_margin_dbtp = margin;
+            if settings.dsd.from_dsd.reference_auto_gain_selected() {
+                let target = DbNano::ZERO
+                    .checked_sub(margin)
+                    .expect("validated Reference margin cannot overflow");
+                settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_target(target);
+            }
         }
-        if let Some(scope) = parsed_reference_scope {
-            settings.dsd.from_dsd.auto_gain_scope = scope;
+        if let Some(automatic) = parsed_reference_scope {
+            settings.dsd.from_dsd.automatic_gain_scope = automatic;
+            if !automatic {
+                settings.dsd.from_dsd.gain =
+                    settings.dsd.from_dsd.gain.with_scope(TruePeakScope::Track);
+            }
         }
         settings.dsd.general_from_dsd.gain = SampleGainPolicy::Off;
         return Ok(());
@@ -1333,8 +1342,7 @@ fn apply_cli_dsd_reference_settings(
 mod dsd_reference_cli_settings_tests {
     use super::*;
     use tonepoet_pipeline::{
-        DbNano, DsdReferenceGainScope, DsdSourceGainMode, DsdSourcePathway,
-        SampleGainPolicy, TruePeakScanTier, TruePeakScope,
+        DsdSourcePathway, SampleGainPolicy, TruePeakScanTier, TruePeakScope,
     };
 
     fn apply(
@@ -1412,15 +1420,15 @@ mod dsd_reference_cli_settings_tests {
         )
         .unwrap();
         assert_eq!(settings.dsd.from_dsd.pathway, DsdSourcePathway::Reference);
-        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Auto);
         assert_eq!(
-            settings.dsd.from_dsd.auto_gain_margin_dbtp,
-            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN
+            settings.dsd.from_dsd.gain,
+            SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: "-1.000000000".parse().unwrap(),
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Reference,
+            }
         );
-        assert_eq!(
-            settings.dsd.from_dsd.auto_gain_scope,
-            DsdReferenceGainScope::Auto
-        );
+        assert!(settings.dsd.from_dsd.automatic_gain_scope);
         assert_eq!(settings.dsd.gain_policy(), SampleGainPolicy::Off);
     }
 
@@ -1439,15 +1447,15 @@ mod dsd_reference_cli_settings_tests {
             None,
         )
         .unwrap();
-        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Auto);
         assert_eq!(
-            settings.dsd.from_dsd.auto_gain_margin_dbtp,
-            "1.250000000".parse().unwrap()
+            settings.dsd.from_dsd.gain,
+            SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: "-1.250000000".parse().unwrap(),
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Reference,
+            }
         );
-        assert_eq!(
-            settings.dsd.from_dsd.auto_gain_scope,
-            DsdReferenceGainScope::Track
-        );
+        assert!(!settings.dsd.from_dsd.automatic_gain_scope);
     }
 
     #[test]
@@ -1465,7 +1473,7 @@ mod dsd_reference_cli_settings_tests {
             None,
         )
         .unwrap();
-        assert_eq!(settings.dsd.from_dsd.gain_mode, DsdSourceGainMode::Off);
+        assert_eq!(settings.dsd.from_dsd.gain, SampleGainPolicy::Off);
 
         let mut invalid = tonepoet_pipeline::PipelineSettings::default();
         let error = apply(

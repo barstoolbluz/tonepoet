@@ -571,7 +571,8 @@ mod manifest_merge_gap_tests {
     #[test]
     fn native_album_profiles_produce_distinct_legacy_manifest_settings_fingerprints() {
         use tonepoet_pipeline::{
-            TruePeakScope, DsdReconstructionSelection, DsdSettings, DsdSourceGainMode,
+            DsdReconstructionSelection, DsdSettings, SampleGainPolicy, TruePeakScanTier,
+            TruePeakScope,
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -584,9 +585,13 @@ mod manifest_merge_gap_tests {
         let settings_for = |profile| {
             let mut settings = PipelineSettings::default();
             settings.dsd = DsdSettings::reference();
-            settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
+            settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: "-1.000000000".parse().unwrap(),
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Reference,
+            };
+            settings.dsd.from_dsd.automatic_gain_scope = true;
             settings.dsd.from_dsd.profile = profile;
-            settings.dsd.set_true_peak_scope(TruePeakScope::Album);
             settings.dsd.bind_runtime_album_gain(
                 "-0.750000000".parse().unwrap(),
                 Some("-0.490000000".parse().unwrap()),

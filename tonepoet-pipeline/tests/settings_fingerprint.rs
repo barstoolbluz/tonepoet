@@ -67,11 +67,16 @@ fn phase2_gain_identity_paths_are_explicit() {
     assert_eq!(
         DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS,
         &[
+            "dsd.from_dsd.gain.mode",
+            "dsd.from_dsd.gain.target_dbtp",
+            "dsd.from_dsd.gain.scope",
+            "dsd.from_dsd.gain.scan",
+            "dsd.from_dsd.automatic_gain_scope",
             "dsd.general_from_dsd.gain.mode",
             "dsd.general_from_dsd.gain.target_dbtp",
             "dsd.general_from_dsd.gain.scope",
             "dsd.general_from_dsd.gain.scan",
-            "dsd.general_from_dsd.runtime_album_gain_db",
+            "dsd.runtime_album_gain_db",
         ]
     );
     assert_eq!(

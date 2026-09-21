@@ -40,7 +40,7 @@ use tonepoet_pipeline::{
     extract_single_loudnorm_report, plan_conversion, plan_reference_dsd,
     validate_reference_decode_mechanism, AudioCodec, AudioFormat,
     BitDepthTarget, ConversionPlan, DbNano, DsdReconstructionSelection,
-    DsdReferencePolicyVersion, DsdSourceGainMode, DsdSourceKind, DsdSourcePathway, FinalPcmContract, Finalization,
+    DsdReferencePolicyVersion, DsdSourceKind, DsdSourcePathway, FinalPcmContract, Finalization,
     MeasurementId, PcmBitDepth, PlanAction, PipelineSettings, PlanRequest,
     PlannedCommand, RateTarget,
     ReferenceDecodeAuthority,
@@ -49,8 +49,8 @@ use tonepoet_pipeline::{
     ReferenceStreamedWavCapacityEvidenceV2,
     ReferenceStreamedWavCapacityEvidenceV3,
     ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
-    ResolvedGainPolicy, ResolvedOutputTarget, SampleKind, SourceInfo, SourceRepresentationKind,
-    ToolIdentifier, TruePeakPurpose, WavPackMode,
+    ResolvedGainPolicy, ResolvedOutputTarget, SampleGainPolicy, SampleKind, SourceInfo, SourceRepresentationKind,
+    ToolIdentifier, TruePeakPurpose, TruePeakScanTier, TruePeakScope, WavPackMode,
     W64PcmExpectation, W64PcmFormatExpectation, W64SampleEncoding,
     inspect_exact_w64_pcm, validate_exact_w64_pcm,
     REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
@@ -93,6 +93,16 @@ const W64_RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00
 #[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 const W64_FACT_GUID: &[u8; 16] = b"fact\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
 const W64_DATA_GUID: &[u8; 16] = b"data\xf3\xac\xd3\x11\x8c\xd1\x00\xc0\x4f\x8e\xdb\x8a";
+
+fn reference_auto_gain(margin_dbtp: DbNano) -> SampleGainPolicy {
+    SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: DbNano::ZERO
+            .checked_sub(margin_dbtp)
+            .expect("Reference gain margin fixture must be representable"),
+        scope: TruePeakScope::Track,
+        scan: TruePeakScanTier::Reference,
+    }
+}
 
 fn selected() -> bool {
     std::env::var(GATE).as_deref() == Ok("1")
@@ -1113,8 +1123,7 @@ fn assert_qualification_decode_route_table() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavRiff,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Auto,
-        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
         None,
     );
     let carrier_summary = carrier_plan.reference.as_ref().expect("Reference summary");
@@ -2960,8 +2969,7 @@ fn planned_reference_source_cell(
     depth: PcmBitDepth,
     target: ResolvedOutputTarget,
     profile: DsdReconstructionSelection,
-    gain_mode: DsdSourceGainMode,
-    auto_gain_margin_dbtp: DbNano,
+    gain: SampleGainPolicy,
     compression_level: Option<u8>,
 ) -> ConversionPlan {
     let mut settings = PipelineSettings::default();
@@ -2971,8 +2979,7 @@ fn planned_reference_source_cell(
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = profile;
-    settings.dsd.from_dsd.gain_mode = gain_mode;
-    settings.dsd.from_dsd.auto_gain_margin_dbtp = auto_gain_margin_dbtp;
+    settings.dsd.from_dsd.gain = gain;
     settings.wavpack.hybrid = false;
     settings.wavpack.correction_file = false;
     if target == ResolvedOutputTarget::FlacNative {
@@ -3029,8 +3036,7 @@ fn planned_reference_cell(
     depth: PcmBitDepth,
     target: ResolvedOutputTarget,
     profile: DsdReconstructionSelection,
-    gain_mode: DsdSourceGainMode,
-    auto_gain_margin_dbtp: DbNano,
+    gain: SampleGainPolicy,
     compression_level: Option<u8>,
 ) -> ConversionPlan {
     planned_reference_source_cell(
@@ -3044,8 +3050,7 @@ fn planned_reference_cell(
         depth,
         target,
         profile,
-        gain_mode,
-        auto_gain_margin_dbtp,
+        gain,
         compression_level,
     )
 }
@@ -3445,7 +3450,7 @@ fn capacity_boundary_plan_result(
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
+    settings.dsd.from_dsd.gain = reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN);
     let request = PlanRequest {
         input_path: input.to_path_buf(),
         output_path: root.join(format!("capacity-{sample_frames}.w64")),
@@ -3591,8 +3596,7 @@ fn qualify_analyzer_carrier_contract() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Auto,
-        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -3729,7 +3733,7 @@ fn decoded_f64_samples(
 
 fn terminal_bound_q63(policy: ResolvedGainPolicy) -> u64 {
     match policy {
-        ResolvedGainPolicy::Auto { terminal_bound, .. }
+        ResolvedGainPolicy::TruePeakNormalize { terminal_bound, .. }
         | ResolvedGainPolicy::Off { terminal_bound, .. } => {
             terminal_bound.max_added_peak_fs_q63_ceil
         }
@@ -4076,8 +4080,7 @@ fn qualify_lossless_package_cells(
                             depth,
                             target,
                             DsdReconstructionSelection::Reference,
-                            DsdSourceGainMode::Auto,
-                            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+                            reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
                             level,
                         );
                         let summary = plan.reference.as_ref().expect("Reference summary");
@@ -4090,8 +4093,8 @@ fn qualify_lossless_package_cells(
                             false,
                         );
                         let selected_gain = match summary.gain_policy {
-                            ResolvedGainPolicy::Auto { bound_gain: Some(gain), .. } => gain,
-                            ResolvedGainPolicy::Auto { bound_gain: None, .. } => DbNano::ZERO,
+                            ResolvedGainPolicy::TruePeakNormalize { bound_gain: Some(gain), .. } => gain,
+                            ResolvedGainPolicy::TruePeakNormalize { bound_gain: None, .. } => DbNano::ZERO,
                             ResolvedGainPolicy::Off { .. } => DbNano::ZERO,
                         };
                         let terminal = tonepoet_pipeline::lower_reference_terminal_command(
@@ -4591,7 +4594,7 @@ fn gain_arg(args: &[String]) -> Option<&str> {
 fn gain_policy_evidence(policy: ResolvedGainPolicy, terminal_args: &[String]) -> Value {
     let applied_gain_db = gain_arg(terminal_args).map(str::to_owned);
     match policy {
-        ResolvedGainPolicy::Auto {
+        ResolvedGainPolicy::TruePeakNormalize {
             target_dbtp,
             scope,
             bound_gain,
@@ -4661,8 +4664,7 @@ fn qualify_true_peak_analyzer_authority() -> Value {
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Auto,
-        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
         None,
     );
     let policy = plan.reference.as_ref().expect("Reference summary").gain_policy;
@@ -4735,7 +4737,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     let root = TempDir::new().expect("common Reference gain-chain tempdir");
     let source = root.path().join("source-placeholder.dsf");
 
-    let make_plan = |mode: DsdSourceGainMode| {
+    let make_plan = |gain: SampleGainPolicy| {
         planned_reference_cell(
             root.path(),
             &source,
@@ -4745,8 +4747,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
             PcmBitDepth::Float64,
             ResolvedOutputTarget::WavW64,
             DsdReconstructionSelection::Reference,
-            mode,
-            DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+            gain,
             None,
         )
     };
@@ -4775,7 +4776,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
         certificate_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(b"phase5-gain-certificate"),
     };
 
-    let auto_plan = make_plan(DsdSourceGainMode::Auto);
+    let auto_plan = make_plan(reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN));
     let auto_summary = auto_plan.reference.as_ref().expect("auto summary");
     let auto = tonepoet_pipeline::resolve_reference_certified_gain(
         &make_pre(0.25),
@@ -4785,7 +4786,7 @@ fn qualify_production_measurement_gain_terminal_chain() -> Value {
     .expect("Reference Auto gain resolves");
     assert!(auto.selected_gain <= auto.requested_gain);
 
-    let off_plan = make_plan(DsdSourceGainMode::Off);
+    let off_plan = make_plan(SampleGainPolicy::Off);
     let off_summary = off_plan.reference.as_ref().expect("off summary");
     let off = tonepoet_pipeline::resolve_reference_certified_gain(
         &make_pre(0.10),
@@ -5273,8 +5274,7 @@ fn planned_render_command(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         selection,
-        DsdSourceGainMode::Auto,
-        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");
@@ -5393,8 +5393,7 @@ fn assert_planned_w64_bridge(
         PcmBitDepth::Float64,
         ResolvedOutputTarget::WavW64,
         DsdReconstructionSelection::Reference,
-        DsdSourceGainMode::Auto,
-        DbNano::DEFAULT_REFERENCE_AUTO_MARGIN,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_AUTO_MARGIN),
         None,
     );
     let summary = plan.reference.as_ref().expect("Reference summary");

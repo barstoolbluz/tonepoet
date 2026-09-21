@@ -1191,6 +1191,14 @@ pub enum TrackSourceRef {
     /// barrier binds one common scalar; final Reference execution reuses this
     /// exact carrier and still performs terminal realization plus the
     /// independent post-terminal certified acceptance scan.
+    ///
+    /// This intentionally is not folded into `DsdTruePeakCarrier`. That
+    /// carrier is headerless PCM after the Custom pre-gain graph and owns a
+    /// charged terminal candidate. Reference instead retains the exact Wave64
+    /// bytes that were certified, binds their content/plan digests and full
+    /// observation, and re-derives its terminal plan before the independent
+    /// post-terminal certification. A shared variant would require mutually
+    /// exclusive optional state and weaken those fail-closed invariants.
     DsdReferenceAutoGainCarrier {
         path: PathBuf,
         /// Original user-visible DSD source used for provenance and metadata.

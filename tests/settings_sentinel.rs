@@ -24,7 +24,7 @@ use tonepoet_pipeline::{
     AacProfile, AacSettings, AudioFormat, BitDepthTarget, DbNano, DitherType,
     DsdFilterPreset, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdLowpassMethod,
     DsdNoiseShaper, DsdReconstructionSelection, DsdReferencePolicyVersion, DsdSettings,
-    DsdSourceGainMode, DsdSourcePathway, GainCompensation, MetadataSettings, ModulatorOrder,
+    DsdSourcePathway, GainCompensation, MetadataSettings, ModulatorOrder,
     Mp3Mode, Mp3Settings, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth,
     PipelineSettings, PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings,
     ResampleQuality, SampleGainPolicy, SoxResamplerSettings, SoxSincPhase,
@@ -140,9 +140,12 @@ fn rich_common_settings() -> PipelineSettings {
     // propagates every stored field without making them execution claims.
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
-    settings.dsd.from_dsd.auto_gain_margin_dbtp = db("1.250000000");
-    settings.dsd.from_dsd.auto_gain_scope = tonepoet_pipeline::DsdReferenceGainScope::Track;
+    settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-1.250000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Standard,
+    };
+    settings.dsd.from_dsd.automatic_gain_scope = false;
 
     settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
     settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
@@ -194,6 +197,12 @@ fn custom_fixed_sentinel() -> PipelineSettings {
     settings.dsd.set_gain_policy(SampleGainPolicy::FixedGain {
         gain_db: db("1.250000000"),
     });
+    // This setting is dormant while Custom is selected, but remains part of
+    // raw settings identity. Exercise the non-default mode/gain slot without
+    // inventing a second Reference-only gain schema.
+    settings.dsd.from_dsd.gain = SampleGainPolicy::FixedGain {
+        gain_db: db("1.750000000"),
+    };
     settings.pcm_true_peak.policy = SampleGainPolicy::FixedGain {
         gain_db: db("2.250000000"),
     };
@@ -207,9 +216,12 @@ fn reference_sentinel() -> PipelineSettings {
     settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Auto;
-    settings.dsd.from_dsd.auto_gain_margin_dbtp = db("1.250000000");
-    settings.dsd.from_dsd.auto_gain_scope = tonepoet_pipeline::DsdReferenceGainScope::Track;
+    settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-1.250000000"),
+        scope: TruePeakScope::Track,
+        scan: TruePeakScanTier::Reference,
+    };
+    settings.dsd.from_dsd.automatic_gain_scope = false;
     // Explicit Reference delivery is mutually exclusive with the Custom DSD
     // sample-domain gain policy. The Custom sentinels above cover those fields.
     settings.dsd.set_gain_policy(SampleGainPolicy::Off);
@@ -266,7 +278,7 @@ fn canonical_field_value(settings: &PipelineSettings, path: &str) -> serde_json:
                 serde_json::Value::Null
             }
         }
-        "dsd.general_from_dsd.runtime_album_gain_db" => serde_json::to_value(
+        "dsd.runtime_album_gain_db" => serde_json::to_value(
             settings.dsd.runtime_album_gain_db(),
         )
         .expect("serialize DSD runtime gain"),

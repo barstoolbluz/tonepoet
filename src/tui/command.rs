@@ -16049,8 +16049,8 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         },
         "dsd-reference-scope" => {
             let scope = match value.to_ascii_lowercase().as_str() {
-                "auto" => Some(tonepoet_pipeline::DsdReferenceGainScope::Auto),
-                "track" => Some(tonepoet_pipeline::DsdReferenceGainScope::Track),
+                "auto" => Some(DsdReferenceScopeChoice::Auto),
+                "track" => Some(DsdReferenceScopeChoice::Track),
                 _ => None,
             };
             if let Some(scope) = scope {

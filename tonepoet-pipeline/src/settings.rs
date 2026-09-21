@@ -13,8 +13,8 @@ use crate::enums::{
     SsrcPdfType, SsrcProfile, WavPackMode,
 };
 use crate::dsd_reference::{
-    reference_error_text, DbNano, DsdReferencePolicyVersion,
-    DsdReferenceGainScope, DsdSourceGainMode, DsdSourcePathway, DsdSourceSettings, ReferenceErrorCode,
+    reference_error_text, DbNano, DsdReferencePolicyVersion, DsdSourcePathway, DsdSourceSettings,
+    ReferenceErrorCode,
 };
 use crate::error::{PlanningError, Result};
 
@@ -509,22 +509,44 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                     reference_error_text(ReferenceErrorCode::Toolchain),
                 ));
             }
-            settings.from_dsd.auto_gain_target_dbtp()?;
-            if settings.from_dsd.gain_mode == DsdSourceGainMode::Off
-                && settings.runtime_album_gain_db().is_some()
-            {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.runtime_album_gain_db",
-                    "Reference gain-off cannot carry submitted-album gain authority",
-                ));
-            }
-            if settings.from_dsd.auto_gain_scope == DsdReferenceGainScope::Track
-                && settings.runtime_album_gain_db().is_some()
-            {
-                return Err(PlanningError::invalid_settings(
-                    "dsd.runtime_album_gain_db",
-                    "Track-scoped Reference auto gain cannot carry submitted-album gain authority",
-                ));
+            match settings.from_dsd.gain {
+                SampleGainPolicy::Off => {
+                    if settings.runtime_album_gain_db().is_some() {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.runtime_album_gain_db",
+                            "Reference gain-off cannot carry submitted-album gain authority",
+                        ));
+                    }
+                }
+                SampleGainPolicy::TruePeakNormalize { scope, scan, .. } => {
+                    settings.from_dsd.reference_auto_gain_margin_dbtp()?;
+                    if scan != crate::enums::TruePeakScanTier::Reference {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.from_dsd.gain.scan",
+                            "Reference true-peak normalization requires the Reference certified scan tier",
+                        ));
+                    }
+                    if scope != crate::enums::TruePeakScope::Track {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.from_dsd.gain.scope",
+                            "Reference stores Track as its canonical scope; automatic album scope is selected by automatic_gain_scope",
+                        ));
+                    }
+                    if !settings.from_dsd.automatic_gain_scope
+                        && settings.runtime_album_gain_db().is_some()
+                    {
+                        return Err(PlanningError::invalid_settings(
+                            "dsd.runtime_album_gain_db",
+                            "Track-scoped Reference true-peak normalization cannot carry submitted-album gain authority",
+                        ));
+                    }
+                }
+                SampleGainPolicy::TruePeakGuard { .. } | SampleGainPolicy::FixedGain { .. } => {
+                    return Err(PlanningError::invalid_settings(
+                        "dsd.from_dsd.gain",
+                        "Reference delivery accepts only true-peak normalize or off",
+                    ));
+                }
             }
         }
     }
@@ -1244,8 +1266,8 @@ impl DsdSettings {
     #[must_use]
     pub const fn reference_auto_album_gain_possible(&self) -> bool {
         matches!(self.from_dsd.pathway, DsdSourcePathway::Reference)
-            && matches!(self.from_dsd.gain_mode, DsdSourceGainMode::Auto)
-            && matches!(self.from_dsd.auto_gain_scope, DsdReferenceGainScope::Auto)
+            && matches!(self.from_dsd.gain, SampleGainPolicy::TruePeakNormalize { .. })
+            && self.from_dsd.automatic_gain_scope
     }
 
     /// Ordinary DSD gain policy.
