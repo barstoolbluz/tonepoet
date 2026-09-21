@@ -3,12 +3,19 @@
 //! Some older rippers prepend an ID3v2 tag and append an ID3v1 `TAG` block
 //! around an otherwise valid native FLAC stream. FFmpeg can decode the FLAC
 //! audio correctly and then report the trailing ID3v1 bytes as invalid FLAC
-//! frame data. The helpers here authorize treating that *post-extent* decoder
-//! error as EOF only when the wrapper shape and STREAMINFO sample extent are
-//! both independently verified.
+//! frame data. A stream copy may discard the ID3v2 prefix while retaining the
+//! trailer, so decode authorization follows the file actually being read, not
+//! the shape of the original source.
+//!
+//! The helpers here authorize treating a *post-extent* decoder error as EOF
+//! only when a terminal ID3v1 block and the STREAMINFO sample extent are both
+//! independently verified. Publication cleanup remains narrower: it is only
+//! offered when the conversion source has the full legacy ID3v2 + FLAC + ID3v1
+//! envelope.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::Path;
 
 const ID3V2_HEADER_LEN: u64 = 10;
@@ -23,8 +30,16 @@ pub(crate) struct WrappedFlacExtent {
     pub(crate) sample_frames: u64,
 }
 
-/// Shared decode guard for the one legacy FLAC envelope whose trailing ID3v1
-/// bytes may make FFmpeg report a post-audio decoder error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlacEnvelopeLayout {
+    file_len: u64,
+    flac_offset: u64,
+    sample_frames: Option<u64>,
+    has_id3v1_trailer: bool,
+}
+
+/// Shared decode guard for a native FLAC stream whose trailing ID3v1 bytes may
+/// make FFmpeg report a post-audio decoder error.
 ///
 /// The compatibility rule is deliberately narrow: an error is accepted as EOF
 /// only after the independently verified STREAMINFO extent has been decoded.
@@ -44,7 +59,8 @@ impl WrappedFlacDecodeGuard {
             return Ok(Self::default());
         }
         Ok(Self {
-            declared_sample_frames: wrapped_flac_extent(path)?.map(|extent| extent.sample_frames),
+            declared_sample_frames: decode_guard_flac_extent(path)?
+                .map(|extent| extent.sample_frames),
         })
     }
 
@@ -124,31 +140,143 @@ impl std::fmt::Display for WrappedFlacDecodeError {
 /// compatibility path is intended to tolerate: ID3v2 prefix + native FLAC +
 /// ID3v1 trailer. Ordinary FLACs and ambiguous/malformed wrappers return
 /// `Ok(None)` and therefore retain normal decoder-error handling.
+///
+/// Production goes through [`WrappedFlacDecodeGuard::for_path`]; this narrow
+/// recognizer is kept for the tests that pin the exact source envelope.
+#[cfg(test)]
 pub(crate) fn wrapped_flac_extent(path: &Path) -> io::Result<Option<WrappedFlacExtent>> {
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
-    if len < ID3V2_HEADER_LEN + 4 + 4 + STREAMINFO_LEN as u64 + ID3V1_LEN {
-        return Ok(None);
-    }
-
-    let mut id3v2 = [0_u8; ID3V2_HEADER_LEN as usize];
-    file.read_exact(&mut id3v2)?;
-    if &id3v2[..3] != b"ID3" {
-        return Ok(None);
-    }
-    let Some(tag_payload_len) = synchsafe_u28(&id3v2[6..10]) else {
+    let Some(layout) = inspect_flac_envelope(path)? else {
         return Ok(None);
     };
-    let footer_len = if id3v2[5] & 0x10 != 0 { 10_u64 } else { 0_u64 };
-    let prefix_len = ID3V2_HEADER_LEN
-        .checked_add(u64::from(tag_payload_len))
-        .and_then(|value| value.checked_add(footer_len))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ID3v2 extent overflow"))?;
-    if prefix_len + 4 + 4 + STREAMINFO_LEN as u64 + ID3V1_LEN > len {
+    if layout.flac_offset == 0 || !layout.has_id3v1_trailer {
+        return Ok(None);
+    }
+    let Some(sample_frames) = layout.sample_frames else {
+        return Ok(None);
+    };
+    Ok(Some(WrappedFlacExtent {
+        sample_frames,
+    }))
+}
+
+/// Return the byte range that should be retained when publishing a FLAC
+/// converted from an exact legacy ID3v2 + FLAC + ID3v1 source.
+///
+/// This is deliberately provenance-gated by the source. The converted output
+/// may still have both wrappers, or FFmpeg may already have dropped the ID3v2
+/// prefix while retaining the terminal ID3v1 block. A terminal block is
+/// stripped only when its complete 128 bytes match the source trailer, so an
+/// unrelated terminal `TAG` signature is never silently removed.
+pub(crate) fn wrapped_flac_normalization_range(
+    source: &Path,
+    converted: &Path,
+) -> io::Result<Option<Range<u64>>> {
+    let Some(source_layout) = inspect_flac_envelope(source)? else {
+        return Ok(None);
+    };
+    if source_layout.flac_offset == 0 || !source_layout.has_id3v1_trailer {
         return Ok(None);
     }
 
-    file.seek(SeekFrom::Start(prefix_len))?;
+    let Some(converted_layout) = inspect_flac_envelope(converted)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "converted output is not a structurally recognizable native FLAC: {}",
+                converted.display()
+            ),
+        ));
+    };
+
+    let mut end = converted_layout.file_len;
+    if converted_layout.has_id3v1_trailer {
+        let source_tag = read_id3v1_trailer(source, source_layout.file_len)?;
+        let converted_tag = read_id3v1_trailer(converted, converted_layout.file_len)?;
+        if source_tag != converted_tag {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "converted FLAC has an unexpected terminal ID3v1 block: {}",
+                    converted.display()
+                ),
+            ));
+        }
+        end = end.checked_sub(ID3V1_LEN).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ID3v1 trailer extent underflow")
+        })?;
+    }
+
+    let start = converted_layout.flac_offset;
+    if start == 0 && end == converted_layout.file_len {
+        return Ok(None);
+    }
+    if end <= start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "converted FLAC wrapper bounds are invalid: {}..{} in {}",
+                start,
+                end,
+                converted.display()
+            ),
+        ));
+    }
+    Ok(Some(start..end))
+}
+
+fn decode_guard_flac_extent(path: &Path) -> io::Result<Option<WrappedFlacExtent>> {
+    let Some(layout) = inspect_flac_envelope(path)? else {
+        return Ok(None);
+    };
+    if !layout.has_id3v1_trailer {
+        return Ok(None);
+    }
+    let Some(sample_frames) = layout.sample_frames else {
+        return Ok(None);
+    };
+    Ok(Some(WrappedFlacExtent {
+        sample_frames,
+    }))
+}
+
+fn inspect_flac_envelope(path: &Path) -> io::Result<Option<FlacEnvelopeLayout>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let minimum_flac_len = 4 + 4 + STREAMINFO_LEN as u64;
+    if file_len < minimum_flac_len {
+        return Ok(None);
+    }
+
+    let mut prefix_header = [0_u8; ID3V2_HEADER_LEN as usize];
+    let prefix_probe_len = usize::try_from(file_len.min(ID3V2_HEADER_LEN))
+        .expect("bounded ID3v2 prefix probe fits usize");
+    file.read_exact(&mut prefix_header[..prefix_probe_len])?;
+    let flac_offset = if prefix_probe_len == ID3V2_HEADER_LEN as usize
+        && &prefix_header[..3] == b"ID3"
+    {
+        let Some(tag_payload_len) = synchsafe_u28(&prefix_header[6..10]) else {
+            return Ok(None);
+        };
+        let footer_len = if prefix_header[5] & 0x10 != 0 {
+            ID3V2_HEADER_LEN
+        } else {
+            0
+        };
+        ID3V2_HEADER_LEN
+            .checked_add(u64::from(tag_payload_len))
+            .and_then(|value| value.checked_add(footer_len))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ID3v2 extent overflow"))?
+    } else {
+        0
+    };
+    if flac_offset
+        .checked_add(minimum_flac_len)
+        .map_or(true, |minimum_end| minimum_end > file_len)
+    {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(flac_offset))?;
     let mut marker = [0_u8; 4];
     file.read_exact(&mut marker)?;
     if &marker != FLAC_MARKER {
@@ -167,21 +295,41 @@ pub(crate) fn wrapped_flac_extent(path: &Path) -> io::Result<Option<WrappedFlacE
     let mut streaminfo = [0_u8; STREAMINFO_LEN];
     file.read_exact(&mut streaminfo)?;
     let packed = u64::from_be_bytes(streaminfo[10..18].try_into().expect("fixed STREAMINFO slice"));
-    let sample_frames = packed & 0x0f_ffff_ffff;
-    if sample_frames == 0 {
-        // FLAC permits an unknown total-samples field. It cannot authorize the
-        // narrow post-extent EOF exception because there is no exact extent.
-        return Ok(None);
-    }
+    let declared_sample_frames = packed & 0x0f_ffff_ffff;
+    // FLAC permits zero for an unknown total-samples field. Structural
+    // publication cleanup does not need a decoded-sample claim, but the decode
+    // guard does and therefore rejects `None` at its own boundary.
+    let sample_frames = (declared_sample_frames != 0).then_some(declared_sample_frames);
 
-    file.seek(SeekFrom::End(-(ID3V1_LEN as i64)))?;
-    let mut tag = [0_u8; 3];
-    file.read_exact(&mut tag)?;
-    if &tag != b"TAG" {
-        return Ok(None);
-    }
+    let has_id3v1_trailer = if file_len >= ID3V1_LEN {
+        file.seek(SeekFrom::End(-(ID3V1_LEN as i64)))?;
+        let mut tag = [0_u8; 3];
+        file.read_exact(&mut tag)?;
+        &tag == b"TAG"
+    } else {
+        false
+    };
 
-    Ok(Some(WrappedFlacExtent { sample_frames }))
+    Ok(Some(FlacEnvelopeLayout {
+        file_len,
+        flac_offset,
+        sample_frames,
+        has_id3v1_trailer,
+    }))
+}
+
+fn read_id3v1_trailer(path: &Path, file_len: u64) -> io::Result<[u8; ID3V1_LEN as usize]> {
+    if file_len < ID3V1_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("FLAC is too short to contain an ID3v1 trailer: {}", path.display()),
+        ));
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(file_len - ID3V1_LEN))?;
+    let mut trailer = [0_u8; ID3V1_LEN as usize];
+    file.read_exact(&mut trailer)?;
+    Ok(trailer)
 }
 
 fn synchsafe_u28(bytes: &[u8]) -> Option<u32> {
@@ -291,6 +439,81 @@ mod tests {
                 decoded: 47_999
             })
         ));
+    }
+
+    #[test]
+    fn decode_guard_recognizes_stream_copy_that_dropped_only_id3v2_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream-copy.flac");
+        let bytes = wrapped_fixture(48_000);
+        File::create(&path)
+            .unwrap()
+            .write_all(&bytes[ID3V2_HEADER_LEN as usize..])
+            .unwrap();
+
+        assert_eq!(
+            wrapped_flac_extent(&path).unwrap(),
+            None,
+            "the exact source-wrapper recognizer must remain provenance-narrow"
+        );
+        let guard = WrappedFlacDecodeGuard::for_path(&path, true).unwrap();
+        assert_eq!(guard.declared_sample_frames(), Some(48_000));
+        assert!(guard.accepts_post_extent_error(48_000));
+        assert!(!guard.accepts_post_extent_error(47_999));
+    }
+
+    #[test]
+    fn normalization_range_strips_source_prefix_and_matching_trailer_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        let wrapped = wrapped_fixture(48_000);
+        File::create(&source).unwrap().write_all(&wrapped).unwrap();
+
+        let copied = dir.path().join("copied.flac");
+        File::create(&copied).unwrap().write_all(&wrapped).unwrap();
+        assert_eq!(
+            wrapped_flac_normalization_range(&source, &copied).unwrap(),
+            Some(ID3V2_HEADER_LEN..wrapped.len() as u64 - ID3V1_LEN)
+        );
+
+        let stream_copy = dir.path().join("stream-copy.flac");
+        let trailer_only = &wrapped[ID3V2_HEADER_LEN as usize..];
+        File::create(&stream_copy)
+            .unwrap()
+            .write_all(trailer_only)
+            .unwrap();
+        assert_eq!(
+            wrapped_flac_normalization_range(&source, &stream_copy).unwrap(),
+            Some(0..trailer_only.len() as u64 - ID3V1_LEN)
+        );
+
+        let clean = dir.path().join("clean.flac");
+        let clean_bytes = &wrapped
+            [ID3V2_HEADER_LEN as usize..wrapped.len() - ID3V1_LEN as usize];
+        File::create(&clean).unwrap().write_all(clean_bytes).unwrap();
+        assert_eq!(
+            wrapped_flac_normalization_range(&source, &clean).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn normalization_refuses_unrelated_terminal_tag_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        let wrapped = wrapped_fixture(48_000);
+        File::create(&source).unwrap().write_all(&wrapped).unwrap();
+
+        let converted = dir.path().join("converted.flac");
+        let mut altered = wrapped[ID3V2_HEADER_LEN as usize..].to_vec();
+        let trailer = altered.len() - ID3V1_LEN as usize;
+        altered[trailer + 3] = 0x7f;
+        File::create(&converted).unwrap().write_all(&altered).unwrap();
+
+        let error = wrapped_flac_normalization_range(&source, &converted)
+            .expect_err("mismatched terminal ID3v1 bytes must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unexpected terminal ID3v1 block"));
     }
 
     #[test]

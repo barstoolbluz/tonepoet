@@ -13689,6 +13689,28 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
             .expect("published FLAC audio");
         assert!(output_path.is_file(), "published audio artifact must exist");
 
+        let published_bytes = std::fs::read(&output_path).expect("read published FLAC");
+        assert_eq!(
+            published_bytes.get(..4),
+            Some(&b"fLaC"[..]),
+            "published FLAC must not retain the source ID3v2 prefix"
+        );
+        assert!(
+            published_bytes.len() < 128
+                || published_bytes[published_bytes.len() - 128..]
+                    .get(..3)
+                    != Some(&b"TAG"[..]),
+            "published FLAC must not retain the source ID3v1 trailer"
+        );
+        let published_guard =
+            crate::flac_envelope::WrappedFlacDecodeGuard::for_path(&output_path, true)
+                .expect("inspect published FLAC");
+        assert_eq!(
+            published_guard.declared_sample_frames(),
+            None,
+            "published FLAC must no longer need legacy decoder tolerance"
+        );
+
         let tags = format_tag_map(&ffprobe_json(&output_path));
         for key in ["REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK"] {
             assert!(
@@ -29743,6 +29765,113 @@ fn track_source_identity_path(track: &PreparedTrack) -> &Path {
     }
 }
 
+fn normalize_legacy_wrapped_flac_artifact_before_publish(
+    source_path: &Path,
+    staged_path: &Path,
+) -> io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Some(retained) =
+        crate::flac_envelope::wrapped_flac_normalization_range(source_path, staged_path)?
+    else {
+        return Ok(());
+    };
+    let retained_len = retained.end.checked_sub(retained.start).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy FLAC normalization range is inverted for {}",
+                staged_path.display()
+            ),
+        )
+    })?;
+    if retained_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy FLAC normalization would produce an empty output: {}",
+                staged_path.display()
+            ),
+        ));
+    }
+
+    let temp = metadata_rewrite_temp_path(staged_path)?;
+    let write_result = (|| -> io::Result<()> {
+        let mut input = fs::File::open(staged_path)?;
+        input.seek(SeekFrom::Start(retained.start))?;
+        let mut bounded = input.take(retained_len);
+        let mut output = fs::File::create(temp.path())?;
+        let copied = io::copy(&mut bounded, &mut output)?;
+        if copied != retained_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "legacy FLAC normalization copied {copied} of {retained_len} bytes from {}",
+                    staged_path.display()
+                ),
+            ));
+        }
+        output.sync_all()?;
+
+        if crate::flac_envelope::wrapped_flac_normalization_range(source_path, temp.path())?
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy FLAC normalization left an ID3 envelope on {}",
+                    staged_path.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        temp.cleanup_best_effort();
+        return Err(error);
+    }
+
+    replace_rewritten_metadata_file(staged_path, temp)?;
+    Ok(())
+}
+
+fn normalize_legacy_wrapped_flac_outputs_before_publish(
+    artifact_set: &ArtifactSet,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> io::Result<()> {
+    if req.settings.target_format != PlannerAudioFormat::Flac {
+        return Ok(());
+    }
+    let AudioArtifacts::Tracks(tracks) = &artifact_set.audio else {
+        // Merged outputs are newly authored carriers rather than byte-preserved
+        // single-file conversions, so source-envelope provenance does not apply.
+        return Ok(());
+    };
+
+    let source_by_id: BTreeMap<TrackId, &PreparedTrack> = source
+        .tracks
+        .iter()
+        .map(|track| (track.id.clone(), track))
+        .collect();
+    for artifact in tracks {
+        let prepared = source_by_id.get(&artifact.track_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "published track {:?} has no corresponding prepared source track",
+                    artifact.track_id
+                ),
+            )
+        })?;
+        normalize_legacy_wrapped_flac_artifact_before_publish(
+            track_source_identity_path(prepared),
+            &artifact.staged_path,
+        )?;
+    }
+    Ok(())
+}
+
 
 // ===========================================================================
 // Scheduler split points
@@ -42404,6 +42533,38 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             ))
             .await;
         }
+        if let Err(err) = normalize_legacy_wrapped_flac_outputs_before_publish(
+            artifact_set,
+            &source_value,
+            &req,
+        ) {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(format!(
+                    "failed to normalize legacy ID3-wrapped FLAC output: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            current_outcome =
+                push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages: stages_from(&current_outcome),
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return Box::pin(finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                current_outcome,
+            ))
+            .await;
+        }
     }
 
     // Native Reference publication always carries manifest-v2 authority.
@@ -43548,6 +43709,35 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
             return finalize_report(
                 &req, reporter, source, plan, artifacts, published, current_outcome,
+            )
+            .await;
+        }
+        if let Err(err) =
+            normalize_legacy_wrapped_flac_outputs_before_publish(artifact_set, source_ref, &req)
+        {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(format!(
+                    "failed to normalize legacy ID3-wrapped FLAC output: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages,
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                current_outcome,
             )
             .await;
         }

@@ -744,8 +744,25 @@ struct MatrixCase {
     extra_tools: &'static [&'static str],
 }
 
-#[tokio::test]
-async fn supported_pcm_depth_format_cells_publish_exact_requested_representation() {
+/// This cell matrix drives the full pipeline many times and overflows the
+/// 2 MiB default test-thread stack. Production runs the pipeline on workers
+/// with `CONVERSION_RUNTIME_WORKER_STACK_BYTES`, so run the body on such a
+/// worker rather than on the test thread.
+#[test]
+fn supported_pcm_depth_format_cells_publish_exact_requested_representation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+        .build()
+        .expect("depth matrix runtime");
+    runtime.block_on(async {
+        tokio::spawn(supported_pcm_depth_format_cells_publish_exact_requested_representation_body())
+            .await
+            .expect("depth matrix body");
+    });
+}
+
+async fn supported_pcm_depth_format_cells_publish_exact_requested_representation_body() {
     const TEST: &str = "supported_pcm_depth_format_cells_publish_exact_requested_representation";
     if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe"]) {
         return;

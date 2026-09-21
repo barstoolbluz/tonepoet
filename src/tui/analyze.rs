@@ -820,6 +820,23 @@ mod loudness_status_tests {
     }
 
     #[test]
+    fn analyze_accepts_id3v1_trailer_only_stream_copy() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let bytes = std::fs::read(&source).expect("read wrapped FLAC fixture");
+        assert!(bytes.starts_with(b"ID3"));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staged = temp.path().join("stream-copy.flac");
+        std::fs::write(&staged, &bytes[10..]).expect("write trailer-only staged FLAC");
+
+        let result = analyze_file(&staged, None, None)
+            .expect(":analyze must accept a verified trailer-only native FLAC stream copy");
+        assert_eq!(result.sample_rate, 48_000);
+        assert_eq!(result.channels, 2);
+        assert!((result.duration_secs - 1.0).abs() < 0.01);
+    }
+
+    #[test]
     fn native_unavailability_maps_without_collapsing_reasons() {
         use crate::convert::replaygain::MathematicalUnavailability as Native;
 

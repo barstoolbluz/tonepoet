@@ -43,7 +43,7 @@ use tonepoet_pipeline::{
     DsdReferencePolicyVersion, DsdSourceKind, DsdSourcePathway, FinalPcmContract, Finalization,
     MeasurementId, PcmBitDepth, PlanAction, PipelineSettings, PlanRequest,
     PlannedCommand, RateTarget,
-    ReferenceDecodeAuthority,
+    ReferenceDecodeAuthority, ReferenceDecodeRoleClass,
     ReferenceDecodeMechanism, ReferenceDecodedCarrier, ReferenceDecodedCarrierSelector,
     ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
     ReferenceStreamedWavCapacityEvidenceV2,
@@ -1006,13 +1006,18 @@ fn post_metadata_decode_authority(
 }
 
 fn assert_qualification_decode_route_table() -> Value {
-    assert_eq!(REFERENCE_DECODE_ROUTE_RULES.len(), 16);
     let int24 = FinalPcmContract {
         sample_rate_hz: 176_400,
         channels: 2,
         sample_kind: SampleKind::SignedInteger,
         bit_depth: PcmBitDepth::Int24,
         dither: ReferenceDither::Tpdf,
+    };
+    let int32 = FinalPcmContract {
+        bit_depth: PcmBitDepth::Int32,
+        // Int32 Reference terminals carry no dither (production rule).
+        dither: ReferenceDither::None,
+        ..int24
     };
     let float32 = FinalPcmContract {
         sample_kind: SampleKind::Float,
@@ -1032,6 +1037,10 @@ fn assert_qualification_decode_route_table() -> Value {
         ReferenceDecodeMechanism::DirectFfmpeg
     );
     assert_eq!(
+        qpcm_decode_authority(int32).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
+    assert_eq!(
         qpcm_decode_authority(float32).mechanism(),
         ReferenceDecodeMechanism::DirectFfmpeg
     );
@@ -1042,6 +1051,10 @@ fn assert_qualification_decode_route_table() -> Value {
     assert_eq!(
         packaged_decode_authority(ResolvedOutputTarget::WavW64, float64).mechanism(),
         ReferenceDecodeMechanism::SoxFloat64W64RawStream
+    );
+    assert_eq!(
+        packaged_decode_authority(ResolvedOutputTarget::WavW64, int32).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
     );
     assert_eq!(
         packaged_decode_authority(ResolvedOutputTarget::WavRiff, float64).mechanism(),
@@ -1056,6 +1069,10 @@ fn assert_qualification_decode_route_table() -> Value {
         ReferenceSampleHashEncoding::SignedInt24Le
     );
     assert_eq!(
+        qpcm_decode_authority(int32).hash_encoding(),
+        ReferenceSampleHashEncoding::SignedInt32Le
+    );
+    assert_eq!(
         qpcm_decode_authority(float32).hash_encoding(),
         ReferenceSampleHashEncoding::Float32Le
     );
@@ -1067,6 +1084,25 @@ fn assert_qualification_decode_route_table() -> Value {
         qpcm_decode_authority(float64).hash_format(),
         REFERENCE_SAMPLE_HASH_FORMAT
     );
+
+    for role in [
+        ReferenceDecodeRoleClass::TerminalQpcmW64,
+        ReferenceDecodeRoleClass::PackagedW64,
+        ReferenceDecodeRoleClass::PackagedNonW64,
+        ReferenceDecodeRoleClass::PostMetadataW64,
+        ReferenceDecodeRoleClass::PostMetadataNonW64,
+    ] {
+        assert!(
+            REFERENCE_DECODE_ROUTE_RULES.iter().any(|rule| {
+                rule.role_class() == role
+                    && rule.bit_depth() == PcmBitDepth::Int32
+                    && rule.mechanism() == ReferenceDecodeMechanism::DirectFfmpeg
+                    && rule.hash_encoding() == ReferenceSampleHashEncoding::SignedInt32Le
+            }),
+            "current Reference decode table must carry the Int32 direct-FFmpeg route for {}",
+            role.key(),
+        );
+    }
 
     let mut rejected_roles = Vec::new();
     for (role, role_key) in [
@@ -1926,7 +1962,7 @@ fn qualify_w64_exact_integrity_contract() -> Value {
     })
 }
 
-fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) {
+fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) -> Duration {
     let file = File::create(path).expect("create DSF qualification fixture");
     let mut writer = sacd_rs::dsf_writer::DsfWriter::new(
         file,
@@ -1940,6 +1976,16 @@ fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
         .write_interleaved(&payload)
         .expect("write deterministic DSF payload");
     writer.finish().expect("finish DSF qualification fixture");
+
+    let mut fixture = File::open(path).expect("reopen DSF qualification fixture");
+    let info = sacd_rs::dsd_file::inspect_dsf(&mut fixture)
+        .expect("inspect completed DSF qualification fixture");
+    assert_eq!(info.channel_count, channels);
+    assert_eq!(info.sample_rate, sample_rate_hz);
+    let sample_count = info
+        .sample_count_per_channel
+        .expect("DSF fixture declares per-channel sample count");
+    Duration::from_secs_f64(sample_count as f64 / f64::from(sample_rate_hz))
 }
 
 fn qualify_common_reference_candidate_execution() -> Value {
@@ -1953,7 +1999,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
     fs::create_dir_all(&work).expect("create candidate work root");
 
     let source = root.join("source.dsf");
-    write_dsf_reference_fixture(&source, 2, 2_822_400);
+    let source_duration = write_dsf_reference_fixture(&source, 2, 2_822_400);
     let source_kind = DsdSourceKind::DsfUncompressed;
     let materialized = qualify_reference_source_materialization(
         &source_kind,
@@ -1980,7 +2026,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
             source_representation: SourceRepresentationKind::Dsd,
             sample_kind: Some(SampleKind::Dsd),
             channels: Some(2),
-            duration: None,
+            duration: Some(source_duration),
             frame_extent: None,
             dsd_source_kind: Some(source_kind.clone()),
             audio_md5: None,
@@ -2229,7 +2275,7 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
     let output = temp.path().join("default-settings.flac");
     let work = temp.path().join("work");
     fs::create_dir_all(&work).expect("create default-settings smoke workdir");
-    write_dsf_reference_fixture(&input, 2, 2_822_400);
+    let _ = write_dsf_reference_fixture(&input, 2, 2_822_400);
 
     let settings = PipelineSettings::default();
     assert_eq!(
@@ -3982,8 +4028,8 @@ fn qualify_lossless_package_cells(
     let (track_metadata, album_metadata) = qualification_metadata();
     let planner_mono_source = temp.path().join("planner-mono.dsf");
     let planner_stereo_source = temp.path().join("planner-stereo.dsf");
-    write_dsf_reference_fixture(&planner_mono_source, 1, 2_822_400);
-    write_dsf_reference_fixture(&planner_stereo_source, 2, 2_822_400);
+    let _ = write_dsf_reference_fixture(&planner_mono_source, 1, 2_822_400);
+    let _ = write_dsf_reference_fixture(&planner_stereo_source, 2, 2_822_400);
 
     let mut case_count = 0_usize;
     let mut terminal_bound_cells = BTreeSet::new();

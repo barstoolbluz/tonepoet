@@ -1864,6 +1864,30 @@ mod tests {
     }
 
     #[test]
+    fn id3v1_trailer_only_stream_copy_observes_declared_extent_and_succeeds() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let bytes = std::fs::read(&source).expect("read wrapped FLAC fixture");
+        assert!(bytes.starts_with(b"ID3"));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staged = temp.path().join("stream-copy.flac");
+        std::fs::write(&staged, &bytes[10..]).expect("write trailer-only staged FLAC");
+
+        assert_eq!(
+            crate::flac_envelope::wrapped_flac_extent(&staged).expect("wrapper inspection"),
+            None,
+            "a trailer-only stream copy is not the exact legacy source wrapper"
+        );
+        let observation = observe_file(
+            &staged,
+            "id3v1-trailer-only-stream-copy".to_string(),
+            MetricDemand::IntegratedOnly,
+        )
+        .expect("ReplayGain reader must accept a verified trailer-only stream copy");
+        assert_eq!(observation.summary.loudness.real_frames, 48_000);
+    }
+
+    #[test]
     fn demand_is_derived_before_meter_construction() {
         assert_eq!(
             MetricDemand::from_requires_lra(false).native(),
