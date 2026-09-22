@@ -11901,7 +11901,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
