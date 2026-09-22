@@ -4216,7 +4216,11 @@ mod tests {
         let spec = ReconstructionSpec::for_id(ReconstructionId::Hq1024V1);
         let mut scanner = CertifiedScanner::new(spec, SearchPolicy::Reference9, 1);
         let coarse_start = 0_i128;
-        let coarse_end = 512_i128;
+        // The tile must be long enough that each plateau exceeds one cell's
+        // complete raw reconstruction support (about first_taps plus the tail
+        // span); 512 coarse cells leave plateaus shorter than that and no cell
+        // can be flat.
+        let coarse_end = 8_192_i128;
         let (raw_start, raw_end) = scanner.tile_raw_support(coarse_start, coarse_end);
         let transition = raw_start + (raw_end - raw_start) / 2;
         for index in raw_start..=raw_end {
