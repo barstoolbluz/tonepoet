@@ -1408,11 +1408,14 @@ fn synth_r64_fixture_duration(
     let mut args = vec![
         "-S".to_string(),
         "-D".to_string(),
-        "-n".to_string(),
+        // Input-format options precede the null input; placed after it they
+        // describe the output and sox_ng synthesizes at its 48 kHz default and
+        // resamples.
         "-r".to_string(),
         sample_rate_hz.to_string(),
         "-c".to_string(),
         channels.to_string(),
+        "-n".to_string(),
         "-t".to_string(),
         "w64".to_string(),
         "-e".to_string(),
@@ -6154,11 +6157,14 @@ fn planned_response_db(
     run(
         sox,
         &[
-            "-n".to_string(),
+            // Input-format options precede the null input; placed after it
+            // they describe the output and sox_ng synthesizes at its 48 kHz
+            // default and resamples, aliasing every tone above 24 kHz.
             "-r".to_string(),
             source_rate_hz.to_string(),
             "-c".to_string(),
             "1".to_string(),
+            "-n".to_string(),
             "-t".to_string(),
             "w64".to_string(),
             "-e".to_string(),
@@ -6210,11 +6216,11 @@ fn assert_planned_w64_bridge(
     run(
         sox,
         &[
-            "-n".to_string(),
             "-r".to_string(),
             "2822400".to_string(),
             "-c".to_string(),
             "2".to_string(),
+            "-n".to_string(),
             "-t".to_string(),
             "w64".to_string(),
             "-e".to_string(),
@@ -6273,11 +6279,336 @@ fn assert_planned_w64_bridge(
     fs::remove_file(&summary.r64_path).expect("remove W64 bridge output fixture");
 }
 
-fn qualify_production_source_front_end_integration() -> Value {
-    panic!(
-        "production source-front-end release qualification is unavailable: \
-         the qualification helper is absent from this source baseline"
+fn source_front_end_render_args_sha256(command: &PlannedCommand) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tonepoet-reference-source-front-end-render-argv/v1\0");
+    for arg in &command.args {
+        hasher.update((arg.len() as u64).to_be_bytes());
+        hasher.update(arg.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualify_source_front_end_planner_render(
+    sox: &Path,
+    ffmpeg: &Path,
+    case_root: &Path,
+    input: &Path,
+    source_rate_hz: u32,
+    channels: u16,
+    source_format: AudioFormat,
+    source_kind: DsdSourceKind,
+) -> String {
+    let plan = planned_reference_source_cell(
+        case_root,
+        input,
+        source_rate_hz,
+        // Policy v17 admits 88.2 kHz only from DSD64; DSD128 and DSD256 must
+        // target 176.4 kHz or higher (DSD-REF-P0-006). Keep each cell inside
+        // the admitted profile table.
+        match source_rate_hz {
+            2_822_400 => 88_200,
+            5_644_800 => 176_400,
+            _ => 352_800,
+        },
+        channels,
+        source_format,
+        source_kind.clone(),
+        PcmBitDepth::Float64,
+        ResolvedOutputTarget::WavW64,
+        DsdReconstructionSelection::Reference,
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET),
+        None,
     );
+    let summary = plan.reference.as_ref().expect("Reference source-front-end summary");
+    match (&source_kind, &summary.front_end) {
+        (
+            DsdSourceKind::DsfUncompressed | DsdSourceKind::DsdiffUncompressed,
+            tonepoet_pipeline::DsdInputFrontEnd::NativeUncompressed,
+        ) => {}
+        (
+            DsdSourceKind::DsdiffDst,
+            tonepoet_pipeline::DsdInputFrontEnd::DsdiffDst { .. },
+        ) => {}
+        (source_kind, front_end) => panic!(
+            "Reference source-front-end plan mismatch: source={source_kind:?} front_end={front_end:?}"
+        ),
+    }
+
+    let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+        input,
+        &summary.r64_path,
+        summary.final_pcm.sample_rate_hz,
+        summary.profile,
+        Some(Duration::from_millis(50)),
+    );
+    let render_args_sha256 = source_front_end_render_args_sha256(&render);
+    run_planned_command(&render, sox, ffmpeg);
+
+    let observed_rate = combined(&run(
+        sox,
+        &[
+            "--i".to_string(),
+            "-r".to_string(),
+            summary.r64_path.display().to_string(),
+        ],
+    ));
+    assert_eq!(
+        observed_rate.trim(),
+        summary.final_pcm.sample_rate_hz.to_string(),
+        "source-front-end render rate drifted for {source_kind:?}",
+    );
+    let observed_channels = combined(&run(
+        sox,
+        &[
+            "--i".to_string(),
+            "-c".to_string(),
+            summary.r64_path.display().to_string(),
+        ],
+    ));
+    assert_eq!(
+        observed_channels.trim(),
+        channels.to_string(),
+        "source-front-end render channel count drifted for {source_kind:?}",
+    );
+    fs::remove_file(&summary.r64_path).expect("remove source-front-end render carrier");
+    render_args_sha256
+}
+
+fn write_predictive_dst_source_front_end_fixture(path: &Path) -> &'static [u8] {
+    const ENCODED: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001.dst.bin"
+    ));
+    const EXPECTED_DSD: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001.dsd.bin"
+    ));
+
+    let file = File::create(path).expect("create predictive DSDIFF/DST qualification fixture");
+    let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, 2, 2_822_400)
+        .expect("create predictive DSDIFF/DST qualification writer");
+    writer
+        .write_encoded_frame(ENCODED, EXPECTED_DSD)
+        .expect("write pinned predictive DST frame with DSTC");
+    writer
+        .finish()
+        .expect("finish predictive DSDIFF/DST qualification fixture");
+    EXPECTED_DSD
+}
+
+fn qualify_production_source_front_end_integration() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let temp = TempDir::new().expect("production source-front-end qualification tempdir");
+    let root = temp.path();
+
+    let mut native_cases = Vec::new();
+    for (source_kind_key, source_format, source_kind, extension) in [
+        (
+            "dsf_uncompressed",
+            AudioFormat::Dsf,
+            DsdSourceKind::DsfUncompressed,
+            "dsf",
+        ),
+        (
+            "dsdiff_uncompressed",
+            AudioFormat::Dff,
+            DsdSourceKind::DsdiffUncompressed,
+            "dff",
+        ),
+    ] {
+        for source_rate_hz in [2_822_400_u32, 5_644_800, 11_289_600] {
+            for channels in [1_u16, 2] {
+                let case_root = root.join(format!(
+                    "native-{source_kind_key}-{source_rate_hz}-{channels}ch"
+                ));
+                let materialize_root = case_root.join("materialized");
+                fs::create_dir_all(&materialize_root)
+                    .expect("create native source-front-end case directory");
+                let source = case_root.join(format!("source.{extension}"));
+                match &source_kind {
+                    DsdSourceKind::DsfUncompressed => {
+                        let _ = write_dsf_reference_fixture_with_byte(
+                            &source,
+                            channels,
+                            source_rate_hz,
+                            0x96,
+                        );
+                    }
+                    DsdSourceKind::DsdiffUncompressed => {
+                        write_dff_reference_fixture(&source, channels, source_rate_hz);
+                    }
+                    _ => unreachable!("native source matrix contains only uncompressed sources"),
+                }
+
+                let source_sha256 = sha256_hex(
+                    &fs::read(&source).expect("read native source-front-end fixture"),
+                );
+                let materialized = qualify_reference_source_materialization(
+                    &source_kind,
+                    &source,
+                    &materialize_root,
+                )
+                .expect("production native source materialization");
+                assert_not_hard_linked(&source, &materialized.materialized_path);
+                assert_eq!(materialized.source_content_sha256.to_hex(), source_sha256);
+                assert_eq!(
+                    materialized.canonical_materialization_sha256,
+                    materialized.source_content_sha256,
+                    "native Reference materialization must preserve source bytes exactly",
+                );
+
+                let render_args_sha256 = qualify_source_front_end_planner_render(
+                    &sox,
+                    &ffmpeg,
+                    &case_root,
+                    &materialized.materialized_path,
+                    source_rate_hz,
+                    channels,
+                    source_format.clone(),
+                    source_kind.clone(),
+                );
+                native_cases.push(serde_json::json!({
+                    "source_kind": source_kind_key,
+                    "source_rate_hz": source_rate_hz,
+                    "channels": channels,
+                    "source_sha256": source_sha256,
+                    "materialized_sha256": materialized.canonical_materialization_sha256.to_hex(),
+                    "materialization_identity_digest": materialized.materialization_identity_digest.to_hex(),
+                    "hard_link": false,
+                    "planner_render": "passed",
+                    "render_args_sha256": render_args_sha256,
+                }));
+            }
+        }
+    }
+    assert_eq!(native_cases.len(), 12);
+
+    let dst_root = root.join("dsdiff-dst-dsd64-stereo");
+    let dst_materialize_root = dst_root.join("materialized");
+    fs::create_dir_all(&dst_materialize_root)
+        .expect("create DSDIFF/DST source-front-end case directory");
+    let dst_source = dst_root.join("source.dff");
+    let expected_dsd = write_predictive_dst_source_front_end_fixture(&dst_source);
+
+    let mut dst_source_file = File::open(&dst_source).expect("open DSDIFF/DST source fixture");
+    let dst_source_info = sacd_rs::dsd_file::inspect_dsd_container(&mut dst_source_file)
+        .expect("production DSD container inspector accepts DSDIFF/DST fixture");
+    assert_eq!(
+        dst_source_info.format,
+        sacd_rs::dsd_file::DsdContainerFormat::Dsdiff,
+    );
+    assert_eq!(
+        dst_source_info.compression,
+        sacd_rs::dsd_file::DsdCompression::Dst,
+    );
+    assert_eq!(dst_source_info.sample_rate, 2_822_400);
+    assert_eq!(dst_source_info.channel_count, 2);
+
+    let decoded_source = collect_decoded_dsd(&dst_source);
+    assert_eq!(
+        decoded_source.as_slice(),
+        expected_dsd,
+        "production DSDIFF/DST reader must verify DSTC and reproduce pinned oracle DSD bytes",
+    );
+
+    let dst_source_sha256 = sha256_hex(
+        &fs::read(&dst_source).expect("read predictive DSDIFF/DST source fixture"),
+    );
+    let dst_kind = DsdSourceKind::DsdiffDst;
+    let dst_materialized = qualify_reference_source_materialization(
+        &dst_kind,
+        &dst_source,
+        &dst_materialize_root,
+    )
+    .expect("production DSDIFF/DST source materialization");
+    assert_eq!(dst_materialized.source_content_sha256.to_hex(), dst_source_sha256);
+    assert_ne!(
+        dst_materialized.source_content_sha256,
+        dst_materialized.canonical_materialization_sha256,
+        "DSDIFF/DST canonical materialization must bind the decoded DFF, not the compressed source bytes",
+    );
+
+    let mut canonical_file = File::open(&dst_materialized.materialized_path)
+        .expect("open canonical DSDIFF/DSD materialization");
+    let canonical_info = sacd_rs::dsd_file::inspect_dsd_container(&mut canonical_file)
+        .expect("inspect canonical DSDIFF/DSD materialization");
+    assert_eq!(
+        canonical_info.format,
+        sacd_rs::dsd_file::DsdContainerFormat::Dsdiff,
+    );
+    assert_eq!(
+        canonical_info.compression,
+        sacd_rs::dsd_file::DsdCompression::Dsd,
+    );
+    assert_eq!(canonical_info.sample_rate, 2_822_400);
+    assert_eq!(canonical_info.channel_count, 2);
+    let canonical_decoded = collect_decoded_dsd(&dst_materialized.materialized_path);
+    assert_eq!(
+        canonical_decoded.as_slice(),
+        expected_dsd,
+        "canonical DSDIFF/DSD materialization must read back as the pinned oracle bytes",
+    );
+
+    let baseline_identity = dst_materialized.materialization_identity_digest;
+    let recomputed_identity =
+        tonepoet::convert::pipeline::qualify_reference_materialization_identity_digest(
+            &dst_kind,
+            dst_materialized.source_content_sha256,
+            dst_materialized.canonical_materialization_sha256,
+        );
+    assert_eq!(baseline_identity, recomputed_identity);
+    // The production v2 executed-evidence digest binds this exact materialization
+    // identity; prove that canonical-carrier substitution changes that binding.
+    let mut tampered_canonical_sha256 = dst_materialized.canonical_materialization_sha256;
+    tampered_canonical_sha256.0[0] ^= 1;
+    let tampered_identity =
+        tonepoet::convert::pipeline::qualify_reference_materialization_identity_digest(
+            &dst_kind,
+            dst_materialized.source_content_sha256,
+            tampered_canonical_sha256,
+        );
+    assert_ne!(
+        baseline_identity, tampered_identity,
+        "executed-evidence v2 materialization identity must change when the canonical DFF hash changes",
+    );
+
+    let dst_render_args_sha256 = qualify_source_front_end_planner_render(
+        &sox,
+        &ffmpeg,
+        &dst_root,
+        &dst_materialized.materialized_path,
+        2_822_400,
+        2,
+        AudioFormat::Dff,
+        dst_kind,
+    );
+
+    serde_json::json!({
+        "schema": "tonepoet-reference-production-source-front-end-integration/v1",
+        "status": "passed",
+        "native_case_count": native_cases.len(),
+        "native_cases": native_cases,
+        "dsdiff_dst": {
+            "source_rate_hz": 2_822_400,
+            "channels": 2,
+            "source_sha256": dst_source_sha256,
+            "canonical_materialized_sha256": dst_materialized.canonical_materialization_sha256.to_hex(),
+            "oracle_dsd_sha256": sha256_hex(expected_dsd),
+            "cmpr_classification": "passed",
+            "dstc_verification": "passed",
+            "canonical_dff_readback": "passed",
+            "planner_render": "passed",
+            "render_args_sha256": dst_render_args_sha256,
+            "executed_evidence_binding_schema": "tonepoet-reference-executed-evidence/v2",
+            "materialization_identity_digest": baseline_identity.to_hex(),
+            "materialization_identity_tamper_rejected": true,
+        },
+        "sacd_dsd": "unavailable:DSD-REF-P0-023",
+        "sacd_dst": "unavailable:DSD-REF-P0-023",
+    })
 }
 
 fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
