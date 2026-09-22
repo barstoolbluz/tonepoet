@@ -10,6 +10,8 @@
 // raise the macro recursion limit for this test crate to expand it.
 #![recursion_limit = "512"]
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -28,12 +30,12 @@ use tonepoet::convert::pipeline::{
     plan_request_for_track, qualify_production_metadata_mutation,
     qualify_reference_common_candidate_execution,
     qualify_reference_production_promotion_gate,
-    qualify_reference_source_materialization, ActionPipeline, AlbumMetadata,
-    CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, FailurePolicy, LogPolicy,
+    qualify_reference_source_materialization, ActionPipeline, AlbumMetadata, BoundToolExecutable,
+    CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, EnvVar, FailurePolicy, LogPolicy,
     NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PreparedTrack,
-    PublishPolicy, RealToolRunner, SacdArea, SourceAudioCoding, SourceAudioDescriptor,
-    SourceOptions, StagePolicy, StageRequirement, ToolBinary, TrackId, TrackMetadata,
-    TrackSelection, TrackSourceRef,
+    PublishPolicy, RealToolRunner, SacdArea, SecretString, SourceAudioCoding, SourceAudioDescriptor,
+    SourceOptions, StagePolicy, StageRequirement, ToolBinary, ToolCommand, ToolRunner,
+    ToolRunnerError, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
 };
 use tonepoet_pipeline::{
     build_reference_render_transcript_fixture,
@@ -48,9 +50,10 @@ use tonepoet_pipeline::{
     ReferenceDecodedSampleRole, ReferenceDither, ReferenceErrorCode,
     ReferenceStreamedWavCapacityEvidenceV2,
     ReferenceStreamedWavCapacityEvidenceV3,
-    ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile,
-    ResolvedGainPolicy, ResolvedOutputTarget, SampleGainPolicy, SampleKind, SourceInfo, SourceRepresentationKind,
-    ToolIdentifier, TruePeakPurpose, TruePeakScanTier, TruePeakScope, WavPackMode,
+    ReferenceProgrammeScope, ReferenceSampleHashEncoding, ResolvedDsdProfile, ResolvedGainPolicy,
+    ResolvedOutputTarget, SampleGainPolicy, SampleKind, Sha256Digest, SourceInfo,
+    SourceRepresentationKind, ToolIdentifier, TruePeakPurpose, TruePeakScanTier, TruePeakScope,
+    WavPackMode,
     W64PcmExpectation, W64PcmFormatExpectation, W64SampleEncoding,
     inspect_exact_w64_pcm, validate_exact_w64_pcm,
     REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
@@ -76,18 +79,71 @@ const ATOMIC_PARSLEY_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH";
 const METAFLAC_STORE_ENV: &str = "TONEPOET_REFERENCE_METAFLAC_STORE_PATH";
 const WVTAG_STORE_ENV: &str = "TONEPOET_REFERENCE_WVTAG_STORE_PATH";
 const ATOMIC_PARSLEY_STORE_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH";
-const GAIN08_EVIDENCE_ENV: &str = "TONEPOET_REFERENCE_GAIN08_EVIDENCE_PATH";
-const GAIN09_EVIDENCE_ENV: &str = "TONEPOET_REFERENCE_GAIN09_EVIDENCE_PATH";
-const TIMEOUT_RESOURCE_EVIDENCE_ENV: &str =
-    "TONEPOET_REFERENCE_TIMEOUT_RESOURCE_EVIDENCE_PATH";
-const WORKSPACE_REGRESSION_EVIDENCE_ENV: &str =
-    "TONEPOET_REFERENCE_WORKSPACE_REGRESSION_EVIDENCE_PATH";
-const PERFORMANCE_RESOURCE_EVIDENCE_ENV: &str =
-    "TONEPOET_REFERENCE_PERFORMANCE_EVIDENCE_PATH";
 const QUALIFICATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUALIFICATION_PIPELINE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const QUALIFICATION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
 const QUALIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+struct QualificationCountingAllocator;
+
+thread_local! {
+    static COUNT_ALLOCATIONS_ON_THREAD: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATION_COUNT_ON_THREAD: Cell<u64> = const { Cell::new(0) };
+}
+
+fn record_qualification_allocation() {
+    // Allocation can occur while thread-local state is being destroyed. An
+    // allocator must not turn that process state into a panic, so failed TLS
+    // access simply means the allocation is outside this measurement window.
+    let _ = COUNT_ALLOCATIONS_ON_THREAD.try_with(|enabled| {
+        if enabled.get() {
+            let _ = ALLOCATION_COUNT_ON_THREAD
+                .try_with(|count| count.set(count.get().saturating_add(1)));
+        }
+    });
+}
+
+unsafe impl GlobalAlloc for QualificationCountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_qualification_allocation();
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_qualification_allocation();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record_qualification_allocation();
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static QUALIFICATION_GLOBAL_ALLOCATOR: QualificationCountingAllocator =
+    QualificationCountingAllocator;
+
+struct AllocationCounterGuard;
+
+impl Drop for AllocationCounterGuard {
+    fn drop(&mut self) {
+        let _ = COUNT_ALLOCATIONS_ON_THREAD.try_with(|enabled| enabled.set(false));
+    }
+}
+
+fn allocation_count_for<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    ALLOCATION_COUNT_ON_THREAD.with(|count| count.set(0));
+    COUNT_ALLOCATIONS_ON_THREAD.with(|enabled| enabled.set(true));
+    let _guard = AllocationCounterGuard;
+    let result = f();
+    let allocations = ALLOCATION_COUNT_ON_THREAD.with(Cell::get);
+    (result, allocations)
+}
 
 const W64_RIFF_GUID: &[u8; 16] = b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
 #[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
@@ -588,6 +644,114 @@ fn qualify_subprocess_environment_isolation() -> Value {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file_digest(path: &Path) -> Sha256Digest {
+    let mut file = File::open(path)
+        .unwrap_or_else(|error| panic!("cannot open {} for SHA-256: {error}", path.display()));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("cannot hash {}: {error}", path.display()));
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Sha256Digest(hasher.finalize().into())
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("qualification duration fits u64 nanoseconds")
+}
+
+fn command_record_evidence_string(record: &tonepoet::convert::pipeline::CommandRecord) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "description": &record.description,
+        "program": record.binary.canonical_name(),
+        "args": &record.sanitized_args,
+        "cwd": record.cwd.as_ref().map(|path| path.display().to_string()),
+        "environment_policy": format!("{:?}", record.environment_policy),
+        "environment": &record.environment,
+        "exit": format!("{:?}", record.exit),
+        "elapsed_nanos": duration_nanos_u64(record.elapsed),
+    }))
+    .expect("serialize command-record evidence")
+}
+
+fn planned_command_evidence_string(command: &PlannedCommand) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "description": &command.description,
+        "program": command.tool.program(),
+        "args": &command.args,
+        "environment_policy": format!("{:?}", command.environment_policy),
+        "environment": &command.environment,
+    }))
+    .expect("serialize planned-command evidence")
+}
+
+fn command_record_retained_tail_bytes(
+    records: &[tonepoet::convert::pipeline::CommandRecord],
+) -> u64 {
+    records
+        .iter()
+        .map(|record| record.stdout_tail.len().saturating_add(record.stderr_tail.len()))
+        .try_fold(0_u64, |total, bytes| {
+            total.checked_add(u64::try_from(bytes).expect("retained tail byte count fits u64"))
+        })
+        .expect("retained tail byte total fits u64")
+}
+
+fn regular_file_bytes_under(path: &Path) -> u64 {
+    let metadata = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("cannot inspect qualification path {}: {error}", path.display()));
+    if metadata.file_type().is_file() {
+        return metadata.len();
+    }
+    if !metadata.file_type().is_dir() {
+        return 0;
+    }
+
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("cannot read qualification directory {}: {error}", path.display()))
+        .map(|entry| {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("cannot enumerate qualification directory {}: {error}", path.display())
+            });
+            regular_file_bytes_under(&entry.path())
+        })
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .expect("qualification scratch byte total fits u64")
+}
+
+fn qualification_runtime_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        for (name, enabled) in [
+            ("sse2", std::is_x86_feature_detected!("sse2")),
+            ("sse3", std::is_x86_feature_detected!("sse3")),
+            ("ssse3", std::is_x86_feature_detected!("ssse3")),
+            ("sse4.1", std::is_x86_feature_detected!("sse4.1")),
+            ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+            ("avx", std::is_x86_feature_detected!("avx")),
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+        ] {
+            if enabled {
+                features.push(name);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.push("neon");
+        }
+    }
+    features
 }
 
 fn canonical_fixture_corpus_digest(files: &[(&str, &[u8])]) -> String {
@@ -2355,7 +2519,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
         },
         settings: settings.clone(),
         plan_scope: tonepoet_pipeline::PlanScope::track("phase5-q01-candidate"),
-        intermediate_dir: Some(work),
+        intermediate_dir: Some(work.clone()),
         container_ffmpeg_flags: Vec::new(),
         resolved_output_target: Some(ResolvedOutputTarget::WavW64),
         reference_programme_scope: ReferenceProgrammeScope::Singleton,
@@ -2371,14 +2535,18 @@ fn qualify_common_reference_candidate_execution() -> Value {
         .enable_all()
         .build()
         .expect("candidate qualification runtime");
-    let candidate = runtime
-        .block_on(qualify_reference_common_candidate_execution(
+    let silent_started = Instant::now();
+    let (candidate_result, silent_allocations) = allocation_count_for(|| {
+        runtime.block_on(qualify_reference_common_candidate_execution(
             &request,
             &root,
             &runner,
             &cancel,
             &tool_paths,
         ))
+    });
+    let silent_wall = silent_started.elapsed();
+    let candidate = candidate_result
         .expect("unpromoted candidate executes in the offline harness");
 
     assert!(!delivered.exists(), "candidate harness must not publish delivered output");
@@ -2445,20 +2613,24 @@ fn qualify_common_reference_candidate_execution() -> Value {
         },
         settings,
         plan_scope: tonepoet_pipeline::PlanScope::track("phase5-q01-candidate-non-silent"),
-        intermediate_dir: Some(non_silent_work),
+        intermediate_dir: Some(non_silent_work.clone()),
         container_ffmpeg_flags: Vec::new(),
         resolved_output_target: Some(ResolvedOutputTarget::WavW64),
         reference_programme_scope: ReferenceProgrammeScope::Singleton,
         planned_riff_non_audio_upper_bound_bytes: Some(0),
     };
-    let non_silent_candidate = runtime
-        .block_on(qualify_reference_common_candidate_execution(
+    let non_silent_started = Instant::now();
+    let (non_silent_candidate_result, non_silent_allocations) = allocation_count_for(|| {
+        runtime.block_on(qualify_reference_common_candidate_execution(
             &non_silent_request,
             &non_silent_root,
             &runner,
             &cancel,
             &tool_paths,
         ))
+    });
+    let non_silent_wall = non_silent_started.elapsed();
+    let non_silent_candidate = non_silent_candidate_result
         .expect("non-silent unpromoted candidate executes in the offline harness");
     assert!(
         !non_silent_delivered.exists(),
@@ -2502,6 +2674,15 @@ fn qualify_common_reference_candidate_execution() -> Value {
                 && observation.purpose == TruePeakPurpose::GainAuthority
         })
         .expect("non-silent candidate records protected-R64 gain authority");
+    let non_silent_post = non_silent_candidate
+        .measurements
+        .values()
+        .find(|observation| {
+            observation.subject
+                == tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm
+                && observation.purpose == TruePeakPurpose::PostFinalAcceptance
+        })
+        .expect("non-silent candidate records terminal-QPCM acceptance authority");
     let non_silent_gain = tonepoet_pipeline::resolve_reference_certified_gain(
         non_silent_pre,
         non_silent_candidate.plan.gain_policy,
@@ -2537,6 +2718,78 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "qualified terminal must realize the certified automatic gain"
     );
 
+    let silent_reconstruction_passes = candidate
+        .commands
+        .iter()
+        .filter(|record| {
+            record.description.as_deref()
+                == Some("Render qualified Reference DSD reconstruction")
+        })
+        .count();
+    let non_silent_reconstruction_passes = non_silent_candidate
+        .commands
+        .iter()
+        .filter(|record| {
+            record.description.as_deref()
+                == Some("Render qualified Reference DSD reconstruction")
+        })
+        .count();
+    assert_eq!(silent_reconstruction_passes, 1);
+    assert_eq!(non_silent_reconstruction_passes, 1);
+
+    let silent_full_read_bytes = fs::metadata(&candidate.plan.r64_path)
+        .expect("inspect silent protected R64")
+        .len()
+        .checked_add(
+            fs::metadata(&candidate.plan.qpcm_path)
+                .expect("inspect silent terminal QPCM")
+                .len(),
+        )
+        .expect("silent complete-reader byte total fits u64");
+    let non_silent_full_read_bytes = fs::metadata(&non_silent_candidate.plan.r64_path)
+        .expect("inspect non-silent protected R64")
+        .len()
+        .checked_add(
+            fs::metadata(&non_silent_candidate.plan.qpcm_path)
+                .expect("inspect non-silent terminal QPCM")
+                .len(),
+        )
+        .expect("non-silent complete-reader byte total fits u64");
+    let silent_scratch_bytes = regular_file_bytes_under(&work);
+    let non_silent_scratch_bytes = regular_file_bytes_under(&non_silent_work);
+    let silent_retained_tail_bytes = command_record_retained_tail_bytes(&candidate.commands);
+    let non_silent_retained_tail_bytes =
+        command_record_retained_tail_bytes(&non_silent_candidate.commands);
+    let silent_command_elapsed_nanos = candidate
+        .commands
+        .iter()
+        .map(|record| duration_nanos_u64(record.elapsed))
+        .try_fold(0_u64, |total, elapsed| total.checked_add(elapsed))
+        .expect("silent command elapsed total fits u64");
+    let non_silent_command_elapsed_nanos = non_silent_candidate
+        .commands
+        .iter()
+        .map(|record| duration_nanos_u64(record.elapsed))
+        .try_fold(0_u64, |total, elapsed| total.checked_add(elapsed))
+        .expect("non-silent command elapsed total fits u64");
+    let silent_commands = candidate
+        .commands
+        .iter()
+        .map(command_record_evidence_string)
+        .collect::<Vec<_>>();
+    let non_silent_commands = non_silent_candidate
+        .commands
+        .iter()
+        .map(command_record_evidence_string)
+        .collect::<Vec<_>>();
+
+    assert!(silent_full_read_bytes > 0);
+    assert!(non_silent_full_read_bytes > 0);
+    assert!(silent_scratch_bytes >= silent_full_read_bytes);
+    assert!(non_silent_scratch_bytes >= non_silent_full_read_bytes);
+    assert!(duration_nanos_u64(silent_wall) > 0);
+    assert!(duration_nanos_u64(non_silent_wall) > 0);
+
     assert_eq!(
         non_silent_candidate.plan.qualification_candidate_manifest_digest,
         candidate.plan.qualification_candidate_manifest_digest,
@@ -2571,12 +2824,67 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "non_silent_automatic_gain_applied": true,
         "non_silent_gain_policy": "true_peak_normalize_track_standard",
         "non_silent_selected_gain_db": non_silent_gain.selected_gain.render(false),
+        "non_silent_gain_authority_interval": certified_probe_interval_json(non_silent_pre),
+        "non_silent_post_terminal_interval": certified_probe_interval_json(non_silent_post),
+        "non_silent_terminal_gain_arg": expected_gain_arg,
         "non_silent_measurement_count": non_silent_candidate.measurements.len(),
         "common_runtime_closure_fingerprint_sha256": candidate.common_runtime_closure_fingerprint_sha256,
         "metadata_mutation_closure_fingerprint_sha256": candidate.metadata_mutation_closure_fingerprint_sha256,
         "candidate_manifest_sha256": candidate.plan.qualification_candidate_manifest_digest.to_hex(),
+        "runtime_dispatch_digest": candidate.toolchain.runtime_dispatch_digest.to_hex(),
+        "ffmpeg_canonical_path": candidate.toolchain.ffmpeg.canonical_path.display().to_string(),
+        "ffmpeg_executable_sha256": candidate.toolchain.ffmpeg.executable_sha256.to_hex(),
+        "sox_ng_canonical_path": candidate.toolchain.sox_ng.canonical_path.display().to_string(),
+        "sox_ng_executable_sha256": candidate.toolchain.sox_ng.executable_sha256.to_hex(),
         "resolved_command_hash": candidate.resolved_command_hash,
         "materialization_identity_digest": materialized.materialization_identity_digest.to_hex(),
+        "silent_commands": silent_commands,
+        "non_silent_commands": non_silent_commands,
+        "resource_measurements": {
+            "silent": {
+                "programme": "exact_silence_0x69",
+                "programme_duration_nanos": duration_nanos_u64(source_duration),
+                "source_bytes": fs::metadata(&source).expect("inspect silent source").len(),
+                "decode_reconstruction_passes": silent_reconstruction_passes,
+                "process_count": candidate.commands.len(),
+                "full_read_bytes": silent_full_read_bytes,
+                "scratch_bytes": silent_scratch_bytes,
+                "host_thread_allocations": silent_allocations,
+                "retained_output_tail_bytes": silent_retained_tail_bytes,
+                "retained_output_tail_capacity_bytes": candidate.commands.len()
+                    .checked_mul(2)
+                    .and_then(|count| count.checked_mul(tonepoet::convert::pipeline::TOOL_OUTPUT_TAIL_BYTES))
+                    .expect("silent retained-tail capacity fits usize"),
+                "wall_clock_nanos": duration_nanos_u64(silent_wall),
+                "command_elapsed_nanos": silent_command_elapsed_nanos,
+            },
+            "non_silent": {
+                "programme": "sigma_delta_stereo_tones",
+                "programme_duration_nanos": duration_nanos_u64(non_silent_duration),
+                "source_bytes": fs::metadata(&non_silent_source).expect("inspect non-silent source").len(),
+                "decode_reconstruction_passes": non_silent_reconstruction_passes,
+                "process_count": non_silent_candidate.commands.len(),
+                "full_read_bytes": non_silent_full_read_bytes,
+                "scratch_bytes": non_silent_scratch_bytes,
+                "host_thread_allocations": non_silent_allocations,
+                "retained_output_tail_bytes": non_silent_retained_tail_bytes,
+                "retained_output_tail_capacity_bytes": non_silent_candidate.commands.len()
+                    .checked_mul(2)
+                    .and_then(|count| count.checked_mul(tonepoet::convert::pipeline::TOOL_OUTPUT_TAIL_BYTES))
+                    .expect("non-silent retained-tail capacity fits usize"),
+                "wall_clock_nanos": duration_nanos_u64(non_silent_wall),
+                "command_elapsed_nanos": non_silent_command_elapsed_nanos,
+            },
+            "enabled_kernels": {
+                "arch": std::env::consts::ARCH,
+                "runtime_features": qualification_runtime_features(),
+                "runtime_dispatch_digest": candidate.toolchain.runtime_dispatch_digest.to_hex(),
+                "certified_scan_tier": tonepoet_pipeline::REFERENCE_CERTIFIED_SCAN_TIER,
+            },
+            "allocation_scope": "test-process allocation events on the current qualification thread during each Q01 execution; child-process and other-thread allocators are intentionally outside this counter",
+            "full_read_scope": "exact protected-R64 plus terminal-QPCM carrier bytes consumed by the two complete certified readers",
+            "scratch_scope": "retained regular-file bytes under the per-programme work directory after candidate execution",
+        },
         "production_refusal": promotion_error,
     })
 }
@@ -2767,10 +3075,19 @@ fn qualify_historical_dc_root_cause_probe() -> Value {
     } else {
         "historical_full_scale_rail_not_reproduced"
     };
+    let command_evidence = commands
+        .iter()
+        .map(command_record_evidence_string)
+        .collect::<Vec<_>>();
 
     let report = serde_json::json!({
         "schema": "tonepoet-reference-historical-dc-root-cause/v1",
         "status": "captured",
+        "candidate_manifest_sha256": summary.qualification_candidate_manifest_digest.to_hex(),
+        "sox_ng_canonical_path": sox.display().to_string(),
+        "sox_ng_executable_sha256": sha256_file_digest(&sox).to_hex(),
+        "ffmpeg_canonical_path": ffmpeg.display().to_string(),
+        "ffmpeg_executable_sha256": sha256_file_digest(&ffmpeg).to_hex(),
         "historical_fixture": "write_dsf_reference_fixture_with_byte(..., 0x00)",
         "execution_outcome": execution_outcome,
         "execution_error": execution_error,
@@ -2806,6 +3123,7 @@ fn qualify_historical_dc_root_cause_probe() -> Value {
             "sanitized_args": terminal.sanitized_args.clone(),
             "exit": format!("{:?}", terminal.exit),
         },
+        "commands": command_evidence,
         "scalar_model": {
             "selected_gain_linear": selected_gain_linear,
             "predicted_sample_min": scalar_predicted_min,
@@ -3026,6 +3344,20 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
     let sox = required_tool(SOX_ENV);
     let ffmpeg = required_tool(FFMPEG_ENV);
     let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
+    let tool_authority = serde_json::json!({
+        "sox_ng": {
+            "canonical_path": sox.display().to_string(),
+            "executable_sha256": sha256_file_digest(&sox).to_hex(),
+        },
+        "ffmpeg": {
+            "canonical_path": ffmpeg.display().to_string(),
+            "executable_sha256": sha256_file_digest(&ffmpeg).to_hex(),
+        },
+        "ffprobe": {
+            "canonical_path": ffprobe.display().to_string(),
+            "executable_sha256": sha256_file_digest(&ffprobe).to_hex(),
+        },
+    });
     let temp = TempDir::new().expect("default-settings smoke tempdir");
     let input = temp.path().join("default-settings-dsd64.dsf");
     let output = temp.path().join("default-settings.flac");
@@ -3086,6 +3418,11 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
             panic!("DSD64 DSF to FLAC must not plan a passthrough copy")
         }
     };
+    let command_evidence = commands
+        .iter()
+        .map(planned_command_evidence_string)
+        .collect::<Vec<_>>();
+    let execution_started = Instant::now();
 
     for command in commands {
         assert_eq!(
@@ -3108,6 +3445,7 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
             String::from_utf8_lossy(&executed.stderr),
         );
     }
+    let execution_wall = execution_started.elapsed();
     match finalization {
         Finalization::AtomicRename { from, to } => {
             assert_eq!(to, &output);
@@ -3125,7 +3463,10 @@ fn qualify_default_settings_dsd64_dsf_to_flac() -> Value {
         "sample_rate_hz": 88200,
         "channels": 2,
         "bit_depth": "int24",
+        "tool_authority": tool_authority,
         "command_count": commands.len(),
+        "command_evidence": command_evidence,
+        "wall_clock_nanos": duration_nanos_u64(execution_wall),
         "commands": commands.iter().map(|command| serde_json::json!({
             "tool": command.tool.program(),
             "args": &command.args,
@@ -7024,25 +7365,26 @@ fn qualification_evidence_sha256(value: &Value) -> String {
     sha256_hex(&bytes)
 }
 
-fn required_bound_release_gate_evidence(
-    variable: &str,
+fn evidence_string_array(value: &Value, field: &str) -> Vec<String> {
+    value[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} must be an array"))
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} entries must be strings"))
+                .to_string()
+        })
+        .collect()
+}
+
+fn validate_external_release_gate_evidence(
+    value: &Value,
     gate: &str,
     candidate_manifest_sha256: &str,
     runtime_closure_fingerprint_sha256: &str,
-) -> Value {
-    let raw_path = std::env::var_os(variable)
-        .unwrap_or_else(|| panic!("{variable} must point to completed {gate} evidence"));
-    let path = fs::canonicalize(&raw_path).unwrap_or_else(|error| {
-        panic!(
-            "cannot canonicalize {variable}={}: {error}",
-            Path::new(&raw_path).display()
-        )
-    });
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|error| panic!("cannot read {gate} evidence {}: {error}", path.display()));
-    assert!(!bytes.is_empty(), "{gate} evidence must not be empty");
-    let value: Value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|error| panic!("{gate} evidence must be JSON: {error}"));
+) {
     assert_eq!(
         value["schema"].as_str(),
         Some("tonepoet-reference-external-release-gate-evidence/v1"),
@@ -7090,6 +7432,88 @@ fn required_bound_release_gate_evidence(
             );
         }
     }
+}
+
+fn external_release_gate_evidence(
+    gate: &str,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+    commands: Vec<String>,
+    measurements: Value,
+) -> Value {
+    assert!(!commands.is_empty(), "{gate} must execute or characterize a real command");
+    assert!(
+        measurements
+            .as_object()
+            .is_some_and(|measurements| !measurements.is_empty()),
+        "{gate} must record real measurements",
+    );
+    let value = serde_json::json!({
+        "schema": "tonepoet-reference-external-release-gate-evidence/v1",
+        "gate": gate,
+        "status": "passed",
+        "candidate_manifest_sha256": candidate_manifest_sha256,
+        "runtime_closure_fingerprint_sha256": runtime_closure_fingerprint_sha256,
+        "commands": commands,
+        "measurements": measurements,
+    });
+    validate_external_release_gate_evidence(
+        &value,
+        gate,
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+    );
+    value
+}
+
+fn release_gate_evidence_output_dir() -> PathBuf {
+    std::env::var_os("TONEPOET_DSD_REFERENCE_RELEASE_GATE_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/dsd_reference_common_v17_release_gates")
+        })
+}
+
+fn bind_generated_release_gate_evidence(
+    output_dir: &Path,
+    gate: &str,
+    value: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    validate_external_release_gate_evidence(
+        value,
+        gate,
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+    );
+    fs::create_dir_all(output_dir).unwrap_or_else(|error| {
+        panic!(
+            "cannot create Reference release-gate evidence directory {}: {error}",
+            output_dir.display()
+        )
+    });
+    let path = output_dir.join(format!("{gate}.json"));
+    write_report_atomically(&path, value);
+    let path = fs::canonicalize(&path).unwrap_or_else(|error| {
+        panic!("cannot canonicalize generated {gate} evidence {}: {error}", path.display())
+    });
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| panic!("cannot read generated {gate} evidence {}: {error}", path.display()));
+    assert!(!bytes.is_empty(), "generated {gate} evidence must not be empty");
+    let installed: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("generated {gate} evidence must be JSON: {error}"));
+    assert_eq!(
+        &installed, value,
+        "atomically installed {gate} evidence must round-trip exactly",
+    );
+    validate_external_release_gate_evidence(
+        &installed,
+        gate,
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+    );
 
     serde_json::json!({
         "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
@@ -7099,8 +7523,466 @@ fn required_bound_release_gate_evidence(
         "source_sha256": sha256_hex(&bytes),
         "candidate_manifest_sha256": candidate_manifest_sha256,
         "runtime_closure_fingerprint_sha256": runtime_closure_fingerprint_sha256,
-        "record": value,
+        "record": installed,
     })
+}
+
+fn qualify_gain08_release_gate(
+    common_candidate_execution: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    assert_eq!(
+        common_candidate_execution["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "GAIN08 must derive from the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["common_runtime_closure_fingerprint_sha256"].as_str(),
+        Some(runtime_closure_fingerprint_sha256),
+        "GAIN08 must derive from the exact characterized runtime closure",
+    );
+    assert_eq!(common_candidate_execution["non_silent_programme_verified_finite"], true);
+    assert_eq!(common_candidate_execution["non_silent_automatic_gain_applied"], true);
+    let selected_gain = common_candidate_execution["non_silent_selected_gain_db"]
+        .as_str()
+        .expect("GAIN08 selected gain is recorded")
+        .parse::<DbNano>()
+        .expect("GAIN08 selected gain parses as DbNano");
+    let terminal_gain = common_candidate_execution["non_silent_terminal_gain_arg"]
+        .as_str()
+        .expect("GAIN08 terminal gain is recorded")
+        .parse::<DbNano>()
+        .expect("GAIN08 terminal gain parses as DbNano");
+    assert!(selected_gain > DbNano::ZERO, "GAIN08 must exercise positive automatic gain");
+    assert_eq!(
+        terminal_gain, selected_gain,
+        "GAIN08 terminal realization must consume the exact certified gain authority",
+    );
+
+    external_release_gate_evidence(
+        "GAIN08",
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+        evidence_string_array(common_candidate_execution, "non_silent_commands"),
+        serde_json::json!({
+            "definition": "ordinary finite-programme automatic gain binds the protected-R64 certified authority to exactly one terminal scalar and passes post-terminal acceptance",
+            "programme": "sigma_delta_stereo_tones",
+            "gain_policy": common_candidate_execution["non_silent_gain_policy"].clone(),
+            "selected_gain_db": common_candidate_execution["non_silent_selected_gain_db"].clone(),
+            "terminal_gain_db": common_candidate_execution["non_silent_terminal_gain_arg"].clone(),
+            "pre_terminal_certified_interval": common_candidate_execution["non_silent_gain_authority_interval"].clone(),
+            "post_terminal_certified_interval": common_candidate_execution["non_silent_post_terminal_interval"].clone(),
+            "terminal_realization_count": 1,
+            "post_terminal_acceptance": "passed",
+        }),
+    )
+}
+
+fn qualify_gain09_release_gate(
+    historical_dc_root_cause: &Value,
+    common_candidate_execution: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    assert_eq!(
+        historical_dc_root_cause["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "GAIN09 historical reproduction must use the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "GAIN09 binding source must be the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["common_runtime_closure_fingerprint_sha256"].as_str(),
+        Some(runtime_closure_fingerprint_sha256),
+        "GAIN09 must bind the characterized runtime closure from this qualification run",
+    );
+    assert_eq!(
+        historical_dc_root_cause["sox_ng_canonical_path"].as_str(),
+        common_candidate_execution["sox_ng_canonical_path"].as_str(),
+        "GAIN09 historical reproduction must use the same SoX-ng path as Q01",
+    );
+    assert_eq!(
+        historical_dc_root_cause["sox_ng_executable_sha256"].as_str(),
+        common_candidate_execution["sox_ng_executable_sha256"].as_str(),
+        "GAIN09 historical reproduction must use the same SoX-ng executable as Q01",
+    );
+    assert_eq!(
+        historical_dc_root_cause["ffmpeg_canonical_path"].as_str(),
+        common_candidate_execution["ffmpeg_canonical_path"].as_str(),
+        "GAIN09 historical reproduction must use the same FFmpeg path as Q01",
+    );
+    assert_eq!(
+        historical_dc_root_cause["ffmpeg_executable_sha256"].as_str(),
+        common_candidate_execution["ffmpeg_executable_sha256"].as_str(),
+        "GAIN09 historical reproduction must use the same FFmpeg executable as Q01",
+    );
+    assert_eq!(
+        historical_dc_root_cause["execution_outcome"].as_str(),
+        Some("post_terminal_rejected"),
+        "GAIN09 must reproduce the historical DC candidate reaching the fail-closed post-terminal gate",
+    );
+    assert_eq!(historical_dc_root_cause["qpcm_reaches_sample_rail"], true);
+    assert_eq!(
+        historical_dc_root_cause["scalar_model"]["predicts_sample_rail"],
+        true,
+        "GAIN09 must explain the terminal rail from the selected scalar rather than an unknown runtime effect",
+    );
+    assert_eq!(
+        historical_dc_root_cause["terminal_gain_matches_selected_authority"],
+        true,
+    );
+    assert_eq!(
+        historical_dc_root_cause["root_cause_class"].as_str(),
+        Some("selected_gain_drives_sample_domain_clipping"),
+    );
+
+    external_release_gate_evidence(
+        "GAIN09",
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+        evidence_string_array(historical_dc_root_cause, "commands"),
+        serde_json::json!({
+            "definition": "the pathological 0x00 full-scale-negative-DC fixture is causally explained by the selected gain scalar and is rejected before publication when terminal QPCM reaches the sample rail",
+            "historical_fixture": historical_dc_root_cause["historical_fixture"].clone(),
+            "execution_outcome": historical_dc_root_cause["execution_outcome"].clone(),
+            "protected_r64": historical_dc_root_cause["protected_r64"].clone(),
+            "gain_authority": historical_dc_root_cause["gain_authority"].clone(),
+            "scalar_model": historical_dc_root_cause["scalar_model"].clone(),
+            "terminal_qpcm": historical_dc_root_cause["terminal_qpcm"].clone(),
+            "root_cause_class": historical_dc_root_cause["root_cause_class"].clone(),
+            "publication_attempted": false,
+        }),
+    )
+}
+
+fn qualify_timeout_cancellation_resource_release_gate(
+    common_candidate_execution: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    assert_eq!(
+        common_candidate_execution["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "timeout/cancellation gate must bind the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["common_runtime_closure_fingerprint_sha256"].as_str(),
+        Some(runtime_closure_fingerprint_sha256),
+        "timeout/cancellation gate must bind the exact characterized runtime closure",
+    );
+    let ffmpeg = PathBuf::from(
+        common_candidate_execution["ffmpeg_canonical_path"]
+            .as_str()
+            .expect("Q01 records the canonical FFmpeg path"),
+    );
+    let ffmpeg_sha256 = common_candidate_execution["ffmpeg_executable_sha256"]
+        .as_str()
+        .expect("Q01 records the FFmpeg executable digest")
+        .to_string();
+    let ffmpeg_digest = Sha256Digest::from_hex(&ffmpeg_sha256)
+        .expect("Q01 FFmpeg executable digest parses as SHA-256");
+    let runner = RealToolRunner::new(HashMap::from([("ffmpeg".to_string(), ffmpeg.clone())]));
+    let bound_ffmpeg = BoundToolExecutable {
+        canonical_path: ffmpeg.clone(),
+        executable_sha256: ffmpeg_digest,
+    };
+    let make_command = |timeout: Duration| ToolCommand {
+        binary: ToolBinary::Ffmpeg,
+        args: vec![
+            "-nostdin".to_string(),
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            "anullsrc=r=48000:cl=stereo".to_string(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
+        ],
+        secret_args: Vec::new(),
+        cwd: None,
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+        env: vec![EnvVar {
+            key: "LC_ALL".to_string(),
+            value: SecretString::new("C"),
+            secret: false,
+        }],
+        timeout,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("timeout/cancellation qualification runtime");
+
+    let timeout_budget = Duration::from_millis(500);
+    let timeout_cancel = CancellationToken::new();
+    let timeout_started = Instant::now();
+    let timeout_result = runtime
+        .block_on(tokio::time::timeout(
+            Duration::from_secs(20),
+            runner.run_bound(make_command(timeout_budget), &bound_ffmpeg, &timeout_cancel),
+        ))
+        .expect("production timeout probe must reach a terminal runner result");
+    let timeout_wall = timeout_started.elapsed();
+    let (timeout_elapsed, timeout_record) = match timeout_result {
+        Err(ToolRunnerError::Timeout { elapsed, command }) => (elapsed, command),
+        other => panic!("production timeout probe returned {other:?}"),
+    };
+
+    let cancellation_budget = Duration::from_secs(30);
+    let cancellation_delay = Duration::from_secs(1);
+    let cancellation = CancellationToken::new();
+    let cancellation_trigger = cancellation.clone();
+    let cancellation_started = Instant::now();
+    let cancellation_result = runtime
+        .block_on(async {
+            let trigger = tokio::spawn(async move {
+                tokio::time::sleep(cancellation_delay).await;
+                cancellation_trigger.cancel();
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                runner.run_bound(
+                    make_command(cancellation_budget),
+                    &bound_ffmpeg,
+                    &cancellation,
+                ),
+            )
+            .await
+            .expect("production cancellation probe must reach a terminal runner result");
+            trigger.await.expect("cancellation trigger task completes");
+            result
+        });
+    let cancellation_wall = cancellation_started.elapsed();
+    let cancellation_record = match cancellation_result {
+        Err(ToolRunnerError::Cancelled { command }) => command,
+        other => panic!("production cancellation probe returned {other:?}"),
+    };
+
+    for (label, record) in [
+        ("timeout", &timeout_record),
+        ("cancellation", &cancellation_record),
+    ] {
+        assert!(record.exit.is_some(), "{label} probe must return only after child reap");
+        assert!(
+            record.stdout_tail.len() <= tonepoet::convert::pipeline::TOOL_OUTPUT_TAIL_BYTES,
+            "{label} stdout retention exceeded the production bound",
+        );
+        assert!(
+            record.stderr_tail.len() <= tonepoet::convert::pipeline::TOOL_OUTPUT_TAIL_BYTES,
+            "{label} stderr retention exceeded the production bound",
+        );
+    }
+
+    external_release_gate_evidence(
+        "timeout_cancellation_resource",
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+        vec![
+            command_record_evidence_string(&timeout_record),
+            command_record_evidence_string(&cancellation_record),
+        ],
+        serde_json::json!({
+            "definition": "the production RealToolRunner terminates and reaps the pinned qualified tool on both its command deadline and caller cancellation while retaining bounded output tails",
+            "ffmpeg_canonical_path": ffmpeg.display().to_string(),
+            "ffmpeg_executable_sha256": ffmpeg_sha256,
+            "qualified_environment": {"LC_ALL": "C"},
+            "timeout": {
+                "configured_budget_nanos": duration_nanos_u64(timeout_budget),
+                "runner_elapsed_nanos": duration_nanos_u64(timeout_elapsed),
+                "wall_clock_nanos": duration_nanos_u64(timeout_wall),
+                "exit": format!("{:?}", timeout_record.exit),
+                "retained_stdout_bytes": timeout_record.stdout_tail.len(),
+                "retained_stderr_bytes": timeout_record.stderr_tail.len(),
+                "reaped": true,
+            },
+            "cancellation": {
+                "configured_command_budget_nanos": duration_nanos_u64(cancellation_budget),
+                "cancellation_delay_nanos": duration_nanos_u64(cancellation_delay),
+                "runner_elapsed_nanos": duration_nanos_u64(cancellation_record.elapsed),
+                "wall_clock_nanos": duration_nanos_u64(cancellation_wall),
+                "exit": format!("{:?}", cancellation_record.exit),
+                "retained_stdout_bytes": cancellation_record.stdout_tail.len(),
+                "retained_stderr_bytes": cancellation_record.stderr_tail.len(),
+                "reaped": true,
+            },
+            "retained_tail_bound_bytes_per_stream": tonepoet::convert::pipeline::TOOL_OUTPUT_TAIL_BYTES,
+        }),
+    )
+}
+
+fn qualify_ordinary_workspace_regression_release_gate(
+    default_settings_live_smoke: &Value,
+    common_candidate_execution: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    assert_eq!(
+        common_candidate_execution["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "ordinary regression gate must bind the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["common_runtime_closure_fingerprint_sha256"].as_str(),
+        Some(runtime_closure_fingerprint_sha256),
+        "ordinary regression gate must bind the exact characterized runtime closure",
+    );
+    assert_eq!(
+        default_settings_live_smoke["tool_authority"]["sox_ng"]["canonical_path"].as_str(),
+        common_candidate_execution["sox_ng_canonical_path"].as_str(),
+        "ordinary regression must use the same SoX-ng path as Q01",
+    );
+    assert_eq!(
+        default_settings_live_smoke["tool_authority"]["sox_ng"]["executable_sha256"].as_str(),
+        common_candidate_execution["sox_ng_executable_sha256"].as_str(),
+        "ordinary regression must use the same SoX-ng executable as Q01",
+    );
+    assert_eq!(
+        default_settings_live_smoke["tool_authority"]["ffmpeg"]["canonical_path"].as_str(),
+        common_candidate_execution["ffmpeg_canonical_path"].as_str(),
+        "ordinary regression must use the same FFmpeg path as Q01",
+    );
+    assert_eq!(
+        default_settings_live_smoke["tool_authority"]["ffmpeg"]["executable_sha256"].as_str(),
+        common_candidate_execution["ffmpeg_executable_sha256"].as_str(),
+        "ordinary regression must use the same FFmpeg executable as Q01",
+    );
+    assert_eq!(default_settings_live_smoke["status"], "passed");
+    assert_eq!(default_settings_live_smoke["route"], "legacy_flat_v1");
+    assert!(json_u64(default_settings_live_smoke, "command_count") > 0);
+    assert!(
+        default_settings_live_smoke["output_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+    );
+
+    external_release_gate_evidence(
+        "ordinary_workspace_regression",
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+        evidence_string_array(default_settings_live_smoke, "command_evidence"),
+        serde_json::json!({
+            "definition": "a real-tool ordinary default DSD64 DSF to FLAC conversion still plans and executes the frozen non-Reference route in the same qualified process",
+            "scope": "targeted ordinary-path regression; the operator's separate workspace gate remains the authority for the full workspace suite",
+            "route": default_settings_live_smoke["route"].clone(),
+            "source": default_settings_live_smoke["source"].clone(),
+            "target": default_settings_live_smoke["target"].clone(),
+            "sample_rate_hz": default_settings_live_smoke["sample_rate_hz"].clone(),
+            "channels": default_settings_live_smoke["channels"].clone(),
+            "bit_depth": default_settings_live_smoke["bit_depth"].clone(),
+            "tool_authority": default_settings_live_smoke["tool_authority"].clone(),
+            "command_count": default_settings_live_smoke["command_count"].clone(),
+            "wall_clock_nanos": default_settings_live_smoke["wall_clock_nanos"].clone(),
+            "output_sha256": default_settings_live_smoke["output_sha256"].clone(),
+        }),
+    )
+}
+
+fn qualify_paired_performance_resource_release_gate(
+    common_candidate_execution: &Value,
+    candidate_manifest_sha256: &str,
+    runtime_closure_fingerprint_sha256: &str,
+) -> Value {
+    assert_eq!(
+        common_candidate_execution["candidate_manifest_sha256"].as_str(),
+        Some(candidate_manifest_sha256),
+        "paired resource gate must derive from the exact release candidate",
+    );
+    assert_eq!(
+        common_candidate_execution["common_runtime_closure_fingerprint_sha256"].as_str(),
+        Some(runtime_closure_fingerprint_sha256),
+        "paired resource gate must derive from the exact characterized runtime closure",
+    );
+    let resources = &common_candidate_execution["resource_measurements"];
+    let silent = &resources["silent"];
+    let non_silent = &resources["non_silent"];
+    for (label, measurement) in [("silent", silent), ("non_silent", non_silent)] {
+        assert_eq!(json_u64(measurement, "decode_reconstruction_passes"), 1);
+        assert!(json_u64(measurement, "process_count") > 0);
+        assert!(json_u64(measurement, "full_read_bytes") > 0);
+        assert!(
+            json_u64(measurement, "scratch_bytes") >= json_u64(measurement, "full_read_bytes"),
+            "{label} scratch accounting must include both complete-reader carriers",
+        );
+        assert!(
+            json_u64(measurement, "retained_output_tail_bytes")
+                <= json_u64(measurement, "retained_output_tail_capacity_bytes"),
+            "{label} retained output exceeded the production per-process bound",
+        );
+        let wall = Duration::from_nanos(json_u64(measurement, "wall_clock_nanos"));
+        assert!(wall > Duration::ZERO);
+        assert!(
+            wall < QUALIFICATION_PIPELINE_TIMEOUT,
+            "{label} candidate exceeded the existing qualification pipeline deadline",
+        );
+    }
+    assert_eq!(
+        resources["enabled_kernels"]["runtime_dispatch_digest"].as_str(),
+        common_candidate_execution["runtime_dispatch_digest"].as_str(),
+        "paired resource characterization must bind the same measured runtime dispatch as Q01",
+    );
+
+    let mut commands = evidence_string_array(common_candidate_execution, "silent_commands");
+    commands.extend(evidence_string_array(
+        common_candidate_execution,
+        "non_silent_commands",
+    ));
+    external_release_gate_evidence(
+        "paired_performance_resource",
+        candidate_manifest_sha256,
+        runtime_closure_fingerprint_sha256,
+        commands,
+        serde_json::json!({
+            "definition": "paired characterization of the same candidate closure on exact silence and ordinary finite programme material; pass criteria are successful completion within the pre-existing qualification deadline and bounded resource invariants, not a newly invented speed threshold",
+            "pair": [silent["programme"].clone(), non_silent["programme"].clone()],
+            "decode_reconstruction_passes": {
+                "silent": silent["decode_reconstruction_passes"].clone(),
+                "non_silent": non_silent["decode_reconstruction_passes"].clone(),
+            },
+            "process_count": {
+                "silent": silent["process_count"].clone(),
+                "non_silent": non_silent["process_count"].clone(),
+            },
+            "full_read_bytes": {
+                "scope": resources["full_read_scope"].clone(),
+                "silent": silent["full_read_bytes"].clone(),
+                "non_silent": non_silent["full_read_bytes"].clone(),
+            },
+            "scratch_bytes": {
+                "scope": resources["scratch_scope"].clone(),
+                "silent": silent["scratch_bytes"].clone(),
+                "non_silent": non_silent["scratch_bytes"].clone(),
+            },
+            "allocations": {
+                "scope": resources["allocation_scope"].clone(),
+                "silent": silent["host_thread_allocations"].clone(),
+                "non_silent": non_silent["host_thread_allocations"].clone(),
+            },
+            "retained_buffers": {
+                "scope": "production runner stdout/stderr tail buffers retained in CommandRecord after each subprocess completes",
+                "silent_bytes": silent["retained_output_tail_bytes"].clone(),
+                "silent_capacity_bytes": silent["retained_output_tail_capacity_bytes"].clone(),
+                "non_silent_bytes": non_silent["retained_output_tail_bytes"].clone(),
+                "non_silent_capacity_bytes": non_silent["retained_output_tail_capacity_bytes"].clone(),
+            },
+            "enabled_kernels": resources["enabled_kernels"].clone(),
+            "wall_clock_timing": {
+                "silent_programme_duration_nanos": silent["programme_duration_nanos"].clone(),
+                "silent_wall_clock_nanos": silent["wall_clock_nanos"].clone(),
+                "silent_command_elapsed_nanos": silent["command_elapsed_nanos"].clone(),
+                "non_silent_programme_duration_nanos": non_silent["programme_duration_nanos"].clone(),
+                "non_silent_wall_clock_nanos": non_silent["wall_clock_nanos"].clone(),
+                "non_silent_command_elapsed_nanos": non_silent["command_elapsed_nanos"].clone(),
+                "existing_qualification_pipeline_timeout_nanos": duration_nanos_u64(QUALIFICATION_PIPELINE_TIMEOUT),
+            },
+        }),
+    )
 }
 
 fn release_gate_result(gate: &str, evidence: &Value) -> tonepoet_pipeline::ReferenceReleaseGateResultV1 {
@@ -7193,33 +8075,70 @@ fn complete_p0_reference_qualification_report() {
         .count();
     let rejected_target_depth_cells = target_depth_cells.len() - supported_target_depth_cells;
 
-    let gain08 = required_bound_release_gate_evidence(
-        GAIN08_EVIDENCE_ENV,
+    // Complete every newly defined release-gate measurement before publishing
+    // any of the five records. A failed measurement therefore cannot leave a
+    // mixture of fresh "passed" records from only the early gates.
+    let gain08_record = qualify_gain08_release_gate(
+        &common_candidate_execution,
+        &candidate_manifest_sha256,
+        &runtime_closure_fingerprint_sha256,
+    );
+    let gain09_record = qualify_gain09_release_gate(
+        &historical_dc_root_cause,
+        &common_candidate_execution,
+        &candidate_manifest_sha256,
+        &runtime_closure_fingerprint_sha256,
+    );
+    let timeout_resource_record = qualify_timeout_cancellation_resource_release_gate(
+        &common_candidate_execution,
+        &candidate_manifest_sha256,
+        &runtime_closure_fingerprint_sha256,
+    );
+    let workspace_regression_record = qualify_ordinary_workspace_regression_release_gate(
+        &default_settings_live_smoke,
+        &common_candidate_execution,
+        &candidate_manifest_sha256,
+        &runtime_closure_fingerprint_sha256,
+    );
+    let performance_resource_record = qualify_paired_performance_resource_release_gate(
+        &common_candidate_execution,
+        &candidate_manifest_sha256,
+        &runtime_closure_fingerprint_sha256,
+    );
+
+    let generated_release_gate_evidence_dir = release_gate_evidence_output_dir();
+    let gain08 = bind_generated_release_gate_evidence(
+        &generated_release_gate_evidence_dir,
         "GAIN08",
+        &gain08_record,
         &candidate_manifest_sha256,
         &runtime_closure_fingerprint_sha256,
     );
-    let gain09 = required_bound_release_gate_evidence(
-        GAIN09_EVIDENCE_ENV,
+    let gain09 = bind_generated_release_gate_evidence(
+        &generated_release_gate_evidence_dir,
         "GAIN09",
+        &gain09_record,
         &candidate_manifest_sha256,
         &runtime_closure_fingerprint_sha256,
     );
-    let timeout_resource = required_bound_release_gate_evidence(
-        TIMEOUT_RESOURCE_EVIDENCE_ENV,
+    let timeout_resource = bind_generated_release_gate_evidence(
+        &generated_release_gate_evidence_dir,
         "timeout_cancellation_resource",
+        &timeout_resource_record,
         &candidate_manifest_sha256,
         &runtime_closure_fingerprint_sha256,
     );
-    let workspace_regression = required_bound_release_gate_evidence(
-        WORKSPACE_REGRESSION_EVIDENCE_ENV,
+    let workspace_regression = bind_generated_release_gate_evidence(
+        &generated_release_gate_evidence_dir,
         "ordinary_workspace_regression",
+        &workspace_regression_record,
         &candidate_manifest_sha256,
         &runtime_closure_fingerprint_sha256,
     );
-    let performance_resource = required_bound_release_gate_evidence(
-        PERFORMANCE_RESOURCE_EVIDENCE_ENV,
+    let performance_resource = bind_generated_release_gate_evidence(
+        &generated_release_gate_evidence_dir,
         "paired_performance_resource",
+        &performance_resource_record,
         &candidate_manifest_sha256,
         &runtime_closure_fingerprint_sha256,
     );
@@ -7424,6 +8343,10 @@ fn complete_p0_reference_qualification_report() {
         serde_json::to_value(&certification).expect("serialize v17 certification value");
     write_report_atomically(&certification_path, &certification_value);
 
+    eprintln!(
+        "Reference generated release-gate evidence: {}",
+        generated_release_gate_evidence_dir.display()
+    );
     eprintln!("Reference common-model evidence: {}", evidence_path.display());
     eprintln!("Reference common-model qualification report: {}", report_path.display());
     eprintln!("Reference common-model release certification: {}", certification_path.display());
