@@ -14,13 +14,13 @@
     "default_settings_live_smoke",
     "throughput_and_deadline_qualification",
     "complete_real_tool_reference_qualification",
-    "w64_exact_integrity_60_cell_matrix",
+    "w64_exact_integrity_80_cell_matrix",
     "release_report_binding"
   ],
   "w64_exact_integrity": {
     "status": "not_run",
-    "required_cell_count": 60,
-    "uncharacterized_enabled_cells": 60,
+    "required_cell_count": 80,
+    "uncharacterized_enabled_cells": 80,
     "malformed_w64_publication_allowed": false,
     "same_path_hash_counted_as_independent_packaging": false,
     "boundary_region_resolution_base_fraction": "1/510"

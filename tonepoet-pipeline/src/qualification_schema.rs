@@ -763,7 +763,7 @@ pub const REFERENCE_REQUIRED_RELEASE_GATES: [&str; 12] = [
     "Q02",
     "GAIN08",
     "GAIN09",
-    "wave64_integrity_60_cell",
+    "wave64_integrity_80_cell",
     "complete_reader",
     "package_identity",
     "post_metadata_identity",

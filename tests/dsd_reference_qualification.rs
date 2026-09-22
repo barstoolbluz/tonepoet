@@ -8218,7 +8218,7 @@ fn complete_p0_reference_qualification_report() {
         release_gate_result("Q02", &q02),
         release_gate_result("GAIN08", &gain08),
         release_gate_result("GAIN09", &gain09),
-        release_gate_result("wave64_integrity_60_cell", &w64_exact_integrity),
+        release_gate_result("wave64_integrity_80_cell", &w64_exact_integrity),
         release_gate_result("complete_reader", &complete_reader_evidence),
         release_gate_result("package_identity", &package_identity_evidence),
         release_gate_result("post_metadata_identity", &post_metadata_identity_evidence),
@@ -8245,8 +8245,8 @@ fn complete_p0_reference_qualification_report() {
         .expect("W64 qualification records expected malformed cells");
     assert_eq!(
         w64_exact_integrity["cell_count"].as_u64(),
-        Some(60),
-        "Phase-5 retains the complete 60-cell Wave64 characterization",
+        Some(80),
+        "Phase-5 retains the complete 80-cell Wave64 characterization",
     );
     let positive_case_count = 1_u64
         + u64::try_from(package_case_count).expect("package case count fits u64")
@@ -8290,7 +8290,7 @@ fn complete_p0_reference_qualification_report() {
             "Q02": q02,
             "GAIN08": gain08,
             "GAIN09": gain09,
-            "wave64_integrity_60_cell": w64_exact_integrity,
+            "wave64_integrity_80_cell": w64_exact_integrity,
             "complete_reader": complete_reader_evidence,
             "package_identity": package_identity_evidence,
             "post_metadata_identity": post_metadata_identity_evidence,

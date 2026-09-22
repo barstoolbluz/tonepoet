@@ -3151,7 +3151,7 @@ fn validate_terminal_effects_certification(
                 "the embedded release-certification report has no terminal maxima by depth",
             )
         })?;
-    let expected_depth_keys = BTreeSet::from(["int24", "float32", "float64"]);
+    let expected_depth_keys = BTreeSet::from(["int24", "int32", "float32", "float64"]);
     if observed
         .keys()
         .map(String::as_str)
@@ -3854,7 +3854,7 @@ fn validate_embedded_release_certification(
         192_000, 352_800, 384_000, 705_600, 768_000,
     ];
     let expected_channels = [1_u64, 2_u64];
-    let expected_depths = ["int24", "float32", "float64"];
+    let expected_depths = ["int24", "int32", "float32", "float64"];
     let mut observed_cells = BTreeSet::new();
     let mut observed_malformed_all_zero_cells = 0_u64;
     let mut observed_valid_all_zero_cells = 0_u64;
@@ -3991,20 +3991,20 @@ fn validate_embedded_release_certification(
                 values.iter().map(serde_json::Value::as_u64).collect::<Option<Vec<_>>>()
                     != Some(expected_channels.to_vec())
             })
-        || w64_integrity.get("cell_count").and_then(serde_json::Value::as_u64) != Some(60)
+        || w64_integrity.get("cell_count").and_then(serde_json::Value::as_u64) != Some(80)
         || w64_integrity.get("malformed_all_zero_cell_count")
             .and_then(serde_json::Value::as_u64) != Some(observed_malformed_all_zero_cells)
         || w64_integrity.get("valid_all_zero_cell_count")
             .and_then(serde_json::Value::as_u64) != Some(observed_valid_all_zero_cells)
-        || observed_malformed_all_zero_cells + observed_valid_all_zero_cells != 60
+        || observed_malformed_all_zero_cells + observed_valid_all_zero_cells != 80
         || w64_integrity.get("uncharacterized_enabled_cells")
             .and_then(serde_json::Value::as_u64) != Some(0)
         || w64_integrity.get("same_path_qpcm_package_hash_counted_as_independent_packaging")
             .and_then(serde_json::Value::as_bool) != Some(false)
         || w64_integrity.get("w64_delivery_mode").and_then(serde_json::Value::as_str)
             != Some("terminal_qpcm_is_delivered_directly_after_exact_structure_and_full_consumer_traversal")
-        || w64_cells.len() != 60
-        || observed_cells.len() != 60
+        || w64_cells.len() != 80
+        || observed_cells.len() != 80
     {
         return Err(reference_toolchain_error(
             "the embedded exact Wave64 integrity evidence is incomplete or non-canonical",
@@ -5399,10 +5399,10 @@ fn validate_embedded_reference_policy_tables(
             .enabled_depths
             .iter()
             .map(String::as_str)
-            .eq(["int24", "float32", "float64"])
+            .eq(["int24", "int32", "float32", "float64"])
         || manifest.w64_integrity.rates_hz.as_slice() != expected_w64_rates
         || manifest.w64_integrity.channels.as_slice() != [1_u16, 2_u16]
-        || manifest.w64_integrity.required_characterization_cell_count != 60
+        || manifest.w64_integrity.required_characterization_cell_count != 80
         || manifest.w64_integrity.boundary_region_resolution_base_fraction != "1/510"
         || manifest.w64_integrity.trigger_claim
             != "encoded_all_zero_after_depth_and_effects_quantization; input threshold is measured per cell and is not assumed"

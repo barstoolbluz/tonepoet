@@ -1326,6 +1326,7 @@
     ],
     "enabled_depths": [
       "int24",
+      "int32",
       "float32",
       "float64"
     ],
@@ -1345,7 +1346,7 @@
       1,
       2
     ],
-    "required_characterization_cell_count": 60,
+    "required_characterization_cell_count": 80,
     "trigger_claim": "encoded_all_zero_after_depth_and_effects_quantization; input threshold is measured per cell and is not assumed",
     "same_path_qpcm_package_hash_is_independent_packaging_evidence": false,
     "boundary_region_resolution_base_fraction": "1/510",
