@@ -3004,8 +3004,8 @@ fn qualify_historical_dc_root_cause_probe() -> Value {
     assert!(summary.qpcm_path.is_file(), "historical DC probe retained terminal QPCM");
 
     // Re-read the retained files independently after the common executor has
-    // returned. This reconstructs the missing authority chain even on the
-    // post-acceptance error path, where the executor intentionally returns
+    // returned. This reconstructs the authority chain on both accepted and
+    // rejected paths; the post-acceptance error path intentionally returns
     // CommandRecords but not its measurement map.
     let pre = historical_dc_certified_w64_probe(
         &summary.r64_path,
@@ -3026,7 +3026,7 @@ fn qualify_historical_dc_root_cause_probe() -> Value {
             record.description.as_deref()
                 == Some("Apply one qualified Reference terminal realization")
         })
-        .expect("historical DC failure retains the terminal CommandRecord");
+        .expect("historical DC candidate retains the terminal CommandRecord");
     let terminal_gain_args = terminal
         .sanitized_args
         .windows(2)
@@ -3157,16 +3157,24 @@ fn qualify_historical_dc_root_cause_probe() -> Value {
 }
 
 #[test]
-fn historical_dc_root_cause_probe_captures_authority_chain() {
+fn historical_dc_root_cause_probe_confirms_current_path_avoids_former_rail() {
     if !selected() {
         eprintln!(
-            "skipping historical DC root-cause probe; set {GATE}=1 to run the pinned real-tool reproduction"
+            "skipping historical DC root-cause probe; set {GATE}=1 to run the pinned real-tool regression probe"
         );
         return;
     }
 
     let report = qualify_historical_dc_root_cause_probe();
     assert_eq!(report["status"], "captured");
+    assert_eq!(report["execution_outcome"], "accepted");
+    assert_eq!(report["qpcm_reaches_sample_rail"], false);
+    assert_eq!(report["scalar_model"]["predicts_sample_rail"], false);
+    assert_eq!(report["terminal_qpcm"]["post_terminal_acceptance"], "accepted");
+    assert_eq!(
+        report["root_cause_class"],
+        "historical_full_scale_rail_not_reproduced"
+    );
     assert_eq!(report["terminal_gain_matches_selected_authority"], true);
 }
 
@@ -7588,7 +7596,7 @@ fn qualify_gain09_release_gate(
     assert_eq!(
         historical_dc_root_cause["candidate_manifest_sha256"].as_str(),
         Some(candidate_manifest_sha256),
-        "GAIN09 historical reproduction must use the exact release candidate",
+        "GAIN09 historical fixture probe must use the exact release candidate",
     );
     assert_eq!(
         common_candidate_execution["candidate_manifest_sha256"].as_str(),
@@ -7603,41 +7611,51 @@ fn qualify_gain09_release_gate(
     assert_eq!(
         historical_dc_root_cause["sox_ng_canonical_path"].as_str(),
         common_candidate_execution["sox_ng_canonical_path"].as_str(),
-        "GAIN09 historical reproduction must use the same SoX-ng path as Q01",
+        "GAIN09 historical fixture probe must use the same SoX-ng path as Q01",
     );
     assert_eq!(
         historical_dc_root_cause["sox_ng_executable_sha256"].as_str(),
         common_candidate_execution["sox_ng_executable_sha256"].as_str(),
-        "GAIN09 historical reproduction must use the same SoX-ng executable as Q01",
+        "GAIN09 historical fixture probe must use the same SoX-ng executable as Q01",
     );
     assert_eq!(
         historical_dc_root_cause["ffmpeg_canonical_path"].as_str(),
         common_candidate_execution["ffmpeg_canonical_path"].as_str(),
-        "GAIN09 historical reproduction must use the same FFmpeg path as Q01",
+        "GAIN09 historical fixture probe must use the same FFmpeg path as Q01",
     );
     assert_eq!(
         historical_dc_root_cause["ffmpeg_executable_sha256"].as_str(),
         common_candidate_execution["ffmpeg_executable_sha256"].as_str(),
-        "GAIN09 historical reproduction must use the same FFmpeg executable as Q01",
+        "GAIN09 historical fixture probe must use the same FFmpeg executable as Q01",
     );
     assert_eq!(
         historical_dc_root_cause["execution_outcome"].as_str(),
-        Some("post_terminal_rejected"),
-        "GAIN09 must reproduce the historical DC candidate reaching the fail-closed post-terminal gate",
+        Some("accepted"),
+        "GAIN09 current candidate must convert the former 0x00 fixture successfully",
     );
-    assert_eq!(historical_dc_root_cause["qpcm_reaches_sample_rail"], true);
+    assert_eq!(
+        historical_dc_root_cause["qpcm_reaches_sample_rail"],
+        false,
+        "GAIN09 current terminal QPCM must not reproduce the historical sample rail",
+    );
     assert_eq!(
         historical_dc_root_cause["scalar_model"]["predicts_sample_rail"],
-        true,
-        "GAIN09 must explain the terminal rail from the selected scalar rather than an unknown runtime effect",
+        false,
+        "GAIN09 current selected scalar must predict an in-range terminal sample domain",
     );
     assert_eq!(
         historical_dc_root_cause["terminal_gain_matches_selected_authority"],
         true,
     );
     assert_eq!(
+        historical_dc_root_cause["terminal_qpcm"]["post_terminal_acceptance"].as_str(),
+        Some("accepted"),
+        "GAIN09 independently measured terminal QPCM must pass post-terminal acceptance",
+    );
+    assert_eq!(
         historical_dc_root_cause["root_cause_class"].as_str(),
-        Some("selected_gain_drives_sample_domain_clipping"),
+        Some("historical_full_scale_rail_not_reproduced"),
+        "GAIN09 must classify the historical full-scale rail as absent from the current Reference path",
     );
 
     external_release_gate_evidence(
@@ -7646,11 +7664,14 @@ fn qualify_gain09_release_gate(
         runtime_closure_fingerprint_sha256,
         evidence_string_array(historical_dc_root_cause, "commands"),
         serde_json::json!({
-            "definition": "the pathological 0x00 full-scale-negative-DC fixture is causally explained by the selected gain scalar and is rejected before publication when terminal QPCM reaches the sample rail",
+            "definition": "the former 0x00 full-scale-negative-DC fixture traverses the current Reference candidate without reproducing the historical sample rail: the selected gain is realized exactly, both the scalar model and measured terminal QPCM remain inside the sample domain, and independent post-terminal acceptance passes",
             "historical_fixture": historical_dc_root_cause["historical_fixture"].clone(),
             "execution_outcome": historical_dc_root_cause["execution_outcome"].clone(),
             "protected_r64": historical_dc_root_cause["protected_r64"].clone(),
             "gain_authority": historical_dc_root_cause["gain_authority"].clone(),
+            "terminal": historical_dc_root_cause["terminal"].clone(),
+            "terminal_gain_matches_selected_authority":
+                historical_dc_root_cause["terminal_gain_matches_selected_authority"].clone(),
             "scalar_model": historical_dc_root_cause["scalar_model"].clone(),
             "terminal_qpcm": historical_dc_root_cause["terminal_qpcm"].clone(),
             "root_cause_class": historical_dc_root_cause["root_cause_class"].clone(),
@@ -7723,11 +7744,16 @@ fn qualify_timeout_cancellation_resource_release_gate(
     let timeout_budget = Duration::from_millis(500);
     let timeout_cancel = CancellationToken::new();
     let timeout_started = Instant::now();
+    // `tokio::time::timeout` captures the runtime handle when it is built, so
+    // it must be constructed inside the runtime, not as a `block_on` argument.
     let timeout_result = runtime
-        .block_on(tokio::time::timeout(
-            Duration::from_secs(20),
-            runner.run_bound(make_command(timeout_budget), &bound_ffmpeg, &timeout_cancel),
-        ))
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                runner.run_bound(make_command(timeout_budget), &bound_ffmpeg, &timeout_cancel),
+            )
+            .await
+        })
         .expect("production timeout probe must reach a terminal runner result");
     let timeout_wall = timeout_started.elapsed();
     let (timeout_elapsed, timeout_record) = match timeout_result {
@@ -7855,7 +7881,7 @@ fn qualify_ordinary_workspace_regression_release_gate(
     );
     assert_eq!(default_settings_live_smoke["status"], "passed");
     assert_eq!(default_settings_live_smoke["route"], "legacy_flat_v1");
-    assert!(json_u64(default_settings_live_smoke, "command_count") > 0);
+    assert!(json_u64(&default_settings_live_smoke["command_count"], "command_count") > 0);
     assert!(
         default_settings_live_smoke["output_sha256"]
             .as_str()
@@ -7903,19 +7929,19 @@ fn qualify_paired_performance_resource_release_gate(
     let silent = &resources["silent"];
     let non_silent = &resources["non_silent"];
     for (label, measurement) in [("silent", silent), ("non_silent", non_silent)] {
-        assert_eq!(json_u64(measurement, "decode_reconstruction_passes"), 1);
-        assert!(json_u64(measurement, "process_count") > 0);
-        assert!(json_u64(measurement, "full_read_bytes") > 0);
+        assert_eq!(json_u64(&measurement["decode_reconstruction_passes"], "decode_reconstruction_passes"), 1);
+        assert!(json_u64(&measurement["process_count"], "process_count") > 0);
+        assert!(json_u64(&measurement["full_read_bytes"], "full_read_bytes") > 0);
         assert!(
-            json_u64(measurement, "scratch_bytes") >= json_u64(measurement, "full_read_bytes"),
+            json_u64(&measurement["scratch_bytes"], "scratch_bytes") >= json_u64(&measurement["full_read_bytes"], "full_read_bytes"),
             "{label} scratch accounting must include both complete-reader carriers",
         );
         assert!(
-            json_u64(measurement, "retained_output_tail_bytes")
-                <= json_u64(measurement, "retained_output_tail_capacity_bytes"),
+            json_u64(&measurement["retained_output_tail_bytes"], "retained_output_tail_bytes")
+                <= json_u64(&measurement["retained_output_tail_capacity_bytes"], "retained_output_tail_capacity_bytes"),
             "{label} retained output exceeded the production per-process bound",
         );
-        let wall = Duration::from_nanos(json_u64(measurement, "wall_clock_nanos"));
+        let wall = Duration::from_nanos(json_u64(&measurement["wall_clock_nanos"], "wall_clock_nanos"));
         assert!(wall > Duration::ZERO);
         assert!(
             wall < QUALIFICATION_PIPELINE_TIMEOUT,
